@@ -1,4 +1,3 @@
-
 import os
 import re
 from typing import Optional
@@ -11,33 +10,22 @@ from pypdf import PdfReader
 app = FastAPI()
 
 AI_INTERNAL_SECRET = (os.environ.get("AI_INTERNAL_SECRET") or "").strip()
-
 FETCH_TIMEOUT = int(os.environ.get("MM_FETCH_TIMEOUT_SECONDS", "30"))
-MAX_PDF_BYTES = int(os.environ.get("MM_MAX_PDF_BYTES", str(50 * 1024 * 1024)))  # 50MB default
+MAX_PDF_BYTES = int(os.environ.get("MM_MAX_PDF_BYTES", str(50 * 1024 * 1024)))  # 50MB
 
 
 @app.get("/healthz")
 def healthz():
-    return {
-        "ok": True,
-        "status": "healthy",
-        "build": os.environ.get("BUILD_ID", "no-build-id"),
-    }
+    return {"ok": True, "status": "healthy", "build": os.environ.get("BUILD_ID", "no-build-id")}
 
 
 @app.get("/ping")
 def ping():
-    return {
-        "ok": True,
-        "status": "ok",
-        "build": os.environ.get("BUILD_ID", "no-build-id"),
-    }
+    return {"ok": True, "status": "ok", "build": os.environ.get("BUILD_ID", "no-build-id")}
 
 
 class IngestRequest(BaseModel):
-    # URL temporaneo (Bubble signed URL / CDN)
     file_url: str
-    # opzionali (per logging/debug)
     document_id: Optional[str] = None
     filename: Optional[str] = None
 
@@ -50,7 +38,6 @@ def _require_secret(x_ai_internal_secret: Optional[str]) -> None:
 
 
 def _normalize_url(u: str) -> str:
-    # Bubble/CF a volte danno //cdn...
     if u.startswith("//"):
         return "https:" + u
     return u
@@ -74,7 +61,7 @@ def ingest_document(
     if not url.lower().startswith("http"):
         raise HTTPException(status_code=400, detail="file_url must be http(s)")
 
-    # download con limite dimensione
+    # download (stream) with size limit
     try:
         with requests.get(url, stream=True, timeout=FETCH_TIMEOUT) as r:
             r.raise_for_status()
@@ -127,5 +114,3 @@ def ingest_document(
         "text_chars": text_chars,
     }
 
-%), col  2/10 ( 20%), char    2/3839 ( 0%) ]
-^G Help          ^O Write Out     ^W Where Is      ^K
