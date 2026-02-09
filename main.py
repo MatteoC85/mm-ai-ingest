@@ -1,3 +1,4 @@
+
 import os
 import re
 from typing import Optional
@@ -125,3 +126,6 @@ def ingest_document(
         "pages_with_text": pages_with_text,
         "text_chars": text_chars,
     }
+
+%), col  2/10 ( 20%), char    2/3839 ( 0%) ]
+^G Help          ^O Write Out     ^W Where Is      ^K
