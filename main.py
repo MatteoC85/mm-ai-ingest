@@ -23,7 +23,7 @@ class IngestRequest(BaseModel):
 @app.post("/v1/ai/ingest/document")
 def ingest_document(
     payload: IngestRequest,
-    x_ai_internal_secret: Optional[str] = Header(default=None, convert_underscores=False),
+    x_ai_internal_secret: Optional[str] = Header(default=None),
 ):
     # auth
     if not AI_INTERNAL_SECRET:
