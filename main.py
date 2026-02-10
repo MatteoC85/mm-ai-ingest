@@ -13,6 +13,7 @@ app = FastAPI()
 AI_INTERNAL_SECRET = (os.environ.get("AI_INTERNAL_SECRET") or "").strip()
 FETCH_TIMEOUT = int(os.environ.get("MM_FETCH_TIMEOUT_SECONDS", "30"))
 MAX_PDF_BYTES = int(os.environ.get("MM_MAX_PDF_BYTES", str(50 * 1024 * 1024)))
+MIN_TEXT_CHARS = int(os.environ.get("MM_MIN_TEXT_CHARS", "200"))
 
 @app.get("/ping")
 def ping():
@@ -58,5 +59,17 @@ def ingest_document(
             text_chars += len(t)
     except Exception:
         raise HTTPException(status_code=422, detail="PDF parse failed")
+
+        # NOT_INDEXABLE (V1)
+    if text_chars < MIN_TEXT_CHARS:
+        return {
+            "ok": False,
+            "error": {
+                "code": "NOT_INDEXABLE",
+                "message": f"Documento non indicizzabile: testo troppo corto (< {MIN_TEXT_CHARS} caratteri). Probabile PDF scannerizzato o vuoto.",
+            },
+            "pages_detected": pages_total,
+            "text_chars": text_chars,
+        }
 
     return {"ok": True, "pages_detected": pages_total, "text_chars": text_chars}
