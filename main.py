@@ -1,5 +1,6 @@
 import os
 import re
+import io
 from typing import Optional
 
 import requests
@@ -49,7 +50,7 @@ def ingest_document(
 
     # parse
     try:
-        reader = PdfReader(bytes(data))
+        reader = PdfReader(io.BytesIO(data))
         pages_total = len(reader.pages)
         text_chars = 0
         for p in reader.pages:
