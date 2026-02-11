@@ -9,6 +9,9 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from pypdf import PdfReader
 
+from google.cloud import tasks_v2
+import json
+
 app = FastAPI()
 
 AI_INTERNAL_SECRET = (os.environ.get("AI_INTERNAL_SECRET") or "").strip()
@@ -175,6 +178,47 @@ def ingest_document(
         conn.commit()
     finally:
         conn.close()
+
+        # ===============================
+    # Enqueue async index job (Cloud Tasks)
+    # ===============================
+    try:
+        project = os.environ.get("GCP_PROJECT")
+        location = "europe-west1"
+        queue = "mm-ai-index-dev"
+        service_url = os.environ.get("K_SERVICE_URL") or os.environ.get("SERVICE_URL")
+
+        if not service_url:
+            # fallback hardcoded (DEV only)
+            service_url = "https://mm-ai-ingest-fixed-pvgxe6eo5q-ew.a.run.app"
+
+        client = tasks_v2.CloudTasksClient()
+        parent = client.queue_path(project, location, queue)
+
+        task_payload = {
+            "company_id": company_id,
+            "machine_id": machine_id,
+            "bubble_document_id": bubble_document_id,
+            "trace_id": "ingest_auto",
+        }
+
+        task = {
+            "http_request": {
+                "http_method": tasks_v2.HttpMethod.POST,
+                "url": f"{service_url}/v1/ai/index/document",
+                "headers": {
+                    "Content-Type": "application/json",
+                    "X-AI-Internal-Secret": AI_INTERNAL_SECRET,
+                },
+                "body": json.dumps(task_payload).encode(),
+            }
+        }
+
+        client.create_task(request={"parent": parent, "task": task})
+
+    except Exception as e:
+        # non blocchiamo ingest se enqueue fallisce
+        print("Cloud Tasks enqueue failed:", str(e))
 
     return {
         "ok": True,
