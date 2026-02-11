@@ -179,7 +179,7 @@ def ingest_document(
     finally:
         conn.close()
 
-        # ===============================
+    # ===============================
     # Enqueue async index job (Cloud Tasks)
     # ===============================
     try:
