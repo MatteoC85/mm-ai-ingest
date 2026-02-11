@@ -60,6 +60,38 @@ def db_ping(x_ai_internal_secret: Optional[str] = Header(default=None)):
 class IngestRequest(BaseModel):
     file_url: str
 
+@app.post("/db_smoke_write")
+def db_smoke_write(x_ai_internal_secret: Optional[str] = Header(default=None)):
+    if not AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=500, detail="AI_INTERNAL_SECRET missing")
+    if (x_ai_internal_secret or "").strip() != AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    if not (DB_HOST and DB_USER and DB_PASSWORD):
+        raise HTTPException(status_code=500, detail="DB env missing")
+
+    conn = psycopg2.connect(
+        host=DB_HOST,
+        dbname=DB_NAME,
+        user=DB_USER,
+        password=DB_PASSWORD,
+    )
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT now();")
+            nowv = cur.fetchone()[0]
+
+            # scrittura minimale (nessun dato “vero”)
+            cur.execute("""
+                INSERT INTO document_pages(company_id, document_id, page_num, text)
+                VALUES ('__smoke__', '__smoke__', 0, 'smoke test')
+                ON CONFLICT DO NOTHING;
+            """)
+        conn.commit()
+        return {"ok": True, "now": str(nowv)}
+    finally:
+        conn.close()
+
 @app.post("/v1/ai/ingest/document")
 def ingest_document(
     payload: IngestRequest,
