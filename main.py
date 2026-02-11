@@ -183,3 +183,38 @@ def ingest_document(
         "pages_detected": pages_total,  # compat
         "text_chars": text_chars,
     }
+
+class IndexDocumentRequest(BaseModel):
+    company_id: str
+    machine_id: str
+    bubble_document_id: str
+    trace_id: Optional[str] = None
+
+
+@app.post("/v1/ai/index/document")
+def index_document(
+    payload: IndexDocumentRequest,
+    x_ai_internal_secret: Optional[str] = Header(default=None),
+):
+    # auth (stessa dell’ingest)
+    if not AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=500, detail="AI_INTERNAL_SECRET missing")
+    if (x_ai_internal_secret or "").strip() != AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    # stub: per ora non fa chunk/embedding
+    company_id = (payload.company_id or "").strip()
+    machine_id = (payload.machine_id or "").strip()
+    bubble_document_id = (payload.bubble_document_id or "").strip()
+
+    if not (company_id and machine_id and bubble_document_id):
+        raise HTTPException(status_code=400, detail="Missing company_id/machine_id/bubble_document_id")
+
+    return {
+        "ok": True,
+        "status": "accepted",
+        "company_id": company_id,
+        "machine_id": machine_id,
+        "bubble_document_id": bubble_document_id,
+        "trace_id": payload.trace_id,
+    }
