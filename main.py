@@ -82,11 +82,15 @@ def db_smoke_write(x_ai_internal_secret: Optional[str] = Header(default=None)):
             nowv = cur.fetchone()[0]
 
             # scrittura minimale (nessun dato “vero”)
-            cur.execute("""
-                INSERT INTO document_pages(company_id, document_id, page_num, text)
-                VALUES ('__smoke__', '__smoke__', 0, 'smoke test')
-                ON CONFLICT DO NOTHING;
-            """)
+            cur.execute(
+    """
+    INSERT INTO document_pages(company_id, machine_id, bubble_document_id, page_number, text, text_chars)
+    VALUES (%s, %s, %s, %s, %s, %s)
+    ON CONFLICT (company_id, bubble_document_id, page_number) DO NOTHING;
+    """,
+    ("__smoke__", "__smoke__", "__smoke__", 0, "smoke test", 10),
+)
+
         conn.commit()
         return {"ok": True, "now": str(nowv)}
     finally:
