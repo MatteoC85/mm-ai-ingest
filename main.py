@@ -1,11 +1,9 @@
 import os
-import re
 import io
-from typing import Optional
 import math
+from typing import Optional
 
 import requests
-import psycopg2
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from pypdf import PdfReader
@@ -15,10 +13,6 @@ app = FastAPI()
 AI_INTERNAL_SECRET = (os.environ.get("AI_INTERNAL_SECRET") or "").strip()
 FETCH_TIMEOUT = int(os.environ.get("MM_FETCH_TIMEOUT_SECONDS", "30"))
 MAX_PDF_BYTES = int(os.environ.get("MM_MAX_PDF_BYTES", str(50 * 1024 * 1024)))
-DB_HOST = (os.environ.get("MM_DB_HOST") or "").strip()
-DB_NAME = (os.environ.get("MM_DB_NAME") or "postgres").strip()
-DB_USER = (os.environ.get("MM_DB_USER") or "").strip()
-DB_PASSWORD = (os.environ.get("MM_DB_PASSWORD") or "").strip()
 
 # Indicizzabilità (PRO) — configurabile via env
 MIN_TEXT_CHARS = int(os.environ.get("MM_MIN_TEXT_CHARS", "2000"))
@@ -32,69 +26,10 @@ MIN_PAGES_WITH_TEXT_PCT = float(os.environ.get("MM_MIN_PAGES_WITH_TEXT_PCT", "0.
 def ping():
     return {"ok": True}
 
-@app.get("/db_ping")
-def db_ping(x_ai_internal_secret: Optional[str] = Header(default=None)):
-    # proteggiamo con lo stesso secret interno
-    if not AI_INTERNAL_SECRET:
-        raise HTTPException(status_code=500, detail="AI_INTERNAL_SECRET missing")
-    if (x_ai_internal_secret or "").strip() != AI_INTERNAL_SECRET:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    if not (DB_HOST and DB_USER and DB_PASSWORD):
-        raise HTTPException(status_code=500, detail="DB env missing")
-
-    conn = psycopg2.connect(
-        host=DB_HOST,      # /cloudsql/...
-        dbname=DB_NAME,    # postgres
-        user=DB_USER,      # mm_ai_app
-        password=DB_PASSWORD,
-    )
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT 1;")
-            v = cur.fetchone()[0]
-        return {"ok": True, "db": "ok", "value": v}
-    finally:
-        conn.close()
 
 class IngestRequest(BaseModel):
     file_url: str
 
-@app.post("/db_smoke_write")
-def db_smoke_write(x_ai_internal_secret: Optional[str] = Header(default=None)):
-    if not AI_INTERNAL_SECRET:
-        raise HTTPException(status_code=500, detail="AI_INTERNAL_SECRET missing")
-    if (x_ai_internal_secret or "").strip() != AI_INTERNAL_SECRET:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    if not (DB_HOST and DB_USER and DB_PASSWORD):
-        raise HTTPException(status_code=500, detail="DB env missing")
-
-    conn = psycopg2.connect(
-        host=DB_HOST,
-        dbname=DB_NAME,
-        user=DB_USER,
-        password=DB_PASSWORD,
-    )
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT now();")
-            nowv = cur.fetchone()[0]
-
-            # scrittura minimale (nessun dato “vero”)
-            cur.execute(
-    """
-    INSERT INTO document_pages(company_id, machine_id, bubble_document_id, page_number, text, text_chars)
-    VALUES (%s, %s, %s, %s, %s, %s)
-    ON CONFLICT (company_id, bubble_document_id, page_number) DO NOTHING;
-    """,
-    ("__smoke__", "__smoke__", "__smoke__", 0, "smoke test", 10),
-)
-
-        conn.commit()
-        return {"ok": True, "now": str(nowv)}
-    finally:
-        conn.close()
 
 @app.post("/v1/ai/ingest/document")
 def ingest_document(
@@ -120,7 +55,7 @@ def ingest_document(
             raise HTTPException(status_code=413, detail="PDF too large")
     except HTTPException:
         raise
-    except Exception as e:
+    except Exception:
         raise HTTPException(status_code=502, detail="Fetch failed")
 
     # parse
@@ -147,9 +82,7 @@ def ingest_document(
                 "ok": False,
                 "error": {
                     "code": "NOT_INDEXABLE",
-                    "message": (
-                        f"Documento non indicizzabile: troppo poco testo per {pages_total} pagina/e."
-                    ),
+                    "message": f"Documento non indicizzabile: troppo poco testo per {pages_total} pagina/e.",
                 },
                 "reason": reason,
                 "pages_total": pages_total,
@@ -174,9 +107,7 @@ def ingest_document(
                 "ok": False,
                 "error": {
                     "code": "NOT_INDEXABLE",
-                    "message": (
-                        "Documento non indicizzabile: testo insufficiente o troppo poco distribuito sulle pagine."
-                    ),
+                    "message": "Documento non indicizzabile: testo insufficiente o troppo poco distribuito sulle pagine.",
                 },
                 "reason": reason,
                 "pages_total": pages_total,
@@ -192,23 +123,11 @@ def ingest_document(
                 },
             }
 
-        # NOT_INDEXABLE (V1)
-    if text_chars < MIN_TEXT_CHARS:
-        return {
-            "ok": False,
-            "error": {
-                "code": "NOT_INDEXABLE",
-                "message": f"Documento non indicizzabile: testo troppo corto (< {MIN_TEXT_CHARS} caratteri). Probabile PDF scannerizzato o vuoto.",
-            },
-            "pages_detected": pages_total,
-            "text_chars": text_chars,
-        }
-
-        return {
+    # OK indicizzabile
+    return {
         "ok": True,
         "pages_total": pages_total,
         "pages_with_text": pages_with_text,
         "pages_detected": pages_total,  # compat
         "text_chars": text_chars,
     }
-
