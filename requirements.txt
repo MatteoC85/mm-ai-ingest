@@ -3,3 +3,4 @@ uvicorn[standard]
 requests
 pypdf
 psycopg2-binary==2.9.9
+google-cloud-tasks
