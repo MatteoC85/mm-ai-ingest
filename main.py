@@ -183,7 +183,7 @@ def ingest_document(
     # Enqueue async index job (Cloud Tasks)
     # ===============================
     try:
-        project = os.environ.get("GCP_PROJECT")
+        project = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT")
         location = "europe-west1"
         queue = "mm-ai-index-dev"
         service_url = os.environ.get("K_SERVICE_URL") or os.environ.get("SERVICE_URL")
