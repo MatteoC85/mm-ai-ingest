@@ -5,6 +5,7 @@ from typing import Optional
 import math
 
 import requests
+import psycopg2
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from pypdf import PdfReader
@@ -14,6 +15,10 @@ app = FastAPI()
 AI_INTERNAL_SECRET = (os.environ.get("AI_INTERNAL_SECRET") or "").strip()
 FETCH_TIMEOUT = int(os.environ.get("MM_FETCH_TIMEOUT_SECONDS", "30"))
 MAX_PDF_BYTES = int(os.environ.get("MM_MAX_PDF_BYTES", str(50 * 1024 * 1024)))
+DB_HOST = (os.environ.get("MM_DB_HOST") or "").strip()
+DB_NAME = (os.environ.get("MM_DB_NAME") or "postgres").strip()
+DB_USER = (os.environ.get("MM_DB_USER") or "").strip()
+DB_PASSWORD = (os.environ.get("MM_DB_PASSWORD") or "").strip()
 
 # Indicizzabilità (PRO) — configurabile via env
 MIN_TEXT_CHARS = int(os.environ.get("MM_MIN_TEXT_CHARS", "2000"))
@@ -26,6 +31,31 @@ MIN_PAGES_WITH_TEXT_PCT = float(os.environ.get("MM_MIN_PAGES_WITH_TEXT_PCT", "0.
 @app.get("/ping")
 def ping():
     return {"ok": True}
+
+@app.get("/db_ping")
+def db_ping(x_ai_internal_secret: Optional[str] = Header(default=None)):
+    # proteggiamo con lo stesso secret interno
+    if not AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=500, detail="AI_INTERNAL_SECRET missing")
+    if (x_ai_internal_secret or "").strip() != AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    if not (DB_HOST and DB_USER and DB_PASSWORD):
+        raise HTTPException(status_code=500, detail="DB env missing")
+
+    conn = psycopg2.connect(
+        host=DB_HOST,      # /cloudsql/...
+        dbname=DB_NAME,    # postgres
+        user=DB_USER,      # mm_ai_app
+        password=DB_PASSWORD,
+    )
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1;")
+            v = cur.fetchone()[0]
+        return {"ok": True, "db": "ok", "value": v}
+    finally:
+        conn.close()
 
 class IngestRequest(BaseModel):
     file_url: str
