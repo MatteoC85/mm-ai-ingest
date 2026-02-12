@@ -18,7 +18,6 @@ app = FastAPI()
 AI_INTERNAL_SECRET = (os.environ.get("AI_INTERNAL_SECRET") or "").strip()
 FETCH_TIMEOUT = int(os.environ.get("MM_FETCH_TIMEOUT_SECONDS", "30"))
 MAX_PDF_BYTES = int(os.environ.get("MM_MAX_PDF_BYTES", str(50 * 1024 * 1024)))
-GCP_PROJECT_ID = (os.environ.get("MM_GCP_PROJECT") or os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT") or "").strip()
 
 # DB (Cloud SQL via unix socket /cloudsql/...)
 DB_HOST = (os.environ.get("MM_DB_HOST") or "").strip()
@@ -32,6 +31,13 @@ MIN_TEXT_CHARS_SHORT = int(os.environ.get("MM_MIN_TEXT_CHARS_SHORT", "800"))
 MIN_PAGE_CHARS = int(os.environ.get("MM_MIN_PAGE_CHARS", "30"))
 MIN_PAGES_WITH_TEXT_ABS = int(os.environ.get("MM_MIN_PAGES_WITH_TEXT_ABS", "2"))
 MIN_PAGES_WITH_TEXT_PCT = float(os.environ.get("MM_MIN_PAGES_WITH_TEXT_PCT", "0.20"))
+
+# Chunking (Solution A) — robust defaults (char-based, overlap)
+# Nota: char != token, ma su testo tecnico è una proxy buona e stabile.
+CHUNK_TARGET_CHARS = int(os.environ.get("MM_CHUNK_TARGET_CHARS", "3800"))
+CHUNK_OVERLAP_CHARS = int(os.environ.get("MM_CHUNK_OVERLAP_CHARS", "800"))
+CHUNK_MIN_CHARS = int(os.environ.get("MM_CHUNK_MIN_CHARS", "200"))  # evita chunk microscopici
+PAGE_JOIN_SEPARATOR = "\n\n"  # conserva struttura (utile per tabelle/testo a blocchi)
 
 
 @app.get("/ping")
@@ -67,6 +73,152 @@ def _get_table_columns(cur, table_name: str) -> set[str]:
         (table_name,),
     )
     return {r[0] for r in cur.fetchall()}
+
+
+def _normalize_text_keep_lines(s: str) -> str:
+    """
+    Normalizzazione 'safe' per manuali/tabelle:
+    - normalizza newline
+    - rimuove spazi e TAB ripetuti MA non schiaccia i newline
+    - strip finale
+    """
+    if not s:
+        return ""
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    # riduci TAB a spazio (tabelle estratte spesso hanno tab)
+    s = s.replace("\t", " ")
+    # comprimi spazi multipli, ma preserva newline
+    out = []
+    prev_space = False
+    for ch in s:
+        if ch == " ":
+            if prev_space:
+                continue
+            prev_space = True
+            out.append(" ")
+        else:
+            prev_space = False
+            out.append(ch)
+    return "".join(out).strip()
+
+
+def _build_global_text_and_page_spans(pages: list[tuple[int, str]]) -> tuple[str, list[tuple[int, int, int]]]:
+    """
+    pages: list of (page_number, text)
+    Ritorna:
+    - global_text: concatenazione pagine con separatore
+    - spans: lista di (start_idx, end_idx, page_number) in global_text
+    """
+    parts: list[str] = []
+    spans: list[tuple[int, int, int]] = []
+    pos = 0
+
+    for (page_number, text) in pages:
+        t = _normalize_text_keep_lines(text or "")
+        start = pos
+        parts.append(t)
+        pos += len(t)
+        end = pos  # end is exclusive
+        spans.append((start, end, int(page_number)))
+
+        # aggiungi separatore tra pagine (non dopo l’ultima)
+        parts.append(PAGE_JOIN_SEPARATOR)
+        pos += len(PAGE_JOIN_SEPARATOR)
+
+    if parts:
+        # rimuovi l'ultimo separatore aggiunto
+        global_text = "".join(parts)
+        global_text = global_text[: -len(PAGE_JOIN_SEPARATOR)]
+        # correggi l'ultima span end (perché abbiamo tagliato il separatore finale)
+        last_start, last_end, last_page = spans[-1]
+        # last_end non cambia: il separatore era fuori dalla span (aggiunto dopo)
+        return global_text, spans
+
+    return "", []
+
+
+def _pages_for_slice(spans: list[tuple[int, int, int]], slice_start: int, slice_end: int) -> tuple[int, int]:
+    """
+    Dato un intervallo [slice_start, slice_end) su global_text,
+    ritorna (page_from, page_to) basandosi sulle spans.
+    """
+    page_from = None
+    page_to = None
+
+    for (ps, pe, pn) in spans:
+        # overlap se:
+        # ps < slice_end AND pe > slice_start
+        if ps < slice_end and pe > slice_start:
+            if page_from is None:
+                page_from = pn
+            page_to = pn
+
+    # fallback safety
+    if page_from is None:
+        page_from = spans[0][2] if spans else 1
+    if page_to is None:
+        page_to = page_from
+
+    return int(page_from), int(page_to)
+
+
+def _chunk_text(global_text: str, spans: list[tuple[int, int, int]]) -> list[dict]:
+    """
+    Chunking solution A:
+    - step = target - overlap
+    - chunk_end = min(start + target, len(text))
+    - trim whitespace ai bordi ma NON toccare i newline interni
+    - scarta chunk troppo piccoli (tranne se è l’unico)
+    Ritorna lista di dict:
+      {chunk_index, page_from, page_to, chunk_text}
+    """
+    text_len = len(global_text)
+    if text_len == 0:
+        return []
+
+    target = max(500, CHUNK_TARGET_CHARS)
+    overlap = min(max(0, CHUNK_OVERLAP_CHARS), target - 1) if target > 1 else 0
+    step = max(1, target - overlap)
+
+    chunks: list[dict] = []
+    start = 0
+    chunk_index = 1
+
+    while start < text_len:
+        end = min(start + target, text_len)
+        chunk_raw = global_text[start:end]
+
+        # trim bordi (non tocca i newline interni)
+        chunk_clean = chunk_raw.strip()
+
+        # se l’ultimo chunk viene minuscolo, prova ad attaccarlo al precedente (PRO robustness)
+        if chunks and len(chunk_clean) < CHUNK_MIN_CHARS:
+            # append al chunk precedente mantenendo separatore
+            prev = chunks[-1]
+            prev_text = prev["chunk_text"]
+            glued = (prev_text + "\n" + chunk_clean).strip()
+            prev["chunk_text"] = glued
+            # aggiorna page_to col nuovo slice
+            pf, pt = _pages_for_slice(spans, start, end)
+            prev["page_to"] = max(prev["page_to"], pt)
+            break
+
+        pf, pt = _pages_for_slice(spans, start, end)
+        chunks.append(
+            {
+                "chunk_index": chunk_index,
+                "page_from": pf,
+                "page_to": pt,
+                "chunk_text": chunk_clean,
+            }
+        )
+
+        chunk_index += 1
+        start += step
+
+    # se per qualche motivo restasse vuoto (testo quasi tutto whitespace)
+    chunks = [c for c in chunks if c["chunk_text"]]
+    return chunks
 
 
 @app.post("/v1/ai/ingest/document")
@@ -197,22 +349,17 @@ def ingest_document(
     # Enqueue async index job (Cloud Tasks)
     # ===============================
     try:
-        if not GCP_PROJECT_ID:
-            raise Exception("Missing project id (set MM_GCP_PROJECT on Cloud Run)")
-
+        project = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT") or "machinemind-ai-2a"
         location = "europe-west1"
         queue = "mm-ai-index-dev"
+        service_url = os.environ.get("K_SERVICE_URL") or os.environ.get("SERVICE_URL")
 
-        # usa sempre questa env se disponibile (Cloud Run standard)
-        service_url = (os.environ.get("K_SERVICE") and os.environ.get("K_REVISION"))  # solo per check
-        base_url = (os.environ.get("SERVICE_URL") or os.environ.get("K_SERVICE_URL") or "").strip()
-
-        # FALLBACK: meglio hardcodata che vuota (DEV only)
-        if not base_url:
-            base_url = "https://mm-ai-ingest-fixed-pvgxe6eo5q-ew.a.run.app"
+        if not service_url:
+            # fallback hardcoded (DEV only)
+            service_url = "https://mm-ai-ingest-fixed-pvgxe6eo5q-ew.a.run.app"
 
         client = tasks_v2.CloudTasksClient()
-        parent = client.queue_path(GCP_PROJECT_ID, location, queue)
+        parent = client.queue_path(project, location, queue)
 
         task_payload = {
             "company_id": company_id,
@@ -224,7 +371,7 @@ def ingest_document(
         task = {
             "http_request": {
                 "http_method": tasks_v2.HttpMethod.POST,
-                "url": f"{base_url}/v1/ai/index/document",
+                "url": f"{service_url}/v1/ai/index/document",
                 "headers": {
                     "Content-Type": "application/json",
                     "X-AI-Internal-Secret": AI_INTERNAL_SECRET,
@@ -237,8 +384,8 @@ def ingest_document(
         print("ENQUEUE_OK", resp.name)
 
     except Exception as e:
+        # non blocchiamo ingest se enqueue fallisce
         print("ENQUEUE_FAIL", str(e))
-
 
     return {
         "ok": True,
@@ -261,7 +408,7 @@ def index_document(
     payload: IndexDocumentRequest,
     x_ai_internal_secret: Optional[str] = Header(default=None),
 ):
-    # auth (stessa dell’ingest)
+    # auth
     if not AI_INTERNAL_SECRET:
         raise HTTPException(status_code=500, detail="AI_INTERNAL_SECRET missing")
     if (x_ai_internal_secret or "").strip() != AI_INTERNAL_SECRET:
@@ -275,36 +422,21 @@ def index_document(
     if not (company_id and machine_id and bubble_document_id):
         raise HTTPException(status_code=400, detail="Missing company_id/machine_id/bubble_document_id")
 
-    # DEBUG: stampa dove stai scrivendo (senza password)
-    print("INDEX_START", {
-        "company_id": company_id,
-        "machine_id": machine_id,
-        "bubble_document_id": bubble_document_id,
-        "trace_id": trace_id,
-        "db_host": DB_HOST,
-        "db_name": DB_NAME,
-        "db_user": DB_USER,
-    })
-
     conn = _db_conn()
     try:
         with conn.cursor() as cur:
             # 1) Leggi pagine estratte
             cur.execute(
                 """
-                SELECT page_number, text, text_chars
+                SELECT page_number, text
                 FROM document_pages
                 WHERE company_id=%s AND bubble_document_id=%s
                 ORDER BY page_number;
                 """,
                 (company_id, bubble_document_id),
             )
-            pages = cur.fetchall()
-            print("INDEX_PAGES", {"count": len(pages)})
-
-            if not pages:
-                # IMPORTANTISSIMO: lo vediamo in log
-                print("INDEX_ABORT_NO_PAGES", {"company_id": company_id, "bubble_document_id": bubble_document_id})
+            page_rows = cur.fetchall()
+            if not page_rows:
                 return {
                     "ok": True,
                     "status": "indexed",
@@ -317,7 +449,14 @@ def index_document(
                     "note": "No pages found in document_pages for given ids",
                 }
 
-            # 2) Verifica schema document_chunks
+            # 2) Costruisci testo globale + mappa posizioni->pagine
+            pages = [(int(pn), txt or "") for (pn, txt) in page_rows]
+            global_text, spans = _build_global_text_and_page_spans(pages)
+
+            # 3) Chunking PRO (char-based + overlap)
+            chunks = _chunk_text(global_text, spans)
+
+            # 4) Verifica schema document_chunks (il tuo schema è fisso)
             chunk_cols = _get_table_columns(cur, "document_chunks")
             required = {
                 "company_id",
@@ -330,19 +469,18 @@ def index_document(
             }
             missing = sorted(list(required - set(chunk_cols)))
             if missing:
-                print("INDEX_ABORT_SCHEMA_MISSING", {"missing": missing, "found": sorted(chunk_cols)})
                 raise HTTPException(
                     status_code=500,
                     detail=f"document_chunks missing columns: {missing}. Found: {sorted(chunk_cols)}",
                 )
 
-            # 3) Replace completo (idempotente)
+            # 5) Replace completo (idempotente)
             cur.execute(
                 "DELETE FROM document_chunks WHERE company_id=%s AND bubble_document_id=%s;",
                 (company_id, bubble_document_id),
             )
 
-            # 4) Insert: v1 = 1 chunk per pagina
+            # 6) Insert chunks
             insert_q = """
                 INSERT INTO document_chunks(
                     company_id, machine_id, bubble_document_id,
@@ -352,39 +490,22 @@ def index_document(
                 VALUES (%s, %s, %s, %s, %s, %s, %s);
             """
 
-            chunks_written = 0
-            for (page_number, text, text_chars) in pages:
-                page_number_i = int(page_number or 0)
-                text_s = (text or "").strip()
-
+            for c in chunks:
                 cur.execute(
                     insert_q,
                     (
                         company_id,
                         machine_id,
                         bubble_document_id,
-                        page_number_i,  # chunk_index
-                        page_number_i,  # page_from
-                        page_number_i,  # page_to
-                        text_s,         # chunk_text
+                        int(c["chunk_index"]),
+                        int(c["page_from"]),
+                        int(c["page_to"]),
+                        c["chunk_text"],
                     ),
                 )
-                chunks_written += 1
 
-            conn.commit()
+        conn.commit()
 
-            # DEBUG: conta righe appena inserite
-            cur.execute(
-                "SELECT count(*) FROM document_chunks WHERE company_id=%s AND bubble_document_id=%s;",
-                (company_id, bubble_document_id),
-            )
-            inserted_count = int(cur.fetchone()[0])
-            print("INDEX_DONE", {"chunks_written": chunks_written, "inserted_count": inserted_count})
-
-    except Exception as e:
-        # IMPORTANTISSIMO: se qualcosa va storto, lo vediamo
-        print("INDEX_ERROR", str(e))
-        raise
     finally:
         conn.close()
 
@@ -395,6 +516,8 @@ def index_document(
         "machine_id": machine_id,
         "bubble_document_id": bubble_document_id,
         "trace_id": trace_id,
-        "chunks_written": chunks_written,
+        "chunks_written": len(chunks),
         "pages_detected": len(pages),
+        "chunk_target_chars": CHUNK_TARGET_CHARS,
+        "chunk_overlap_chars": CHUNK_OVERLAP_CHARS,
     }
