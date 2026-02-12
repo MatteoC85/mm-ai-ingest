@@ -603,7 +603,7 @@ def search_chunks(
                 bubble_document_id = payload.bubble_document_id.strip()
                 cur.execute(
                     """
-                    SELECT chunk_index, page_from, page_to, left(chunk_text, 400) AS preview,
+                    SELECT bubble_document_id, chunk_index, page_from, page_to, left(chunk_text, 400) AS preview,
                            1 - (embedding <=> %s::vector) AS similarity
                     FROM public.document_chunks
                     WHERE company_id = %s
@@ -617,9 +617,12 @@ def search_chunks(
                 rows = cur.fetchall()
 
                 results = []
-                for (chunk_index, page_from, page_to, preview, similarity) in rows:
+                for (bdid, chunk_index, page_from, page_to, preview, similarity) in rows:
+                    citation_id = f"{bdid}:p{int(page_from)}-{int(page_to)}:c{int(chunk_index)}"
                     results.append(
                         {
+                            "citation_id": citation_id,
+                            "bubble_document_id": bdid,
                             "chunk_index": int(chunk_index),
                             "page_from": int(page_from),
                             "page_to": int(page_to),
@@ -647,8 +650,10 @@ def search_chunks(
 
                 results = []
                 for (bubble_document_id, chunk_index, page_from, page_to, preview, similarity) in rows:
+                    citation_id = f"{bubble_document_id}:p{int(page_from)}-{int(page_to)}:c{int(chunk_index)}"
                     results.append(
                         {
+                            "citation_id": citation_id,
                             "bubble_document_id": bubble_document_id,
                             "chunk_index": int(chunk_index),
                             "page_from": int(page_from),
