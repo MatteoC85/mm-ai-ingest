@@ -18,6 +18,7 @@ app = FastAPI()
 AI_INTERNAL_SECRET = (os.environ.get("AI_INTERNAL_SECRET") or "").strip()
 FETCH_TIMEOUT = int(os.environ.get("MM_FETCH_TIMEOUT_SECONDS", "30"))
 MAX_PDF_BYTES = int(os.environ.get("MM_MAX_PDF_BYTES", str(50 * 1024 * 1024)))
+GCP_PROJECT_ID = (os.environ.get("MM_GCP_PROJECT") or os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT") or "").strip()
 
 # DB (Cloud SQL via unix socket /cloudsql/...)
 DB_HOST = (os.environ.get("MM_DB_HOST") or "").strip()
@@ -196,17 +197,22 @@ def ingest_document(
     # Enqueue async index job (Cloud Tasks)
     # ===============================
     try:
-        project = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT")
+        if not GCP_PROJECT_ID:
+            raise Exception("Missing project id (set MM_GCP_PROJECT on Cloud Run)")
+
         location = "europe-west1"
         queue = "mm-ai-index-dev"
-        service_url = os.environ.get("K_SERVICE_URL") or os.environ.get("SERVICE_URL")
 
-        if not service_url:
-            # fallback hardcoded (DEV only)
-            service_url = "https://mm-ai-ingest-fixed-pvgxe6eo5q-ew.a.run.app"
+        # usa sempre questa env se disponibile (Cloud Run standard)
+        service_url = (os.environ.get("K_SERVICE") and os.environ.get("K_REVISION"))  # solo per check
+        base_url = (os.environ.get("SERVICE_URL") or os.environ.get("K_SERVICE_URL") or "").strip()
+
+        # FALLBACK: meglio hardcodata che vuota (DEV only)
+        if not base_url:
+            base_url = "https://mm-ai-ingest-fixed-pvgxe6eo5q-ew.a.run.app"
 
         client = tasks_v2.CloudTasksClient()
-        parent = client.queue_path(project, location, queue)
+        parent = client.queue_path(GCP_PROJECT_ID, location, queue)
 
         task_payload = {
             "company_id": company_id,
@@ -218,7 +224,7 @@ def ingest_document(
         task = {
             "http_request": {
                 "http_method": tasks_v2.HttpMethod.POST,
-                "url": f"{service_url}/v1/ai/index/document",
+                "url": f"{base_url}/v1/ai/index/document",
                 "headers": {
                     "Content-Type": "application/json",
                     "X-AI-Internal-Secret": AI_INTERNAL_SECRET,
@@ -227,11 +233,12 @@ def ingest_document(
             }
         }
 
-        client.create_task(request={"parent": parent, "task": task})
+        resp = client.create_task(request={"parent": parent, "task": task})
+        print("ENQUEUE_OK", resp.name)
 
     except Exception as e:
-        # non blocchiamo ingest se enqueue fallisce
-        print("Cloud Tasks enqueue failed:", str(e))
+        print("ENQUEUE_FAIL", str(e))
+
 
     return {
         "ok": True,
