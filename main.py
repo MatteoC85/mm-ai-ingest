@@ -56,9 +56,6 @@ def _db_conn():
     )
 
 
-# -------------------------------
-# Helpers: schema-adaptive chunks
-# -------------------------------
 def _get_table_columns(cur, table_name: str) -> set[str]:
     cur.execute(
         """
@@ -69,13 +66,6 @@ def _get_table_columns(cur, table_name: str) -> set[str]:
         (table_name,),
     )
     return {r[0] for r in cur.fetchall()}
-
-
-def _pick_column(colset: set[str], candidates: list[str]) -> Optional[str]:
-    for c in candidates:
-        if c in colset:
-            return c
-    return None
 
 
 @app.post("/v1/ai/ingest/document")
@@ -299,97 +289,58 @@ def index_document(
                     detail="No document_pages found for company_id + bubble_document_id",
                 )
 
-            # 2) Scopri lo schema reale di document_chunks (mappa nomi colonna)
+            # 2) Verifica schema document_chunks (il tuo schema è fisso)
             chunk_cols = _get_table_columns(cur, "document_chunks")
-
-            company_col = "company_id" if "company_id" in chunk_cols else None
-            machine_col = "machine_id" if "machine_id" in chunk_cols else None
-            doc_col = _pick_column(chunk_cols, ["bubble_document_id", "document_id", "doc_id"])
-            page_col = _pick_column(chunk_cols, ["page_number", "page"])
-            chunk_col = _pick_column(chunk_cols, ["chunk_number", "chunk_index", "chunk_no"])
-            text_col = _pick_column(chunk_cols, ["text", "chunk_text", "content"])
-            chars_col = _pick_column(chunk_cols, ["text_chars", "chunk_chars", "chars"])
-            embedding_col = _pick_column(chunk_cols, ["embedding", "vector"])
-
-            missing = []
-            if not company_col:
-                missing.append("company_id")
-            if not doc_col:
-                missing.append("bubble_document_id/document_id/doc_id")
-            if not text_col:
-                missing.append("text/chunk_text/content")
-
+            required = {
+                "company_id",
+                "machine_id",
+                "bubble_document_id",
+                "chunk_index",
+                "page_from",
+                "page_to",
+                "chunk_text",
+            }
+            missing = sorted(list(required - set(chunk_cols)))
             if missing:
                 raise HTTPException(
                     status_code=500,
-                    detail=(
-                        f"document_chunks schema missing required columns: {missing}. "
-                        f"Found columns: {sorted(chunk_cols)}"
-                    ),
+                    detail=f"document_chunks missing columns: {missing}. Found: {sorted(chunk_cols)}",
                 )
 
-            # 3) Replace completo (idempotente per retry Cloud Tasks)
-            delete_q = sql.SQL(
-                "DELETE FROM document_chunks WHERE {company_col}=%s AND {doc_col}=%s;"
-            ).format(
-                company_col=sql.Identifier(company_col),
-                doc_col=sql.Identifier(doc_col),
+            # 3) Replace completo (idempotente)
+            cur.execute(
+                "DELETE FROM document_chunks WHERE company_id=%s AND bubble_document_id=%s;",
+                (company_id, bubble_document_id),
             )
-            cur.execute(delete_q, (company_id, bubble_document_id))
 
-            # 4) Insert dinamico (solo colonne esistenti)
-            insert_columns: list[str] = []
-            insert_columns.append(company_col)
-            if machine_col:
-                insert_columns.append(machine_col)
-            insert_columns.append(doc_col)
-
-            # v1: 1 chunk = 1 pagina
-            if chunk_col:
-                insert_columns.append(chunk_col)
-            if page_col:
-                insert_columns.append(page_col)
-
-            insert_columns.append(text_col)
-            if chars_col:
-                insert_columns.append(chars_col)
-            if embedding_col:
-                insert_columns.append(embedding_col)
-
-            insert_q = sql.SQL("INSERT INTO document_chunks ({cols}) VALUES ({vals});").format(
-                cols=sql.SQL(", ").join([sql.Identifier(c) for c in insert_columns]),
-                vals=sql.SQL(", ").join([sql.Placeholder() for _ in insert_columns]),
-            )
+            # 4) Insert: v1 = 1 chunk per pagina
+            insert_q = """
+                INSERT INTO document_chunks(
+                    company_id, machine_id, bubble_document_id,
+                    chunk_index, page_from, page_to,
+                    chunk_text
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s);
+            """
 
             chunks_written = 0
-            total_chars = 0
-
             for (page_number, text, text_chars) in pages:
                 page_number_i = int(page_number or 0)
-                text_s = text or ""
-                chars_i = int(text_chars or len(text_s))
+                text_s = (text or "").strip()
 
-                values: list[object] = []
-                values.append(company_id)
-                if machine_col:
-                    values.append(machine_id)
-                values.append(bubble_document_id)
-
-                if chunk_col:
-                    values.append(page_number_i)  # chunk == page number (v1)
-                if page_col:
-                    values.append(page_number_i)
-
-                values.append(text_s)
-                if chars_col:
-                    values.append(chars_i)
-                if embedding_col:
-                    values.append(None)  # embeddings non implementati ancora
-
-                cur.execute(insert_q, values)
-
+                cur.execute(
+                    insert_q,
+                    (
+                        company_id,
+                        machine_id,
+                        bubble_document_id,
+                        page_number_i,  # chunk_index
+                        page_number_i,  # page_from
+                        page_number_i,  # page_to
+                        text_s,         # chunk_text
+                    ),
+                )
                 chunks_written += 1
-                total_chars += chars_i
 
         conn.commit()
 
@@ -404,6 +355,5 @@ def index_document(
         "bubble_document_id": bubble_document_id,
         "trace_id": trace_id,
         "chunks_written": chunks_written,
-        "text_chars": total_chars,
         "pages_detected": len(pages),
     }
