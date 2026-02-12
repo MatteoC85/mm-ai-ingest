@@ -1,5 +1,6 @@
 import os
 import io
+import re
 import math
 from typing import Optional, List
 
@@ -853,7 +854,22 @@ def ask_v1(
                 {"role": "user", "content": user_msg},
             ]
         ).strip()
+
+        # Normalizza eventuale prefisso DOC:
         answer = answer.replace("[DOC:", "[").replace("[doc:", "[")
+
+        # Espandi citazioni abbreviate del tipo:
+        # [DOCID:p1-2:c1; p2-2:c2]  ->  [DOCID:p1-2:c1] [DOCID:p2-2:c2]
+        m = re.search(r"\[([^\]:]+):([^\]]+);([^\]]+)\]", answer)
+        if m:
+            docid = m.group(1).strip()
+            first = m.group(2).strip()
+            rest = m.group(3).strip()
+
+            parts = [p.strip() for p in rest.split(";") if p.strip()]
+            expanded = [f"[{docid}:{first}]"] + [f"[{docid}:{p}]" for p in parts]
+
+            answer = re.sub(r"\[[^\]]+\]", " ".join(expanded), answer, count=1)
 
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"LLM failed: {str(e)}")
@@ -877,7 +893,7 @@ def ask_v1(
         "ok": True,
         "status": "answered",
         "answer": answer,
-        "citations": citations,   # per ora: tutte le fonti passate (MVP). Refinement dopo.
+        "citations": citations,  # per ora: tutte le fonti passate (MVP). Refinement dopo.
         "top_k": top_k,
         "similarity_max": sim_max,
         "chat_model": OPENAI_CHAT_MODEL,
