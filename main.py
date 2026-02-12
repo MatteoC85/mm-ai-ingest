@@ -39,6 +39,10 @@ CHUNK_OVERLAP_CHARS = int(os.environ.get("MM_CHUNK_OVERLAP_CHARS", "800"))
 CHUNK_MIN_CHARS = int(os.environ.get("MM_CHUNK_MIN_CHARS", "200"))  # evita chunk microscopici
 PAGE_JOIN_SEPARATOR = "\n\n"  # conserva struttura (utile per tabelle/testo a blocchi)
 
+# OpenAI
+OPENAI_API_KEY = (os.environ.get("OPENAI_API_KEY") or "").strip()
+OPENAI_EMBED_MODEL = (os.environ.get("OPENAI_EMBED_MODEL") or "text-embedding-3-small").strip()
+OPENAI_EMBED_URL = (os.environ.get("OPENAI_EMBED_URL") or "https://api.openai.com/v1/embeddings").strip()
 
 @app.get("/ping")
 def ping():
@@ -219,6 +223,34 @@ def _chunk_text(global_text: str, spans: list[tuple[int, int, int]]) -> list[dic
     # se per qualche motivo restasse vuoto (testo quasi tutto whitespace)
     chunks = [c for c in chunks if c["chunk_text"]]
     return chunks
+
+def _openai_embed_texts(texts: list[str]) -> list[list[float]]:
+    if not OPENAI_API_KEY:
+        raise Exception("OPENAI_API_KEY missing")
+
+    # Privacy: inviamo SOLO i testi, niente metadati.
+    payload = {
+        "model": OPENAI_EMBED_MODEL,
+        "input": texts,
+    }
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    r = requests.post(OPENAI_EMBED_URL, headers=headers, json=payload, timeout=60)
+    if r.status_code != 200:
+        raise Exception(f"OpenAI embeddings failed: {r.status_code} {r.text}")
+
+    data = r.json()
+    # data["data"] = [{embedding: [...], index: i, ...}, ...]
+    out = [None] * len(texts)
+    for item in data.get("data", []):
+        out[int(item["index"])] = item["embedding"]
+    if any(v is None for v in out):
+        raise Exception("OpenAI embeddings response missing some items")
+    return out
 
 
 @app.post("/v1/ai/ingest/document")
@@ -503,6 +535,51 @@ def index_document(
                         c["chunk_text"],
                     ),
                 )
+
+            # 7) Embeddings (batch) + update su DB
+            # Batch piccolo per DEV robusto
+            BATCH_SIZE = 32
+
+            # Prepara i testi (privacy: solo chunk_text)
+            chunk_texts = [c["chunk_text"] for c in chunks]
+
+            for batch_start in range(0, len(chunks), BATCH_SIZE):
+                batch_texts = chunk_texts[batch_start: batch_start + BATCH_SIZE]
+
+                try:
+                    vectors = _openai_embed_texts(batch_texts)
+                except Exception as e:
+                    # segna errore su tutti i chunk del batch
+                    for j in range(len(batch_texts)):
+                        idx = batch_start + j
+                        cur.execute(
+                            """
+                            UPDATE document_chunks
+                            SET embedding_error=%s, embedding_model=%s, embedded_at=NOW()
+                            WHERE company_id=%s AND bubble_document_id=%s AND chunk_index=%s;
+                            """,
+                            (str(e), OPENAI_EMBED_MODEL, company_id, bubble_document_id, int(chunks[idx]["chunk_index"])),
+                        )
+                    continue
+
+                for j, vec in enumerate(vectors):
+                    idx = batch_start + j
+                    chunk_idx = int(chunks[idx]["chunk_index"])
+
+                    # pgvector: passiamo stringa "[...]" e castiamo a vector
+                    vec_literal = "[" + ",".join(f"{x:.8f}" for x in vec) + "]"
+
+                    cur.execute(
+                        """
+                        UPDATE document_chunks
+                        SET embedding = %s::vector,
+                            embedding_model = %s,
+                            embedded_at = NOW(),
+                            embedding_error = NULL
+                        WHERE company_id=%s AND bubble_document_id=%s AND chunk_index=%s;
+                        """,
+                        (vec_literal, OPENAI_EMBED_MODEL, company_id, bubble_document_id, chunk_idx),
+                    )
 
         conn.commit()
 
