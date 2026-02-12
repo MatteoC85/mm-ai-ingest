@@ -44,6 +44,7 @@ OPENAI_API_KEY = (os.environ.get("OPENAI_API_KEY") or "").strip()
 OPENAI_EMBED_MODEL = (os.environ.get("OPENAI_EMBED_MODEL") or "text-embedding-3-small").strip()
 OPENAI_EMBED_URL = (os.environ.get("OPENAI_EMBED_URL") or "https://api.openai.com/v1/embeddings").strip()
 
+
 @app.get("/ping")
 def ping():
     return {"ok": True}
@@ -133,9 +134,6 @@ def _build_global_text_and_page_spans(pages: list[tuple[int, str]]) -> tuple[str
         # rimuovi l'ultimo separatore aggiunto
         global_text = "".join(parts)
         global_text = global_text[: -len(PAGE_JOIN_SEPARATOR)]
-        # correggi l'ultima span end (perché abbiamo tagliato il separatore finale)
-        last_start, last_end, last_page = spans[-1]
-        # last_end non cambia: il separatore era fuori dalla span (aggiunto dopo)
         return global_text, spans
 
     return "", []
@@ -150,14 +148,11 @@ def _pages_for_slice(spans: list[tuple[int, int, int]], slice_start: int, slice_
     page_to = None
 
     for (ps, pe, pn) in spans:
-        # overlap se:
-        # ps < slice_end AND pe > slice_start
         if ps < slice_end and pe > slice_start:
             if page_from is None:
                 page_from = pn
             page_to = pn
 
-    # fallback safety
     if page_from is None:
         page_from = spans[0][2] if spans else 1
     if page_to is None:
@@ -191,18 +186,12 @@ def _chunk_text(global_text: str, spans: list[tuple[int, int, int]]) -> list[dic
     while start < text_len:
         end = min(start + target, text_len)
         chunk_raw = global_text[start:end]
-
-        # trim bordi (non tocca i newline interni)
         chunk_clean = chunk_raw.strip()
 
-        # se l’ultimo chunk viene minuscolo, prova ad attaccarlo al precedente (PRO robustness)
         if chunks and len(chunk_clean) < CHUNK_MIN_CHARS:
-            # append al chunk precedente mantenendo separatore
             prev = chunks[-1]
-            prev_text = prev["chunk_text"]
-            glued = (prev_text + "\n" + chunk_clean).strip()
+            glued = (prev["chunk_text"] + "\n" + chunk_clean).strip()
             prev["chunk_text"] = glued
-            # aggiorna page_to col nuovo slice
             pf, pt = _pages_for_slice(spans, start, end)
             prev["page_to"] = max(prev["page_to"], pt)
             break
@@ -220,15 +209,14 @@ def _chunk_text(global_text: str, spans: list[tuple[int, int, int]]) -> list[dic
         chunk_index += 1
         start += step
 
-    # se per qualche motivo restasse vuoto (testo quasi tutto whitespace)
     chunks = [c for c in chunks if c["chunk_text"]]
     return chunks
+
 
 def _openai_embed_texts(texts: list[str]) -> list[list[float]]:
     if not OPENAI_API_KEY:
         raise Exception("OPENAI_API_KEY missing")
 
-    # Privacy: inviamo SOLO i testi, niente metadati.
     payload = {
         "model": OPENAI_EMBED_MODEL,
         "input": texts,
@@ -244,13 +232,29 @@ def _openai_embed_texts(texts: list[str]) -> list[list[float]]:
         raise Exception(f"OpenAI embeddings failed: {r.status_code} {r.text}")
 
     data = r.json()
-    # data["data"] = [{embedding: [...], index: i, ...}, ...]
     out = [None] * len(texts)
     for item in data.get("data", []):
         out[int(item["index"])] = item["embedding"]
     if any(v is None for v in out):
         raise Exception("OpenAI embeddings response missing some items")
     return out
+
+
+# =========================
+# (MODIFICA 1/3) SearchRequest
+# =========================
+class SearchRequest(BaseModel):
+    query: str
+    company_id: str
+    bubble_document_id: Optional[str] = None
+    top_k: int = 5
+
+
+# =========================
+# (MODIFICA 2/3) vector literal helper
+# =========================
+def _vector_literal(vec: list[float]) -> str:
+    return "[" + ",".join(f"{x:.8f}" for x in vec) + "]"
 
 
 @app.post("/v1/ai/ingest/document")
@@ -264,7 +268,6 @@ def ingest_document(
     if (x_ai_internal_secret or "").strip() != AI_INTERNAL_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    # metadati necessari per salvare pages
     company_id = (payload.company_id or "").strip()
     machine_id = (payload.machine_id or "").strip()
     bubble_document_id = (payload.bubble_document_id or "").strip()
@@ -305,7 +308,7 @@ def ingest_document(
     except Exception:
         raise HTTPException(status_code=422, detail="PDF parse failed")
 
-    # Indicizzabilità PRO (se non indicizzabile, NON salviamo niente su DB)
+    # Indicizzabilità PRO
     if pages_total <= 2:
         if pages_with_text < 1 or text_chars < MIN_TEXT_CHARS_SHORT:
             reason = "LOW_TEXT_COVERAGE" if pages_with_text < 1 else "LOW_TEXT_CHARS"
@@ -318,13 +321,8 @@ def ingest_document(
                 "reason": reason,
                 "pages_total": pages_total,
                 "pages_with_text": pages_with_text,
-                "pages_detected": pages_total,  # compat
+                "pages_detected": pages_total,
                 "text_chars": text_chars,
-                "thresholds": {
-                    "min_text_chars_short": MIN_TEXT_CHARS_SHORT,
-                    "min_page_chars": MIN_PAGE_CHARS,
-                    "min_pages_with_text_abs": 1,
-                },
             }
     else:
         min_pages_required = max(
@@ -342,28 +340,18 @@ def ingest_document(
                 "reason": reason,
                 "pages_total": pages_total,
                 "pages_with_text": pages_with_text,
-                "pages_detected": pages_total,  # compat
+                "pages_detected": pages_total,
                 "text_chars": text_chars,
-                "thresholds": {
-                    "min_text_chars": MIN_TEXT_CHARS,
-                    "min_page_chars": MIN_PAGE_CHARS,
-                    "min_pages_with_text_abs": MIN_PAGES_WITH_TEXT_ABS,
-                    "min_pages_with_text_pct": MIN_PAGES_WITH_TEXT_PCT,
-                    "min_pages_required": min_pages_required,
-                },
             }
 
-    # ✅ Indicizzabile -> salva document_pages (replace completo)
+    # salva document_pages
     conn = _db_conn()
     try:
         with conn.cursor() as cur:
-            # pulizia eventuale re-ingest
             cur.execute(
                 "DELETE FROM document_pages WHERE company_id=%s AND bubble_document_id=%s;",
                 (company_id, bubble_document_id),
             )
-
-            # insert pagine (page_number 1-based)
             for i, t in enumerate(pages_text, start=1):
                 cur.execute(
                     """
@@ -372,22 +360,17 @@ def ingest_document(
                     """,
                     (company_id, machine_id, bubble_document_id, i, t, len(t)),
                 )
-
         conn.commit()
     finally:
         conn.close()
 
-    # ===============================
-    # Enqueue async index job (Cloud Tasks)
-    # ===============================
+    # enqueue Cloud Tasks
     try:
         project = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT") or "machinemind-ai-2a"
         location = "europe-west1"
         queue = "mm-ai-index-dev"
         service_url = os.environ.get("K_SERVICE_URL") or os.environ.get("SERVICE_URL")
-
         if not service_url:
-            # fallback hardcoded (DEV only)
             service_url = "https://mm-ai-ingest-fixed-pvgxe6eo5q-ew.a.run.app"
 
         client = tasks_v2.CloudTasksClient()
@@ -416,14 +399,13 @@ def ingest_document(
         print("ENQUEUE_OK", resp.name)
 
     except Exception as e:
-        # non blocchiamo ingest se enqueue fallisce
         print("ENQUEUE_FAIL", str(e))
 
     return {
         "ok": True,
         "pages_total": pages_total,
         "pages_with_text": pages_with_text,
-        "pages_detected": pages_total,  # compat
+        "pages_detected": pages_total,
         "text_chars": text_chars,
     }
 
@@ -440,7 +422,6 @@ def index_document(
     payload: IndexDocumentRequest,
     x_ai_internal_secret: Optional[str] = Header(default=None),
 ):
-    # auth
     if not AI_INTERNAL_SECRET:
         raise HTTPException(status_code=500, detail="AI_INTERNAL_SECRET missing")
     if (x_ai_internal_secret or "").strip() != AI_INTERNAL_SECRET:
@@ -457,7 +438,6 @@ def index_document(
     conn = _db_conn()
     try:
         with conn.cursor() as cur:
-            # 1) Leggi pagine estratte
             cur.execute(
                 """
                 SELECT page_number, text
@@ -481,14 +461,10 @@ def index_document(
                     "note": "No pages found in document_pages for given ids",
                 }
 
-            # 2) Costruisci testo globale + mappa posizioni->pagine
             pages = [(int(pn), txt or "") for (pn, txt) in page_rows]
             global_text, spans = _build_global_text_and_page_spans(pages)
-
-            # 3) Chunking PRO (char-based + overlap)
             chunks = _chunk_text(global_text, spans)
 
-            # 4) Verifica schema document_chunks (il tuo schema è fisso)
             chunk_cols = _get_table_columns(cur, "document_chunks")
             required = {
                 "company_id",
@@ -506,13 +482,11 @@ def index_document(
                     detail=f"document_chunks missing columns: {missing}. Found: {sorted(chunk_cols)}",
                 )
 
-            # 5) Replace completo (idempotente)
             cur.execute(
                 "DELETE FROM document_chunks WHERE company_id=%s AND bubble_document_id=%s;",
                 (company_id, bubble_document_id),
             )
 
-            # 6) Insert chunks
             insert_q = """
                 INSERT INTO document_chunks(
                     company_id, machine_id, bubble_document_id,
@@ -536,11 +510,8 @@ def index_document(
                     ),
                 )
 
-            # 7) Embeddings (batch) + update su DB
-            # Batch piccolo per DEV robusto
+            # Embeddings (batch)
             BATCH_SIZE = 32
-
-            # Prepara i testi (privacy: solo chunk_text)
             chunk_texts = [c["chunk_text"] for c in chunks]
 
             for batch_start in range(0, len(chunks), BATCH_SIZE):
@@ -549,7 +520,6 @@ def index_document(
                 try:
                     vectors = _openai_embed_texts(batch_texts)
                 except Exception as e:
-                    # segna errore su tutti i chunk del batch
                     for j in range(len(batch_texts)):
                         idx = batch_start + j
                         cur.execute(
@@ -565,9 +535,7 @@ def index_document(
                 for j, vec in enumerate(vectors):
                     idx = batch_start + j
                     chunk_idx = int(chunks[idx]["chunk_index"])
-
-                    # pgvector: passiamo stringa "[...]" e castiamo a vector
-                    vec_literal = "[" + ",".join(f"{x:.8f}" for x in vec) + "]"
+                    vec_literal = _vector_literal(vec)
 
                     cur.execute(
                         """
@@ -582,7 +550,6 @@ def index_document(
                     )
 
         conn.commit()
-
     finally:
         conn.close()
 
@@ -598,3 +565,100 @@ def index_document(
         "chunk_target_chars": CHUNK_TARGET_CHARS,
         "chunk_overlap_chars": CHUNK_OVERLAP_CHARS,
     }
+
+
+# =========================
+# (MODIFICA 3/3) endpoint retrieval vettoriale
+# =========================
+@app.post("/v1/ai/search")
+def search_chunks(
+    payload: SearchRequest,
+    x_ai_internal_secret: Optional[str] = Header(default=None),
+):
+    # auth
+    if not AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=500, detail="AI_INTERNAL_SECRET missing")
+    if (x_ai_internal_secret or "").strip() != AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    q = (payload.query or "").strip()
+    if not q:
+        raise HTTPException(status_code=400, detail="Missing query")
+
+    company_id = (payload.company_id or "").strip()
+    if not company_id:
+        raise HTTPException(status_code=400, detail="Missing company_id")
+
+    top_k = int(payload.top_k or 5)
+    top_k = max(1, min(top_k, 20))
+
+    # 1) embed query (privacy: inviamo solo testo query)
+    q_vec = _openai_embed_texts([q])[0]
+    q_vec_lit = _vector_literal(q_vec)
+
+    conn = _db_conn()
+    try:
+        with conn.cursor() as cur:
+            if payload.bubble_document_id:
+                bubble_document_id = payload.bubble_document_id.strip()
+                cur.execute(
+                    """
+                    SELECT chunk_index, page_from, page_to, left(chunk_text, 400) AS preview,
+                           1 - (embedding <=> %s::vector) AS similarity
+                    FROM public.document_chunks
+                    WHERE company_id = %s
+                      AND bubble_document_id = %s
+                      AND embedding IS NOT NULL
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s;
+                    """,
+                    (q_vec_lit, company_id, bubble_document_id, q_vec_lit, top_k),
+                )
+                rows = cur.fetchall()
+
+                results = []
+                for (chunk_index, page_from, page_to, preview, similarity) in rows:
+                    results.append(
+                        {
+                            "chunk_index": int(chunk_index),
+                            "page_from": int(page_from),
+                            "page_to": int(page_to),
+                            "similarity": float(similarity),
+                            "preview": preview,
+                        }
+                    )
+
+                return {"ok": True, "top_k": top_k, "results": results}
+
+            else:
+                cur.execute(
+                    """
+                    SELECT bubble_document_id, chunk_index, page_from, page_to, left(chunk_text, 400) AS preview,
+                           1 - (embedding <=> %s::vector) AS similarity
+                    FROM public.document_chunks
+                    WHERE company_id = %s
+                      AND embedding IS NOT NULL
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s;
+                    """,
+                    (q_vec_lit, company_id, q_vec_lit, top_k),
+                )
+                rows = cur.fetchall()
+
+                results = []
+                for (bubble_document_id, chunk_index, page_from, page_to, preview, similarity) in rows:
+                    results.append(
+                        {
+                            "bubble_document_id": bubble_document_id,
+                            "chunk_index": int(chunk_index),
+                            "page_from": int(page_from),
+                            "page_to": int(page_to),
+                            "similarity": float(similarity),
+                            "preview": preview,
+                        }
+                    )
+
+                return {"ok": True, "top_k": top_k, "results": results}
+
+    finally:
+        conn.close()
