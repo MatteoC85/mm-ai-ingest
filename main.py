@@ -8,6 +8,7 @@ import psycopg2
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from pypdf import PdfReader
+from psycopg2 import sql
 
 from google.cloud import tasks_v2
 import json
@@ -53,6 +54,28 @@ def _db_conn():
         user=DB_USER,      # mm_ai_app
         password=DB_PASSWORD,
     )
+
+
+# -------------------------------
+# Helpers: schema-adaptive chunks
+# -------------------------------
+def _get_table_columns(cur, table_name: str) -> set[str]:
+    cur.execute(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema='public' AND table_name=%s;
+        """,
+        (table_name,),
+    )
+    return {r[0] for r in cur.fetchall()}
+
+
+def _pick_column(colset: set[str], candidates: list[str]) -> Optional[str]:
+    for c in candidates:
+        if c in colset:
+            return c
+    return None
 
 
 @app.post("/v1/ai/ingest/document")
@@ -228,6 +251,7 @@ def ingest_document(
         "text_chars": text_chars,
     }
 
+
 class IndexDocumentRequest(BaseModel):
     company_id: str
     machine_id: str
@@ -246,19 +270,140 @@ def index_document(
     if (x_ai_internal_secret or "").strip() != AI_INTERNAL_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    # stub: per ora non fa chunk/embedding
     company_id = (payload.company_id or "").strip()
     machine_id = (payload.machine_id or "").strip()
     bubble_document_id = (payload.bubble_document_id or "").strip()
+    trace_id = (payload.trace_id or "").strip() or None
 
     if not (company_id and machine_id and bubble_document_id):
         raise HTTPException(status_code=400, detail="Missing company_id/machine_id/bubble_document_id")
 
+    conn = _db_conn()
+    try:
+        with conn.cursor() as cur:
+            # 1) Leggi pagine estratte
+            cur.execute(
+                """
+                SELECT page_number, text, text_chars
+                FROM document_pages
+                WHERE company_id=%s AND bubble_document_id=%s
+                ORDER BY page_number;
+                """,
+                (company_id, bubble_document_id),
+            )
+            pages = cur.fetchall()
+
+            if not pages:
+                raise HTTPException(
+                    status_code=404,
+                    detail="No document_pages found for company_id + bubble_document_id",
+                )
+
+            # 2) Scopri lo schema reale di document_chunks (mappa nomi colonna)
+            chunk_cols = _get_table_columns(cur, "document_chunks")
+
+            company_col = "company_id" if "company_id" in chunk_cols else None
+            machine_col = "machine_id" if "machine_id" in chunk_cols else None
+            doc_col = _pick_column(chunk_cols, ["bubble_document_id", "document_id", "doc_id"])
+            page_col = _pick_column(chunk_cols, ["page_number", "page"])
+            chunk_col = _pick_column(chunk_cols, ["chunk_number", "chunk_index", "chunk_no"])
+            text_col = _pick_column(chunk_cols, ["text", "chunk_text", "content"])
+            chars_col = _pick_column(chunk_cols, ["text_chars", "chunk_chars", "chars"])
+            embedding_col = _pick_column(chunk_cols, ["embedding", "vector"])
+
+            missing = []
+            if not company_col:
+                missing.append("company_id")
+            if not doc_col:
+                missing.append("bubble_document_id/document_id/doc_id")
+            if not text_col:
+                missing.append("text/chunk_text/content")
+
+            if missing:
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        f"document_chunks schema missing required columns: {missing}. "
+                        f"Found columns: {sorted(chunk_cols)}"
+                    ),
+                )
+
+            # 3) Replace completo (idempotente per retry Cloud Tasks)
+            delete_q = sql.SQL(
+                "DELETE FROM document_chunks WHERE {company_col}=%s AND {doc_col}=%s;"
+            ).format(
+                company_col=sql.Identifier(company_col),
+                doc_col=sql.Identifier(doc_col),
+            )
+            cur.execute(delete_q, (company_id, bubble_document_id))
+
+            # 4) Insert dinamico (solo colonne esistenti)
+            insert_columns: list[str] = []
+            insert_columns.append(company_col)
+            if machine_col:
+                insert_columns.append(machine_col)
+            insert_columns.append(doc_col)
+
+            # v1: 1 chunk = 1 pagina
+            if chunk_col:
+                insert_columns.append(chunk_col)
+            if page_col:
+                insert_columns.append(page_col)
+
+            insert_columns.append(text_col)
+            if chars_col:
+                insert_columns.append(chars_col)
+            if embedding_col:
+                insert_columns.append(embedding_col)
+
+            insert_q = sql.SQL("INSERT INTO document_chunks ({cols}) VALUES ({vals});").format(
+                cols=sql.SQL(", ").join([sql.Identifier(c) for c in insert_columns]),
+                vals=sql.SQL(", ").join([sql.Placeholder() for _ in insert_columns]),
+            )
+
+            chunks_written = 0
+            total_chars = 0
+
+            for (page_number, text, text_chars) in pages:
+                page_number_i = int(page_number or 0)
+                text_s = text or ""
+                chars_i = int(text_chars or len(text_s))
+
+                values: list[object] = []
+                values.append(company_id)
+                if machine_col:
+                    values.append(machine_id)
+                values.append(bubble_document_id)
+
+                if chunk_col:
+                    values.append(page_number_i)  # chunk == page number (v1)
+                if page_col:
+                    values.append(page_number_i)
+
+                values.append(text_s)
+                if chars_col:
+                    values.append(chars_i)
+                if embedding_col:
+                    values.append(None)  # embeddings non implementati ancora
+
+                cur.execute(insert_q, values)
+
+                chunks_written += 1
+                total_chars += chars_i
+
+        conn.commit()
+
+    finally:
+        conn.close()
+
     return {
         "ok": True,
-        "status": "accepted",
+        "status": "indexed",
         "company_id": company_id,
         "machine_id": machine_id,
         "bubble_document_id": bubble_document_id,
-        "trace_id": payload.trace_id,
+        "trace_id": trace_id,
+        "chunks_written": chunks_written,
+        "text_chars": total_chars,
+        "pages_detected": len(pages),
     }
