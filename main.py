@@ -275,6 +275,17 @@ def index_document(
     if not (company_id and machine_id and bubble_document_id):
         raise HTTPException(status_code=400, detail="Missing company_id/machine_id/bubble_document_id")
 
+    # DEBUG: stampa dove stai scrivendo (senza password)
+    print("INDEX_START", {
+        "company_id": company_id,
+        "machine_id": machine_id,
+        "bubble_document_id": bubble_document_id,
+        "trace_id": trace_id,
+        "db_host": DB_HOST,
+        "db_name": DB_NAME,
+        "db_user": DB_USER,
+    })
+
     conn = _db_conn()
     try:
         with conn.cursor() as cur:
@@ -289,14 +300,24 @@ def index_document(
                 (company_id, bubble_document_id),
             )
             pages = cur.fetchall()
+            print("INDEX_PAGES", {"count": len(pages)})
 
             if not pages:
-                raise HTTPException(
-                    status_code=404,
-                    detail="No document_pages found for company_id + bubble_document_id",
-                )
+                # IMPORTANTISSIMO: lo vediamo in log
+                print("INDEX_ABORT_NO_PAGES", {"company_id": company_id, "bubble_document_id": bubble_document_id})
+                return {
+                    "ok": True,
+                    "status": "indexed",
+                    "company_id": company_id,
+                    "machine_id": machine_id,
+                    "bubble_document_id": bubble_document_id,
+                    "trace_id": trace_id,
+                    "chunks_written": 0,
+                    "pages_detected": 0,
+                    "note": "No pages found in document_pages for given ids",
+                }
 
-            # 2) Verifica schema document_chunks (il tuo schema è fisso)
+            # 2) Verifica schema document_chunks
             chunk_cols = _get_table_columns(cur, "document_chunks")
             required = {
                 "company_id",
@@ -309,6 +330,7 @@ def index_document(
             }
             missing = sorted(list(required - set(chunk_cols)))
             if missing:
+                print("INDEX_ABORT_SCHEMA_MISSING", {"missing": missing, "found": sorted(chunk_cols)})
                 raise HTTPException(
                     status_code=500,
                     detail=f"document_chunks missing columns: {missing}. Found: {sorted(chunk_cols)}",
@@ -349,8 +371,20 @@ def index_document(
                 )
                 chunks_written += 1
 
-        conn.commit()
+            conn.commit()
 
+            # DEBUG: conta righe appena inserite
+            cur.execute(
+                "SELECT count(*) FROM document_chunks WHERE company_id=%s AND bubble_document_id=%s;",
+                (company_id, bubble_document_id),
+            )
+            inserted_count = int(cur.fetchone()[0])
+            print("INDEX_DONE", {"chunks_written": chunks_written, "inserted_count": inserted_count})
+
+    except Exception as e:
+        # IMPORTANTISSIMO: se qualcosa va storto, lo vediamo
+        print("INDEX_ERROR", str(e))
+        raise
     finally:
         conn.close()
 
