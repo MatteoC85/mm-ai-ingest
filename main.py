@@ -853,6 +853,8 @@ def ask_v1(
                 {"role": "user", "content": user_msg},
             ]
         ).strip()
+        answer = answer.replace("[DOC:", "[").replace("[doc:", "[")
+
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"LLM failed: {str(e)}")
 
