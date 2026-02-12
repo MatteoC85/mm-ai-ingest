@@ -9,7 +9,6 @@ import psycopg2
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from pypdf import PdfReader
-from psycopg2 import sql
 
 from google.cloud import tasks_v2
 import json
@@ -34,11 +33,10 @@ MIN_PAGES_WITH_TEXT_ABS = int(os.environ.get("MM_MIN_PAGES_WITH_TEXT_ABS", "2"))
 MIN_PAGES_WITH_TEXT_PCT = float(os.environ.get("MM_MIN_PAGES_WITH_TEXT_PCT", "0.20"))
 
 # Chunking (Solution A) — robust defaults (char-based, overlap)
-# Nota: char != token, ma su testo tecnico è una proxy buona e stabile.
 CHUNK_TARGET_CHARS = int(os.environ.get("MM_CHUNK_TARGET_CHARS", "3800"))
 CHUNK_OVERLAP_CHARS = int(os.environ.get("MM_CHUNK_OVERLAP_CHARS", "800"))
-CHUNK_MIN_CHARS = int(os.environ.get("MM_CHUNK_MIN_CHARS", "200"))  # evita chunk microscopici
-PAGE_JOIN_SEPARATOR = "\n\n"  # conserva struttura (utile per tabelle/testo a blocchi)
+CHUNK_MIN_CHARS = int(os.environ.get("MM_CHUNK_MIN_CHARS", "200"))
+PAGE_JOIN_SEPARATOR = "\n\n"
 
 # OpenAI
 OPENAI_API_KEY = (os.environ.get("OPENAI_API_KEY") or "").strip()
@@ -49,10 +47,10 @@ OPENAI_EMBED_URL = (os.environ.get("OPENAI_EMBED_URL") or "https://api.openai.co
 OPENAI_CHAT_MODEL = (os.environ.get("OPENAI_CHAT_MODEL") or "gpt-4.1-mini").strip()
 OPENAI_CHAT_URL = (os.environ.get("OPENAI_CHAT_URL") or "https://api.openai.com/v1/chat/completions").strip()
 
-ASK_SIM_THRESHOLD = float(os.environ.get("MM_ASK_SIM_THRESHOLD", "0.35"))  # sotto => NO_SOURCES
-ASK_MAX_TOP_K = int(os.environ.get("MM_ASK_MAX_TOP_K", "8"))              # cap costi
-ASK_SNIPPET_CHARS = int(os.environ.get("MM_ASK_SNIPPET_CHARS", "700"))    # snippet per prompt+citation
-ASK_MAX_CONTEXT_CHARS = int(os.environ.get("MM_ASK_MAX_CONTEXT_CHARS", "6000"))  # cap prompt
+ASK_SIM_THRESHOLD = float(os.environ.get("MM_ASK_SIM_THRESHOLD", "0.35"))
+ASK_MAX_TOP_K = int(os.environ.get("MM_ASK_MAX_TOP_K", "8"))
+ASK_SNIPPET_CHARS = int(os.environ.get("MM_ASK_SNIPPET_CHARS", "700"))
+ASK_MAX_CONTEXT_CHARS = int(os.environ.get("MM_ASK_MAX_CONTEXT_CHARS", "6000"))
 
 
 @app.get("/ping")
@@ -71,9 +69,9 @@ def _db_conn():
     if not (DB_HOST and DB_USER and DB_PASSWORD):
         raise HTTPException(status_code=500, detail="DB env missing")
     return psycopg2.connect(
-        host=DB_HOST,      # /cloudsql/PROJECT:REGION:INSTANCE
-        dbname=DB_NAME,    # postgres
-        user=DB_USER,      # mm_ai_app
+        host=DB_HOST,
+        dbname=DB_NAME,
+        user=DB_USER,
         password=DB_PASSWORD,
     )
 
@@ -91,18 +89,10 @@ def _get_table_columns(cur, table_name: str) -> set[str]:
 
 
 def _normalize_text_keep_lines(s: str) -> str:
-    """
-    Normalizzazione 'safe' per manuali/tabelle:
-    - normalizza newline
-    - rimuove spazi e TAB ripetuti MA non schiaccia i newline
-    - strip finale
-    """
     if not s:
         return ""
     s = s.replace("\r\n", "\n").replace("\r", "\n")
-    # riduci TAB a spazio (tabelle estratte spesso hanno tab)
     s = s.replace("\t", " ")
-    # comprimi spazi multipli, ma preserva newline
     out = []
     prev_space = False
     for ch in s:
@@ -118,12 +108,6 @@ def _normalize_text_keep_lines(s: str) -> str:
 
 
 def _build_global_text_and_page_spans(pages: list[tuple[int, str]]) -> tuple[str, list[tuple[int, int, int]]]:
-    """
-    pages: list of (page_number, text)
-    Ritorna:
-    - global_text: concatenazione pagine con separatore
-    - spans: lista di (start_idx, end_idx, page_number) in global_text
-    """
     parts: list[str] = []
     spans: list[tuple[int, int, int]] = []
     pos = 0
@@ -133,15 +117,13 @@ def _build_global_text_and_page_spans(pages: list[tuple[int, str]]) -> tuple[str
         start = pos
         parts.append(t)
         pos += len(t)
-        end = pos  # end is exclusive
+        end = pos
         spans.append((start, end, int(page_number)))
 
-        # aggiungi separatore tra pagine (non dopo l’ultima)
         parts.append(PAGE_JOIN_SEPARATOR)
         pos += len(PAGE_JOIN_SEPARATOR)
 
     if parts:
-        # rimuovi l'ultimo separatore aggiunto
         global_text = "".join(parts)
         global_text = global_text[: -len(PAGE_JOIN_SEPARATOR)]
         return global_text, spans
@@ -150,10 +132,6 @@ def _build_global_text_and_page_spans(pages: list[tuple[int, str]]) -> tuple[str
 
 
 def _pages_for_slice(spans: list[tuple[int, int, int]], slice_start: int, slice_end: int) -> tuple[int, int]:
-    """
-    Dato un intervallo [slice_start, slice_end) su global_text,
-    ritorna (page_from, page_to) basandosi sulle spans.
-    """
     page_from = None
     page_to = None
 
@@ -172,15 +150,6 @@ def _pages_for_slice(spans: list[tuple[int, int, int]], slice_start: int, slice_
 
 
 def _chunk_text(global_text: str, spans: list[tuple[int, int, int]]) -> list[dict]:
-    """
-    Chunking solution A:
-    - step = target - overlap
-    - chunk_end = min(start + target, len(text))
-    - trim whitespace ai bordi ma NON toccare i newline interni
-    - scarta chunk troppo piccoli (tranne se è l’unico)
-    Ritorna lista di dict:
-      {chunk_index, page_from, page_to, chunk_text}
-    """
     text_len = len(global_text)
     if text_len == 0:
         return []
@@ -227,15 +196,8 @@ def _openai_embed_texts(texts: list[str]) -> list[list[float]]:
     if not OPENAI_API_KEY:
         raise Exception("OPENAI_API_KEY missing")
 
-    payload = {
-        "model": OPENAI_EMBED_MODEL,
-        "input": texts,
-    }
-
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
+    payload = {"model": OPENAI_EMBED_MODEL, "input": texts}
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
 
     r = requests.post(OPENAI_EMBED_URL, headers=headers, json=payload, timeout=60)
     if r.status_code != 200:
@@ -249,44 +211,35 @@ def _openai_embed_texts(texts: list[str]) -> list[list[float]]:
         raise Exception("OpenAI embeddings response missing some items")
     return out
 
+
 def _openai_chat(messages: list[dict]) -> str:
     if not OPENAI_API_KEY:
         raise Exception("OPENAI_API_KEY missing")
 
-    payload = {
-        "model": OPENAI_CHAT_MODEL,
-        "messages": messages,
-        "temperature": 0.2,
-    }
-
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
+    payload = {"model": OPENAI_CHAT_MODEL, "messages": messages, "temperature": 0.2}
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
 
     r = requests.post(OPENAI_CHAT_URL, headers=headers, json=payload, timeout=60)
     if r.status_code != 200:
         raise Exception(f"OpenAI chat failed: {r.status_code} {r.text}")
 
     data = r.json()
-    # formato Chat Completions
     return (data.get("choices", [{}])[0].get("message", {}) or {}).get("content", "") or ""
 
 
-# =========================
-# (MODIFICA 1/3) SearchRequest
-# =========================
 class SearchRequest(BaseModel):
     query: str
     company_id: str
     bubble_document_id: Optional[str] = None
     top_k: int = 5
 
+
 class AskRequest(BaseModel):
     query: str
     company_id: str
     bubble_document_id: Optional[str] = None
     top_k: int = 5
+    debug: Optional[bool] = False
 
 
 class Citation(BaseModel):
@@ -297,9 +250,7 @@ class Citation(BaseModel):
     snippet: str
     similarity: float
 
-# =========================
-# (MODIFICA 2/3) vector literal helper
-# =========================
+
 def _vector_literal(vec: list[float]) -> str:
     return "[" + ",".join(f"{x:.8f}" for x in vec) + "]"
 
@@ -309,7 +260,6 @@ def ingest_document(
     payload: IngestRequest,
     x_ai_internal_secret: Optional[str] = Header(default=None),
 ):
-    # auth
     if not AI_INTERNAL_SECRET:
         raise HTTPException(status_code=500, detail="AI_INTERNAL_SECRET missing")
     if (x_ai_internal_secret or "").strip() != AI_INTERNAL_SECRET:
@@ -325,7 +275,6 @@ def ingest_document(
     if url.startswith("//"):
         url = "https:" + url
 
-    # download
     try:
         r = requests.get(url, timeout=FETCH_TIMEOUT)
         r.raise_for_status()
@@ -337,7 +286,6 @@ def ingest_document(
     except Exception:
         raise HTTPException(status_code=502, detail="Fetch failed")
 
-    # parse + estrazione testo per pagina
     try:
         reader = PdfReader(io.BytesIO(data))
         pages_total = len(reader.pages)
@@ -355,7 +303,6 @@ def ingest_document(
     except Exception:
         raise HTTPException(status_code=422, detail="PDF parse failed")
 
-    # Indicizzabilità PRO
     if pages_total <= 2:
         if pages_with_text < 1 or text_chars < MIN_TEXT_CHARS_SHORT:
             reason = "LOW_TEXT_COVERAGE" if pages_with_text < 1 else "LOW_TEXT_CHARS"
@@ -391,7 +338,6 @@ def ingest_document(
                 "text_chars": text_chars,
             }
 
-    # salva document_pages
     conn = _db_conn()
     try:
         with conn.cursor() as cur:
@@ -411,7 +357,6 @@ def ingest_document(
     finally:
         conn.close()
 
-    # enqueue Cloud Tasks
     try:
         project = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT") or "machinemind-ai-2a"
         location = "europe-west1"
@@ -557,7 +502,6 @@ def index_document(
                     ),
                 )
 
-            # Embeddings (batch)
             BATCH_SIZE = 32
             chunk_texts = [c["chunk_text"] for c in chunks]
 
@@ -614,15 +558,11 @@ def index_document(
     }
 
 
-# =========================
-# (MODIFICA 3/3) endpoint retrieval vettoriale
-# =========================
 @app.post("/v1/ai/search")
 def search_chunks(
     payload: SearchRequest,
     x_ai_internal_secret: Optional[str] = Header(default=None),
 ):
-    # auth
     if not AI_INTERNAL_SECRET:
         raise HTTPException(status_code=500, detail="AI_INTERNAL_SECRET missing")
     if (x_ai_internal_secret or "").strip() != AI_INTERNAL_SECRET:
@@ -639,7 +579,6 @@ def search_chunks(
     top_k = int(payload.top_k or 5)
     top_k = max(1, min(top_k, 20))
 
-    # 1) embed query (privacy: inviamo solo testo query)
     q_vec = _openai_embed_texts([q])[0]
     q_vec_lit = _vector_literal(q_vec)
 
@@ -680,47 +619,46 @@ def search_chunks(
 
                 return {"ok": True, "top_k": top_k, "results": results}
 
-            else:
-                cur.execute(
-                    """
-                    SELECT bubble_document_id, chunk_index, page_from, page_to, left(chunk_text, 400) AS preview,
-                           1 - (embedding <=> %s::vector) AS similarity
-                    FROM public.document_chunks
-                    WHERE company_id = %s
-                      AND embedding IS NOT NULL
-                    ORDER BY embedding <=> %s::vector
-                    LIMIT %s;
-                    """,
-                    (q_vec_lit, company_id, q_vec_lit, top_k),
+            cur.execute(
+                """
+                SELECT bubble_document_id, chunk_index, page_from, page_to, left(chunk_text, 400) AS preview,
+                       1 - (embedding <=> %s::vector) AS similarity
+                FROM public.document_chunks
+                WHERE company_id = %s
+                  AND embedding IS NOT NULL
+                ORDER BY embedding <=> %s::vector
+                LIMIT %s;
+                """,
+                (q_vec_lit, company_id, q_vec_lit, top_k),
+            )
+            rows = cur.fetchall()
+
+            results = []
+            for (bubble_document_id, chunk_index, page_from, page_to, preview, similarity) in rows:
+                citation_id = f"{bubble_document_id}:p{int(page_from)}-{int(page_to)}:c{int(chunk_index)}"
+                results.append(
+                    {
+                        "citation_id": citation_id,
+                        "bubble_document_id": bubble_document_id,
+                        "chunk_index": int(chunk_index),
+                        "page_from": int(page_from),
+                        "page_to": int(page_to),
+                        "similarity": float(similarity),
+                        "preview": preview,
+                    }
                 )
-                rows = cur.fetchall()
 
-                results = []
-                for (bubble_document_id, chunk_index, page_from, page_to, preview, similarity) in rows:
-                    citation_id = f"{bubble_document_id}:p{int(page_from)}-{int(page_to)}:c{int(chunk_index)}"
-                    results.append(
-                        {
-                            "citation_id": citation_id,
-                            "bubble_document_id": bubble_document_id,
-                            "chunk_index": int(chunk_index),
-                            "page_from": int(page_from),
-                            "page_to": int(page_to),
-                            "similarity": float(similarity),
-                            "preview": preview,
-                        }
-                    )
-
-                return {"ok": True, "top_k": top_k, "results": results}
+            return {"ok": True, "top_k": top_k, "results": results}
 
     finally:
         conn.close()
+
 
 @app.post("/v1/ai/ask")
 def ask_v1(
     payload: AskRequest,
     x_ai_internal_secret: Optional[str] = Header(default=None),
 ):
-    # auth
     if not AI_INTERNAL_SECRET:
         raise HTTPException(status_code=500, detail="AI_INTERNAL_SECRET missing")
     if (x_ai_internal_secret or "").strip() != AI_INTERNAL_SECRET:
@@ -737,18 +675,32 @@ def ask_v1(
     top_k = int(payload.top_k or 5)
     top_k = max(1, min(top_k, ASK_MAX_TOP_K))
 
-    # 1) embed query (privacy: inviamo solo testo query)
     q_vec = _openai_embed_texts([q])[0]
     q_vec_lit = _vector_literal(q_vec)
 
-    # 2) retrieval
+    rows = []
+    chunks_matching_filter = None
+
     conn = _db_conn()
     try:
         with conn.cursor() as cur:
             if payload.bubble_document_id:
                 bdid = payload.bubble_document_id.strip()
+
+                # debug: quanti chunk matchano davvero company+doc (utile quando da Bubble vedi no_sources)
+                if payload.debug:
+                    cur.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM public.document_chunks
+                        WHERE company_id=%s AND bubble_document_id=%s AND embedding IS NOT NULL;
+                        """,
+                        (company_id, bdid),
+                    )
+                    chunks_matching_filter = int(cur.fetchone()[0] or 0)
+
                 cur.execute(
-                    f"""
+                    """
                     SELECT bubble_document_id, chunk_index, page_from, page_to,
                            left(chunk_text, %s) AS snippet,
                            1 - (embedding <=> %s::vector) AS similarity
@@ -763,7 +715,7 @@ def ask_v1(
                 )
             else:
                 cur.execute(
-                    f"""
+                    """
                     SELECT bubble_document_id, chunk_index, page_from, page_to,
                            left(chunk_text, %s) AS snippet,
                            1 - (embedding <=> %s::vector) AS similarity
@@ -781,15 +733,22 @@ def ask_v1(
         conn.close()
 
     if not rows:
-        return {
+        resp = {
             "ok": True,
             "status": "no_sources",
             "answer": "Non trovo informazioni nei documenti indicizzati per rispondere.",
             "citations": [],
             "top_k": top_k,
+            "similarity_max": None,
         }
+        if payload.debug:
+            resp["debug"] = {
+                "company_id": company_id,
+                "bubble_document_id": payload.bubble_document_id,
+                "chunks_matching_filter": chunks_matching_filter,
+            }
+        return resp
 
-    # costruisci citations + controlla soglia
     citations: List[dict] = []
     sim_max = -1.0
 
@@ -809,7 +768,7 @@ def ask_v1(
         )
 
     if sim_max < ASK_SIM_THRESHOLD:
-        return {
+        resp = {
             "ok": True,
             "status": "no_sources",
             "answer": "Non trovo informazioni nei documenti indicizzati per rispondere.",
@@ -817,8 +776,14 @@ def ask_v1(
             "top_k": top_k,
             "similarity_max": sim_max,
         }
+        if payload.debug:
+            resp["debug"] = {
+                "company_id": company_id,
+                "bubble_document_id": payload.bubble_document_id,
+                "chunks_matching_filter": chunks_matching_filter,
+            }
+        return resp
 
-    # 3) costruisci contesto per LLM (NO ID interni: usiamo solo citation_id + snippet + pagine)
     ctx_parts: List[str] = []
     total_chars = 0
     for c in citations:
@@ -835,7 +800,7 @@ def ask_v1(
         "Regole obbligatorie:\n"
         "1) Se le fonti NON contengono la risposta, rispondi ESATTAMENTE: "
         "\"Non trovo informazioni nei documenti indicizzati per rispondere.\" e basta.\n"
-        "2) Quando affermi qualcosa, aggiungi sempre la citazione tra parentesi quadre, es: [DOC:p1-2:c3].\n"
+        "2) Quando affermi qualcosa, aggiungi sempre la citazione tra parentesi quadre usando il citation_id, es: [DOCID:p1-2:c3].\n"
         "3) Non inventare, non usare conoscenza esterna.\n"
         "4) Rispondi in italiano, chiaro e conciso.\n"
     )
@@ -846,7 +811,6 @@ def ask_v1(
         "ISTRUZIONE:\nRispondi alla domanda usando SOLO le fonti e inserendo citazioni [citation_id]."
     )
 
-    # 4) call LLM
     try:
         answer = _openai_chat(
             [
@@ -865,20 +829,16 @@ def ask_v1(
             docid = m.group(1).strip()
             first = m.group(2).strip()
             rest = m.group(3).strip()
-
             parts = [p.strip() for p in rest.split(";") if p.strip()]
             expanded = [f"[{docid}:{first}]"] + [f"[{docid}:{p}]" for p in parts]
-
             answer = re.sub(r"\[[^\]]+\]", " ".join(expanded), answer, count=1)
 
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"LLM failed: {str(e)}")
 
-    # se LLM restituisce vuoto, fallback
     if not answer:
         answer = "Non trovo informazioni nei documenti indicizzati per rispondere."
 
-    # se LLM ha risposto NO_SOURCES (stringa esatta richiesta), allora zero citations
     if answer == "Non trovo informazioni nei documenti indicizzati per rispondere.":
         return {
             "ok": True,
@@ -893,7 +853,7 @@ def ask_v1(
         "ok": True,
         "status": "answered",
         "answer": answer,
-        "citations": citations,  # per ora: tutte le fonti passate (MVP). Refinement dopo.
+        "citations": citations,
         "top_k": top_k,
         "similarity_max": sim_max,
         "chat_model": OPENAI_CHAT_MODEL,
