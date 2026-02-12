@@ -1,7 +1,7 @@
 import os
 import io
 import math
-from typing import Optional
+from typing import Optional, List
 
 import requests
 import psycopg2
@@ -43,6 +43,15 @@ PAGE_JOIN_SEPARATOR = "\n\n"  # conserva struttura (utile per tabelle/testo a bl
 OPENAI_API_KEY = (os.environ.get("OPENAI_API_KEY") or "").strip()
 OPENAI_EMBED_MODEL = (os.environ.get("OPENAI_EMBED_MODEL") or "text-embedding-3-small").strip()
 OPENAI_EMBED_URL = (os.environ.get("OPENAI_EMBED_URL") or "https://api.openai.com/v1/embeddings").strip()
+
+# OpenAI Chat (per /ask)
+OPENAI_CHAT_MODEL = (os.environ.get("OPENAI_CHAT_MODEL") or "gpt-4.1-mini").strip()
+OPENAI_CHAT_URL = (os.environ.get("OPENAI_CHAT_URL") or "https://api.openai.com/v1/chat/completions").strip()
+
+ASK_SIM_THRESHOLD = float(os.environ.get("MM_ASK_SIM_THRESHOLD", "0.35"))  # sotto => NO_SOURCES
+ASK_MAX_TOP_K = int(os.environ.get("MM_ASK_MAX_TOP_K", "8"))              # cap costi
+ASK_SNIPPET_CHARS = int(os.environ.get("MM_ASK_SNIPPET_CHARS", "700"))    # snippet per prompt+citation
+ASK_MAX_CONTEXT_CHARS = int(os.environ.get("MM_ASK_MAX_CONTEXT_CHARS", "6000"))  # cap prompt
 
 
 @app.get("/ping")
@@ -239,6 +248,29 @@ def _openai_embed_texts(texts: list[str]) -> list[list[float]]:
         raise Exception("OpenAI embeddings response missing some items")
     return out
 
+def _openai_chat(messages: list[dict]) -> str:
+    if not OPENAI_API_KEY:
+        raise Exception("OPENAI_API_KEY missing")
+
+    payload = {
+        "model": OPENAI_CHAT_MODEL,
+        "messages": messages,
+        "temperature": 0.2,
+    }
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    r = requests.post(OPENAI_CHAT_URL, headers=headers, json=payload, timeout=60)
+    if r.status_code != 200:
+        raise Exception(f"OpenAI chat failed: {r.status_code} {r.text}")
+
+    data = r.json()
+    # formato Chat Completions
+    return (data.get("choices", [{}])[0].get("message", {}) or {}).get("content", "") or ""
+
 
 # =========================
 # (MODIFICA 1/3) SearchRequest
@@ -249,6 +281,20 @@ class SearchRequest(BaseModel):
     bubble_document_id: Optional[str] = None
     top_k: int = 5
 
+class AskRequest(BaseModel):
+    query: str
+    company_id: str
+    bubble_document_id: Optional[str] = None
+    top_k: int = 5
+
+
+class Citation(BaseModel):
+    citation_id: str
+    bubble_document_id: str
+    page_from: int
+    page_to: int
+    snippet: str
+    similarity: float
 
 # =========================
 # (MODIFICA 2/3) vector literal helper
@@ -667,3 +713,170 @@ def search_chunks(
 
     finally:
         conn.close()
+
+@app.post("/v1/ai/ask")
+def ask_v1(
+    payload: AskRequest,
+    x_ai_internal_secret: Optional[str] = Header(default=None),
+):
+    # auth
+    if not AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=500, detail="AI_INTERNAL_SECRET missing")
+    if (x_ai_internal_secret or "").strip() != AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    q = (payload.query or "").strip()
+    if not q:
+        raise HTTPException(status_code=400, detail="Missing query")
+
+    company_id = (payload.company_id or "").strip()
+    if not company_id:
+        raise HTTPException(status_code=400, detail="Missing company_id")
+
+    top_k = int(payload.top_k or 5)
+    top_k = max(1, min(top_k, ASK_MAX_TOP_K))
+
+    # 1) embed query (privacy: inviamo solo testo query)
+    q_vec = _openai_embed_texts([q])[0]
+    q_vec_lit = _vector_literal(q_vec)
+
+    # 2) retrieval
+    conn = _db_conn()
+    try:
+        with conn.cursor() as cur:
+            if payload.bubble_document_id:
+                bdid = payload.bubble_document_id.strip()
+                cur.execute(
+                    f"""
+                    SELECT bubble_document_id, chunk_index, page_from, page_to,
+                           left(chunk_text, %s) AS snippet,
+                           1 - (embedding <=> %s::vector) AS similarity
+                    FROM public.document_chunks
+                    WHERE company_id = %s
+                      AND bubble_document_id = %s
+                      AND embedding IS NOT NULL
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s;
+                    """,
+                    (ASK_SNIPPET_CHARS, q_vec_lit, company_id, bdid, q_vec_lit, top_k),
+                )
+            else:
+                cur.execute(
+                    f"""
+                    SELECT bubble_document_id, chunk_index, page_from, page_to,
+                           left(chunk_text, %s) AS snippet,
+                           1 - (embedding <=> %s::vector) AS similarity
+                    FROM public.document_chunks
+                    WHERE company_id = %s
+                      AND embedding IS NOT NULL
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s;
+                    """,
+                    (ASK_SNIPPET_CHARS, q_vec_lit, company_id, q_vec_lit, top_k),
+                )
+
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        return {
+            "ok": True,
+            "status": "no_sources",
+            "answer": "Non trovo informazioni nei documenti indicizzati per rispondere.",
+            "citations": [],
+            "top_k": top_k,
+        }
+
+    # costruisci citations + controlla soglia
+    citations: List[dict] = []
+    sim_max = -1.0
+
+    for (bdid, chunk_index, page_from, page_to, snippet, similarity) in rows:
+        sim = float(similarity)
+        sim_max = max(sim_max, sim)
+        citation_id = f"{bdid}:p{int(page_from)}-{int(page_to)}:c{int(chunk_index)}"
+        citations.append(
+            {
+                "citation_id": citation_id,
+                "bubble_document_id": bdid,
+                "page_from": int(page_from),
+                "page_to": int(page_to),
+                "snippet": (snippet or "").strip(),
+                "similarity": sim,
+            }
+        )
+
+    if sim_max < ASK_SIM_THRESHOLD:
+        return {
+            "ok": True,
+            "status": "no_sources",
+            "answer": "Non trovo informazioni nei documenti indicizzati per rispondere.",
+            "citations": [],
+            "top_k": top_k,
+            "similarity_max": sim_max,
+        }
+
+    # 3) costruisci contesto per LLM (NO ID interni: usiamo solo citation_id + snippet + pagine)
+    ctx_parts: List[str] = []
+    total_chars = 0
+    for c in citations:
+        part = f"[{c['citation_id']}] (p{c['page_from']}-{c['page_to']})\n{c['snippet']}\n"
+        if total_chars + len(part) > ASK_MAX_CONTEXT_CHARS:
+            break
+        ctx_parts.append(part)
+        total_chars += len(part)
+    sources_block = "\n".join(ctx_parts).strip()
+
+    system_msg = (
+        "Sei un assistente tecnico per aziende industriali. "
+        "Devi rispondere SOLO usando le FONTI fornite. "
+        "Regole obbligatorie:\n"
+        "1) Se le fonti NON contengono la risposta, rispondi ESATTAMENTE: "
+        "\"Non trovo informazioni nei documenti indicizzati per rispondere.\" e basta.\n"
+        "2) Quando affermi qualcosa, aggiungi sempre la citazione tra parentesi quadre, es: [DOC:p1-2:c3].\n"
+        "3) Non inventare, non usare conoscenza esterna.\n"
+        "4) Rispondi in italiano, chiaro e conciso.\n"
+    )
+
+    user_msg = (
+        f"DOMANDA:\n{q}\n\n"
+        f"FONTI:\n{sources_block}\n\n"
+        "ISTRUZIONE:\nRispondi alla domanda usando SOLO le fonti e inserendo citazioni [citation_id]."
+    )
+
+    # 4) call LLM
+    try:
+        answer = _openai_chat(
+            [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ]
+        ).strip()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"LLM failed: {str(e)}")
+
+    # se LLM restituisce vuoto, fallback
+    if not answer:
+        answer = "Non trovo informazioni nei documenti indicizzati per rispondere."
+
+    # se LLM ha risposto NO_SOURCES (stringa esatta richiesta), allora zero citations
+    if answer == "Non trovo informazioni nei documenti indicizzati per rispondere.":
+        return {
+            "ok": True,
+            "status": "no_sources",
+            "answer": answer,
+            "citations": [],
+            "top_k": top_k,
+            "similarity_max": sim_max,
+        }
+
+    return {
+        "ok": True,
+        "status": "answered",
+        "answer": answer,
+        "citations": citations,   # per ora: tutte le fonti passate (MVP). Refinement dopo.
+        "top_k": top_k,
+        "similarity_max": sim_max,
+        "chat_model": OPENAI_CHAT_MODEL,
+    }
