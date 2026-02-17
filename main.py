@@ -110,6 +110,61 @@ def _pick_entity_from_citations(q: str, citations: list[dict]) -> Optional[tuple
 
     return None
 
+def _db_find_entity_chunk(company_id: str, machine_id: str, kind: str) -> Optional[dict]:
+    """
+    Cerca nei chunk (scope: company_id AND (machine_id = M OR NULL)) un chunk che contenga un'entità.
+    kind: "url" | "email" | "phone"
+    Ritorna {citation_id, bubble_document_id, page_from, page_to, snippet} oppure None.
+    """
+    if kind == "url":
+        pattern = r"(https?://|www\.)"
+        rx = URL_REGEX
+    elif kind == "email":
+        pattern = r"@[A-Z0-9.-]+\.[A-Z]{2,}"
+        rx = EMAIL_REGEX
+    elif kind == "phone":
+        pattern = r"\+?\d[\d\s().-]{7,}\d"
+        rx = PHONE_REGEX
+    else:
+        return None
+
+    conn = _db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT bubble_document_id, chunk_index, page_from, page_to,
+                       left(chunk_text, %s) AS snippet
+                FROM public.document_chunks
+                WHERE company_id = %s
+                  AND (machine_id = %s OR machine_id IS NULL)
+                  AND chunk_text ~* %s
+                ORDER BY bubble_document_id, page_from, chunk_index
+                LIMIT 1;
+                """,
+                (ASK_SNIPPET_CHARS, company_id, machine_id, pattern),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+
+            bdid, chunk_index, page_from, page_to, snippet = row
+            snippet = (snippet or "").strip()
+            value = _extract_first(rx, snippet)
+            if not value:
+                return None
+
+            citation_id = f"{bdid}:p{int(page_from)}-{int(page_to)}:c{int(chunk_index)}"
+            return {
+                "citation_id": citation_id,
+                "bubble_document_id": bdid,
+                "page_from": int(page_from),
+                "page_to": int(page_to),
+                "snippet": snippet,
+                "value": value,
+            }
+    finally:
+        conn.close()
 
 @app.get("/ping")
 def ping():
@@ -851,6 +906,39 @@ def ask_v1(
                 "similarity_max": sim_max,
                 "chat_model": OPENAI_CHAT_MODEL,
             }
+        
+        # 2nd-level fallback: se gli snippet top_k non contengono l'entità,
+        # prova a cercarla direttamente nel DB nello scope macchina + generici.
+        kind = None
+        if _q_has_any(q, URL_HINTS):
+            kind = "url"
+        elif _q_has_any(q, EMAIL_HINTS):
+            kind = "email"
+        elif _q_has_any(q, PHONE_HINTS):
+            kind = "phone"
+
+        if kind:
+            hit = _db_find_entity_chunk(company_id=company_id, machine_id=machine_id, kind=kind)
+            if hit:
+                answer = f"Nel documento compare questo dato: {hit['value']} [{hit['citation_id']}]"
+                return {
+                    "ok": True,
+                    "status": "answered",
+                    "answer": answer,
+                    "citations": [
+                        {
+                            "citation_id": hit["citation_id"],
+                            "bubble_document_id": hit["bubble_document_id"],
+                            "page_from": hit["page_from"],
+                            "page_to": hit["page_to"],
+                            "snippet": hit["snippet"],
+                            "similarity": sim_max,
+                        }
+                    ],
+                    "top_k": top_k,
+                    "similarity_max": sim_max,
+                    "chat_model": OPENAI_CHAT_MODEL,
+                }
 
         resp = {
             "ok": True,
