@@ -2,6 +2,7 @@ import os
 import io
 import re
 import math
+import json
 from typing import Optional, List
 
 import requests
@@ -11,7 +12,6 @@ from pydantic import BaseModel
 from pypdf import PdfReader
 
 from google.cloud import tasks_v2
-import json
 
 app = FastAPI()
 
@@ -51,6 +51,64 @@ ASK_SIM_THRESHOLD = float(os.environ.get("MM_ASK_SIM_THRESHOLD", "0.35"))
 ASK_MAX_TOP_K = int(os.environ.get("MM_ASK_MAX_TOP_K", "8"))
 ASK_SNIPPET_CHARS = int(os.environ.get("MM_ASK_SNIPPET_CHARS", "700"))
 ASK_MAX_CONTEXT_CHARS = int(os.environ.get("MM_ASK_MAX_CONTEXT_CHARS", "6000"))
+
+# -----------------------------
+# Entity fallback (URL / email / phone)
+# -----------------------------
+URL_REGEX = re.compile(r"(https?://[^\s\)\]\}]+|www\.[^\s\)\]\}]+)", re.IGNORECASE)
+EMAIL_REGEX = re.compile(r"([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})", re.IGNORECASE)
+PHONE_REGEX = re.compile(r"(\+?\d[\d\s().-]{7,}\d)")
+
+URL_HINTS = ["sito", "website", "web site", "url", "link", "pagina", "dominio", "www"]
+EMAIL_HINTS = ["email", "e-mail", "mail", "posta"]
+PHONE_HINTS = ["telefono", "cell", "cellulare", "tel", "contatto", "chiamare", "numero"]
+
+
+def _q_has_any(q: str, hints: list[str]) -> bool:
+    qq = (q or "").lower()
+    return any(h in qq for h in hints)
+
+
+def _clean_tail(s: str) -> str:
+    return (s or "").rstrip(".,;:!?)\"]}")
+
+
+def _extract_first(regex: re.Pattern, text: str) -> Optional[str]:
+    if not text:
+        return None
+    m = regex.search(text)
+    if not m:
+        return None
+    return _clean_tail(m.group(1))
+
+
+def _pick_entity_from_citations(q: str, citations: list[dict]) -> Optional[tuple[str, dict]]:
+    wants_url = _q_has_any(q, URL_HINTS)
+    wants_email = _q_has_any(q, EMAIL_HINTS)
+    wants_phone = _q_has_any(q, PHONE_HINTS)
+
+    if not (wants_url or wants_email or wants_phone):
+        return None
+
+    for c in citations:
+        snip = c.get("snippet", "") or ""
+
+        if wants_url:
+            u = _extract_first(URL_REGEX, snip)
+            if u:
+                return (u, c)
+
+        if wants_email:
+            e = _extract_first(EMAIL_REGEX, snip)
+            if e:
+                return (e, c)
+
+        if wants_phone:
+            p = _extract_first(PHONE_REGEX, snip)
+            if p:
+                return (p, c)
+
+    return None
 
 
 @app.get("/ping")
@@ -778,7 +836,22 @@ def ask_v1(
             }
         )
 
+    # ✅ Entity fallback: se la domanda chiede sito/email/telefono e lo troviamo negli snippet, rispondiamo anche sotto soglia
     if sim_max < ASK_SIM_THRESHOLD:
+        picked = _pick_entity_from_citations(q, citations)
+        if picked:
+            value, c = picked
+            answer = f"Nel documento compare questo dato: {value} [{c['citation_id']}]"
+            return {
+                "ok": True,
+                "status": "answered",
+                "answer": answer,
+                "citations": citations,
+                "top_k": top_k,
+                "similarity_max": sim_max,
+                "chat_model": OPENAI_CHAT_MODEL,
+            }
+
         resp = {
             "ok": True,
             "status": "no_sources",
