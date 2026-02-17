@@ -807,7 +807,40 @@ def ask_v1(
     conn = _db_conn()
     try:
         with conn.cursor() as cur:
-            if payload.bubble_document_id:
+            # ✅ 1) Se document_ids presenti, restringi davvero lo scope ai doc selezionati
+            if doc_ids:
+                if payload.debug:
+                    cur.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM public.document_chunks
+                        WHERE company_id=%s
+                        AND bubble_document_id = ANY(%s)
+                        AND embedding IS NOT NULL
+                        AND (machine_id=%s OR machine_id IS NULL);
+                        """,
+                        (company_id, doc_ids, machine_id),
+                    )
+                    chunks_matching_filter = int(cur.fetchone()[0] or 0)
+
+                cur.execute(
+                    """
+                    SELECT bubble_document_id, chunk_index, page_from, page_to,
+                        left(chunk_text, %s) AS snippet,
+                        1 - (embedding <=> %s::vector) AS similarity
+                    FROM public.document_chunks
+                    WHERE company_id = %s
+                    AND bubble_document_id = ANY(%s)
+                    AND embedding IS NOT NULL
+                    AND (machine_id = %s OR machine_id IS NULL)
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s;
+                    """,
+                    (ASK_SNIPPET_CHARS, q_vec_lit, company_id, doc_ids, machine_id, q_vec_lit, top_k),
+                )
+
+            # ✅ 2) Backward compat: singolo bubble_document_id
+            elif payload.bubble_document_id:
                 bdid = payload.bubble_document_id.strip()
 
                 if payload.debug:
@@ -816,9 +849,9 @@ def ask_v1(
                         SELECT COUNT(*)
                         FROM public.document_chunks
                         WHERE company_id=%s
-                          AND bubble_document_id=%s
-                          AND embedding IS NOT NULL
-                          AND (machine_id=%s OR machine_id IS NULL);
+                        AND bubble_document_id=%s
+                        AND embedding IS NOT NULL
+                        AND (machine_id=%s OR machine_id IS NULL);
                         """,
                         (company_id, bdid, machine_id),
                     )
@@ -827,28 +860,30 @@ def ask_v1(
                 cur.execute(
                     """
                     SELECT bubble_document_id, chunk_index, page_from, page_to,
-                           left(chunk_text, %s) AS snippet,
-                           1 - (embedding <=> %s::vector) AS similarity
+                        left(chunk_text, %s) AS snippet,
+                        1 - (embedding <=> %s::vector) AS similarity
                     FROM public.document_chunks
                     WHERE company_id = %s
-                      AND bubble_document_id = %s
-                      AND embedding IS NOT NULL
-                      AND (machine_id = %s OR machine_id IS NULL)
+                    AND bubble_document_id = %s
+                    AND embedding IS NOT NULL
+                    AND (machine_id = %s OR machine_id IS NULL)
                     ORDER BY embedding <=> %s::vector
                     LIMIT %s;
                     """,
                     (ASK_SNIPPET_CHARS, q_vec_lit, company_id, bdid, machine_id, q_vec_lit, top_k),
                 )
+
+            # ✅ 3) Default: tutti i doc nello scope macchina + generici
             else:
                 cur.execute(
                     """
                     SELECT bubble_document_id, chunk_index, page_from, page_to,
-                           left(chunk_text, %s) AS snippet,
-                           1 - (embedding <=> %s::vector) AS similarity
+                        left(chunk_text, %s) AS snippet,
+                        1 - (embedding <=> %s::vector) AS similarity
                     FROM public.document_chunks
                     WHERE company_id = %s
-                      AND embedding IS NOT NULL
-                      AND (machine_id = %s OR machine_id IS NULL)
+                    AND embedding IS NOT NULL
+                    AND (machine_id = %s OR machine_id IS NULL)
                     ORDER BY embedding <=> %s::vector
                     LIMIT %s;
                     """,
