@@ -169,6 +169,15 @@ def _db_find_entity_chunk(company_id: str, machine_id: str, kind: str) -> Option
 @app.get("/ping")
 def ping():
     return {"ok": True}
+    
+@app.get("/version")
+def version():
+    return {
+        "ok": True,
+        "service": os.environ.get("K_SERVICE"),
+        "revision": os.environ.get("K_REVISION"),
+        "commit_sha": os.environ.get("COMMIT_SHA"),
+    }
 
 class IngestRequest(BaseModel):
     file_url: str
