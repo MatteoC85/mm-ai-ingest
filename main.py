@@ -19,20 +19,20 @@ AI_INTERNAL_SECRET = (os.environ.get("AI_INTERNAL_SECRET") or "").strip()
 FETCH_TIMEOUT = int(os.environ.get("MM_FETCH_TIMEOUT_SECONDS", "30"))
 MAX_PDF_BYTES = int(os.environ.get("MM_MAX_PDF_BYTES", str(50 * 1024 * 1024)))
 
-# DB (Cloud SQL via unix socket /cloudsql/...)
+# DB
 DB_HOST = (os.environ.get("MM_DB_HOST") or "").strip()
 DB_NAME = (os.environ.get("MM_DB_NAME") or "postgres").strip()
 DB_USER = (os.environ.get("MM_DB_USER") or "").strip()
 DB_PASSWORD = (os.environ.get("MM_DB_PASSWORD") or "").strip()
 
-# Indicizzabilità (PRO) — configurabile via env
+# Indicizzabilità
 MIN_TEXT_CHARS = int(os.environ.get("MM_MIN_TEXT_CHARS", "2000"))
 MIN_TEXT_CHARS_SHORT = int(os.environ.get("MM_MIN_TEXT_CHARS_SHORT", "800"))
 MIN_PAGE_CHARS = int(os.environ.get("MM_MIN_PAGE_CHARS", "30"))
 MIN_PAGES_WITH_TEXT_ABS = int(os.environ.get("MM_MIN_PAGES_WITH_TEXT_ABS", "2"))
 MIN_PAGES_WITH_TEXT_PCT = float(os.environ.get("MM_MIN_PAGES_WITH_TEXT_PCT", "0.20"))
 
-# Chunking (Solution A) — robust defaults (char-based, overlap)
+# Chunking
 CHUNK_TARGET_CHARS = int(os.environ.get("MM_CHUNK_TARGET_CHARS", "3800"))
 CHUNK_OVERLAP_CHARS = int(os.environ.get("MM_CHUNK_OVERLAP_CHARS", "800"))
 CHUNK_MIN_CHARS = int(os.environ.get("MM_CHUNK_MIN_CHARS", "200"))
@@ -43,7 +43,7 @@ OPENAI_API_KEY = (os.environ.get("OPENAI_API_KEY") or "").strip()
 OPENAI_EMBED_MODEL = (os.environ.get("OPENAI_EMBED_MODEL") or "text-embedding-3-small").strip()
 OPENAI_EMBED_URL = (os.environ.get("OPENAI_EMBED_URL") or "https://api.openai.com/v1/embeddings").strip()
 
-# OpenAI Chat (per /ask)
+# OpenAI Chat
 OPENAI_CHAT_MODEL = (os.environ.get("OPENAI_CHAT_MODEL") or "gpt-4.1-mini").strip()
 OPENAI_CHAT_URL = (os.environ.get("OPENAI_CHAT_URL") or "https://api.openai.com/v1/chat/completions").strip()
 
@@ -237,6 +237,7 @@ class SearchRequest(BaseModel):
 class AskRequest(BaseModel):
     query: str
     company_id: str
+    machine_id: Optional[str] = None
     bubble_document_id: Optional[str] = None
     top_k: int = 5
     debug: Optional[bool] = False
@@ -672,6 +673,11 @@ def ask_v1(
     if not company_id:
         raise HTTPException(status_code=400, detail="Missing company_id")
 
+    # ✅ machine_id obbligatorio: scope = macchina corrente + generici (machine_id IS NULL)
+    machine_id = (payload.machine_id or "").strip()
+    if not machine_id:
+        raise HTTPException(status_code=400, detail="Missing machine_id")
+
     top_k = int(payload.top_k or 5)
     top_k = max(1, min(top_k, ASK_MAX_TOP_K))
 
@@ -687,15 +693,17 @@ def ask_v1(
             if payload.bubble_document_id:
                 bdid = payload.bubble_document_id.strip()
 
-                # debug: quanti chunk matchano davvero company+doc (utile quando da Bubble vedi no_sources)
                 if payload.debug:
                     cur.execute(
                         """
                         SELECT COUNT(*)
                         FROM public.document_chunks
-                        WHERE company_id=%s AND bubble_document_id=%s AND embedding IS NOT NULL;
+                        WHERE company_id=%s
+                          AND bubble_document_id=%s
+                          AND embedding IS NOT NULL
+                          AND (machine_id=%s OR machine_id IS NULL);
                         """,
-                        (company_id, bdid),
+                        (company_id, bdid, machine_id),
                     )
                     chunks_matching_filter = int(cur.fetchone()[0] or 0)
 
@@ -708,10 +716,11 @@ def ask_v1(
                     WHERE company_id = %s
                       AND bubble_document_id = %s
                       AND embedding IS NOT NULL
+                      AND (machine_id = %s OR machine_id IS NULL)
                     ORDER BY embedding <=> %s::vector
                     LIMIT %s;
                     """,
-                    (ASK_SNIPPET_CHARS, q_vec_lit, company_id, bdid, q_vec_lit, top_k),
+                    (ASK_SNIPPET_CHARS, q_vec_lit, company_id, bdid, machine_id, q_vec_lit, top_k),
                 )
             else:
                 cur.execute(
@@ -722,10 +731,11 @@ def ask_v1(
                     FROM public.document_chunks
                     WHERE company_id = %s
                       AND embedding IS NOT NULL
+                      AND (machine_id = %s OR machine_id IS NULL)
                     ORDER BY embedding <=> %s::vector
                     LIMIT %s;
                     """,
-                    (ASK_SNIPPET_CHARS, q_vec_lit, company_id, q_vec_lit, top_k),
+                    (ASK_SNIPPET_CHARS, q_vec_lit, company_id, machine_id, q_vec_lit, top_k),
                 )
 
             rows = cur.fetchall()
@@ -744,6 +754,7 @@ def ask_v1(
         if payload.debug:
             resp["debug"] = {
                 "company_id": company_id,
+                "machine_id": machine_id,
                 "bubble_document_id": payload.bubble_document_id,
                 "chunks_matching_filter": chunks_matching_filter,
             }
@@ -779,6 +790,7 @@ def ask_v1(
         if payload.debug:
             resp["debug"] = {
                 "company_id": company_id,
+                "machine_id": machine_id,
                 "bubble_document_id": payload.bubble_document_id,
                 "chunks_matching_filter": chunks_matching_filter,
             }
@@ -819,11 +831,8 @@ def ask_v1(
             ]
         ).strip()
 
-        # Normalizza eventuale prefisso DOC:
         answer = answer.replace("[DOC:", "[").replace("[doc:", "[")
 
-        # Espandi citazioni abbreviate del tipo:
-        # [DOCID:p1-2:c1; p2-2:c2]  ->  [DOCID:p1-2:c1] [DOCID:p2-2:c2]
         m = re.search(r"\[([^\]:]+):([^\]]+);([^\]]+)\]", answer)
         if m:
             docid = m.group(1).strip()
