@@ -1,0 +1,24 @@
+serviceAccount: projects/machinemind-ai-2a/serviceAccounts/443517556116-compute@developer.gserviceaccount.com
+logsBucket: gs://mm-ai-cb-logs-443517556116
+
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: ["build", "-t", "gcr.io/$PROJECT_ID/github.com/matteoc85/mm-ai-ingest:$COMMIT_SHA", "-f", "Dockerfile", "."]
+
+  - name: gcr.io/cloud-builders/docker
+    args: ["push", "gcr.io/$PROJECT_ID/github.com/matteoc85/mm-ai-ingest:$COMMIT_SHA"]
+
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      [
+        "run", "deploy", "mm-ai-ingest-fixed",
+        "--image", "gcr.io/$PROJECT_ID/github.com/matteoc85/mm-ai-ingest:$COMMIT_SHA",
+        "--region", "europe-west1",
+        "--platform", "managed",
+        "--allow-unauthenticated",
+        "--quiet"
+      ]
+
+images:
+  - "gcr.io/$PROJECT_ID/github.com/matteoc85/mm-ai-ingest:$COMMIT_SHA"
