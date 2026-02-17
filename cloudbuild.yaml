@@ -8,7 +8,6 @@ steps:
   - name: gcr.io/cloud-builders/docker
     args: ["push", "europe-west1-docker.pkg.dev/$PROJECT_ID/mm-ai-ingest/mm-ai-ingest:$COMMIT_SHA"]
 
-  # 1) Deploy (senza traffic)
   - name: gcr.io/google.com/cloudsdktool/cloud-sdk
     entrypoint: gcloud
     args:
@@ -21,7 +20,6 @@ steps:
         "--quiet"
       ]
 
-  # 2) Traffico 100% alla latest revision (comando giusto)
   - name: gcr.io/google.com/cloudsdktool/cloud-sdk
     entrypoint: gcloud
     args:
