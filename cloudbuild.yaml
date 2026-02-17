@@ -8,6 +8,7 @@ steps:
   - name: gcr.io/cloud-builders/docker
     args: ["push", "europe-west1-docker.pkg.dev/$PROJECT_ID/mm-ai-ingest/mm-ai-ingest:$COMMIT_SHA"]
 
+  # 1) Deploy (senza traffic)
   - name: gcr.io/google.com/cloudsdktool/cloud-sdk
     entrypoint: gcloud
     args:
@@ -17,7 +18,17 @@ steps:
         "--region", "europe-west1",
         "--platform", "managed",
         "--allow-unauthenticated",
-        "--traffic", "100",
+        "--quiet"
+      ]
+
+  # 2) Traffico 100% alla latest revision (comando giusto)
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      [
+        "run", "services", "update-traffic", "mm-ai-ingest-fixed",
+        "--region", "europe-west1",
+        "--to-latest",
         "--quiet"
       ]
 
