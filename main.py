@@ -5,7 +5,7 @@ import io
 import re
 import math
 import json
-from typing import Optional, List
+from typing import Optional, List, Any, Union
 
 import requests
 import psycopg2
@@ -74,7 +74,6 @@ def _q_has_any(q: str, hints: list[str]) -> bool:
 def _clean_tail(s: str) -> str:
     return (s or "").rstrip(".,;:!?)\"]}")
 
-
 def _extract_first(regex: re.Pattern, text: str) -> Optional[str]:
     if not text:
         return None
@@ -82,7 +81,6 @@ def _extract_first(regex: re.Pattern, text: str) -> Optional[str]:
     if not m:
         return None
     return _clean_tail(m.group(1))
-
 
 def _pick_entity_from_citations(q: str, citations: list[dict]) -> Optional[tuple[str, dict]]:
     wants_url = _q_has_any(q, URL_HINTS)
@@ -172,13 +170,11 @@ def _db_find_entity_chunk(company_id: str, machine_id: str, kind: str) -> Option
 def ping():
     return {"ok": True}
 
-
 class IngestRequest(BaseModel):
     file_url: str
     company_id: str
     machine_id: str
     bubble_document_id: str
-
 
 def _db_conn():
     if not (DB_HOST and DB_USER and DB_PASSWORD):
@@ -190,7 +186,6 @@ def _db_conn():
         password=DB_PASSWORD,
     )
 
-
 def _get_table_columns(cur, table_name: str) -> set[str]:
     cur.execute(
         """
@@ -201,7 +196,6 @@ def _get_table_columns(cur, table_name: str) -> set[str]:
         (table_name,),
     )
     return {r[0] for r in cur.fetchall()}
-
 
 def _normalize_text_keep_lines(s: str) -> str:
     if not s:
@@ -220,7 +214,6 @@ def _normalize_text_keep_lines(s: str) -> str:
             prev_space = False
             out.append(ch)
     return "".join(out).strip()
-
 
 def _build_global_text_and_page_spans(pages: list[tuple[int, str]]) -> tuple[str, list[tuple[int, int, int]]]:
     parts: list[str] = []
@@ -245,7 +238,6 @@ def _build_global_text_and_page_spans(pages: list[tuple[int, str]]) -> tuple[str
 
     return "", []
 
-
 def _pages_for_slice(spans: list[tuple[int, int, int]], slice_start: int, slice_end: int) -> tuple[int, int]:
     page_from = None
     page_to = None
@@ -262,7 +254,6 @@ def _pages_for_slice(spans: list[tuple[int, int, int]], slice_start: int, slice_
         page_to = page_from
 
     return int(page_from), int(page_to)
-
 
 def _chunk_text(global_text: str, spans: list[tuple[int, int, int]]) -> list[dict]:
     text_len = len(global_text)
@@ -326,7 +317,6 @@ def _openai_embed_texts(texts: list[str]) -> list[list[float]]:
         raise Exception("OpenAI embeddings response missing some items")
     return out
 
-
 def _openai_chat(messages: list[dict]) -> str:
     if not OPENAI_API_KEY:
         raise Exception("OPENAI_API_KEY missing")
@@ -348,15 +338,14 @@ class SearchRequest(BaseModel):
     bubble_document_id: Optional[str] = None
     top_k: int = 5
 
-
 class AskRequest(BaseModel):
     query: str
     company_id: str
     machine_id: Optional[str] = None
     bubble_document_id: Optional[str] = None
+    document_ids: Optional[Union[List[str], str]] = None  # ✅ robusto
     top_k: int = 5
     debug: Optional[bool] = False
-
 
 class Citation(BaseModel):
     citation_id: str
@@ -793,6 +782,19 @@ def ask_v1(
     if not machine_id:
         raise HTTPException(status_code=400, detail="Missing machine_id")
 
+    doc_ids = payload.document_ids
+
+    # ✅ supporta: lista vera oppure stringa "id1, id2, id3"
+    if isinstance(doc_ids, str):
+        doc_ids = [x.strip() for x in doc_ids.split(",") if x.strip()]
+    
+    if isinstance(doc_ids, list):
+        doc_ids = [str(x).strip() for x in doc_ids if str(x).strip()]
+        if not doc_ids:
+            doc_ids = None
+    else:
+        doc_ids = None
+    
     top_k = int(payload.top_k or 5)
     top_k = max(1, min(top_k, ASK_MAX_TOP_K))
 
