@@ -17,6 +17,7 @@ steps:
         "--region", "europe-west1",
         "--platform", "managed",
         "--allow-unauthenticated",
+        "--set-env-vars", "COMMIT_SHA=$COMMIT_SHA",
         "--quiet"
       ]
 
