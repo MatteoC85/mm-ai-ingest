@@ -807,7 +807,7 @@ def ask_v1(
     conn = _db_conn()
     try:
         with conn.cursor() as cur:
-            # ✅ 1) Se document_ids presenti, restringi davvero lo scope ai doc selezionati
+            # ✅ 1) Se document_ids presenti, lo scope è ESATTAMENTE quello (company + doc_ids). Niente filtro macchina.
             if doc_ids:
                 if payload.debug:
                     cur.execute(
@@ -816,10 +816,9 @@ def ask_v1(
                         FROM public.document_chunks
                         WHERE company_id=%s
                         AND bubble_document_id = ANY(%s)
-                        AND embedding IS NOT NULL
-                        AND (machine_id=%s OR machine_id IS NULL);
+                        AND embedding IS NOT NULL;
                         """,
-                        (company_id, doc_ids, machine_id),
+                        (company_id, doc_ids),
                     )
                     chunks_matching_filter = int(cur.fetchone()[0] or 0)
 
@@ -832,14 +831,13 @@ def ask_v1(
                     WHERE company_id = %s
                     AND bubble_document_id = ANY(%s)
                     AND embedding IS NOT NULL
-                    AND (machine_id = %s OR machine_id IS NULL)
                     ORDER BY embedding <=> %s::vector
                     LIMIT %s;
                     """,
-                    (ASK_SNIPPET_CHARS, q_vec_lit, company_id, doc_ids, machine_id, q_vec_lit, top_k),
+                    (ASK_SNIPPET_CHARS, q_vec_lit, company_id, doc_ids, q_vec_lit, top_k),
                 )
 
-            # ✅ 2) Backward compat: singolo bubble_document_id
+            # ✅ 2) Backward compat: singolo bubble_document_id (qui mantiene filtro macchina + generici)
             elif payload.bubble_document_id:
                 bdid = payload.bubble_document_id.strip()
 
@@ -872,7 +870,6 @@ def ask_v1(
                     """,
                     (ASK_SNIPPET_CHARS, q_vec_lit, company_id, bdid, machine_id, q_vec_lit, top_k),
                 )
-
             # ✅ 3) Default: tutti i doc nello scope macchina + generici
             else:
                 cur.execute(
