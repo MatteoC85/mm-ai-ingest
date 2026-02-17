@@ -17,6 +17,7 @@ steps:
         "--region", "europe-west1",
         "--platform", "managed",
         "--allow-unauthenticated",
+        "--traffic", "100",
         "--quiet"
       ]
 
