@@ -1,5 +1,3 @@
-# trigger test 2026-02-17
-
 import os
 import io
 import re
@@ -74,6 +72,7 @@ def _q_has_any(q: str, hints: list[str]) -> bool:
 def _clean_tail(s: str) -> str:
     return (s or "").rstrip(".,;:!?)\"]}")
 
+
 def _extract_first(regex: re.Pattern, text: str) -> Optional[str]:
     if not text:
         return None
@@ -81,6 +80,7 @@ def _extract_first(regex: re.Pattern, text: str) -> Optional[str]:
     if not m:
         return None
     return _clean_tail(m.group(1))
+
 
 def _pick_entity_from_citations(q: str, citations: list[dict]) -> Optional[tuple[str, dict]]:
     wants_url = _q_has_any(q, URL_HINTS)
@@ -109,6 +109,7 @@ def _pick_entity_from_citations(q: str, citations: list[dict]) -> Optional[tuple
                 return (p, c)
 
     return None
+
 
 def _db_find_entity_chunk(company_id: str, machine_id: str, kind: str) -> Optional[dict]:
     """
@@ -166,6 +167,7 @@ def _db_find_entity_chunk(company_id: str, machine_id: str, kind: str) -> Option
     finally:
         conn.close()
 
+
 def _dedup_citations_by_snippet(citations: list[dict], max_items: int) -> list[dict]:
     """
     Dedup semplice: normalizza snippet e tiene la citation con similarity più alta per snippet.
@@ -186,7 +188,8 @@ def _dedup_citations_by_snippet(citations: list[dict], max_items: int) -> list[d
 
     out = list(best.values())
     out.sort(key=lambda x: float(x.get("similarity", 0)), reverse=True)
-    return out[:max_items]      
+    return out[:max_items]
+
 
 def _fts_search_chunks(
     company_id: str,
@@ -261,10 +264,12 @@ def _fts_search_chunks(
     finally:
         conn.close()
 
+
 @app.get("/ping")
 def ping():
     return {"ok": True}
-    
+
+
 @app.get("/version")
 def version():
     return {
@@ -274,11 +279,13 @@ def version():
         "commit_sha": os.environ.get("COMMIT_SHA"),
     }
 
+
 class IngestRequest(BaseModel):
     file_url: str
     company_id: str
     machine_id: str
     bubble_document_id: str
+
 
 def _db_conn():
     if not (DB_HOST and DB_USER and DB_PASSWORD):
@@ -290,6 +297,92 @@ def _db_conn():
         password=DB_PASSWORD,
     )
 
+
+# -----------------------------
+# rg_links support
+# -----------------------------
+def _db_upsert_document_file(company_id: str, bubble_document_id: str, file_url: str) -> None:
+    """
+    Salva (best-effort) file_url per bubble_document_id, per costruire rg_links in /ask.
+    """
+    company_id = (company_id or "").strip()
+    bubble_document_id = (bubble_document_id or "").strip()
+    file_url = (file_url or "").strip()
+    if not (company_id and bubble_document_id and file_url):
+        return
+
+    conn = _db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO public.document_files(company_id, bubble_document_id, file_url, updated_at)
+                VALUES (%s, %s, %s, NOW())
+                ON CONFLICT (company_id, bubble_document_id)
+                DO UPDATE SET file_url = EXCLUDED.file_url, updated_at = NOW();
+                """,
+                (company_id, bubble_document_id, file_url),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _build_rg_links(company_id: str, citations: list[dict]) -> list[dict]:
+    """
+    Ritorna lista di link reali: file_url#page=page_from per ogni citation.
+    """
+    if not citations:
+        return []
+
+    doc_ids = sorted({str(c.get("bubble_document_id") or "").strip() for c in citations if c.get("bubble_document_id")})
+    if not doc_ids:
+        return []
+
+    conn = _db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT bubble_document_id, file_url
+                FROM public.document_files
+                WHERE company_id = %s
+                  AND bubble_document_id = ANY(%s);
+                """,
+                (company_id, doc_ids),
+            )
+            rows = cur.fetchall()
+            file_map = {str(bdid): (url or "").strip() for (bdid, url) in rows if bdid and url}
+    finally:
+        conn.close()
+
+    out: list[dict] = []
+    for c in citations:
+        bdid = str(c.get("bubble_document_id") or "").strip()
+        if not bdid:
+            continue
+        file_url = file_map.get(bdid)
+        if not file_url:
+            continue
+
+        base = file_url.split("#", 1)[0]
+        page_from = int(c.get("page_from") or 1)
+        if page_from < 1:
+            page_from = 1
+
+        out.append(
+            {
+                "citation_id": c.get("citation_id"),
+                "bubble_document_id": bdid,
+                "page_from": int(c.get("page_from") or page_from),
+                "page_to": int(c.get("page_to") or page_from),
+                "url": f"{base}#page={page_from}",
+            }
+        )
+
+    return out
+
+
 def _get_table_columns(cur, table_name: str) -> set[str]:
     cur.execute(
         """
@@ -300,6 +393,7 @@ def _get_table_columns(cur, table_name: str) -> set[str]:
         (table_name,),
     )
     return {r[0] for r in cur.fetchall()}
+
 
 def _normalize_text_keep_lines(s: str) -> str:
     if not s:
@@ -318,6 +412,7 @@ def _normalize_text_keep_lines(s: str) -> str:
             prev_space = False
             out.append(ch)
     return "".join(out).strip()
+
 
 def _build_global_text_and_page_spans(pages: list[tuple[int, str]]) -> tuple[str, list[tuple[int, int, int]]]:
     parts: list[str] = []
@@ -342,6 +437,7 @@ def _build_global_text_and_page_spans(pages: list[tuple[int, str]]) -> tuple[str
 
     return "", []
 
+
 def _pages_for_slice(spans: list[tuple[int, int, int]], slice_start: int, slice_end: int) -> tuple[int, int]:
     page_from = None
     page_to = None
@@ -358,6 +454,7 @@ def _pages_for_slice(spans: list[tuple[int, int, int]], slice_start: int, slice_
         page_to = page_from
 
     return int(page_from), int(page_to)
+
 
 def _chunk_text(global_text: str, spans: list[tuple[int, int, int]]) -> list[dict]:
     text_len = len(global_text)
@@ -421,6 +518,7 @@ def _openai_embed_texts(texts: list[str]) -> list[list[float]]:
         raise Exception("OpenAI embeddings response missing some items")
     return out
 
+
 def _openai_chat(messages: list[dict]) -> str:
     if not OPENAI_API_KEY:
         raise Exception("OPENAI_API_KEY missing")
@@ -442,6 +540,7 @@ class SearchRequest(BaseModel):
     bubble_document_id: Optional[str] = None
     top_k: int = 5
 
+
 class AskRequest(BaseModel):
     query: str
     company_id: str
@@ -450,6 +549,7 @@ class AskRequest(BaseModel):
     document_ids: Optional[Union[List[str], str]] = None  # ✅ robusto
     top_k: int = 5
     debug: Optional[bool] = False
+
 
 class Citation(BaseModel):
     citation_id: str
@@ -483,6 +583,9 @@ def ingest_document(
     url = payload.file_url.strip()
     if url.startswith("//"):
         url = "https:" + url
+
+    # ✅ rg_links: salva file_url per poter costruire link reali (doc#page)
+    _db_upsert_document_file(company_id, bubble_document_id, url)
 
     try:
         r = requests.get(url, timeout=FETCH_TIMEOUT)
@@ -891,14 +994,14 @@ def ask_v1(
     # ✅ supporta: lista vera oppure stringa "id1, id2, id3"
     if isinstance(doc_ids, str):
         doc_ids = [x.strip() for x in doc_ids.split(",") if x.strip()]
-    
+
     if isinstance(doc_ids, list):
         doc_ids = [str(x).strip() for x in doc_ids if str(x).strip()]
         if not doc_ids:
             doc_ids = None
     else:
         doc_ids = None
-    
+
     top_k = int(payload.top_k or 5)
     top_k = max(1, min(top_k, ASK_MAX_TOP_K))
 
@@ -1001,6 +1104,7 @@ def ask_v1(
             "status": "no_sources",
             "answer": "Non trovo informazioni nei documenti indicizzati per rispondere.",
             "citations": [],
+            "rg_links": [],  # ✅
             "top_k": top_k,
             "similarity_max": None,
         }
@@ -1050,25 +1154,24 @@ def ask_v1(
             fts_used = True
             citations = _dedup_citations_by_snippet(citations + fts, max_items=top_k)
 
-
     # ✅ Entity fallback: se la domanda chiede sito/email/telefono e lo troviamo negli snippet, rispondiamo anche sotto soglia
     if sim_max < ASK_SIM_THRESHOLD:
         picked = _pick_entity_from_citations(q, citations)
         if picked:
             value, c = picked
             answer = f"Nel documento compare questo dato: {value} [{c['citation_id']}]"
+            rg_links = _build_rg_links(company_id, citations)
             return {
                 "ok": True,
                 "status": "answered",
                 "answer": answer,
                 "citations": citations,
+                "rg_links": rg_links,  # ✅
                 "top_k": top_k,
                 "similarity_max": sim_max,
                 "chat_model": OPENAI_CHAT_MODEL,
             }
-        
-        # 2nd-level fallback: se gli snippet top_k non contengono l'entità,
-        # prova a cercarla direttamente nel DB nello scope macchina + generici.
+
         kind = None
         if _q_has_any(q, URL_HINTS):
             kind = "url"
@@ -1081,33 +1184,35 @@ def ask_v1(
             hit = _db_find_entity_chunk(company_id=company_id, machine_id=machine_id, kind=kind)
             if hit:
                 answer = f"Nel documento compare questo dato: {hit['value']} [{hit['citation_id']}]"
+                cit_list = [
+                    {
+                        "citation_id": hit["citation_id"],
+                        "bubble_document_id": hit["bubble_document_id"],
+                        "page_from": hit["page_from"],
+                        "page_to": hit["page_to"],
+                        "snippet": hit["snippet"],
+                        "similarity": sim_max,
+                    }
+                ]
+                rg_links = _build_rg_links(company_id, cit_list)
                 return {
                     "ok": True,
                     "status": "answered",
                     "answer": answer,
-                    "citations": [
-                        {
-                            "citation_id": hit["citation_id"],
-                            "bubble_document_id": hit["bubble_document_id"],
-                            "page_from": hit["page_from"],
-                            "page_to": hit["page_to"],
-                            "snippet": hit["snippet"],
-                            "similarity": sim_max,
-                        }
-                    ],
+                    "citations": cit_list,
+                    "rg_links": rg_links,  # ✅
                     "top_k": top_k,
                     "similarity_max": sim_max,
                     "chat_model": OPENAI_CHAT_MODEL,
                 }
 
-        # ✅ Se FTS ha trovato fonti (citations non vuote), NON ritornare no_sources:
-        # passiamo alla generazione LLM usando SOLO le fonti trovate.
         if not (fts_used and citations):
             resp = {
                 "ok": True,
                 "status": "no_sources",
                 "answer": "Non trovo informazioni nei documenti indicizzati per rispondere.",
                 "citations": [],
+                "rg_links": [],  # ✅
                 "top_k": top_k,
                 "similarity_max": sim_max,
             }
@@ -1179,15 +1284,19 @@ def ask_v1(
             "status": "no_sources",
             "answer": answer,
             "citations": [],
+            "rg_links": [],  # ✅
             "top_k": top_k,
             "similarity_max": sim_max,
         }
+
+    rg_links = _build_rg_links(company_id, citations)
 
     return {
         "ok": True,
         "status": "answered",
         "answer": answer,
         "citations": citations,
+        "rg_links": rg_links,  # ✅
         "top_k": top_k,
         "similarity_max": sim_max,
         "chat_model": OPENAI_CHAT_MODEL,
