@@ -229,18 +229,23 @@ def _fts_search_chunks(
             cur.execute(
                 f"""
                 SELECT bubble_document_id, chunk_index, page_from, page_to,
-                       left(chunk_text, %s) AS snippet
+                    left(chunk_text, %s) AS snippet,
+                    ts_rank_cd(
+                        to_tsvector('simple', chunk_text),
+                        plainto_tsquery('simple', %s)
+                    ) AS rank
                 FROM public.document_chunks
                 WHERE {where_sql}
-                  AND to_tsvector('simple', chunk_text) @@ plainto_tsquery('simple', %s)
+                AND to_tsvector('simple', chunk_text) @@ plainto_tsquery('simple', %s)
+                ORDER BY rank DESC
                 LIMIT %s;
                 """,
-                [ASK_SNIPPET_CHARS, *params, q, top_k],
+                [ASK_SNIPPET_CHARS, q, *params, q, top_k],
             )
             rows = cur.fetchall()
 
             out: list[dict] = []
-            for (bdid, chunk_index, page_from, page_to, snippet) in rows:
+            for (bdid, chunk_index, page_from, page_to, snippet, rank) in rows:
                 citation_id = f"{bdid}:p{int(page_from)}-{int(page_to)}:c{int(chunk_index)}"
                 out.append(
                     {
