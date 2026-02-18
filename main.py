@@ -188,6 +188,74 @@ def _dedup_citations_by_snippet(citations: list[dict], max_items: int) -> list[d
     out.sort(key=lambda x: float(x.get("similarity", 0)), reverse=True)
     return out[:max_items]      
 
+def _fts_search_chunks(
+    company_id: str,
+    machine_id: str,
+    q: str,
+    top_k: int,
+    doc_ids: Optional[list[str]] = None,
+    bubble_document_id: Optional[str] = None,
+) -> list[dict]:
+    """
+    Lexical retrieval (Postgres FTS) nello stesso scope del dense retrieval.
+    Ritorna citations-like: {citation_id, bubble_document_id, page_from, page_to, snippet, similarity}
+    similarity per FTS = 0.0 (non confrontabile con cosine).
+    """
+    q = (q or "").strip()
+    if not q:
+        return []
+
+    conn = _db_conn()
+    try:
+        with conn.cursor() as cur:
+            where = ["company_id = %s"]
+            params: list[Any] = [company_id]
+
+            # scope coerente con ask_v1
+            if doc_ids:
+                where.append("bubble_document_id = ANY(%s)")
+                params.append(doc_ids)
+            elif bubble_document_id:
+                where.append("bubble_document_id = %s")
+                params.append(bubble_document_id)
+                where.append("(machine_id = %s OR machine_id IS NULL)")
+                params.append(machine_id)
+            else:
+                where.append("(machine_id = %s OR machine_id IS NULL)")
+                params.append(machine_id)
+
+            where_sql = " AND ".join(where)
+
+            cur.execute(
+                f"""
+                SELECT bubble_document_id, chunk_index, page_from, page_to,
+                       left(chunk_text, %s) AS snippet
+                FROM public.document_chunks
+                WHERE {where_sql}
+                  AND to_tsvector('simple', chunk_text) @@ plainto_tsquery('simple', %s)
+                LIMIT %s;
+                """,
+                [ASK_SNIPPET_CHARS, *params, q, top_k],
+            )
+            rows = cur.fetchall()
+
+            out: list[dict] = []
+            for (bdid, chunk_index, page_from, page_to, snippet) in rows:
+                citation_id = f"{bdid}:p{int(page_from)}-{int(page_to)}:c{int(chunk_index)}"
+                out.append(
+                    {
+                        "citation_id": citation_id,
+                        "bubble_document_id": bdid,
+                        "page_from": int(page_from),
+                        "page_to": int(page_to),
+                        "snippet": (snippet or "").strip(),
+                        "similarity": 0.0,  # FTS non è cosine
+                    }
+                )
+            return out
+    finally:
+        conn.close()
+
 @app.get("/ping")
 def ping():
     return {"ok": True}
@@ -957,9 +1025,22 @@ def ask_v1(
                 "similarity": sim,
             }
         )
-        
+
     # ✅ dedup: evita doppioni (stesso snippet) quando document_ids include doc simili/duplicati
     citations = _dedup_citations_by_snippet(citations, max_items=top_k)
+
+    # ✅ Hybrid retrieval: se dense è debole, aggiungi anche risultati FTS nello stesso scope
+    if sim_max < ASK_SIM_THRESHOLD:
+        fts = _fts_search_chunks(
+            company_id=company_id,
+            machine_id=machine_id,
+            q=q,
+            top_k=top_k,
+            doc_ids=doc_ids if isinstance(doc_ids, list) else None,
+            bubble_document_id=payload.bubble_document_id.strip() if payload.bubble_document_id else None,
+        )
+        if fts:
+            citations = _dedup_citations_by_snippet(citations + fts, max_items=top_k)
 
     # ✅ Entity fallback: se la domanda chiede sito/email/telefono e lo troviamo negli snippet, rispondiamo anche sotto soglia
     if sim_max < ASK_SIM_THRESHOLD:
