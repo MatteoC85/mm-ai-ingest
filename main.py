@@ -166,6 +166,28 @@ def _db_find_entity_chunk(company_id: str, machine_id: str, kind: str) -> Option
     finally:
         conn.close()
 
+def _dedup_citations_by_snippet(citations: list[dict], max_items: int) -> list[dict]:
+    """
+    Dedup semplice: normalizza snippet e tiene la citation con similarity più alta per snippet.
+    """
+    def norm(s: str) -> str:
+        s = (s or "").strip().lower()
+        s = re.sub(r"\s+", " ", s)
+        return s[:400]  # basta per dedup
+
+    best = {}
+    for c in citations:
+        k = norm(c.get("snippet", ""))
+        if not k:
+            k = c.get("citation_id")
+        prev = best.get(k)
+        if (prev is None) or (float(c.get("similarity", 0)) > float(prev.get("similarity", 0))):
+            best[k] = c
+
+    out = list(best.values())
+    out.sort(key=lambda x: float(x.get("similarity", 0)), reverse=True)
+    return out[:max_items]      
+
 @app.get("/ping")
 def ping():
     return {"ok": True}
@@ -935,6 +957,9 @@ def ask_v1(
                 "similarity": sim,
             }
         )
+        
+    # ✅ dedup: evita doppioni (stesso snippet) quando document_ids include doc simili/duplicati
+    citations = _dedup_citations_by_snippet(citations, max_items=top_k)
 
     # ✅ Entity fallback: se la domanda chiede sito/email/telefono e lo troviamo negli snippet, rispondiamo anche sotto soglia
     if sim_max < ASK_SIM_THRESHOLD:
