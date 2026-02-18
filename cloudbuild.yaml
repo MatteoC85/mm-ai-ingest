@@ -3,42 +3,37 @@ logsBucket: gs://mm-ai-cb-logs-443517556116
 
 steps:
   - name: gcr.io/cloud-builders/docker
-    args: ["build", "-t", "europe-west1-docker.pkg.dev/$PROJECT_ID/mm-ai-ingest/mm-ai-ingest:$COMMIT_SHA", "-f", "Dockerfile", "."]
+    args:
+      [
+        "build",
+        "-t",
+        "europe-west1-docker.pkg.dev/$PROJECT_ID/mm-ai-ingest/mm-ai-ingest:$COMMIT_SHA",
+        "-f",
+        "Dockerfile",
+        "."
+      ]
 
   - name: gcr.io/cloud-builders/docker
-    args: ["push", "europe-west1-docker.pkg.dev/$PROJECT_ID/mm-ai-ingest/mm-ai-ingest:$COMMIT_SHA"]
+    args:
+      [
+        "push",
+        "europe-west1-docker.pkg.dev/$PROJECT_ID/mm-ai-ingest/mm-ai-ingest:$COMMIT_SHA"
+      ]
 
-  # 1) Deploy immagine (SENZA --set-env-vars: evita wipe env)
   - name: gcr.io/google.com/cloudsdktool/cloud-sdk
     entrypoint: gcloud
     args:
       [
-        "run", "deploy", "mm-ai-ingest-fixed",
-        "--image", "europe-west1-docker.pkg.dev/$PROJECT_ID/mm-ai-ingest/mm-ai-ingest:$COMMIT_SHA",
-        "--region", "europe-west1",
-        "--platform", "managed",
+        "run",
+        "deploy",
+        "mm-ai-ingest-fixed",
+        "--image",
+        "europe-west1-docker.pkg.dev/$PROJECT_ID/mm-ai-ingest/mm-ai-ingest:$COMMIT_SHA",
+        "--region",
+        "europe-west1",
+        "--platform",
+        "managed",
         "--allow-unauthenticated",
-        "--quiet"
-      ]
-
-  # 2) Update NON-distruttivo env vars (aggiunge/override solo queste)
-  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
-    entrypoint: gcloud
-    args:
-      [
-        "run", "services", "update", "mm-ai-ingest-fixed",
-        "--region", "europe-west1",
-        "--update-env-vars", "COMMIT_SHA=$COMMIT_SHA,AI_INTERNAL_SECRET=v1_internal_9f3c1d7a6b2e4f8c0a5d1e9b3c7f2a6d",
-        "--quiet"
-      ]
-
-  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
-    entrypoint: gcloud
-    args:
-      [
-        "run", "services", "update-traffic", "mm-ai-ingest-fixed",
-        "--region", "europe-west1",
-        "--to-latest",
         "--quiet"
       ]
 
