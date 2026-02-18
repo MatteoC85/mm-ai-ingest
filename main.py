@@ -1029,6 +1029,8 @@ def ask_v1(
     # ✅ dedup: evita doppioni (stesso snippet) quando document_ids include doc simili/duplicati
     citations = _dedup_citations_by_snippet(citations, max_items=top_k)
 
+    fts_used = False
+
     # ✅ Hybrid retrieval: se dense è debole, aggiungi anche risultati FTS nello stesso scope
     if sim_max < ASK_SIM_THRESHOLD:
         fts = _fts_search_chunks(
@@ -1040,7 +1042,9 @@ def ask_v1(
             bubble_document_id=payload.bubble_document_id.strip() if payload.bubble_document_id else None,
         )
         if fts:
+            fts_used = True
             citations = _dedup_citations_by_snippet(citations + fts, max_items=top_k)
+
 
     # ✅ Entity fallback: se la domanda chiede sito/email/telefono e lo troviamo negli snippet, rispondiamo anche sotto soglia
     if sim_max < ASK_SIM_THRESHOLD:
@@ -1091,22 +1095,26 @@ def ask_v1(
                     "chat_model": OPENAI_CHAT_MODEL,
                 }
 
-        resp = {
-            "ok": True,
-            "status": "no_sources",
-            "answer": "Non trovo informazioni nei documenti indicizzati per rispondere.",
-            "citations": [],
-            "top_k": top_k,
-            "similarity_max": sim_max,
-        }
-        if payload.debug:
-            resp["debug"] = {
-                "company_id": company_id,
-                "machine_id": machine_id,
-                "bubble_document_id": payload.bubble_document_id,
-                "chunks_matching_filter": chunks_matching_filter,
+        # ✅ Se FTS ha trovato fonti (citations non vuote), NON ritornare no_sources:
+        # passiamo alla generazione LLM usando SOLO le fonti trovate.
+        if not (fts_used and citations):
+            resp = {
+                "ok": True,
+                "status": "no_sources",
+                "answer": "Non trovo informazioni nei documenti indicizzati per rispondere.",
+                "citations": [],
+                "top_k": top_k,
+                "similarity_max": sim_max,
             }
-        return resp
+            if payload.debug:
+                resp["debug"] = {
+                    "company_id": company_id,
+                    "machine_id": machine_id,
+                    "bubble_document_id": payload.bubble_document_id,
+                    "chunks_matching_filter": chunks_matching_filter,
+                    "fts_used": fts_used,
+                }
+            return resp
 
     ctx_parts: List[str] = []
     total_chars = 0
