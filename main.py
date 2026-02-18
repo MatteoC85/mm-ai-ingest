@@ -1160,7 +1160,13 @@ def ask_v1(
         if picked:
             value, c = picked
             answer = f"Nel documento compare questo dato: {value} [{c['citation_id']}]"
-            rg_links = _build_rg_links(company_id, citations)
+            rg_links = []
+            try:
+                rg_links = _build_rg_links(company_id, citations)
+            except Exception as e:
+                print("RG_LINKS_FAIL", str(e))
+                rg_links = []
+
             return {
                 "ok": True,
                 "status": "answered",
@@ -1289,7 +1295,13 @@ def ask_v1(
             "similarity_max": sim_max,
         }
 
-    rg_links = _build_rg_links(company_id, citations)
+    rg_links = []
+    try:
+        rg_links = _build_rg_links(company_id, citations)
+    except Exception as e:
+        print("RG_LINKS_FAIL", str(e))
+        rg_links = []
+
 
     return {
         "ok": True,
