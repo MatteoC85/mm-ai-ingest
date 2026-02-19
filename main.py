@@ -58,6 +58,91 @@ ASK_MAX_CONTEXT_CHARS = int(os.environ.get("MM_ASK_MAX_CONTEXT_CHARS", "6000"))
 URL_REGEX = re.compile(r"(https?://[^\s\)\]\}]+|www\.[^\s\)\]\}]+)", re.IGNORECASE)
 EMAIL_REGEX = re.compile(r"([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})", re.IGNORECASE)
 PHONE_REGEX = re.compile(r"(\+?\d[\d\s().-]{7,}\d)")
+# -----------------------------
+# Code token fallback (SENTINEL / part-number / codici)
+# -----------------------------
+CODE_TOKEN_REGEX = re.compile(r"\b[A-Z0-9_]{6,}\b")
+
+
+def _extract_code_tokens(q: str) -> list[str]:
+    q = (q or "").strip().upper()
+    if not q:
+        return []
+    toks = CODE_TOKEN_REGEX.findall(q)
+    out = []
+    seen = set()
+    for t in toks:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out[:5]  # cap low-cost
+
+
+def _db_find_token_chunk(
+    company_id: str,
+    machine_id: str,
+    token: str,
+    doc_ids: Optional[list[str]] = None,
+    bubble_document_id: Optional[str] = None,
+) -> Optional[dict]:
+    """
+    Fallback deterministico per codici (SENTINEL, part-number, ecc.)
+    Cerca ILIKE '%TOKEN%' nello stesso scope dell'ask.
+    Ritorna citation-like: {citation_id, bubble_document_id, page_from, page_to, snippet, similarity}
+    """
+    token = (token or "").strip()
+    if not token:
+        return None
+
+    conn = _db_conn()
+    try:
+        with conn.cursor() as cur:
+            where = ["company_id = %s"]
+            params: list[Any] = [company_id]
+
+            if doc_ids:
+                where.append("bubble_document_id = ANY(%s)")
+                params.append(doc_ids)
+            elif bubble_document_id:
+                where.append("bubble_document_id = %s")
+                params.append(bubble_document_id)
+                where.append("(machine_id = %s OR machine_id IS NULL)")
+                params.append(machine_id)
+            else:
+                where.append("(machine_id = %s OR machine_id IS NULL)")
+                params.append(machine_id)
+
+            where_sql = " AND ".join(where)
+
+            cur.execute(
+                f"""
+                SELECT bubble_document_id, chunk_index, page_from, page_to,
+                       left(chunk_text, %s) AS snippet
+                FROM public.document_chunks
+                WHERE {where_sql}
+                  AND chunk_text ILIKE %s
+                ORDER BY bubble_document_id, page_from, chunk_index
+                LIMIT 1;
+                """,
+                [ASK_SNIPPET_CHARS, *params, f"%{token}%"],
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+
+            bdid, chunk_index, page_from, page_to, snippet = row
+            citation_id = f"{bdid}:p{int(page_from)}-{int(page_to)}:c{int(chunk_index)}"
+            return {
+                "citation_id": citation_id,
+                "bubble_document_id": str(bdid),
+                "page_from": int(page_from),
+                "page_to": int(page_to),
+                "snippet": (snippet or "").strip(),
+                "similarity": 0.0,
+            }
+    finally:
+        conn.close()
+
 
 URL_HINTS = ["sito", "website", "web site", "url", "link", "pagina", "dominio", "www"]
 EMAIL_HINTS = ["email", "e-mail", "mail", "posta"]
@@ -1211,7 +1296,41 @@ def ask_v1(
                     "similarity_max": sim_max,
                     "chat_model": OPENAI_CHAT_MODEL,
                 }
+        # ✅ Fallback deterministico per "codici" (SENTINEL, part-number, ecc.)
+        code_tokens = _extract_code_tokens(q)
+        if code_tokens:
+            hit = None
+            for tok in code_tokens:
+                hit = _db_find_token_chunk(
+                    company_id=company_id,
+                    machine_id=machine_id,
+                    token=tok,
+                    doc_ids=doc_ids if isinstance(doc_ids, list) else None,
+                    bubble_document_id=payload.bubble_document_id.strip() if payload.bubble_document_id else None,
+                )
+                if hit:
+                    break
 
+            if hit:
+                cit_list = [hit]
+                rg_links = []
+                try:
+                    rg_links = _build_rg_links(company_id, cit_list)
+                except Exception as e:
+                    print("RG_LINKS_FAIL", str(e))
+                    rg_links = []
+
+                return {
+                    "ok": True,
+                    "status": "answered",
+                    "answer": f"Nel documento compare questa stringa: {code_tokens[0]} [{hit['citation_id']}]",
+                    "citations": cit_list,
+                    "rg_links": rg_links,
+                    "top_k": top_k,
+                    "similarity_max": sim_max,
+                    "chat_model": OPENAI_CHAT_MODEL,
+                }
+                
         if not (fts_used and citations):
             resp = {
                 "ok": True,
