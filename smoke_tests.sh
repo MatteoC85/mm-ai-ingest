@@ -103,8 +103,8 @@ PY
 # -----------------------------
 parse_status() {
   python3 -c 'import json,sys
-raw = sys.stdin.buffer.read().decode("utf-8", errors="replace")
-raw_strip = raw.strip()
+raw=sys.stdin.buffer.read().decode("utf-8", errors="replace")
+raw_strip=raw.strip()
 obj=None
 try:
     obj=json.loads(raw_strip)
