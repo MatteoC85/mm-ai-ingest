@@ -102,50 +102,38 @@ PY
 # - stderr: debug (non rompe command substitution)
 # -----------------------------
 parse_status() {
-  python3 - <<'PY'
-import json, sys
-
+  python3 -c 'import json,sys
 raw = sys.stdin.buffer.read().decode("utf-8", errors="replace")
 raw_strip = raw.strip()
-
-obj = None
-# 1) try full parse
+obj=None
 try:
-    obj = json.loads(raw_strip)
+    obj=json.loads(raw_strip)
 except Exception:
-    obj = None
-
-# 2) fallback: extract first JSON object
+    obj=None
 if not isinstance(obj, dict):
-    i = raw.find("{")
-    j = raw.rfind("}")
-    if i != -1 and j != -1 and j > i:
-        candidate = raw[i:j+1]
+    i=raw.find("{")
+    j=raw.rfind("}")
+    if i!=-1 and j!=-1 and j>i:
+        candidate=raw[i:j+1]
         try:
-            obj = json.loads(candidate)
+            obj=json.loads(candidate)
         except Exception:
-            obj = None
-
+            obj=None
 if not isinstance(obj, dict):
     sys.stderr.write("parse_status: PARSE_ERROR (not JSON). RAW_HEAD=" + raw[:220].replace("\n","\\n") + "\n")
     print("PARSE_ERROR")
-    sys.exit(0)
-
-status = obj.get("status") or ""
+    raise SystemExit
+status=obj.get("status") or ""
 if not status:
     sys.stderr.write("parse_status: PARSE_ERROR (missing .status). keys=" + ",".join(obj.keys()) + "\n")
     print("PARSE_ERROR")
-    sys.exit(0)
-
-# Se status=error, stampa dettagli utili su stderr
-if status == "error":
-    err = obj.get("error") or {}
-    code = obj.get("error_code") or err.get("code") or ""
-    msg = err.get("message") or ""
+    raise SystemExit
+if status=="error":
+    err=obj.get("error") or {}
+    code=obj.get("error_code") or err.get("code") or ""
+    msg=err.get("message") or ""
     sys.stderr.write(f"parse_status: API status=error code={code} message={msg}\n")
-
-print(status)
-PY
+print(status)'
 }
 
 # -----------------------------
