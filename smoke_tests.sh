@@ -43,6 +43,7 @@ ask_status() {
   local doc="$3"
   local query="$4"
 
+  # prende la risposta (JSON) in una variabile
   local resp
   resp="$(curl --max-time 60 --connect-timeout 10 -sS -X POST "$WORKER_URL" \
     -H "Content-Type: application/json" \
@@ -55,15 +56,16 @@ ask_status() {
       \"options\":{\"top_k\":$TOP_K}
     }" || true)"
 
-  python3 - <<PY
-import json
-raw = """$resp"""
+  # passa la risposta a python via STDIN (NO injection nel codice)
+  printf '%s' "$resp" | python3 - <<'PY'
+import json,sys
+raw = sys.stdin.read()
 try:
-  j = json.loads(raw)
-  print(j.get("status",""))
+    j = json.loads(raw)
+    print(j.get("status",""))
 except Exception:
-  print("PARSE_ERROR")
-  print(raw[:400])
+    print("PARSE_ERROR")
+    print(raw[:400])
 PY
 }
 
