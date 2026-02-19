@@ -1432,3 +1432,67 @@ def ask_v1(
         "similarity_max": sim_max,
         "chat_model": OPENAI_CHAT_MODEL,
     }
+# -----------------------------
+# Delete PRO (hard delete RAG data)
+# -----------------------------
+class DeleteDocumentRequest(BaseModel):
+    company_id: str
+    bubble_document_id: str
+
+
+@app.post("/v1/ai/delete/document")
+def delete_document_v1(
+    payload: DeleteDocumentRequest,
+    x_ai_internal_secret: Optional[str] = Header(default=None),
+):
+    if not AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=500, detail="AI_INTERNAL_SECRET missing")
+    if (x_ai_internal_secret or "").strip() != AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    company_id = (payload.company_id or "").strip()
+    bubble_document_id = (payload.bubble_document_id or "").strip()
+    if not (company_id and bubble_document_id):
+        raise HTTPException(status_code=400, detail="Missing company_id/bubble_document_id")
+
+    deleted_chunks = 0
+    deleted_pages = 0
+    deleted_files = 0
+
+    conn = _db_conn()
+    try:
+        with conn.cursor() as cur:
+            # Ordine: chunks -> pages -> files (idempotente)
+            cur.execute(
+                "DELETE FROM public.document_chunks WHERE company_id=%s AND bubble_document_id=%s;",
+                (company_id, bubble_document_id),
+            )
+            deleted_chunks = cur.rowcount or 0
+
+            cur.execute(
+                "DELETE FROM public.document_pages WHERE company_id=%s AND bubble_document_id=%s;",
+                (company_id, bubble_document_id),
+            )
+            deleted_pages = cur.rowcount or 0
+
+            cur.execute(
+                "DELETE FROM public.document_files WHERE company_id=%s AND bubble_document_id=%s;",
+                (company_id, bubble_document_id),
+            )
+            deleted_files = cur.rowcount or 0
+
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {
+        "ok": True,
+        "status": "deleted",
+        "company_id": company_id,
+        "bubble_document_id": bubble_document_id,
+        "deleted": {
+            "document_chunks": int(deleted_chunks),
+            "document_pages": int(deleted_pages),
+            "document_files": int(deleted_files),
+        },
+    }
