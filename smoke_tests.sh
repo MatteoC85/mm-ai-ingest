@@ -44,22 +44,29 @@ ask_status() {
   local query="$4"
 
   # prende la risposta (JSON) in una variabile
-  local resp
-  resp="$(curl --max-time 60 --connect-timeout 10 -sS -X POST "$WORKER_URL" \
-    -H "Content-Type: application/json" \
-    -d "{
-      \"auth_token\":\"$TOKEN\",
-      \"company_id\":\"$company\",
-      \"machine_id\":\"$machine\",
-      \"document_ids\":\"$doc\",
-      \"query\":\"$query\",
-      \"options\":{\"top_k\":$TOP_K}
-    }" || true)"
+  local resp=""
+  for _ in 1 2 3; do
+    resp="$(curl --max-time 60 --connect-timeout 10 -sS -X POST "$WORKER_URL" \
+      -H "Content-Type: application/json" \
+      -d "{
+        \"auth_token\":\"$TOKEN\",
+        \"company_id\":\"$company\",
+        \"machine_id\":\"$machine\",
+        \"document_ids\":\"$doc\",
+        \"query\":\"$query\",
+        \"options\":{\"top_k\":$TOP_K}
+      }" || true)"
+    if [[ "${resp:0:1}" == "{" ]]; then
+      break
+    fi
+    sleep 1
+  done
 
   # passa la risposta a python via STDIN (NO injection nel codice)
   printf '%s' "$resp" | python3 - <<'PY'
 import json,sys
-raw = sys.stdin.read()
+raw_bytes = sys.stdin.buffer.read()
+raw = raw_bytes.decode("utf-8", errors="replace")
 try:
     j = json.loads(raw)
     print(j.get("status",""))
