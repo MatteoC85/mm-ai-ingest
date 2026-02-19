@@ -1,17 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# MachineMind AI — Smoke tests (multi-tenant anti-leak + sentinel/code fallback)
-# Usage:
-#   export TOKEN="v1_internal_..."
-#   bash smoke_tests.sh
-#
-# Expected:
-#   - A sees A  -> answered
-#   - B sees B  -> answered
-#   - A sees B  -> no_sources
-#   - B sees A  -> no_sources
-
 WORKER_URL="https://mm-ai-mock.square-sunset-7388.workers.dev/v1/ai/ask"
 
 # ---- IDs (DEV) ----
@@ -26,6 +15,7 @@ DOC_B="1771494052788x533049530417938400"
 SENT_B="SENTINEL_B_K2M8P"
 
 TOP_K=5
+MAX_ATTEMPTS=6
 
 if [[ -z "${TOKEN:-}" ]]; then
   echo "ERROR: TOKEN env var is required."
@@ -37,66 +27,80 @@ need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "ERROR: missing command '
 need_cmd curl
 need_cmd python3
 
+build_payload() {
+  # Args: company machine doc query
+  python3 - <<PY
+import json
+company="${1}"
+machine="${2}"
+doc="${3}"
+query="${4}"
+token="${TOKEN}"
+top_k=int("${TOP_K}")
+print(json.dumps({
+  "auth_token": token,
+  "company_id": company,
+  "machine_id": machine,
+  "document_ids": doc,
+  "query": query,
+  "options": {"top_k": top_k},
+}, ensure_ascii=False))
+PY
+}
+
+parse_status() {
+  # Read JSON from stdin and print .status (or PARSE_ERROR)
+  python3 - <<'PY'
+import json,sys
+raw = sys.stdin.buffer.read().decode("utf-8", errors="replace")
+try:
+  j = json.loads(raw)
+  print(j.get("status",""))
+except Exception:
+  print("PARSE_ERROR")
+PY
+}
+
 ask_status() {
   local company="$1"
   local machine="$2"
   local doc="$3"
   local query="$4"
 
-  # Build JSON payload via python to avoid any quoting/emoji/special-char issues.
   local payload
-  payload="$(python3 - <<PY
-import json
-print(json.dumps({
-  "auth_token": "${TOKEN}",
-  "company_id": "${company}",
-  "machine_id": "${machine}",
-  "document_ids": "${doc}",
-  "query": "${query}",
-  "options": {"top_k": int("${TOP_K}")},
-}, ensure_ascii=False))
-PY
-)"
+  payload="$(build_payload "$company" "$machine" "$doc" "$query")"
 
   local resp=""
-  local rc=0
-  local ok_json="0"
+  local attempt=1
+  local sleep_s=1
 
-  # Retry transient network/empty body issues
-  for _ in 1 2 3 4 5; do
+  while [[ $attempt -le $MAX_ATTEMPTS ]]; do
     set +e
     resp="$(curl --max-time 60 --connect-timeout 10 -sS -X POST "$WORKER_URL" \
       -H "Content-Type: application/json; charset=utf-8" \
       --data-binary "$payload")"
-    rc=$?
+    local rc=$?
     set -e
 
+    # Success path: non-empty JSON body
     if [[ $rc -eq 0 && -n "$resp" && "${resp:0:1}" == "{" ]]; then
-      ok_json="1"
-      break
+      printf '%s' "$resp" | parse_status
+      return 0
     fi
 
-    sleep 1
+    # Retry
+    if [[ $attempt -lt $MAX_ATTEMPTS ]]; then
+      sleep "$sleep_s"
+      sleep_s=$((sleep_s * 2))
+      if [[ $sleep_s -gt 16 ]]; then sleep_s=16; fi
+    fi
+    attempt=$((attempt + 1))
   done
 
-  if [[ "$ok_json" != "1" ]]; then
-    echo "PARSE_ERROR"
-    echo "RAW_HEAD: ${resp:0:400}"
-    return 0
-  fi
-
-  # Parse JSON robustly (emoji/unicode safe)
-  printf '%s' "$resp" | python3 - <<'PY'
-import json,sys
-raw_bytes = sys.stdin.buffer.read()
-raw = raw_bytes.decode("utf-8", errors="replace")
-try:
-    j = json.loads(raw)
-    print(j.get("status",""))
-except Exception:
-    print("PARSE_ERROR")
-    print("RAW_HEAD:", raw[:400].replace("\n","\\n"))
-PY
+  # After retries: fail hard with clear error
+  echo "NETWORK_ERROR"
+  echo "RAW_HEAD: ${resp:0:200}"
+  return 0
 }
 
 assert_eq() {
