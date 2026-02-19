@@ -43,26 +43,49 @@ ask_status() {
   local doc="$3"
   local query="$4"
 
-  # prende la risposta (JSON) in una variabile
+  # Build JSON payload via python to avoid any quoting/emoji/special-char issues.
+  local payload
+  payload="$(python3 - <<PY
+import json
+print(json.dumps({
+  "auth_token": "${TOKEN}",
+  "company_id": "${company}",
+  "machine_id": "${machine}",
+  "document_ids": "${doc}",
+  "query": "${query}",
+  "options": {"top_k": int("${TOP_K}")},
+}, ensure_ascii=False))
+PY
+)"
+
   local resp=""
-  for _ in 1 2 3; do
+  local rc=0
+  local ok_json="0"
+
+  # Retry transient network/empty body issues
+  for _ in 1 2 3 4 5; do
+    set +e
     resp="$(curl --max-time 60 --connect-timeout 10 -sS -X POST "$WORKER_URL" \
-      -H "Content-Type: application/json" \
-      -d "{
-        \"auth_token\":\"$TOKEN\",
-        \"company_id\":\"$company\",
-        \"machine_id\":\"$machine\",
-        \"document_ids\":\"$doc\",
-        \"query\":\"$query\",
-        \"options\":{\"top_k\":$TOP_K}
-      }" || true)"
-    if [[ "${resp:0:1}" == "{" ]]; then
+      -H "Content-Type: application/json; charset=utf-8" \
+      --data-binary "$payload")"
+    rc=$?
+    set -e
+
+    if [[ $rc -eq 0 && -n "$resp" && "${resp:0:1}" == "{" ]]; then
+      ok_json="1"
       break
     fi
+
     sleep 1
   done
 
-  # passa la risposta a python via STDIN (NO injection nel codice)
+  if [[ "$ok_json" != "1" ]]; then
+    echo "PARSE_ERROR"
+    echo "RAW_HEAD: ${resp:0:400}"
+    return 0
+  fi
+
+  # Parse JSON robustly (emoji/unicode safe)
   printf '%s' "$resp" | python3 - <<'PY'
 import json,sys
 raw_bytes = sys.stdin.buffer.read()
