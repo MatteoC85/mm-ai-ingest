@@ -3,14 +3,14 @@ set -euo pipefail
 
 # MachineMind AI — Smoke tests (multi-tenant anti-leak + sentinel/code fallback)
 # Usage:
-#   export TOKEN="v1_internal_..."   # DO NOT commit the token in git
-#   ./smoke_tests.sh
+#   export TOKEN="v1_internal_..."
+#   bash smoke_tests.sh
 #
-# Expected outcomes:
-#   1) A sees A  -> answered
-#   2) B sees B  -> answered
-#   3) A sees B  -> no_sources
-#   4) B sees A  -> no_sources
+# Expected:
+#   - A sees A  -> answered
+#   - B sees B  -> answered
+#   - A sees B  -> no_sources
+#   - B sees A  -> no_sources
 
 WORKER_URL="https://mm-ai-mock.square-sunset-7388.workers.dev/v1/ai/ask"
 
@@ -33,9 +33,7 @@ if [[ -z "${TOKEN:-}" ]]; then
   exit 2
 fi
 
-need_cmd() {
-  command -v "$1" >/dev/null 2>&1 || { echo "ERROR: missing command '$1'"; exit 2; }
-}
+need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "ERROR: missing command '$1'"; exit 2; }; }
 need_cmd curl
 need_cmd python3
 
@@ -45,7 +43,8 @@ ask_status() {
   local doc="$3"
   local query="$4"
 
-  curl -s -X POST "$WORKER_URL" \
+  local resp
+  resp="$(curl --max-time 60 --connect-timeout 10 -sS -X POST "$WORKER_URL" \
     -H "Content-Type: application/json" \
     -d "{
       \"auth_token\":\"$TOKEN\",
@@ -54,14 +53,17 @@ ask_status() {
       \"document_ids\":\"$doc\",
       \"query\":\"$query\",
       \"options\":{\"top_k\":$TOP_K}
-    }" | python3 - <<'PY'
-import json,sys
+    }" || true)"
+
+  python3 - <<PY
+import json
+raw = """$resp"""
 try:
-  j=json.load(sys.stdin)
-except Exception as e:
+  j = json.loads(raw)
+  print(j.get("status",""))
+except Exception:
   print("PARSE_ERROR")
-  sys.exit(0)
-print(j.get("status",""))
+  print(raw[:400])
 PY
 }
 
@@ -79,19 +81,15 @@ assert_eq() {
 echo "Running smoke tests against: $WORKER_URL"
 echo
 
-# 1) A sees A -> answered
 S1="$(ask_status "$COMPANY_A" "$MACHINE_A" "$DOC_A" "Trova la stringa $SENT_A nel documento.")"
 assert_eq "A sees A" "$S1" "answered"
 
-# 2) B sees B -> answered
 S2="$(ask_status "$COMPANY_B" "$MACHINE_B" "$DOC_B" "Trova la stringa $SENT_B nel documento.")"
 assert_eq "B sees B" "$S2" "answered"
 
-# 3) A sees B -> no_sources (anti-leak)
 S3="$(ask_status "$COMPANY_A" "$MACHINE_A" "$DOC_B" "Trova la stringa $SENT_B nel documento.")"
 assert_eq "A sees B (should block)" "$S3" "no_sources"
 
-# 4) B sees A -> no_sources (anti-leak)
 S4="$(ask_status "$COMPANY_B" "$MACHINE_B" "$DOC_A" "Trova la stringa $SENT_A nel documento.")"
 assert_eq "B sees A (should block)" "$S4" "no_sources"
 
