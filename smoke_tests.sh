@@ -72,7 +72,7 @@ try:
     print(j.get("status",""))
 except Exception:
     print("PARSE_ERROR")
-    print(raw[:400])
+    print("RAW_HEAD:", raw[:400].replace("\n","\\n"))
 PY
 }
 
