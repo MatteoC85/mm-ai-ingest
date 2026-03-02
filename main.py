@@ -370,6 +370,8 @@ class IngestRequest(BaseModel):
     company_id: str
     machine_id: str
     bubble_document_id: str
+    plan_embed_chars_limit_total: Optional[int] = None
+    plan_index_storage_limit_bytes: Optional[int] = None
 
 
 def _db_conn():
@@ -734,6 +736,46 @@ def ingest_document(
                 "pages_detected": pages_total,
                 "text_chars": text_chars,
             }
+
+    # ✅ Plan limits (enforcement dopo parsing, prima di scrivere su DB)
+    plan_chars_limit = int(payload.plan_embed_chars_limit_total or 0)
+    plan_storage_limit = int(payload.plan_index_storage_limit_bytes or 0)
+
+    # Calcolo stima storage per questo documento (semplice/robusto)
+    # chunks stimati: basati su testo totale e parametri chunking
+    effective_step = max(1, CHUNK_TARGET_CHARS - min(CHUNK_OVERLAP_CHARS, CHUNK_TARGET_CHARS - 1))
+    est_chunks = int(math.ceil(max(1, text_chars) / effective_step))
+
+    BYTES_PER_CHAR = 3          # stima conservativa
+    BYTES_PER_CHUNK = 2000      # overhead embedding+metadata
+    est_storage_bytes = int(text_chars * BYTES_PER_CHAR + est_chunks * BYTES_PER_CHUNK)
+
+    # NOTE: per enforcement "attuale" serve anche il current usage (lo faremo dopo via Bubble counters)
+    # Qui facciamo enforcement "per singolo documento" (hard-stop se documento troppo grande per il piano)
+    if plan_chars_limit > 0 and text_chars > plan_chars_limit:
+        return {
+            "ok": False,
+            "error": {
+                "code": "LIMIT_EXCEEDED",
+                "message": "Documento troppo grande per il piano (limite caratteri indicizzabili).",
+            },
+            "reason": "PLAN_EMBED_CHARS_LIMIT_EXCEEDED",
+            "text_chars": text_chars,
+            "limit_chars": plan_chars_limit,
+        }
+
+    if plan_storage_limit > 0 and est_storage_bytes > plan_storage_limit:
+        return {
+            "ok": False,
+            "error": {
+                "code": "LIMIT_EXCEEDED",
+                "message": "Documento troppo grande per il piano (limite storage AI indicizzato).",
+            },
+            "reason": "PLAN_INDEX_STORAGE_LIMIT_EXCEEDED",
+            "text_chars": text_chars,
+            "est_storage_bytes": est_storage_bytes,
+            "limit_storage_bytes": plan_storage_limit,
+        }
 
     conn = _db_conn()
     try:
