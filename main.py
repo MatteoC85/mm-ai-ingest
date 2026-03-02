@@ -839,6 +839,7 @@ def ingest_document(
         "pages_with_text": pages_with_text,
         "pages_detected": pages_total,
         "text_chars": text_chars,
+        "est_storage_bytes": est_storage_bytes,
     }
 
 
