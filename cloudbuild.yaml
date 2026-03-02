@@ -34,7 +34,7 @@ steps:
         "--platform",
         "managed",
         "--allow-unauthenticated",
-        "--set-env-vars",
+        "--update-env-vars",
         "COMMIT_SHA=$COMMIT_SHA",
         "--quiet"
       ]
