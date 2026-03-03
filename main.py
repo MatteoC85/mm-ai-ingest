@@ -1,4 +1,3 @@
-
 import os
 import io
 import re
@@ -373,6 +372,10 @@ class IngestRequest(BaseModel):
     bubble_document_id: str
     plan_embed_chars_limit_total: Optional[int] = None
     plan_index_storage_limit_bytes: Optional[int] = None
+    embed_chars_used_total: Optional[int] = None
+    index_storage_used_total: Optional[int] = None
+    doc_prev_embed_chars: Optional[int] = None
+    doc_prev_index_storage_bytes: Optional[int] = None
 
 
 def _db_conn():
@@ -776,6 +779,48 @@ def ingest_document(
             "text_chars": text_chars,
             "est_storage_bytes": est_storage_bytes,
             "limit_storage_bytes": plan_storage_limit,
+        }
+
+    # ✅ Total limits (company usage): used - prev + new <= limit
+    used_chars_total = int(payload.embed_chars_used_total or 0)
+    used_storage_total = int(payload.index_storage_used_total or 0)
+
+    prev_doc_chars = int(payload.doc_prev_embed_chars or 0)
+    prev_doc_storage = int(payload.doc_prev_index_storage_bytes or 0)
+
+    # Delta-correct total
+    new_total_chars = used_chars_total - prev_doc_chars + int(text_chars)
+    new_total_storage = used_storage_total - prev_doc_storage + int(est_storage_bytes)
+
+    if plan_chars_limit > 0 and new_total_chars > plan_chars_limit:
+        return {
+            "ok": False,
+            "error": {
+                "code": "LIMIT_EXCEEDED",
+                "message": "Limite totale caratteri AI superato per questa Company (used - prev + new).",
+            },
+            "reason": "PLAN_EMBED_CHARS_LIMIT_EXCEEDED",
+            "text_chars": text_chars,
+            "limit_chars": plan_chars_limit,
+            "used_chars_total": used_chars_total,
+            "doc_prev_chars": prev_doc_chars,
+            "new_total_chars": new_total_chars,
+        }
+
+    if plan_storage_limit > 0 and new_total_storage > plan_storage_limit:
+        return {
+            "ok": False,
+            "error": {
+                "code": "LIMIT_EXCEEDED",
+                "message": "Limite totale storage AI superato per questa Company (used - prev + new).",
+            },
+            "reason": "PLAN_INDEX_STORAGE_LIMIT_EXCEEDED",
+            "text_chars": text_chars,
+            "est_storage_bytes": est_storage_bytes,
+            "limit_storage_bytes": plan_storage_limit,
+            "used_storage_total": used_storage_total,
+            "doc_prev_storage_bytes": prev_doc_storage,
+            "new_total_storage_bytes": new_total_storage,
         }
 
     conn = _db_conn()
