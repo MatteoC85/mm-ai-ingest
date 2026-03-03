@@ -3,6 +3,7 @@ import io
 import re
 import math
 import json
+import unicodedata
 from typing import Optional, List, Any, Union
 
 import requests
@@ -485,10 +486,88 @@ def _get_table_columns(cur, table_name: str) -> set[str]:
     )
     return {r[0] for r in cur.fetchall()}
 
+def _normalize_unicode_advanced(s: str) -> str:
+    if not s:
+        return ""
+
+    # Unicode compatibility normalization
+    s = unicodedata.normalize("NFKC", s)
+
+    # Ligatures (extra safety)
+    s = s.replace("ﬁ", "fi")
+    s = s.replace("ﬂ", "fl")
+    s = s.replace("ﬀ", "ff")
+    s = s.replace("ﬃ", "ffi")
+    s = s.replace("ﬄ", "ffl")
+
+    # Normalize dashes
+    s = s.replace("–", "-").replace("—", "-").replace("‐", "-")
+
+    # Replace non-breaking space
+    s = s.replace("\u00A0", " ")
+
+    # Remove zero-width chars
+    s = s.replace("\u200B", "").replace("\u200C", "").replace("\u200D", "")
+
+    return s
+
+def _dehyphenate_lines_keep_newlines(s: str) -> str:
+    """
+    Unisce solo casi sicuri:
+    - riga termina con '-' e prima c'è una parola (>=2 lettere)
+    - riga successiva inizia con lettera minuscola
+    - evita casi tipo ISO-9001 / codici con numeri o underscore vicino al '-'
+    """
+    if not s:
+        return ""
+
+    lines = s.split("\n")
+    out: list[str] = []
+    i = 0
+
+    # pattern conservativi
+    end_word_hyphen = re.compile(r"([A-Za-zÀ-ÖØ-öø-ÿ]{2,})-$")
+    next_starts_lower = re.compile(r"^[a-zà-öø-ÿ]")
+    avoid_prev = re.compile(r"[0-9_]\-$")     # es: ISO_-, X9-
+    avoid_next = re.compile(r"^[0-9_]+")      # es: -123, _ABC
+
+    while i < len(lines):
+        cur = lines[i]
+        if i + 1 < len(lines):
+            nxt = lines[i + 1]
+
+            cur_stripped = cur.rstrip()
+            nxt_stripped = nxt.lstrip()
+
+            # evita liste/bullet
+            if nxt_stripped.startswith(("-", "•", "·", "*")):
+                out.append(cur)
+                i += 1
+                continue
+
+            if avoid_prev.search(cur_stripped) or avoid_next.search(nxt_stripped):
+                out.append(cur)
+                i += 1
+                continue
+
+            m = end_word_hyphen.search(cur_stripped)
+            if m and next_starts_lower.search(nxt_stripped):
+                # unisci: "parola-" + "continua" => "parolacontinua"
+                merged = cur_stripped[:-1] + nxt_stripped
+                out.append(merged)
+                i += 2
+                continue
+
+        out.append(cur)
+        i += 1
+
+    return "\n".join(out)
 
 def _normalize_text_keep_lines(s: str) -> str:
     if not s:
         return ""
+    s = _normalize_unicode_advanced(s)
+    s = _dehyphenate_lines_keep_newlines(s)
     s = s.replace("\r\n", "\n").replace("\r", "\n")
     s = s.replace("\t", " ")
     out = []
@@ -504,6 +583,216 @@ def _normalize_text_keep_lines(s: str) -> str:
             out.append(ch)
     return "".join(out).strip()
 
+def _hf_norm_line(s: str) -> str:
+    s = _normalize_text_keep_lines(s)
+    s = s.lower()
+    # numeri -> #
+    s = re.sub(r"\d+", "#", s)
+    # spazi multipli già compressi, ma ripuliamo ancora
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _extract_top_bottom_lines(page_text: str, top_n: int = 4, bottom_n: int = 4) -> tuple[list[str], list[str]]:
+    lines = [ln.strip() for ln in (page_text or "").split("\n")]
+    lines = [ln for ln in lines if ln]  # drop empty
+
+    top = lines[:top_n] if top_n > 0 else []
+    bottom = lines[-bottom_n:] if bottom_n > 0 else []
+    return top, bottom
+
+
+def _detect_repeated_headers_footers(
+    pages_text: list[str],
+    top_n: int = 4,
+    bottom_n: int = 4,
+    min_ratio: float = 0.7,
+    min_len: int = 8,
+    max_len: int = 140,
+) -> tuple[set[str], set[str]]:
+    """
+    Ritorna set di righe NORMALIZZATE (hf_norm_line) da rimuovere in header e footer.
+    """
+    if not pages_text:
+        return set(), set()
+
+    top_counts: dict[str, int] = {}
+    bot_counts: dict[str, int] = {}
+
+    for txt in pages_text:
+        top, bottom = _extract_top_bottom_lines(txt, top_n=top_n, bottom_n=bottom_n)
+        for ln in top:
+            k = _hf_norm_line(ln)
+            if min_len <= len(k) <= max_len:
+                top_counts[k] = top_counts.get(k, 0) + 1
+        for ln in bottom:
+            k = _hf_norm_line(ln)
+            if min_len <= len(k) <= max_len:
+                bot_counts[k] = bot_counts.get(k, 0) + 1
+
+    n_pages = len(pages_text)
+    thr = int(math.ceil(n_pages * min_ratio))
+
+    top_keep = {k for (k, c) in top_counts.items() if c >= thr}
+    bot_keep = {k for (k, c) in bot_counts.items() if c >= thr}
+
+    return top_keep, bot_keep
+
+_PAGE_NOISE_RX = re.compile(
+    r"^(?:"
+    r"(?:page|pagina)\s*#?(?:\s*of\s*#?)?"     # "page 3" / "pagina 3" / "page 3 of 20"
+    r"|#\s*/\s*#"                               # "3/20" normalizzato a "#/#"
+    r")$",
+    re.IGNORECASE,
+)
+
+def _is_page_noise_line(line: str) -> bool:
+    k = _hf_norm_line(line)  # lowercase + digits-># + spaces normalized
+    if not k:
+        return False
+    if len(k) > 40:
+        return False
+    return _PAGE_NOISE_RX.match(k) is not None
+
+def _remove_headers_footers_from_page(
+    page_text: str,
+    header_norm: set[str],
+    footer_norm: set[str],
+    top_n: int = 4,
+    bottom_n: int = 4,
+) -> str:
+    lines = [ln.strip() for ln in (page_text or "").split("\n")]
+
+    # remove header candidates only in the top area
+    for i in range(min(top_n, len(lines))):
+        if (_hf_norm_line(lines[i]) in header_norm) or _is_page_noise_line(lines[i]):
+            lines[i] = ""
+
+    # remove footer candidates only in the bottom area
+    for j in range(len(lines) - min(bottom_n, len(lines)), len(lines)):
+        if 0 <= j < len(lines) and ((_hf_norm_line(lines[j]) in footer_norm) or _is_page_noise_line(lines[j])):
+            lines[j] = ""
+
+    # cleanup: collapse multiple empty lines
+    out_lines = []
+    prev_empty = False
+    for ln in lines:
+        ln = ln.strip()
+        if not ln:
+            if prev_empty:
+                continue
+            prev_empty = True
+            out_lines.append("")
+        else:
+            prev_empty = False
+            out_lines.append(ln)
+
+    return "\n".join(out_lines).strip()
+
+def _looks_like_bullet(line: str) -> bool:
+    s = (line or "").lstrip()
+    if not s:
+        return False
+    if s.startswith(("•", "·", "*", "-")):
+        return True
+    if re.match(r"^\(?\d+\)?[.)]\s+", s):  # "1) " "1. "
+        return True
+    if re.match(r"^[a-zA-Z][.)]\s+", s):  # "a) " "A. "
+        return True
+    return False
+
+
+def _looks_like_table(line: str) -> bool:
+    # euristica semplice: molti spazi "a colonne" o separatori
+    if not line:
+        return False
+    if re.search(r"\s{3,}\S+\s{3,}", line):
+        return True
+    if "|" in line and re.search(r"\S+\s*\|\s*\S+", line):
+        return True
+    return False
+
+
+def _looks_like_title(line: str) -> bool:
+    s = (line or "").strip()
+    if not s:
+        return False
+    # titolo tipico: tutto maiuscolo e corto
+    letters = re.sub(r"[^A-Za-zÀ-ÖØ-öø-ÿ]+", "", s)
+    if letters and letters.isupper() and len(s) <= 80:
+        return True
+    return False
+
+def _reflow_paragraphs_conservative(page_text: str) -> str:
+    """
+    Unisce righe in paragrafi con regole conservative:
+    - NON unisce se riga è bullet, tabella, titolo
+    - unisce se la riga successiva sembra continuazione (inizia minuscola)
+    - unisce se la riga corrente non finisce con punteggiatura forte
+    """
+    if not page_text:
+        return ""
+
+    lines = [ln.rstrip() for ln in page_text.split("\n")]
+
+    out: list[str] = []
+    i = 0
+
+    while i < len(lines):
+        cur = (lines[i] or "").rstrip()
+        if not cur:
+            out.append("")
+            i += 1
+            continue
+
+        # blocchi che non tocchiamo
+        if _looks_like_bullet(cur) or _looks_like_table(cur) or _looks_like_title(cur):
+            out.append(cur)
+            i += 1
+            continue
+
+        j = i
+        buf = cur
+
+        while j + 1 < len(lines):
+            nxt = (lines[j + 1] or "").strip()
+            if not nxt:
+                break
+
+            # non unire se next è bullet/table/title
+            if _looks_like_bullet(nxt) or _looks_like_table(nxt) or _looks_like_title(nxt):
+                break
+
+            # non unire se current finisce con stop forte
+            if re.search(r"[.;:!?]$", buf):
+                break
+
+            # unisci solo se next sembra continuazione (inizia minuscola)
+            if not re.match(r"^[a-zà-öø-ÿ]", nxt):
+                break
+
+            # ok: merge con spazio
+            buf = buf + " " + nxt
+            j += 1
+
+        out.append(buf)
+        i = j + 1
+
+    # collassa righe vuote multiple
+    cleaned = []
+    prev_empty = False
+    for ln in out:
+        ln = ln.strip()
+        if not ln:
+            if prev_empty:
+                continue
+            prev_empty = True
+            cleaned.append("")
+        else:
+            prev_empty = False
+            cleaned.append(ln)
+
+    return "\n".join(cleaned).strip()
 
 def _build_global_text_and_page_spans(pages: list[tuple[int, str]]) -> tuple[str, list[tuple[int, int, int]]]:
     parts: list[str] = []
@@ -693,15 +982,25 @@ def ingest_document(
         reader = PdfReader(io.BytesIO(data))
         pages_total = len(reader.pages)
 
+        raw_pages: list[str] = []
+        for p in reader.pages:
+            t = p.extract_text() or ""
+            t = _normalize_text_keep_lines(t)
+            raw_pages.append(t)
+
+        # Detect repeated header/footer lines (normalized)
+        header_norm, footer_norm = _detect_repeated_headers_footers(raw_pages)
+
         pages_text: list[str] = []
         pages_with_text = 0
         text_chars = 0
 
-        for p in reader.pages:
-            t = (p.extract_text() or "").strip()
-            pages_text.append(t)
-            text_chars += len(t)
-            if len(t) >= MIN_PAGE_CHARS:
+        for t in raw_pages:
+            cleaned = _remove_headers_footers_from_page(t, header_norm, footer_norm)
+            cleaned = _reflow_paragraphs_conservative(cleaned)
+            pages_text.append(cleaned)
+            text_chars += len(cleaned)
+            if len(cleaned) >= MIN_PAGE_CHARS:
                 pages_with_text += 1
     except Exception:
         raise HTTPException(status_code=422, detail="PDF parse failed")
