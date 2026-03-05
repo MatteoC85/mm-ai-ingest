@@ -903,6 +903,24 @@ def _looks_like_title(line: str) -> bool:
         return True
     return False
 
+_SECTION_ENUM_RX = re.compile(r"^\s*\d+(?:\.\d+){0,3}\s+[A-Za-zÀ-ÖØ-öø-ÿ]")  # es: "1 Intro", "2.3 Safety"
+_SECTION_ALLCAPS_RX = re.compile(r"^[A-ZÀ-ÖØ-Þ][A-ZÀ-ÖØ-Þ0-9\s\-]{3,}$")     # es: "MACHINE SETUP"
+
+def _looks_like_section_header(line: str) -> bool:
+    s = (line or "").strip()
+    if not s:
+        return False
+
+    # numerato: 1 / 1.2 / 1.2.3
+    if _SECTION_ENUM_RX.match(s) and len(s) <= 120:
+        return True
+
+    # tutto maiuscolo ma non troppo lungo
+    if _SECTION_ALLCAPS_RX.match(s) and len(s.split()) <= 6:
+        return True
+
+    return False
+
 def _reflow_paragraphs_conservative(page_text: str) -> str:
     """
     Unisce righe in paragrafi con regole conservative:
@@ -1093,9 +1111,17 @@ def _chunk_sentences_with_pages(
     """
     # 1) espandi in lista di (page_number, sentence)
     seq: list[tuple[int, str]] = []
+    current_section: Optional[str] = None
+
     for pn, txt in pages:
         for s in _split_sentences_conservative(txt or ""):
-            seq.append((int(pn), s))
+            s_clean = s.strip()
+
+            # detect section header
+            if _looks_like_section_header(s_clean):
+                current_section = s_clean
+
+            seq.append((int(pn), s_clean, current_section))
 
     if not seq:
         return []
@@ -1112,7 +1138,7 @@ def _chunk_sentences_with_pages(
         total = 0
         j = i
         while j < len(seq):
-            pn, s = seq[j]
+            pn, s, section = seq[j]
             add = (s + " ")
             if total + len(add) > target_chars and total >= min_chars:
                 break
@@ -1123,7 +1149,7 @@ def _chunk_sentences_with_pages(
 
         if not buf:
             # forced add one sentence
-            pn, s = seq[i]
+            pn, s, section = seq[i]
             buf = [s]
             pages_in_chunk = [pn]
             j = i + 1
@@ -1131,6 +1157,10 @@ def _chunk_sentences_with_pages(
         page_from = min(pages_in_chunk)
         page_to = max(pages_in_chunk)
         chunk_text = "\n".join(buf).strip()
+
+        # prepend section title if present
+        if section:
+            chunk_text = f"SECTION: {section}\n" + chunk_text
 
         chunks.append({
             "chunk_index": chunk_index,
@@ -1146,7 +1176,7 @@ def _chunk_sentences_with_pages(
             carry_len = 0
             k = j - 1
             while k >= i and carry_len < overlap_chars:
-                pn, s = seq[k]
+                pn, s, _ = seq[k]
                 carry.insert(0, (pn, s))
                 carry_len += len(s) + 1
                 k -= 1
