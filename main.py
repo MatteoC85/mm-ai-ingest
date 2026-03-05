@@ -584,6 +584,39 @@ def _normalize_text_keep_lines(s: str) -> str:
             out.append(ch)
     return "".join(out).strip()
 
+def _pymupdf_page_to_text_blocks(page: "fitz.Page") -> str:
+    """
+    Estrae testo usando blocks (x0,y0,x1,y1,text,...), ordina per lettura (y,x).
+    Più robusto di get_text("text") su bullet/layout.
+    """
+    blocks = page.get_text("blocks") or []
+    # block: (x0, y0, x1, y1, "text", block_no, block_type)
+    blocks_sorted = sorted(blocks, key=lambda b: (float(b[1]), float(b[0])))
+
+    parts: list[str] = []
+    for b in blocks_sorted:
+        txt = (b[4] or "").strip()
+        if not txt:
+            continue
+        parts.append(txt)
+
+    # separa i blocchi con doppio newline (preserva paragrafi)
+    return "\n\n".join(parts).strip()
+
+
+def _extract_pages_with_layout_blocks(pdf_bytes: bytes) -> list[str]:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        out: list[str] = []
+        for i in range(doc.page_count):
+            page = doc.load_page(i)
+            t = _pymupdf_page_to_text_blocks(page)
+            t = _normalize_text_keep_lines(t)
+            out.append(t)
+        return out
+    finally:
+        doc.close()
+
 def _hf_norm_line(s: str) -> str:
     s = _normalize_text_keep_lines(s)
     s = s.lower()
@@ -907,6 +940,110 @@ def _chunk_text(global_text: str, spans: list[tuple[int, int, int]]) -> list[dic
     chunks = [c for c in chunks if c["chunk_text"]]
     return chunks
 
+_SENT_SPLIT_RX = re.compile(r"(?<=[\.\!\?])\s+")
+
+def _split_sentences_conservative(text: str) -> list[str]:
+    """
+    Split conservativo:
+    - preserva righe bullet come "frasi" singole
+    - spezza su . ! ? + spazi
+    - mantiene newline come separatore forte
+    """
+    if not text:
+        return []
+
+    # prima separa per newline per preservare bullet/list
+    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+    out: list[str] = []
+
+    for ln in lines:
+        # bullet / enumerazioni: keep as-is
+        if ln.startswith(("•", "·", "*", "-")) or re.match(r"^\(?\d+\)?[.)]\s+", ln):
+            out.append(ln)
+            continue
+
+        # split per punteggiatura forte
+        parts = [p.strip() for p in _SENT_SPLIT_RX.split(ln) if p.strip()]
+        out.extend(parts)
+
+    return out
+
+
+def _chunk_sentences_with_pages(
+    pages: list[tuple[int, str]],
+    target_chars: int,
+    overlap_chars: int,
+    min_chars: int,
+) -> list[dict]:
+    """
+    Crea chunk concatenando frasi, mantenendo page_from/page_to.
+    Overlap implementato come "carry" delle ultime frasi fino a overlap_chars.
+    """
+    # 1) espandi in lista di (page_number, sentence)
+    seq: list[tuple[int, str]] = []
+    for pn, txt in pages:
+        for s in _split_sentences_conservative(txt or ""):
+            seq.append((int(pn), s))
+
+    if not seq:
+        return []
+
+    chunks: list[dict] = []
+    i = 0
+    chunk_index = 1
+
+    while i < len(seq):
+        # build one chunk
+        buf: list[str] = []
+        pages_in_chunk: list[int] = []
+
+        total = 0
+        j = i
+        while j < len(seq):
+            pn, s = seq[j]
+            add = (s + " ")
+            if total + len(add) > target_chars and total >= min_chars:
+                break
+            buf.append(s)
+            pages_in_chunk.append(pn)
+            total += len(add)
+            j += 1
+
+        if not buf:
+            # forced add one sentence
+            pn, s = seq[i]
+            buf = [s]
+            pages_in_chunk = [pn]
+            j = i + 1
+
+        page_from = min(pages_in_chunk)
+        page_to = max(pages_in_chunk)
+        chunk_text = "\n".join(buf).strip()
+
+        chunks.append({
+            "chunk_index": chunk_index,
+            "page_from": page_from,
+            "page_to": page_to,
+            "chunk_text": chunk_text,
+        })
+        chunk_index += 1
+
+        # overlap: step avanti ma porta dietro ultime frasi fino a overlap_chars
+        if overlap_chars > 0:
+            carry = []
+            carry_len = 0
+            k = j - 1
+            while k >= i and carry_len < overlap_chars:
+                pn, s = seq[k]
+                carry.insert(0, (pn, s))
+                carry_len += len(s) + 1
+                k -= 1
+            # prossimo i = k+1 (cioè riparti includendo carry)
+            i = max(i + 1, j - len(carry))
+        else:
+            i = j
+
+    return [c for c in chunks if c.get("chunk_text")]
 
 def _openai_embed_texts(texts: list[str]) -> list[list[float]]:
     if not OPENAI_API_KEY:
@@ -1008,23 +1145,8 @@ def ingest_document(
         raise HTTPException(status_code=502, detail="Fetch failed")
 
     try:
-        # --- Extract text with PyMuPDF (more robust than pypdf) ---
-        doc = fitz.open(stream=data, filetype="pdf")
-        pages_total = doc.page_count
-
-        raw_pages: list[str] = []
-        for i in range(pages_total):
-            page = doc.load_page(i)
-
-            # PyMuPDF extraction
-            t = page.get_text("text") or ""
-
-            # Normalize early
-            t = _normalize_text_keep_lines(t)
-
-            raw_pages.append(t)
-
-        doc.close()
+        raw_pages = _extract_pages_with_layout_blocks(data)
+        pages_total = len(raw_pages)
 
         # Detect repeated header/footer lines (normalized)
         header_norm, footer_norm = _detect_repeated_headers_footers(raw_pages)
@@ -1277,8 +1399,12 @@ def index_document(
                 }
 
             pages = [(int(pn), txt or "") for (pn, txt) in page_rows]
-            global_text, spans = _build_global_text_and_page_spans(pages)
-            chunks = _chunk_text(global_text, spans)
+            chunks = _chunk_sentences_with_pages(
+                pages=pages,
+                target_chars=CHUNK_TARGET_CHARS,
+                overlap_chars=CHUNK_OVERLAP_CHARS,
+                min_chars=CHUNK_MIN_CHARS,
+)
 
             chunk_cols = _get_table_columns(cur, "document_chunks")
             required = {
