@@ -891,6 +891,81 @@ def _reflow_paragraphs_conservative(page_text: str) -> str:
 
     return "\n".join(cleaned).strip()
 
+_TOC_TITLE_RX = re.compile(r"\b(?:contents|content|indice|index|table of contents)\b", re.IGNORECASE)
+
+def _looks_like_toc_line(line: str) -> bool:
+    s = (line or "").strip()
+    if not s:
+        return False
+
+    # tipico: leader dots
+    if re.search(r"\.{4,}", s):
+        return True
+
+    # tipico: "1.2.3 Something  12" oppure "Something .... 12"
+    if re.search(r"\b\d+(?:\.\d+){1,}\b", s) and re.search(r"\s\d{1,4}\s*$", s):
+        return True
+
+    # tipico: finisce con numero pagina e contiene testo
+    if re.search(r"\s\d{1,4}\s*$", s) and len(s) <= 140 and re.search(r"[A-Za-zÀ-ÖØ-öø-ÿ]", s):
+        return True
+
+    # tipico: molto “spezzato” con grandi spazi tra colonne
+    if len(re.findall(r"\s{3,}", s)) >= 2 and re.search(r"\d{1,4}\s*$", s):
+        return True
+
+    return False
+
+
+def _strip_toc_lines(page_text: str) -> str:
+    if not page_text:
+        return ""
+
+    lines = [ln.rstrip() for ln in page_text.split("\n")]
+    kept: list[str] = []
+    removed = 0
+
+    for ln in lines:
+        if _looks_like_toc_line(ln):
+            removed += 1
+            continue
+        kept.append(ln)
+
+    out = "\n".join(kept).strip()
+
+    # se abbiamo rimosso molte righe ed è rimasto poco, considerala pagina "vuota"
+    if removed >= 6 and len(out) < 200:
+        return ""
+
+    return out
+
+
+def _maybe_remove_toc(page_text: str) -> str:
+    """
+    Rimuove l'indice quando rilevato:
+    - titolo tipo Contents/Indice/Index
+    - oppure alta densità di righe TOC
+    """
+    if not page_text:
+        return ""
+
+    # quick check titolo
+    if _TOC_TITLE_RX.search(page_text[:800] or ""):
+        return _strip_toc_lines(page_text)
+
+    # density check
+    lines = [ln.strip() for ln in page_text.split("\n") if ln.strip()]
+    if len(lines) < 8:
+        return page_text
+
+    toc_hits = sum(1 for ln in lines[:40] if _looks_like_toc_line(ln))
+    ratio = toc_hits / max(1, min(len(lines), 40))
+
+    if toc_hits >= 6 and ratio >= 0.30:
+        return _strip_toc_lines(page_text)
+
+    return page_text
+
 _SENT_SPLIT_RX = re.compile(r"(?<=[\.\!\?])\s+")
 
 def _split_sentences_conservative(text: str) -> list[str]:
@@ -1113,6 +1188,7 @@ def ingest_document(
                 footer_norm,
             )
             cleaned = _reflow_paragraphs_conservative(cleaned)
+            cleaned = _maybe_remove_toc(cleaned)
             pages_text.append(cleaned)
             text_chars += len(cleaned)
             if len(cleaned) >= MIN_PAGE_CHARS:
