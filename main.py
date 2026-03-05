@@ -418,6 +418,69 @@ def _db_upsert_document_file(company_id: str, bubble_document_id: str, file_url:
     finally:
         conn.close()
 
+def _db_upsert_cleaning_meta(company_id: str, bubble_document_id: str, header_norm: set[str], footer_norm: set[str]) -> None:
+    company_id = (company_id or "").strip()
+    bubble_document_id = (bubble_document_id or "").strip()
+    if not (company_id and bubble_document_id):
+        return
+
+    # set -> list stabile e corta
+    header_list = sorted([x for x in (header_norm or set()) if x])
+    footer_list = sorted([x for x in (footer_norm or set()) if x])
+
+    conn = _db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO public.document_cleaning_meta(company_id, bubble_document_id, header_norm, footer_norm, updated_at)
+                VALUES (%s, %s, %s::jsonb, %s::jsonb, NOW())
+                ON CONFLICT (company_id, bubble_document_id)
+                DO UPDATE SET header_norm = EXCLUDED.header_norm,
+                              footer_norm = EXCLUDED.footer_norm,
+                              updated_at = NOW();
+                """,
+                (company_id, bubble_document_id, json.dumps(header_list), json.dumps(footer_list)),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _db_get_cleaning_meta(company_id: str, bubble_document_id: str) -> tuple[set[str], set[str]]:
+    company_id = (company_id or "").strip()
+    bubble_document_id = (bubble_document_id or "").strip()
+    if not (company_id and bubble_document_id):
+        return set(), set()
+
+    conn = _db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT header_norm, footer_norm
+                FROM public.document_cleaning_meta
+                WHERE company_id=%s AND bubble_document_id=%s
+                LIMIT 1;
+                """,
+                (company_id, bubble_document_id),
+            )
+            row = cur.fetchone()
+            if not row:
+                return set(), set()
+
+            h, f = row
+            # psycopg2 può ritornare dict/list già parse-ati o stringa JSON
+            if isinstance(h, str):
+                h = json.loads(h or "[]")
+            if isinstance(f, str):
+                f = json.loads(f or "[]")
+
+            header_set = set([str(x) for x in (h or []) if x])
+            footer_set = set([str(x) for x in (f or []) if x])
+            return header_set, footer_set
+    finally:
+        conn.close()
 
 def _build_rg_links(company_id: str, citations: list[dict]) -> list[dict]:
     """
@@ -757,6 +820,29 @@ def _remove_headers_footers_from_page(
             out_lines.append(ln)
 
     return "\n".join(out_lines).strip()
+
+def _strip_hf_from_chunk_text(chunk_text: str, header_norm: set[str], footer_norm: set[str]) -> str:
+    if not chunk_text:
+        return ""
+
+    lines = [ln.strip() for ln in chunk_text.split("\n")]
+    cleaned = []
+    for ln in lines:
+        if not ln:
+            continue
+
+        k = _hf_norm_line(ln)
+        if (k in header_norm) or (k in footer_norm):
+            continue
+
+        # ulteriore sicurezza: elimina anche "page x of y" se rimane mai
+        ln2 = _strip_page_noise_prefix(ln)
+        if _is_page_noise_line(ln2):
+            continue
+
+        cleaned.append(ln2)
+
+    return "\n".join(cleaned).strip()
 
 def _looks_like_bullet(line: str) -> bool:
     s = (line or "").lstrip()
@@ -1177,6 +1263,9 @@ def ingest_document(
         # Detect repeated header/footer lines (normalized)
         header_norm, footer_norm = _detect_repeated_headers_footers(raw_pages)
 
+        # Persist cleaning meta for later chunk stripping
+        _db_upsert_cleaning_meta(company_id, bubble_document_id, header_norm, footer_norm)
+
         pages_text: list[str] = []
         pages_with_text = 0
         text_chars = 0
@@ -1401,6 +1490,8 @@ def index_document(
 
     if not (company_id and machine_id and bubble_document_id):
         raise HTTPException(status_code=400, detail="Missing company_id/machine_id/bubble_document_id")
+    
+    header_norm, footer_norm = _db_get_cleaning_meta(company_id, bubble_document_id)
 
     conn = _db_conn()
     try:
@@ -1457,6 +1548,13 @@ def index_document(
                 filtered_chunks.append(c)
 
             chunks = filtered_chunks
+
+            # Strip persisted header/footer lines from chunk text before saving/embedding
+            for c in chunks:
+                c["chunk_text"] = _strip_hf_from_chunk_text(c.get("chunk_text", ""), header_norm, footer_norm)
+
+            # drop empty chunks after stripping
+            chunks = [c for c in chunks if (c.get("chunk_text") or "").strip()]
 
             chunk_cols = _get_table_columns(cur, "document_chunks")
             required = {
@@ -2084,6 +2182,11 @@ def delete_document_v1(
                 (company_id, bubble_document_id),
             )
             deleted_files = cur.rowcount or 0
+
+            cur.execute(
+                "DELETE FROM public.document_cleaning_meta WHERE company_id=%s AND bubble_document_id=%s;",
+                (company_id, bubble_document_id),
+            )
 
         conn.commit()
     finally:
