@@ -8,6 +8,7 @@ from typing import Optional, List, Any, Union
 
 import requests
 import psycopg2
+import fitz  # PyMuPDF
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from pypdf import PdfReader
@@ -1007,14 +1008,23 @@ def ingest_document(
         raise HTTPException(status_code=502, detail="Fetch failed")
 
     try:
-        reader = PdfReader(io.BytesIO(data))
-        pages_total = len(reader.pages)
+        # --- Extract text with PyMuPDF (more robust than pypdf) ---
+        doc = fitz.open(stream=data, filetype="pdf")
+        pages_total = doc.page_count
 
         raw_pages: list[str] = []
-        for p in reader.pages:
-            t = p.extract_text() or ""
+        for i in range(pages_total):
+            page = doc.load_page(i)
+
+            # PyMuPDF extraction
+            t = page.get_text("text") or ""
+
+            # Normalize early
             t = _normalize_text_keep_lines(t)
+
             raw_pages.append(t)
+
+        doc.close()
 
         # Detect repeated header/footer lines (normalized)
         header_norm, footer_norm = _detect_repeated_headers_footers(raw_pages)
