@@ -716,20 +716,9 @@ def _remove_headers_footers_from_page(
     footer_norm: set[str],
     top_n: int = 4,
     bottom_n: int = 4,
-    debug: bool = False,
-    debug_page_number: Optional[int] = None,
 ) -> str:
 
     lines = [ln.strip() for ln in (page_text or "").split("\n")]
-
-        # DEV debug: log solo p1-p2, solo se MM_DEBUG_CLEAN=1
-    if debug and debug_page_number and debug_page_number <= 2:
-        for idx in range(min(3, len(lines))):
-            before = lines[idx]
-            after = _strip_page_noise_prefix(before)
-
-            print(f"MM_DEBUG_CLEAN p{debug_page_number} line{idx}_before={repr(before)}")
-            print(f"MM_DEBUG_CLEAN p{debug_page_number} line{idx}_after={repr(after)}")
 
     # Strip page counter also when it appears a few lines below due to blank lines / block joins
     # (es: linee vuote tra titolo/sottotitolo e "Page X of Y")
@@ -1117,15 +1106,11 @@ def ingest_document(
         pages_with_text = 0
         text_chars = 0
 
-        debug_clean = (os.environ.get("MM_DEBUG_CLEAN") or "").strip() == "1"
-
         for page_number, t in enumerate(raw_pages, start=1):
             cleaned = _remove_headers_footers_from_page(
                 t,
                 header_norm,
                 footer_norm,
-                debug=debug_clean,
-                debug_page_number=page_number,
             )
             cleaned = _reflow_paragraphs_conservative(cleaned)
             pages_text.append(cleaned)
@@ -1302,10 +1287,9 @@ def ingest_document(
         }
 
         resp = client.create_task(request={"parent": parent, "task": task})
-        print("ENQUEUE_OK", resp.name)
 
-    except Exception as e:
-        print("ENQUEUE_FAIL", str(e))
+    except Exception:
+        pass
 
     return {
         "ok": True,
