@@ -692,9 +692,10 @@ _PAGE_PREFIX_STRIP_RX = re.compile(
 )
 
 def _strip_page_noise_prefix(line: str) -> str:
-    # applica solo se la linea inizia davvero con Page/Pagina + numero
     if not line:
         return line
+    # normalizza unicode e rimuove zero-width / NBSP ecc.
+    line = _normalize_unicode_advanced(line)
     return _PAGE_PREFIX_STRIP_RX.sub("", line).strip()
 
 def _remove_headers_footers_from_page(
