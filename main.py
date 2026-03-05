@@ -2037,10 +2037,30 @@ def ask_v1(
             }
         )
 
+    # --- Keyword gate for high-intent technical queries ---
+    q_low = q.lower()
+
+    key_terms = []
+    if "lubrif" in q_low or "olio" in q_low or "ingrass" in q_low or "cuscinet" in q_low or "riduttor" in q_low:
+        # lista piccola e robusta
+        key_terms = ["lubrif", "olio", "ingrass", "cuscinet", "riduttor"]
+
+    if key_terms:
+        gated = []
+        for c in candidates:
+            hay = ((c.get("snippet") or "") + " " + (c.get("citation_id") or "")).lower()
+            # Nota: snippet è limitato, ma in questi manuali basta spesso
+            if any(t in hay for t in key_terms):
+                gated.append(c)
+
+        # se troviamo almeno 2 candidati "veri", usa solo quelli
+        if len(gated) >= 2:
+            candidates = gated
+
     # --- Dynamic cutoff (prima di MMR) ---
     # Se dopo i primi 1-2 la similarità crolla, meglio tornare meno citazioni.
     # cutoff relativo a sim_max: tieni solo candidati entro delta.
-    CUTOFF_DELTA = 0.12
+    CUTOFF_DELTA = 0.08 if key_terms else 0.12
     cut_candidates = [c for c in candidates if (sim_max - float(c.get("similarity", 0.0))) <= CUTOFF_DELTA]
 
     # tieni comunque almeno 2 se esistono
