@@ -1171,7 +1171,7 @@ def _chunk_sentences_with_pages(
     Overlap implementato come "carry" delle ultime frasi fino a overlap_chars.
     """
     # 1) espandi in lista di (page_number, sentence)
-    seq: list[tuple[int, str]] = []
+    seq: list[tuple[int, str, Optional[str]]] = []
     current_section: Optional[str] = None
 
     for pn, txt in pages:
@@ -1917,6 +1917,7 @@ def ask_v1(
                     """
                     SELECT bubble_document_id, chunk_index, page_from, page_to,
                         left(chunk_text, %s) AS snippet,
+                        left(chunk_text, 2000) AS chunk_full,
                         1 - (embedding <=> %s::vector) AS similarity,
                         embedding
                     FROM public.document_chunks
@@ -1951,6 +1952,7 @@ def ask_v1(
                     """
                     SELECT bubble_document_id, chunk_index, page_from, page_to,
                         left(chunk_text, %s) AS snippet,
+                        left(chunk_text, 2000) AS chunk_full,
                         1 - (embedding <=> %s::vector) AS similarity,
                         embedding
                     FROM public.document_chunks
@@ -1969,6 +1971,7 @@ def ask_v1(
                     """
                     SELECT bubble_document_id, chunk_index, page_from, page_to,
                         left(chunk_text, %s) AS snippet,
+                        left(chunk_text, 2000) AS chunk_full,
                         1 - (embedding <=> %s::vector) AS similarity,
                         embedding
                     FROM public.document_chunks
@@ -2008,7 +2011,7 @@ def ask_v1(
     candidates: list[dict] = []
     sim_max = -1.0
 
-    for (bdid, chunk_index, page_from, page_to, snippet, similarity, embedding) in rows:
+    for (bdid, chunk_index, page_from, page_to, snippet, chunk_full, similarity, embedding) in rows:
         sim = float(similarity)
         sim_max = max(sim_max, sim)
 
@@ -2032,6 +2035,7 @@ def ask_v1(
                 "page_from": int(page_from),
                 "page_to": int(page_to),
                 "snippet": (snippet or "").strip(),
+                "chunk_full": (chunk_full or "").strip(),
                 "similarity": sim,
                 "embedding_list": emb_list or [],
             }
@@ -2048,7 +2052,7 @@ def ask_v1(
     if key_terms:
         gated = []
         for c in candidates:
-            hay = ((c.get("snippet") or "") + " " + (c.get("citation_id") or "")).lower()
+            hay = ((c.get("chunk_full") or c.get("snippet") or "") + " " + (c.get("citation_id") or "")).lower()
             # Nota: snippet è limitato, ma in questi manuali basta spesso
             if any(t in hay for t in key_terms):
                 gated.append(c)
@@ -2074,24 +2078,7 @@ def ask_v1(
     # rimuovi embedding_list prima di rispondere (non serve al client)
     for c in citations:
         c.pop("embedding_list", None)
-
-    # dedup finale per snippet (extra safety)
-    citations = _dedup_citations_by_snippet(citations, max_items=top_k)
-
-    for (bdid, chunk_index, page_from, page_to, snippet, similarity, embedding) in rows:
-        sim = float(similarity)
-        sim_max = max(sim_max, sim)
-        citation_id = f"{bdid}:p{int(page_from)}-{int(page_to)}:c{int(chunk_index)}"
-        citations.append(
-            {
-                "citation_id": citation_id,
-                "bubble_document_id": bdid,
-                "page_from": int(page_from),
-                "page_to": int(page_to),
-                "snippet": (snippet or "").strip(),
-                "similarity": sim,
-            }
-        )
+        c.pop("chunk_full", None)
 
     # ✅ dedup: evita doppioni (stesso snippet) quando document_ids include doc simili/duplicati
     citations = _dedup_citations_by_snippet(citations, max_items=top_k)
