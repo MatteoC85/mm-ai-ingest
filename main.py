@@ -694,9 +694,21 @@ _PAGE_PREFIX_STRIP_RX = re.compile(
 def _strip_page_noise_prefix(line: str) -> str:
     if not line:
         return line
-    # normalizza unicode e rimuove zero-width / NBSP ecc.
+
     line = _normalize_unicode_advanced(line)
-    return _PAGE_PREFIX_STRIP_RX.sub("", line).strip()
+
+    # rimuove "Page X of Y" o "Pagina X di Y" ovunque nella riga
+    line = re.sub(
+        r"\b(?:page|pagina)\s*\d+\s*(?:of|di)?\s*\d*\b",
+        "",
+        line,
+        flags=re.IGNORECASE,
+    )
+
+    # pulizia spazi
+    line = re.sub(r"\s{2,}", " ", line)
+
+    return line.strip()
 
 def _remove_headers_footers_from_page(
     page_text: str,
