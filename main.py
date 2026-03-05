@@ -1263,8 +1263,12 @@ def ingest_document(
         # Detect repeated header/footer lines (normalized)
         header_norm, footer_norm = _detect_repeated_headers_footers(raw_pages)
 
-        # Persist cleaning meta for later chunk stripping
-        _db_upsert_cleaning_meta(company_id, bubble_document_id, header_norm, footer_norm)
+        # Persist cleaning meta for later chunk stripping (best-effort)
+        try:
+            _db_upsert_cleaning_meta(company_id, bubble_document_id, header_norm, footer_norm)
+        except Exception as e:
+            # non bloccare ingest: la pulizia PDF deve andare avanti anche se meta DB fallisce
+            print("CLEANING_META_UPSERT_FAIL", str(e))
 
         pages_text: list[str] = []
         pages_with_text = 0
