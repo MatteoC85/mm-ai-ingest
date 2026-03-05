@@ -721,12 +721,14 @@ def _remove_headers_footers_from_page(
 ) -> str:
 
     lines = [ln.strip() for ln in (page_text or "").split("\n")]
-    # DEV debug: log solo p1-p2, solo se MM_DEBUG_CLEAN=1
-    if debug and debug_page_number and debug_page_number <= 2 and len(lines) > 0:
-        before0 = lines[0]
-        after0 = _strip_page_noise_prefix(before0)
-        print(f"MM_DEBUG_CLEAN p{debug_page_number} line0_before={repr(before0)}")
-        print(f"MM_DEBUG_CLEAN p{debug_page_number} line0_after={repr(after0)}")
+
+    if debug and debug_page_number and debug_page_number <= 2:
+    for idx in range(min(3, len(lines))):
+        before = lines[idx]
+        after = _strip_page_noise_prefix(before)
+
+        print(f"MM_DEBUG_CLEAN p{debug_page_number} line{idx}_before={repr(before)}")
+        print(f"MM_DEBUG_CLEAN p{debug_page_number} line{idx}_after={repr(after)}")
         
     # remove header candidates only in the top area
     for i in range(min(top_n, len(lines))):
