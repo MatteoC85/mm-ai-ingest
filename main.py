@@ -703,13 +703,38 @@ def _looks_like_bullet(line: str) -> bool:
 
 
 def _looks_like_table(line: str) -> bool:
-    # euristica semplice: molti spazi "a colonne" o separatori
+    """
+    Euristiche conservative per righe tabellari/colonnate (senza coordinate).
+    Se True: NON reflow.
+    """
     if not line:
         return False
-    if re.search(r"\s{3,}\S+\s{3,}", line):
+
+    s = line.rstrip("\n")
+
+    # separatori tabella
+    if "|" in s and re.search(r"\S+\s*\|\s*\S+", s):
         return True
-    if "|" in line and re.search(r"\S+\s*\|\s*\S+", line):
+
+    # molti spazi come separatori di colonne (almeno 2 gap larghi)
+    if len(re.findall(r"\s{3,}", s)) >= 2:
         return True
+
+    # presenza di "leader dots" tipo "...."
+    if re.search(r"\.{4,}", s):
+        return True
+
+    # riga con pattern "chiave  valore  valore" (molte colonne)
+    tokens = re.split(r"\s+", s.strip())
+    if len(tokens) >= 6:
+        # se contiene numeri/unità è più probabile tabella
+        if re.search(r"\d", s) and (re.search(r"\b(rpm|bar|mm|cm|kg|°c|v|a|hz)\b", s, re.IGNORECASE) is not None):
+            return True
+
+    # header tipico tabella: tante parole + spaziatura ampia
+    if len(tokens) >= 4 and len(re.findall(r"\s{2,}", s)) >= 3:
+        return True
+
     return False
 
 
@@ -757,6 +782,9 @@ def _reflow_paragraphs_conservative(page_text: str) -> str:
         while j + 1 < len(lines):
             nxt = (lines[j + 1] or "").strip()
             if not nxt:
+                break
+
+            if _looks_like_table(buf) or _looks_like_table(nxt):
                 break
 
             # non unire se next è bullet/table/title
