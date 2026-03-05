@@ -1436,6 +1436,28 @@ def index_document(
                 min_chars=CHUNK_MIN_CHARS,
             )
 
+            # remove low-signal chunks (titles, noise, very short text)
+            filtered_chunks = []
+
+            for c in chunks:
+                txt = (c.get("chunk_text") or "").strip()
+
+                # troppo corto
+                if len(txt) < 120:
+                    continue
+
+                # nessuna lettera → numeri/simboli
+                if not re.search(r"[A-Za-zÀ-ÖØ-öø-ÿ]", txt):
+                    continue
+
+                # titolo ripetuto tipo "OMAS TECHNICAL MANUAL"
+                if len(txt.split()) <= 4 and txt.isupper():
+                    continue
+
+                filtered_chunks.append(c)
+
+            chunks = filtered_chunks
+
             chunk_cols = _get_table_columns(cur, "document_chunks")
             required = {
                 "company_id",
