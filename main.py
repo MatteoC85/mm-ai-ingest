@@ -275,6 +275,67 @@ def _dedup_citations_by_snippet(citations: list[dict], max_items: int) -> list[d
     out.sort(key=lambda x: float(x.get("similarity", 0)), reverse=True)
     return out[:max_items]
 
+def _cosine_sim(a: list[float], b: list[float]) -> float:
+    # embeddings OpenAI sono già normalizzati ~unit norm, ma facciamo safe
+    dot = 0.0
+    na = 0.0
+    nb = 0.0
+    for i in range(min(len(a), len(b))):
+        va = float(a[i])
+        vb = float(b[i])
+        dot += va * vb
+        na += va * va
+        nb += vb * vb
+    if na <= 0.0 or nb <= 0.0:
+        return 0.0
+    return dot / ((na ** 0.5) * (nb ** 0.5))
+
+
+def _mmr_select(
+    q_vec: list[float],
+    candidates: list[dict],
+    top_k: int,
+    lambda_mult: float = 0.85,
+) -> list[dict]:
+    """
+    candidates item: {
+      ...,
+      "similarity": float,        # sim(q,d)
+      "embedding_list": list[float]  # embedding del chunk
+    }
+    """
+    if not candidates:
+        return []
+
+    selected: list[dict] = []
+    remaining = candidates[:]
+
+    # start: best by similarity
+    remaining.sort(key=lambda x: float(x.get("similarity", 0.0)), reverse=True)
+    selected.append(remaining.pop(0))
+
+    while remaining and len(selected) < top_k:
+        best_idx = -1
+        best_score = -1e9
+
+        for i, cand in enumerate(remaining):
+            sim_q = float(cand.get("similarity", 0.0))
+
+            # max similarity to already selected
+            max_sim_sel = 0.0
+            ce = cand.get("embedding_list") or []
+            for s in selected:
+                se = s.get("embedding_list") or []
+                max_sim_sel = max(max_sim_sel, _cosine_sim(ce, se))
+
+            score = lambda_mult * sim_q - (1.0 - lambda_mult) * max_sim_sel
+            if score > best_score:
+                best_score = score
+                best_idx = i
+
+        selected.append(remaining.pop(best_idx))
+
+    return selected
 
 def _fts_search_chunks(
     company_id: str,
@@ -1826,6 +1887,8 @@ def ask_v1(
     top_k = int(payload.top_k or 5)
     top_k = max(1, min(top_k, ASK_MAX_TOP_K))
 
+    candidate_k = max(top_k, min(40, top_k * 6))
+
     q_vec = _openai_embed_texts([q])[0]
     q_vec_lit = _vector_literal(q_vec)
 
@@ -1854,7 +1917,8 @@ def ask_v1(
                     """
                     SELECT bubble_document_id, chunk_index, page_from, page_to,
                         left(chunk_text, %s) AS snippet,
-                        1 - (embedding <=> %s::vector) AS similarity
+                        1 - (embedding <=> %s::vector) AS similarity,
+                        embedding
                     FROM public.document_chunks
                     WHERE company_id = %s
                     AND bubble_document_id = ANY(%s)
@@ -1862,7 +1926,7 @@ def ask_v1(
                     ORDER BY embedding <=> %s::vector
                     LIMIT %s;
                     """,
-                    (ASK_SNIPPET_CHARS, q_vec_lit, company_id, doc_ids, q_vec_lit, top_k),
+                    (ASK_SNIPPET_CHARS, q_vec_lit, company_id, doc_ids, q_vec_lit, candidate_k),
                 )
 
             # ✅ 2) Backward compat: singolo bubble_document_id (qui mantiene filtro macchina + generici)
@@ -1887,7 +1951,8 @@ def ask_v1(
                     """
                     SELECT bubble_document_id, chunk_index, page_from, page_to,
                         left(chunk_text, %s) AS snippet,
-                        1 - (embedding <=> %s::vector) AS similarity
+                        1 - (embedding <=> %s::vector) AS similarity,
+                        embedding
                     FROM public.document_chunks
                     WHERE company_id = %s
                     AND bubble_document_id = %s
@@ -1896,7 +1961,7 @@ def ask_v1(
                     ORDER BY embedding <=> %s::vector
                     LIMIT %s;
                     """,
-                    (ASK_SNIPPET_CHARS, q_vec_lit, company_id, bdid, machine_id, q_vec_lit, top_k),
+                    (ASK_SNIPPET_CHARS, q_vec_lit, company_id, bdid, machine_id, q_vec_lit, candidate_k),
                 )
             # ✅ 3) Default: tutti i doc nello scope macchina + generici
             else:
@@ -1904,7 +1969,8 @@ def ask_v1(
                     """
                     SELECT bubble_document_id, chunk_index, page_from, page_to,
                         left(chunk_text, %s) AS snippet,
-                        1 - (embedding <=> %s::vector) AS similarity
+                        1 - (embedding <=> %s::vector) AS similarity,
+                        embedding
                     FROM public.document_chunks
                     WHERE company_id = %s
                     AND embedding IS NOT NULL
@@ -1912,7 +1978,7 @@ def ask_v1(
                     ORDER BY embedding <=> %s::vector
                     LIMIT %s;
                     """,
-                    (ASK_SNIPPET_CHARS, q_vec_lit, company_id, machine_id, q_vec_lit, top_k),
+                    (ASK_SNIPPET_CHARS, q_vec_lit, company_id, machine_id, q_vec_lit, candidate_k),
                 )
 
             rows = cur.fetchall()
@@ -1938,10 +2004,61 @@ def ask_v1(
             }
         return resp
 
-    citations: List[dict] = []
+    # build candidates with embedding lists
+    candidates: list[dict] = []
     sim_max = -1.0
 
-    for (bdid, chunk_index, page_from, page_to, snippet, similarity) in rows:
+    for (bdid, chunk_index, page_from, page_to, snippet, similarity, embedding) in rows:
+        sim = float(similarity)
+        sim_max = max(sim_max, sim)
+
+        # embedding può arrivare come stringa tipo "[0.1,0.2,...]" oppure come list
+        emb_list = None
+        if embedding is None:
+            emb_list = None
+        elif isinstance(embedding, list):
+            emb_list = embedding
+        else:
+            # pgvector spesso torna come stringa
+            s = str(embedding).strip()
+            s = s.strip("[]")
+            emb_list = [float(x) for x in s.split(",") if x.strip()]
+
+        citation_id = f"{bdid}:p{int(page_from)}-{int(page_to)}:c{int(chunk_index)}"
+        candidates.append(
+            {
+                "citation_id": citation_id,
+                "bubble_document_id": bdid,
+                "page_from": int(page_from),
+                "page_to": int(page_to),
+                "snippet": (snippet or "").strip(),
+                "similarity": sim,
+                "embedding_list": emb_list or [],
+            }
+        )
+
+    # --- Dynamic cutoff (prima di MMR) ---
+    # Se dopo i primi 1-2 la similarità crolla, meglio tornare meno citazioni.
+    # cutoff relativo a sim_max: tieni solo candidati entro delta.
+    CUTOFF_DELTA = 0.12
+    cut_candidates = [c for c in candidates if (sim_max - float(c.get("similarity", 0.0))) <= CUTOFF_DELTA]
+
+    # tieni comunque almeno 2 se esistono
+    cut_candidates.sort(key=lambda x: float(x.get("similarity", 0.0)), reverse=True)
+    if len(cut_candidates) < min(2, len(candidates)):
+        cut_candidates = sorted(candidates, key=lambda x: float(x.get("similarity", 0.0)), reverse=True)[: min(2, len(candidates))]
+
+    # --- MMR selection ---
+    citations = _mmr_select(q_vec, cut_candidates, top_k=top_k, lambda_mult=0.85)
+
+    # rimuovi embedding_list prima di rispondere (non serve al client)
+    for c in citations:
+        c.pop("embedding_list", None)
+
+    # dedup finale per snippet (extra safety)
+    citations = _dedup_citations_by_snippet(citations, max_items=top_k)
+
+    for (bdid, chunk_index, page_from, page_to, snippet, similarity, embedding) in rows:
         sim = float(similarity)
         sim_max = max(sim_max, sim)
         citation_id = f"{bdid}:p{int(page_from)}-{int(page_to)}:c{int(chunk_index)}"
