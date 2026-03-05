@@ -730,6 +730,14 @@ def _remove_headers_footers_from_page(
 
             print(f"MM_DEBUG_CLEAN p{debug_page_number} line{idx}_before={repr(before)}")
             print(f"MM_DEBUG_CLEAN p{debug_page_number} line{idx}_after={repr(after)}")
+
+    # Strip page counter also when it appears a few lines below due to blank lines / block joins
+    # (es: linee vuote tra titolo/sottotitolo e "Page X of Y")
+    scan_n = min(12, len(lines))  # header "esteso" ma low-cost
+    for k in range(scan_n):
+        lines[k] = _strip_page_noise_prefix(lines[k])
+        if _is_page_noise_line(lines[k]):
+            lines[k] = ""  
         
     # remove header candidates only in the top area
     for i in range(min(top_n, len(lines))):
