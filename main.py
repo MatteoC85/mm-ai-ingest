@@ -686,18 +686,16 @@ def _is_page_noise_line(line: str) -> bool:
         return False
     return _PAGE_NOISE_RX.match(k) is not None
 
-_PAGE_NOISE_PREFIX_RX = re.compile(r"^(?:page|pagina)\s*#?(?:\s*of\s*#?)?\s+", re.IGNORECASE)
+_PAGE_PREFIX_STRIP_RX = re.compile(
+    r"^\s*(?:page|pagina)\s*\d+(?:\s*(?:of|di)\s*\d+)?\s*",
+    re.IGNORECASE,
+)
 
 def _strip_page_noise_prefix(line: str) -> str:
-    # lavora su linea normalizzata ma restituisce originale ripulita
-    # caso: "Page 1 of 5 La macchina..." -> "La macchina..."
-    k = _hf_norm_line(line)
-    if not k:
+    # applica solo se la linea inizia davvero con Page/Pagina + numero
+    if not line:
         return line
-    # se dopo normalizzazione inizia con "page # of #"
-    if k.startswith("page #") or k.startswith("pagina #"):
-        return re.sub(r"^(?i)(page|pagina)\s*\d+(?:\s*of\s*\d+)?\s+", "", line).strip()
-    return line
+    return _PAGE_PREFIX_STRIP_RX.sub("", line).strip()
 
 def _remove_headers_footers_from_page(
     page_text: str,
