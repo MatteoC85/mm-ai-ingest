@@ -704,9 +704,18 @@ def _remove_headers_footers_from_page(
     footer_norm: set[str],
     top_n: int = 4,
     bottom_n: int = 4,
+    debug: bool = False,
+    debug_page_number: Optional[int] = None,
 ) -> str:
-    lines = [ln.strip() for ln in (page_text or "").split("\n")]
 
+    lines = [ln.strip() for ln in (page_text or "").split("\n")]
+    # DEV debug: log solo p1-p2, solo se MM_DEBUG_CLEAN=1
+    if debug and debug_page_number and debug_page_number <= 2 and len(lines) > 0:
+        before0 = lines[0]
+        after0 = _strip_page_noise_prefix(before0)
+        print(f"MM_DEBUG_CLEAN p{debug_page_number} line0_before={repr(before0)}")
+        print(f"MM_DEBUG_CLEAN p{debug_page_number} line0_after={repr(after0)}")
+        
     # remove header candidates only in the top area
     for i in range(min(top_n, len(lines))):
         lines[i] = _strip_page_noise_prefix(lines[i]) 
@@ -1085,8 +1094,16 @@ def ingest_document(
         pages_with_text = 0
         text_chars = 0
 
-        for t in raw_pages:
-            cleaned = _remove_headers_footers_from_page(t, header_norm, footer_norm)
+        debug_clean = (os.environ.get("MM_DEBUG_CLEAN") or "").strip() == "1"
+
+        for page_number, t in enumerate(raw_pages, start=1):
+            cleaned = _remove_headers_footers_from_page(
+                t,
+                header_norm,
+                footer_norm,
+                debug=debug_clean,
+                debug_page_number=page_number,
+            )
             cleaned = _reflow_paragraphs_conservative(cleaned)
             pages_text.append(cleaned)
             text_chars += len(cleaned)
