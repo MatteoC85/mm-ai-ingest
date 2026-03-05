@@ -11,7 +11,6 @@ import psycopg2
 import fitz  # PyMuPDF
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
-from pypdf import PdfReader
 
 from google.cloud import tasks_v2
 
@@ -38,7 +37,6 @@ MIN_PAGES_WITH_TEXT_PCT = float(os.environ.get("MM_MIN_PAGES_WITH_TEXT_PCT", "0.
 CHUNK_TARGET_CHARS = int(os.environ.get("MM_CHUNK_TARGET_CHARS", "3800"))
 CHUNK_OVERLAP_CHARS = int(os.environ.get("MM_CHUNK_OVERLAP_CHARS", "800"))
 CHUNK_MIN_CHARS = int(os.environ.get("MM_CHUNK_MIN_CHARS", "200"))
-PAGE_JOIN_SEPARATOR = "\n\n"
 
 # OpenAI
 OPENAI_API_KEY = (os.environ.get("OPENAI_API_KEY") or "").strip()
@@ -688,6 +686,19 @@ def _is_page_noise_line(line: str) -> bool:
         return False
     return _PAGE_NOISE_RX.match(k) is not None
 
+_PAGE_NOISE_PREFIX_RX = re.compile(r"^(?:page|pagina)\s*#?(?:\s*of\s*#?)?\s+", re.IGNORECASE)
+
+def _strip_page_noise_prefix(line: str) -> str:
+    # lavora su linea normalizzata ma restituisce originale ripulita
+    # caso: "Page 1 of 5 La macchina..." -> "La macchina..."
+    k = _hf_norm_line(line)
+    if not k:
+        return line
+    # se dopo normalizzazione inizia con "page # of #"
+    if k.startswith("page #") or k.startswith("pagina #"):
+        return re.sub(r"^(?i)(page|pagina)\s*\d+(?:\s*of\s*\d+)?\s+", "", line).strip()
+    return line
+
 def _remove_headers_footers_from_page(
     page_text: str,
     header_norm: set[str],
@@ -699,11 +710,15 @@ def _remove_headers_footers_from_page(
 
     # remove header candidates only in the top area
     for i in range(min(top_n, len(lines))):
+        lines[i] = _strip_page_noise_prefix(lines[i]) 
         if (_hf_norm_line(lines[i]) in header_norm) or _is_page_noise_line(lines[i]):
             lines[i] = ""
 
     # remove footer candidates only in the bottom area
     for j in range(len(lines) - min(bottom_n, len(lines)), len(lines)):
+        if 0 <= j < len(lines):
+            lines[j] = _strip_page_noise_prefix(lines[j])  
+
         if 0 <= j < len(lines) and ((_hf_norm_line(lines[j]) in footer_norm) or _is_page_noise_line(lines[j])):
             lines[j] = ""
 
@@ -855,90 +870,6 @@ def _reflow_paragraphs_conservative(page_text: str) -> str:
             cleaned.append(ln)
 
     return "\n".join(cleaned).strip()
-
-def _build_global_text_and_page_spans(pages: list[tuple[int, str]]) -> tuple[str, list[tuple[int, int, int]]]:
-    parts: list[str] = []
-    spans: list[tuple[int, int, int]] = []
-    pos = 0
-
-    for (page_number, text) in pages:
-        t = _normalize_text_keep_lines(text or "")
-        start = pos
-        parts.append(t)
-        pos += len(t)
-        end = pos
-        spans.append((start, end, int(page_number)))
-
-        parts.append(PAGE_JOIN_SEPARATOR)
-        pos += len(PAGE_JOIN_SEPARATOR)
-
-    if parts:
-        global_text = "".join(parts)
-        global_text = global_text[: -len(PAGE_JOIN_SEPARATOR)]
-        return global_text, spans
-
-    return "", []
-
-
-def _pages_for_slice(spans: list[tuple[int, int, int]], slice_start: int, slice_end: int) -> tuple[int, int]:
-    page_from = None
-    page_to = None
-
-    for (ps, pe, pn) in spans:
-        if ps < slice_end and pe > slice_start:
-            if page_from is None:
-                page_from = pn
-            page_to = pn
-
-    if page_from is None:
-        page_from = spans[0][2] if spans else 1
-    if page_to is None:
-        page_to = page_from
-
-    return int(page_from), int(page_to)
-
-
-def _chunk_text(global_text: str, spans: list[tuple[int, int, int]]) -> list[dict]:
-    text_len = len(global_text)
-    if text_len == 0:
-        return []
-
-    target = max(500, CHUNK_TARGET_CHARS)
-    overlap = min(max(0, CHUNK_OVERLAP_CHARS), target - 1) if target > 1 else 0
-    step = max(1, target - overlap)
-
-    chunks: list[dict] = []
-    start = 0
-    chunk_index = 1
-
-    while start < text_len:
-        end = min(start + target, text_len)
-        chunk_raw = global_text[start:end]
-        chunk_clean = chunk_raw.strip()
-
-        if chunks and len(chunk_clean) < CHUNK_MIN_CHARS:
-            prev = chunks[-1]
-            glued = (prev["chunk_text"] + "\n" + chunk_clean).strip()
-            prev["chunk_text"] = glued
-            pf, pt = _pages_for_slice(spans, start, end)
-            prev["page_to"] = max(prev["page_to"], pt)
-            break
-
-        pf, pt = _pages_for_slice(spans, start, end)
-        chunks.append(
-            {
-                "chunk_index": chunk_index,
-                "page_from": pf,
-                "page_to": pt,
-                "chunk_text": chunk_clean,
-            }
-        )
-
-        chunk_index += 1
-        start += step
-
-    chunks = [c for c in chunks if c["chunk_text"]]
-    return chunks
 
 _SENT_SPLIT_RX = re.compile(r"(?<=[\.\!\?])\s+")
 
@@ -1404,7 +1335,7 @@ def index_document(
                 target_chars=CHUNK_TARGET_CHARS,
                 overlap_chars=CHUNK_OVERLAP_CHARS,
                 min_chars=CHUNK_MIN_CHARS,
-)
+            )
 
             chunk_cols = _get_table_columns(cur, "document_chunks")
             required = {
