@@ -1544,11 +1544,15 @@ def _llm_rerank_citations(
     }
 
     system_msg = (
-        "Selezioni le citazioni migliori per rispondere a una domanda tecnica industriale. "
-        "Obiettivo: massima precisione, minima hallucinazione. "
-        "Scegli solo citation_id realmente utili alla domanda. "
-        "Preferisci match specifici su componente, fluido, procedura, misura, codice o sezione. "
-        "Se i candidati sono dubbi o generici, restituisci meno elementi. "
+        "Selezioni le citazioni minime e più precise per rispondere a una domanda tecnica industriale. "
+        "Obiettivo: tenere solo le fonti strettamente necessarie e scartare quelle solo vagamente correlate. "
+        "Regole obbligatorie: "
+        "1) seleziona il minor numero possibile di citation_id utili; "
+        "2) preferisci chunk che contengono direttamente la risposta, non solo parole affini; "
+        "3) scarta chunk generici di manutenzione, installazione, sicurezza o contesto se non aggiungono un fatto necessario alla risposta; "
+        "4) scarta chunk che parlano di pulizia, trasporto, avviamento o altri usi dell'olio non riferiti alla lubrificazione richiesta; "
+        "5) se due chunk sono simili, tieni solo il più specifico; "
+        "6) è corretto restituire anche solo 1, 2 o 3 citation_id se bastano. "
         "Non inventare e non aggiungere testo fuori dal JSON."
     )
 
