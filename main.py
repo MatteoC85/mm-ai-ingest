@@ -2953,12 +2953,7 @@ def root_cause_v1(
 
     if _should_use_reranker(q=q, candidates=cut_candidates, sim_max=sim_max, top_k=top_k):
         try:
-            reranked_ids = _llm_rerank_citations(
-                q=q,
-                candidates=cut_candidates,
-                top_k=top_k,
-                diagnostic_mode=True
-            )
+            reranked_ids = _llm_rerank_citations(q=q, candidates=cut_candidates, top_k=top_k)
             if reranked_ids:
                 by_id = {str(c.get("citation_id")): c for c in cut_candidates}
                 reranked = [by_id[cid] for cid in reranked_ids if cid in by_id]
