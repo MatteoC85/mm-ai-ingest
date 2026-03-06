@@ -2620,7 +2620,7 @@ def ask_v1(
         rg_links = []
 
 
-    return {
+    resp = {
         "ok": True,
         "status": "answered",
         "answer": answer,
@@ -2637,6 +2637,7 @@ def ask_v1(
             "rerank_used": rerank_used,
             "rerank_error": rerank_error[:300] if rerank_error else None,
         }
+
     return resp
 
 # -----------------------------
