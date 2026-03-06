@@ -47,6 +47,12 @@ OPENAI_EMBED_URL = (os.environ.get("OPENAI_EMBED_URL") or "https://api.openai.co
 OPENAI_CHAT_MODEL = (os.environ.get("OPENAI_CHAT_MODEL") or "gpt-4.1-mini").strip()
 OPENAI_CHAT_URL = (os.environ.get("OPENAI_CHAT_URL") or "https://api.openai.com/v1/chat/completions").strip()
 
+# OpenAI Citation Reranker (on-demand)
+OPENAI_RERANK_MODEL = (os.environ.get("OPENAI_RERANK_MODEL") or "gpt-4.1-nano").strip()
+RERANK_MAX_CANDIDATES = int(os.environ.get("MM_RERANK_MAX_CANDIDATES", "18"))
+RERANK_SNIPPET_CHARS = int(os.environ.get("MM_RERANK_SNIPPET_CHARS", "320"))
+RERANK_TIMEOUT = int(os.environ.get("MM_RERANK_TIMEOUT_SECONDS", "30"))
+
 ASK_SIM_THRESHOLD = float(os.environ.get("MM_ASK_SIM_THRESHOLD", "0.35"))
 ASK_MAX_TOP_K = int(os.environ.get("MM_ASK_MAX_TOP_K", "8"))
 ASK_SNIPPET_CHARS = int(os.environ.get("MM_ASK_SNIPPET_CHARS", "700"))
@@ -1282,6 +1288,169 @@ def _openai_chat(messages: list[dict]) -> str:
     data = r.json()
     return (data.get("choices", [{}])[0].get("message", {}) or {}).get("content", "") or ""
 
+def _extract_section_from_text(text: str) -> str:
+    if not text:
+        return ""
+    m = re.search(r"^SECTION:\s*(.+)$", text, flags=re.MULTILINE)
+    return (m.group(1).strip() if m else "")[:120]
+
+
+def _openai_chat_json(
+    messages: list[dict],
+    *,
+    model: Optional[str] = None,
+    json_schema: Optional[dict] = None,
+    timeout: int = 60,
+) -> dict:
+    if not OPENAI_API_KEY:
+        raise Exception("OPENAI_API_KEY missing")
+
+    payload = {
+        "model": (model or OPENAI_CHAT_MODEL),
+        "messages": messages,
+        "temperature": 0,
+    }
+    if json_schema:
+        payload["response_format"] = {
+            "type": "json_schema",
+            "json_schema": json_schema,
+        }
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    r = requests.post(OPENAI_CHAT_URL, headers=headers, json=payload, timeout=timeout)
+    if r.status_code != 200:
+        raise Exception(f"OpenAI chat JSON failed: {r.status_code} {r.text}")
+
+    data = r.json()
+    msg = (data.get("choices", [{}])[0].get("message", {}) or {})
+    content = msg.get("content", "")
+
+    if isinstance(content, list):
+        text = "".join(
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        ).strip()
+    else:
+        text = str(content or "").strip()
+
+    if not text:
+        raise Exception("OpenAI chat JSON empty response")
+
+    try:
+        return json.loads(text)
+    except Exception as e:
+        raise Exception(f"OpenAI chat JSON parse failed: {str(e)} | raw={text[:500]}")
+
+
+def _llm_rerank_citations(
+    q: str,
+    candidates: list[dict],
+    top_k: int,
+) -> list[str]:
+    q = (q or "").strip()
+    if not q or not candidates:
+        return []
+
+    requested_k = max(1, min(int(top_k or 1), ASK_MAX_TOP_K))
+    max_candidates = max(1, min(int(RERANK_MAX_CANDIDATES), len(candidates)))
+
+    items = []
+    seen = set()
+
+    for c in candidates[:max_candidates]:
+        cid = str(c.get("citation_id") or "").strip()
+        if not cid or cid in seen:
+            continue
+        seen.add(cid)
+
+        full_text = (c.get("chunk_full") or c.get("snippet") or "").strip()
+        section = _extract_section_from_text(full_text)
+
+        snippet = (c.get("snippet") or "").strip()
+        snippet = re.sub(r"^SECTION:\s*[^\n]+\n?", "", snippet).strip()
+
+        items.append(
+            {
+                "citation_id": cid,
+                "section": section,
+                "page_from": int(c.get("page_from") or 0),
+                "page_to": int(c.get("page_to") or 0),
+                "similarity": round(float(c.get("similarity", 0.0)), 4),
+                "snippet": snippet[:RERANK_SNIPPET_CHARS],
+            }
+        )
+
+    if not items:
+        return []
+
+    schema = {
+        "name": "citation_rerank",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "selected_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                }
+            },
+            "required": ["selected_ids"],
+        },
+    }
+
+    system_msg = (
+        "Selezioni le citazioni migliori per rispondere a una domanda tecnica industriale. "
+        "Obiettivo: massima precisione, minima hallucinazione. "
+        "Scegli solo citation_id realmente utili alla domanda. "
+        "Preferisci match specifici su componente, fluido, procedura, misura, codice o sezione. "
+        "Se i candidati sono dubbi o generici, restituisci meno elementi. "
+        "Non inventare e non aggiungere testo fuori dal JSON."
+    )
+
+    user_msg = (
+        f"DOMANDA:\n{q}\n\n"
+        f"TOP_K_DESIDERATO: {requested_k}\n\n"
+        "CANDIDATI_JSON:\n"
+        f"{json.dumps(items, ensure_ascii=False)}\n\n"
+        "Restituisci JSON valido con questa forma:\n"
+        '{"selected_ids":["id1","id2"]}\n'
+        "Ordina selected_ids dal migliore al meno rilevante. "
+        "Non includere più di TOP_K_DESIDERATO elementi."
+    )
+
+    parsed = _openai_chat_json(
+        [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ],
+        model=OPENAI_RERANK_MODEL,
+        json_schema=schema,
+        timeout=RERANK_TIMEOUT,
+    )
+
+    selected = parsed.get("selected_ids") or []
+    if not isinstance(selected, list):
+        return []
+
+    allowed = {item["citation_id"] for item in items}
+    out = []
+    used = set()
+
+    for cid in selected:
+        cid = str(cid or "").strip()
+        if not cid or cid not in allowed or cid in used:
+            continue
+        used.add(cid)
+        out.append(cid)
+        if len(out) >= requested_k:
+            break
+
+    return out
 
 class SearchRequest(BaseModel):
     query: str
