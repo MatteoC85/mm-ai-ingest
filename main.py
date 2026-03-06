@@ -114,11 +114,19 @@ class AskRequest(BaseModel):
     top_k: int = 5
     debug: Optional[bool] = False
 
+class RootCauseRequest(BaseModel):
+    query: str
+    company_id: str
+    machine_id: Optional[str] = None
+    bubble_document_id: Optional[str] = None
+    document_ids: Optional[Union[List[str], str]] = None
+    top_k: int = 6
+    max_causes: int = 3
+    debug: Optional[bool] = False
 
 class DeleteDocumentRequest(BaseModel):
     company_id: str
     bubble_document_id: str
-
 
 def _db_conn():
     if not (DB_HOST and DB_USER and DB_PASSWORD):
@@ -1460,6 +1468,169 @@ def _should_use_reranker(
 
     return True
 
+def _unique_non_empty_strings(items: list[Any], limit: Optional[int] = None) -> list[str]:
+    out: list[str] = []
+    seen = set()
+
+    for item in items or []:
+        s = str(item or "").strip()
+        if not s:
+            continue
+
+        k = s.lower()
+        if k in seen:
+            continue
+
+        seen.add(k)
+        out.append(s)
+
+        if limit is not None and len(out) >= limit:
+            break
+
+    return out
+
+
+def _extract_citation_ids_from_root_cause_json(result: dict) -> list[str]:
+    if not isinstance(result, dict):
+        return []
+
+    out: list[str] = []
+    seen = set()
+
+    for cause in result.get("possible_causes") or []:
+        if not isinstance(cause, dict):
+            continue
+
+        for cid in cause.get("citations") or []:
+            cid = str(cid or "").strip()
+            if not cid or cid in seen:
+                continue
+
+            seen.add(cid)
+            out.append(cid)
+
+    return out
+
+
+def _ground_root_cause_result(
+    result: dict,
+    citations: list[dict],
+    max_causes: int,
+) -> tuple[dict, list[dict]]:
+    result = result if isinstance(result, dict) else {}
+    max_causes = max(1, min(int(max_causes or 1), 3))
+
+    by_id = {
+        str(c.get("citation_id") or "").strip(): c
+        for c in citations
+        if c.get("citation_id")
+    }
+
+    grounded_causes: list[dict] = []
+
+    for cause in result.get("possible_causes") or []:
+        if not isinstance(cause, dict):
+            continue
+
+        cause_text = str(cause.get("cause") or "").strip()
+        why_text = str(cause.get("why") or "").strip()
+        checks = _unique_non_empty_strings(cause.get("checks") or [], limit=4)
+
+        used_ids: list[str] = []
+        seen_ids = set()
+
+        for cid in cause.get("citations") or []:
+            cid = str(cid or "").strip()
+            if not cid or cid not in by_id or cid in seen_ids:
+                continue
+
+            seen_ids.add(cid)
+            used_ids.append(cid)
+            if len(used_ids) >= 3:
+                break
+
+        if not cause_text or not why_text or not used_ids:
+            continue
+
+        grounded_causes.append(
+            {
+                "rank": len(grounded_causes) + 1,
+                "cause": cause_text,
+                "why": why_text,
+                "checks": checks,
+                "citations": used_ids,
+            }
+        )
+
+        if len(grounded_causes) >= max_causes:
+            break
+
+    problem_summary = str(result.get("problem_summary") or "").strip()
+
+    recommended_next_checks = _unique_non_empty_strings(
+        result.get("recommended_next_checks") or [],
+        limit=6,
+    )
+
+    if not recommended_next_checks:
+        flattened_checks = []
+        for cause in grounded_causes:
+            flattened_checks.extend(cause.get("checks") or [])
+        recommended_next_checks = _unique_non_empty_strings(flattened_checks, limit=6)
+
+    grounded = {
+        "problem_summary": problem_summary,
+        "possible_causes": grounded_causes,
+        "recommended_next_checks": recommended_next_checks,
+    }
+
+    grounded_ids = _extract_citation_ids_from_root_cause_json(grounded)
+    grounded_citations = [by_id[cid] for cid in grounded_ids if cid in by_id]
+
+    return grounded, grounded_citations
+
+
+def _root_cause_response_schema(max_causes: int) -> dict:
+    max_causes = max(1, min(int(max_causes or 1), 3))
+
+    return {
+        "name": "root_cause_finder_v1",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "problem_summary": {"type": "string"},
+                "possible_causes": {
+                    "type": "array",
+                    "maxItems": max_causes,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "rank": {"type": "integer"},
+                            "cause": {"type": "string"},
+                            "why": {"type": "string"},
+                            "checks": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                            "citations": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                        },
+                        "required": ["rank", "cause", "why", "checks", "citations"],
+                    },
+                },
+                "recommended_next_checks": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+            },
+            "required": ["problem_summary", "possible_causes", "recommended_next_checks"],
+        },
+    }
 
 @app.get("/ping")
 def ping():
@@ -2456,6 +2627,385 @@ def ask_v1(
         }
     )
 
+@app.post("/v1/ai/root-cause")
+def root_cause_v1(
+    payload: RootCauseRequest,
+    x_ai_internal_secret: Optional[str] = Header(default=None),
+):
+    if not AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=500, detail="AI_INTERNAL_SECRET missing")
+    if (x_ai_internal_secret or "").strip() != AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    q = (payload.query or "").strip()
+    if not q:
+        raise HTTPException(status_code=400, detail="Missing query")
+
+    company_id = (payload.company_id or "").strip()
+    if not company_id:
+        raise HTTPException(status_code=400, detail="Missing company_id")
+
+    machine_id = (payload.machine_id or "").strip()
+    if not machine_id:
+        raise HTTPException(status_code=400, detail="Missing machine_id")
+
+    doc_ids = payload.document_ids
+    if isinstance(doc_ids, str):
+        doc_ids = [x.strip() for x in doc_ids.split(",") if x.strip()]
+
+    if isinstance(doc_ids, list):
+        doc_ids = [str(x).strip() for x in doc_ids if str(x).strip()]
+        if not doc_ids:
+            doc_ids = None
+    else:
+        doc_ids = None
+
+    top_k = int(payload.top_k or 6)
+    top_k = max(1, min(top_k, ASK_MAX_TOP_K))
+    max_causes = max(1, min(int(payload.max_causes or 3), 3))
+    candidate_k = max(top_k, min(40, top_k * 6))
+
+    q_vec = _openai_embed_texts([q])[0]
+    q_vec_lit = _vector_literal(q_vec)
+
+    rows = []
+    chunks_matching_filter = None
+    sim_max: Optional[float] = None
+    fts_used = False
+    rerank_used = False
+    rerank_error: Optional[str] = None
+
+    def _finalize(resp: dict) -> dict:
+        if payload.debug:
+            resp["debug"] = {
+                "company_id": company_id,
+                "machine_id": machine_id,
+                "bubble_document_id": payload.bubble_document_id,
+                "document_ids": doc_ids,
+                "chunks_matching_filter": chunks_matching_filter,
+                "similarity_max": sim_max,
+                "fts_used": fts_used,
+                "rerank_enabled": RERANK_ENABLED,
+                "rerank_used": rerank_used,
+                "rerank_error": rerank_error[:300] if rerank_error else None,
+            }
+        return resp
+
+    conn = _db_conn()
+    try:
+        with conn.cursor() as cur:
+            if doc_ids:
+                if payload.debug:
+                    cur.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM public.document_chunks
+                        WHERE company_id=%s
+                          AND bubble_document_id = ANY(%s)
+                          AND embedding IS NOT NULL;
+                        """,
+                        (company_id, doc_ids),
+                    )
+                    chunks_matching_filter = int(cur.fetchone()[0] or 0)
+
+                cur.execute(
+                    """
+                    SELECT bubble_document_id, chunk_index, page_from, page_to,
+                           left(chunk_text, %s) AS snippet,
+                           left(chunk_text, 2000) AS chunk_full,
+                           1 - (embedding <=> %s::vector) AS similarity,
+                           embedding
+                    FROM public.document_chunks
+                    WHERE company_id = %s
+                      AND bubble_document_id = ANY(%s)
+                      AND embedding IS NOT NULL
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s;
+                    """,
+                    (ASK_SNIPPET_CHARS, q_vec_lit, company_id, doc_ids, q_vec_lit, candidate_k),
+                )
+            elif payload.bubble_document_id:
+                bdid = payload.bubble_document_id.strip()
+
+                if payload.debug:
+                    cur.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM public.document_chunks
+                        WHERE company_id=%s
+                          AND bubble_document_id=%s
+                          AND embedding IS NOT NULL
+                          AND (machine_id=%s OR machine_id IS NULL);
+                        """,
+                        (company_id, bdid, machine_id),
+                    )
+                    chunks_matching_filter = int(cur.fetchone()[0] or 0)
+
+                cur.execute(
+                    """
+                    SELECT bubble_document_id, chunk_index, page_from, page_to,
+                           left(chunk_text, %s) AS snippet,
+                           left(chunk_text, 2000) AS chunk_full,
+                           1 - (embedding <=> %s::vector) AS similarity,
+                           embedding
+                    FROM public.document_chunks
+                    WHERE company_id = %s
+                      AND bubble_document_id = %s
+                      AND embedding IS NOT NULL
+                      AND (machine_id = %s OR machine_id IS NULL)
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s;
+                    """,
+                    (ASK_SNIPPET_CHARS, q_vec_lit, company_id, bdid, machine_id, q_vec_lit, candidate_k),
+                )
+            else:
+                if payload.debug:
+                    cur.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM public.document_chunks
+                        WHERE company_id=%s
+                          AND embedding IS NOT NULL
+                          AND (machine_id=%s OR machine_id IS NULL);
+                        """,
+                        (company_id, machine_id),
+                    )
+                    chunks_matching_filter = int(cur.fetchone()[0] or 0)
+
+                cur.execute(
+                    """
+                    SELECT bubble_document_id, chunk_index, page_from, page_to,
+                           left(chunk_text, %s) AS snippet,
+                           left(chunk_text, 2000) AS chunk_full,
+                           1 - (embedding <=> %s::vector) AS similarity,
+                           embedding
+                    FROM public.document_chunks
+                    WHERE company_id = %s
+                      AND embedding IS NOT NULL
+                      AND (machine_id = %s OR machine_id IS NULL)
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s;
+                    """,
+                    (ASK_SNIPPET_CHARS, q_vec_lit, company_id, machine_id, q_vec_lit, candidate_k),
+                )
+
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        return _finalize(
+            {
+                "ok": True,
+                "status": "no_sources",
+                "symptom": q,
+                "problem_summary": "",
+                "possible_causes": [],
+                "recommended_next_checks": [],
+                "citations": [],
+                "rg_links": [],
+                "top_k": top_k,
+                "similarity_max": None,
+            }
+        )
+
+    candidates: list[dict] = []
+    sim_max = -1.0
+
+    for (bdid, chunk_index, page_from, page_to, snippet, chunk_full, similarity, embedding) in rows:
+        sim = float(similarity)
+        sim_max = max(sim_max, sim)
+
+        if embedding is None:
+            emb_list = None
+        elif isinstance(embedding, list):
+            emb_list = embedding
+        else:
+            s = str(embedding).strip()
+            s = s.strip("[]")
+            emb_list = [float(x) for x in s.split(",") if x.strip()]
+
+        citation_id = f"{bdid}:p{int(page_from)}-{int(page_to)}:c{int(chunk_index)}"
+        candidates.append(
+            {
+                "citation_id": citation_id,
+                "bubble_document_id": bdid,
+                "page_from": int(page_from),
+                "page_to": int(page_to),
+                "snippet": (snippet or "").strip(),
+                "chunk_full": (chunk_full or "").strip(),
+                "similarity": sim,
+                "embedding_list": emb_list or [],
+            }
+        )
+
+    q_low = q.lower()
+    key_terms = []
+    if "lubrif" in q_low or "olio" in q_low or "ingrass" in q_low or "cuscinet" in q_low or "riduttor" in q_low:
+        key_terms = ["lubrif", "olio", "ingrass", "cuscinet", "riduttor"]
+
+    if key_terms:
+        gated = []
+        for c in candidates:
+            hay = ((c.get("chunk_full") or c.get("snippet") or "") + " " + (c.get("citation_id") or "")).lower()
+            if any(t in hay for t in key_terms):
+                gated.append(c)
+
+        if len(gated) >= 2:
+            candidates = gated
+
+    cutoff_delta = 0.08 if key_terms else 0.12
+    cut_candidates = [c for c in candidates if (sim_max - float(c.get("similarity", 0.0))) <= cutoff_delta]
+    cut_candidates.sort(key=lambda x: float(x.get("similarity", 0.0)), reverse=True)
+
+    if len(cut_candidates) < min(2, len(candidates)):
+        cut_candidates = sorted(
+            candidates,
+            key=lambda x: float(x.get("similarity", 0.0)),
+            reverse=True,
+        )[: min(2, len(candidates))]
+
+    citations = _mmr_select(q_vec, cut_candidates, top_k=top_k, lambda_mult=0.85)
+
+    if _should_use_reranker(q=q, candidates=cut_candidates, sim_max=sim_max, top_k=top_k):
+        try:
+            reranked_ids = _llm_rerank_citations(q=q, candidates=cut_candidates, top_k=top_k)
+            if reranked_ids:
+                by_id = {str(c.get("citation_id")): c for c in cut_candidates}
+                reranked = [by_id[cid] for cid in reranked_ids if cid in by_id]
+                if reranked:
+                    citations = reranked
+                    rerank_used = True
+        except Exception as e:
+            rerank_error = str(e)
+
+    for c in citations:
+        c.pop("embedding_list", None)
+        c.pop("chunk_full", None)
+
+    citations = _dedup_citations_by_snippet(citations, max_items=top_k)
+
+    if sim_max < ASK_SIM_THRESHOLD:
+        fts = _fts_search_chunks(
+            company_id=company_id,
+            machine_id=machine_id,
+            q=q,
+            top_k=top_k,
+            doc_ids=doc_ids if isinstance(doc_ids, list) else None,
+            bubble_document_id=payload.bubble_document_id.strip() if payload.bubble_document_id else None,
+        )
+        if fts:
+            fts_used = True
+            citations = _dedup_citations_by_snippet(citations + fts, max_items=top_k)
+
+    if sim_max < ASK_SIM_THRESHOLD and not (fts_used and citations):
+        return _finalize(
+            {
+                "ok": True,
+                "status": "no_sources",
+                "symptom": q,
+                "problem_summary": "",
+                "possible_causes": [],
+                "recommended_next_checks": [],
+                "citations": [],
+                "rg_links": [],
+                "top_k": top_k,
+                "similarity_max": sim_max,
+            }
+        )
+
+    ctx_parts: List[str] = []
+    total_chars = 0
+    for c in citations:
+        part = f"[{c['citation_id']}] (p{c['page_from']}-{c['page_to']})\n{c['snippet']}\n"
+        if total_chars + len(part) > ASK_MAX_CONTEXT_CHARS:
+            break
+        ctx_parts.append(part)
+        total_chars += len(part)
+    sources_block = "\n".join(ctx_parts).strip()
+
+    schema = _root_cause_response_schema(max_causes=max_causes)
+
+    system_msg = (
+        "Sei un assistente tecnico industriale specializzato in root cause analysis. "
+        "Devi usare SOLO le FONTI fornite. "
+        "Obiettivo: proporre poche cause plausibili e verifiche pratiche, senza inventare. "
+        f"Regole obbligatorie:\n"
+        f"1) restituisci massimo {max_causes} possibili cause;\n"
+        "2) ogni causa deve avere almeno 1 citation_id preso ESATTAMENTE dalle fonti;\n"
+        "3) non usare conoscenza esterna;\n"
+        "4) se le fonti non bastano, restituisci possible_causes=[] e recommended_next_checks=[];\n"
+        "5) le verifiche devono essere controlli operativi concreti e brevi;\n"
+        "6) non citare fonti inesistenti.\n"
+    )
+
+    user_msg = (
+        f"SINTOMO/PROBLEMA:\n{q}\n\n"
+        f"FONTI:\n{sources_block}\n\n"
+        "Restituisci JSON valido. Nelle citations usa solo citation_id presenti nelle fonti."
+    )
+
+    try:
+        result_json = _openai_chat_json(
+            [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            model=OPENAI_CHAT_MODEL,
+            json_schema=schema,
+            timeout=60,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"LLM failed: {str(e)}")
+
+    grounded_result, grounded_citations = _ground_root_cause_result(
+        result=result_json,
+        citations=citations,
+        max_causes=max_causes,
+    )
+
+    if not grounded_result.get("problem_summary"):
+        grounded_result["problem_summary"] = q
+
+    if not grounded_result.get("possible_causes"):
+        return _finalize(
+            {
+                "ok": True,
+                "status": "no_sources",
+                "symptom": q,
+                "problem_summary": grounded_result.get("problem_summary") or "",
+                "possible_causes": [],
+                "recommended_next_checks": [],
+                "citations": [],
+                "rg_links": [],
+                "top_k": top_k,
+                "similarity_max": sim_max,
+                "chat_model": OPENAI_CHAT_MODEL,
+            }
+        )
+
+    rg_links = []
+    try:
+        rg_links = _build_rg_links(company_id, grounded_citations)
+    except Exception as e:
+        print("RG_LINKS_FAIL", str(e))
+        rg_links = []
+
+    return _finalize(
+        {
+            "ok": True,
+            "status": "answered",
+            "symptom": q,
+            "problem_summary": grounded_result.get("problem_summary") or q,
+            "possible_causes": grounded_result.get("possible_causes") or [],
+            "recommended_next_checks": grounded_result.get("recommended_next_checks") or [],
+            "citations": grounded_citations,
+            "rg_links": rg_links,
+            "top_k": top_k,
+            "similarity_max": sim_max,
+            "chat_model": OPENAI_CHAT_MODEL,
+        }
+    )
 
 @app.post("/v1/ai/delete/document")
 def delete_document_v1(
