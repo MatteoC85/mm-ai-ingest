@@ -1432,6 +1432,81 @@ def _llm_rerank_citations(
 
     return out
 
+def _llm_filter_diagnostic_chunks(
+    q: str,
+    candidates: list[dict],
+    max_keep: int,
+) -> list[str]:
+
+    if not q or not candidates:
+        return []
+
+    items = []
+
+    for c in candidates[:18]:
+        cid = str(c.get("citation_id") or "").strip()
+        snippet = (c.get("snippet") or "").strip()
+
+        items.append({
+            "citation_id": cid,
+            "snippet": snippet[:300]
+        })
+
+    schema = {
+        "name": "diagnostic_filter",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "selected_ids": {
+                    "type": "array",
+                    "items": {"type": "string"}
+                }
+            },
+            "required": ["selected_ids"]
+        }
+    }
+
+    system_msg = (
+        "Selezioni solo le fonti realmente utili per diagnosticare un problema tecnico su una macchina industriale.\n"
+        "Regole:\n"
+        "1) Tieni solo fonti che parlano del fenomeno o dei componenti coinvolti.\n"
+        "2) Scarta fonti generiche di manutenzione, sicurezza, installazione o lubrificazione se non sono direttamente legate al sintomo.\n"
+        "3) Se una fonte parla solo di controlli generici o procedure standard, scartala.\n"
+        "4) Mantieni poche fonti ma molto pertinenti.\n"
+    )
+
+    user_msg = (
+        f"PROBLEMA:\n{q}\n\n"
+        f"CANDIDATI:\n{json.dumps(items, ensure_ascii=False)}\n\n"
+        f"Restituisci JSON con gli id delle fonti più utili alla diagnosi."
+    )
+
+    parsed = _openai_chat_json(
+        [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ],
+        model=OPENAI_RERANK_MODEL,
+        json_schema=schema,
+        timeout=RERANK_TIMEOUT,
+    )
+
+    selected = parsed.get("selected_ids") or []
+
+    out = []
+    used = set()
+
+    for cid in selected:
+        cid = str(cid).strip()
+        if cid and cid not in used:
+            used.add(cid)
+            out.append(cid)
+        if len(out) >= max_keep:
+            break
+
+    return out
 
 def _should_use_reranker(
     q: str,
@@ -2866,6 +2941,23 @@ def root_cause_v1(
         )[: min(2, len(candidates))]
 
     citations = _mmr_select(q_vec, cut_candidates, top_k=top_k, lambda_mult=0.85)
+
+    try:
+        filtered_ids = _llm_filter_diagnostic_chunks(
+            q=q,
+            candidates=cut_candidates,
+            max_keep=top_k
+        )
+
+        if filtered_ids:
+            by_id = {str(c.get("citation_id")): c for c in cut_candidates}
+            filtered = [by_id[cid] for cid in filtered_ids if cid in by_id]
+
+            if filtered:
+                citations = filtered
+
+    except Exception as e:
+        print("DIAGNOSTIC_FILTER_FAIL", str(e))
 
     if _should_use_reranker(q=q, candidates=cut_candidates, sim_max=sim_max, top_k=top_k):
         try:
