@@ -52,6 +52,11 @@ OPENAI_RERANK_MODEL = (os.environ.get("OPENAI_RERANK_MODEL") or "gpt-4.1-nano").
 RERANK_MAX_CANDIDATES = int(os.environ.get("MM_RERANK_MAX_CANDIDATES", "18"))
 RERANK_SNIPPET_CHARS = int(os.environ.get("MM_RERANK_SNIPPET_CHARS", "320"))
 RERANK_TIMEOUT = int(os.environ.get("MM_RERANK_TIMEOUT_SECONDS", "30"))
+RERANK_ENABLED = (os.environ.get("MM_RERANK_ENABLED") or "0").strip() == "1"
+RERANK_MIN_SIM_MAX = float(os.environ.get("MM_RERANK_MIN_SIM_MAX", "0.38"))
+RERANK_MAX_SIM_MAX = float(os.environ.get("MM_RERANK_MAX_SIM_MAX", "0.72"))
+RERANK_MAX_SPREAD = float(os.environ.get("MM_RERANK_MAX_SPREAD", "0.10"))
+RERANK_MIN_CANDIDATES = int(os.environ.get("MM_RERANK_MIN_CANDIDATES", "4"))
 
 ASK_SIM_THRESHOLD = float(os.environ.get("MM_ASK_SIM_THRESHOLD", "0.35"))
 ASK_MAX_TOP_K = int(os.environ.get("MM_ASK_MAX_TOP_K", "8"))
@@ -1481,6 +1486,150 @@ class Citation(BaseModel):
 def _vector_literal(vec: list[float]) -> str:
     return "[" + ",".join(f"{x:.8f}" for x in vec) + "]"
 
+def _llm_rerank_citations(
+    q: str,
+    candidates: list[dict],
+    top_k: int,
+) -> list[str]:
+    q = (q or "").strip()
+    if not q or not candidates:
+        return []
+
+    requested_k = max(1, min(int(top_k or 1), ASK_MAX_TOP_K))
+    max_candidates = max(1, min(int(RERANK_MAX_CANDIDATES), len(candidates)))
+
+    items = []
+    seen = set()
+
+    for c in candidates[:max_candidates]:
+        cid = str(c.get("citation_id") or "").strip()
+        if not cid or cid in seen:
+            continue
+        seen.add(cid)
+
+        full_text = (c.get("chunk_full") or c.get("snippet") or "").strip()
+        section = _extract_section_from_text(full_text)
+
+        snippet = (c.get("snippet") or "").strip()
+        snippet = re.sub(r"^SECTION:\s*[^\n]+\n?", "", snippet).strip()
+
+        items.append(
+            {
+                "citation_id": cid,
+                "section": section,
+                "page_from": int(c.get("page_from") or 0),
+                "page_to": int(c.get("page_to") or 0),
+                "similarity": round(float(c.get("similarity", 0.0)), 4),
+                "snippet": snippet[:RERANK_SNIPPET_CHARS],
+            }
+        )
+
+    if not items:
+        return []
+
+    schema = {
+        "name": "citation_rerank",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "selected_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                }
+            },
+            "required": ["selected_ids"],
+        },
+    }
+
+    system_msg = (
+        "Selezioni le citazioni migliori per rispondere a una domanda tecnica industriale. "
+        "Obiettivo: massima precisione, minima hallucinazione. "
+        "Scegli solo citation_id realmente utili alla domanda. "
+        "Preferisci match specifici su componente, fluido, procedura, misura, codice o sezione. "
+        "Se i candidati sono dubbi o generici, restituisci meno elementi. "
+        "Non inventare e non aggiungere testo fuori dal JSON."
+    )
+
+    user_msg = (
+        f"DOMANDA:\n{q}\n\n"
+        f"TOP_K_DESIDERATO: {requested_k}\n\n"
+        "CANDIDATI_JSON:\n"
+        f"{json.dumps(items, ensure_ascii=False)}\n\n"
+        "Restituisci JSON valido con questa forma:\n"
+        '{"selected_ids":["id1","id2"]}\n'
+        "Ordina selected_ids dal migliore al meno rilevante. "
+        "Non includere più di TOP_K_DESIDERATO elementi."
+    )
+
+    parsed = _openai_chat_json(
+        [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ],
+        model=OPENAI_RERANK_MODEL,
+        json_schema=schema,
+        timeout=RERANK_TIMEOUT,
+    )
+
+    selected = parsed.get("selected_ids") or []
+    if not isinstance(selected, list):
+        return []
+
+    allowed = {item["citation_id"] for item in items}
+    out = []
+    used = set()
+
+    for cid in selected:
+        cid = str(cid or "").strip()
+        if not cid or cid not in allowed or cid in used:
+            continue
+        used.add(cid)
+        out.append(cid)
+        if len(out) >= requested_k:
+            break
+
+    return out
+
+
+def _should_use_reranker(
+    q: str,
+    candidates: list[dict],
+    sim_max: float,
+    top_k: int,
+) -> bool:
+    if not RERANK_ENABLED:
+        return False
+
+    if not q or not candidates:
+        return False
+
+    if len(candidates) < max(2, RERANK_MIN_CANDIDATES):
+        return False
+
+    if sim_max is None:
+        return False
+
+    if sim_max < RERANK_MIN_SIM_MAX:
+        return False
+
+    if sim_max > RERANK_MAX_SIM_MAX:
+        return False
+
+    ordered = sorted(
+        candidates,
+        key=lambda x: float(x.get("similarity", 0.0)),
+        reverse=True,
+    )
+    if len(ordered) < 2:
+        return False
+
+    spread = float(ordered[0].get("similarity", 0.0)) - float(ordered[min(len(ordered) - 1, top_k - 1)].get("similarity", 0.0))
+    if spread > RERANK_MAX_SPREAD:
+        return False
+
+    return True
 
 @app.post("/v1/ai/ingest/document")
 def ingest_document(
@@ -2173,6 +2322,7 @@ def ask_v1(
                 "machine_id": machine_id,
                 "bubble_document_id": payload.bubble_document_id,
                 "chunks_matching_filter": chunks_matching_filter,
+                "rerank_enabled": RERANK_ENABLED,
             }
         return resp
 
@@ -2243,6 +2393,22 @@ def ask_v1(
 
     # --- MMR selection ---
     citations = _mmr_select(q_vec, cut_candidates, top_k=top_k, lambda_mult=0.85)
+
+    # --- Optional LLM reranker on-demand ---
+    rerank_used = False
+    rerank_error = None
+
+    if _should_use_reranker(q=q, candidates=cut_candidates, sim_max=sim_max, top_k=top_k):
+        try:
+            reranked_ids = _llm_rerank_citations(q=q, candidates=cut_candidates, top_k=top_k)
+            if reranked_ids:
+                by_id = {str(c.get("citation_id")): c for c in cut_candidates}
+                reranked = [by_id[cid] for cid in reranked_ids if cid in by_id]
+                if reranked:
+                    citations = reranked
+                    rerank_used = True
+        except Exception as e:
+            rerank_error = str(e)
 
     # rimuovi embedding_list prima di rispondere (non serve al client)
     for c in citations:
@@ -2377,6 +2543,9 @@ def ask_v1(
                     "bubble_document_id": payload.bubble_document_id,
                     "chunks_matching_filter": chunks_matching_filter,
                     "fts_used": fts_used,
+                    "rerank_enabled": RERANK_ENABLED,
+                    "rerank_used": rerank_used,
+                    "rerank_error": rerank_error[:300] if rerank_error else None,
                 }
             return resp
 
@@ -2461,6 +2630,15 @@ def ask_v1(
         "similarity_max": sim_max,
         "chat_model": OPENAI_CHAT_MODEL,
     }
+
+    if payload.debug:
+        resp["debug"] = {
+            "rerank_enabled": RERANK_ENABLED,
+            "rerank_used": rerank_used,
+            "rerank_error": rerank_error[:300] if rerank_error else None,
+        }
+    return resp
+
 # -----------------------------
 # Delete PRO (hard delete RAG data)
 # -----------------------------
