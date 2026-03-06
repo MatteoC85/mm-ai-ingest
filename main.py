@@ -1226,6 +1226,35 @@ def _extract_section_from_text(text: str) -> str:
     m = re.search(r"^SECTION:\s*(.+)$", text, flags=re.MULTILINE)
     return (m.group(1).strip() if m else "")[:120]
 
+def _extract_citation_ids_from_answer(answer: str) -> list[str]:
+    answer = (answer or "").strip()
+    if not answer:
+        return []
+
+    ids = re.findall(r"\[([^\]]+)\]", answer)
+    out: list[str] = []
+    seen = set()
+
+    for cid in ids:
+        cid = (cid or "").strip()
+        if not cid or cid in seen:
+            continue
+        seen.add(cid)
+        out.append(cid)
+
+    return out
+
+
+def _ground_citations_to_answer(answer: str, citations: list[dict]) -> list[dict]:
+    if not answer or not citations:
+        return citations
+
+    used_ids = set(_extract_citation_ids_from_answer(answer))
+    if not used_ids:
+        return citations
+
+    grounded = [c for c in citations if str(c.get("citation_id") or "").strip() in used_ids]
+    return grounded or citations
 
 def _openai_chat_json(
     messages: list[dict],
@@ -2397,6 +2426,8 @@ def ask_v1(
                 "similarity_max": sim_max,
             }
         )
+    
+    citations = _ground_citations_to_answer(answer, citations)
 
     rg_links = []
     try:
