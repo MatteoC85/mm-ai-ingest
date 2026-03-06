@@ -59,7 +59,7 @@ RERANK_MIN_CANDIDATES = int(os.environ.get("MM_RERANK_MIN_CANDIDATES", "4"))
 ASK_SIM_THRESHOLD = float(os.environ.get("MM_ASK_SIM_THRESHOLD", "0.35"))
 ASK_MAX_TOP_K = int(os.environ.get("MM_ASK_MAX_TOP_K", "8"))
 ASK_SNIPPET_CHARS = int(os.environ.get("MM_ASK_SNIPPET_CHARS", "700"))
-ASK_MAX_CONTEXT_CHARS = int(os.environ.get("MM_ASK_MAX_CONTEXT_CHARS", "6000"))
+ASK_MAX_CONTEXT_CHARS = int(os.environ.get("MM_ASK_MAX_CONTEXT_CHARS", "9000"))
 
 # -----------------------------
 # Entity fallback (URL / email / phone)
@@ -114,19 +114,22 @@ class AskRequest(BaseModel):
     top_k: int = 5
     debug: Optional[bool] = False
 
+
 class RootCauseRequest(BaseModel):
     query: str
     company_id: str
     machine_id: Optional[str] = None
     bubble_document_id: Optional[str] = None
     document_ids: Optional[Union[List[str], str]] = None
-    top_k: int = 6
+    top_k: int = 8
     max_causes: int = 3
     debug: Optional[bool] = False
+
 
 class DeleteDocumentRequest(BaseModel):
     company_id: str
     bubble_document_id: str
+
 
 def _db_conn():
     if not (DB_HOST and DB_USER and DB_PASSWORD):
@@ -320,8 +323,8 @@ def _extract_code_tokens(q: str) -> list[str]:
             out.append(t)
     return out[:5]
 
-def _infer_machine_components(q: str) -> list[str]:
 
+def _infer_machine_components(q: str) -> list[str]:
     if not q:
         return []
 
@@ -350,7 +353,6 @@ def _infer_machine_components(q: str) -> list[str]:
     user_msg = f"Symptom:\n{q}"
 
     try:
-
         parsed = _openai_chat_json(
             [
                 {"role": "system", "content": system_msg},
@@ -377,6 +379,7 @@ def _infer_machine_components(q: str) -> list[str]:
 
     except Exception:
         return []
+
 
 def _q_has_any(q: str, hints: list[str]) -> bool:
     qq = (q or "").lower()
@@ -1291,6 +1294,7 @@ def _extract_section_from_text(text: str) -> str:
     m = re.search(r"^SECTION:\s*(.+)$", text, flags=re.MULTILINE)
     return (m.group(1).strip() if m else "")[:120]
 
+
 def _extract_citation_ids_from_answer(answer: str) -> list[str]:
     answer = (answer or "").strip()
     if not answer:
@@ -1316,17 +1320,16 @@ def _ground_citations_to_answer(answer: str, citations: list[dict]) -> list[dict
 
     used_ids = set(_extract_citation_ids_from_answer(answer))
 
-    # se non troviamo citation nel testo, NON filtriamo nulla
     if not used_ids:
         return citations
 
     grounded = [c for c in citations if str(c.get("citation_id") or "").strip() in used_ids]
 
-    # se il filtro elimina tutto, manteniamo le citations originali
     if not grounded:
         return citations
 
     return grounded
+
 
 def _openai_chat_json(
     messages: list[dict],
@@ -1498,12 +1501,12 @@ def _llm_rerank_citations(
 
     return out
 
+
 def _llm_filter_diagnostic_chunks(
     q: str,
     candidates: list[dict],
     max_keep: int,
 ) -> list[str]:
-
     if not q or not candidates:
         return []
 
@@ -1574,6 +1577,7 @@ def _llm_filter_diagnostic_chunks(
 
     return out
 
+
 def _should_use_reranker(
     q: str,
     candidates: list[dict],
@@ -1608,6 +1612,7 @@ def _should_use_reranker(
         return False
 
     return True
+
 
 def _unique_non_empty_strings(items: list[Any], limit: Optional[int] = None) -> list[str]:
     out: list[str] = []
@@ -1772,6 +1777,7 @@ def _root_cause_response_schema(max_causes: int) -> dict:
             "required": ["problem_summary", "possible_causes", "recommended_next_checks"],
         },
     }
+
 
 @app.get("/ping")
 def ping():
@@ -2745,7 +2751,7 @@ def ask_v1(
                 "similarity_max": sim_max,
             }
         )
-    
+
     citations = _ground_citations_to_answer(answer, citations)
 
     rg_links = []
@@ -2768,6 +2774,7 @@ def ask_v1(
         }
     )
 
+
 @app.post("/v1/ai/root-cause")
 def root_cause_v1(
     payload: RootCauseRequest,
@@ -2779,11 +2786,6 @@ def root_cause_v1(
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     q = (payload.query or "").strip()
-    components = _infer_machine_components(q)
-
-    if components:
-        q = q + " " + " ".join(components)
-        
     if not q:
         raise HTTPException(status_code=400, detail="Missing query")
 
@@ -2806,10 +2808,10 @@ def root_cause_v1(
     else:
         doc_ids = None
 
-    top_k = int(payload.top_k or 6)
+    top_k = int(payload.top_k or 8)
     top_k = max(1, min(top_k, ASK_MAX_TOP_K))
     max_causes = max(1, min(int(payload.max_causes or 3), 3))
-    candidate_k = max(top_k, min(40, top_k * 6))
+    candidate_k = max(top_k, min(80, top_k * 10))
 
     q_vec = _openai_embed_texts([q])[0]
     q_vec_lit = _vector_literal(q_vec)
@@ -3152,6 +3154,7 @@ def root_cause_v1(
             "chat_model": OPENAI_CHAT_MODEL,
         }
     )
+
 
 @app.post("/v1/ai/delete/document")
 def delete_document_v1(
