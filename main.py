@@ -320,6 +320,63 @@ def _extract_code_tokens(q: str) -> list[str]:
             out.append(t)
     return out[:5]
 
+def _infer_machine_components(q: str) -> list[str]:
+
+    if not q:
+        return []
+
+    schema = {
+        "name": "component_inference",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "components": {
+                    "type": "array",
+                    "items": {"type": "string"}
+                }
+            },
+            "required": ["components"]
+        }
+    }
+
+    system_msg = (
+        "You are an industrial machine expert. "
+        "Given a machine symptom, list machine components likely involved. "
+        "Return short component names only."
+    )
+
+    user_msg = f"Symptom:\n{q}"
+
+    try:
+
+        parsed = _openai_chat_json(
+            [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            model="gpt-4.1-nano",
+            json_schema=schema,
+            timeout=20,
+        )
+
+        comps = parsed.get("components") or []
+
+        out = []
+        seen = set()
+
+        for c in comps:
+            c = str(c).strip().lower()
+            if not c or c in seen:
+                continue
+            seen.add(c)
+            out.append(c)
+
+        return out[:6]
+
+    except Exception:
+        return []
 
 def _q_has_any(q: str, hints: list[str]) -> bool:
     qq = (q or "").lower()
@@ -2722,6 +2779,11 @@ def root_cause_v1(
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     q = (payload.query or "").strip()
+    components = _infer_machine_components(q)
+
+    if components:
+        q = q + " " + " ".join(components)
+        
     if not q:
         raise HTTPException(status_code=400, detail="Missing query")
 
