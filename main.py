@@ -1250,11 +1250,18 @@ def _ground_citations_to_answer(answer: str, citations: list[dict]) -> list[dict
         return citations
 
     used_ids = set(_extract_citation_ids_from_answer(answer))
+
+    # se non troviamo citation nel testo, NON filtriamo nulla
     if not used_ids:
         return citations
 
     grounded = [c for c in citations if str(c.get("citation_id") or "").strip() in used_ids]
-    return grounded or citations
+
+    # se il filtro elimina tutto, manteniamo le citations originali
+    if not grounded:
+        return citations
+
+    return grounded
 
 def _openai_chat_json(
     messages: list[dict],
