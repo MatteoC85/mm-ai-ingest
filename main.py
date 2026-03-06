@@ -2942,23 +2942,6 @@ def root_cause_v1(
 
     citations = _mmr_select(q_vec, cut_candidates, top_k=top_k, lambda_mult=0.85)
 
-    try:
-        filtered_ids = _llm_filter_diagnostic_chunks(
-            q=q,
-            candidates=cut_candidates,
-            max_keep=top_k
-        )
-
-        if filtered_ids:
-            by_id = {str(c.get("citation_id")): c for c in cut_candidates}
-            filtered = [by_id[cid] for cid in filtered_ids if cid in by_id]
-
-            if filtered:
-                citations = filtered
-
-    except Exception as e:
-        print("DIAGNOSTIC_FILTER_FAIL", str(e))
-
     if _should_use_reranker(q=q, candidates=cut_candidates, sim_max=sim_max, top_k=top_k):
         try:
             reranked_ids = _llm_rerank_citations(q=q, candidates=cut_candidates, top_k=top_k)
