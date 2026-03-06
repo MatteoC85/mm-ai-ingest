@@ -1326,6 +1326,7 @@ def _llm_rerank_citations(
     q: str,
     candidates: list[dict],
     top_k: int,
+    diagnostic_mode: bool = False,
 ) -> list[str]:
     q = (q or "").strip()
     if not q or not candidates:
@@ -1379,18 +1380,26 @@ def _llm_rerank_citations(
         },
     }
 
-    system_msg = (
-        "Selezioni le citazioni minime e più precise per rispondere a una domanda tecnica industriale. "
-        "Obiettivo: tenere solo le fonti strettamente necessarie e scartare quelle solo vagamente correlate. "
-        "Regole obbligatorie: "
-        "1) seleziona il minor numero possibile di citation_id utili; "
-        "2) preferisci chunk che contengono direttamente la risposta, non solo parole affini; "
-        "3) scarta chunk generici di manutenzione, installazione, sicurezza o contesto se non aggiungono un fatto necessario alla risposta; "
-        "4) scarta chunk che parlano di pulizia, trasporto, avviamento o altri usi dell'olio non riferiti alla lubrificazione richiesta; "
-        "5) se due chunk sono simili, tieni solo il più specifico; "
-        "6) è corretto restituire anche solo 1, 2 o 3 citation_id se bastano. "
-        "Non inventare e non aggiungere testo fuori dal JSON."
-    )
+    if diagnostic_mode:
+        system_msg = (
+            "Selezioni le citazioni più utili per diagnosticare un problema tecnico su una macchina industriale. "
+            "Regole obbligatorie: "
+            "1) tieni solo fonti che parlano del fenomeno o dei componenti coinvolti; "
+            "2) scarta fonti generiche di manutenzione, sicurezza, installazione o lubrificazione se non sono direttamente legate al sintomo; "
+            "3) preferisci fonti che descrivono componenti, regolazioni, giochi meccanici o anomalie; "
+            "4) se due fonti sono simili, tieni la più specifica; "
+            "5) restituisci il minor numero possibile di citation_id utili."
+        )
+    else:
+        system_msg = (
+            "Selezioni le citazioni minime e più precise per rispondere a una domanda tecnica industriale. "
+            "Obiettivo: tenere solo le fonti strettamente necessarie e scartare quelle solo vagamente correlate. "
+            "Regole obbligatorie: "
+            "1) seleziona il minor numero possibile di citation_id utili; "
+            "2) preferisci chunk che contengono direttamente la risposta; "
+            "3) scarta chunk generici di manutenzione o contesto se non aggiungono informazione utile; "
+            "4) se due chunk sono simili, tieni solo il più specifico."
+        )
 
     user_msg = (
         f"DOMANDA:\n{q}\n\n"
@@ -2944,7 +2953,12 @@ def root_cause_v1(
 
     if _should_use_reranker(q=q, candidates=cut_candidates, sim_max=sim_max, top_k=top_k):
         try:
-            reranked_ids = _llm_rerank_citations(q=q, candidates=cut_candidates, top_k=top_k)
+            reranked_ids = _llm_rerank_citations(
+                q=q,
+                candidates=cut_candidates,
+                top_k=top_k,
+                diagnostic_mode=True
+            )
             if reranked_ids:
                 by_id = {str(c.get("citation_id")): c for c in cut_candidates}
                 reranked = [by_id[cid] for cid in reranked_ids if cid in by_id]
