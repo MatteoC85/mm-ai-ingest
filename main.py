@@ -2788,6 +2788,103 @@ def _reorder_citations_by_priority_ids(
 
     return out[:max_items]
 
+def _score_root_cause_causal_strength(
+    q: str,
+    chunk_text: str,
+    diagnostic_keywords: list[str],
+) -> dict:
+    sig = _root_cause_chunk_signal_summary(
+        q=q,
+        chunk_text=chunk_text,
+        diagnostic_keywords=diagnostic_keywords,
+    )
+    txt = _normalize_unicode_advanced(chunk_text or "").lower()
+
+    if not sig or not txt:
+        return {
+            "causal_strength_score": -0.25,
+            "causal_strength_band": "weak",
+        }
+
+    score = 0.0
+
+    # segnali di evidenza diretta sul gruppo/processo coinvolto
+    if sig.get("strong_component_hits", 0) >= 2:
+        score += 0.20
+    elif sig.get("strong_component_hits", 0) == 1:
+        score += 0.08
+
+    if sig.get("process_hits", 0) >= 1:
+        score += 0.16
+
+    if sig.get("symptom_hits", 0) >= 1:
+        score += 0.12
+
+    if sig.get("section_diag_hits", 0) >= 1:
+        score += 0.10
+    elif sig.get("diag_hits", 0) >= 1:
+        score += 0.06
+
+    # sinergie: componente + processo/sintomo = evidenza forte
+    if sig.get("strong_component_hits", 0) >= 1 and sig.get("process_hits", 0) >= 1:
+        score += 0.10
+    if sig.get("strong_component_hits", 0) >= 1 and sig.get("symptom_hits", 0) >= 1:
+        score += 0.08
+
+    # segnali di evidenza indiretta/collaterale
+    if sig.get("lube_control_hits", 0) >= 2 and not sig.get("query_lube_related"):
+        score -= 0.10
+
+    if sig.get("startup_install_hits", 0) >= 2 and not sig.get("query_install_related"):
+        score -= 0.12
+
+    if sig.get("description_section_hit"):
+        score -= 0.18
+
+    if sig.get("overview_section_hit"):
+        score -= 0.08
+
+    # penalizza chunk molto parziali / istruzioni isolate
+    partial_instruction_markers = [
+        "invertire le fasi",
+        "invert phases",
+        "contattare immediatamente",
+        "contact immediately",
+        "prima accensione",
+        "first start-up",
+        "first startup",
+        "alla prima accensione",
+        "freccia",
+        "arrow",
+    ]
+    partial_hits = sum(1 for m in partial_instruction_markers if m in txt)
+    if partial_hits >= 1 and sig.get("strong_component_hits", 0) == 0:
+        score -= 0.10
+    if partial_hits >= 2:
+        score -= 0.08
+
+    # penalizza evidenze senza vero legame col processo o col sintomo
+    if (
+        sig.get("strong_component_hits", 0) == 0
+        and sig.get("process_hits", 0) == 0
+        and sig.get("symptom_hits", 0) == 0
+    ):
+        score -= 0.14
+
+    score = max(-0.40, min(0.40, score))
+
+    if score >= 0.18:
+        band = "direct"
+    elif score >= 0.02:
+        band = "indirect"
+    else:
+        band = "collateral"
+
+    return {
+        "causal_strength_score": score,
+        "causal_strength_band": band,
+    }
+
 def _dedup_root_cause_candidates_semantic(
     citations: list[dict],
     max_items: int,
@@ -2815,10 +2912,12 @@ def _dedup_root_cause_candidates_semantic(
             continue
 
         prev_tuple = (
+            float(prev.get("causal_strength_score", 0.0)),
             float(prev.get("semantic_score", 0.0)),
             float(prev.get("similarity", 0.0)),
         )
         cur_tuple = (
+            float(c.get("causal_strength_score", 0.0)),
             float(c.get("semantic_score", 0.0)),
             float(c.get("similarity", 0.0)),
         )
@@ -2829,6 +2928,7 @@ def _dedup_root_cause_candidates_semantic(
     out = list(best.values())
     out.sort(
         key=lambda x: (
+            float(x.get("causal_strength_score", 0.0)),
             float(x.get("semantic_score", 0.0)),
             float(x.get("similarity", 0.0)),
         ),
@@ -2857,6 +2957,7 @@ def _prioritize_root_cause_coverage(
     ordered = sorted(
         citations,
         key=lambda x: (
+            float(x.get("causal_strength_score", 0.0)),
             float(x.get("semantic_score", 0.0)),
             float(x.get("similarity", 0.0)),
         ),
@@ -4065,6 +4166,8 @@ def root_cause_v1(
     evidence_matrix: dict = {}
     semantic_score_max: Optional[float] = None
     semantic_score_avg: Optional[float] = None
+    causal_strength_max: Optional[float] = None
+    causal_strength_avg: Optional[float] = None
 
     def _finalize(resp: dict) -> dict:
         if payload.debug:
@@ -4086,6 +4189,8 @@ def root_cause_v1(
                 "hard_excluded_count": hard_excluded_count,
                 "semantic_score_max": semantic_score_max,
                 "semantic_score_avg": semantic_score_avg,
+                "causal_strength_max": causal_strength_max,
+                "causal_strength_avg": causal_strength_avg,
                 "evidence_matrix_used": evidence_matrix_used,
                 "evidence_matrix_hypotheses": len(evidence_matrix.get("cause_hypotheses") or []) if isinstance(evidence_matrix, dict) else 0,
             }
@@ -4276,23 +4381,39 @@ def root_cause_v1(
 
     semantic_candidates = []
     semantic_scores = []
+    causal_scores = []
 
     for c in rescored_candidates:
         cc = dict(c)
+        chunk_text = (cc.get("chunk_full") or cc.get("snippet") or "").strip()
+
         semantic = _score_root_cause_chunk_semantic(
             q=q,
-            chunk_text=(cc.get("chunk_full") or cc.get("snippet") or "").strip(),
+            chunk_text=chunk_text,
             diagnostic_keywords=diagnostic_keywords,
         )
+        causal = _score_root_cause_causal_strength(
+            q=q,
+            chunk_text=chunk_text,
+            diagnostic_keywords=diagnostic_keywords,
+        )
+
         cc.update(semantic)
+        cc.update(causal)
+
         semantic_candidates.append(cc)
         semantic_scores.append(float(cc.get("semantic_score", 0.0)))
+        causal_scores.append(float(cc.get("causal_strength_score", 0.0)))
 
     candidates = semantic_candidates
 
     if semantic_scores:
         semantic_score_max = max(semantic_scores)
         semantic_score_avg = sum(semantic_scores) / len(semantic_scores)
+
+    if causal_scores:
+        causal_strength_max = max(causal_scores)
+        causal_strength_avg = sum(causal_scores) / len(causal_scores)
 
     if not candidates:
         return _finalize(
@@ -4331,8 +4452,13 @@ def root_cause_v1(
     if len(sem_good) >= 2:
         cut_candidates = sem_good
 
+    causal_good = [c for c in cut_candidates if float(c.get("causal_strength_score", 0.0)) >= 0.02]
+    if len(causal_good) >= 2:
+        cut_candidates = causal_good
+
     cut_candidates.sort(
         key=lambda x: (
+            float(x.get("causal_strength_score", 0.0)),
             float(x.get("semantic_score", 0.0)),
             float(x.get("rrf_score", 0.0)),
             float(x.get("similarity", 0.0)),
@@ -4344,6 +4470,7 @@ def root_cause_v1(
         cut_candidates = sorted(
             candidates,
             key=lambda x: (
+                float(x.get("causal_strength_score", 0.0)),
                 float(x.get("semantic_score", 0.0)),
                 float(x.get("rrf_score", 0.0)),
                 float(x.get("similarity", 0.0)),
@@ -4370,11 +4497,15 @@ def root_cause_v1(
         semantic_raw = float(c.get("semantic_score", 0.0))
         semantic_norm = max(0.0, min(1.0, (semantic_raw + 0.45) / 0.90))
 
+        causal_raw = float(c.get("causal_strength_score", 0.0))
+        causal_norm = max(0.0, min(1.0, (causal_raw + 0.40) / 0.80))
+
         cc["raw_similarity"] = raw_sim
         cc["similarity"] = (
-            0.55 * raw_sim
-            + 0.20 * rrf_norm
-            + 0.25 * semantic_norm
+            0.42 * raw_sim
+            + 0.18 * rrf_norm
+            + 0.20 * semantic_norm
+            + 0.20 * causal_norm
         )
         mmr_candidates.append(cc)
 
@@ -4651,6 +4782,8 @@ def root_cause_v1(
         "13) non usare come evidenza centrale sezioni di descrizione generale della macchina o sezioni safety/ripari/porte se non collegano esplicitamente il problema al componente o gruppo coinvolto.\n"
         "14) evita di usare più citations della stessa famiglia di evidenza per la stessa causa, salvo che siano realmente complementari.\n"
         "15) privilegia cause diverse ben supportate, non variazioni della stessa causa basate sulla stessa area di testo.\n"
+        "16) privilegia cause supportate da evidenze dirette sul componente o sul processo coinvolto; le evidenze collaterali o indirette valgono meno se esistono fonti più dirette.\n"
+        "17) non promuovere come causa principale istruzioni isolate di avviamento, inversione fasi, verso motore pompa o controlli secondari se non sono il supporto più diretto disponibile.\n"
     )
 
     user_msg = (
