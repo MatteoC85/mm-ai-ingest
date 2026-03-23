@@ -381,16 +381,18 @@ def _infer_machine_components(q: str) -> list[str]:
         return []
 
 def _build_diagnostic_queries(q: str, inferred_components: list[str]) -> list[str]:
-    q = (q or "").strip()
-    comps = [str(x).strip().lower() for x in (inferred_components or []) if str(x).strip()]
+    q = re.sub(r"\s+", " ", (q or "").strip())
+    comps = [re.sub(r"\s+", " ", str(x).strip()) for x in (inferred_components or []) if str(x).strip()]
     if not q:
         return []
+
+    q_low = _normalize_unicode_advanced(q).lower()
 
     out: list[str] = []
     seen = set()
 
     def add(s: str):
-        s = (s or "").strip()
+        s = re.sub(r"\s+", " ", (s or "").strip())
         if not s:
             return
         k = s.lower()
@@ -399,32 +401,44 @@ def _build_diagnostic_queries(q: str, inferred_components: list[str]) -> list[st
         seen.add(k)
         out.append(s)
 
+    def has_any(stems: list[str]) -> bool:
+        return any(st in q_low for st in stems)
+
+    symptom_aliases: list[str] = []
+
+    if has_any(["vibr", "oscillat", "oscillaz"]):
+        symptom_aliases.extend(["vibration", "vibrazione"])
+    if has_any(["noise", "noisy", "rumor", "rumore", "rumoros", "sound", "rattle", "squeal", "strid", "sfreg"]):
+        symptom_aliases.extend(["noise", "rumore"])
+    if has_any(["overheat", "surriscal", "temperat", "hot", "cald"]):
+        symptom_aliases.extend(["overheating", "surriscaldamento"])
+    if has_any(["jam", "block", "stuck", "stop", "bloc", "ferma", "arrest"]):
+        symptom_aliases.extend(["jam", "blocco"])
+    if has_any(["lubric", "lubrif", "oil", "olio", "grease", "grasso"]):
+        symptom_aliases.extend(["lubrication", "lubrificazione"])
+    if has_any(["feed", "advance", "avanz", "wire", "filo", "material"]):
+        symptom_aliases.extend(["feed", "avanzamento"])
+    if has_any(["bend", "bending", "pieg", "forming", "formatura"]):
+        symptom_aliases.extend(["bending", "piegatura"])
+
     add(q)
 
     if comps:
-        add(q + " " + " ".join(comps[:4]))
+        add(q + " " + " ".join(comps[:3]))
 
-    for c in comps[:4]:
-        add(f"{q} {c}")
-        add(f"problema {c} {q}")
-        add(f"anomalia {c} {q}")
+    add(f"root cause {q}")
+    add(f"causa {q}")
 
-    q_low = q.lower()
+    if symptom_aliases:
+        add(f"{q} {symptom_aliases[0]}")
+        if len(symptom_aliases) > 1:
+            add(f"{q} {symptom_aliases[1]}")
 
-    symptom_terms = []
-    if "vibr" in q_low:
-        symptom_terms += ["vibrazione", "vibra", "oscillazione"]
-    if "rumor" in q_low:
-        symptom_terms += ["rumore", "rumorosità"]
-    if "surrisc" in q_low or "cald" in q_low or "temperatur" in q_low:
-        symptom_terms += ["surriscaldamento", "temperatura", "calore"]
-    if "bloc" in q_low or "ferma" in q_low or "stop" in q_low:
-        symptom_terms += ["blocco", "arresto", "fermo macchina"]
-    if "lubrif" in q_low or "olio" in q_low or "ingrass" in q_low:
-        symptom_terms += ["lubrificazione", "olio", "grasso"]
+    if comps:
+        add(f"{q} {comps[0]}")
+        add(f"root cause {comps[0]} {q}")
 
-    for t in symptom_terms[:4]:
-        add(f"{q} {t}")
+    add(f"diagnosi {q}")
 
     return out[:8]
 
@@ -466,33 +480,53 @@ def _rrf_merge_candidates(
 
 
 def _collect_candidate_keywords(q: str, inferred_components: list[str]) -> list[str]:
-    q = (q or "").strip().lower()
+    q_norm = _normalize_unicode_advanced(q or "").lower()
     comps = [str(x).strip().lower() for x in (inferred_components or []) if str(x).strip()]
 
     out = []
     seen = set()
 
     def add(x: str):
-        x = (x or "").strip().lower()
+        x = re.sub(r"\s+", " ", (x or "").strip().lower())
         if not x or x in seen:
             return
         seen.add(x)
         out.append(x)
 
+    stopwords = {
+        "the", "and", "for", "with", "when", "while", "during", "after", "before", "from",
+        "machine", "problem", "issue", "fault", "cause", "possible", "probable",
+        "abnormal", "anomalous", "anomaly", "diagnosis",
+        "il", "lo", "la", "i", "gli", "le", "di", "del", "della", "dei", "delle",
+        "con", "per", "tra", "fra", "sul", "sulla", "macchina", "problema",
+        "guasto", "causa", "possibile", "probabile", "anomalo", "anomala",
+        "anomali", "anomale", "durante", "quando", "mentre", "dopo", "prima",
+        "nel", "nella", "su"
+    }
+
     for c in comps[:6]:
         add(c)
 
-    heuristic_terms = [
-        "cuscinetto", "cuscinetti", "riduttore", "lubrificazione", "olio", "grasso",
-        "sensore", "encoder", "motore", "vite", "rullo", "guida", "puleggia",
-        "catena", "cinghia", "albero", "inverter", "valvola", "pressione",
+    for tok in re.findall(r"[a-zà-öø-ÿ0-9]{3,}", q_norm):
+        if tok not in stopwords:
+            add(tok)
+
+    alias_groups = [
+        (["vibr", "oscillat", "oscillaz"], ["vibration", "vibrazione", "oscillation", "oscillazione"]),
+        (["noise", "noisy", "rumor", "rumore", "rumoros", "sound", "rattle", "squeal", "strid", "sfreg"], ["noise", "rumore", "rattle", "stridore"]),
+        (["overheat", "surriscal", "temperat", "hot", "cald"], ["overheating", "surriscaldamento", "temperature", "temperatura"]),
+        (["jam", "block", "stuck", "stop", "bloc", "ferma", "arrest"], ["jam", "blocco", "stoppage", "arresto"]),
+        (["lubric", "lubrif", "oil", "olio", "grease", "grasso"], ["lubrication", "lubrificazione", "oil", "olio", "grease", "grasso"]),
+        (["feed", "advance", "avanz", "wire", "filo", "material"], ["feed", "avanzamento", "wire", "filo", "materiale"]),
+        (["bend", "bending", "pieg", "forming", "formatura"], ["bending", "piegatura", "forming", "formatura"]),
     ]
 
-    for t in heuristic_terms:
-        if t in q:
-            add(t)
+    for stems, aliases in alias_groups:
+        if any(st in q_norm for st in stems):
+            for alias in aliases:
+                add(alias)
 
-    return out[:10]
+    return out[:12]
 
 
 def _expand_with_neighbor_chunks(
@@ -565,97 +599,150 @@ def _expand_with_neighbor_chunks(
 
     return out
 
+def _root_cause_chunk_signal_summary(
+    q: str,
+    chunk_text: str,
+    diagnostic_keywords: list[str],
+) -> dict:
+    txt = _normalize_unicode_advanced(chunk_text or "").lower()
+    if not txt:
+        return {}
+
+    section = _normalize_unicode_advanced(_extract_section_from_text(chunk_text) or "").lower()
+    q_low = _normalize_unicode_advanced(q or "").lower()
+
+    diag_terms = []
+    seen_diag = set()
+    for x in diagnostic_keywords or []:
+        x = re.sub(r"\s+", " ", str(x).strip().lower())
+        if len(x) < 3 or x in seen_diag:
+            continue
+        seen_diag.add(x)
+        diag_terms.append(x)
+
+    boilerplate_section_markers = [
+        "safety", "warning", "warnings", "sicurezza", "avvertenze",
+        "installation", "installazione", "electrical connections", "collegamenti elettrici", "wiring",
+        "transport", "trasporto", "storage", "stoccaggio",
+        "commissioning", "messa in servizio", "start-up", "startup", "prima accensione",
+        "overview", "general description", "descrizione generale", "general features", "caratteristiche generali",
+        "technical data", "dati tecnici", "specifications", "caratteristiche tecniche",
+        "intended use", "destinazione d'uso", "acoustic", "noise emissions", "emissioni sonore",
+    ]
+
+    boilerplate_body_markers = [
+        "read the manual", "leggere il manuale",
+        "disconnect the power supply", "togliere tensione",
+        "protective earth", "messa a terra", "cavo di terra",
+        "ambient temperature", "temperatura ambiente",
+        "humidity", "umidita", "agenti atmosferici", "weather agents",
+        "lifting", "sollevamento", "packaging", "imballo", "unpacking", "disimball",
+        "transport", "trasporto", "storage", "stoccaggio", "installation", "installazione",
+        "power supply", "alimentazione", "voltage", "tensione", "frequency", "frequenza",
+        "dimensions", "dimensioni", "weight", "peso",
+        "noise level", "livello di rumore", "sound pressure", "pressione sonora",
+        "routine maintenance", "manutenzione ordinaria",
+        "maintenance interval", "intervalli di manutenzione",
+        "lubrication schedule", "piano di lubrificazione",
+    ]
+
+    mechanical_markers = [
+        "bearing", "cuscinet", "gear", "ingran", "gearbox", "ridutt",
+        "shaft", "albero", "belt", "cinghia", "chain", "catena",
+        "roller", "rullo", "guide", "guida", "motor", "motore",
+        "sensor", "sensore", "encoder", "valve", "valvol",
+        "cylinder", "cilindr", "pump", "pompa", "brake", "freno",
+        "alignment", "alline", "clearance", "gioco", "backlash",
+        "feed", "advance", "avanz", "bend", "bending", "pieg",
+        "friction", "attrit", "pressure", "pression",
+    ]
+
+    symptom_groups = [
+        (["vibr", "oscillat", "oscillaz"], ["vibrat", "vibraz", "oscillat", "oscill"]),
+        (["noise", "noisy", "rumor", "rumore", "rumoros", "sound", "rattle", "squeal", "strid", "sfreg"], ["noise", "rumor", "rumore", "rumoros", "rattle", "squeal", "strid", "sfreg"]),
+        (["overheat", "surriscal", "temperat", "hot", "cald"], ["overheat", "surriscal", "temperat", "hot", "cald"]),
+        (["jam", "block", "stuck", "stop", "bloc", "ferma", "arrest"], ["jam", "block", "stuck", "stop", "bloc", "ferma", "arrest"]),
+        (["lubric", "lubrif", "oil", "olio", "grease", "grasso"], ["lubric", "lubrif", "oil", "olio", "grease", "grasso"]),
+        (["feed", "advance", "avanz", "wire", "filo", "material"], ["feed", "advance", "avanz", "wire", "filo", "material"]),
+        (["bend", "bending", "pieg", "forming", "formatura"], ["bend", "bending", "pieg", "forming", "formatura"]),
+    ]
+
+    symptom_markers: list[str] = []
+    for query_stems, chunk_stems in symptom_groups:
+        if any(st in q_low for st in query_stems):
+            symptom_markers.extend(chunk_stems)
+
+    def count_hits(markers: list[str], hay: str) -> int:
+        return sum(1 for m in markers if m and m in hay)
+
+    spec_markers = [
+        "noise level", "livello di rumore", "sound pressure", "pressione sonora",
+        "dimensions", "dimensioni", "weight", "peso",
+        "voltage", "tensione", "frequency", "frequenza",
+    ]
+
+    return {
+        "diag_hits": count_hits(diag_terms[:12], txt),
+        "boilerplate_section_hit": any(m in section for m in boilerplate_section_markers),
+        "boilerplate_body_hits": count_hits(boilerplate_body_markers, txt),
+        "mechanical_hits": count_hits(mechanical_markers, txt),
+        "symptom_hits": count_hits(list(dict.fromkeys(symptom_markers)), txt),
+        "spec_hits": count_hits(spec_markers, txt),
+    }
+
 def _should_downrank_generic_root_cause_chunk(
     q: str,
     chunk_text: str,
     diagnostic_keywords: list[str],
 ) -> bool:
-    txt = (chunk_text or "").lower()
-    if not txt:
+    sig = _root_cause_chunk_signal_summary(
+        q=q,
+        chunk_text=chunk_text,
+        diagnostic_keywords=diagnostic_keywords,
+    )
+    if not sig:
         return False
 
-    section = _extract_section_from_text(chunk_text).lower()
-    q_low = (q or "").lower()
-    diag_terms = [str(x).strip().lower() for x in (diagnostic_keywords or []) if str(x).strip()]
-
-    generic_section_markers = [
-        "norme generali di installazione",
-        "collegamenti elettrici",
-        "ambiente di lavoro",
-        "posizionamento della macchina",
-        "stoccaggio",
-        "sicurezza",
-    ]
-
-    generic_body_markers = [
-        "durante il trasporto",
-        "prima della messa in moto",
-        "prima accensione",
-        "collegamenti elettrici",
-        "tensione di rete",
-        "quadro di comando",
-        "locale asciutto",
-        "agenti atmosferici",
-        "cavo di terra",
-        "umidità",
-        "stoccaggio",
-        "installazione",
-        "piano di appoggio",
-        "spessori di gomma",
-        "messa in moto",
-        "collegare la linea elettrica",
-        "verificare la tensione di rete",
-    ]
-
-    strong_mechanical_markers = [
-        "cuscinett",
-        "rullo",
-        "albero",
-        "ingranagg",
-        "riduttor",
-        "slitta",
-        "eccentric",
-        "trasmission",
-        "guida",
-        "pressione",
-        "alline",
-        "volantino",
-        "manopola",
-        "encoder",
-        "stampo",
-        "avanzamento",
-        "piegatura",
-    ]
-
-    symptom_markers = []
-    if "vibr" in q_low:
-        symptom_markers += ["vibraz", "oscill"]
-    if "rumor" in q_low:
-        symptom_markers += ["rumore", "rumoros", "strid", "sfreg"]
-    if "avanz" in q_low or "filo" in q_low:
-        symptom_markers += ["avanz", "trascin", "filo", "materiale"]
-    if "pieg" in q_low:
-        symptom_markers += ["pieg", "pressa", "slitta", "stampo"]
-
-    generic_section_hit = any(m in section for m in generic_section_markers)
-    generic_body_hits = sum(1 for m in generic_body_markers if m in txt)
-    strong_mechanical_hits = sum(1 for m in strong_mechanical_markers if m in txt)
-    diag_hits = sum(1 for t in diag_terms if t and t in txt)
-    symptom_hits = sum(1 for m in symptom_markers if m in txt)
-
-    if strong_mechanical_hits >= 2:
+    if sig["mechanical_hits"] >= 2:
         return False
 
-    if diag_hits >= 2 and symptom_hits >= 1:
+    if sig["symptom_hits"] >= 1 and (sig["diag_hits"] >= 1 or sig["mechanical_hits"] >= 1):
         return False
 
-    if generic_section_hit and strong_mechanical_hits == 0:
+    if sig["boilerplate_section_hit"] and sig["mechanical_hits"] == 0 and sig["symptom_hits"] == 0:
         return True
 
-    if generic_body_hits >= 3 and strong_mechanical_hits == 0 and symptom_hits == 0:
+    if sig["boilerplate_body_hits"] >= 3 and sig["mechanical_hits"] == 0 and sig["symptom_hits"] == 0:
         return True
 
-    if generic_body_hits >= 4 and diag_hits <= 1:
+    if sig["spec_hits"] >= 2 and sig["diag_hits"] == 0 and sig["symptom_hits"] == 0:
+        return True
+
+    return False
+
+def _should_hard_exclude_root_cause_chunk(
+    q: str,
+    chunk_text: str,
+    diagnostic_keywords: list[str],
+) -> bool:
+    sig = _root_cause_chunk_signal_summary(
+        q=q,
+        chunk_text=chunk_text,
+        diagnostic_keywords=diagnostic_keywords,
+    )
+    if not sig:
+        return False
+
+    if sig["mechanical_hits"] > 0 or sig["symptom_hits"] > 0 or sig["diag_hits"] >= 2:
+        return False
+
+    if sig["boilerplate_section_hit"] and sig["boilerplate_body_hits"] >= 2:
+        return True
+
+    if sig["boilerplate_body_hits"] >= 5:
+        return True
+
+    if sig["spec_hits"] >= 3:
         return True
 
     return False
@@ -1823,6 +1910,7 @@ def _llm_filter_diagnostic_chunks(
         "2) Scarta fonti generiche di manutenzione, sicurezza, installazione o lubrificazione se non sono direttamente legate al sintomo.\n"
         "3) Se una fonte parla solo di controlli generici o procedure standard, scartala.\n"
         "4) Mantieni poche fonti ma molto pertinenti.\n"
+        "5) Non collassare tutto su una sola fonte se esistono 2-3 aree causali diverse ben supportate.\n"
     )
 
     user_msg = (
@@ -1939,6 +2027,8 @@ def _llm_build_diagnostic_evidence_matrix(
         "3) cause_hypotheses = massimo poche ipotesi distinte; non duplicare varianti della stessa causa.\n"
         "4) Ogni ipotesi deve usare solo citation_id presenti nei candidati.\n"
         "5) check_focus = verifiche pratiche brevi, non frasi lunghe.\n"
+        "6) Non collassare tutto su una sola causa se le citazioni supportano aree causali diverse.\n"
+        "7) keep_ids deve mantenere copertura delle aree causali utili, non solo il numero minimo di fonti.\n"
     )
 
     user_msg = (
@@ -2138,6 +2228,39 @@ def _sanitize_citations_for_response(citations: list[dict]) -> list[dict]:
         )
 
     return out
+
+def _reorder_citations_by_priority_ids(
+    citations: list[dict],
+    priority_ids: list[str],
+    max_items: int,
+) -> list[dict]:
+    if not citations:
+        return []
+
+    by_id = {
+        str(c.get("citation_id") or "").strip(): c
+        for c in citations
+        if c.get("citation_id")
+    }
+
+    out: list[dict] = []
+    used = set()
+
+    for cid in priority_ids or []:
+        cid = str(cid or "").strip()
+        if not cid or cid in used or cid not in by_id:
+            continue
+        used.add(cid)
+        out.append(by_id[cid])
+
+    for c in citations:
+        cid = str(c.get("citation_id") or "").strip()
+        if not cid or cid in used:
+            continue
+        used.add(cid)
+        out.append(c)
+
+    return out[:max_items]
 
 def _root_cause_response_schema(max_causes: int) -> dict:
     max_causes = max(1, min(int(max_causes or 1), 3))
@@ -3242,6 +3365,7 @@ def root_cause_v1(
     rerank_used = False
     rerank_error: Optional[str] = None
     generic_downranked_count = 0
+    hard_excluded_count = 0
     evidence_matrix_used = False
     evidence_matrix: dict = {}
 
@@ -3262,6 +3386,7 @@ def root_cause_v1(
                 "inferred_components": inferred_components,
                 "diagnostic_keywords": diagnostic_keywords,
                 "generic_downranked_count": generic_downranked_count,
+                "hard_excluded_count": hard_excluded_count,
                 "evidence_matrix_used": evidence_matrix_used,
                 "evidence_matrix_hypotheses": len(evidence_matrix.get("cause_hypotheses") or []) if isinstance(evidence_matrix, dict) else 0,
             }
@@ -3409,22 +3534,48 @@ def root_cause_v1(
     candidates = _rrf_merge_candidates(dense_ranked_lists, k=60)
 
     generic_downranked_count = 0
+    hard_excluded_count = 0
+    rescored_candidates = []
 
     for c in candidates:
         chunk_text = (c.get("chunk_full") or c.get("snippet") or "").strip()
+        if not chunk_text:
+            continue
+
+        if _should_hard_exclude_root_cause_chunk(
+            q=q,
+            chunk_text=chunk_text,
+            diagnostic_keywords=diagnostic_keywords,
+        ):
+            hard_excluded_count += 1
+            continue
+
+        cc = dict(c)
 
         is_generic = _should_downrank_generic_root_cause_chunk(
             q=q,
             chunk_text=chunk_text,
             diagnostic_keywords=diagnostic_keywords,
         )
-
-        c["generic_downranked"] = bool(is_generic)
+        cc["generic_downranked"] = bool(is_generic)
 
         if is_generic:
             generic_downranked_count += 1
-            c["similarity"] = max(0.0, float(c.get("similarity", 0.0)) - 0.10)
-            c["rrf_score"] = max(0.0, float(c.get("rrf_score", 0.0)) - 0.015)
+            cc["similarity"] = max(0.0, float(cc.get("similarity", 0.0)) - 0.10)
+            cc["rrf_score"] = max(0.0, float(cc.get("rrf_score", 0.0)) - 0.015)
+
+        keyword_hits = sum(
+            1
+            for t in diagnostic_keywords[:12]
+            if t and t in chunk_text.lower()
+        )
+        if keyword_hits >= 2:
+            cc["similarity"] = min(1.0, float(cc.get("similarity", 0.0)) + 0.03)
+            cc["rrf_score"] = float(cc.get("rrf_score", 0.0)) + 0.005
+
+        rescored_candidates.append(cc)
+
+    candidates = rescored_candidates
 
     if not candidates:
         return _finalize(
@@ -3445,27 +3596,15 @@ def root_cause_v1(
     sim_max = max(float(c.get("similarity", 0.0)) for c in candidates) if candidates else None
 
     q_low = q.lower()
-    key_terms = []
-    if "lubrif" in q_low or "olio" in q_low or "ingrass" in q_low or "cuscinet" in q_low or "riduttor" in q_low:
-        key_terms = ["lubrif", "olio", "ingrass", "cuscinet", "riduttor"]
+    tight_cutoff = any(
+        stem in q_low
+        for stem in [
+            "lubrif", "olio", "ingrass", "oil", "grease",
+            "bearing", "cuscinet", "riduttor", "gearbox",
+        ]
+    )
 
-    if diagnostic_keywords:
-        key_terms = list(dict.fromkeys(key_terms + diagnostic_keywords))
-
-    if key_terms:
-        gated = []
-        for c in candidates:
-            hay = (
-                ((c.get("chunk_full") or c.get("snippet") or "") + " " + (c.get("citation_id") or "")).lower()
-            )
-            if any(t in hay for t in key_terms):
-                gated.append(c)
-
-        if len(gated) >= 2:
-            candidates = gated
-            sim_max = max(float(c.get("similarity", 0.0)) for c in candidates) if candidates else sim_max
-
-    cutoff_delta = 0.08 if key_terms else 0.12
+    cutoff_delta = 0.08 if tight_cutoff else 0.12
     cut_candidates = [c for c in candidates if (float(sim_max or 0.0) - float(c.get("similarity", 0.0))) <= cutoff_delta]
     cut_candidates.sort(
         key=lambda x: (
@@ -3537,25 +3676,62 @@ def root_cause_v1(
             max_keep=top_k,
         )
         if selected_diag_ids:
-            by_id = {str(c.get("citation_id")): c for c in cut_candidates}
-            filtered = [by_id[cid] for cid in selected_diag_ids if cid in by_id]
-            if filtered:
-                citations = _dedup_citations_by_snippet(filtered, max_items=top_k)
+            citations = _reorder_citations_by_priority_ids(
+                citations=citations,
+                priority_ids=selected_diag_ids,
+                max_items=top_k,
+            )
     except Exception as e:
         rerank_error = str(e) if not rerank_error else rerank_error
 
     if float(sim_max or 0.0) < ASK_SIM_THRESHOLD:
-        fts = _fts_search_chunks(
-            company_id=company_id,
-            machine_id=machine_id,
-            q=q,
-            top_k=top_k,
-            doc_ids=doc_ids if isinstance(doc_ids, list) else None,
-            bubble_document_id=payload.bubble_document_id.strip() if payload.bubble_document_id else None,
-        )
-        if fts:
+        fts_queries = [q]
+        for dq in diagnostic_queries:
+            dq_low = dq.lower()
+            if dq_low == q.lower():
+                continue
+            if dq_low.startswith(("root cause ", "causa ", "diagnosi ")):
+                continue
+            fts_queries.append(dq)
+            if len(fts_queries) >= 4:
+                break
+
+        fts_merged: list[dict] = []
+
+        for fts_q in fts_queries:
+            fts_hits = _fts_search_chunks(
+                company_id=company_id,
+                machine_id=machine_id,
+                q=fts_q,
+                top_k=top_k,
+                doc_ids=doc_ids if isinstance(doc_ids, list) else None,
+                bubble_document_id=payload.bubble_document_id.strip() if payload.bubble_document_id else None,
+            )
+
+            for c in fts_hits:
+                chunk_text = (c.get("snippet") or "").strip()
+                if not chunk_text:
+                    continue
+
+                if _should_hard_exclude_root_cause_chunk(
+                    q=q,
+                    chunk_text=chunk_text,
+                    diagnostic_keywords=diagnostic_keywords,
+                ):
+                    continue
+
+                if _should_downrank_generic_root_cause_chunk(
+                    q=q,
+                    chunk_text=chunk_text,
+                    diagnostic_keywords=diagnostic_keywords,
+                ):
+                    c["similarity"] = max(0.0, float(c.get("similarity", 0.0)) - 0.05)
+
+                fts_merged.append(c)
+
+        if fts_merged:
             fts_used = True
-            citations = _dedup_citations_by_snippet(citations + fts, max_items=top_k)
+            citations = _dedup_citations_by_snippet(citations + fts_merged, max_items=top_k)
 
     try:
         evidence_matrix = _llm_build_diagnostic_evidence_matrix(
@@ -3571,21 +3747,31 @@ def root_cause_v1(
         ]
         cause_hypotheses = evidence_matrix.get("cause_hypotheses") or []
 
-        if keep_ids:
-            by_id = {
-                str(c.get("citation_id")): c
-                for c in citations
-                if c.get("citation_id")
-            }
-            filtered = [by_id[cid] for cid in keep_ids if cid in by_id]
+        priority_ids: list[str] = []
+        seen_priority = set()
 
-            # Applica il filtro solo se non collassa troppo l'evidenza.
-            # Se la matrice tiene una sola citation, usala per guidare il prompt
-            # ma non rimpiazzare le citations originali.
-            if len(filtered) >= 2 or len(cause_hypotheses) >= 2:
-                citations = _dedup_citations_by_snippet(filtered, max_items=top_k)
+        for cid in keep_ids:
+            if cid not in seen_priority:
+                seen_priority.add(cid)
+                priority_ids.append(cid)
 
-        evidence_matrix_used = bool(cause_hypotheses)
+        for hyp in cause_hypotheses:
+            if not isinstance(hyp, dict):
+                continue
+            for cid in hyp.get("evidence_ids") or []:
+                cid = str(cid).strip()
+                if cid and cid not in seen_priority:
+                    seen_priority.add(cid)
+                    priority_ids.append(cid)
+
+        if priority_ids:
+            citations = _reorder_citations_by_priority_ids(
+                citations=citations,
+                priority_ids=priority_ids,
+                max_items=top_k,
+            )
+
+        evidence_matrix_used = bool(cause_hypotheses or keep_ids)
     except Exception as e:
         rerank_error = str(e) if not rerank_error else rerank_error
         evidence_matrix = {}
