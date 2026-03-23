@@ -693,6 +693,30 @@ def _root_cause_chunk_signal_summary(
         "posizionamento",
     ]
 
+    positioning_markers = [
+        "positioning",
+        "posizionamento",
+        "foundation",
+        "fondazione",
+        "planarity",
+        "planarità",
+        "level",
+        "livella",
+        "levelling",
+        "leveling",
+        "livellamento",
+        "support surface",
+        "piano di appoggio",
+        "rubber shims",
+        "spessori di gomma",
+        "threaded holes",
+        "fori filettati",
+        "mounting holes",
+        "fori di fondazione",
+        "near a wall",
+        "vicino ad un muro",
+    ]
+
     safety_access_markers = [
         "work area",
         "zona di lavoro",
@@ -857,6 +881,14 @@ def _root_cause_chunk_signal_summary(
             "power",
             "alimentaz",
             "tension",
+            "posizion",
+            "livell",
+            "fondaz",
+            "planarit",
+            "piano di appoggio",
+            "support surface",
+            "setup",
+            "mount",
         ]
     )
 
@@ -880,6 +912,7 @@ def _root_cause_chunk_signal_summary(
         "boilerplate_section_hit": any(m in section for m in boilerplate_section_markers),
         "overview_section_hit": any(m in section for m in overview_section_markers),
         "startup_install_hits": count_hits(startup_install_markers, txt),
+        "positioning_hits": count_hits(positioning_markers, txt),
         "safety_access_hits": count_hits(safety_access_markers, txt),
         "acoustic_protection_hits": count_hits(acoustic_protection_markers, txt),
         "lube_control_hits": count_hits(lube_control_markers, txt),
@@ -944,6 +977,14 @@ def _should_downrank_generic_root_cause_chunk(
         return True
 
     if (
+        sig["positioning_hits"] >= 2
+        and not sig["query_install_related"]
+        and sig["process_hits"] == 0
+        and sig["strong_component_hits"] <= 1
+    ):
+        return True
+
+    if (
         sig["lube_control_hits"] >= 2
         and not sig["query_lube_related"]
         and sig["diag_hits"] == 0
@@ -1000,6 +1041,14 @@ def _should_hard_exclude_root_cause_chunk(
         and sig["symptom_hits"] == 0
         and sig["strong_component_hits"] <= 1
         and sig["process_hits"] == 0
+    ):
+        return True
+
+    if (
+        sig["positioning_hits"] >= 3
+        and not sig["query_install_related"]
+        and sig["process_hits"] == 0
+        and sig["strong_component_hits"] <= 1
     ):
         return True
 
@@ -1206,15 +1255,34 @@ def _db_find_entity_chunk(
 
 def _dedup_citations_by_snippet(citations: list[dict], max_items: int) -> list[dict]:
     def norm(s: str) -> str:
-        s = (s or "").strip().lower()
-        s = re.sub(r"\s+", " ", s)
-        return s[:400]
+        s = _normalize_unicode_advanced(s or "")
+        s = re.sub(r"^SECTION:\s*[^\n]+\n?", "", s, flags=re.IGNORECASE).strip()
+
+        lines = [ln.strip() for ln in s.split("\n") if ln.strip()]
+        cleaned = []
+        seen_lines = set()
+
+        for ln in lines:
+            ln_low = re.sub(r"\s+", " ", ln.lower()).strip()
+
+            if re.fullmatch(r"\d+", ln_low):
+                continue
+
+            if ln_low in seen_lines:
+                continue
+
+            seen_lines.add(ln_low)
+            cleaned.append(ln_low)
+
+        s = " ".join(cleaned)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s[:500]
 
     best = {}
     for c in citations:
         k = norm(c.get("snippet", ""))
         if not k:
-            k = c.get("citation_id")
+            k = str(c.get("citation_id") or "").strip()
 
         prev = best.get(k)
         if (prev is None) or (float(c.get("similarity", 0.0)) > float(prev.get("similarity", 0.0))):
@@ -4203,6 +4271,7 @@ def root_cause_v1(
         "9) preferisci evidenze provenienti da sezioni operative o di componente; overview, safety, installation, start-up, caratteristiche generali o acoustic sections valgono solo se il sintomo le riguarda direttamente.\n"
         "10) non proporre cause basate principalmente su sezioni generali di manutenzione, lubrificazione macchina, pneumatica, safety o overview se le fonti non collegano esplicitamente quella causa al gruppo coinvolto dal sintomo.\n"
         "11) se una fonte parla del sintomo in modo generico ma non del gruppo/processo corretto, non usarla come evidenza centrale.\n"
+        "12) non proporre cause di installazione, posizionamento, fondazione, livellamento o piano di appoggio salvo che la query riguardi esplicitamente setup, installazione, messa in servizio o spostamento macchina.\n"
     )
 
     user_msg = (
