@@ -634,6 +634,13 @@ def _root_cause_chunk_signal_summary(
         "destinazione d'uso",
     ]
 
+    description_section_markers = [
+        "descrizione della macchina",
+        "machine description",
+        "description of the machine",
+        "descrizione macchina",
+    ]
+
     boilerplate_section_markers = overview_section_markers + [
         "safety",
         "warning",
@@ -891,6 +898,24 @@ def _root_cause_chunk_signal_summary(
             "mount",
         ]
     )
+    query_safety_related = any(
+        st in q_low
+        for st in [
+            "sicur",
+            "safety",
+            "ripar",
+            "guard",
+            "porta",
+            "door",
+            "microinter",
+            "interlock",
+            "arrest",
+            "stop",
+            "emerg",
+            "zona di lavoro",
+            "work area",
+        ]
+    )
 
     query_lube_related = any(
         st in q_low
@@ -911,6 +936,7 @@ def _root_cause_chunk_signal_summary(
         "section_diag_hits": count_hits(diag_terms[:12], section),
         "boilerplate_section_hit": any(m in section for m in boilerplate_section_markers),
         "overview_section_hit": any(m in section for m in overview_section_markers),
+        "description_section_hit": any(m in section for m in description_section_markers),
         "startup_install_hits": count_hits(startup_install_markers, txt),
         "positioning_hits": count_hits(positioning_markers, txt),
         "safety_access_hits": count_hits(safety_access_markers, txt),
@@ -921,6 +947,7 @@ def _root_cause_chunk_signal_summary(
         "symptom_hits": count_hits(list(dict.fromkeys(symptom_markers)), txt),
         "spec_hits": count_hits(spec_markers, txt),
         "query_install_related": query_install_related,
+        "query_safety_related": query_safety_related,
         "query_lube_related": query_lube_related,
     }
 
@@ -936,6 +963,23 @@ def _should_downrank_generic_root_cause_chunk(
     )
     if not sig:
         return False
+
+    if (
+        sig["description_section_hit"]
+        and sig["diag_hits"] == 0
+        and sig["section_diag_hits"] == 0
+        and sig["strong_component_hits"] == 0
+    ):
+        return True
+
+    if (
+        sig["safety_access_hits"] >= 2
+        and not sig["query_safety_related"]
+        and sig["diag_hits"] == 0
+        and sig["section_diag_hits"] == 0
+        and sig["strong_component_hits"] == 0
+    ):
+        return True
 
     if (sig["strong_component_hits"] >= 2 or sig["process_hits"] >= 1) and (
         sig["diag_hits"] >= 1 or sig["section_diag_hits"] >= 1
@@ -1011,6 +1055,24 @@ def _should_hard_exclude_root_cause_chunk(
     )
     if not sig:
         return False
+
+    if (
+        sig["description_section_hit"]
+        and sig["diag_hits"] == 0
+        and sig["section_diag_hits"] == 0
+        and sig["strong_component_hits"] == 0
+    ):
+        return True
+
+    if (
+        sig["safety_access_hits"] >= 2
+        and not sig["query_safety_related"]
+        and sig["diag_hits"] == 0
+        and sig["section_diag_hits"] == 0
+        and sig["strong_component_hits"] == 0
+        and sig["process_hits"] == 0
+    ):
+        return True
 
     if (sig["strong_component_hits"] >= 2 or sig["process_hits"] >= 1) and (
         sig["diag_hits"] >= 1 or sig["section_diag_hits"] >= 1
@@ -1281,7 +1343,14 @@ def _dedup_citations_by_snippet(citations: list[dict], max_items: int) -> list[d
     best = {}
     for c in citations:
         k = norm(c.get("snippet", ""))
-        if not k:
+        if k:
+            k = (
+                f"{str(c.get('bubble_document_id') or '').strip()}"
+                f"|{int(c.get('page_from') or 0)}"
+                f"|{int(c.get('page_to') or 0)}"
+                f"|{k[:220]}"
+            )
+        else:
             k = str(c.get("citation_id") or "").strip()
 
         prev = best.get(k)
@@ -4272,6 +4341,7 @@ def root_cause_v1(
         "10) non proporre cause basate principalmente su sezioni generali di manutenzione, lubrificazione macchina, pneumatica, safety o overview se le fonti non collegano esplicitamente quella causa al gruppo coinvolto dal sintomo.\n"
         "11) se una fonte parla del sintomo in modo generico ma non del gruppo/processo corretto, non usarla come evidenza centrale.\n"
         "12) non proporre cause di installazione, posizionamento, fondazione, livellamento o piano di appoggio salvo che la query riguardi esplicitamente setup, installazione, messa in servizio o spostamento macchina.\n"
+        "13) non usare come evidenza centrale sezioni di descrizione generale della macchina o sezioni safety/ripari/porte se non collegano esplicitamente il problema al componente o gruppo coinvolto.\n"
     )
 
     user_msg = (
