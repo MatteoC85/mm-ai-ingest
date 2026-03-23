@@ -2396,6 +2396,8 @@ def _llm_filter_diagnostic_chunks(
             "citation_id": cid,
             "section": section[:120],
             "evidence_family": _root_cause_evidence_family_key(c),
+            "matched_subsystems": c.get("matched_subsystems") or [],
+            "subsystem_score": round(float(c.get("subsystem_score", 0.0)), 4),
             "generic_downranked": bool(c.get("generic_downranked")),
             "snippet": snippet[:300]
         })
@@ -2428,6 +2430,8 @@ def _llm_filter_diagnostic_chunks(
         "7) Preferisci sezioni operative o di componente rispetto a overview, safety, installation, start-up o caratteristiche generali.\n"
         "8) Evita di selezionare più citation_id della stessa evidence_family se una sola fonte rappresenta già bene quell'area.\n"
         "9) Seleziona fonti che coprono aree causali diverse quando sono ben supportate.\n"
+        "10) Preferisci fonti allineate ai sottosistemi dominanti implicati dal sintomo.\n"
+        "11) Se esistono fonti di sottosistemi secondari, mantienile solo se spiegano una causa davvero plausibile e non indiretta.\n"
     )
 
     user_msg = (
@@ -2490,6 +2494,8 @@ def _llm_build_diagnostic_evidence_matrix(
                 "citation_id": cid,
                 "section": section[:120],
                 "evidence_family": _root_cause_evidence_family_key(c),
+                "matched_subsystems": c.get("matched_subsystems") or [],
+                "subsystem_score": round(float(c.get("subsystem_score", 0.0)), 4),
                 "page_from": int(c.get("page_from") or 0),
                 "page_to": int(c.get("page_to") or 0),
                 "generic_downranked": bool(c.get("generic_downranked")),
@@ -2555,6 +2561,8 @@ def _llm_build_diagnostic_evidence_matrix(
         "9) Preferisci sezioni operative o di componente rispetto a overview, safety, installation, start-up o caratteristiche generali.\n"
         "10) Evita di mantenere più citation_id della stessa evidence_family se una sola fonte è già rappresentativa.\n"
         "11) keep_ids e cause_hypotheses devono massimizzare la copertura di aree causali diverse, non la ripetizione della stessa area.\n"
+        "12) Preferisci ipotesi coerenti con i sottosistemi dominanti implicati dal sintomo.\n"
+        "13) Le evidenze di sottosistemi secondari vanno tenute solo se supportano una causa distinta e plausibile.\n"
     )
 
     user_msg = (
@@ -2883,6 +2891,148 @@ def _score_root_cause_causal_strength(
     return {
         "causal_strength_score": score,
         "causal_strength_band": band,
+    }
+
+def _root_cause_target_subsystems(
+    q: str,
+    inferred_components: list[str],
+) -> list[str]:
+    q_low = _normalize_unicode_advanced(q or "").lower()
+    comps_low = " ".join(
+        _normalize_unicode_advanced(str(x) or "").lower()
+        for x in (inferred_components or [])
+    )
+
+    out: list[str] = []
+    seen = set()
+
+    def add(name: str):
+        if not name or name in seen:
+            return
+        seen.add(name)
+        out.append(name)
+
+    if any(t in q_low for t in ["feed", "advance", "avanz", "wire", "filo", "strip", "nastro", "material"]):
+        add("material_feed")
+
+    if any(t in q_low for t in ["bend", "bending", "pieg", "forming", "formatura", "press", "pressa", "tool", "die", "stampo"]):
+        add("forming")
+
+    if any(t in q_low for t in ["straight", "straighten", "raddrizz"]):
+        add("straightening")
+
+    if any(t in q_low or t in comps_low for t in [
+        "motor", "motore", "bearing", "cuscinet", "shaft", "albero",
+        "gear", "ingran", "gearbox", "ridutt", "transmission", "trasmission",
+        "brushless", "cam", "coupling", "giunto", "belt", "cinghia", "chain", "catena"
+    ]):
+        add("drive_train")
+
+    if any(t in q_low for t in ["lubric", "lubrif", "oil", "olio", "grease", "grasso", "pump", "pompa"]):
+        add("lubrication")
+
+    if any(t in q_low for t in ["pneumat", "hydraul", "idraulic", "air", "aria", "pressure", "pression", "valv", "valvol", "cylind", "cilindr"]):
+        add("fluid_power")
+
+    if any(t in q_low or t in comps_low for t in ["encoder", "sensor", "sensore", "plc", "electr", "elettric", "inverter", "control", "controllo"]):
+        add("electrical_control")
+
+    if not out:
+        if any(t in q_low for t in ["vibr", "oscillat", "rumor", "rumore", "noise", "rattle", "strid"]):
+            add("drive_train")
+
+    return out[:4]
+
+
+def _score_root_cause_subsystem_alignment(
+    q: str,
+    chunk_text: str,
+    target_subsystems: list[str],
+) -> dict:
+    txt = _normalize_unicode_advanced(chunk_text or "").lower()
+    section = _normalize_unicode_advanced(_extract_section_from_text(chunk_text) or "").lower()
+
+    if not txt:
+        return {
+            "subsystem_score": -0.25,
+            "matched_subsystems": [],
+        }
+
+    subsystem_markers = {
+        "material_feed": [
+            "feed", "advance", "avanz", "trascin", "infeed", "material",
+            "wire", "filo", "strip", "nastro", "roller", "rullo", "roll"
+        ],
+        "forming": [
+            "bend", "bending", "pieg", "forming", "formatura",
+            "press", "pressa", "tool", "die", "stampo", "punch", "punzone", "matrice"
+        ],
+        "straightening": [
+            "straighten", "straightening", "raddrizz", "flatten"
+        ],
+        "drive_train": [
+            "motor", "motore", "brushless", "shaft", "albero", "bearing", "cuscinet",
+            "gear", "ingran", "gearbox", "ridutt", "transmission", "trasmission",
+            "cam", "coupling", "giunto", "belt", "cinghia", "chain", "catena"
+        ],
+        "lubrication": [
+            "lubric", "lubrif", "oil", "olio", "grease", "grasso",
+            "pump", "pompa", "pressostato", "pressure switch"
+        ],
+        "fluid_power": [
+            "pneumat", "hydraul", "idraulic", "aria", "air",
+            "pressure", "pression", "valv", "valvol", "cylind", "cilindr"
+        ],
+        "electrical_control": [
+            "encoder", "sensor", "sensore", "plc", "electr", "elettric",
+            "inverter", "control", "controllo", "drive"
+        ],
+        "safety_installation": [
+            "safety", "sicurezza", "riparo", "guard", "door", "porta",
+            "microinter", "installation", "installazione", "startup", "start-up",
+            "commission", "messa in servizio", "foundation", "fondazione",
+            "positioning", "posizionamento", "livellamento", "piano di appoggio"
+        ],
+    }
+
+    matched_subsystems: list[str] = []
+    for name, markers in subsystem_markers.items():
+        if any(m in txt or m in section for m in markers):
+            matched_subsystems.append(name)
+
+    target_set = {str(x).strip() for x in (target_subsystems or []) if str(x).strip()}
+    matched_set = set(matched_subsystems)
+    overlap = target_set & matched_set
+
+    score = 0.0
+
+    if overlap:
+        score += min(0.34, 0.18 * len(overlap))
+
+        if any(ts in section for ts in [
+            "feed", "advance", "avanz", "bend", "pieg",
+            "straight", "raddrizz", "trasmission", "transmission"
+        ]):
+            score += 0.06
+
+    if matched_set and not overlap:
+        support_only = matched_set <= {"lubrication", "fluid_power", "electrical_control", "safety_installation"}
+        if support_only:
+            score -= 0.16
+        else:
+            score -= 0.08
+
+    if matched_set == {"lubrication"} and "lubrication" not in target_set:
+        score -= 0.08
+
+    if "safety_installation" in matched_set and not overlap:
+        score -= 0.10
+
+    score = max(-0.30, min(0.40, score))
+
+    return {
+        "subsystem_score": score,
+        "matched_subsystems": matched_subsystems[:4],
     }
 
 def _dedup_root_cause_candidates_semantic(
@@ -4137,6 +4287,7 @@ def root_cause_v1(
     inferred_components = _infer_machine_components(q)
     diagnostic_queries = _build_diagnostic_queries(q, inferred_components)
     diagnostic_keywords = _collect_candidate_keywords(q, inferred_components)
+    target_subsystems = _root_cause_target_subsystems(q, inferred_components)
 
     query_vectors: dict[str, list[float]] = {}
     query_texts = diagnostic_queries[:] if diagnostic_queries else [q]
@@ -4168,6 +4319,8 @@ def root_cause_v1(
     semantic_score_avg: Optional[float] = None
     causal_strength_max: Optional[float] = None
     causal_strength_avg: Optional[float] = None
+    subsystem_score_max: Optional[float] = None
+    subsystem_score_avg: Optional[float] = None
 
     def _finalize(resp: dict) -> dict:
         if payload.debug:
@@ -4185,12 +4338,15 @@ def root_cause_v1(
                 "diagnostic_queries": diagnostic_queries,
                 "inferred_components": inferred_components,
                 "diagnostic_keywords": diagnostic_keywords,
+                "target_subsystems": target_subsystems,
                 "generic_downranked_count": generic_downranked_count,
                 "hard_excluded_count": hard_excluded_count,
                 "semantic_score_max": semantic_score_max,
                 "semantic_score_avg": semantic_score_avg,
                 "causal_strength_max": causal_strength_max,
                 "causal_strength_avg": causal_strength_avg,
+                "subsystem_score_max": subsystem_score_max,
+                "subsystem_score_avg": subsystem_score_avg,
                 "evidence_matrix_used": evidence_matrix_used,
                 "evidence_matrix_hypotheses": len(evidence_matrix.get("cause_hypotheses") or []) if isinstance(evidence_matrix, dict) else 0,
             }
@@ -4382,6 +4538,7 @@ def root_cause_v1(
     semantic_candidates = []
     semantic_scores = []
     causal_scores = []
+    subsystem_scores = []
 
     for c in rescored_candidates:
         cc = dict(c)
@@ -4397,13 +4554,20 @@ def root_cause_v1(
             chunk_text=chunk_text,
             diagnostic_keywords=diagnostic_keywords,
         )
+        subsystem = _score_root_cause_subsystem_alignment(
+            q=q,
+            chunk_text=chunk_text,
+            target_subsystems=target_subsystems,
+        )
 
         cc.update(semantic)
         cc.update(causal)
+        cc.update(subsystem)
 
         semantic_candidates.append(cc)
         semantic_scores.append(float(cc.get("semantic_score", 0.0)))
         causal_scores.append(float(cc.get("causal_strength_score", 0.0)))
+        subsystem_scores.append(float(cc.get("subsystem_score", 0.0)))
 
     candidates = semantic_candidates
 
@@ -4414,6 +4578,10 @@ def root_cause_v1(
     if causal_scores:
         causal_strength_max = max(causal_scores)
         causal_strength_avg = sum(causal_scores) / len(causal_scores)
+
+    if subsystem_scores:
+        subsystem_score_max = max(subsystem_scores)
+        subsystem_score_avg = sum(subsystem_scores) / len(subsystem_scores)
 
     if not candidates:
         return _finalize(
@@ -4456,8 +4624,13 @@ def root_cause_v1(
     if len(causal_good) >= 2:
         cut_candidates = causal_good
 
+    subsystem_good = [c for c in cut_candidates if float(c.get("subsystem_score", 0.0)) >= 0.02]
+    if len(subsystem_good) >= 2:
+        cut_candidates = subsystem_good
+
     cut_candidates.sort(
         key=lambda x: (
+            float(x.get("subsystem_score", 0.0)),
             float(x.get("causal_strength_score", 0.0)),
             float(x.get("semantic_score", 0.0)),
             float(x.get("rrf_score", 0.0)),
@@ -4470,6 +4643,7 @@ def root_cause_v1(
         cut_candidates = sorted(
             candidates,
             key=lambda x: (
+                float(x.get("subsystem_score", 0.0)),
                 float(x.get("causal_strength_score", 0.0)),
                 float(x.get("semantic_score", 0.0)),
                 float(x.get("rrf_score", 0.0)),
@@ -4500,12 +4674,16 @@ def root_cause_v1(
         causal_raw = float(c.get("causal_strength_score", 0.0))
         causal_norm = max(0.0, min(1.0, (causal_raw + 0.40) / 0.80))
 
+        subsystem_raw = float(c.get("subsystem_score", 0.0))
+        subsystem_norm = max(0.0, min(1.0, (subsystem_raw + 0.30) / 0.70))
+
         cc["raw_similarity"] = raw_sim
         cc["similarity"] = (
-            0.42 * raw_sim
-            + 0.18 * rrf_norm
-            + 0.20 * semantic_norm
-            + 0.20 * causal_norm
+            0.34 * raw_sim
+            + 0.16 * rrf_norm
+            + 0.16 * semantic_norm
+            + 0.16 * causal_norm
+            + 0.18 * subsystem_norm
         )
         mmr_candidates.append(cc)
 
@@ -4757,6 +4935,8 @@ def root_cause_v1(
 
         evidence_matrix_block = "\n".join(lines).strip()
 
+    subsystem_focus_block = ", ".join(target_subsystems) if target_subsystems else "(non identificato)"
+
     schema = _root_cause_response_schema(max_causes=max_causes)
 
     system_msg = (
@@ -4784,10 +4964,13 @@ def root_cause_v1(
         "15) privilegia cause diverse ben supportate, non variazioni della stessa causa basate sulla stessa area di testo.\n"
         "16) privilegia cause supportate da evidenze dirette sul componente o sul processo coinvolto; le evidenze collaterali o indirette valgono meno se esistono fonti più dirette.\n"
         "17) non promuovere come causa principale istruzioni isolate di avviamento, inversione fasi, verso motore pompa o controlli secondari se non sono il supporto più diretto disponibile.\n"
+        "18) privilegia cause appartenenti ai sottosistemi dominanti implicati dal sintomo.\n"
+        "19) usa sottosistemi secondari solo se la causa è davvero plausibile e ben supportata da fonti specifiche.\n"
     )
 
     user_msg = (
         f"SINTOMO/PROBLEMA:\n{q}\n\n"
+        f"SOTTOSISTEMI_PRIORITARI:\n{subsystem_focus_block}\n\n"
         f"MATRICE_EVIDENZE:\n{evidence_matrix_block or '(non disponibile)'}\n\n"
         f"FONTI:\n{sources_block}\n\n"
         "Restituisci JSON valido. Nelle citations usa solo citation_id presenti nelle fonti."
