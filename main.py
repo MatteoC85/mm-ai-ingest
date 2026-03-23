@@ -2395,6 +2395,7 @@ def _llm_filter_diagnostic_chunks(
         items.append({
             "citation_id": cid,
             "section": section[:120],
+            "evidence_family": _root_cause_evidence_family_key(c),
             "generic_downranked": bool(c.get("generic_downranked")),
             "snippet": snippet[:300]
         })
@@ -2425,6 +2426,8 @@ def _llm_filter_diagnostic_chunks(
         "5) Non collassare tutto su una sola fonte se esistono 2-3 aree causali diverse ben supportate.\n"
         "6) Le fonti con generic_downranked=true sono bassa priorità e vanno tenute solo se il sintomo coincide in modo diretto.\n"
         "7) Preferisci sezioni operative o di componente rispetto a overview, safety, installation, start-up o caratteristiche generali.\n"
+        "8) Evita di selezionare più citation_id della stessa evidence_family se una sola fonte rappresenta già bene quell'area.\n"
+        "9) Seleziona fonti che coprono aree causali diverse quando sono ben supportate.\n"
     )
 
     user_msg = (
@@ -2486,6 +2489,7 @@ def _llm_build_diagnostic_evidence_matrix(
             {
                 "citation_id": cid,
                 "section": section[:120],
+                "evidence_family": _root_cause_evidence_family_key(c),
                 "page_from": int(c.get("page_from") or 0),
                 "page_to": int(c.get("page_to") or 0),
                 "generic_downranked": bool(c.get("generic_downranked")),
@@ -2549,6 +2553,8 @@ def _llm_build_diagnostic_evidence_matrix(
         "7) keep_ids deve mantenere copertura delle aree causali utili, non solo il numero minimo di fonti.\n"
         "8) Le fonti con generic_downranked=true sono bassa priorità e non vanno usate come evidenza centrale se esistono fonti più specifiche.\n"
         "9) Preferisci sezioni operative o di componente rispetto a overview, safety, installation, start-up o caratteristiche generali.\n"
+        "10) Evita di mantenere più citation_id della stessa evidence_family se una sola fonte è già rappresentativa.\n"
+        "11) keep_ids e cause_hypotheses devono massimizzare la copertura di aree causali diverse, non la ripetizione della stessa area.\n"
     )
 
     user_msg = (
@@ -2829,6 +2835,127 @@ def _dedup_root_cause_candidates_semantic(
         reverse=True,
     )
     return out[:max_items]
+
+def _root_cause_evidence_family_key(c: dict) -> str:
+    doc_id = str(c.get("bubble_document_id") or "").strip()
+    page_from = int(c.get("page_from") or 0)
+
+    section = _extract_section_from_text(c.get("chunk_full") or c.get("snippet") or "")
+    section = _normalize_unicode_advanced(section or "")
+    section = re.sub(r"\s+", " ", section).strip().lower()[:120]
+
+    return f"{doc_id}|p{page_from}|sec:{section}"
+
+
+def _prioritize_root_cause_coverage(
+    citations: list[dict],
+    max_items: int,
+) -> list[dict]:
+    if not citations:
+        return []
+
+    ordered = sorted(
+        citations,
+        key=lambda x: (
+            float(x.get("semantic_score", 0.0)),
+            float(x.get("similarity", 0.0)),
+        ),
+        reverse=True,
+    )
+
+    out: list[dict] = []
+    used_ids = set()
+    used_families = set()
+
+    # primo pass: massimizza copertura famiglie diverse
+    for c in ordered:
+        cid = str(c.get("citation_id") or "").strip()
+        if not cid or cid in used_ids:
+            continue
+
+        fam = _root_cause_evidence_family_key(c)
+        if fam in used_families:
+            continue
+
+        used_ids.add(cid)
+        used_families.add(fam)
+        out.append(c)
+
+        if len(out) >= max_items:
+            return out[:max_items]
+
+    # secondo pass: riempi eventuali slot rimanenti
+    for c in ordered:
+        cid = str(c.get("citation_id") or "").strip()
+        if not cid or cid in used_ids:
+            continue
+
+        used_ids.add(cid)
+        out.append(c)
+
+        if len(out) >= max_items:
+            break
+
+    return out[:max_items]
+
+
+def _compact_root_cause_result_citations_by_family(
+    result: dict,
+    citations: list[dict],
+    max_per_cause: int = 2,
+) -> tuple[dict, list[dict]]:
+    result = dict(result or {})
+    by_id = {
+        str(c.get("citation_id") or "").strip(): c
+        for c in (citations or [])
+        if c.get("citation_id")
+    }
+
+    compact_causes: list[dict] = []
+    final_ids: list[str] = []
+    seen_final_ids = set()
+
+    for cause in result.get("possible_causes") or []:
+        if not isinstance(cause, dict):
+            continue
+
+        kept_ids: list[str] = []
+        used_families = set()
+
+        for cid in cause.get("citations") or []:
+            cid = str(cid or "").strip()
+            if not cid or cid not in by_id:
+                continue
+
+            fam = _root_cause_evidence_family_key(by_id[cid])
+            if fam in used_families:
+                continue
+
+            used_families.add(fam)
+            kept_ids.append(cid)
+
+            if len(kept_ids) >= max_per_cause:
+                break
+
+        if not kept_ids:
+            continue
+
+        new_cause = dict(cause)
+        new_cause["citations"] = kept_ids
+        compact_causes.append(new_cause)
+
+        for cid in kept_ids:
+            if cid not in seen_final_ids:
+                seen_final_ids.add(cid)
+                final_ids.append(cid)
+
+    for i, cause in enumerate(compact_causes, start=1):
+        cause["rank"] = i
+
+    result["possible_causes"] = compact_causes
+    compact_citations = [by_id[cid] for cid in final_ids if cid in by_id]
+
+    return result, compact_citations
 
 def _root_cause_response_schema(max_causes: int) -> dict:
     max_causes = max(1, min(int(max_causes or 1), 3))
@@ -4276,6 +4403,7 @@ def root_cause_v1(
 
     citations = _dedup_citations_by_snippet(citations, max_items=top_k)
     citations = _dedup_root_cause_candidates_semantic(citations, max_items=top_k)
+    citations = _prioritize_root_cause_coverage(citations, max_items=top_k)
 
     try:
         selected_diag_ids = _llm_filter_diagnostic_chunks(
@@ -4301,6 +4429,8 @@ def root_cause_v1(
             )
     except Exception as e:
         rerank_error = str(e) if not rerank_error else rerank_error
+
+    citations = _prioritize_root_cause_coverage(citations, max_items=top_k)
 
     if float(sim_max or 0.0) < ASK_SIM_THRESHOLD:
         fts_queries = [q]
@@ -4413,6 +4543,7 @@ def root_cause_v1(
     if len(nongeneric_citations) >= 2:
         citations = nongeneric_citations[:top_k]
 
+    citations = _prioritize_root_cause_coverage(citations, max_items=top_k)
     citations = _dedup_root_cause_candidates_semantic(citations, max_items=top_k)
 
     sem_strong = [
@@ -4518,6 +4649,8 @@ def root_cause_v1(
         "11) se una fonte parla del sintomo in modo generico ma non del gruppo/processo corretto, non usarla come evidenza centrale.\n"
         "12) non proporre cause di installazione, posizionamento, fondazione, livellamento o piano di appoggio salvo che la query riguardi esplicitamente setup, installazione, messa in servizio o spostamento macchina.\n"
         "13) non usare come evidenza centrale sezioni di descrizione generale della macchina o sezioni safety/ripari/porte se non collegano esplicitamente il problema al componente o gruppo coinvolto.\n"
+        "14) evita di usare più citations della stessa famiglia di evidenza per la stessa causa, salvo che siano realmente complementari.\n"
+        "15) privilegia cause diverse ben supportate, non variazioni della stessa causa basate sulla stessa area di testo.\n"
     )
 
     user_msg = (
@@ -4544,6 +4677,12 @@ def root_cause_v1(
         result=result_json,
         citations=citations,
         max_causes=max_causes,
+    )
+
+    grounded_result, grounded_citations = _compact_root_cause_result_citations_by_family(
+        result=grounded_result,
+        citations=grounded_citations,
+        max_per_cause=2,
     )
 
     if not grounded_result.get("problem_summary"):
