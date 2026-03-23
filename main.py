@@ -565,6 +565,101 @@ def _expand_with_neighbor_chunks(
 
     return out
 
+def _should_downrank_generic_root_cause_chunk(
+    q: str,
+    chunk_text: str,
+    diagnostic_keywords: list[str],
+) -> bool:
+    txt = (chunk_text or "").lower()
+    if not txt:
+        return False
+
+    section = _extract_section_from_text(chunk_text).lower()
+    q_low = (q or "").lower()
+    diag_terms = [str(x).strip().lower() for x in (diagnostic_keywords or []) if str(x).strip()]
+
+    generic_section_markers = [
+        "norme generali di installazione",
+        "collegamenti elettrici",
+        "ambiente di lavoro",
+        "posizionamento della macchina",
+        "stoccaggio",
+        "sicurezza",
+    ]
+
+    generic_body_markers = [
+        "durante il trasporto",
+        "prima della messa in moto",
+        "prima accensione",
+        "collegamenti elettrici",
+        "tensione di rete",
+        "quadro di comando",
+        "locale asciutto",
+        "agenti atmosferici",
+        "cavo di terra",
+        "umidità",
+        "stoccaggio",
+        "installazione",
+        "piano di appoggio",
+        "spessori di gomma",
+        "messa in moto",
+        "collegare la linea elettrica",
+        "verificare la tensione di rete",
+    ]
+
+    strong_mechanical_markers = [
+        "cuscinett",
+        "rullo",
+        "albero",
+        "ingranagg",
+        "riduttor",
+        "slitta",
+        "eccentric",
+        "trasmission",
+        "guida",
+        "pressione",
+        "alline",
+        "volantino",
+        "manopola",
+        "encoder",
+        "stampo",
+        "avanzamento",
+        "piegatura",
+    ]
+
+    symptom_markers = []
+    if "vibr" in q_low:
+        symptom_markers += ["vibraz", "oscill"]
+    if "rumor" in q_low:
+        symptom_markers += ["rumore", "rumoros", "strid", "sfreg"]
+    if "avanz" in q_low or "filo" in q_low:
+        symptom_markers += ["avanz", "trascin", "filo", "materiale"]
+    if "pieg" in q_low:
+        symptom_markers += ["pieg", "pressa", "slitta", "stampo"]
+
+    generic_section_hit = any(m in section for m in generic_section_markers)
+    generic_body_hits = sum(1 for m in generic_body_markers if m in txt)
+    strong_mechanical_hits = sum(1 for m in strong_mechanical_markers if m in txt)
+    diag_hits = sum(1 for t in diag_terms if t and t in txt)
+    symptom_hits = sum(1 for m in symptom_markers if m in txt)
+
+    if strong_mechanical_hits >= 2:
+        return False
+
+    if diag_hits >= 2 and symptom_hits >= 1:
+        return False
+
+    if generic_section_hit and strong_mechanical_hits == 0:
+        return True
+
+    if generic_body_hits >= 3 and strong_mechanical_hits == 0 and symptom_hits == 0:
+        return True
+
+    if generic_body_hits >= 4 and diag_hits <= 1:
+        return True
+
+    return False
+
 def _q_has_any(q: str, hints: list[str]) -> bool:
     qq = (q or "").lower()
     return any(h in qq for h in hints)
@@ -3022,7 +3117,8 @@ def root_cause_v1(
     fts_used = False
     rerank_used = False
     rerank_error: Optional[str] = None
-
+    generic_downranked_count = 0
+    
     def _finalize(resp: dict) -> dict:
         if payload.debug:
             resp["debug"] = {
@@ -3039,6 +3135,7 @@ def root_cause_v1(
                 "diagnostic_queries": diagnostic_queries,
                 "inferred_components": inferred_components,
                 "diagnostic_keywords": diagnostic_keywords,
+                "generic_downranked_count": generic_downranked_count,
             }
         return resp
 
@@ -3182,6 +3279,24 @@ def root_cause_v1(
         conn.close()
 
     candidates = _rrf_merge_candidates(dense_ranked_lists, k=60)
+
+    generic_downranked_count = 0
+
+    for c in candidates:
+        chunk_text = (c.get("chunk_full") or c.get("snippet") or "").strip()
+
+        is_generic = _should_downrank_generic_root_cause_chunk(
+            q=q,
+            chunk_text=chunk_text,
+            diagnostic_keywords=diagnostic_keywords,
+        )
+
+        c["generic_downranked"] = bool(is_generic)
+
+        if is_generic:
+            generic_downranked_count += 1
+            c["similarity"] = max(0.0, float(c.get("similarity", 0.0)) - 0.10)
+            c["rrf_score"] = max(0.0, float(c.get("rrf_score", 0.0)) - 0.015)
 
     if not candidates:
         return _finalize(
@@ -3329,7 +3444,7 @@ def root_cause_v1(
                 "similarity_max": sim_max,
             }
         )
-        
+
     enriched_citations: list[dict] = []
     seen_enriched = set()
 
