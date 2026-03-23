@@ -1133,6 +1133,85 @@ def _should_hard_exclude_root_cause_chunk(
 
     return False
 
+def _score_root_cause_chunk_semantic(
+    q: str,
+    chunk_text: str,
+    diagnostic_keywords: list[str],
+) -> dict:
+    sig = _root_cause_chunk_signal_summary(
+        q=q,
+        chunk_text=chunk_text,
+        diagnostic_keywords=diagnostic_keywords,
+    )
+    if not sig:
+        return {
+            "semantic_score": -0.30,
+            "semantic_band": "weak",
+        }
+
+    score = 0.0
+
+    # segnali positivi
+    score += min(0.20, 0.05 * float(sig.get("diag_hits", 0)))
+    score += min(0.18, 0.08 * float(sig.get("section_diag_hits", 0)))
+    score += min(0.16, 0.06 * float(sig.get("symptom_hits", 0)))
+    score += min(0.22, 0.05 * float(sig.get("strong_component_hits", 0)))
+    score += min(0.18, 0.07 * float(sig.get("process_hits", 0)))
+
+    # sinergie utili
+    if sig.get("symptom_hits", 0) >= 1 and sig.get("strong_component_hits", 0) >= 1:
+        score += 0.08
+    if sig.get("diag_hits", 0) >= 1 and (
+        sig.get("strong_component_hits", 0) >= 1 or sig.get("process_hits", 0) >= 1
+    ):
+        score += 0.08
+    if sig.get("section_diag_hits", 0) >= 1 and sig.get("process_hits", 0) >= 1:
+        score += 0.06
+
+    # penalità generali
+    if sig.get("description_section_hit"):
+        score -= 0.28
+    if sig.get("overview_section_hit"):
+        score -= 0.14
+    if sig.get("boilerplate_section_hit"):
+        score -= 0.10
+
+    if sig.get("startup_install_hits", 0) >= 2 and not sig.get("query_install_related"):
+        score -= min(0.18, 0.04 * float(sig.get("startup_install_hits", 0)))
+
+    if sig.get("positioning_hits", 0) >= 2 and not sig.get("query_install_related"):
+        score -= min(0.22, 0.05 * float(sig.get("positioning_hits", 0)))
+
+    if sig.get("safety_access_hits", 0) >= 2 and not sig.get("query_safety_related"):
+        score -= min(0.22, 0.05 * float(sig.get("safety_access_hits", 0)))
+
+    if sig.get("acoustic_protection_hits", 0) >= 1 and not sig.get("query_safety_related"):
+        score -= min(0.18, 0.06 * float(sig.get("acoustic_protection_hits", 0)))
+
+    if (
+        sig.get("lube_control_hits", 0) >= 2
+        and not sig.get("query_lube_related")
+        and sig.get("process_hits", 0) == 0
+    ):
+        score -= min(0.14, 0.04 * float(sig.get("lube_control_hits", 0)))
+
+    if sig.get("spec_hits", 0) >= 2:
+        score -= min(0.14, 0.04 * float(sig.get("spec_hits", 0)))
+
+    score = max(-0.45, min(0.45, score))
+
+    if score >= 0.18:
+        band = "strong"
+    elif score >= 0.02:
+        band = "medium"
+    else:
+        band = "weak"
+
+    return {
+        "semantic_score": score,
+        "semantic_band": band,
+    }
+
 def _q_has_any(q: str, hints: list[str]) -> bool:
     qq = (q or "").lower()
     return any(h in qq for h in hints)
@@ -2703,6 +2782,54 @@ def _reorder_citations_by_priority_ids(
 
     return out[:max_items]
 
+def _dedup_root_cause_candidates_semantic(
+    citations: list[dict],
+    max_items: int,
+) -> list[dict]:
+    def _sig(c: dict) -> str:
+        txt = _normalize_unicode_advanced(c.get("snippet", "") or "")
+        txt = re.sub(r"^SECTION:\s*[^\n]+\n?", "", txt, flags=re.IGNORECASE).strip()
+        txt = re.sub(r"\s+", " ", txt).lower()
+        txt = txt[:220]
+
+        return (
+            f"{str(c.get('bubble_document_id') or '').strip()}|"
+            f"{int(c.get('page_from') or 0)}|"
+            f"{int(c.get('page_to') or 0)}|"
+            f"{txt}"
+        )
+
+    best = {}
+    for c in citations or []:
+        k = _sig(c)
+        prev = best.get(k)
+
+        if prev is None:
+            best[k] = c
+            continue
+
+        prev_tuple = (
+            float(prev.get("semantic_score", 0.0)),
+            float(prev.get("similarity", 0.0)),
+        )
+        cur_tuple = (
+            float(c.get("semantic_score", 0.0)),
+            float(c.get("similarity", 0.0)),
+        )
+
+        if cur_tuple > prev_tuple:
+            best[k] = c
+
+    out = list(best.values())
+    out.sort(
+        key=lambda x: (
+            float(x.get("semantic_score", 0.0)),
+            float(x.get("similarity", 0.0)),
+        ),
+        reverse=True,
+    )
+    return out[:max_items]
+
 def _root_cause_response_schema(max_causes: int) -> dict:
     max_causes = max(1, min(int(max_causes or 1), 3))
 
@@ -3809,6 +3936,8 @@ def root_cause_v1(
     hard_excluded_count = 0
     evidence_matrix_used = False
     evidence_matrix: dict = {}
+    semantic_score_max: Optional[float] = None
+    semantic_score_avg: Optional[float] = None
 
     def _finalize(resp: dict) -> dict:
         if payload.debug:
@@ -3828,6 +3957,8 @@ def root_cause_v1(
                 "diagnostic_keywords": diagnostic_keywords,
                 "generic_downranked_count": generic_downranked_count,
                 "hard_excluded_count": hard_excluded_count,
+                "semantic_score_max": semantic_score_max,
+                "semantic_score_avg": semantic_score_avg,
                 "evidence_matrix_used": evidence_matrix_used,
                 "evidence_matrix_hypotheses": len(evidence_matrix.get("cause_hypotheses") or []) if isinstance(evidence_matrix, dict) else 0,
             }
@@ -4016,7 +4147,25 @@ def root_cause_v1(
 
         rescored_candidates.append(cc)
 
-    candidates = rescored_candidates
+    semantic_candidates = []
+    semantic_scores = []
+
+    for c in rescored_candidates:
+        cc = dict(c)
+        semantic = _score_root_cause_chunk_semantic(
+            q=q,
+            chunk_text=(cc.get("chunk_full") or cc.get("snippet") or "").strip(),
+            diagnostic_keywords=diagnostic_keywords,
+        )
+        cc.update(semantic)
+        semantic_candidates.append(cc)
+        semantic_scores.append(float(cc.get("semantic_score", 0.0)))
+
+    candidates = semantic_candidates
+
+    if semantic_scores:
+        semantic_score_max = max(semantic_scores)
+        semantic_score_avg = sum(semantic_scores) / len(semantic_scores)
 
     if not candidates:
         return _finalize(
@@ -4046,9 +4195,18 @@ def root_cause_v1(
     )
 
     cutoff_delta = 0.08 if tight_cutoff else 0.12
-    cut_candidates = [c for c in candidates if (float(sim_max or 0.0) - float(c.get("similarity", 0.0))) <= cutoff_delta]
+    cut_candidates = [
+        c for c in candidates
+        if (float(sim_max or 0.0) - float(c.get("similarity", 0.0))) <= cutoff_delta
+    ]
+
+    sem_good = [c for c in cut_candidates if float(c.get("semantic_score", 0.0)) >= 0.02]
+    if len(sem_good) >= 2:
+        cut_candidates = sem_good
+
     cut_candidates.sort(
         key=lambda x: (
+            float(x.get("semantic_score", 0.0)),
             float(x.get("rrf_score", 0.0)),
             float(x.get("similarity", 0.0)),
         ),
@@ -4059,6 +4217,7 @@ def root_cause_v1(
         cut_candidates = sorted(
             candidates,
             key=lambda x: (
+                float(x.get("semantic_score", 0.0)),
                 float(x.get("rrf_score", 0.0)),
                 float(x.get("similarity", 0.0)),
             ),
@@ -4081,8 +4240,15 @@ def root_cause_v1(
         rrf = float(c.get("rrf_score", 0.0))
         rrf_norm = (rrf / max_rrf) if max_rrf > 0 else 0.0
 
+        semantic_raw = float(c.get("semantic_score", 0.0))
+        semantic_norm = max(0.0, min(1.0, (semantic_raw + 0.45) / 0.90))
+
         cc["raw_similarity"] = raw_sim
-        cc["similarity"] = 0.80 * raw_sim + 0.20 * rrf_norm
+        cc["similarity"] = (
+            0.55 * raw_sim
+            + 0.20 * rrf_norm
+            + 0.25 * semantic_norm
+        )
         mmr_candidates.append(cc)
 
     citations = _mmr_select(base_q_vec, mmr_candidates, top_k=top_k, lambda_mult=0.85)
@@ -4109,6 +4275,7 @@ def root_cause_v1(
         c.pop("query_used", None)
 
     citations = _dedup_citations_by_snippet(citations, max_items=top_k)
+    citations = _dedup_root_cause_candidates_semantic(citations, max_items=top_k)
 
     try:
         selected_diag_ids = _llm_filter_diagnostic_chunks(
@@ -4245,6 +4412,15 @@ def root_cause_v1(
 
     if len(nongeneric_citations) >= 2:
         citations = nongeneric_citations[:top_k]
+
+    citations = _dedup_root_cause_candidates_semantic(citations, max_items=top_k)
+
+    sem_strong = [
+        c for c in citations
+        if float(c.get("semantic_score", 0.0)) >= 0.02
+    ]
+    if len(sem_strong) >= 2:
+        citations = sem_strong[:top_k]
 
     if float(sim_max or 0.0) < ASK_SIM_THRESHOLD and not (fts_used and citations):
         return _finalize(
