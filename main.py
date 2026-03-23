@@ -620,41 +620,193 @@ def _root_cause_chunk_signal_summary(
         seen_diag.add(x)
         diag_terms.append(x)
 
-    boilerplate_section_markers = [
-        "safety", "warning", "warnings", "sicurezza", "avvertenze",
-        "installation", "installazione", "electrical connections", "collegamenti elettrici", "wiring",
-        "transport", "trasporto", "storage", "stoccaggio",
-        "commissioning", "messa in servizio", "start-up", "startup", "prima accensione",
-        "overview", "general description", "descrizione generale", "general features", "caratteristiche generali",
-        "technical data", "dati tecnici", "specifications", "caratteristiche tecniche",
-        "intended use", "destinazione d'uso", "acoustic", "noise emissions", "emissioni sonore",
+    overview_section_markers = [
+        "overview",
+        "general features",
+        "general description",
+        "caratteristiche generali",
+        "descrizione generale",
+        "technical data",
+        "specifications",
+        "dati tecnici",
+        "caratteristiche tecniche",
+        "intended use",
+        "destinazione d'uso",
     ]
 
-    boilerplate_body_markers = [
-        "read the manual", "leggere il manuale",
-        "disconnect the power supply", "togliere tensione",
-        "protective earth", "messa a terra", "cavo di terra",
-        "ambient temperature", "temperatura ambiente",
-        "humidity", "umidita", "agenti atmosferici", "weather agents",
-        "lifting", "sollevamento", "packaging", "imballo", "unpacking", "disimball",
-        "transport", "trasporto", "storage", "stoccaggio", "installation", "installazione",
-        "power supply", "alimentazione", "voltage", "tensione", "frequency", "frequenza",
-        "dimensions", "dimensioni", "weight", "peso",
-        "noise level", "livello di rumore", "sound pressure", "pressione sonora",
-        "routine maintenance", "manutenzione ordinaria",
-        "maintenance interval", "intervalli di manutenzione",
-        "lubrication schedule", "piano di lubrificazione",
+    boilerplate_section_markers = overview_section_markers + [
+        "safety",
+        "warning",
+        "warnings",
+        "sicurezza",
+        "avvertenze",
+        "installation",
+        "installazione",
+        "electrical connections",
+        "collegamenti elettrici",
+        "wiring",
+        "transport",
+        "trasporto",
+        "storage",
+        "stoccaggio",
+        "commissioning",
+        "messa in servizio",
+        "start-up",
+        "startup",
+        "prima accensione",
+        "messa in moto",
+        "foundation",
+        "fondazione",
+        "positioning",
+        "posizionamento",
     ]
 
-    mechanical_markers = [
-        "bearing", "cuscinet", "gear", "ingran", "gearbox", "ridutt",
-        "shaft", "albero", "belt", "cinghia", "chain", "catena",
-        "roller", "rullo", "guide", "guida", "motor", "motore",
-        "sensor", "sensore", "encoder", "valve", "valvol",
-        "cylinder", "cilindr", "pump", "pompa", "brake", "freno",
-        "alignment", "alline", "clearance", "gioco", "backlash",
-        "feed", "advance", "avanz", "bend", "bending", "pieg",
-        "friction", "attrit", "pressure", "pression",
+    startup_install_markers = [
+        "before starting",
+        "before start-up",
+        "before startup",
+        "prima di avviare",
+        "prima dell'avviamento",
+        "prima della messa in moto",
+        "before commissioning",
+        "messa in servizio",
+        "messa in moto",
+        "start the machine",
+        "avviare la macchina",
+        "control panel",
+        "quadro di comando",
+        "network voltage",
+        "tensione di rete",
+        "power supply",
+        "alimentazione",
+        "minimum level",
+        "livello minimo",
+        "installation",
+        "installazione",
+        "transport",
+        "trasporto",
+        "storage",
+        "stoccaggio",
+        "foundation",
+        "fondazione",
+        "positioning",
+        "posizionamento",
+    ]
+
+    safety_access_markers = [
+        "work area",
+        "zona di lavoro",
+        "access door",
+        "porta di accesso",
+        "porte protette",
+        "safety door",
+        "safety doors",
+        "micro switch",
+        "micro switches",
+        "microswitch",
+        "microinterruttor",
+        "automatic cycle",
+        "ciclo automatico",
+        "protective guard",
+        "protective guards",
+        "riparo",
+        "ripari",
+    ]
+
+    acoustic_protection_markers = [
+        "acoustic",
+        "noise emission",
+        "noise emissions",
+        "noise level",
+        "sound pressure",
+        "sound insulation",
+        "soundproof",
+        "soundproofing",
+        "emissioni sonore",
+        "livello di rumore",
+        "pressione sonora",
+        "isolamento acustico",
+        "fonoassorb",
+        "rumoros",
+        "protective panel",
+        "protective panels",
+        "pannelli di protezione",
+    ]
+
+    lube_control_markers = [
+        "lubrication circuit",
+        "circuito di lubrificazione",
+        "automatic lubrication",
+        "lubrificazione automatica",
+        "pressure switch",
+        "pressostato",
+        "oil level",
+        "livello olio",
+        "minimum level",
+        "livello minimo",
+        "oil tank",
+        "serbatoio",
+        "pressure drop",
+        "cali pressione",
+    ]
+
+    strong_component_markers = [
+        "bearing",
+        "cuscinet",
+        "gear",
+        "ingran",
+        "gearbox",
+        "ridutt",
+        "shaft",
+        "albero",
+        "belt",
+        "cinghia",
+        "chain",
+        "catena",
+        "roller",
+        "rullo",
+        "guide",
+        "guida",
+        "motor",
+        "motore",
+        "sensor",
+        "sensore",
+        "encoder",
+        "valve",
+        "valvol",
+        "cylinder",
+        "cilindr",
+        "pump",
+        "pompa",
+        "brake",
+        "freno",
+        "alignment",
+        "alline",
+        "clearance",
+        "gioco",
+        "backlash",
+        "friction",
+        "attrit",
+        "slitta",
+        "slide",
+        "die",
+        "stampo",
+    ]
+
+    process_markers = [
+        "feed",
+        "advance",
+        "avanz",
+        "wire",
+        "filo",
+        "bend",
+        "bending",
+        "pieg",
+        "forming",
+        "formatura",
+        "straighten",
+        "straightening",
+        "raddrizz",
     ]
 
     symptom_groups = [
@@ -676,18 +828,67 @@ def _root_cause_chunk_signal_summary(
         return sum(1 for m in markers if m and m in hay)
 
     spec_markers = [
-        "noise level", "livello di rumore", "sound pressure", "pressione sonora",
-        "dimensions", "dimensioni", "weight", "peso",
-        "voltage", "tensione", "frequency", "frequenza",
+        "noise level",
+        "livello di rumore",
+        "sound pressure",
+        "pressione sonora",
+        "dimensions",
+        "dimensioni",
+        "weight",
+        "peso",
+        "voltage",
+        "tensione",
+        "frequency",
+        "frequenza",
     ]
+
+    query_install_related = any(
+        st in q_low
+        for st in [
+            "install",
+            "startup",
+            "start-up",
+            "start",
+            "avvi",
+            "messa in servizio",
+            "messa in moto",
+            "commission",
+            "elettric",
+            "power",
+            "alimentaz",
+            "tension",
+        ]
+    )
+
+    query_lube_related = any(
+        st in q_low
+        for st in [
+            "lubric",
+            "lubrif",
+            "oil",
+            "olio",
+            "grease",
+            "grasso",
+            "pressost",
+            "pressure switch",
+        ]
+    )
 
     return {
         "diag_hits": count_hits(diag_terms[:12], txt),
+        "section_diag_hits": count_hits(diag_terms[:12], section),
         "boilerplate_section_hit": any(m in section for m in boilerplate_section_markers),
-        "boilerplate_body_hits": count_hits(boilerplate_body_markers, txt),
-        "mechanical_hits": count_hits(mechanical_markers, txt),
+        "overview_section_hit": any(m in section for m in overview_section_markers),
+        "startup_install_hits": count_hits(startup_install_markers, txt),
+        "safety_access_hits": count_hits(safety_access_markers, txt),
+        "acoustic_protection_hits": count_hits(acoustic_protection_markers, txt),
+        "lube_control_hits": count_hits(lube_control_markers, txt),
+        "strong_component_hits": count_hits(strong_component_markers, txt),
+        "process_hits": count_hits(process_markers, txt),
         "symptom_hits": count_hits(list(dict.fromkeys(symptom_markers)), txt),
         "spec_hits": count_hits(spec_markers, txt),
+        "query_install_related": query_install_related,
+        "query_lube_related": query_lube_related,
     }
 
 def _should_downrank_generic_root_cause_chunk(
@@ -703,16 +904,42 @@ def _should_downrank_generic_root_cause_chunk(
     if not sig:
         return False
 
-    if sig["mechanical_hits"] >= 2:
+    if (sig["strong_component_hits"] >= 2 or sig["process_hits"] >= 1) and (
+        sig["diag_hits"] >= 1 or sig["section_diag_hits"] >= 1 or sig["symptom_hits"] >= 1
+    ):
         return False
 
-    if sig["symptom_hits"] >= 1 and (sig["diag_hits"] >= 1 or sig["mechanical_hits"] >= 1):
-        return False
-
-    if sig["boilerplate_section_hit"] and sig["mechanical_hits"] == 0 and sig["symptom_hits"] == 0:
+    if sig["overview_section_hit"] and (
+        sig["acoustic_protection_hits"] >= 1 or sig["safety_access_hits"] >= 2
+    ):
         return True
 
-    if sig["boilerplate_body_hits"] >= 3 and sig["mechanical_hits"] == 0 and sig["symptom_hits"] == 0:
+    if (
+        sig["boilerplate_section_hit"]
+        and sig["diag_hits"] == 0
+        and sig["section_diag_hits"] == 0
+        and sig["symptom_hits"] == 0
+        and sig["strong_component_hits"] <= 1
+    ):
+        return True
+
+    if (
+        sig["startup_install_hits"] >= 3
+        and not sig["query_install_related"]
+        and sig["diag_hits"] == 0
+        and sig["section_diag_hits"] == 0
+        and sig["symptom_hits"] == 0
+    ):
+        return True
+
+    if (
+        sig["lube_control_hits"] >= 2
+        and not sig["query_lube_related"]
+        and sig["diag_hits"] == 0
+        and sig["section_diag_hits"] == 0
+        and sig["symptom_hits"] == 0
+        and sig["strong_component_hits"] <= 1
+    ):
         return True
 
     if sig["spec_hits"] >= 2 and sig["diag_hits"] == 0 and sig["symptom_hits"] == 0:
@@ -733,16 +960,42 @@ def _should_hard_exclude_root_cause_chunk(
     if not sig:
         return False
 
-    if sig["mechanical_hits"] > 0 or sig["symptom_hits"] > 0 or sig["diag_hits"] >= 2:
+    if (sig["strong_component_hits"] >= 1 or sig["process_hits"] >= 1) and (
+        sig["diag_hits"] >= 1 or sig["section_diag_hits"] >= 1 or sig["symptom_hits"] >= 1
+    ):
         return False
 
-    if sig["boilerplate_section_hit"] and sig["boilerplate_body_hits"] >= 2:
+    if sig["overview_section_hit"] and (
+        sig["acoustic_protection_hits"] >= 1 or sig["safety_access_hits"] >= 2
+    ):
         return True
 
-    if sig["boilerplate_body_hits"] >= 5:
+    if (
+        sig["startup_install_hits"] >= 4
+        and not sig["query_install_related"]
+        and sig["diag_hits"] == 0
+        and sig["section_diag_hits"] == 0
+        and sig["symptom_hits"] == 0
+        and sig["strong_component_hits"] <= 1
+        and sig["process_hits"] == 0
+    ):
         return True
 
-    if sig["spec_hits"] >= 3:
+    if (
+        sig["acoustic_protection_hits"] >= 2
+        and sig["diag_hits"] == 0
+        and sig["section_diag_hits"] == 0
+        and sig["symptom_hits"] == 0
+    ):
+        return True
+
+    if (
+        sig["spec_hits"] >= 3
+        and sig["diag_hits"] == 0
+        and sig["section_diag_hits"] == 0
+        and sig["symptom_hits"] == 0
+        and sig["strong_component_hits"] == 0
+    ):
         return True
 
     return False
@@ -1561,29 +1814,41 @@ def _chunk_sentences_with_pages(
 
         total = 0
         j = i
-        section: Optional[str] = None
+        chunk_section: Optional[str] = seq[i][2]
+
         while j < len(seq):
-            pn, s, section = seq[j]
+            pn, s, sent_section = seq[j]
             add = s + " "
+
+            # Non attraversare il cambio di sezione
+            if buf and sent_section != chunk_section:
+                break
+
             if total + len(add) > target_chars and total >= min_chars:
                 break
+
             buf.append(s)
             pages_in_chunk.append(pn)
             total += len(add)
+
+            if chunk_section is None and sent_section is not None:
+                chunk_section = sent_section
+
             j += 1
 
         if not buf:
-            pn, s, section = seq[i]
+            pn, s, sent_section = seq[i]
             buf = [s]
             pages_in_chunk = [pn]
+            chunk_section = sent_section
             j = i + 1
 
         page_from = min(pages_in_chunk)
         page_to = max(pages_in_chunk)
         chunk_text = "\n".join(buf).strip()
 
-        if section:
-            chunk_text = f"SECTION: {section}\n" + chunk_text
+        if chunk_section:
+            chunk_text = f"SECTION: {chunk_section}\n" + chunk_text
 
         chunks.append(
             {
@@ -1600,7 +1865,9 @@ def _chunk_sentences_with_pages(
             carry_len = 0
             k = j - 1
             while k >= i and carry_len < overlap_chars:
-                pn, s, _ = seq[k]
+                pn, s, sent_section = seq[k]
+                if sent_section != chunk_section:
+                    break
                 carry.insert(0, (pn, s))
                 carry_len += len(s) + 1
                 k -= 1
@@ -1812,10 +2079,14 @@ def _llm_rerank_citations(
             "Regole obbligatorie: "
             "1) tieni solo fonti che parlano del fenomeno o dei componenti coinvolti; "
             "2) scarta fonti generiche di manutenzione, sicurezza, installazione o lubrificazione se non sono direttamente legate al sintomo; "
-            "3) preferisci fonti che descrivono componenti, regolazioni, giochi meccanici o anomalie; "
-            "4) se due fonti sono simili, tieni la più specifica; "
-            "5) restituisci il minor numero possibile di citation_id utili."
+            "3) preferisci fonti che descrivono componenti, regolazioni, giochi meccanici, allineamenti o anomalie operative; "
+            "4) overview, caratteristiche generali, safety, acoustic, installation, start-up e sezioni simili sono bassa priorità, salvo che il sintomo riguardi esplicitamente quei temi; "
+            "5) se una fonte è soprattutto boilerplate e solo marginalmente correlata, scartala; "
+            "6) se due fonti sono simili, tieni la più specifica; "
+            "7) non collassare tutto su una sola fonte se 2-3 fonti specifiche coprono aree causali diverse; "
+            "8) restituisci il minor numero possibile di citation_id davvero utili."
         )
+        
     else:
         system_msg = (
             "Selezioni le citazioni minime e più precise per rispondere a una domanda tecnica industriale. "
@@ -1881,9 +2152,12 @@ def _llm_filter_diagnostic_chunks(
     for c in candidates[:18]:
         cid = str(c.get("citation_id") or "").strip()
         snippet = (c.get("snippet") or "").strip()
+        section = _extract_section_from_text(c.get("chunk_full") or c.get("snippet") or "")
 
         items.append({
             "citation_id": cid,
+            "section": section[:120],
+            "generic_downranked": bool(c.get("generic_downranked")),
             "snippet": snippet[:300]
         })
 
@@ -1911,6 +2185,8 @@ def _llm_filter_diagnostic_chunks(
         "3) Se una fonte parla solo di controlli generici o procedure standard, scartala.\n"
         "4) Mantieni poche fonti ma molto pertinenti.\n"
         "5) Non collassare tutto su una sola fonte se esistono 2-3 aree causali diverse ben supportate.\n"
+        "6) Le fonti con generic_downranked=true sono bassa priorità e vanno tenute solo se il sintomo coincide in modo diretto.\n"
+        "7) Preferisci sezioni operative o di componente rispetto a overview, safety, installation, start-up o caratteristiche generali.\n"
     )
 
     user_msg = (
@@ -1966,11 +2242,15 @@ def _llm_build_diagnostic_evidence_matrix(
         snippet = (c.get("chunk_full") or c.get("snippet") or "").strip()
         snippet = re.sub(r"^SECTION:\s*[^\n]+\n?", "", snippet).strip()
 
+        section = _extract_section_from_text(c.get("chunk_full") or c.get("snippet") or "")
+
         items.append(
             {
                 "citation_id": cid,
+                "section": section[:120],
                 "page_from": int(c.get("page_from") or 0),
                 "page_to": int(c.get("page_to") or 0),
+                "generic_downranked": bool(c.get("generic_downranked")),
                 "snippet": snippet[:360],
             }
         )
@@ -2029,6 +2309,8 @@ def _llm_build_diagnostic_evidence_matrix(
         "5) check_focus = verifiche pratiche brevi, non frasi lunghe.\n"
         "6) Non collassare tutto su una sola causa se le citazioni supportano aree causali diverse.\n"
         "7) keep_ids deve mantenere copertura delle aree causali utili, non solo il numero minimo di fonti.\n"
+        "8) Le fonti con generic_downranked=true sono bassa priorità e non vanno usate come evidenza centrale se esistono fonti più specifiche.\n"
+        "9) Preferisci sezioni operative o di componente rispetto a overview, safety, installation, start-up o caratteristiche generali.\n"
     )
 
     user_msg = (
@@ -3676,9 +3958,19 @@ def root_cause_v1(
             max_keep=top_k,
         )
         if selected_diag_ids:
+            nongeneric_ids = {
+                str(c.get("citation_id") or "").strip()
+                for c in citations
+                if c.get("citation_id") and not bool(c.get("generic_downranked"))
+            }
+
+            priority_ids = [cid for cid in selected_diag_ids if cid in nongeneric_ids]
+            if not priority_ids:
+                priority_ids = selected_diag_ids
+
             citations = _reorder_citations_by_priority_ids(
                 citations=citations,
-                priority_ids=selected_diag_ids,
+                priority_ids=priority_ids,
                 max_items=top_k,
             )
     except Exception as e:
@@ -3765,9 +4057,19 @@ def root_cause_v1(
                     priority_ids.append(cid)
 
         if priority_ids:
+            nongeneric_ids = {
+                str(c.get("citation_id") or "").strip()
+                for c in citations
+                if c.get("citation_id") and not bool(c.get("generic_downranked"))
+            }
+
+            filtered_priority_ids = [cid for cid in priority_ids if cid in nongeneric_ids]
+            if not filtered_priority_ids:
+                filtered_priority_ids = priority_ids
+
             citations = _reorder_citations_by_priority_ids(
                 citations=citations,
-                priority_ids=priority_ids,
+                priority_ids=filtered_priority_ids,
                 max_items=top_k,
             )
 
@@ -3868,6 +4170,7 @@ def root_cause_v1(
         "6) privilegia cause coerenti con il sintomo osservato, non manutenzione generica;\n"
         "7) non duplicare cause quasi uguali;\n"
         "8) non citare fonti inesistenti.\n"
+        "9) preferisci evidenze provenienti da sezioni operative o di componente; overview, safety, installation, start-up, caratteristiche generali o acoustic sections valgono solo se il sintomo le riguarda direttamente.\n"
     )
 
     user_msg = (
