@@ -2117,6 +2117,27 @@ def _ground_root_cause_result(
 
     return grounded, grounded_citations
 
+def _sanitize_citations_for_response(citations: list[dict]) -> list[dict]:
+    out: list[dict] = []
+
+    for c in citations or []:
+        cid = str(c.get("citation_id") or "").strip()
+        bdid = str(c.get("bubble_document_id") or "").strip()
+
+        if not cid or not bdid:
+            continue
+
+        out.append(
+            {
+                "citation_id": cid,
+                "bubble_document_id": bdid,
+                "page_from": int(c.get("page_from") or 0),
+                "page_to": int(c.get("page_to") or 0),
+                "snippet": (c.get("snippet") or "").strip(),
+            }
+        )
+
+    return out
 
 def _root_cause_response_schema(max_causes: int) -> dict:
     max_causes = max(1, min(int(max_causes or 1), 3))
@@ -3548,6 +3569,7 @@ def root_cause_v1(
             for x in (evidence_matrix.get("keep_ids") or [])
             if str(x).strip()
         ]
+        cause_hypotheses = evidence_matrix.get("cause_hypotheses") or []
 
         if keep_ids:
             by_id = {
@@ -3556,10 +3578,14 @@ def root_cause_v1(
                 if c.get("citation_id")
             }
             filtered = [by_id[cid] for cid in keep_ids if cid in by_id]
-            if filtered:
+
+            # Applica il filtro solo se non collassa troppo l'evidenza.
+            # Se la matrice tiene una sola citation, usala per guidare il prompt
+            # ma non rimpiazzare le citations originali.
+            if len(filtered) >= 2 or len(cause_hypotheses) >= 2:
                 citations = _dedup_citations_by_snippet(filtered, max_items=top_k)
 
-        evidence_matrix_used = bool(evidence_matrix.get("cause_hypotheses"))
+        evidence_matrix_used = bool(cause_hypotheses)
     except Exception as e:
         rerank_error = str(e) if not rerank_error else rerank_error
         evidence_matrix = {}
@@ -3704,9 +3730,11 @@ def root_cause_v1(
             }
         )
 
+    response_citations = _sanitize_citations_for_response(grounded_citations)
+
     rg_links = []
     try:
-        rg_links = _build_rg_links(company_id, grounded_citations)
+        rg_links = _build_rg_links(company_id, response_citations)
     except Exception as e:
         print("RG_LINKS_FAIL", str(e))
         rg_links = []
@@ -3719,14 +3747,13 @@ def root_cause_v1(
             "problem_summary": grounded_result.get("problem_summary") or q,
             "possible_causes": grounded_result.get("possible_causes") or [],
             "recommended_next_checks": grounded_result.get("recommended_next_checks") or [],
-            "citations": grounded_citations,
+            "citations": response_citations,
             "rg_links": rg_links,
             "top_k": top_k,
             "similarity_max": sim_max,
             "chat_model": OPENAI_CHAT_MODEL,
         }
     )
-
 
 @app.post("/v1/ai/delete/document")
 def delete_document_v1(
