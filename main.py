@@ -380,6 +380,190 @@ def _infer_machine_components(q: str) -> list[str]:
     except Exception:
         return []
 
+def _build_diagnostic_queries(q: str, inferred_components: list[str]) -> list[str]:
+    q = (q or "").strip()
+    comps = [str(x).strip().lower() for x in (inferred_components or []) if str(x).strip()]
+    if not q:
+        return []
+
+    out: list[str] = []
+    seen = set()
+
+    def add(s: str):
+        s = (s or "").strip()
+        if not s:
+            return
+        k = s.lower()
+        if k in seen:
+            return
+        seen.add(k)
+        out.append(s)
+
+    add(q)
+
+    if comps:
+        add(q + " " + " ".join(comps[:4]))
+
+    for c in comps[:4]:
+        add(f"{q} {c}")
+        add(f"problema {c} {q}")
+        add(f"anomalia {c} {q}")
+
+    q_low = q.lower()
+
+    symptom_terms = []
+    if "vibr" in q_low:
+        symptom_terms += ["vibrazione", "vibra", "oscillazione"]
+    if "rumor" in q_low:
+        symptom_terms += ["rumore", "rumorosità"]
+    if "surrisc" in q_low or "cald" in q_low or "temperatur" in q_low:
+        symptom_terms += ["surriscaldamento", "temperatura", "calore"]
+    if "bloc" in q_low or "ferma" in q_low or "stop" in q_low:
+        symptom_terms += ["blocco", "arresto", "fermo macchina"]
+    if "lubrif" in q_low or "olio" in q_low or "ingrass" in q_low:
+        symptom_terms += ["lubrificazione", "olio", "grasso"]
+
+    for t in symptom_terms[:4]:
+        add(f"{q} {t}")
+
+    return out[:8]
+
+
+def _rrf_merge_candidates(
+    ranked_lists: list[list[dict]],
+    k: int = 60,
+) -> list[dict]:
+    scores: dict[str, float] = {}
+    best_item: dict[str, dict] = {}
+
+    for ranked in ranked_lists:
+        for idx, item in enumerate(ranked):
+            cid = str(item.get("citation_id") or "").strip()
+            if not cid:
+                continue
+
+            score = 1.0 / float(k + idx + 1)
+            scores[cid] = scores.get(cid, 0.0) + score
+
+            prev = best_item.get(cid)
+            if prev is None or float(item.get("similarity", 0.0)) > float(prev.get("similarity", 0.0)):
+                best_item[cid] = item
+
+    out = []
+    for cid, item in best_item.items():
+        merged = dict(item)
+        merged["rrf_score"] = scores.get(cid, 0.0)
+        out.append(merged)
+
+    out.sort(
+        key=lambda x: (
+            float(x.get("rrf_score", 0.0)),
+            float(x.get("similarity", 0.0)),
+        ),
+        reverse=True,
+    )
+    return out
+
+
+def _collect_candidate_keywords(q: str, inferred_components: list[str]) -> list[str]:
+    q = (q or "").strip().lower()
+    comps = [str(x).strip().lower() for x in (inferred_components or []) if str(x).strip()]
+
+    out = []
+    seen = set()
+
+    def add(x: str):
+        x = (x or "").strip().lower()
+        if not x or x in seen:
+            return
+        seen.add(x)
+        out.append(x)
+
+    for c in comps[:6]:
+        add(c)
+
+    heuristic_terms = [
+        "cuscinetto", "cuscinetti", "riduttore", "lubrificazione", "olio", "grasso",
+        "sensore", "encoder", "motore", "vite", "rullo", "guida", "puleggia",
+        "catena", "cinghia", "albero", "inverter", "valvola", "pressione",
+    ]
+
+    for t in heuristic_terms:
+        if t in q:
+            add(t)
+
+    return out[:10]
+
+
+def _expand_with_neighbor_chunks(
+    company_id: str,
+    bubble_document_id: str,
+    citation_ids: list[str],
+    *,
+    radius: int = 1,
+) -> list[dict]:
+    if not citation_ids:
+        return []
+
+    parsed = []
+    for cid in citation_ids:
+        m = re.match(r"^(.*):p(\d+)-(\d+):c(\d+)$", str(cid).strip())
+        if not m:
+            continue
+        bdid = m.group(1).strip()
+        chunk_index = int(m.group(4))
+        if bdid != bubble_document_id:
+            continue
+        parsed.append(chunk_index)
+
+    if not parsed:
+        return []
+
+    min_idx = max(1, min(parsed) - radius)
+    max_idx = max(parsed) + radius
+
+    conn = _db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT bubble_document_id, chunk_index, page_from, page_to,
+                       left(chunk_text, %s) AS snippet,
+                       left(chunk_text, 2000) AS chunk_full
+                FROM public.document_chunks
+                WHERE company_id=%s
+                  AND bubble_document_id=%s
+                  AND chunk_index BETWEEN %s AND %s
+                ORDER BY chunk_index;
+                """,
+                (
+                    ASK_SNIPPET_CHARS,
+                    company_id,
+                    bubble_document_id,
+                    min_idx,
+                    max_idx,
+                ),
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    out = []
+    for (bdid, chunk_index, page_from, page_to, snippet, chunk_full) in rows:
+        cid = f"{bdid}:p{int(page_from)}-{int(page_to)}:c{int(chunk_index)}"
+        out.append(
+            {
+                "citation_id": cid,
+                "bubble_document_id": str(bdid),
+                "page_from": int(page_from),
+                "page_to": int(page_to),
+                "snippet": (snippet or "").strip(),
+                "chunk_full": (chunk_full or "").strip(),
+                "similarity": 0.0,
+            }
+        )
+
+    return out
 
 def _q_has_any(q: str, hints: list[str]) -> bool:
     qq = (q or "").lower()
@@ -2774,7 +2958,6 @@ def ask_v1(
         }
     )
 
-
 @app.post("/v1/ai/root-cause")
 def root_cause_v1(
     payload: RootCauseRequest,
@@ -2813,8 +2996,25 @@ def root_cause_v1(
     max_causes = max(1, min(int(payload.max_causes or 3), 3))
     candidate_k = max(top_k, min(80, top_k * 10))
 
-    q_vec = _openai_embed_texts([q])[0]
-    q_vec_lit = _vector_literal(q_vec)
+    inferred_components = _infer_machine_components(q)
+    diagnostic_queries = _build_diagnostic_queries(q, inferred_components)
+    diagnostic_keywords = _collect_candidate_keywords(q, inferred_components)
+
+    query_vectors: dict[str, list[float]] = {}
+    query_texts = diagnostic_queries[:] if diagnostic_queries else [q]
+
+    try:
+        batch_vectors = _openai_embed_texts(query_texts)
+        query_vectors = {
+            text: vec
+            for text, vec in zip(query_texts, batch_vectors)
+            if text and vec
+        }
+    except Exception:
+        query_vectors = {q: _openai_embed_texts([q])[0]}
+
+    if q not in query_vectors:
+        query_vectors[q] = _openai_embed_texts([q])[0]
 
     rows = []
     chunks_matching_filter = None
@@ -2836,8 +3036,13 @@ def root_cause_v1(
                 "rerank_enabled": RERANK_ENABLED,
                 "rerank_used": rerank_used,
                 "rerank_error": rerank_error[:300] if rerank_error else None,
+                "diagnostic_queries": diagnostic_queries,
+                "inferred_components": inferred_components,
+                "diagnostic_keywords": diagnostic_keywords,
             }
         return resp
+
+    dense_ranked_lists: list[list[dict]] = []
 
     conn = _db_conn()
     try:
@@ -2856,25 +3061,8 @@ def root_cause_v1(
                     )
                     chunks_matching_filter = int(cur.fetchone()[0] or 0)
 
-                cur.execute(
-                    """
-                    SELECT bubble_document_id, chunk_index, page_from, page_to,
-                           left(chunk_text, %s) AS snippet,
-                           left(chunk_text, 2000) AS chunk_full,
-                           1 - (embedding <=> %s::vector) AS similarity,
-                           embedding
-                    FROM public.document_chunks
-                    WHERE company_id = %s
-                      AND bubble_document_id = ANY(%s)
-                      AND embedding IS NOT NULL
-                    ORDER BY embedding <=> %s::vector
-                    LIMIT %s;
-                    """,
-                    (ASK_SNIPPET_CHARS, q_vec_lit, company_id, doc_ids, q_vec_lit, candidate_k),
-                )
             elif payload.bubble_document_id:
                 bdid = payload.bubble_document_id.strip()
-
                 if payload.debug:
                     cur.execute(
                         """
@@ -2889,23 +3077,6 @@ def root_cause_v1(
                     )
                     chunks_matching_filter = int(cur.fetchone()[0] or 0)
 
-                cur.execute(
-                    """
-                    SELECT bubble_document_id, chunk_index, page_from, page_to,
-                           left(chunk_text, %s) AS snippet,
-                           left(chunk_text, 2000) AS chunk_full,
-                           1 - (embedding <=> %s::vector) AS similarity,
-                           embedding
-                    FROM public.document_chunks
-                    WHERE company_id = %s
-                      AND bubble_document_id = %s
-                      AND embedding IS NOT NULL
-                      AND (machine_id = %s OR machine_id IS NULL)
-                    ORDER BY embedding <=> %s::vector
-                    LIMIT %s;
-                    """,
-                    (ASK_SNIPPET_CHARS, q_vec_lit, company_id, bdid, machine_id, q_vec_lit, candidate_k),
-                )
             else:
                 if payload.debug:
                     cur.execute(
@@ -2920,28 +3091,99 @@ def root_cause_v1(
                     )
                     chunks_matching_filter = int(cur.fetchone()[0] or 0)
 
-                cur.execute(
-                    """
-                    SELECT bubble_document_id, chunk_index, page_from, page_to,
-                           left(chunk_text, %s) AS snippet,
-                           left(chunk_text, 2000) AS chunk_full,
-                           1 - (embedding <=> %s::vector) AS similarity,
-                           embedding
-                    FROM public.document_chunks
-                    WHERE company_id = %s
-                      AND embedding IS NOT NULL
-                      AND (machine_id = %s OR machine_id IS NULL)
-                    ORDER BY embedding <=> %s::vector
-                    LIMIT %s;
-                    """,
-                    (ASK_SNIPPET_CHARS, q_vec_lit, company_id, machine_id, q_vec_lit, candidate_k),
-                )
+            for dq, dq_vec in query_vectors.items():
+                q_vec_lit = _vector_literal(dq_vec)
 
-            rows = cur.fetchall()
+                if doc_ids:
+                    cur.execute(
+                        """
+                        SELECT bubble_document_id, chunk_index, page_from, page_to,
+                               left(chunk_text, %s) AS snippet,
+                               left(chunk_text, 2000) AS chunk_full,
+                               1 - (embedding <=> %s::vector) AS similarity,
+                               embedding
+                        FROM public.document_chunks
+                        WHERE company_id = %s
+                          AND bubble_document_id = ANY(%s)
+                          AND embedding IS NOT NULL
+                        ORDER BY embedding <=> %s::vector
+                        LIMIT %s;
+                        """,
+                        (ASK_SNIPPET_CHARS, q_vec_lit, company_id, doc_ids, q_vec_lit, candidate_k),
+                    )
+                elif payload.bubble_document_id:
+                    bdid = payload.bubble_document_id.strip()
+                    cur.execute(
+                        """
+                        SELECT bubble_document_id, chunk_index, page_from, page_to,
+                               left(chunk_text, %s) AS snippet,
+                               left(chunk_text, 2000) AS chunk_full,
+                               1 - (embedding <=> %s::vector) AS similarity,
+                               embedding
+                        FROM public.document_chunks
+                        WHERE company_id = %s
+                          AND bubble_document_id = %s
+                          AND embedding IS NOT NULL
+                          AND (machine_id = %s OR machine_id IS NULL)
+                        ORDER BY embedding <=> %s::vector
+                        LIMIT %s;
+                        """,
+                        (ASK_SNIPPET_CHARS, q_vec_lit, company_id, bdid, machine_id, q_vec_lit, candidate_k),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT bubble_document_id, chunk_index, page_from, page_to,
+                               left(chunk_text, %s) AS snippet,
+                               left(chunk_text, 2000) AS chunk_full,
+                               1 - (embedding <=> %s::vector) AS similarity,
+                               embedding
+                        FROM public.document_chunks
+                        WHERE company_id = %s
+                          AND embedding IS NOT NULL
+                          AND (machine_id = %s OR machine_id IS NULL)
+                        ORDER BY embedding <=> %s::vector
+                        LIMIT %s;
+                        """,
+                        (ASK_SNIPPET_CHARS, q_vec_lit, company_id, machine_id, q_vec_lit, candidate_k),
+                    )
+
+                raw_rows = cur.fetchall()
+
+                ranked = []
+                for (bdid, chunk_index, page_from, page_to, snippet, chunk_full, similarity, embedding) in raw_rows:
+                    if embedding is None:
+                        emb_list = None
+                    elif isinstance(embedding, list):
+                        emb_list = embedding
+                    else:
+                        s = str(embedding).strip()
+                        s = s.strip("[]")
+                        emb_list = [float(x) for x in s.split(",") if x.strip()]
+
+                    citation_id = f"{bdid}:p{int(page_from)}-{int(page_to)}:c{int(chunk_index)}"
+                    ranked.append(
+                        {
+                            "citation_id": citation_id,
+                            "bubble_document_id": str(bdid),
+                            "page_from": int(page_from),
+                            "page_to": int(page_to),
+                            "snippet": (snippet or "").strip(),
+                            "chunk_full": (chunk_full or "").strip(),
+                            "similarity": float(similarity),
+                            "embedding_list": emb_list or [],
+                            "query_used": dq,
+                        }
+                    )
+
+                if ranked:
+                    dense_ranked_lists.append(ranked)
     finally:
         conn.close()
 
-    if not rows:
+    candidates = _rrf_merge_candidates(dense_ranked_lists, k=60)
+
+    if not candidates:
         return _finalize(
             {
                 "ok": True,
@@ -2957,67 +3199,79 @@ def root_cause_v1(
             }
         )
 
-    candidates: list[dict] = []
-    sim_max = -1.0
-
-    for (bdid, chunk_index, page_from, page_to, snippet, chunk_full, similarity, embedding) in rows:
-        sim = float(similarity)
-        sim_max = max(sim_max, sim)
-
-        if embedding is None:
-            emb_list = None
-        elif isinstance(embedding, list):
-            emb_list = embedding
-        else:
-            s = str(embedding).strip()
-            s = s.strip("[]")
-            emb_list = [float(x) for x in s.split(",") if x.strip()]
-
-        citation_id = f"{bdid}:p{int(page_from)}-{int(page_to)}:c{int(chunk_index)}"
-        candidates.append(
-            {
-                "citation_id": citation_id,
-                "bubble_document_id": bdid,
-                "page_from": int(page_from),
-                "page_to": int(page_to),
-                "snippet": (snippet or "").strip(),
-                "chunk_full": (chunk_full or "").strip(),
-                "similarity": sim,
-                "embedding_list": emb_list or [],
-            }
-        )
+    sim_max = max(float(c.get("similarity", 0.0)) for c in candidates) if candidates else None
 
     q_low = q.lower()
     key_terms = []
     if "lubrif" in q_low or "olio" in q_low or "ingrass" in q_low or "cuscinet" in q_low or "riduttor" in q_low:
         key_terms = ["lubrif", "olio", "ingrass", "cuscinet", "riduttor"]
 
+    if diagnostic_keywords:
+        key_terms = list(dict.fromkeys(key_terms + diagnostic_keywords))
+
     if key_terms:
         gated = []
         for c in candidates:
-            hay = ((c.get("chunk_full") or c.get("snippet") or "") + " " + (c.get("citation_id") or "")).lower()
+            hay = (
+                ((c.get("chunk_full") or c.get("snippet") or "") + " " + (c.get("citation_id") or "")).lower()
+            )
             if any(t in hay for t in key_terms):
                 gated.append(c)
 
         if len(gated) >= 2:
             candidates = gated
+            sim_max = max(float(c.get("similarity", 0.0)) for c in candidates) if candidates else sim_max
 
     cutoff_delta = 0.08 if key_terms else 0.12
-    cut_candidates = [c for c in candidates if (sim_max - float(c.get("similarity", 0.0))) <= cutoff_delta]
-    cut_candidates.sort(key=lambda x: float(x.get("similarity", 0.0)), reverse=True)
+    cut_candidates = [c for c in candidates if (float(sim_max or 0.0) - float(c.get("similarity", 0.0))) <= cutoff_delta]
+    cut_candidates.sort(
+        key=lambda x: (
+            float(x.get("rrf_score", 0.0)),
+            float(x.get("similarity", 0.0)),
+        ),
+        reverse=True,
+    )
 
     if len(cut_candidates) < min(2, len(candidates)):
         cut_candidates = sorted(
             candidates,
-            key=lambda x: float(x.get("similarity", 0.0)),
+            key=lambda x: (
+                float(x.get("rrf_score", 0.0)),
+                float(x.get("similarity", 0.0)),
+            ),
             reverse=True,
         )[: min(2, len(candidates))]
 
-    citations = _mmr_select(q_vec, cut_candidates, top_k=top_k, lambda_mult=0.85)
-
-    if _should_use_reranker(q=q, candidates=cut_candidates, sim_max=sim_max, top_k=top_k):
+    base_q_vec = query_vectors.get(q)
+    if base_q_vec is None:
         try:
-            reranked_ids = _llm_rerank_citations(q=q, candidates=cut_candidates, top_k=top_k)
+            base_q_vec = _openai_embed_texts([q])[0]
+        except Exception:
+            base_q_vec = next(iter(query_vectors.values()))
+
+    max_rrf = max(float(c.get("rrf_score", 0.0)) for c in cut_candidates) if cut_candidates else 0.0
+    mmr_candidates = []
+
+    for c in cut_candidates:
+        cc = dict(c)
+        raw_sim = float(c.get("similarity", 0.0))
+        rrf = float(c.get("rrf_score", 0.0))
+        rrf_norm = (rrf / max_rrf) if max_rrf > 0 else 0.0
+
+        cc["raw_similarity"] = raw_sim
+        cc["similarity"] = 0.80 * raw_sim + 0.20 * rrf_norm
+        mmr_candidates.append(cc)
+
+    citations = _mmr_select(base_q_vec, mmr_candidates, top_k=top_k, lambda_mult=0.85)
+
+    if _should_use_reranker(q=q, candidates=cut_candidates, sim_max=float(sim_max or 0.0), top_k=top_k):
+        try:
+            reranked_ids = _llm_rerank_citations(
+                q=q,
+                candidates=cut_candidates,
+                top_k=top_k,
+                diagnostic_mode=True,
+            )
             if reranked_ids:
                 by_id = {str(c.get("citation_id")): c for c in cut_candidates}
                 reranked = [by_id[cid] for cid in reranked_ids if cid in by_id]
@@ -3029,11 +3283,25 @@ def root_cause_v1(
 
     for c in citations:
         c.pop("embedding_list", None)
-        c.pop("chunk_full", None)
-
+        c.pop("query_used", None)
+        
     citations = _dedup_citations_by_snippet(citations, max_items=top_k)
 
-    if sim_max < ASK_SIM_THRESHOLD:
+    try:
+        selected_diag_ids = _llm_filter_diagnostic_chunks(
+            q=q,
+            candidates=cut_candidates[:18],
+            max_keep=top_k,
+        )
+        if selected_diag_ids:
+            by_id = {str(c.get("citation_id")): c for c in cut_candidates}
+            filtered = [by_id[cid] for cid in selected_diag_ids if cid in by_id]
+            if filtered:
+                citations = _dedup_citations_by_snippet(filtered, max_items=top_k)
+    except Exception as e:
+        rerank_error = str(e) if not rerank_error else rerank_error
+
+    if float(sim_max or 0.0) < ASK_SIM_THRESHOLD:
         fts = _fts_search_chunks(
             company_id=company_id,
             machine_id=machine_id,
@@ -3046,7 +3314,7 @@ def root_cause_v1(
             fts_used = True
             citations = _dedup_citations_by_snippet(citations + fts, max_items=top_k)
 
-    if sim_max < ASK_SIM_THRESHOLD and not (fts_used and citations):
+    if float(sim_max or 0.0) < ASK_SIM_THRESHOLD and not (fts_used and citations):
         return _finalize(
             {
                 "ok": True,
@@ -3062,20 +3330,67 @@ def root_cause_v1(
             }
         )
 
+    enriched_citations: list[dict] = []
+    seen_enriched = set()
+
+    for c in citations:
+        cid = str(c.get("citation_id") or "").strip()
+        bdid = str(c.get("bubble_document_id") or "").strip()
+        if not cid or not bdid:
+            continue
+
+        neighbors = _expand_with_neighbor_chunks(
+            company_id=company_id,
+            bubble_document_id=bdid,
+            citation_ids=[cid],
+            radius=1,
+        )
+
+        merged_text_parts = []
+        local_seen = set()
+
+        for item in neighbors:
+            nid = str(item.get("citation_id") or "").strip()
+            txt = (item.get("chunk_full") or item.get("snippet") or "").strip()
+            if not nid or not txt or nid in local_seen:
+                continue
+            local_seen.add(nid)
+            merged_text_parts.append(f"[{nid}] {txt}")
+
+        if not merged_text_parts:
+            merged_text_parts = [f"[{cid}] {(c.get('chunk_full') or c.get('snippet') or '').strip()}"]
+
+        merged = dict(c)
+        merged["evidence_pack"] = "\n".join(merged_text_parts)[:2200]
+
+        if cid not in seen_enriched:
+            seen_enriched.add(cid)
+            enriched_citations.append(merged)
+
+    if enriched_citations:
+        citations = enriched_citations
+
     ctx_parts: List[str] = []
     total_chars = 0
     for c in citations:
-        part = f"[{c['citation_id']}] (p{c['page_from']}-{c['page_to']})\n{c['snippet']}\n"
+        evidence_text = (c.get("evidence_pack") or c.get("chunk_full") or c.get("snippet") or "").strip()
+        part = (
+            f"[{c['citation_id']}] "
+            f"(doc={c['bubble_document_id']}, p{c['page_from']}-{c['page_to']})\n"
+            f"{evidence_text}\n"
+        )
         if total_chars + len(part) > ASK_MAX_CONTEXT_CHARS:
             break
         ctx_parts.append(part)
         total_chars += len(part)
-    sources_block = "\n".join(ctx_parts).strip()
+
+    sources_block = "\n\n".join(ctx_parts).strip()
 
     schema = _root_cause_response_schema(max_causes=max_causes)
 
     system_msg = (
         "Sei un assistente tecnico industriale specializzato in root cause analysis. "
+        "Devi ragionare come un tecnico esperto che distingue tra sintomo, possibile causa, evidenza e verifica pratica. "
         "Devi usare SOLO le FONTI fornite. "
         "Obiettivo: proporre poche cause plausibili e verifiche pratiche, senza inventare. "
         f"Regole obbligatorie:\n"
@@ -3084,7 +3399,9 @@ def root_cause_v1(
         "3) non usare conoscenza esterna;\n"
         "4) se le fonti non bastano, restituisci possible_causes=[] e recommended_next_checks=[];\n"
         "5) le verifiche devono essere controlli operativi concreti e brevi;\n"
-        "6) non citare fonti inesistenti.\n"
+        "6) privilegia cause coerenti con il sintomo osservato, non manutenzione generica;\n"
+        "7) se una fonte è solo generica o di contesto, non usarla come evidenza principale;\n"
+        "8) non citare fonti inesistenti.\n"
     )
 
     user_msg = (
