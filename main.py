@@ -905,12 +905,23 @@ def _should_downrank_generic_root_cause_chunk(
         return False
 
     if (sig["strong_component_hits"] >= 2 or sig["process_hits"] >= 1) and (
-        sig["diag_hits"] >= 1 or sig["section_diag_hits"] >= 1 or sig["symptom_hits"] >= 1
+        sig["diag_hits"] >= 1 or sig["section_diag_hits"] >= 1
     ):
+        return False
+
+    if sig["symptom_hits"] >= 1 and sig["strong_component_hits"] >= 2:
         return False
 
     if sig["overview_section_hit"] and (
         sig["acoustic_protection_hits"] >= 1 or sig["safety_access_hits"] >= 2
+    ):
+        return True
+
+    if (
+        sig["overview_section_hit"]
+        and sig["symptom_hits"] >= 1
+        and sig["process_hits"] == 0
+        and sig["strong_component_hits"] <= 1
     ):
         return True
 
@@ -960,13 +971,24 @@ def _should_hard_exclude_root_cause_chunk(
     if not sig:
         return False
 
-    if (sig["strong_component_hits"] >= 1 or sig["process_hits"] >= 1) and (
-        sig["diag_hits"] >= 1 or sig["section_diag_hits"] >= 1 or sig["symptom_hits"] >= 1
+    if (sig["strong_component_hits"] >= 2 or sig["process_hits"] >= 1) and (
+        sig["diag_hits"] >= 1 or sig["section_diag_hits"] >= 1
     ):
+        return False
+
+    if sig["symptom_hits"] >= 1 and sig["strong_component_hits"] >= 2:
         return False
 
     if sig["overview_section_hit"] and (
         sig["acoustic_protection_hits"] >= 1 or sig["safety_access_hits"] >= 2
+    ):
+        return True
+
+    if (
+        sig["overview_section_hit"]
+        and sig["symptom_hits"] >= 1
+        and sig["process_hits"] == 0
+        and sig["strong_component_hits"] <= 1
     ):
         return True
 
@@ -4079,6 +4101,14 @@ def root_cause_v1(
         evidence_matrix = {}
         evidence_matrix_used = False
 
+    nongeneric_citations = [
+        c for c in citations
+        if not bool(c.get("generic_downranked"))
+    ]
+
+    if len(nongeneric_citations) >= 2:
+        citations = nongeneric_citations[:top_k]
+
     if float(sim_max or 0.0) < ASK_SIM_THRESHOLD and not (fts_used and citations):
         return _finalize(
             {
@@ -4171,6 +4201,8 @@ def root_cause_v1(
         "7) non duplicare cause quasi uguali;\n"
         "8) non citare fonti inesistenti.\n"
         "9) preferisci evidenze provenienti da sezioni operative o di componente; overview, safety, installation, start-up, caratteristiche generali o acoustic sections valgono solo se il sintomo le riguarda direttamente.\n"
+        "10) non proporre cause basate principalmente su sezioni generali di manutenzione, lubrificazione macchina, pneumatica, safety o overview se le fonti non collegano esplicitamente quella causa al gruppo coinvolto dal sintomo.\n"
+        "11) se una fonte parla del sintomo in modo generico ma non del gruppo/processo corretto, non usarla come evidenza centrale.\n"
     )
 
     user_msg = (
