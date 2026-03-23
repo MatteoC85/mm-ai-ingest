@@ -3284,7 +3284,7 @@ def root_cause_v1(
     for c in citations:
         c.pop("embedding_list", None)
         c.pop("query_used", None)
-        
+
     citations = _dedup_citations_by_snippet(citations, max_items=top_k)
 
     try:
@@ -3329,39 +3329,21 @@ def root_cause_v1(
                 "similarity_max": sim_max,
             }
         )
-
+        
     enriched_citations: list[dict] = []
     seen_enriched = set()
 
     for c in citations:
         cid = str(c.get("citation_id") or "").strip()
-        bdid = str(c.get("bubble_document_id") or "").strip()
-        if not cid or not bdid:
+        if not cid:
             continue
 
-        neighbors = _expand_with_neighbor_chunks(
-            company_id=company_id,
-            bubble_document_id=bdid,
-            citation_ids=[cid],
-            radius=1,
-        )
-
-        merged_text_parts = []
-        local_seen = set()
-
-        for item in neighbors:
-            nid = str(item.get("citation_id") or "").strip()
-            txt = (item.get("chunk_full") or item.get("snippet") or "").strip()
-            if not nid or not txt or nid in local_seen:
-                continue
-            local_seen.add(nid)
-            merged_text_parts.append(f"[{nid}] {txt}")
-
-        if not merged_text_parts:
-            merged_text_parts = [f"[{cid}] {(c.get('chunk_full') or c.get('snippet') or '').strip()}"]
+        central_text = (c.get("chunk_full") or c.get("snippet") or "").strip()
+        if not central_text:
+            continue
 
         merged = dict(c)
-        merged["evidence_pack"] = "\n".join(merged_text_parts)[:2200]
+        merged["evidence_pack"] = f"[{cid}] {central_text[:2200]}"
 
         if cid not in seen_enriched:
             seen_enriched.add(cid)
