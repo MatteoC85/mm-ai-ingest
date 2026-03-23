@@ -1856,6 +1856,109 @@ def _llm_filter_diagnostic_chunks(
 
     return out
 
+def _llm_build_diagnostic_evidence_matrix(
+    q: str,
+    citations: list[dict],
+    max_causes: int,
+) -> dict:
+    if not q or not citations:
+        return {}
+
+    max_causes = max(1, min(int(max_causes or 1), 3))
+
+    items = []
+    seen = set()
+
+    for c in citations[:10]:
+        cid = str(c.get("citation_id") or "").strip()
+        if not cid or cid in seen:
+            continue
+        seen.add(cid)
+
+        snippet = (c.get("chunk_full") or c.get("snippet") or "").strip()
+        snippet = re.sub(r"^SECTION:\s*[^\n]+\n?", "", snippet).strip()
+
+        items.append(
+            {
+                "citation_id": cid,
+                "page_from": int(c.get("page_from") or 0),
+                "page_to": int(c.get("page_to") or 0),
+                "snippet": snippet[:360],
+            }
+        )
+
+    if not items:
+        return {}
+
+    schema = {
+        "name": "diagnostic_evidence_matrix",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "keep_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "discard_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "cause_hypotheses": {
+                    "type": "array",
+                    "maxItems": max_causes,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "cause": {"type": "string"},
+                            "evidence_ids": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                            "check_focus": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                        },
+                        "required": ["cause", "evidence_ids", "check_focus"],
+                    },
+                },
+            },
+            "required": ["keep_ids", "discard_ids", "cause_hypotheses"],
+        },
+    }
+
+    system_msg = (
+        "Selezioni e organizzi le evidenze per una root cause analysis industriale.\n"
+        "Obiettivo: tenere solo le fonti davvero utili e raggrupparle per area causale.\n"
+        "Regole obbligatorie:\n"
+        "1) keep_ids = solo citazioni utili alla diagnosi.\n"
+        "2) discard_ids = citazioni generiche, ripetitive, di solo contesto o sicurezza.\n"
+        "3) cause_hypotheses = massimo poche ipotesi distinte; non duplicare varianti della stessa causa.\n"
+        "4) Ogni ipotesi deve usare solo citation_id presenti nei candidati.\n"
+        "5) check_focus = verifiche pratiche brevi, non frasi lunghe.\n"
+    )
+
+    user_msg = (
+        f"SINTOMO/PROBLEMA:\n{q}\n\n"
+        "CITAZIONI_CANDIDATE_JSON:\n"
+        f"{json.dumps(items, ensure_ascii=False)}\n\n"
+        "Restituisci JSON valido."
+    )
+
+    parsed = _openai_chat_json(
+        [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ],
+        model=OPENAI_RERANK_MODEL,
+        json_schema=schema,
+        timeout=RERANK_TIMEOUT,
+    )
+
+    return parsed if isinstance(parsed, dict) else {}
 
 def _should_use_reranker(
     q: str,
@@ -3118,7 +3221,9 @@ def root_cause_v1(
     rerank_used = False
     rerank_error: Optional[str] = None
     generic_downranked_count = 0
-    
+    evidence_matrix_used = False
+    evidence_matrix: dict = {}
+
     def _finalize(resp: dict) -> dict:
         if payload.debug:
             resp["debug"] = {
@@ -3136,6 +3241,8 @@ def root_cause_v1(
                 "inferred_components": inferred_components,
                 "diagnostic_keywords": diagnostic_keywords,
                 "generic_downranked_count": generic_downranked_count,
+                "evidence_matrix_used": evidence_matrix_used,
+                "evidence_matrix_hypotheses": len(evidence_matrix.get("cause_hypotheses") or []) if isinstance(evidence_matrix, dict) else 0,
             }
         return resp
 
@@ -3429,6 +3536,35 @@ def root_cause_v1(
             fts_used = True
             citations = _dedup_citations_by_snippet(citations + fts, max_items=top_k)
 
+    try:
+        evidence_matrix = _llm_build_diagnostic_evidence_matrix(
+            q=q,
+            citations=citations,
+            max_causes=max_causes,
+        )
+
+        keep_ids = [
+            str(x).strip()
+            for x in (evidence_matrix.get("keep_ids") or [])
+            if str(x).strip()
+        ]
+
+        if keep_ids:
+            by_id = {
+                str(c.get("citation_id")): c
+                for c in citations
+                if c.get("citation_id")
+            }
+            filtered = [by_id[cid] for cid in keep_ids if cid in by_id]
+            if filtered:
+                citations = _dedup_citations_by_snippet(filtered, max_items=top_k)
+
+        evidence_matrix_used = bool(evidence_matrix.get("cause_hypotheses"))
+    except Exception as e:
+        rerank_error = str(e) if not rerank_error else rerank_error
+        evidence_matrix = {}
+        evidence_matrix_used = False
+
     if float(sim_max or 0.0) < ASK_SIM_THRESHOLD and not (fts_used and citations):
         return _finalize(
             {
@@ -3483,12 +3619,33 @@ def root_cause_v1(
 
     sources_block = "\n\n".join(ctx_parts).strip()
 
+    evidence_matrix_block = ""
+    if evidence_matrix_used:
+        lines = []
+        for i, hyp in enumerate(evidence_matrix.get("cause_hypotheses") or [], start=1):
+            cause = str(hyp.get("cause") or "").strip()
+            ev_ids = [str(x).strip() for x in (hyp.get("evidence_ids") or []) if str(x).strip()]
+            checks = [str(x).strip() for x in (hyp.get("check_focus") or []) if str(x).strip()]
+
+            if not cause:
+                continue
+
+            lines.append(f"IPOTESI_{i}: {cause}")
+            if ev_ids:
+                lines.append("EVIDENZE: " + ", ".join(ev_ids[:3]))
+            if checks:
+                lines.append("VERIFICHE_FOCUS: " + " | ".join(checks[:3]))
+
+        evidence_matrix_block = "\n".join(lines).strip()
+
     schema = _root_cause_response_schema(max_causes=max_causes)
 
     system_msg = (
         "Sei un assistente tecnico industriale specializzato in root cause analysis. "
         "Devi ragionare come un tecnico esperto che distingue tra sintomo, possibile causa, evidenza e verifica pratica. "
         "Devi usare SOLO le FONTI fornite. "
+        "Usa la MATRICE_EVIDENZE come pre-sintesi utile, ma verifica sempre coerenza con le fonti. "
+        "Se più evidenze puntano alla stessa area causale, uniscile in un'unica causa e non duplicarle. "
         "Obiettivo: proporre poche cause plausibili e verifiche pratiche, senza inventare. "
         f"Regole obbligatorie:\n"
         f"1) restituisci massimo {max_causes} possibili cause;\n"
@@ -3497,12 +3654,13 @@ def root_cause_v1(
         "4) se le fonti non bastano, restituisci possible_causes=[] e recommended_next_checks=[];\n"
         "5) le verifiche devono essere controlli operativi concreti e brevi;\n"
         "6) privilegia cause coerenti con il sintomo osservato, non manutenzione generica;\n"
-        "7) se una fonte è solo generica o di contesto, non usarla come evidenza principale;\n"
+        "7) non duplicare cause quasi uguali;\n"
         "8) non citare fonti inesistenti.\n"
     )
 
     user_msg = (
         f"SINTOMO/PROBLEMA:\n{q}\n\n"
+        f"MATRICE_EVIDENZE:\n{evidence_matrix_block or '(non disponibile)'}\n\n"
         f"FONTI:\n{sources_block}\n\n"
         "Restituisci JSON valido. Nelle citations usa solo citation_id presenti nelle fonti."
     )
