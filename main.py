@@ -278,6 +278,72 @@ def _db_get_cleaning_meta(company_id: str, bubble_document_id: str) -> tuple[set
     finally:
         conn.close()
 
+def _db_get_index_usage(company_id: str, bubble_document_id: Optional[str] = None) -> dict:
+    company_id = (company_id or "").strip()
+    bubble_document_id = (bubble_document_id or "").strip() if bubble_document_id else None
+
+    if not company_id:
+        return {
+            "text_chars": 0,
+            "chunk_count": 0,
+            "est_storage_bytes": 0,
+        }
+
+    conn = _db_conn()
+    try:
+        with conn.cursor() as cur:
+            if bubble_document_id:
+                cur.execute(
+                    """
+                    SELECT COALESCE(SUM(text_chars), 0)
+                    FROM public.document_pages
+                    WHERE company_id=%s
+                      AND bubble_document_id=%s;
+                    """,
+                    (company_id, bubble_document_id),
+                )
+                text_chars = int(cur.fetchone()[0] or 0)
+
+                cur.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM public.document_chunks
+                    WHERE company_id=%s
+                      AND bubble_document_id=%s;
+                    """,
+                    (company_id, bubble_document_id),
+                )
+                chunk_count = int(cur.fetchone()[0] or 0)
+            else:
+                cur.execute(
+                    """
+                    SELECT COALESCE(SUM(text_chars), 0)
+                    FROM public.document_pages
+                    WHERE company_id=%s;
+                    """,
+                    (company_id,),
+                )
+                text_chars = int(cur.fetchone()[0] or 0)
+
+                cur.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM public.document_chunks
+                    WHERE company_id=%s;
+                    """,
+                    (company_id,),
+                )
+                chunk_count = int(cur.fetchone()[0] or 0)
+
+        est_storage_bytes = int(text_chars * 3 + chunk_count * 2000)
+
+        return {
+            "text_chars": text_chars,
+            "chunk_count": chunk_count,
+            "est_storage_bytes": est_storage_bytes,
+        }
+    finally:
+        conn.close()
 
 def _build_rg_links(company_id: str, citations: list[dict]) -> list[dict]:
     if not citations:
@@ -325,13 +391,16 @@ def _build_rg_links(company_id: str, citations: list[dict]) -> list[dict]:
         if page_from < 1:
             page_from = 1
 
+        is_structured = _is_structured_source_key(bdid)
+        final_url = file_url if is_structured else f"{base}#page={page_from}"
+
         out.append(
             {
                 "citation_id": c.get("citation_id"),
                 "bubble_document_id": bdid,
                 "page_from": int(c.get("page_from") or page_from),
                 "page_to": int(c.get("page_to") or page_from),
-                "url": f"{base}#page={page_from}",
+                "url": final_url,
             }
         )
 
@@ -369,6 +438,13 @@ def _build_structured_source_key(source_type: str, source_id: str) -> str:
         raise HTTPException(status_code=400, detail="Missing source_id")
     return f"{st}:{sid}"
 
+def _is_structured_source_key(value: str) -> bool:
+    v = str(value or "").strip().lower()
+    if ":" not in v:
+        return False
+
+    prefix = v.split(":", 1)[0].strip()
+    return prefix in STRUCTURED_SOURCE_TYPES
 
 def _clean_structured_text_value(value: Any) -> str:
     s = _normalize_unicode_advanced(str(value or ""))
@@ -3627,6 +3703,157 @@ def ingest_document(
         "est_storage_bytes": est_storage_bytes,
     }
 
+@app.post("/v1/ai/ingest/source")
+def ingest_structured_source(
+    payload: StructuredSourceIngestRequest,
+    x_ai_internal_secret: Optional[str] = Header(default=None),
+):
+    if not AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=500, detail="AI_INTERNAL_SECRET missing")
+    if (x_ai_internal_secret or "").strip() != AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    company_id = (payload.company_id or "").strip()
+    machine_id = (payload.machine_id or "").strip()
+    source_id = (payload.source_id or "").strip()
+
+    if not (company_id and machine_id and source_id):
+        raise HTTPException(status_code=400, detail="Missing company_id/machine_id/source_id")
+
+    source_type = _normalize_structured_source_type(payload.source_type)
+    source_key = _build_structured_source_key(source_type, source_id)
+
+    text = _compose_structured_source_text(payload)
+    text_chars = len(text)
+
+    if text_chars <= 0:
+        raise HTTPException(status_code=400, detail="Structured source text is empty")
+
+    source_url = (payload.source_url or "").strip()
+    if source_url.startswith("//"):
+        source_url = "https:" + source_url
+
+    est_storage_bytes = _estimate_index_storage_bytes_for_text(text_chars)
+
+    plan_chars_limit = int(payload.plan_embed_chars_limit_total or 0)
+    plan_storage_limit = int(payload.plan_index_storage_limit_bytes or 0)
+
+    prev_usage = _db_get_index_usage(company_id=company_id, bubble_document_id=source_key)
+    company_usage = _db_get_index_usage(company_id=company_id)
+
+    new_total_chars = int(company_usage["text_chars"]) - int(prev_usage["text_chars"]) + int(text_chars)
+    new_total_storage = int(company_usage["est_storage_bytes"]) - int(prev_usage["est_storage_bytes"]) + int(est_storage_bytes)
+
+    if plan_chars_limit > 0 and text_chars > plan_chars_limit:
+        return {
+            "ok": False,
+            "error": {
+                "code": "LIMIT_EXCEEDED",
+                "message": "Fonte testuale troppo grande per il piano (limite caratteri indicizzabili).",
+            },
+            "reason": "PLAN_EMBED_CHARS_LIMIT_EXCEEDED",
+            "text_chars": text_chars,
+            "limit_chars": plan_chars_limit,
+        }
+
+    if plan_storage_limit > 0 and est_storage_bytes > plan_storage_limit:
+        return {
+            "ok": False,
+            "error": {
+                "code": "LIMIT_EXCEEDED",
+                "message": "Fonte testuale troppo grande per il piano (limite storage AI indicizzato).",
+            },
+            "reason": "PLAN_INDEX_STORAGE_LIMIT_EXCEEDED",
+            "text_chars": text_chars,
+            "est_storage_bytes": est_storage_bytes,
+            "limit_storage_bytes": plan_storage_limit,
+        }
+
+    if plan_chars_limit > 0 and new_total_chars > plan_chars_limit:
+        return {
+            "ok": False,
+            "error": {
+                "code": "LIMIT_EXCEEDED",
+                "message": "Limite totale caratteri AI superato per questa Company.",
+            },
+            "reason": "PLAN_EMBED_CHARS_LIMIT_EXCEEDED",
+            "text_chars": text_chars,
+            "limit_chars": plan_chars_limit,
+            "new_total_chars": new_total_chars,
+            "prev_source_chars": int(prev_usage["text_chars"]),
+            "company_chars_before": int(company_usage["text_chars"]),
+        }
+
+    if plan_storage_limit > 0 and new_total_storage > plan_storage_limit:
+        return {
+            "ok": False,
+            "error": {
+                "code": "LIMIT_EXCEEDED",
+                "message": "Limite totale storage AI superato per questa Company.",
+            },
+            "reason": "PLAN_INDEX_STORAGE_LIMIT_EXCEEDED",
+            "text_chars": text_chars,
+            "est_storage_bytes": est_storage_bytes,
+            "limit_storage_bytes": plan_storage_limit,
+            "new_total_storage_bytes": new_total_storage,
+            "prev_source_storage_bytes": int(prev_usage["est_storage_bytes"]),
+            "company_storage_before": int(company_usage["est_storage_bytes"]),
+        }
+
+    conn = _db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM public.document_pages
+                WHERE company_id=%s AND bubble_document_id=%s;
+                """,
+                (company_id, source_key),
+            )
+
+            cur.execute(
+                """
+                INSERT INTO public.document_pages(
+                    company_id,
+                    machine_id,
+                    bubble_document_id,
+                    page_number,
+                    text,
+                    text_chars
+                )
+                VALUES (%s, %s, %s, %s, %s, %s);
+                """,
+                (company_id, machine_id, source_key, 1, text, text_chars),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    if source_url:
+        _db_upsert_document_file(company_id, source_key, source_url)
+
+    index_result = index_document(
+        IndexDocumentRequest(
+            company_id=company_id,
+            machine_id=machine_id,
+            bubble_document_id=source_key,
+            trace_id="structured_ingest",
+        ),
+        x_ai_internal_secret=AI_INTERNAL_SECRET,
+    )
+
+    return {
+        "ok": True,
+        "status": "indexed",
+        "source_type": source_type,
+        "source_key": source_key,
+        "pages_total": 1,
+        "pages_with_text": 1,
+        "pages_detected": 1,
+        "text_chars": text_chars,
+        "est_storage_bytes": est_storage_bytes,
+        "chunks_written": int(index_result.get("chunks_written") or 0),
+    }
 
 @app.post("/v1/ai/index/document")
 def index_document(
@@ -3682,13 +3909,20 @@ def index_document(
                 min_chars=CHUNK_MIN_CHARS,
             )
 
+            source_is_structured = _is_structured_source_key(bubble_document_id)
+
             filtered_chunks = []
             for c in chunks:
                 txt = (c.get("chunk_text") or "").strip()
 
-                if len(txt) < 120:
-                    continue
-                if not re.search(r"[A-Za-zÀ-ÖØ-öø-ÿ]", txt):
+                if source_is_structured:
+                    if len(txt) < 20:
+                        continue
+                else:
+                    if len(txt) < 120:
+                        continue
+
+                if not re.search(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9]", txt):
                     continue
                 if len(txt.split()) <= 4 and txt.isupper():
                     continue
