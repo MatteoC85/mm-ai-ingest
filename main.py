@@ -516,6 +516,43 @@ def _estimate_index_storage_bytes_for_text(text_chars: int) -> int:
 
     return int(int(text_chars or 0) * bytes_per_char + est_chunks * bytes_per_chunk)
 
+def _collapse_structured_chunks(chunks: list[dict]) -> list[dict]:
+    if not chunks:
+        return []
+
+    page_from = min(int(c.get("page_from") or 1) for c in chunks)
+    page_to = max(int(c.get("page_to") or 1) for c in chunks)
+
+    lines: list[str] = []
+    seen = set()
+
+    for c in chunks:
+        txt = (c.get("chunk_text") or "").strip()
+        if not txt:
+            continue
+
+        for ln in txt.split("\n"):
+            ln = ln.strip()
+            if not ln:
+                continue
+            if ln in seen:
+                continue
+            seen.add(ln)
+            lines.append(ln)
+
+    merged = "\n".join(lines).strip()
+    if not merged:
+        return []
+
+    return [
+        {
+            "chunk_index": 1,
+            "page_from": page_from,
+            "page_to": page_to,
+            "chunk_text": merged,
+        }
+    ]
+
 def _extract_code_tokens(q: str) -> list[str]:
     q = (q or "").strip().upper()
     if not q:
@@ -3910,6 +3947,8 @@ def index_document(
             )
 
             source_is_structured = _is_structured_source_key(bubble_document_id)
+            if source_is_structured:
+                chunks = _collapse_structured_chunks(chunks)
 
             filtered_chunks = []
             for c in chunks:
