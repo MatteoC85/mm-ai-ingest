@@ -77,6 +77,13 @@ URL_HINTS = ["sito", "website", "web site", "url", "link", "pagina", "dominio", 
 EMAIL_HINTS = ["email", "e-mail", "mail", "posta"]
 PHONE_HINTS = ["telefono", "cell", "cellulare", "tel", "contatto", "chiamare", "numero"]
 
+STRUCTURED_SOURCE_TYPES = {
+    "procedure",
+    "step",
+    "ps",
+    "md_photo",
+    "md_video",
+}
 
 class IngestRequest(BaseModel):
     file_url: str
@@ -130,6 +137,28 @@ class DeleteDocumentRequest(BaseModel):
     company_id: str
     bubble_document_id: str
 
+class StructuredSourceIngestRequest(BaseModel):
+    company_id: str
+    machine_id: str
+    source_type: str
+    source_id: str
+    source_url: Optional[str] = None
+
+    title: Optional[str] = None
+    description: Optional[str] = None
+    short_description: Optional[str] = None
+    procedure_type: Optional[str] = None
+    step_number: Optional[int] = None
+    category: Optional[str] = None
+    solution: Optional[str] = None
+    notes: Optional[str] = None
+
+    plan_embed_chars_limit_total: Optional[int] = None
+    plan_index_storage_limit_bytes: Optional[int] = None
+    embed_chars_used_total: Optional[int] = None
+    index_storage_used_total: Optional[int] = None
+    doc_prev_embed_chars: Optional[int] = None
+    doc_prev_index_storage_bytes: Optional[int] = None
 
 def _db_conn():
     if not (DB_HOST and DB_USER and DB_PASSWORD):
@@ -308,6 +337,108 @@ def _build_rg_links(company_id: str, citations: list[dict]) -> list[dict]:
 
     return out
 
+def _normalize_structured_source_type(source_type: str) -> str:
+    s = re.sub(r"[\s\-]+", "_", str(source_type or "").strip().lower())
+
+    aliases = {
+        "procedure": "procedure",
+        "step": "step",
+        "ps": "ps",
+        "problemsolution": "ps",
+        "problem_solution": "ps",
+        "problem_solution_item": "ps",
+        "md_photo": "md_photo",
+        "machine_detail_photo": "md_photo",
+        "photo_machine_detail": "md_photo",
+        "md_video": "md_video",
+        "machine_detail_video": "md_video",
+        "video_machine_detail": "md_video",
+    }
+
+    s = aliases.get(s, s)
+    if s not in STRUCTURED_SOURCE_TYPES:
+        raise HTTPException(status_code=400, detail=f"Unsupported source_type: {source_type}")
+
+    return s
+
+
+def _build_structured_source_key(source_type: str, source_id: str) -> str:
+    st = _normalize_structured_source_type(source_type)
+    sid = str(source_id or "").strip()
+    if not sid:
+        raise HTTPException(status_code=400, detail="Missing source_id")
+    return f"{st}:{sid}"
+
+
+def _clean_structured_text_value(value: Any) -> str:
+    s = _normalize_unicode_advanced(str(value or ""))
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+
+    lines = []
+    for ln in s.split("\n"):
+        ln = re.sub(r"\s+", " ", ln).strip()
+        if ln:
+            lines.append(ln)
+
+    return "\n".join(lines).strip()
+
+
+def _append_structured_field(lines: list[str], label: str, value: Any) -> None:
+    v = _clean_structured_text_value(value)
+    if v:
+        lines.append(f"{label}: {v}")
+
+
+def _compose_structured_source_text(payload: StructuredSourceIngestRequest) -> str:
+    st = _normalize_structured_source_type(payload.source_type)
+    lines: list[str] = []
+
+    if st == "procedure":
+        lines.append("SOURCE_TYPE: procedure")
+        _append_structured_field(lines, "TITLE", payload.title)
+        _append_structured_field(lines, "PROCEDURE_TYPE", payload.procedure_type)
+        _append_structured_field(lines, "SHORT_DESCRIPTION", payload.short_description)
+
+    elif st == "step":
+        lines.append("SOURCE_TYPE: step")
+        if payload.step_number is not None:
+            lines.append(f"STEP_NUMBER: {int(payload.step_number)}")
+        _append_structured_field(lines, "TITLE", payload.title)
+        _append_structured_field(lines, "DESCRIPTION", payload.description)
+
+    elif st == "ps":
+        lines.append("SOURCE_TYPE: problem_solution")
+        _append_structured_field(lines, "TITLE", payload.title)
+        _append_structured_field(lines, "CATEGORY", payload.category)
+        _append_structured_field(lines, "DESCRIPTION", payload.description)
+        _append_structured_field(lines, "SOLUTION", payload.solution)
+        _append_structured_field(lines, "NOTES", payload.notes)
+
+    elif st == "md_photo":
+        lines.append("SOURCE_TYPE: machine_detail_photo")
+        _append_structured_field(lines, "TITLE", payload.title)
+        _append_structured_field(lines, "DESCRIPTION", payload.description)
+
+    elif st == "md_video":
+        lines.append("SOURCE_TYPE: machine_detail_video")
+        _append_structured_field(lines, "TITLE", payload.title)
+        _append_structured_field(lines, "DESCRIPTION", payload.description)
+
+    text = "\n".join(lines).strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Structured source text is empty")
+
+    return text
+
+
+def _estimate_index_storage_bytes_for_text(text_chars: int) -> int:
+    effective_step = max(1, CHUNK_TARGET_CHARS - min(CHUNK_OVERLAP_CHARS, CHUNK_TARGET_CHARS - 1))
+    est_chunks = int(math.ceil(max(1, int(text_chars or 0)) / effective_step))
+
+    bytes_per_char = 3
+    bytes_per_chunk = 2000
+
+    return int(int(text_chars or 0) * bytes_per_char + est_chunks * bytes_per_chunk)
 
 def _extract_code_tokens(q: str) -> list[str]:
     q = (q or "").strip().upper()
