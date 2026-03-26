@@ -4860,31 +4860,7 @@ def root_cause_v1(
         if chunks_matching_filter is None:
             chunks_matching_filter = current_chunks_matching_filter
 
-        ranked = []
-        for (bdid, chunk_index, page_from, page_to, snippet, chunk_full, similarity, embedding) in raw_rows:
-            if embedding is None:
-                emb_list = None
-            elif isinstance(embedding, list):
-                emb_list = embedding
-            else:
-                s = str(embedding).strip()
-                s = s.strip("[]")
-                emb_list = [float(x) for x in s.split(",") if x.strip()]
-
-            citation_id = f"{bdid}:p{int(page_from)}-{int(page_to)}:c{int(chunk_index)}"
-            ranked.append(
-                {
-                    "citation_id": citation_id,
-                    "bubble_document_id": str(bdid),
-                    "page_from": int(page_from),
-                    "page_to": int(page_to),
-                    "snippet": (snippet or "").strip(),
-                    "chunk_full": (chunk_full or "").strip(),
-                    "similarity": float(similarity),
-                    "embedding_list": emb_list or [],
-                    "query_used": dq,
-                }
-            )
+        ranked = _raw_rows_to_dense_candidates(raw_rows, query_used=dq)
 
         if ranked:
             dense_ranked_lists.append(ranked)
