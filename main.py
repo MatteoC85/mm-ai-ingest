@@ -4334,8 +4334,8 @@ def ask_v1(
                     """,
                     (ASK_SNIPPET_CHARS, q_vec_lit, company_id, doc_ids, q_vec_lit, candidate_k),
                 )
-            elif payload.bubble_document_id:
-                bdid = payload.bubble_document_id.strip()
+            elif bubble_document_id:
+                bdid = bubble_document_id
 
                 if payload.debug:
                     cur.execute(
@@ -4499,7 +4499,7 @@ def ask_v1(
             q=q,
             top_k=top_k,
             doc_ids=doc_ids if isinstance(doc_ids, list) else None,
-            bubble_document_id=payload.bubble_document_id.strip() if payload.bubble_document_id else None,
+            bubble_document_id=bubble_document_id,
         )
         if fts:
             fts_used = True
@@ -4545,7 +4545,7 @@ def ask_v1(
                 machine_id=machine_id,
                 kind=kind,
                 doc_ids=doc_ids if isinstance(doc_ids, list) else None,
-                bubble_document_id=payload.bubble_document_id.strip() if payload.bubble_document_id else None,
+                bubble_document_id=bubble_document_id,
             )
             if hit:
                 answer = f"Nel documento compare questo dato: {hit['value']} [{hit['citation_id']}]"
