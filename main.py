@@ -4828,8 +4828,8 @@ def root_cause_v1(
                     )
                     chunks_matching_filter = int(cur.fetchone()[0] or 0)
 
-            elif payload.bubble_document_id:
-                bdid = payload.bubble_document_id.strip()
+            elif bubble_document_id:
+                bdid = bubble_document_id
                 if payload.debug:
                     cur.execute(
                         """
@@ -4878,8 +4878,8 @@ def root_cause_v1(
                         """,
                         (ASK_SNIPPET_CHARS, q_vec_lit, company_id, doc_ids, q_vec_lit, candidate_k),
                     )
-                elif payload.bubble_document_id:
-                    bdid = payload.bubble_document_id.strip()
+                elif bubble_document_id:
+                    bdid = bubble_document_id
                     cur.execute(
                         """
                         SELECT bubble_document_id, chunk_index, page_from, page_to,
@@ -5219,7 +5219,7 @@ def root_cause_v1(
                 q=fts_q,
                 top_k=top_k,
                 doc_ids=doc_ids if isinstance(doc_ids, list) else None,
-                bubble_document_id=payload.bubble_document_id.strip() if payload.bubble_document_id else None,
+                bubble_document_id=bubble_document_id,
             )
 
             for c in fts_hits:
