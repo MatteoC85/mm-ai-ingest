@@ -133,6 +133,20 @@ class RootCauseRequest(BaseModel):
     max_causes: int = 3
     debug: Optional[bool] = False
 
+class DraftPSOptions(BaseModel):
+    top_k: int = 8
+    max_causes: int = 3
+
+
+class DraftPSRequest(BaseModel):
+    query: str
+    company_id: str
+    machine_id: Optional[str] = None
+    bubble_document_id: Optional[str] = None
+    document_ids: Optional[Union[List[str], str]] = None
+    language: Optional[str] = "it"
+    options: Optional[DraftPSOptions] = None
+    debug: Optional[bool] = False
 
 class DeleteDocumentRequest(BaseModel):
     company_id: str
@@ -3101,7 +3115,7 @@ def _ground_root_cause_result(
     max_causes: int,
 ) -> tuple[dict, list[dict]]:
     result = result if isinstance(result, dict) else {}
-    max_causes = max(1, min(int(max_causes or 1), 3))
+    max_causes = max(1, min(int(max_causes or 1), 5))
 
     by_id = {
         str(c.get("citation_id") or "").strip(): c
@@ -3193,6 +3207,40 @@ def _sanitize_citations_for_response(citations: list[dict]) -> list[dict]:
         )
 
     return out
+
+def _build_sources_block_from_citations(
+    citations: list[dict],
+    *,
+    max_context_chars: int = ASK_MAX_CONTEXT_CHARS,
+) -> str:
+    ctx_parts: List[str] = []
+    total_chars = 0
+
+    for c in citations or []:
+        part = (
+            f"[{c['citation_id']}] "
+            f"(doc={c['bubble_document_id']}, p{c['page_from']}-{c['page_to']})\n"
+            f"{(c.get('snippet') or '').strip()}\n"
+        )
+
+        if total_chars + len(part) > max_context_chars:
+            break
+
+        ctx_parts.append(part)
+        total_chars += len(part)
+
+    return "\n".join(ctx_parts).strip()
+
+def _build_grounded_context_for_query(
+    *,
+    query: str,
+    company_id: str,
+    machine_id: str,
+    bubble_document_id: Optional[str],
+    document_ids: Optional[Union[List[str], str]],
+    top_k: int,
+    debug: bool = False,
+) -> dict:
 
 def _reorder_citations_by_priority_ids(
     citations: list[dict],
@@ -3681,6 +3729,44 @@ def _root_cause_response_schema(max_causes: int) -> dict:
         },
     }
 
+def _draft_ps_response_schema(max_causes: int) -> dict:
+    max_causes = max(1, min(int(max_causes or 1), 5))
+
+    return {
+        "name": "draft_ps_v1",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "title": {"type": "string"},
+                "problem_summary": {"type": "string"},
+                "possible_causes": {
+                    "type": "array",
+                    "maxItems": max_causes,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "rank": {"type": "integer"},
+                            "cause": {"type": "string"},
+                            "why": {"type": "string"},
+                            "checks": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                            "citations": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                        },
+                        "required": ["rank", "cause", "why", "checks", "citations"],
+                    },
+                },
+            },
+            "required": ["title", "problem_summary", "possible_causes"],
+        },
+    }
 
 @app.get("/ping")
 def ping():
@@ -4741,6 +4827,318 @@ def ask_v1(
             "top_k": top_k,
             "similarity_max": sim_max,
             "chat_model": OPENAI_CHAT_MODEL,
+        }
+    )
+
+@app.post("/v1/ai/draft_ps")
+def draft_ps_v1(
+    payload: DraftPSRequest,
+    x_ai_internal_secret: Optional[str] = Header(default=None),
+):
+    if not AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=500, detail="AI_INTERNAL_SECRET missing")
+    if (x_ai_internal_secret or "").strip() != AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    q = (payload.query or "").strip()
+    if not q:
+        raise HTTPException(status_code=400, detail="Missing query")
+
+    scope = _resolve_query_scope(
+        company_id=payload.company_id,
+        machine_id=payload.machine_id,
+        bubble_document_id=payload.bubble_document_id,
+        document_ids=payload.document_ids,
+    )
+    company_id = scope["company_id"]
+    machine_id = scope["machine_id"]
+    bubble_document_id = scope["bubble_document_id"]
+    doc_ids = scope["document_ids"]
+
+    language = (payload.language or "it").strip().lower()
+    if language not in {"it", "en"}:
+        language = "it"
+
+    options = payload.options or DraftPSOptions()
+
+    top_k = int(options.top_k or 8)
+    top_k = max(3, min(top_k, 12))
+
+    max_causes = int(options.max_causes or 3)
+    max_causes = max(1, min(max_causes, 5))
+
+    candidate_k = max(top_k, min(40, top_k * 6))
+
+    rows = []
+    chunks_matching_filter = None
+    sim_max: Optional[float] = None
+    fts_used = False
+    rerank_used = False
+    rerank_error: Optional[str] = None
+
+    def _finalize(resp: dict) -> dict:
+        if payload.debug:
+            resp["debug"] = {
+                "company_id": company_id,
+                "machine_id": machine_id,
+                "bubble_document_id": bubble_document_id,
+                "document_ids": doc_ids,
+                "chunks_matching_filter": chunks_matching_filter,
+                "similarity_max": sim_max,
+                "fts_used": fts_used,
+                "rerank_enabled": RERANK_ENABLED,
+                "rerank_used": rerank_used,
+                "rerank_error": rerank_error[:300] if rerank_error else None,
+            }
+        return resp
+
+    q_vec = _openai_embed_texts([q])[0]
+    q_vec_lit = _vector_literal(q_vec)
+
+    chunks_matching_filter, rows = _fetch_dense_chunk_candidates(
+        company_id=company_id,
+        machine_id=machine_id,
+        q_vec_lit=q_vec_lit,
+        candidate_k=candidate_k,
+        doc_ids=doc_ids if isinstance(doc_ids, list) else None,
+        bubble_document_id=bubble_document_id,
+        debug=payload.debug,
+    )
+
+    if not rows:
+        return _finalize(
+            {
+                "ok": True,
+                "status": "no_sources",
+                "title": "",
+                "problem_summary": "",
+                "possible_causes": [],
+                "citations": [],
+                "rg_links": [],
+                "meta": {
+                    "top_k": top_k,
+                    "max_causes": max_causes,
+                    "similarity_max": None,
+                    "language": language,
+                },
+            }
+        )
+
+    sim_max = max((float(r[6]) for r in rows), default=-1.0)
+    candidates = _raw_rows_to_dense_candidates(rows)
+
+    q_low = q.lower()
+    key_terms = []
+    if (
+        "lubrif" in q_low
+        or "olio" in q_low
+        or "ingrass" in q_low
+        or "cuscinet" in q_low
+        or "riduttor" in q_low
+    ):
+        key_terms = ["lubrif", "olio", "ingrass", "cuscinet", "riduttor"]
+
+    if key_terms:
+        gated = []
+        for c in candidates:
+            hay = (
+                ((c.get("chunk_full") or c.get("snippet") or "") + " " + (c.get("citation_id") or ""))
+                .lower()
+            )
+            if any(t in hay for t in key_terms):
+                gated.append(c)
+
+        if len(gated) >= 2:
+            candidates = gated
+
+    cutoff_delta = 0.08 if key_terms else 0.12
+    cut_candidates = [
+        c for c in candidates
+        if (sim_max - float(c.get("similarity", 0.0))) <= cutoff_delta
+    ]
+    cut_candidates.sort(key=lambda x: float(x.get("similarity", 0.0)), reverse=True)
+
+    if len(cut_candidates) < min(2, len(candidates)):
+        cut_candidates = sorted(
+            candidates,
+            key=lambda x: float(x.get("similarity", 0.0)),
+            reverse=True,
+        )[: min(2, len(candidates))]
+
+    citations = _mmr_select(q_vec, cut_candidates, top_k=top_k, lambda_mult=0.85)
+
+    if _should_use_reranker(q=q, candidates=cut_candidates, sim_max=sim_max, top_k=min(top_k, ASK_MAX_TOP_K)):
+        try:
+            reranked_ids = _llm_rerank_citations(
+                q=q,
+                candidates=cut_candidates,
+                top_k=min(top_k, ASK_MAX_TOP_K),
+            )
+            if reranked_ids:
+                by_id = {str(c.get("citation_id")): c for c in cut_candidates}
+                reranked = [by_id[cid] for cid in reranked_ids if cid in by_id]
+                if reranked:
+                    citations = reranked
+                    rerank_used = True
+        except Exception as e:
+            rerank_error = str(e)
+
+    for c in citations:
+        c.pop("embedding_list", None)
+        c.pop("chunk_full", None)
+
+    citations = _dedup_citations_by_snippet(citations, max_items=top_k)
+
+    if sim_max < ASK_SIM_THRESHOLD:
+        fts = _fts_search_chunks(
+            company_id=company_id,
+            machine_id=machine_id,
+            q=q,
+            top_k=top_k,
+            doc_ids=doc_ids if isinstance(doc_ids, list) else None,
+            bubble_document_id=bubble_document_id,
+        )
+        if fts:
+            fts_used = True
+            citations = _dedup_citations_by_snippet(citations + fts, max_items=top_k)
+
+    if sim_max < ASK_SIM_THRESHOLD and not (fts_used and citations):
+        return _finalize(
+            {
+                "ok": True,
+                "status": "no_sources",
+                "title": "",
+                "problem_summary": "",
+                "possible_causes": [],
+                "citations": [],
+                "rg_links": [],
+                "meta": {
+                    "top_k": top_k,
+                    "max_causes": max_causes,
+                    "similarity_max": sim_max,
+                    "language": language,
+                },
+            }
+        )
+
+    prompt_citations = _sanitize_citations_for_response(citations)
+    sources_block = _build_sources_block_from_citations(prompt_citations)
+
+    schema = _draft_ps_response_schema(max_causes=max_causes)
+
+    if language == "en":
+        system_msg = (
+            "You are an industrial technical assistant specialized in drafting Problem & Solution entries. "
+            "You must use ONLY the provided sources. "
+            "Do not use outside knowledge. "
+            "Each possible cause must have at least one real citation_id from the sources. "
+            "If the sources are not sufficient, return possible_causes as an empty array. "
+            "Write clearly, technically, and concretely."
+        )
+
+        user_msg = (
+            f"SYMPTOM / PROBLEM:\n{q}\n\n"
+            f"SOURCES:\n{sources_block}\n\n"
+            "Return valid JSON for a grounded Problem & Solution draft. "
+            "Use only citation_id values that appear in the sources."
+        )
+    else:
+        system_msg = (
+            "Sei un assistente tecnico industriale specializzato nella bozza di Problem & Solution. "
+            "Devi usare SOLO le fonti fornite. "
+            "Non usare conoscenza esterna. "
+            "Ogni possibile causa deve avere almeno una citation_id reale presa dalle fonti. "
+            "Se le fonti non bastano, restituisci possible_causes come array vuoto. "
+            "Scrivi in modo tecnico, chiaro e concreto."
+        )
+
+        user_msg = (
+            f"PROBLEMA / SINTOMO:\n{q}\n\n"
+            f"FONTI:\n{sources_block}\n\n"
+            "Restituisci JSON valido per una bozza grounded di Problem & Solution. "
+            "Nelle citations usa solo citation_id presenti nelle fonti."
+        )
+
+    try:
+        result_json = _openai_chat_json(
+            [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            model=OPENAI_CHAT_MODEL,
+            json_schema=schema,
+            timeout=60,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"LLM failed: {str(e)}")
+
+    grounded_result, grounded_citations = _ground_root_cause_result(
+        result=result_json,
+        citations=citations,
+        max_causes=max_causes,
+    )
+
+    grounded_result, grounded_citations = _compact_root_cause_result_citations_by_family(
+        result=grounded_result,
+        citations=grounded_citations,
+        max_per_cause=2,
+    )
+
+    final_title = str((result_json or {}).get("title") or "").strip()
+    if not final_title:
+        final_title = f"P&S draft — {q[:80]}"
+
+    final_problem_summary = (
+        grounded_result.get("problem_summary")
+        or str((result_json or {}).get("problem_summary") or "").strip()
+        or q
+    )
+
+    if not grounded_result.get("possible_causes"):
+        return _finalize(
+            {
+                "ok": True,
+                "status": "no_sources",
+                "title": "",
+                "problem_summary": final_problem_summary,
+                "possible_causes": [],
+                "citations": [],
+                "rg_links": [],
+                "meta": {
+                    "top_k": top_k,
+                    "max_causes": max_causes,
+                    "similarity_max": sim_max,
+                    "chat_model": OPENAI_CHAT_MODEL,
+                    "language": language,
+                },
+            }
+        )
+
+    response_citations = _sanitize_citations_for_response(grounded_citations)
+
+    rg_links = []
+    try:
+        rg_links = _build_rg_links(company_id, response_citations)
+    except Exception as e:
+        print("RG_LINKS_FAIL", str(e))
+        rg_links = []
+
+    return _finalize(
+        {
+            "ok": True,
+            "status": "drafted",
+            "title": final_title,
+            "problem_summary": final_problem_summary,
+            "possible_causes": grounded_result.get("possible_causes") or [],
+            "citations": response_citations,
+            "rg_links": rg_links,
+            "meta": {
+                "top_k": top_k,
+                "max_causes": max_causes,
+                "similarity_max": sim_max,
+                "chat_model": OPENAI_CHAT_MODEL,
+                "language": language,
+            },
         }
     )
 
