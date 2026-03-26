@@ -312,6 +312,41 @@ def _fetch_dense_chunk_candidates(
     finally:
         conn.close()
 
+def _raw_rows_to_dense_candidates(
+    raw_rows: list[tuple],
+    *,
+    query_used: Optional[str] = None,
+) -> list[dict]:
+    candidates: list[dict] = []
+
+    for (bdid, chunk_index, page_from, page_to, snippet, chunk_full, similarity, embedding) in raw_rows:
+        if embedding is None:
+            emb_list = None
+        elif isinstance(embedding, list):
+            emb_list = embedding
+        else:
+            s = str(embedding).strip()
+            s = s.strip("[]")
+            emb_list = [float(x) for x in s.split(",") if x.strip()]
+
+        item = {
+            "citation_id": f"{bdid}:p{int(page_from)}-{int(page_to)}:c{int(chunk_index)}",
+            "bubble_document_id": str(bdid),
+            "page_from": int(page_from),
+            "page_to": int(page_to),
+            "snippet": (snippet or "").strip(),
+            "chunk_full": (chunk_full or "").strip(),
+            "similarity": float(similarity),
+            "embedding_list": emb_list or [],
+        }
+
+        if query_used is not None:
+            item["query_used"] = query_used
+
+        candidates.append(item)
+
+    return candidates
+
 def _db_conn():
     if not (DB_HOST and DB_USER and DB_PASSWORD):
         raise HTTPException(status_code=500, detail="DB env missing")
@@ -4441,35 +4476,8 @@ def ask_v1(
             }
         )
 
-    candidates: list[dict] = []
-    sim_max = -1.0
-
-    for (bdid, chunk_index, page_from, page_to, snippet, chunk_full, similarity, embedding) in rows:
-        sim = float(similarity)
-        sim_max = max(sim_max, sim)
-
-        if embedding is None:
-            emb_list = None
-        elif isinstance(embedding, list):
-            emb_list = embedding
-        else:
-            s = str(embedding).strip()
-            s = s.strip("[]")
-            emb_list = [float(x) for x in s.split(",") if x.strip()]
-
-        citation_id = f"{bdid}:p{int(page_from)}-{int(page_to)}:c{int(chunk_index)}"
-        candidates.append(
-            {
-                "citation_id": citation_id,
-                "bubble_document_id": bdid,
-                "page_from": int(page_from),
-                "page_to": int(page_to),
-                "snippet": (snippet or "").strip(),
-                "chunk_full": (chunk_full or "").strip(),
-                "similarity": sim,
-                "embedding_list": emb_list or [],
-            }
-        )
+    sim_max = max((float(r[6]) for r in rows), default=-1.0)
+    candidates = _raw_rows_to_dense_candidates(rows)
 
     q_low = q.lower()
     key_terms = []
