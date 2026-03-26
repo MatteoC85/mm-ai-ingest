@@ -11,6 +11,7 @@ import fitz  # PyMuPDF
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from google.cloud import tasks_v2
+from urllib.parse import urlparse, unquote
 
 app = FastAPI()
 
@@ -3536,12 +3537,46 @@ def ingest_document(
         r = requests.get(url, timeout=FETCH_TIMEOUT)
         r.raise_for_status()
         data = r.content
-        if len(data) > MAX_PDF_BYTES:
-            raise HTTPException(status_code=413, detail="PDF too large")
     except HTTPException:
         raise
     except Exception:
         raise HTTPException(status_code=502, detail="Fetch failed")
+
+    content_type = (r.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+    content_disposition = (r.headers.get("Content-Disposition") or "").strip()
+
+    url_path = unquote(urlparse(url).path or "")
+    detected_filename = os.path.basename(url_path) or ""
+    detected_extension = os.path.splitext(detected_filename)[1].lower()
+
+    if "filename=" in content_disposition:
+        cd_filename = content_disposition.split("filename=", 1)[1].strip().strip('"').strip("'")
+        if cd_filename:
+            detected_filename = cd_filename
+            detected_extension = os.path.splitext(detected_filename)[1].lower()
+
+    pdf_magic = b"%PDF" in data[:1024]
+    looks_like_pdf = (
+        pdf_magic
+        or detected_extension == ".pdf"
+        or content_type == "application/pdf"
+    )
+
+    if not looks_like_pdf:
+        return {
+            "ok": False,
+            "error": {
+                "code": "NOT_INDEXABLE",
+                "message": "Documento non indicizzabile: formato file non supportato per ingest.",
+            },
+            "reason": "UNSUPPORTED_FILE_TYPE",
+            "detected_content_type": content_type or None,
+            "detected_filename": detected_filename or None,
+            "detected_extension": detected_extension or None,
+        }
+
+    if len(data) > MAX_PDF_BYTES:
+        raise HTTPException(status_code=413, detail="PDF too large")
 
     try:
         raw_pages = _extract_pages_with_layout_blocks(data)
