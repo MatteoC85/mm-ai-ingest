@@ -161,6 +161,16 @@ class StructuredSourceIngestRequest(BaseModel):
     doc_prev_embed_chars: Optional[int] = None
     doc_prev_index_storage_bytes: Optional[int] = None
 
+def _normalize_document_ids(value: Optional[Union[List[str], str]]) -> Optional[list[str]]:
+    if isinstance(value, str):
+        value = [x.strip() for x in value.split(",") if x.strip()]
+
+    if isinstance(value, list):
+        value = [str(x).strip() for x in value if str(x).strip()]
+        return value or None
+
+    return None
+
 def _db_conn():
     if not (DB_HOST and DB_USER and DB_PASSWORD):
         raise HTTPException(status_code=500, detail="DB env missing")
@@ -4234,16 +4244,7 @@ def ask_v1(
     if not machine_id:
         raise HTTPException(status_code=400, detail="Missing machine_id")
 
-    doc_ids = payload.document_ids
-    if isinstance(doc_ids, str):
-        doc_ids = [x.strip() for x in doc_ids.split(",") if x.strip()]
-
-    if isinstance(doc_ids, list):
-        doc_ids = [str(x).strip() for x in doc_ids if str(x).strip()]
-        if not doc_ids:
-            doc_ids = None
-    else:
-        doc_ids = None
+    doc_ids = _normalize_document_ids(payload.document_ids)
 
     top_k = int(payload.top_k or 5)
     top_k = max(1, min(top_k, ASK_MAX_TOP_K))
@@ -4707,16 +4708,7 @@ def root_cause_v1(
     if not machine_id:
         raise HTTPException(status_code=400, detail="Missing machine_id")
 
-    doc_ids = payload.document_ids
-    if isinstance(doc_ids, str):
-        doc_ids = [x.strip() for x in doc_ids.split(",") if x.strip()]
-
-    if isinstance(doc_ids, list):
-        doc_ids = [str(x).strip() for x in doc_ids if str(x).strip()]
-        if not doc_ids:
-            doc_ids = None
-    else:
-        doc_ids = None
+    doc_ids = _normalize_document_ids(payload.document_ids)
 
     top_k = int(payload.top_k or 8)
     top_k = max(1, min(top_k, ASK_MAX_TOP_K))
