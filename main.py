@@ -171,6 +171,30 @@ def _normalize_document_ids(value: Optional[Union[List[str], str]]) -> Optional[
 
     return None
 
+def _resolve_query_scope(
+    company_id: str,
+    machine_id: Optional[str],
+    bubble_document_id: Optional[str] = None,
+    document_ids: Optional[Union[List[str], str]] = None,
+) -> dict:
+    company_id = (company_id or "").strip()
+    if not company_id:
+        raise HTTPException(status_code=400, detail="Missing company_id")
+
+    machine_id = (machine_id or "").strip()
+    if not machine_id:
+        raise HTTPException(status_code=400, detail="Missing machine_id")
+
+    bubble_document_id = (bubble_document_id or "").strip() or None
+    doc_ids = _normalize_document_ids(document_ids)
+
+    return {
+        "company_id": company_id,
+        "machine_id": machine_id,
+        "bubble_document_id": bubble_document_id,
+        "document_ids": doc_ids,
+    }
+
 def _db_conn():
     if not (DB_HOST and DB_USER and DB_PASSWORD):
         raise HTTPException(status_code=500, detail="DB env missing")
@@ -4236,15 +4260,16 @@ def ask_v1(
     if not q:
         raise HTTPException(status_code=400, detail="Missing query")
 
-    company_id = (payload.company_id or "").strip()
-    if not company_id:
-        raise HTTPException(status_code=400, detail="Missing company_id")
-
-    machine_id = (payload.machine_id or "").strip()
-    if not machine_id:
-        raise HTTPException(status_code=400, detail="Missing machine_id")
-
-    doc_ids = _normalize_document_ids(payload.document_ids)
+    scope = _resolve_query_scope(
+        company_id=payload.company_id,
+        machine_id=payload.machine_id,
+        bubble_document_id=payload.bubble_document_id,
+        document_ids=payload.document_ids,
+    )
+    company_id = scope["company_id"]
+    machine_id = scope["machine_id"]
+    bubble_document_id = scope["bubble_document_id"]
+    doc_ids = scope["document_ids"]
 
     top_k = int(payload.top_k or 5)
     top_k = max(1, min(top_k, ASK_MAX_TOP_K))
@@ -4265,7 +4290,7 @@ def ask_v1(
             resp["debug"] = {
                 "company_id": company_id,
                 "machine_id": machine_id,
-                "bubble_document_id": payload.bubble_document_id,
+                "bubble_document_id": bubble_document_id,
                 "document_ids": doc_ids,
                 "chunks_matching_filter": chunks_matching_filter,
                 "similarity_max": sim_max,
@@ -4559,7 +4584,7 @@ def ask_v1(
                     machine_id=machine_id,
                     token=tok,
                     doc_ids=doc_ids if isinstance(doc_ids, list) else None,
-                    bubble_document_id=payload.bubble_document_id.strip() if payload.bubble_document_id else None,
+                    bubble_document_id=bubble_document_id,
                 )
                 if hit:
                     matched_token = tok
@@ -4700,15 +4725,16 @@ def root_cause_v1(
     if not q:
         raise HTTPException(status_code=400, detail="Missing query")
 
-    company_id = (payload.company_id or "").strip()
-    if not company_id:
-        raise HTTPException(status_code=400, detail="Missing company_id")
-
-    machine_id = (payload.machine_id or "").strip()
-    if not machine_id:
-        raise HTTPException(status_code=400, detail="Missing machine_id")
-
-    doc_ids = _normalize_document_ids(payload.document_ids)
+    scope = _resolve_query_scope(
+        company_id=payload.company_id,
+        machine_id=payload.machine_id,
+        bubble_document_id=payload.bubble_document_id,
+        document_ids=payload.document_ids,
+    )
+    company_id = scope["company_id"]
+    machine_id = scope["machine_id"]
+    bubble_document_id = scope["bubble_document_id"]
+    doc_ids = scope["document_ids"]
 
     top_k = int(payload.top_k or 8)
     top_k = max(1, min(top_k, ASK_MAX_TOP_K))
@@ -4758,7 +4784,7 @@ def root_cause_v1(
             resp["debug"] = {
                 "company_id": company_id,
                 "machine_id": machine_id,
-                "bubble_document_id": payload.bubble_document_id,
+                "bubble_document_id": bubble_document_id,
                 "document_ids": doc_ids,
                 "chunks_matching_filter": chunks_matching_filter,
                 "similarity_max": sim_max,
