@@ -3231,17 +3231,6 @@ def _build_sources_block_from_citations(
 
     return "\n".join(ctx_parts).strip()
 
-def _build_grounded_context_for_query(
-    *,
-    query: str,
-    company_id: str,
-    machine_id: str,
-    bubble_document_id: Optional[str],
-    document_ids: Optional[Union[List[str], str]],
-    top_k: int,
-    debug: bool = False,
-) -> dict:
-
 def _reorder_citations_by_priority_ids(
     citations: list[dict],
     priority_ids: list[str],
