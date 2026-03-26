@@ -4418,107 +4418,15 @@ def ask_v1(
             }
         return resp
 
-    conn = _db_conn()
-    try:
-        with conn.cursor() as cur:
-            if doc_ids:
-                if payload.debug:
-                    cur.execute(
-                        """
-                        SELECT COUNT(*)
-                        FROM public.document_chunks
-                        WHERE company_id=%s
-                          AND bubble_document_id = ANY(%s)
-                          AND embedding IS NOT NULL;
-                        """,
-                        (company_id, doc_ids),
-                    )
-                    chunks_matching_filter = int(cur.fetchone()[0] or 0)
-
-                cur.execute(
-                    """
-                    SELECT bubble_document_id, chunk_index, page_from, page_to,
-                           left(chunk_text, %s) AS snippet,
-                           left(chunk_text, 2000) AS chunk_full,
-                           1 - (embedding <=> %s::vector) AS similarity,
-                           embedding
-                    FROM public.document_chunks
-                    WHERE company_id = %s
-                      AND bubble_document_id = ANY(%s)
-                      AND embedding IS NOT NULL
-                    ORDER BY embedding <=> %s::vector
-                    LIMIT %s;
-                    """,
-                    (ASK_SNIPPET_CHARS, q_vec_lit, company_id, doc_ids, q_vec_lit, candidate_k),
-                )
-            elif bubble_document_id:
-                bdid = bubble_document_id
-
-                if payload.debug:
-                    cur.execute(
-                        """
-                        SELECT COUNT(*)
-                        FROM public.document_chunks
-                        WHERE company_id=%s
-                          AND bubble_document_id=%s
-                          AND embedding IS NOT NULL
-                          AND (machine_id=%s OR machine_id IS NULL);
-                        """,
-                        (company_id, bdid, machine_id),
-                    )
-                    chunks_matching_filter = int(cur.fetchone()[0] or 0)
-
-                cur.execute(
-                    """
-                    SELECT bubble_document_id, chunk_index, page_from, page_to,
-                           left(chunk_text, %s) AS snippet,
-                           left(chunk_text, 2000) AS chunk_full,
-                           1 - (embedding <=> %s::vector) AS similarity,
-                           embedding
-                    FROM public.document_chunks
-                    WHERE company_id = %s
-                      AND bubble_document_id = %s
-                      AND embedding IS NOT NULL
-                      AND (machine_id = %s OR machine_id IS NULL)
-                    ORDER BY embedding <=> %s::vector
-                    LIMIT %s;
-                    """,
-                    (ASK_SNIPPET_CHARS, q_vec_lit, company_id, bdid, machine_id, q_vec_lit, candidate_k),
-                )
-            else:
-                if payload.debug:
-                    cur.execute(
-                        """
-                        SELECT COUNT(*)
-                        FROM public.document_chunks
-                        WHERE company_id=%s
-                          AND embedding IS NOT NULL
-                          AND (machine_id=%s OR machine_id IS NULL);
-                        """,
-                        (company_id, machine_id),
-                    )
-                    chunks_matching_filter = int(cur.fetchone()[0] or 0)
-
-                cur.execute(
-                    """
-                    SELECT bubble_document_id, chunk_index, page_from, page_to,
-                           left(chunk_text, %s) AS snippet,
-                           left(chunk_text, 2000) AS chunk_full,
-                           1 - (embedding <=> %s::vector) AS similarity,
-                           embedding
-                    FROM public.document_chunks
-                    WHERE company_id = %s
-                      AND embedding IS NOT NULL
-                      AND (machine_id = %s OR machine_id IS NULL)
-                    ORDER BY embedding <=> %s::vector
-                    LIMIT %s;
-                    """,
-                    (ASK_SNIPPET_CHARS, q_vec_lit, company_id, machine_id, q_vec_lit, candidate_k),
-                )
-
-            rows = cur.fetchall()
-    finally:
-        conn.close()
+    chunks_matching_filter, rows = _fetch_dense_chunk_candidates(
+        company_id=company_id,
+        machine_id=machine_id,
+        q_vec_lit=q_vec_lit,
+        candidate_k=candidate_k,
+        doc_ids=doc_ids if isinstance(doc_ids, list) else None,
+        bubble_document_id=bubble_document_id,
+        debug=payload.debug,
+    )
 
     if not rows:
         return _finalize(
