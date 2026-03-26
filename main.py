@@ -4991,7 +4991,7 @@ def draft_ps_v1(
             fts_used = True
             citations = _dedup_citations_by_snippet(citations + fts, max_items=top_k)
 
-    if sim_max < ASK_SIM_THRESHOLD and not (fts_used and citations):
+    if sim_max < ASK_SIM_THRESHOLD:
         return _finalize(
             {
                 "ok": True,
@@ -5006,6 +5006,7 @@ def draft_ps_v1(
                     "max_causes": max_causes,
                     "similarity_max": sim_max,
                     "language": language,
+                    "reason": "WEAK_RETRIEVAL",
                 },
             }
         )
