@@ -195,6 +195,123 @@ def _resolve_query_scope(
         "document_ids": doc_ids,
     }
 
+def _fetch_dense_chunk_candidates(
+    *,
+    company_id: str,
+    machine_id: str,
+    q_vec_lit: str,
+    candidate_k: int,
+    doc_ids: Optional[list[str]] = None,
+    bubble_document_id: Optional[str] = None,
+    debug: bool = False,
+) -> tuple[Optional[int], list[tuple]]:
+    chunks_matching_filter = None
+
+    conn = _db_conn()
+    try:
+        with conn.cursor() as cur:
+            if doc_ids:
+                if debug:
+                    cur.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM public.document_chunks
+                        WHERE company_id=%s
+                          AND bubble_document_id = ANY(%s)
+                          AND embedding IS NOT NULL;
+                        """,
+                        (company_id, doc_ids),
+                    )
+                    chunks_matching_filter = int(cur.fetchone()[0] or 0)
+
+                cur.execute(
+                    """
+                    SELECT bubble_document_id, chunk_index, page_from, page_to,
+                           left(chunk_text, %s) AS snippet,
+                           left(chunk_text, 2000) AS chunk_full,
+                           1 - (embedding <=> %s::vector) AS similarity,
+                           embedding
+                    FROM public.document_chunks
+                    WHERE company_id = %s
+                      AND bubble_document_id = ANY(%s)
+                      AND embedding IS NOT NULL
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s;
+                    """,
+                    (ASK_SNIPPET_CHARS, q_vec_lit, company_id, doc_ids, q_vec_lit, candidate_k),
+                )
+
+            elif bubble_document_id:
+                bdid = bubble_document_id
+
+                if debug:
+                    cur.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM public.document_chunks
+                        WHERE company_id=%s
+                          AND bubble_document_id=%s
+                          AND embedding IS NOT NULL
+                          AND (machine_id=%s OR machine_id IS NULL);
+                        """,
+                        (company_id, bdid, machine_id),
+                    )
+                    chunks_matching_filter = int(cur.fetchone()[0] or 0)
+
+                cur.execute(
+                    """
+                    SELECT bubble_document_id, chunk_index, page_from, page_to,
+                           left(chunk_text, %s) AS snippet,
+                           left(chunk_text, 2000) AS chunk_full,
+                           1 - (embedding <=> %s::vector) AS similarity,
+                           embedding
+                    FROM public.document_chunks
+                    WHERE company_id = %s
+                      AND bubble_document_id = %s
+                      AND embedding IS NOT NULL
+                      AND (machine_id = %s OR machine_id IS NULL)
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s;
+                    """,
+                    (ASK_SNIPPET_CHARS, q_vec_lit, company_id, bdid, machine_id, q_vec_lit, candidate_k),
+                )
+
+            else:
+                if debug:
+                    cur.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM public.document_chunks
+                        WHERE company_id=%s
+                          AND embedding IS NOT NULL
+                          AND (machine_id=%s OR machine_id IS NULL);
+                        """,
+                        (company_id, machine_id),
+                    )
+                    chunks_matching_filter = int(cur.fetchone()[0] or 0)
+
+                cur.execute(
+                    """
+                    SELECT bubble_document_id, chunk_index, page_from, page_to,
+                           left(chunk_text, %s) AS snippet,
+                           left(chunk_text, 2000) AS chunk_full,
+                           1 - (embedding <=> %s::vector) AS similarity,
+                           embedding
+                    FROM public.document_chunks
+                    WHERE company_id = %s
+                      AND embedding IS NOT NULL
+                      AND (machine_id = %s OR machine_id IS NULL)
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s;
+                    """,
+                    (ASK_SNIPPET_CHARS, q_vec_lit, company_id, machine_id, q_vec_lit, candidate_k),
+                )
+
+            raw_rows = cur.fetchall()
+            return chunks_matching_filter, raw_rows
+    finally:
+        conn.close()
+
 def _db_conn():
     if not (DB_HOST and DB_USER and DB_PASSWORD):
         raise HTTPException(status_code=500, detail="DB env missing")
@@ -4811,142 +4928,50 @@ def root_cause_v1(
 
     dense_ranked_lists: list[list[dict]] = []
 
-    conn = _db_conn()
-    try:
-        with conn.cursor() as cur:
-            if doc_ids:
-                if payload.debug:
-                    cur.execute(
-                        """
-                        SELECT COUNT(*)
-                        FROM public.document_chunks
-                        WHERE company_id=%s
-                          AND bubble_document_id = ANY(%s)
-                          AND embedding IS NOT NULL;
-                        """,
-                        (company_id, doc_ids),
-                    )
-                    chunks_matching_filter = int(cur.fetchone()[0] or 0)
+    for dq, dq_vec in query_vectors.items():
+        q_vec_lit = _vector_literal(dq_vec)
 
-            elif bubble_document_id:
-                bdid = bubble_document_id
-                if payload.debug:
-                    cur.execute(
-                        """
-                        SELECT COUNT(*)
-                        FROM public.document_chunks
-                        WHERE company_id=%s
-                          AND bubble_document_id=%s
-                          AND embedding IS NOT NULL
-                          AND (machine_id=%s OR machine_id IS NULL);
-                        """,
-                        (company_id, bdid, machine_id),
-                    )
-                    chunks_matching_filter = int(cur.fetchone()[0] or 0)
+        current_chunks_matching_filter, raw_rows = _fetch_dense_chunk_candidates(
+            company_id=company_id,
+            machine_id=machine_id,
+            q_vec_lit=q_vec_lit,
+            candidate_k=candidate_k,
+            doc_ids=doc_ids if isinstance(doc_ids, list) else None,
+            bubble_document_id=bubble_document_id,
+            debug=payload.debug,
+        )
 
+        if chunks_matching_filter is None:
+            chunks_matching_filter = current_chunks_matching_filter
+
+        ranked = []
+        for (bdid, chunk_index, page_from, page_to, snippet, chunk_full, similarity, embedding) in raw_rows:
+            if embedding is None:
+                emb_list = None
+            elif isinstance(embedding, list):
+                emb_list = embedding
             else:
-                if payload.debug:
-                    cur.execute(
-                        """
-                        SELECT COUNT(*)
-                        FROM public.document_chunks
-                        WHERE company_id=%s
-                          AND embedding IS NOT NULL
-                          AND (machine_id=%s OR machine_id IS NULL);
-                        """,
-                        (company_id, machine_id),
-                    )
-                    chunks_matching_filter = int(cur.fetchone()[0] or 0)
+                s = str(embedding).strip()
+                s = s.strip("[]")
+                emb_list = [float(x) for x in s.split(",") if x.strip()]
 
-            for dq, dq_vec in query_vectors.items():
-                q_vec_lit = _vector_literal(dq_vec)
+            citation_id = f"{bdid}:p{int(page_from)}-{int(page_to)}:c{int(chunk_index)}"
+            ranked.append(
+                {
+                    "citation_id": citation_id,
+                    "bubble_document_id": str(bdid),
+                    "page_from": int(page_from),
+                    "page_to": int(page_to),
+                    "snippet": (snippet or "").strip(),
+                    "chunk_full": (chunk_full or "").strip(),
+                    "similarity": float(similarity),
+                    "embedding_list": emb_list or [],
+                    "query_used": dq,
+                }
+            )
 
-                if doc_ids:
-                    cur.execute(
-                        """
-                        SELECT bubble_document_id, chunk_index, page_from, page_to,
-                               left(chunk_text, %s) AS snippet,
-                               left(chunk_text, 2000) AS chunk_full,
-                               1 - (embedding <=> %s::vector) AS similarity,
-                               embedding
-                        FROM public.document_chunks
-                        WHERE company_id = %s
-                          AND bubble_document_id = ANY(%s)
-                          AND embedding IS NOT NULL
-                        ORDER BY embedding <=> %s::vector
-                        LIMIT %s;
-                        """,
-                        (ASK_SNIPPET_CHARS, q_vec_lit, company_id, doc_ids, q_vec_lit, candidate_k),
-                    )
-                elif bubble_document_id:
-                    bdid = bubble_document_id
-                    cur.execute(
-                        """
-                        SELECT bubble_document_id, chunk_index, page_from, page_to,
-                               left(chunk_text, %s) AS snippet,
-                               left(chunk_text, 2000) AS chunk_full,
-                               1 - (embedding <=> %s::vector) AS similarity,
-                               embedding
-                        FROM public.document_chunks
-                        WHERE company_id = %s
-                          AND bubble_document_id = %s
-                          AND embedding IS NOT NULL
-                          AND (machine_id = %s OR machine_id IS NULL)
-                        ORDER BY embedding <=> %s::vector
-                        LIMIT %s;
-                        """,
-                        (ASK_SNIPPET_CHARS, q_vec_lit, company_id, bdid, machine_id, q_vec_lit, candidate_k),
-                    )
-                else:
-                    cur.execute(
-                        """
-                        SELECT bubble_document_id, chunk_index, page_from, page_to,
-                               left(chunk_text, %s) AS snippet,
-                               left(chunk_text, 2000) AS chunk_full,
-                               1 - (embedding <=> %s::vector) AS similarity,
-                               embedding
-                        FROM public.document_chunks
-                        WHERE company_id = %s
-                          AND embedding IS NOT NULL
-                          AND (machine_id = %s OR machine_id IS NULL)
-                        ORDER BY embedding <=> %s::vector
-                        LIMIT %s;
-                        """,
-                        (ASK_SNIPPET_CHARS, q_vec_lit, company_id, machine_id, q_vec_lit, candidate_k),
-                    )
-
-                raw_rows = cur.fetchall()
-
-                ranked = []
-                for (bdid, chunk_index, page_from, page_to, snippet, chunk_full, similarity, embedding) in raw_rows:
-                    if embedding is None:
-                        emb_list = None
-                    elif isinstance(embedding, list):
-                        emb_list = embedding
-                    else:
-                        s = str(embedding).strip()
-                        s = s.strip("[]")
-                        emb_list = [float(x) for x in s.split(",") if x.strip()]
-
-                    citation_id = f"{bdid}:p{int(page_from)}-{int(page_to)}:c{int(chunk_index)}"
-                    ranked.append(
-                        {
-                            "citation_id": citation_id,
-                            "bubble_document_id": str(bdid),
-                            "page_from": int(page_from),
-                            "page_to": int(page_to),
-                            "snippet": (snippet or "").strip(),
-                            "chunk_full": (chunk_full or "").strip(),
-                            "similarity": float(similarity),
-                            "embedding_list": emb_list or [],
-                            "query_used": dq,
-                        }
-                    )
-
-                if ranked:
-                    dense_ranked_lists.append(ranked)
-    finally:
-        conn.close()
+        if ranked:
+            dense_ranked_lists.append(ranked)
 
     candidates = _rrf_merge_candidates(dense_ranked_lists, k=60)
 
