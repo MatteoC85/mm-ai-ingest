@@ -4980,24 +4980,24 @@ def draft_ps_v1(
     citations = _dedup_citations_by_snippet(citations, max_items=top_k)
 
     if float(sim_max or 0.0) < DRAFT_PS_SIM_THRESHOLD:
-    return _finalize(
-        {
-            "ok": True,
-            "status": "no_sources",
-            "title": "",
-            "problem_summary": "",
-            "possible_causes": [],
-            "citations": [],
-            "rg_links": [],
-            "meta": {
-                "top_k": top_k,
-                "max_causes": max_causes,
-                "similarity_max": sim_max,
-                "language": language,
-                "reason": "WEAK_RETRIEVAL",
-            },
-        }
-    )
+        return _finalize(
+            {
+                "ok": True,
+                "status": "no_sources",
+                "title": "",
+                "problem_summary": "",
+                "possible_causes": [],
+                "citations": [],
+                "rg_links": [],
+                "meta": {
+                    "top_k": top_k,
+                    "max_causes": max_causes,
+                    "similarity_max": sim_max,
+                    "language": language,
+                    "reason": "WEAK_RETRIEVAL",
+                },
+            }
+        )
 
     prompt_citations = _sanitize_citations_for_response(citations)
     sources_block = _build_sources_block_from_citations(prompt_citations)
