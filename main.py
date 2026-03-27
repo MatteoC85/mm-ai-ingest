@@ -61,6 +61,7 @@ ASK_SIM_THRESHOLD = float(os.environ.get("MM_ASK_SIM_THRESHOLD", "0.35"))
 ASK_MAX_TOP_K = int(os.environ.get("MM_ASK_MAX_TOP_K", "8"))
 ASK_SNIPPET_CHARS = int(os.environ.get("MM_ASK_SNIPPET_CHARS", "700"))
 ASK_MAX_CONTEXT_CHARS = int(os.environ.get("MM_ASK_MAX_CONTEXT_CHARS", "9000"))
+DRAFT_PS_SIM_THRESHOLD = float(os.environ.get("MM_DRAFT_PS_SIM_THRESHOLD", "0.42"))
 
 # -----------------------------
 # Entity fallback (URL / email / phone)
@@ -4978,38 +4979,25 @@ def draft_ps_v1(
 
     citations = _dedup_citations_by_snippet(citations, max_items=top_k)
 
-    if sim_max < ASK_SIM_THRESHOLD:
-        fts = _fts_search_chunks(
-            company_id=company_id,
-            machine_id=machine_id,
-            q=q,
-            top_k=top_k,
-            doc_ids=doc_ids if isinstance(doc_ids, list) else None,
-            bubble_document_id=bubble_document_id,
-        )
-        if fts:
-            fts_used = True
-            citations = _dedup_citations_by_snippet(citations + fts, max_items=top_k)
-
-    if sim_max < ASK_SIM_THRESHOLD:
-        return _finalize(
-            {
-                "ok": True,
-                "status": "no_sources",
-                "title": "",
-                "problem_summary": "",
-                "possible_causes": [],
-                "citations": [],
-                "rg_links": [],
-                "meta": {
-                    "top_k": top_k,
-                    "max_causes": max_causes,
-                    "similarity_max": sim_max,
-                    "language": language,
-                    "reason": "WEAK_RETRIEVAL",
-                },
-            }
-        )
+    if float(sim_max or 0.0) < DRAFT_PS_SIM_THRESHOLD:
+    return _finalize(
+        {
+            "ok": True,
+            "status": "no_sources",
+            "title": "",
+            "problem_summary": "",
+            "possible_causes": [],
+            "citations": [],
+            "rg_links": [],
+            "meta": {
+                "top_k": top_k,
+                "max_causes": max_causes,
+                "similarity_max": sim_max,
+                "language": language,
+                "reason": "WEAK_RETRIEVAL",
+            },
+        }
+    )
 
     prompt_citations = _sanitize_citations_for_response(citations)
     sources_block = _build_sources_block_from_citations(prompt_citations)
