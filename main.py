@@ -4757,15 +4757,13 @@ def ask_v1(
     candidates = _raw_rows_to_dense_candidates(rows)
 
     q_low = q.lower()
-    key_terms = []
-    if "lubrif" in q_low or "olio" in q_low or "ingrass" in q_low or "cuscinet" in q_low or "riduttor" in q_low:
-        key_terms = ["lubrif", "olio", "ingrass", "cuscinet", "riduttor"]
-
-    if key_terms:
+    candidate_keywords = _collect_candidate_keywords(q, [])
+    if candidate_keywords:
         gated = []
         for c in candidates:
             hay = ((c.get("chunk_full") or c.get("snippet") or "") + " " + (c.get("citation_id") or "")).lower()
-            if any(t in hay for t in key_terms):
+            hits = sum(1 for t in candidate_keywords[:10] if t and t in hay)
+            if hits >= 1:
                 gated.append(c)
 
         if len(gated) >= 2:
@@ -5502,6 +5500,22 @@ def root_cause_v1(
             dense_ranked_lists.append(ranked)
 
     candidates = _rrf_merge_candidates(dense_ranked_lists, k=60)
+
+    if not candidates:
+        ask_like_vec = query_vectors.get(q)
+        if ask_like_vec:
+            ask_like_q_vec_lit = _vector_literal(ask_like_vec)
+            _, ask_like_rows = _fetch_dense_chunk_candidates(
+                company_id=company_id,
+                machine_id=machine_id,
+                q_vec_lit=ask_like_q_vec_lit,
+                candidate_k=max(top_k, min(40, top_k * 6)),
+                doc_ids=doc_ids if isinstance(doc_ids, list) else None,
+                bubble_document_id=bubble_document_id,
+                debug=payload.debug,
+            )
+            if ask_like_rows:
+                candidates = _raw_rows_to_dense_candidates(ask_like_rows, query_used=q)
 
     generic_downranked_count = 0
     hard_excluded_count = 0
