@@ -3,6 +3,7 @@ import re
 import math
 import json
 import unicodedata
+from functools import lru_cache
 from typing import Optional, List, Any, Union
 
 import requests
@@ -62,6 +63,14 @@ ASK_MAX_TOP_K = int(os.environ.get("MM_ASK_MAX_TOP_K", "8"))
 ASK_SNIPPET_CHARS = int(os.environ.get("MM_ASK_SNIPPET_CHARS", "700"))
 ASK_MAX_CONTEXT_CHARS = int(os.environ.get("MM_ASK_MAX_CONTEXT_CHARS", "9000"))
 DRAFT_PS_SIM_THRESHOLD = float(os.environ.get("MM_DRAFT_PS_SIM_THRESHOLD", "0.42"))
+
+# Root-cause semantic intent gate
+ROOT_CAUSE_INTENT_MODEL = (os.environ.get("MM_ROOT_CAUSE_INTENT_MODEL") or "gpt-4.1-nano").strip()
+ROOT_CAUSE_GATE_MIN_SYMPTOM_SCORE = float(os.environ.get("MM_ROOT_CAUSE_GATE_MIN_SYMPTOM_SCORE", "0.33"))
+ROOT_CAUSE_GATE_MIN_MARGIN = float(os.environ.get("MM_ROOT_CAUSE_GATE_MIN_MARGIN", "0.05"))
+ROOT_CAUSE_GATE_MIN_PRELIM_SIM = float(os.environ.get("MM_ROOT_CAUSE_GATE_MIN_PRELIM_SIM", "0.36"))
+ROOT_CAUSE_GATE_MIN_PRELIM_HITS = int(os.environ.get("MM_ROOT_CAUSE_GATE_MIN_PRELIM_HITS", "2"))
+ROOT_CAUSE_GATE_PRELIM_TOP_K = int(os.environ.get("MM_ROOT_CAUSE_GATE_PRELIM_TOP_K", "6"))
 
 # -----------------------------
 # Entity fallback (URL / email / phone)
@@ -769,65 +778,282 @@ def _extract_code_tokens(q: str) -> list[str]:
             out.append(t)
     return out[:5]
 
-def _root_cause_query_signal_summary(q: str) -> dict:
-    q_low = _normalize_unicode_advanced(q or "").lower()
-    tokens = re.findall(r"[a-zà-öø-ÿ0-9]{2,}", q_low)
+@lru_cache(maxsize=512)
+def _cached_embed_single(text: str) -> tuple[float, ...]:
+    text = re.sub(r"\s+", " ", str(text or "").strip())
+    if not text:
+        return tuple()
 
-    symptom_stems = [
-        "vibr", "oscillat", "oscillaz",
-        "rumor", "rumore", "noise", "noisy", "rattle", "squeal", "strid", "sfreg",
-        "overheat", "surriscal", "temperat", "hot", "cald",
-        "jam", "block", "stuck", "bloc", "ferm", "arrest",
-        "error", "errore", "alarm", "allarm", "trip", "scatta",
-        "leak", "perdit", "pression", "pressure",
-    ]
+    vec = _openai_embed_texts([text])[0]
+    return tuple(float(x) for x in vec)
 
-    process_stems = [
-        "bend", "bending", "pieg", "forming", "formatura",
-        "feed", "advance", "avanz", "trascin",
-        "wire", "filo", "strip", "nastro",
-        "tagli", "cut", "trancia",
-        "straighten", "raddrizz",
-        "press", "pressa",
-    ]
 
-    component_stems = [
-        "motor", "motore", "bearing", "cuscinet", "shaft", "albero",
-        "gear", "ingran", "gearbox", "ridutt", "transmission", "trasmission",
-        "pump", "pompa", "valv", "valvol",
-        "sensor", "sensore", "encoder", "plc", "inverter",
-        "brushless", "cam", "belt", "cinghia", "chain", "catena",
-        "roller", "rullo", "guide", "guida",
-    ]
+def _mean_vector(vectors: list[list[float]]) -> list[float]:
+    if not vectors:
+        return []
 
-    failure_phrases = [
-        "non ",
-        "does not",
-        "doesn't",
-        "won't",
-        "can't",
-        "cannot",
-        "fail to",
-        "fails to",
-        "non parte",
-        "non va",
-        "non piega",
-        "non avanza",
-        "non trascina",
-        "non gira",
-        "non lubrifica",
-    ]
+    size = len(vectors[0])
+    acc = [0.0] * size
 
-    def count_hits(stems: list[str]) -> int:
-        return sum(1 for s in stems if s and s in q_low)
+    for vec in vectors:
+        if len(vec) != size:
+            continue
+        for i, val in enumerate(vec):
+            acc[i] += float(val)
+
+    n = float(len(vectors))
+    if n <= 0:
+        return []
+
+    return [x / n for x in acc]
+
+
+@lru_cache(maxsize=32)
+def _root_cause_semantic_centroid(label: str) -> tuple[float, ...]:
+    prototype_map = {
+        "technical_fault_symptom": [
+            "la macchina non parte",
+            "la macchina si blocca in avanzamento",
+            "manca olio nel riduttore",
+            "il motore fa rumore anomalo",
+            "la macchina vibra quando piega",
+            "non trascina il filo",
+            "pressione insufficiente nel circuito",
+            "il gruppo di trasmissione si surriscalda",
+            "riduttore senza lubrificazione",
+            "perdita olio dal gruppo riduttore",
+        ],
+        "technical_information_question": [
+            "cos'è una piegatrice",
+            "come funziona il gruppo pressa",
+            "a cosa serve il riduttore",
+            "quali sono i componenti della macchina",
+            "spiegami il funzionamento del motore brushless",
+            "descrivi il ciclo automatico della macchina",
+        ],
+        "non_technical_or_nonsense": [
+            "banana",
+            "scrivimi una poesia",
+            "ciao come stai",
+            "raccontami una barzelletta",
+            "parlami del meteo",
+            "asdf qwerty zxcv",
+        ],
+    }
+
+    examples = prototype_map.get(label) or []
+    if not examples:
+        return tuple()
+
+    vectors = []
+    for ex in examples:
+        vec = list(_cached_embed_single(ex))
+        if vec:
+            vectors.append(vec)
+
+    centroid = _mean_vector(vectors)
+    return tuple(centroid)
+
+
+def _llm_classify_root_cause_query_intent(q: str) -> dict:
+    schema = {
+        "name": "root_cause_intent_classifier",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "intent_class": {
+                    "type": "string",
+                    "enum": [
+                        "technical_fault_symptom",
+                        "technical_information_question",
+                        "non_technical_or_nonsense",
+                        "ambiguous",
+                    ],
+                },
+                "confidence": {
+                    "type": "number",
+                },
+                "rationale": {
+                    "type": "string",
+                },
+            },
+            "required": ["intent_class", "confidence", "rationale"],
+        },
+    }
+
+    system_msg = (
+        "Classifichi una query utente relativa a macchine industriali.\n"
+        "Non usare un vocabolario rigido: ragiona semanticamente.\n"
+        "Categorie:\n"
+        "- technical_fault_symptom: descrive un sintomo, anomalia, guasto, mancanza, blocco, comportamento anomalo o condizione tecnica che può richiedere root cause analysis, anche se la frase è molto breve o telegrafica.\n"
+        "- technical_information_question: domanda tecnica informativa o descrittiva, ma non un sintomo/guasto.\n"
+        "- non_technical_or_nonsense: query non tecnica, casuale, nonsense o fuori dominio.\n"
+        "- ambiguous: troppo ambigua per decidere con sicurezza.\n"
+        "Una query breve come 'manca olio', 'non parte', 'si blocca', 'fa rumore', 'perde pressione' può comunque essere technical_fault_symptom.\n"
+        "Valuta l'intento reale, non la grammatica."
+    )
+
+    user_msg = f"QUERY:\n{q}"
+
+    try:
+        parsed = _openai_chat_json(
+            [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            model=ROOT_CAUSE_INTENT_MODEL,
+            json_schema=schema,
+            timeout=20,
+        )
+        if not isinstance(parsed, dict):
+            return {
+                "intent_class": "ambiguous",
+                "confidence": 0.0,
+                "rationale": "invalid classifier response",
+            }
+
+        parsed["intent_class"] = str(parsed.get("intent_class") or "ambiguous").strip()
+        parsed["confidence"] = float(parsed.get("confidence") or 0.0)
+        parsed["rationale"] = str(parsed.get("rationale") or "").strip()
+        return parsed
+
+    except Exception as e:
+        return {
+            "intent_class": "ambiguous",
+            "confidence": 0.0,
+            "rationale": f"classifier_error: {str(e)[:160]}",
+        }
+
+
+def _root_cause_preliminary_retrieval_signal(
+    *,
+    company_id: str,
+    machine_id: str,
+    q_vec: list[float],
+    doc_ids: Optional[list[str]] = None,
+    bubble_document_id: Optional[str] = None,
+    debug: bool = False,
+) -> dict:
+    if not q_vec:
+        return {
+            "chunks_matching_filter": None,
+            "rows_found": 0,
+            "similarity_max": None,
+            "hits_over_prelim_threshold": 0,
+            "hits_over_ask_threshold": 0,
+        }
+
+    q_vec_lit = _vector_literal(q_vec)
+
+    chunks_matching_filter, raw_rows = _fetch_dense_chunk_candidates(
+        company_id=company_id,
+        machine_id=machine_id,
+        q_vec_lit=q_vec_lit,
+        candidate_k=max(1, ROOT_CAUSE_GATE_PRELIM_TOP_K),
+        doc_ids=doc_ids,
+        bubble_document_id=bubble_document_id,
+        debug=debug,
+    )
+
+    sims = [float(r[6]) for r in raw_rows] if raw_rows else []
+    sim_max = max(sims) if sims else None
 
     return {
+        "chunks_matching_filter": chunks_matching_filter,
+        "rows_found": len(raw_rows),
+        "similarity_max": sim_max,
+        "hits_over_prelim_threshold": sum(1 for s in sims if s >= ROOT_CAUSE_GATE_MIN_PRELIM_SIM),
+        "hits_over_ask_threshold": sum(1 for s in sims if s >= ASK_SIM_THRESHOLD),
+    }
+
+
+def _root_cause_query_signal_summary(
+    q: str,
+    *,
+    company_id: str,
+    machine_id: str,
+    bubble_document_id: Optional[str] = None,
+    doc_ids: Optional[list[str]] = None,
+    debug: bool = False,
+) -> dict:
+    q_norm = re.sub(r"\s+", " ", _normalize_unicode_advanced(q or "")).strip()
+    q_low = q_norm.lower()
+
+    tokens = re.findall(r"[a-zà-öø-ÿ0-9]{2,}", q_low)
+    code_hits = len(_extract_code_tokens(q_norm))
+
+    q_vec = list(_cached_embed_single(q_norm)) if q_norm else []
+
+    symptom_centroid = list(_root_cause_semantic_centroid("technical_fault_symptom"))
+    info_centroid = list(_root_cause_semantic_centroid("technical_information_question"))
+    nonsense_centroid = list(_root_cause_semantic_centroid("non_technical_or_nonsense"))
+
+    symptom_score = _cosine_sim(q_vec, symptom_centroid) if q_vec and symptom_centroid else 0.0
+    info_score = _cosine_sim(q_vec, info_centroid) if q_vec and info_centroid else 0.0
+    nonsense_score = _cosine_sim(q_vec, nonsense_centroid) if q_vec and nonsense_centroid else 0.0
+
+    preliminary = _root_cause_preliminary_retrieval_signal(
+        company_id=company_id,
+        machine_id=machine_id,
+        q_vec=q_vec,
+        doc_ids=doc_ids,
+        bubble_document_id=bubble_document_id,
+        debug=debug,
+    )
+
+    intent_class = "ambiguous"
+    intent_confidence = 0.0
+    intent_rationale = "semantic gate undecided"
+    classifier_used = False
+
+    margin_vs_nonsense = symptom_score - nonsense_score
+    margin_vs_info = symptom_score - info_score
+
+    if (
+        symptom_score >= ROOT_CAUSE_GATE_MIN_SYMPTOM_SCORE
+        and margin_vs_nonsense >= ROOT_CAUSE_GATE_MIN_MARGIN
+        and margin_vs_info >= -0.02
+    ):
+        intent_class = "technical_fault_symptom"
+        intent_confidence = min(0.99, 0.60 + max(0.0, symptom_score - nonsense_score))
+        intent_rationale = "embedding prototypes favor technical fault symptom"
+
+    elif (
+        nonsense_score >= ROOT_CAUSE_GATE_MIN_SYMPTOM_SCORE
+        and (nonsense_score - max(symptom_score, info_score)) >= ROOT_CAUSE_GATE_MIN_MARGIN
+    ):
+        intent_class = "non_technical_or_nonsense"
+        intent_confidence = min(0.99, 0.60 + max(0.0, nonsense_score - symptom_score))
+        intent_rationale = "embedding prototypes favor nonsense/non-technical intent"
+
+    else:
+        classifier_used = True
+        classified = _llm_classify_root_cause_query_intent(q_norm)
+        intent_class = str(classified.get("intent_class") or "ambiguous").strip()
+        intent_confidence = float(classified.get("confidence") or 0.0)
+        intent_rationale = str(classified.get("rationale") or "").strip()
+
+    return {
+        "query_norm": q_norm,
         "token_count": len(tokens),
-        "code_hits": len(_extract_code_tokens(q)),
-        "symptom_hits": count_hits(symptom_stems),
-        "process_hits": count_hits(process_stems),
-        "component_hits": count_hits(component_stems),
-        "has_failure_phrase": any(p in q_low for p in failure_phrases),
+        "code_hits": code_hits,
+        "query_vector": q_vec,
+        "semantic_scores": {
+            "technical_fault_symptom": symptom_score,
+            "technical_information_question": info_score,
+            "non_technical_or_nonsense": nonsense_score,
+        },
+        "semantic_margins": {
+            "symptom_vs_nonsense": margin_vs_nonsense,
+            "symptom_vs_info": margin_vs_info,
+        },
+        "preliminary_retrieval": preliminary,
+        "intent_class": intent_class,
+        "intent_confidence": intent_confidence,
+        "intent_rationale": intent_rationale,
+        "classifier_used": classifier_used,
     }
 
 
@@ -836,27 +1062,41 @@ def _should_fail_closed_root_cause_query(signal_summary: dict) -> bool:
         return True
 
     token_count = int(signal_summary.get("token_count", 0) or 0)
+    intent_class = str(signal_summary.get("intent_class") or "ambiguous").strip()
 
-    signal_score = (
-        min(2, int(signal_summary.get("symptom_hits", 0) or 0))
-        + min(2, int(signal_summary.get("process_hits", 0) or 0))
-        + min(2, int(signal_summary.get("component_hits", 0) or 0))
-        + min(1, int(signal_summary.get("code_hits", 0) or 0))
-        + (1 if bool(signal_summary.get("has_failure_phrase")) else 0)
-    )
+    prelim = signal_summary.get("preliminary_retrieval") or {}
+    prelim_sim_max = prelim.get("similarity_max")
+    prelim_hits = int(prelim.get("hits_over_prelim_threshold", 0) or 0)
+
+    semantic_scores = signal_summary.get("semantic_scores") or {}
+    symptom_score = float(semantic_scores.get("technical_fault_symptom", 0.0) or 0.0)
+    info_score = float(semantic_scores.get("technical_information_question", 0.0) or 0.0)
+    nonsense_score = float(semantic_scores.get("non_technical_or_nonsense", 0.0) or 0.0)
 
     if token_count <= 0:
         return True
 
-    # Query totalmente priva di segnale diagnostico/meccanico -> fail-closed
-    if signal_score == 0:
+    if intent_class == "technical_fault_symptom":
+        return False
+
+    if intent_class == "non_technical_or_nonsense":
         return True
 
-    # Query troppo corta e troppo debole -> fail-closed
-    if signal_score == 1 and token_count <= 2:
+    if intent_class == "technical_information_question":
+        # root-cause non è pensato per domande descrittive pure
         return True
 
-    return False
+    # Caso ambiguo: usa retrieval-aware fallback
+    if (
+        prelim_sim_max is not None
+        and float(prelim_sim_max) >= ROOT_CAUSE_GATE_MIN_PRELIM_SIM
+        and prelim_hits >= ROOT_CAUSE_GATE_MIN_PRELIM_HITS
+        and symptom_score >= (nonsense_score - 0.02)
+        and symptom_score >= (info_score - 0.04)
+    ):
+        return False
+
+    return True
 
 def _infer_machine_components(q: str) -> list[str]:
     if not q:
@@ -5238,30 +5478,12 @@ def root_cause_v1(
     max_causes = max(1, min(int(payload.max_causes or 3), 3))
     candidate_k = max(top_k, min(80, top_k * 10))
 
-    query_signal_summary = _root_cause_query_signal_summary(q)
-    query_fail_closed = _should_fail_closed_root_cause_query(query_signal_summary)
-
     inferred_components: list[str] = []
     diagnostic_queries: list[str] = []
     diagnostic_keywords: list[str] = []
     target_subsystems: list[str] = []
 
     query_vectors: dict[str, list[float]] = {}
-    query_texts = diagnostic_queries[:] if diagnostic_queries else [q]
-
-    try:
-        batch_vectors = _openai_embed_texts(query_texts)
-        query_vectors = {
-            text: vec
-            for text, vec in zip(query_texts, batch_vectors)
-            if text and vec
-        }
-    except Exception:
-        query_vectors = {q: _openai_embed_texts([q])[0]}
-
-    if q not in query_vectors:
-        query_vectors[q] = _openai_embed_texts([q])[0]
-
     rows = []
     chunks_matching_filter = None
     sim_max: Optional[float] = None
@@ -5279,6 +5501,21 @@ def root_cause_v1(
     subsystem_score_max: Optional[float] = None
     subsystem_score_avg: Optional[float] = None
 
+    query_signal_summary = _root_cause_query_signal_summary(
+        q=q,
+        company_id=company_id,
+        machine_id=machine_id,
+        bubble_document_id=bubble_document_id,
+        doc_ids=doc_ids if isinstance(doc_ids, list) else None,
+        debug=payload.debug,
+    )
+    query_fail_closed = _should_fail_closed_root_cause_query(query_signal_summary)
+
+    base_q_vec = list(query_signal_summary.get("query_vector") or [])
+    prelim = query_signal_summary.get("preliminary_retrieval") or {}
+    preliminary_chunks_matching_filter = prelim.get("chunks_matching_filter")
+    preliminary_similarity_max = prelim.get("similarity_max")
+
     def _finalize(resp: dict) -> dict:
         if payload.debug:
             resp["debug"] = {
@@ -5288,6 +5525,8 @@ def root_cause_v1(
                 "document_ids": doc_ids,
                 "query_signal_summary": query_signal_summary,
                 "query_fail_closed": query_fail_closed,
+                "preliminary_chunks_matching_filter": preliminary_chunks_matching_filter,
+                "preliminary_similarity_max": preliminary_similarity_max,
                 "chunks_matching_filter": chunks_matching_filter,
                 "similarity_max": sim_max,
                 "fts_used": fts_used,
@@ -5323,12 +5562,49 @@ def root_cause_v1(
                 "citations": [],
                 "rg_links": [],
                 "top_k": top_k,
-                "similarity_max": None,
+                "similarity_max": preliminary_similarity_max,
             }
         )
 
     inferred_components = _infer_machine_components(q)
     diagnostic_queries = _build_diagnostic_queries(q, inferred_components)
+    diagnostic_keywords = _collect_candidate_keywords(q, inferred_components)
+    target_subsystems = _root_cause_target_subsystems(q, inferred_components)
+
+    query_texts: list[str] = []
+    seen_q = set()
+    for item in [q] + diagnostic_queries:
+        item_norm = re.sub(r"\s+", " ", str(item or "").strip())
+        if not item_norm:
+            continue
+        key = item_norm.lower()
+        if key in seen_q:
+            continue
+        seen_q.add(key)
+        query_texts.append(item_norm)
+
+    if base_q_vec:
+        query_vectors[q] = base_q_vec
+    else:
+        query_vectors[q] = _openai_embed_texts([q])[0]
+
+    remaining_query_texts = [text for text in query_texts if text != q]
+    if remaining_query_texts:
+        try:
+            batch_vectors = _openai_embed_texts(remaining_query_texts)
+            for text, vec in zip(remaining_query_texts, batch_vectors):
+                if text and vec:
+                    query_vectors[text] = vec
+        except Exception:
+            for text in remaining_query_texts:
+                try:
+                    query_vectors[text] = _openai_embed_texts([text])[0]
+                except Exception:
+                    continue
+
+    dense_ranked_lists: list[list[dict]] = []
+
+    for dq, dq_vec in query_vectors.items():
     diagnostic_keywords = _collect_candidate_keywords(q, inferred_components)
     target_subsystems = _root_cause_target_subsystems(q, inferred_components)
 
