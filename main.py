@@ -769,6 +769,94 @@ def _extract_code_tokens(q: str) -> list[str]:
             out.append(t)
     return out[:5]
 
+def _root_cause_query_signal_summary(q: str) -> dict:
+    q_low = _normalize_unicode_advanced(q or "").lower()
+    tokens = re.findall(r"[a-zà-öø-ÿ0-9]{2,}", q_low)
+
+    symptom_stems = [
+        "vibr", "oscillat", "oscillaz",
+        "rumor", "rumore", "noise", "noisy", "rattle", "squeal", "strid", "sfreg",
+        "overheat", "surriscal", "temperat", "hot", "cald",
+        "jam", "block", "stuck", "bloc", "ferm", "arrest",
+        "error", "errore", "alarm", "allarm", "trip", "scatta",
+        "leak", "perdit", "pression", "pressure",
+    ]
+
+    process_stems = [
+        "bend", "bending", "pieg", "forming", "formatura",
+        "feed", "advance", "avanz", "trascin",
+        "wire", "filo", "strip", "nastro",
+        "tagli", "cut", "trancia",
+        "straighten", "raddrizz",
+        "press", "pressa",
+    ]
+
+    component_stems = [
+        "motor", "motore", "bearing", "cuscinet", "shaft", "albero",
+        "gear", "ingran", "gearbox", "ridutt", "transmission", "trasmission",
+        "pump", "pompa", "valv", "valvol",
+        "sensor", "sensore", "encoder", "plc", "inverter",
+        "brushless", "cam", "belt", "cinghia", "chain", "catena",
+        "roller", "rullo", "guide", "guida",
+    ]
+
+    failure_phrases = [
+        "non ",
+        "does not",
+        "doesn't",
+        "won't",
+        "can't",
+        "cannot",
+        "fail to",
+        "fails to",
+        "non parte",
+        "non va",
+        "non piega",
+        "non avanza",
+        "non trascina",
+        "non gira",
+        "non lubrifica",
+    ]
+
+    def count_hits(stems: list[str]) -> int:
+        return sum(1 for s in stems if s and s in q_low)
+
+    return {
+        "token_count": len(tokens),
+        "code_hits": len(_extract_code_tokens(q)),
+        "symptom_hits": count_hits(symptom_stems),
+        "process_hits": count_hits(process_stems),
+        "component_hits": count_hits(component_stems),
+        "has_failure_phrase": any(p in q_low for p in failure_phrases),
+    }
+
+
+def _should_fail_closed_root_cause_query(signal_summary: dict) -> bool:
+    if not signal_summary:
+        return True
+
+    token_count = int(signal_summary.get("token_count", 0) or 0)
+
+    signal_score = (
+        min(2, int(signal_summary.get("symptom_hits", 0) or 0))
+        + min(2, int(signal_summary.get("process_hits", 0) or 0))
+        + min(2, int(signal_summary.get("component_hits", 0) or 0))
+        + min(1, int(signal_summary.get("code_hits", 0) or 0))
+        + (1 if bool(signal_summary.get("has_failure_phrase")) else 0)
+    )
+
+    if token_count <= 0:
+        return True
+
+    # Query totalmente priva di segnale diagnostico/meccanico -> fail-closed
+    if signal_score == 0:
+        return True
+
+    # Query troppo corta e troppo debole -> fail-closed
+    if signal_score == 1 and token_count <= 2:
+        return True
+
+    return False
 
 def _infer_machine_components(q: str) -> list[str]:
     if not q:
@@ -5150,10 +5238,13 @@ def root_cause_v1(
     max_causes = max(1, min(int(payload.max_causes or 3), 3))
     candidate_k = max(top_k, min(80, top_k * 10))
 
-    inferred_components = _infer_machine_components(q)
-    diagnostic_queries = _build_diagnostic_queries(q, inferred_components)
-    diagnostic_keywords = _collect_candidate_keywords(q, inferred_components)
-    target_subsystems = _root_cause_target_subsystems(q, inferred_components)
+    query_signal_summary = _root_cause_query_signal_summary(q)
+    query_fail_closed = _should_fail_closed_root_cause_query(query_signal_summary)
+
+    inferred_components: list[str] = []
+    diagnostic_queries: list[str] = []
+    diagnostic_keywords: list[str] = []
+    target_subsystems: list[str] = []
 
     query_vectors: dict[str, list[float]] = {}
     query_texts = diagnostic_queries[:] if diagnostic_queries else [q]
@@ -5195,6 +5286,8 @@ def root_cause_v1(
                 "machine_id": machine_id,
                 "bubble_document_id": bubble_document_id,
                 "document_ids": doc_ids,
+                "query_signal_summary": query_signal_summary,
+                "query_fail_closed": query_fail_closed,
                 "chunks_matching_filter": chunks_matching_filter,
                 "similarity_max": sim_max,
                 "fts_used": fts_used,
@@ -5217,6 +5310,27 @@ def root_cause_v1(
                 "evidence_matrix_hypotheses": len(evidence_matrix.get("cause_hypotheses") or []) if isinstance(evidence_matrix, dict) else 0,
             }
         return resp
+
+    if query_fail_closed:
+        return _finalize(
+            {
+                "ok": True,
+                "status": "no_sources",
+                "symptom": q,
+                "problem_summary": "",
+                "possible_causes": [],
+                "recommended_next_checks": [],
+                "citations": [],
+                "rg_links": [],
+                "top_k": top_k,
+                "similarity_max": None,
+            }
+        )
+
+    inferred_components = _infer_machine_components(q)
+    diagnostic_queries = _build_diagnostic_queries(q, inferred_components)
+    diagnostic_keywords = _collect_candidate_keywords(q, inferred_components)
+    target_subsystems = _root_cause_target_subsystems(q, inferred_components)
 
     dense_ranked_lists: list[list[dict]] = []
 
