@@ -4950,7 +4950,10 @@ def ask_v1(
         "\"Non trovo informazioni nei documenti indicizzati per rispondere.\" e basta.\n"
         "2) Quando affermi qualcosa, aggiungi sempre la citazione tra parentesi quadre usando il citation_id, es: [DOCID:p1-2:c3].\n"
         "3) Non inventare, non usare conoscenza esterna.\n"
-        "4) Rispondi in italiano, chiaro e conciso.\n"
+        "4) Rispondi nella stessa lingua della query dell’utente.\n"
+        "5) Se la query è un sintomo breve o telegrafico (es. 'manca olio', 'non parte', 'fa rumore'), "
+        "non trasformarla automaticamente in una procedura: descrivi prima cosa dicono le fonti su quella condizione, "
+        "poi indica eventuali controlli o azioni rilevanti.\n"
     )
 
     user_msg = (
@@ -5986,6 +5989,7 @@ def root_cause_v1(
         "17) non promuovere come causa principale istruzioni isolate di avviamento, inversione fasi, verso motore pompa o controlli secondari se non sono il supporto più diretto disponibile.\n"
         "18) privilegia cause appartenenti ai sottosistemi dominanti implicati dal sintomo.\n"
         "19) usa sottosistemi secondari solo se la causa è davvero plausibile e ben supportata da fonti specifiche.\n"
+        "20) Rispondi nella stessa lingua del sintomo/problema fornito dall’utente.\n"
     )
 
     user_msg = (
