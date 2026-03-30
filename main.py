@@ -4756,7 +4756,6 @@ def ask_v1(
     sim_max = max((float(r[6]) for r in rows), default=-1.0)
     candidates = _raw_rows_to_dense_candidates(rows)
 
-    q_low = q.lower()
     candidate_keywords = _collect_candidate_keywords(q, [])
     if candidate_keywords:
         gated = []
@@ -4769,7 +4768,7 @@ def ask_v1(
         if len(gated) >= 2:
             candidates = gated
 
-    cutoff_delta = 0.08 if key_terms else 0.12
+    cutoff_delta = 0.08 if candidate_keywords else 0.12
     cut_candidates = [c for c in candidates if (sim_max - float(c.get("similarity", 0.0))) <= cutoff_delta]
     cut_candidates.sort(key=lambda x: float(x.get("similarity", 0.0)), reverse=True)
 
@@ -5472,9 +5471,6 @@ def root_cause_v1(
                     query_vectors[text] = _openai_embed_texts([text])[0]
                 except Exception:
                     continue
-
-    diagnostic_keywords = _collect_candidate_keywords(q, inferred_components)
-    target_subsystems = _root_cause_target_subsystems(q, inferred_components)
 
     dense_ranked_lists: list[list[dict]] = []
 
