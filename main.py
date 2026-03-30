@@ -3,7 +3,6 @@ import re
 import math
 import json
 import unicodedata
-from functools import lru_cache
 from typing import Optional, List, Any, Union
 
 import requests
@@ -778,83 +777,6 @@ def _extract_code_tokens(q: str) -> list[str]:
             out.append(t)
     return out[:5]
 
-@lru_cache(maxsize=512)
-def _cached_embed_single(text: str) -> tuple[float, ...]:
-    text = re.sub(r"\s+", " ", str(text or "").strip())
-    if not text:
-        return tuple()
-
-    vec = _openai_embed_texts([text])[0]
-    return tuple(float(x) for x in vec)
-
-
-def _mean_vector(vectors: list[list[float]]) -> list[float]:
-    if not vectors:
-        return []
-
-    size = len(vectors[0])
-    acc = [0.0] * size
-
-    for vec in vectors:
-        if len(vec) != size:
-            continue
-        for i, val in enumerate(vec):
-            acc[i] += float(val)
-
-    n = float(len(vectors))
-    if n <= 0:
-        return []
-
-    return [x / n for x in acc]
-
-
-@lru_cache(maxsize=32)
-def _root_cause_semantic_centroid(label: str) -> tuple[float, ...]:
-    prototype_map = {
-        "technical_fault_symptom": [
-            "la macchina non parte",
-            "la macchina si blocca in avanzamento",
-            "manca olio nel riduttore",
-            "il motore fa rumore anomalo",
-            "la macchina vibra quando piega",
-            "non trascina il filo",
-            "pressione insufficiente nel circuito",
-            "il gruppo di trasmissione si surriscalda",
-            "riduttore senza lubrificazione",
-            "perdita olio dal gruppo riduttore",
-        ],
-        "technical_information_question": [
-            "cos'è una piegatrice",
-            "come funziona il gruppo pressa",
-            "a cosa serve il riduttore",
-            "quali sono i componenti della macchina",
-            "spiegami il funzionamento del motore brushless",
-            "descrivi il ciclo automatico della macchina",
-        ],
-        "non_technical_or_nonsense": [
-            "banana",
-            "scrivimi una poesia",
-            "ciao come stai",
-            "raccontami una barzelletta",
-            "parlami del meteo",
-            "asdf qwerty zxcv",
-        ],
-    }
-
-    examples = prototype_map.get(label) or []
-    if not examples:
-        return tuple()
-
-    vectors = []
-    for ex in examples:
-        vec = list(_cached_embed_single(ex))
-        if vec:
-            vectors.append(vec)
-
-    centroid = _mean_vector(vectors)
-    return tuple(centroid)
-
-
 def _llm_classify_root_cause_query_intent(q: str) -> dict:
     schema = {
         "name": "root_cause_intent_classifier",
@@ -884,15 +806,16 @@ def _llm_classify_root_cause_query_intent(q: str) -> dict:
     }
 
     system_msg = (
-        "Classifichi una query utente relativa a macchine industriali.\n"
-        "Non usare un vocabolario rigido: ragiona semanticamente.\n"
-        "Categorie:\n"
-        "- technical_fault_symptom: descrive un sintomo, anomalia, guasto, mancanza, blocco, comportamento anomalo o condizione tecnica che può richiedere root cause analysis, anche se la frase è molto breve o telegrafica.\n"
-        "- technical_information_question: domanda tecnica informativa o descrittiva, ma non un sintomo/guasto.\n"
-        "- non_technical_or_nonsense: query non tecnica, casuale, nonsense o fuori dominio.\n"
-        "- ambiguous: troppo ambigua per decidere con sicurezza.\n"
-        "Una query breve come 'manca olio', 'non parte', 'si blocca', 'fa rumore', 'perde pressione' può comunque essere technical_fault_symptom.\n"
-        "Valuta l'intento reale, non la grammatica."
+        "You classify a user query in an industrial machinery context. "
+        "Work semantically, not by keyword matching. "
+        "The query may be in Italian, English, or mixed language. "
+        "The machinery type is unknown and can be any industrial machine. "
+        "Classes:\n"
+        "- technical_fault_symptom: the query expresses a fault symptom, anomaly, missing condition, malfunction, abnormal behavior, or a concise diagnostic complaint that could justify root cause analysis.\n"
+        "- technical_information_question: the query is technical and relevant to machinery, but it is explanatory/informational rather than a fault symptom.\n"
+        "- non_technical_or_nonsense: the query is outside the technical machinery domain, casual, or nonsense.\n"
+        "- ambiguous: not enough certainty.\n"
+        "Very short phrases can still be technical_fault_symptom if they express a real machine condition."
     )
 
     user_msg = f"QUERY:\n{q}"
@@ -984,15 +907,13 @@ def _root_cause_query_signal_summary(
     tokens = re.findall(r"[a-zà-öø-ÿ0-9]{2,}", q_low)
     code_hits = len(_extract_code_tokens(q_norm))
 
-    q_vec = list(_cached_embed_single(q_norm)) if q_norm else []
+    classifier_used = True
+    classified = _llm_classify_root_cause_query_intent(q_norm)
+    intent_class = str(classified.get("intent_class") or "ambiguous").strip()
+    intent_confidence = float(classified.get("confidence") or 0.0)
+    intent_rationale = str(classified.get("rationale") or "").strip()
 
-    symptom_centroid = list(_root_cause_semantic_centroid("technical_fault_symptom"))
-    info_centroid = list(_root_cause_semantic_centroid("technical_information_question"))
-    nonsense_centroid = list(_root_cause_semantic_centroid("non_technical_or_nonsense"))
-
-    symptom_score = _cosine_sim(q_vec, symptom_centroid) if q_vec and symptom_centroid else 0.0
-    info_score = _cosine_sim(q_vec, info_centroid) if q_vec and info_centroid else 0.0
-    nonsense_score = _cosine_sim(q_vec, nonsense_centroid) if q_vec and nonsense_centroid else 0.0
+    q_vec = _openai_embed_texts([q_norm])[0] if q_norm else []
 
     preliminary = _root_cause_preliminary_retrieval_signal(
         company_id=company_id,
@@ -1003,52 +924,11 @@ def _root_cause_query_signal_summary(
         debug=debug,
     )
 
-    intent_class = "ambiguous"
-    intent_confidence = 0.0
-    intent_rationale = "semantic gate undecided"
-    classifier_used = False
-
-    margin_vs_nonsense = symptom_score - nonsense_score
-    margin_vs_info = symptom_score - info_score
-
-    if (
-        symptom_score >= ROOT_CAUSE_GATE_MIN_SYMPTOM_SCORE
-        and margin_vs_nonsense >= ROOT_CAUSE_GATE_MIN_MARGIN
-        and margin_vs_info >= -0.02
-    ):
-        intent_class = "technical_fault_symptom"
-        intent_confidence = min(0.99, 0.60 + max(0.0, symptom_score - nonsense_score))
-        intent_rationale = "embedding prototypes favor technical fault symptom"
-
-    elif (
-        nonsense_score >= ROOT_CAUSE_GATE_MIN_SYMPTOM_SCORE
-        and (nonsense_score - max(symptom_score, info_score)) >= ROOT_CAUSE_GATE_MIN_MARGIN
-    ):
-        intent_class = "non_technical_or_nonsense"
-        intent_confidence = min(0.99, 0.60 + max(0.0, nonsense_score - symptom_score))
-        intent_rationale = "embedding prototypes favor nonsense/non-technical intent"
-
-    else:
-        classifier_used = True
-        classified = _llm_classify_root_cause_query_intent(q_norm)
-        intent_class = str(classified.get("intent_class") or "ambiguous").strip()
-        intent_confidence = float(classified.get("confidence") or 0.0)
-        intent_rationale = str(classified.get("rationale") or "").strip()
-
     return {
         "query_norm": q_norm,
         "token_count": len(tokens),
         "code_hits": code_hits,
         "query_vector": q_vec,
-        "semantic_scores": {
-            "technical_fault_symptom": symptom_score,
-            "technical_information_question": info_score,
-            "non_technical_or_nonsense": nonsense_score,
-        },
-        "semantic_margins": {
-            "symptom_vs_nonsense": margin_vs_nonsense,
-            "symptom_vs_info": margin_vs_info,
-        },
         "preliminary_retrieval": preliminary,
         "intent_class": intent_class,
         "intent_confidence": intent_confidence,
@@ -1056,22 +936,17 @@ def _root_cause_query_signal_summary(
         "classifier_used": classifier_used,
     }
 
-
 def _should_fail_closed_root_cause_query(signal_summary: dict) -> bool:
     if not signal_summary:
         return True
 
     token_count = int(signal_summary.get("token_count", 0) or 0)
     intent_class = str(signal_summary.get("intent_class") or "ambiguous").strip()
+    intent_confidence = float(signal_summary.get("intent_confidence", 0.0) or 0.0)
 
     prelim = signal_summary.get("preliminary_retrieval") or {}
     prelim_sim_max = prelim.get("similarity_max")
     prelim_hits = int(prelim.get("hits_over_prelim_threshold", 0) or 0)
-
-    semantic_scores = signal_summary.get("semantic_scores") or {}
-    symptom_score = float(semantic_scores.get("technical_fault_symptom", 0.0) or 0.0)
-    info_score = float(semantic_scores.get("technical_information_question", 0.0) or 0.0)
-    nonsense_score = float(semantic_scores.get("non_technical_or_nonsense", 0.0) or 0.0)
 
     if token_count <= 0:
         return True
@@ -1083,16 +958,14 @@ def _should_fail_closed_root_cause_query(signal_summary: dict) -> bool:
         return True
 
     if intent_class == "technical_information_question":
-        # root-cause non è pensato per domande descrittive pure
         return True
 
-    # Caso ambiguo: usa retrieval-aware fallback
+    # ambiguous
     if (
-        prelim_sim_max is not None
+        intent_confidence < 0.55
+        and prelim_sim_max is not None
         and float(prelim_sim_max) >= ROOT_CAUSE_GATE_MIN_PRELIM_SIM
         and prelim_hits >= ROOT_CAUSE_GATE_MIN_PRELIM_HITS
-        and symptom_score >= (nonsense_score - 0.02)
-        and symptom_score >= (info_score - 0.04)
     ):
         return False
 
@@ -5602,9 +5475,6 @@ def root_cause_v1(
                 except Exception:
                     continue
 
-    dense_ranked_lists: list[list[dict]] = []
-
-    for dq, dq_vec in query_vectors.items():
     diagnostic_keywords = _collect_candidate_keywords(q, inferred_components)
     target_subsystems = _root_cause_target_subsystems(q, inferred_components)
 
