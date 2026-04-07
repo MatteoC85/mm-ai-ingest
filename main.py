@@ -59,6 +59,10 @@ RERANK_MIN_CANDIDATES = int(os.environ.get("MM_RERANK_MIN_CANDIDATES", "4"))
 
 FINAL_CITATION_LOCK_DELTA = float(os.environ.get("MM_FINAL_CITATION_LOCK_DELTA", "0.028"))
 FINAL_CITATION_LOCK_DIAGNOSTIC_DELTA = float(os.environ.get("MM_FINAL_CITATION_LOCK_DIAGNOSTIC_DELTA", "0.042"))
+FINAL_CITATION_LOCK_SET_DELTA = float(os.environ.get("MM_FINAL_CITATION_LOCK_SET_DELTA", "0.014"))
+FINAL_CITATION_LOCK_SET_DIAGNOSTIC_DELTA = float(os.environ.get("MM_FINAL_CITATION_LOCK_SET_DIAGNOSTIC_DELTA", "0.020"))
+FINAL_CITATION_LOCK_FAMILY_WITHIN_SET_DELTA = float(os.environ.get("MM_FINAL_CITATION_LOCK_FAMILY_WITHIN_SET_DELTA", "0.016"))
+ROOT_CAUSE_SET_LOCK_DELTA = float(os.environ.get("MM_ROOT_CAUSE_SET_LOCK_DELTA", "0.028"))
 
 ASK_SIM_THRESHOLD = float(os.environ.get("MM_ASK_SIM_THRESHOLD", "0.35"))
 ASK_SHORT_QUERY_SIM_THRESHOLD = float(os.environ.get("MM_ASK_SHORT_QUERY_SIM_THRESHOLD", "0.28"))
@@ -2165,6 +2169,23 @@ def _stable_evidence_family_key(item: dict) -> str:
     return f"{source_type}|{doc_id}|p{page_from}"
 
 
+def _stable_evidence_set_key(item: dict) -> str:
+    source_type = _source_type_from_document_id(item.get("bubble_document_id") or "")
+    doc_id = str(item.get("bubble_document_id") or "").strip()
+
+    section = _extract_section_from_text(item.get("chunk_full") or item.get("snippet") or "")
+    section = _normalize_unicode_advanced(section or "")
+    section = re.sub(r"\s+", " ", section).strip().lower()[:80]
+
+    if source_type in {"ps", "procedure", "step"}:
+        return f"{source_type}|{doc_id}"
+
+    if section:
+        return f"{source_type}|{doc_id}|sec:{section}"
+
+    return f"{source_type}|{doc_id}"
+
+
 def _locked_family_score(bundle: dict) -> float:
     members = list(bundle.get("members") or [])
     if not members:
@@ -2176,20 +2197,22 @@ def _locked_family_score(bundle: dict) -> float:
     max_specificity = max((float(m.get("specificity_score", 0.0)) for m in members), default=0.0)
     selected_count = int(bundle.get("selected_count") or 0)
     source_type = str(bundle.get("source_type") or "manual")
+    member_count = len(members)
 
     score = (
-        0.78 * best
-        + 0.18 * second
-        + 0.06 * max_overlap
-        + 0.05 * max_specificity
-        + 0.02 * min(selected_count, 2)
+        0.55 * best
+        + 0.10 * second
+        + 0.14 * max_overlap
+        + 0.11 * max_specificity
+        + 0.04 * min(selected_count, 2)
+        + 0.03 * min(member_count, 3)
     )
 
     if source_type == "manual" and (max_overlap >= 0.08 or max_specificity >= 0.04):
-        score += 0.03
+        score += 0.04
 
-    if source_type in {"ps", "procedure", "step"} and max_overlap < 0.20 and max_specificity < 0.05:
-        score -= 0.05
+    if source_type in {"ps", "procedure", "step"} and max_overlap < 0.22 and max_specificity < 0.05:
+        score -= 0.08
 
     return score
 
@@ -2207,6 +2230,47 @@ def _locked_member_order_key(item: dict, selected_ids: set[str]) -> tuple:
         int(item.get("page_to") or 0),
         int(item.get("chunk_index") or 0),
         cid,
+    )
+
+
+def _locked_set_score(set_row: dict) -> float:
+    families = list(set_row.get("families") or [])
+    if not families:
+        return -1.0
+
+    top = float(families[0].get("family_score", 0.0))
+    second = float(families[1].get("family_score", 0.0)) if len(families) >= 2 else 0.0
+    manual_bonus = 0.05 if any(str(f.get("source_type") or "") == "manual" for f in families[:2]) else 0.0
+    overlap_bonus = max((float(f.get("max_overlap", 0.0)) for f in families), default=0.0) * 0.10
+    specificity_bonus = max((float(f.get("max_specificity", 0.0)) for f in families), default=0.0) * 0.08
+    generic_penalty = 0.07 if all(bool(f.get("generic_structured")) for f in families[:2]) else 0.0
+
+    return (
+        0.74 * top
+        + 0.18 * second
+        + 0.03 * min(len(families), 3)
+        + manual_bonus
+        + overlap_bonus
+        + specificity_bonus
+        - generic_penalty
+    )
+
+
+def _family_row_sort_key(row: dict) -> tuple:
+    return (
+        -float(row.get("family_score", 0.0)),
+        -float(row.get("best_score", 0.0)),
+        0 if str(row.get("source_type") or "") == "manual" else 1,
+        str(row.get("family_key") or ""),
+    )
+
+
+def _set_row_sort_key(row: dict) -> tuple:
+    return (
+        -float(row.get("set_score", 0.0)),
+        0 if bool(row.get("has_manual")) else 1,
+        -float(row.get("best_family_score", 0.0)),
+        str(row.get("set_key") or ""),
     )
 
 
@@ -2249,7 +2313,10 @@ def _lock_final_citations(
             by_id[cid] = merged
 
     families: dict[str, dict] = {}
-    for item in [by_id[str(c.get("citation_id") or "").strip()] for c in selected_citations if str(c.get("citation_id") or "").strip() in by_id] + [by_id[cid] for cid in by_id if cid not in selected_ids]:
+    ordered_items = [by_id[str(c.get("citation_id") or "").strip()] for c in selected_citations if str(c.get("citation_id") or "").strip() in by_id]
+    ordered_items += [by_id[cid] for cid in by_id if cid not in selected_ids]
+
+    for item in ordered_items:
         cid = str(item.get("citation_id") or "").strip()
         if not cid:
             continue
@@ -2258,6 +2325,7 @@ def _lock_final_citations(
             fam,
             {
                 "family_key": fam,
+                "set_key": _stable_evidence_set_key(item),
                 "source_type": _source_type_from_document_id(item.get("bubble_document_id") or ""),
                 "members": [],
                 "selected_count": 0,
@@ -2277,73 +2345,108 @@ def _lock_final_citations(
         row = dict(bundle)
         row["family_score"] = _locked_family_score(bundle)
         row["best_score"] = float(members[0].get("retrieval_score", members[0].get("similarity", 0.0)) or 0.0)
+        row["max_overlap"] = max((float(m.get("overlap_score", 0.0)) for m in members), default=0.0)
+        row["max_specificity"] = max((float(m.get("specificity_score", 0.0)) for m in members), default=0.0)
         row["generic_structured"] = (
             row["source_type"] in {"ps", "procedure", "step"}
-            and max((float(m.get("overlap_score", 0.0)) for m in members), default=0.0) < 0.20
-            and max((float(m.get("specificity_score", 0.0)) for m in members), default=0.0) < 0.05
+            and row["max_overlap"] < 0.22
+            and row["max_specificity"] < 0.05
         )
         rows.append(row)
 
-    rows.sort(
-        key=lambda r: (
-            -float(r.get("family_score", 0.0)),
-            -float(r.get("best_score", 0.0)),
-            0 if str(r.get("source_type") or "") == "manual" else 1,
-            str(r.get("family_key") or ""),
+    rows.sort(key=_family_row_sort_key)
+
+    set_rows_map: dict[str, dict] = {}
+    for row in rows:
+        set_key = str(row.get("set_key") or "")
+        srow = set_rows_map.setdefault(
+            set_key,
+            {
+                "set_key": set_key,
+                "families": [],
+                "has_manual": False,
+            },
         )
+        srow["families"].append(row)
+        if str(row.get("source_type") or "") == "manual":
+            srow["has_manual"] = True
+
+    set_rows = []
+    for set_key, srow in set_rows_map.items():
+        srow["families"] = sorted(srow["families"], key=_family_row_sort_key)
+        srow["best_family_score"] = float(srow["families"][0].get("family_score", 0.0))
+        srow["set_score"] = _locked_set_score(srow)
+        set_rows.append(srow)
+
+    set_rows.sort(key=_set_row_sort_key)
+    if not set_rows:
+        return _dedup_citations_by_snippet(selected_citations, max_items=top_k)
+
+    keep_sets = [set_rows[0]]
+    set_delta = FINAL_CITATION_LOCK_SET_DIAGNOSTIC_DELTA if diagnostic_mode else FINAL_CITATION_LOCK_SET_DELTA
+
+    if len(set_rows) >= 2:
+        top_set = set_rows[0]
+        second_set = set_rows[1]
+        gap = float(top_set.get("set_score", 0.0)) - float(second_set.get("set_score", 0.0))
+        top_generic = all(bool(f.get("generic_structured")) for f in top_set.get("families")[:2])
+
+        if top_generic and gap <= (set_delta + 0.012):
+            keep_sets = [second_set]
+            if diagnostic_mode and len(set_rows) >= 3:
+                third_set = set_rows[2]
+                if float(second_set.get("set_score", 0.0)) - float(third_set.get("set_score", 0.0)) <= set_delta:
+                    keep_sets.append(third_set)
+        elif diagnostic_mode and gap <= set_delta and not all(bool(f.get("generic_structured")) for f in second_set.get("families")[:2]):
+            keep_sets.append(second_set)
+
+    dominant_rows: list[dict] = []
+    family_delta = FINAL_CITATION_LOCK_FAMILY_WITHIN_SET_DELTA
+
+    for set_row in keep_sets:
+        fams = list(set_row.get("families") or [])
+        if not fams:
+            continue
+
+        dominant_rows.append(fams[0])
+
+        if diagnostic_mode:
+            for fam in fams[1:]:
+                gap = float(fams[0].get("family_score", 0.0)) - float(fam.get("family_score", 0.0))
+                same_set_count = len([r for r in dominant_rows if r.get("set_key") == set_row.get("set_key")])
+                if gap <= family_delta and same_set_count < 2:
+                    dominant_rows.append(fam)
+
+    dominant_rows = sorted(
+        {str(r.get("family_key") or ""): r for r in dominant_rows if r.get("family_key")}.values(),
+        key=_family_row_sort_key,
     )
 
-    top_score = float(rows[0].get("family_score", 0.0))
-    delta = FINAL_CITATION_LOCK_DIAGNOSTIC_DELTA if diagnostic_mode else FINAL_CITATION_LOCK_DELTA
-    max_families = 3 if diagnostic_mode else 2
-
-    keep_rows = []
-    for idx, row in enumerate(rows):
-        if idx == 0:
-            keep_rows.append(row)
-            continue
-        gap = top_score - float(row.get("family_score", 0.0))
-        if gap <= delta and len(keep_rows) < max_families:
-            keep_rows.append(row)
-
-    if query_token_count >= 4:
-        top_row = keep_rows[0]
-        if bool(top_row.get("generic_structured")):
-            manual_alt = next(
-                (
-                    row for row in rows
-                    if row.get("source_type") == "manual"
-                    and (top_score - float(row.get("family_score", 0.0))) <= (delta + 0.012)
-                ),
-                None,
-            )
-            if manual_alt is not None and manual_alt.get("family_key") != top_row.get("family_key"):
-                keep_rows = [manual_alt] + [row for row in keep_rows if row.get("family_key") != manual_alt.get("family_key")]
-                keep_rows = keep_rows[:max_families]
-
-    quotas = [2, 1, 1] if diagnostic_mode else [2, 1]
-    if not diagnostic_mode and keep_rows and keep_rows[0].get("source_type") == "manual" and query_token_count >= 4:
+    quotas = [2, 1, 1] if diagnostic_mode else [2]
+    if dominant_rows and str(dominant_rows[0].get("source_type") or "") == "manual" and query_token_count >= 4:
         quotas[0] = min(3, top_k)
 
     locked: list[dict] = []
     used_ids: set[str] = set()
 
-    for idx, row in enumerate(keep_rows):
+    for idx, row in enumerate(dominant_rows):
         quota = quotas[min(idx, len(quotas) - 1)]
-        for member in row["members"]:
+        family_added = 0
+        for member in row.get("members") or []:
             cid = str(member.get("citation_id") or "").strip()
             if not cid or cid in used_ids:
                 continue
             locked.append(member)
             used_ids.add(cid)
-            if len([x for x in locked if _stable_evidence_family_key(x) == row["family_key"]]) >= quota:
+            family_added += 1
+            if family_added >= quota:
                 break
         if len(locked) >= top_k:
             break
 
     if len(locked) < top_k:
-        for row in keep_rows:
-            for member in row["members"]:
+        for row in dominant_rows:
+            for member in row.get("members") or []:
                 cid = str(member.get("citation_id") or "").strip()
                 if not cid or cid in used_ids:
                     continue
@@ -2355,8 +2458,11 @@ def _lock_final_citations(
                 break
 
     if len(locked) < top_k:
+        top_set_key = str(keep_sets[0].get("set_key") or "") if keep_sets else ""
         for row in rows:
-            for member in row["members"]:
+            if top_set_key and str(row.get("set_key") or "") != top_set_key:
+                continue
+            for member in row.get("members") or []:
                 cid = str(member.get("citation_id") or "").strip()
                 if not cid or cid in used_ids:
                     continue
@@ -5134,25 +5240,31 @@ def _lock_root_cause_result(
 
     family_score_map: dict[str, float] = {}
     family_rank_map: dict[str, int] = {}
+    set_rank_map: dict[str, int] = {}
 
-    ordered_family_keys: list[str] = []
     seen_fams = set()
+    seen_sets = set()
     for idx, c in enumerate(locked_pool):
         fam = _stable_evidence_family_key(c)
+        set_key = _stable_evidence_set_key(c)
         if fam not in seen_fams:
             seen_fams.add(fam)
-            ordered_family_keys.append(fam)
-        family_rank_map[fam] = min(idx, family_rank_map.get(fam, idx))
+            family_rank_map[fam] = idx
+        if set_key not in seen_sets:
+            seen_sets.add(set_key)
+            set_rank_map[set_key] = idx
 
     for c in retrieval_citations:
         fam = _stable_evidence_family_key(c)
+        set_key = _stable_evidence_set_key(c)
         score = (
             float(c.get("retrieval_score", c.get("similarity", 0.0)) or 0.0)
-            + 0.08 * float(c.get("overlap_score", 0.0) or 0.0)
-            + 0.05 * float(c.get("specificity_score", 0.0) or 0.0)
+            + 0.10 * float(c.get("overlap_score", 0.0) or 0.0)
+            + 0.08 * float(c.get("specificity_score", 0.0) or 0.0)
         )
         family_score_map[fam] = max(score, family_score_map.get(fam, -1.0))
         family_rank_map.setdefault(fam, len(family_rank_map) + 100)
+        set_rank_map.setdefault(set_key, len(set_rank_map) + 100)
 
     rows = []
     for cause in possible_causes:
@@ -5184,16 +5296,25 @@ def _lock_root_cause_result(
                 fam,
             ),
         )
+        if not ordered_fams:
+            continue
 
-        kept_ids = [str(family_best[fam].get("citation_id") or "").strip() for fam in ordered_fams[:2] if family_best.get(fam)]
+        dominant_family = ordered_fams[0]
+        dominant_set = _stable_evidence_set_key(family_best[dominant_family])
+
+        same_set_fams = [fam for fam in ordered_fams if _stable_evidence_set_key(family_best[fam]) == dominant_set]
+        kept_ids = [str(family_best[fam].get("citation_id") or "").strip() for fam in same_set_fams[:2] if family_best.get(fam)]
         kept_ids = [cid for cid in kept_ids if cid]
 
         if not kept_ids:
             continue
 
-        dominant_family = ordered_fams[0] if ordered_fams else ""
         label_key = _normalized_cause_label_key(str(cause.get("cause") or ""))
-        score = family_score_map.get(dominant_family, 0.0) + 0.03 * len(kept_ids)
+        score = (
+            family_score_map.get(dominant_family, 0.0)
+            + 0.04 * len(kept_ids)
+            - 0.01 * max(0, set_rank_map.get(dominant_set, 9999))
+        )
 
         row = dict(cause)
         row["citations"] = kept_ids
@@ -5202,6 +5323,7 @@ def _lock_root_cause_result(
                 "cause": row,
                 "label_key": label_key,
                 "dominant_family": dominant_family,
+                "dominant_set": dominant_set,
                 "score": score,
             }
         )
@@ -5222,33 +5344,42 @@ def _lock_root_cause_result(
     deduped = sorted(
         best_by_label.values(),
         key=lambda x: (
+            set_rank_map.get(x.get("dominant_set") or "", 9999),
             -float(x.get("score", 0.0)),
             family_rank_map.get(x.get("dominant_family") or "", 9999),
             str((x.get("cause") or {}).get("cause") or ""),
         ),
     )
 
-    kept_rows: list[dict] = []
-    used_families: dict[str, dict] = {}
+    final_rows: list[dict] = []
+    per_set_counts: dict[str, int] = {}
 
     for row in deduped:
-        fam = str(row.get("dominant_family") or "")
-        prev = used_families.get(fam)
-        if prev is None:
-            used_families[fam] = row
-            kept_rows.append(row)
+        set_key = str(row.get("dominant_set") or "")
+        count = per_set_counts.get(set_key, 0)
+        if count == 0:
+            final_rows.append(row)
+            per_set_counts[set_key] = 1
             continue
 
-        gap = float(prev.get("score", 0.0)) - float(row.get("score", 0.0))
-        if gap >= 0.06:
+        if count >= 2:
             continue
 
-        if len([r for r in kept_rows if str(r.get("dominant_family") or "") == fam]) == 0:
-            kept_rows.append(row)
+        first = next((r for r in final_rows if str(r.get("dominant_set") or "") == set_key), None)
+        if first is None:
+            final_rows.append(row)
+            per_set_counts[set_key] = 1
+            continue
 
-    kept_rows = sorted(
-        kept_rows,
+        gap = float(first.get("score", 0.0)) - float(row.get("score", 0.0))
+        if gap <= ROOT_CAUSE_SET_LOCK_DELTA and str(row.get("dominant_family") or "") != str(first.get("dominant_family") or ""):
+            final_rows.append(row)
+            per_set_counts[set_key] = count + 1
+
+    final_rows = sorted(
+        final_rows,
         key=lambda x: (
+            set_rank_map.get(x.get("dominant_set") or "", 9999),
             -float(x.get("score", 0.0)),
             family_rank_map.get(x.get("dominant_family") or "", 9999),
             str((x.get("cause") or {}).get("cause") or ""),
@@ -5259,50 +5390,24 @@ def _lock_root_cause_result(
     final_citation_ids: list[str] = []
     seen_citation_ids = set()
 
-    for idx, row in enumerate(kept_rows, start=1):
+    for idx, row in enumerate(final_rows, start=1):
         cause = dict(row["cause"])
         cause["rank"] = idx
         final_causes.append(cause)
-
         for cid in cause.get("citations") or []:
             cid = str(cid or "").strip()
-            if cid and cid not in seen_citation_ids and cid in by_id:
+            if cid and cid not in seen_citation_ids:
                 seen_citation_ids.add(cid)
                 final_citation_ids.append(cid)
 
-    if not final_causes:
-        return result, retrieval_citations
+    final_citations = [by_id[cid] for cid in final_citation_ids if cid in by_id]
 
     result["possible_causes"] = final_causes
-
-    recommended = []
-    seen_checks = set()
-    for cause in final_causes:
-        for chk in cause.get("checks") or []:
-            chk = re.sub(r"\s+", " ", str(chk or "")).strip()
-            if not chk:
-                continue
-            key = chk.lower()
-            if key in seen_checks:
-                continue
-            seen_checks.add(key)
-            recommended.append(chk)
-            if len(recommended) >= 6:
-                break
-        if len(recommended) >= 6:
-            break
-
-    if recommended:
-        result["recommended_next_checks"] = recommended
-
-    final_citations = [by_id[cid] for cid in final_citation_ids if cid in by_id]
-    final_citations = _lock_final_citations(
-        selected_citations=final_citations,
-        ranked_candidates=retrieval_citations,
-        top_k=max(len(final_citations), min(len(retrieval_citations), max_causes * 2)),
-        diagnostic_mode=True,
-        query_token_count=6,
-    )
+    if not result.get("recommended_next_checks"):
+        flattened_checks = []
+        for cause in final_causes:
+            flattened_checks.extend(cause.get("checks") or [])
+        result["recommended_next_checks"] = _unique_non_empty_strings(flattened_checks, limit=6)
 
     return result, final_citations
 
@@ -6904,6 +7009,30 @@ def ask_v1(
                 "similarity_max": sim_max,
             }
         )
+
+    relocked_final_citations = _lock_final_citations(
+        selected_citations=final_citations,
+        ranked_candidates=list(retrieval.get("candidates") or []) + list(citations or []) + list(final_citations or []),
+        top_k=min(top_k, max(1, len(final_citations))),
+        diagnostic_mode=False,
+        query_token_count=query_token_count,
+    )
+
+    if relocked_final_citations:
+        original_ids = [str(c.get("citation_id") or "").strip() for c in final_citations if c.get("citation_id")]
+        relocked_ids = [str(c.get("citation_id") or "").strip() for c in relocked_final_citations if c.get("citation_id")]
+
+        if relocked_ids != original_ids or query_token_count >= 4:
+            stable_answer, stable_citations = _extractive_fallback_answer(
+                relocked_final_citations,
+                response_language=response_language,
+                max_points=min(2, top_k),
+            )
+            if stable_answer and stable_citations:
+                answer = stable_answer
+                final_citations = stable_citations
+            else:
+                final_citations = relocked_final_citations
 
     if not _looks_like_target_language(answer, response_language):
         answer = _translate_text_preserving_citations(answer, response_language)
