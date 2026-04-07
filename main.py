@@ -58,13 +58,20 @@ RERANK_MAX_SPREAD = float(os.environ.get("MM_RERANK_MAX_SPREAD", "0.10"))
 RERANK_MIN_CANDIDATES = int(os.environ.get("MM_RERANK_MIN_CANDIDATES", "4"))
 
 ASK_SIM_THRESHOLD = float(os.environ.get("MM_ASK_SIM_THRESHOLD", "0.35"))
+ASK_SHORT_QUERY_SIM_THRESHOLD = float(os.environ.get("MM_ASK_SHORT_QUERY_SIM_THRESHOLD", "0.28"))
 ASK_MAX_TOP_K = int(os.environ.get("MM_ASK_MAX_TOP_K", "8"))
 ASK_SNIPPET_CHARS = int(os.environ.get("MM_ASK_SNIPPET_CHARS", "700"))
 ASK_MAX_CONTEXT_CHARS = int(os.environ.get("MM_ASK_MAX_CONTEXT_CHARS", "9000"))
 DRAFT_PS_SIM_THRESHOLD = float(os.environ.get("MM_DRAFT_PS_SIM_THRESHOLD", "0.42"))
 
+# Shared semantic retrieval planner
+SEMANTIC_QUERY_PLANNER_MODEL = (os.environ.get("MM_SEMANTIC_QUERY_PLANNER_MODEL") or "gpt-4.1-mini").strip()
+SEMANTIC_QUERY_PLANNER_TIMEOUT = int(os.environ.get("MM_SEMANTIC_QUERY_PLANNER_TIMEOUT_SECONDS", "20"))
+SEMANTIC_MAX_DENSE_QUERIES = int(os.environ.get("MM_SEMANTIC_MAX_DENSE_QUERIES", "5"))
+SEMANTIC_MAX_LEXICAL_QUERIES = int(os.environ.get("MM_SEMANTIC_MAX_LEXICAL_QUERIES", "5"))
+
 # Root-cause semantic intent gate
-ROOT_CAUSE_INTENT_MODEL = (os.environ.get("MM_ROOT_CAUSE_INTENT_MODEL") or "gpt-4.1-nano").strip()
+ROOT_CAUSE_INTENT_MODEL = (os.environ.get("MM_ROOT_CAUSE_INTENT_MODEL") or "gpt-4.1-mini").strip()
 ROOT_CAUSE_GATE_MIN_SYMPTOM_SCORE = float(os.environ.get("MM_ROOT_CAUSE_GATE_MIN_SYMPTOM_SCORE", "0.33"))
 ROOT_CAUSE_GATE_MIN_MARGIN = float(os.environ.get("MM_ROOT_CAUSE_GATE_MIN_MARGIN", "0.05"))
 ROOT_CAUSE_GATE_MIN_PRELIM_SIM = float(os.environ.get("MM_ROOT_CAUSE_GATE_MIN_PRELIM_SIM", "0.36"))
@@ -153,7 +160,7 @@ class DraftPSRequest(BaseModel):
     machine_id: Optional[str] = None
     bubble_document_id: Optional[str] = None
     document_ids: Optional[Union[List[str], str]] = None
-    language: Optional[str] = "it"
+    language: Optional[str] = None
     options: Optional[DraftPSOptions] = None
     debug: Optional[bool] = False
 
@@ -258,7 +265,7 @@ def _fetch_dense_chunk_candidates(
                     WHERE company_id = %s
                       AND bubble_document_id = ANY(%s)
                       AND embedding IS NOT NULL
-                    ORDER BY embedding <=> %s::vector
+                    ORDER BY embedding <=> %s::vector, bubble_document_id, page_from, chunk_index
                     LIMIT %s;
                     """,
                     (ASK_SNIPPET_CHARS, q_vec_lit, company_id, doc_ids, q_vec_lit, candidate_k),
@@ -293,7 +300,7 @@ def _fetch_dense_chunk_candidates(
                       AND bubble_document_id = %s
                       AND embedding IS NOT NULL
                       AND (machine_id = %s OR machine_id IS NULL)
-                    ORDER BY embedding <=> %s::vector
+                    ORDER BY embedding <=> %s::vector, bubble_document_id, page_from, chunk_index
                     LIMIT %s;
                     """,
                     (ASK_SNIPPET_CHARS, q_vec_lit, company_id, bdid, machine_id, q_vec_lit, candidate_k),
@@ -324,7 +331,7 @@ def _fetch_dense_chunk_candidates(
                     WHERE company_id = %s
                       AND embedding IS NOT NULL
                       AND (machine_id = %s OR machine_id IS NULL)
-                    ORDER BY embedding <=> %s::vector
+                    ORDER BY embedding <=> %s::vector, bubble_document_id, page_from, chunk_index
                     LIMIT %s;
                     """,
                     (ASK_SNIPPET_CHARS, q_vec_lit, company_id, machine_id, q_vec_lit, candidate_k),
@@ -355,6 +362,7 @@ def _raw_rows_to_dense_candidates(
         item = {
             "citation_id": f"{bdid}:p{int(page_from)}-{int(page_to)}:c{int(chunk_index)}",
             "bubble_document_id": str(bdid),
+            "chunk_index": int(chunk_index),
             "page_from": int(page_from),
             "page_to": int(page_to),
             "snippet": (snippet or "").strip(),
@@ -764,17 +772,33 @@ def _collapse_structured_chunks(chunks: list[dict]) -> list[dict]:
     ]
 
 def _extract_code_tokens(q: str) -> list[str]:
-    q = (q or "").strip().upper()
-    if not q:
+    q = _normalize_unicode_advanced(q or "")
+    if not q.strip():
         return []
 
-    toks = CODE_TOKEN_REGEX.findall(q)
+    raw = re.findall(r"\b[A-Za-z0-9_\-/]{4,}\b", q)
     out = []
     seen = set()
-    for t in toks:
-        if t not in seen:
-            seen.add(t)
-            out.append(t)
+
+    for tok in raw:
+        tok = tok.strip()
+        if not tok:
+            continue
+
+        has_digit = any(ch.isdigit() for ch in tok)
+        has_sep = ("_" in tok) or ("-" in tok) or ("/" in tok)
+        has_upper = any(ch.isupper() for ch in tok)
+
+        if not (has_digit or has_sep or (has_upper and len(tok) >= 6)):
+            continue
+
+        key = tok.upper()
+        if key in seen:
+            continue
+
+        seen.add(key)
+        out.append(tok)
+
     return out[:5]
 
 def _llm_classify_root_cause_query_intent(q: str) -> dict:
@@ -1118,10 +1142,14 @@ def _rrf_merge_candidates(
 
     out.sort(
         key=lambda x: (
-            float(x.get("rrf_score", 0.0)),
-            float(x.get("similarity", 0.0)),
+            -float(x.get("rrf_score", 0.0)),
+            -float(x.get("similarity", 0.0)),
+            str(x.get("bubble_document_id") or ""),
+            int(x.get("page_from") or 0),
+            int(x.get("page_to") or 0),
+            int(x.get("chunk_index") or 0),
+            str(x.get("citation_id") or ""),
         ),
-        reverse=True,
     )
     return out
 
@@ -1174,6 +1202,610 @@ def _collect_candidate_keywords(q: str, inferred_components: list[str]) -> list[
                 add(alias)
 
     return out[:12]
+
+
+def _dedup_text_values(values: list[str], limit: Optional[int] = None) -> list[str]:
+    out: list[str] = []
+    seen = set()
+
+    for value in values or []:
+        s = re.sub(r"\s+", " ", _normalize_unicode_advanced(str(value or ""))).strip()
+        if not s:
+            continue
+
+        key = s.lower()
+        if key in seen:
+            continue
+
+        seen.add(key)
+        out.append(s)
+
+        if limit is not None and len(out) >= limit:
+            break
+
+    return out
+
+
+def _count_query_tokens(q: str) -> int:
+    return len(re.findall(r"[a-zà-öø-ÿ0-9]{2,}", _normalize_unicode_advanced(q or "").lower()))
+
+
+def _simple_query_language(q: str) -> str:
+    toks = re.findall(r"[a-zà-öø-ÿ']{2,}", _normalize_unicode_advanced(q or "").lower())
+    if not toks:
+        return "it"
+
+    it_markers = {
+        "il", "lo", "la", "gli", "le", "di", "del", "della", "dei", "delle", "con",
+        "per", "quando", "durante", "mentre", "dopo", "prima", "non", "si", "una", "un",
+    }
+    en_markers = {
+        "the", "with", "for", "when", "during", "while", "after", "before", "not",
+        "does", "is", "are", "can", "cannot", "won't", "will", "a", "an",
+    }
+
+    it_hits = sum(1 for t in toks if t in it_markers)
+    en_hits = sum(1 for t in toks if t in en_markers)
+
+    if en_hits > it_hits:
+        return "en"
+    return "it"
+
+
+def _select_response_language(
+    q: str,
+    planner: Optional[dict] = None,
+    preferred: Optional[str] = None,
+) -> str:
+    pref = str(preferred or "").strip().lower()
+    if pref in {"it", "en"}:
+        return pref
+
+    if isinstance(planner, dict):
+        lang = str(planner.get("query_language") or "").strip().lower()
+        if lang in {"it", "en"}:
+            return lang
+
+    return _simple_query_language(q)
+
+
+def _localized_no_sources(language: str) -> str:
+    return (
+        "I cannot find enough information in the indexed documents to answer."
+        if str(language or "").lower() == "en"
+        else "Non trovo informazioni sufficienti nei documenti indicizzati per rispondere."
+    )
+
+
+def _localized_value_answer(language: str, value: str, citation_id: str) -> str:
+    if str(language or "").lower() == "en":
+        return f"The document contains this value: {value} [{citation_id}]"
+    return f"Nel documento compare questo dato: {value} [{citation_id}]"
+
+
+def _localized_token_answer(language: str, token: str, citation_id: str) -> str:
+    if str(language or "").lower() == "en":
+        return f"The document contains this string: {token} [{citation_id}]"
+    return f"Nel documento compare questa stringa: {token} [{citation_id}]"
+
+
+def _ask_response_schema() -> dict:
+    return {
+        "name": "ask_grounded_answer_v1",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "answer_status": {
+                    "type": "string",
+                    "enum": ["answered", "no_sources"],
+                },
+                "answer": {"type": "string"},
+                "used_citations": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+            },
+            "required": ["answer_status", "answer", "used_citations"],
+        },
+    }
+
+
+def _ground_citations_to_ids(citation_ids: list[str], citations: list[dict]) -> list[dict]:
+    if not citation_ids or not citations:
+        return []
+
+    by_id = {
+        str(c.get("citation_id") or "").strip(): c
+        for c in citations
+        if c.get("citation_id")
+    }
+
+    out: list[dict] = []
+    seen = set()
+
+    for cid in citation_ids:
+        cid = str(cid or "").strip()
+        if not cid or cid in seen or cid not in by_id:
+            continue
+
+        seen.add(cid)
+        out.append(by_id[cid])
+
+    return out
+
+
+def _semantic_query_plan(q: str, *, mode: str = "ask") -> dict:
+    q_norm = re.sub(r"\s+", " ", _normalize_unicode_advanced(q or "")).strip()
+    fallback_style = "telegraphic" if _count_query_tokens(q_norm) <= 6 else "natural"
+    fallback = {
+        "normalized_query": q_norm,
+        "dense_queries": [q_norm] if q_norm else [],
+        "lexical_queries": [q_norm] if q_norm else [],
+        "query_style": fallback_style,
+        "query_language": _simple_query_language(q_norm),
+    }
+
+    if not q_norm:
+        return fallback
+
+    schema = {
+        "name": "semantic_query_plan_v1",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "normalized_query": {"type": "string"},
+                "dense_queries": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": max(1, SEMANTIC_MAX_DENSE_QUERIES),
+                },
+                "lexical_queries": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": max(1, SEMANTIC_MAX_LEXICAL_QUERIES),
+                },
+                "query_style": {
+                    "type": "string",
+                    "enum": [
+                        "telegraphic",
+                        "natural",
+                        "identifier_lookup",
+                        "contact_lookup",
+                    ],
+                },
+                "query_language": {
+                    "type": "string",
+                    "enum": ["it", "en", "mixed", "other"],
+                },
+            },
+            "required": [
+                "normalized_query",
+                "dense_queries",
+                "lexical_queries",
+                "query_style",
+                "query_language",
+            ],
+        },
+    }
+
+    system_msg = (
+        "You prepare retrieval plans for a technical documentation assistant that must work across different machine sectors. "
+        "Queries and documents may be in Italian or English. "
+        "Work semantically and domain-agnostically. "
+        "Preserve the user's meaning exactly. "
+        "Do not inject unsupported components, causes, sectors, or jargon. "
+        "Produce a small set of retrieval-ready rewrites: "
+        "dense_queries for semantic embedding recall, lexical_queries for keyword/FTS rescue. "
+        "You may include one careful translation between Italian and English if it improves mixed-language recall, "
+        "but do not broaden the meaning. "
+        "query_style should describe the surface form of the query, not the machine domain."
+    )
+
+    user_msg = (
+        f"MODE: {mode}\n"
+        f"QUERY:\n{q_norm}"
+    )
+
+    try:
+        parsed = _openai_chat_json(
+            [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            model=SEMANTIC_QUERY_PLANNER_MODEL,
+            json_schema=schema,
+            timeout=SEMANTIC_QUERY_PLANNER_TIMEOUT,
+        )
+        if not isinstance(parsed, dict):
+            return fallback
+
+        normalized_query = re.sub(r"\s+", " ", str(parsed.get("normalized_query") or q_norm)).strip() or q_norm
+        dense_queries = _dedup_text_values(
+            [q_norm, normalized_query] + list(parsed.get("dense_queries") or []),
+            limit=max(2, SEMANTIC_MAX_DENSE_QUERIES + 1),
+        )
+        lexical_queries = _dedup_text_values(
+            [q_norm, normalized_query] + list(parsed.get("lexical_queries") or []),
+            limit=max(2, SEMANTIC_MAX_LEXICAL_QUERIES + 1),
+        )
+        query_style = str(parsed.get("query_style") or fallback_style).strip().lower()
+        if query_style not in {"telegraphic", "natural", "identifier_lookup", "contact_lookup"}:
+            query_style = fallback_style
+
+        query_language = str(parsed.get("query_language") or fallback["query_language"]).strip().lower()
+        if query_language not in {"it", "en", "mixed", "other"}:
+            query_language = fallback["query_language"]
+
+        return {
+            "normalized_query": normalized_query,
+            "dense_queries": dense_queries or [q_norm],
+            "lexical_queries": lexical_queries or [q_norm],
+            "query_style": query_style,
+            "query_language": query_language,
+        }
+    except Exception:
+        return fallback
+
+
+def _effective_similarity_threshold(
+    q: str,
+    *,
+    planner: Optional[dict] = None,
+    base_threshold: float = ASK_SIM_THRESHOLD,
+) -> float:
+    token_count = _count_query_tokens(q)
+    style = str((planner or {}).get("query_style") or "").strip().lower()
+
+    if style in {"telegraphic", "identifier_lookup", "contact_lookup"} or token_count <= 5:
+        return min(base_threshold, ASK_SHORT_QUERY_SIM_THRESHOLD)
+
+    return base_threshold
+
+
+def _build_prefix_tsquery_from_texts(texts: list[str], limit: int = 10) -> Optional[str]:
+    stopwords = {
+        "the", "and", "for", "with", "when", "while", "during", "after", "before", "from",
+        "this", "that", "these", "those", "into", "onto", "about", "question",
+        "machine", "system", "document", "documents", "manual", "answer", "issue", "problem",
+        "il", "lo", "la", "i", "gli", "le", "con", "per", "quando", "durante", "dopo", "prima",
+        "questo", "questa", "questi", "queste", "domanda", "documento", "documenti",
+        "macchina", "sistema", "problema", "guasto", "risposta",
+    }
+
+    toks: list[str] = []
+    seen = set()
+
+    for text in texts or []:
+        for tok in re.findall(r"[a-zà-öø-ÿ0-9]{3,}", _normalize_unicode_advanced(text or "").lower()):
+            if tok in stopwords:
+                continue
+            if tok in seen:
+                continue
+            seen.add(tok)
+            toks.append(tok)
+            if len(toks) >= limit:
+                break
+        if len(toks) >= limit:
+            break
+
+    if not toks:
+        return None
+
+    return " | ".join(f"{tok}:*" for tok in toks)
+
+
+def _fts_search_chunks_prefix(
+    company_id: str,
+    machine_id: str,
+    texts: list[str],
+    top_k: int,
+    doc_ids: Optional[list[str]] = None,
+    bubble_document_id: Optional[str] = None,
+) -> list[dict]:
+    ts_query = _build_prefix_tsquery_from_texts(texts, limit=10)
+    if not ts_query:
+        return []
+
+    conn = _db_conn()
+    try:
+        with conn.cursor() as cur:
+            where = ["company_id = %s"]
+            params: list[Any] = [company_id]
+
+            if doc_ids:
+                where.append("bubble_document_id = ANY(%s)")
+                params.append(doc_ids)
+            elif bubble_document_id:
+                where.append("bubble_document_id = %s")
+                params.append(bubble_document_id)
+                where.append("(machine_id = %s OR machine_id IS NULL)")
+                params.append(machine_id)
+            else:
+                where.append("(machine_id = %s OR machine_id IS NULL)")
+                params.append(machine_id)
+
+            where_sql = " AND ".join(where)
+
+            cur.execute(
+                f"""
+                SELECT bubble_document_id, chunk_index, page_from, page_to,
+                       left(chunk_text, %s) AS snippet,
+                       ts_rank_cd(
+                           to_tsvector('simple', chunk_text),
+                           to_tsquery('simple', %s)
+                       ) AS rank
+                FROM public.document_chunks
+                WHERE {where_sql}
+                  AND to_tsvector('simple', chunk_text) @@ to_tsquery('simple', %s)
+                ORDER BY rank DESC, bubble_document_id, page_from, chunk_index
+                LIMIT %s;
+                """,
+                [ASK_SNIPPET_CHARS, ts_query, *params, ts_query, top_k],
+            )
+            rows = cur.fetchall()
+
+        out: list[dict] = []
+        for (bdid, chunk_index, page_from, page_to, snippet, _rank) in rows:
+            citation_id = f"{bdid}:p{int(page_from)}-{int(page_to)}:c{int(chunk_index)}"
+            out.append(
+                {
+                    "citation_id": citation_id,
+                    "bubble_document_id": str(bdid),
+                    "chunk_index": int(chunk_index),
+                    "page_from": int(page_from),
+                    "page_to": int(page_to),
+                    "snippet": (snippet or "").strip(),
+                    "similarity": 0.0,
+                }
+            )
+        return out
+    finally:
+        conn.close()
+
+
+def _fts_search_chunks_multi(
+    company_id: str,
+    machine_id: str,
+    queries: list[str],
+    top_k: int,
+    doc_ids: Optional[list[str]] = None,
+    bubble_document_id: Optional[str] = None,
+) -> list[dict]:
+    merged: list[dict] = []
+
+    for q in _dedup_text_values(queries, limit=max(1, SEMANTIC_MAX_LEXICAL_QUERIES + 1)):
+        merged.extend(
+            _fts_search_chunks(
+                company_id=company_id,
+                machine_id=machine_id,
+                q=q,
+                top_k=top_k,
+                doc_ids=doc_ids,
+                bubble_document_id=bubble_document_id,
+            )
+        )
+
+    return _dedup_citations_by_snippet(merged, max_items=top_k)
+
+
+def _dense_candidates_multi_query(
+    *,
+    query_texts: list[str],
+    company_id: str,
+    machine_id: str,
+    candidate_k: int,
+    doc_ids: Optional[list[str]] = None,
+    bubble_document_id: Optional[str] = None,
+    debug: bool = False,
+) -> tuple[Optional[int], list[dict], dict[str, list[float]]]:
+    cleaned_queries = _dedup_text_values(query_texts, limit=max(1, SEMANTIC_MAX_DENSE_QUERIES + 2))
+    if not cleaned_queries:
+        return None, [], {}
+
+    vectors = _openai_embed_texts(cleaned_queries)
+    query_vectors: dict[str, list[float]] = {}
+    dense_ranked_lists: list[list[dict]] = []
+    chunks_matching_filter = None
+
+    for qq, vec in zip(cleaned_queries, vectors):
+        query_vectors[qq] = vec
+        q_vec_lit = _vector_literal(vec)
+
+        current_chunks_matching_filter, raw_rows = _fetch_dense_chunk_candidates(
+            company_id=company_id,
+            machine_id=machine_id,
+            q_vec_lit=q_vec_lit,
+            candidate_k=candidate_k,
+            doc_ids=doc_ids,
+            bubble_document_id=bubble_document_id,
+            debug=debug,
+        )
+
+        if chunks_matching_filter is None:
+            chunks_matching_filter = current_chunks_matching_filter
+
+        ranked = _raw_rows_to_dense_candidates(raw_rows, query_used=qq)
+        if ranked:
+            dense_ranked_lists.append(ranked)
+
+    merged = _rrf_merge_candidates(dense_ranked_lists, k=60)
+    return chunks_matching_filter, merged, query_vectors
+
+
+def _candidate_order_key(item: dict) -> tuple:
+    return (
+        -float(item.get("retrieval_score", item.get("similarity", 0.0)) or 0.0),
+        -float(item.get("similarity", 0.0) or 0.0),
+        -float(item.get("rrf_score", 0.0) or 0.0),
+        str(item.get("bubble_document_id") or ""),
+        int(item.get("page_from") or 0),
+        int(item.get("page_to") or 0),
+        int(item.get("chunk_index") or 0),
+        str(item.get("citation_id") or ""),
+    )
+
+
+def _shared_semantic_retrieval(
+    *,
+    q: str,
+    company_id: str,
+    machine_id: str,
+    candidate_k: int,
+    top_k: int,
+    doc_ids: Optional[list[str]] = None,
+    bubble_document_id: Optional[str] = None,
+    debug: bool = False,
+    planner_mode: str = "ask",
+    base_threshold: float = ASK_SIM_THRESHOLD,
+    diagnostic_mode: bool = False,
+) -> dict:
+    planner = _semantic_query_plan(q, mode=planner_mode)
+    dense_queries = _dedup_text_values(
+        [q, planner.get("normalized_query")] + list(planner.get("dense_queries") or []),
+        limit=max(2, SEMANTIC_MAX_DENSE_QUERIES + 1),
+    )
+    lexical_queries = _dedup_text_values(
+        [q, planner.get("normalized_query")] + list(planner.get("lexical_queries") or []),
+        limit=max(2, SEMANTIC_MAX_LEXICAL_QUERIES + 1),
+    )
+
+    chunks_matching_filter, candidates, query_vectors = _dense_candidates_multi_query(
+        query_texts=dense_queries,
+        company_id=company_id,
+        machine_id=machine_id,
+        candidate_k=candidate_k,
+        doc_ids=doc_ids,
+        bubble_document_id=bubble_document_id,
+        debug=debug,
+    )
+
+    sim_max = max((float(c.get("similarity", 0.0)) for c in candidates), default=None) if candidates else None
+    effective_threshold = _effective_similarity_threshold(
+        q,
+        planner=planner,
+        base_threshold=base_threshold,
+    )
+
+    rerank_used = False
+    rerank_error: Optional[str] = None
+    fts_used = False
+    prefix_fts_used = False
+    exact_fts_used = False
+
+    selected_citations: list[dict] = []
+    cut_candidates: list[dict] = []
+
+    if candidates:
+        max_rrf = max(float(c.get("rrf_score", 0.0)) for c in candidates) if candidates else 0.0
+        prepared: list[dict] = []
+
+        for c in candidates:
+            cc = dict(c)
+            rrf_norm = (float(cc.get("rrf_score", 0.0)) / max_rrf) if max_rrf > 0 else 0.0
+            cc["retrieval_score"] = 0.72 * float(cc.get("similarity", 0.0)) + 0.28 * rrf_norm
+            prepared.append(cc)
+
+        prepared.sort(key=_candidate_order_key)
+
+        sim_delta = 0.15
+        if sim_max is not None:
+            if sim_max >= 0.55:
+                sim_delta = 0.10
+            elif sim_max >= 0.40:
+                sim_delta = 0.12
+
+        cut_candidates = []
+        for c in prepared:
+            if sim_max is None:
+                cut_candidates.append(c)
+                continue
+            if (float(sim_max) - float(c.get("similarity", 0.0))) <= sim_delta:
+                cut_candidates.append(c)
+
+        min_keep = min(len(prepared), max(3, top_k))
+        if len(cut_candidates) < min_keep:
+            cut_candidates = prepared[:min(len(prepared), max(top_k * 3, 10))]
+        else:
+            cut_candidates = cut_candidates[:min(len(cut_candidates), max(top_k * 3, 12))]
+
+        q_vec = (
+            query_vectors.get(q)
+            or query_vectors.get(str(planner.get("normalized_query") or ""))
+            or next(iter(query_vectors.values()), [])
+        )
+
+        selected_citations = _mmr_select(
+            q_vec,
+            cut_candidates,
+            top_k=top_k,
+            lambda_mult=0.87 if diagnostic_mode else 0.85,
+        )
+
+        if sim_max is not None and _should_use_reranker(q=q, candidates=cut_candidates, sim_max=float(sim_max), top_k=top_k):
+            try:
+                reranked_ids = _llm_rerank_citations(
+                    q=q,
+                    candidates=cut_candidates,
+                    top_k=top_k,
+                    diagnostic_mode=diagnostic_mode,
+                )
+                if reranked_ids:
+                    by_id = {str(c.get("citation_id") or "").strip(): c for c in cut_candidates}
+                    reranked = [by_id[cid] for cid in reranked_ids if cid in by_id]
+                    if reranked:
+                        selected_citations = reranked
+                        rerank_used = True
+            except Exception as e:
+                rerank_error = str(e)
+
+        selected_citations = _dedup_citations_by_snippet(selected_citations, max_items=top_k)
+
+    if (sim_max is None or float(sim_max) < effective_threshold) or not selected_citations:
+        prefix_hits = _fts_search_chunks_prefix(
+            company_id=company_id,
+            machine_id=machine_id,
+            texts=lexical_queries,
+            top_k=top_k,
+            doc_ids=doc_ids,
+            bubble_document_id=bubble_document_id,
+        )
+        if prefix_hits:
+            fts_used = True
+            prefix_fts_used = True
+            selected_citations = _dedup_citations_by_snippet(selected_citations + prefix_hits, max_items=top_k)
+
+        exact_hits = _fts_search_chunks_multi(
+            company_id=company_id,
+            machine_id=machine_id,
+            queries=lexical_queries,
+            top_k=top_k,
+            doc_ids=doc_ids,
+            bubble_document_id=bubble_document_id,
+        )
+        if exact_hits:
+            fts_used = True
+            exact_fts_used = True
+            selected_citations = _dedup_citations_by_snippet(selected_citations + exact_hits, max_items=top_k)
+
+    return {
+        "planner": planner,
+        "dense_queries": dense_queries,
+        "lexical_queries": lexical_queries,
+        "chunks_matching_filter": chunks_matching_filter,
+        "similarity_max": sim_max,
+        "effective_threshold": effective_threshold,
+        "candidates": cut_candidates,
+        "citations": selected_citations,
+        "fts_used": fts_used,
+        "prefix_fts_used": prefix_fts_used,
+        "exact_fts_used": exact_fts_used,
+        "rerank_used": rerank_used,
+        "rerank_error": rerank_error[:300] if rerank_error else None,
+    }
 
 
 def _expand_with_neighbor_chunks(
@@ -2084,7 +2716,16 @@ def _dedup_citations_by_snippet(citations: list[dict], max_items: int) -> list[d
             best[k] = c
 
     out = list(best.values())
-    out.sort(key=lambda x: float(x.get("similarity", 0.0)), reverse=True)
+    out.sort(
+        key=lambda x: (
+            -float(x.get("similarity", 0.0)),
+            str(x.get("bubble_document_id") or ""),
+            int(x.get("page_from") or 0),
+            int(x.get("page_to") or 0),
+            int(x.get("chunk_index") or 0),
+            str(x.get("citation_id") or ""),
+        )
+    )
     return out[:max_items]
 
 
@@ -2186,7 +2827,7 @@ def _fts_search_chunks(
                 FROM public.document_chunks
                 WHERE {where_sql}
                   AND to_tsvector('simple', chunk_text) @@ plainto_tsquery('simple', %s)
-                ORDER BY rank DESC
+                ORDER BY rank DESC, bubble_document_id, page_from, chunk_index
                 LIMIT %s;
                 """,
                 [ASK_SNIPPET_CHARS, q, *params, q, top_k],
@@ -2200,6 +2841,7 @@ def _fts_search_chunks(
                     {
                         "citation_id": citation_id,
                         "bubble_document_id": bdid,
+                        "chunk_index": int(chunk_index),
                         "page_from": int(page_from),
                         "page_to": int(page_to),
                         "snippet": (snippet or "").strip(),
@@ -2788,11 +3430,20 @@ def _openai_embed_texts(texts: list[str]) -> list[list[float]]:
     return out
 
 
-def _openai_chat(messages: list[dict]) -> str:
+def _openai_chat(
+    messages: list[dict],
+    *,
+    model: Optional[str] = None,
+    temperature: float = 0.0,
+) -> str:
     if not OPENAI_API_KEY:
         raise Exception("OPENAI_API_KEY missing")
 
-    payload = {"model": OPENAI_CHAT_MODEL, "messages": messages, "temperature": 0.2}
+    payload = {
+        "model": (model or OPENAI_CHAT_MODEL),
+        "messages": messages,
+        "temperature": temperature,
+    }
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json",
@@ -3414,15 +4065,22 @@ def _build_sources_block_from_citations(
     citations: list[dict],
     *,
     max_context_chars: int = ASK_MAX_CONTEXT_CHARS,
+    prefer_chunk_full: bool = False,
 ) -> str:
     ctx_parts: List[str] = []
     total_chars = 0
 
     for c in citations or []:
+        body = ""
+        if prefer_chunk_full:
+            body = (c.get("chunk_full") or c.get("snippet") or "").strip()
+        else:
+            body = (c.get("snippet") or c.get("chunk_full") or "").strip()
+
         part = (
             f"[{c['citation_id']}] "
             f"(doc={c['bubble_document_id']}, p{c['page_from']}-{c['page_to']})\n"
-            f"{(c.get('snippet') or '').strip()}\n"
+            f"{body}\n"
         )
 
         if total_chars + len(part) > max_context_chars:
@@ -4617,7 +5275,7 @@ def search_chunks(
                     WHERE company_id = %s
                       AND bubble_document_id = %s
                       AND embedding IS NOT NULL
-                    ORDER BY embedding <=> %s::vector
+                    ORDER BY embedding <=> %s::vector, bubble_document_id, page_from, chunk_index
                     LIMIT %s;
                     """,
                     (q_vec_lit, company_id, bubble_document_id, q_vec_lit, top_k),
@@ -4648,7 +5306,7 @@ def search_chunks(
                 FROM public.document_chunks
                 WHERE company_id = %s
                   AND embedding IS NOT NULL
-                ORDER BY embedding <=> %s::vector
+                ORDER BY embedding <=> %s::vector, bubble_document_id, page_from, chunk_index
                 LIMIT %s;
                 """,
                 (q_vec_lit, company_id, q_vec_lit, top_k),
@@ -4704,15 +5362,26 @@ def ask_v1(
     top_k = max(1, min(top_k, ASK_MAX_TOP_K))
     candidate_k = max(top_k, min(40, top_k * 6))
 
-    q_vec = _openai_embed_texts([q])[0]
-    q_vec_lit = _vector_literal(q_vec)
+    retrieval = _shared_semantic_retrieval(
+        q=q,
+        company_id=company_id,
+        machine_id=machine_id,
+        candidate_k=candidate_k,
+        top_k=top_k,
+        doc_ids=doc_ids if isinstance(doc_ids, list) else None,
+        bubble_document_id=bubble_document_id,
+        debug=payload.debug,
+        planner_mode="ask",
+        base_threshold=ASK_SIM_THRESHOLD,
+        diagnostic_mode=False,
+    )
 
-    rows = []
-    chunks_matching_filter = None
-    sim_max: Optional[float] = None
-    fts_used = False
-    rerank_used = False
-    rerank_error: Optional[str] = None
+    planner = retrieval.get("planner") or {}
+    response_language = _select_response_language(q, planner=planner)
+    no_sources_text = _localized_no_sources(response_language)
+
+    citations = list(retrieval.get("citations") or [])
+    sim_max = retrieval.get("similarity_max")
 
     def _finalize(resp: dict) -> dict:
         if payload.debug:
@@ -4721,102 +5390,27 @@ def ask_v1(
                 "machine_id": machine_id,
                 "bubble_document_id": bubble_document_id,
                 "document_ids": doc_ids,
-                "chunks_matching_filter": chunks_matching_filter,
+                "query_plan": planner,
+                "dense_queries": retrieval.get("dense_queries") or [],
+                "lexical_queries": retrieval.get("lexical_queries") or [],
+                "chunks_matching_filter": retrieval.get("chunks_matching_filter"),
                 "similarity_max": sim_max,
-                "fts_used": fts_used,
+                "effective_ask_threshold": retrieval.get("effective_threshold"),
+                "fts_used": bool(retrieval.get("fts_used")),
+                "prefix_fts_used": bool(retrieval.get("prefix_fts_used")),
+                "exact_fts_used": bool(retrieval.get("exact_fts_used")),
                 "rerank_enabled": RERANK_ENABLED,
-                "rerank_used": rerank_used,
-                "rerank_error": rerank_error[:300] if rerank_error else None,
+                "rerank_used": bool(retrieval.get("rerank_used")),
+                "rerank_error": retrieval.get("rerank_error"),
             }
         return resp
 
-    chunks_matching_filter, rows = _fetch_dense_chunk_candidates(
-        company_id=company_id,
-        machine_id=machine_id,
-        q_vec_lit=q_vec_lit,
-        candidate_k=candidate_k,
-        doc_ids=doc_ids if isinstance(doc_ids, list) else None,
-        bubble_document_id=bubble_document_id,
-        debug=payload.debug,
-    )
+    effective_threshold = float(retrieval.get("effective_threshold") or ASK_SIM_THRESHOLD)
 
-    if not rows:
-        return _finalize(
-            {
-                "ok": True,
-                "status": "no_sources",
-                "answer": "Non trovo informazioni nei documenti indicizzati per rispondere.",
-                "citations": [],
-                "rg_links": [],
-                "top_k": top_k,
-                "similarity_max": None,
-            }
-        )
-
-    sim_max = max((float(r[6]) for r in rows), default=-1.0)
-    candidates = _raw_rows_to_dense_candidates(rows)
-
-    candidate_keywords = _collect_candidate_keywords(q, [])
-    if candidate_keywords:
-        gated = []
-        for c in candidates:
-            hay = ((c.get("chunk_full") or c.get("snippet") or "") + " " + (c.get("citation_id") or "")).lower()
-            hits = sum(1 for t in candidate_keywords[:10] if t and t in hay)
-            if hits >= 1:
-                gated.append(c)
-
-        if len(gated) >= 2:
-            candidates = gated
-
-    cutoff_delta = 0.08 if candidate_keywords else 0.12
-    cut_candidates = [c for c in candidates if (sim_max - float(c.get("similarity", 0.0))) <= cutoff_delta]
-    cut_candidates.sort(key=lambda x: float(x.get("similarity", 0.0)), reverse=True)
-
-    if len(cut_candidates) < min(2, len(candidates)):
-        cut_candidates = sorted(
-            candidates,
-            key=lambda x: float(x.get("similarity", 0.0)),
-            reverse=True,
-        )[: min(2, len(candidates))]
-
-    citations = _mmr_select(q_vec, cut_candidates, top_k=top_k, lambda_mult=0.85)
-
-    if _should_use_reranker(q=q, candidates=cut_candidates, sim_max=sim_max, top_k=top_k):
-        try:
-            reranked_ids = _llm_rerank_citations(q=q, candidates=cut_candidates, top_k=top_k)
-            if reranked_ids:
-                by_id = {str(c.get("citation_id")): c for c in cut_candidates}
-                reranked = [by_id[cid] for cid in reranked_ids if cid in by_id]
-                if reranked:
-                    citations = reranked
-                    rerank_used = True
-        except Exception as e:
-            rerank_error = str(e)
-
-    for c in citations:
-        c.pop("embedding_list", None)
-        c.pop("chunk_full", None)
-
-    citations = _dedup_citations_by_snippet(citations, max_items=top_k)
-
-    if sim_max < ASK_SIM_THRESHOLD:
-        fts = _fts_search_chunks(
-            company_id=company_id,
-            machine_id=machine_id,
-            q=q,
-            top_k=top_k,
-            doc_ids=doc_ids if isinstance(doc_ids, list) else None,
-            bubble_document_id=bubble_document_id,
-        )
-        if fts:
-            fts_used = True
-            citations = _dedup_citations_by_snippet(citations + fts, max_items=top_k)
-
-    if sim_max < ASK_SIM_THRESHOLD:
+    if (sim_max is None or float(sim_max) < effective_threshold) and citations:
         picked = _pick_entity_from_citations(q, citations)
         if picked:
             value, c = picked
-            answer = f"Nel documento compare questo dato: {value} [{c['citation_id']}]"
 
             rg_links = []
             try:
@@ -4829,8 +5423,8 @@ def ask_v1(
                 {
                     "ok": True,
                     "status": "answered",
-                    "answer": answer,
-                    "citations": citations,
+                    "answer": _localized_value_answer(response_language, value, c["citation_id"]),
+                    "citations": _sanitize_citations_for_response(citations),
                     "rg_links": rg_links,
                     "top_k": top_k,
                     "similarity_max": sim_max,
@@ -4838,6 +5432,7 @@ def ask_v1(
                 }
             )
 
+    if (sim_max is None or float(sim_max) < effective_threshold):
         kind = None
         if _q_has_any(q, URL_HINTS):
             kind = "url"
@@ -4855,15 +5450,15 @@ def ask_v1(
                 bubble_document_id=bubble_document_id,
             )
             if hit:
-                answer = f"Nel documento compare questo dato: {hit['value']} [{hit['citation_id']}]"
                 cit_list = [
                     {
                         "citation_id": hit["citation_id"],
                         "bubble_document_id": hit["bubble_document_id"],
+                        "chunk_index": int(hit.get("chunk_index") or 0),
                         "page_from": hit["page_from"],
                         "page_to": hit["page_to"],
                         "snippet": hit["snippet"],
-                        "similarity": sim_max,
+                        "similarity": sim_max or 0.0,
                     }
                 ]
                 rg_links = _build_rg_links(company_id, cit_list)
@@ -4871,8 +5466,8 @@ def ask_v1(
                     {
                         "ok": True,
                         "status": "answered",
-                        "answer": answer,
-                        "citations": cit_list,
+                        "answer": _localized_value_answer(response_language, hit["value"], hit["citation_id"]),
+                        "citations": _sanitize_citations_for_response(cit_list),
                         "rg_links": rg_links,
                         "top_k": top_k,
                         "similarity_max": sim_max,
@@ -4897,7 +5492,7 @@ def ask_v1(
                     matched_token = tok
                     break
 
-            if hit:
+            if hit and matched_token:
                 cit_list = [hit]
                 rg_links = []
                 try:
@@ -4910,8 +5505,8 @@ def ask_v1(
                     {
                         "ok": True,
                         "status": "answered",
-                        "answer": f"Nel documento compare questa stringa: {matched_token} [{hit['citation_id']}]",
-                        "citations": cit_list,
+                        "answer": _localized_token_answer(response_language, matched_token, hit["citation_id"]),
+                        "citations": _sanitize_citations_for_response(cit_list),
                         "rg_links": rg_links,
                         "top_k": top_k,
                         "similarity_max": sim_max,
@@ -4919,79 +5514,12 @@ def ask_v1(
                     }
                 )
 
-        if not (fts_used and citations):
-            return _finalize(
-                {
-                    "ok": True,
-                    "status": "no_sources",
-                    "answer": "Non trovo informazioni nei documenti indicizzati per rispondere.",
-                    "citations": [],
-                    "rg_links": [],
-                    "top_k": top_k,
-                    "similarity_max": sim_max,
-                }
-            )
-
-    ctx_parts: List[str] = []
-    total_chars = 0
-    for c in citations:
-        part = f"[{c['citation_id']}] (p{c['page_from']}-{c['page_to']})\n{c['snippet']}\n"
-        if total_chars + len(part) > ASK_MAX_CONTEXT_CHARS:
-            break
-        ctx_parts.append(part)
-        total_chars += len(part)
-    sources_block = "\n".join(ctx_parts).strip()
-
-    system_msg = (
-        "Sei un assistente tecnico per aziende industriali. "
-        "Devi rispondere SOLO usando le FONTI fornite. "
-        "Regole obbligatorie:\n"
-        "1) Se le fonti NON contengono la risposta, rispondi ESATTAMENTE: "
-        "\"Non trovo informazioni nei documenti indicizzati per rispondere.\" e basta.\n"
-        "2) Quando affermi qualcosa, aggiungi sempre la citazione tra parentesi quadre usando il citation_id, es: [DOCID:p1-2:c3].\n"
-        "3) Non inventare, non usare conoscenza esterna.\n"
-        "4) Rispondi nella stessa lingua della query dell’utente.\n"
-        "5) Se la query è un sintomo breve o telegrafico (es. 'manca olio', 'non parte', 'fa rumore'), "
-        "non trasformarla automaticamente in una procedura: descrivi prima cosa dicono le fonti su quella condizione, "
-        "poi indica eventuali controlli o azioni rilevanti.\n"
-    )
-
-    user_msg = (
-        f"DOMANDA:\n{q}\n\n"
-        f"FONTI:\n{sources_block}\n\n"
-        "ISTRUZIONE:\nRispondi alla domanda usando SOLO le fonti e inserendo citazioni [citation_id]."
-    )
-
-    try:
-        answer = _openai_chat(
-            [
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_msg},
-            ]
-        ).strip()
-
-        answer = answer.replace("[DOC:", "[").replace("[doc:", "[")
-
-        m = re.search(r"\[([^\]:]+):([^\]]+);([^\]]+)\]", answer)
-        if m:
-            docid = m.group(1).strip()
-            first = m.group(2).strip()
-            rest = m.group(3).strip()
-            parts = [p.strip() for p in rest.split(";") if p.strip()]
-            expanded = [f"[{docid}:{first}]"] + [f"[{docid}:{p}]" for p in parts]
-            answer = re.sub(r"\[[^\]]+\]", " ".join(expanded), answer, count=1)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"LLM failed: {str(e)}")
-
-    if not answer:
-        answer = "Non trovo informazioni nei documenti indicizzati per rispondere."
-
-    if answer == "Non trovo informazioni nei documenti indicizzati per rispondere.":
+    if not citations:
         return _finalize(
             {
                 "ok": True,
                 "status": "no_sources",
-                "answer": answer,
+                "answer": no_sources_text,
                 "citations": [],
                 "rg_links": [],
                 "top_k": top_k,
@@ -4999,11 +5527,77 @@ def ask_v1(
             }
         )
 
-    citations = _ground_citations_to_answer(answer, citations)
+    prompt_citations = []
+    for c in citations:
+        cc = dict(c)
+        cc["snippet"] = (cc.get("snippet") or cc.get("chunk_full") or "").strip()
+        prompt_citations.append(cc)
+
+    sources_block = _build_sources_block_from_citations(
+        prompt_citations,
+        max_context_chars=ASK_MAX_CONTEXT_CHARS,
+        prefer_chunk_full=False,
+    )
+
+    system_msg = (
+        "You are a technical documentation assistant for machinery and industrial equipment. "
+        "Use ONLY the provided sources. "
+        "You may make cautious grounded inferences when the answer is not stated verbatim but the sources strongly support it. "
+        "Never use outside knowledge. "
+        "If the sources are insufficient, return answer_status='no_sources' and answer exactly: "
+        f"\"{no_sources_text}\". "
+        "Always reply in the same language as the user query. "
+        "For every substantive claim include inline citations in square brackets using only the provided citation_id values. "
+        "When the answer is an inference, make that explicit with careful wording such as 'i documenti indicano' or 'the documents indicate'."
+    )
+
+    user_msg = (
+        f"QUESTION:\n{q}\n\n"
+        f"SOURCES:\n{sources_block}\n\n"
+        "Return valid JSON. Use only citation ids present in the sources."
+    )
+
+    try:
+        answer_json = _openai_chat_json(
+            [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            model=OPENAI_CHAT_MODEL,
+            json_schema=_ask_response_schema(),
+            timeout=60,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"LLM failed: {str(e)}")
+
+    answer_status = str((answer_json or {}).get("answer_status") or "").strip().lower()
+    answer = str((answer_json or {}).get("answer") or "").strip()
+    used_ids = _dedup_text_values(list((answer_json or {}).get("used_citations") or []), limit=top_k)
+
+    if answer_status == "no_sources" or not answer:
+        return _finalize(
+            {
+                "ok": True,
+                "status": "no_sources",
+                "answer": no_sources_text,
+                "citations": [],
+                "rg_links": [],
+                "top_k": top_k,
+                "similarity_max": sim_max,
+            }
+        )
+
+    final_citations = _ground_citations_to_ids(used_ids, citations)
+    if not final_citations:
+        final_citations = _ground_citations_to_answer(answer, citations)
+    if not final_citations:
+        final_citations = citations[:top_k]
+
+    response_citations = _sanitize_citations_for_response(final_citations)
 
     rg_links = []
     try:
-        rg_links = _build_rg_links(company_id, citations)
+        rg_links = _build_rg_links(company_id, response_citations)
     except Exception as e:
         print("RG_LINKS_FAIL", str(e))
         rg_links = []
@@ -5013,13 +5607,14 @@ def ask_v1(
             "ok": True,
             "status": "answered",
             "answer": answer,
-            "citations": citations,
+            "citations": response_citations,
             "rg_links": rg_links,
             "top_k": top_k,
             "similarity_max": sim_max,
             "chat_model": OPENAI_CHAT_MODEL,
         }
     )
+
 
 @app.post("/v1/ai/draft_ps")
 def draft_ps_v1(
@@ -5046,10 +5641,6 @@ def draft_ps_v1(
     bubble_document_id = scope["bubble_document_id"]
     doc_ids = scope["document_ids"]
 
-    language = (payload.language or "it").strip().lower()
-    if language not in {"it", "en"}:
-        language = "it"
-
     options = payload.options or DraftPSOptions()
 
     top_k = int(options.top_k or 8)
@@ -5058,14 +5649,26 @@ def draft_ps_v1(
     max_causes = int(options.max_causes or 3)
     max_causes = max(1, min(max_causes, 5))
 
-    candidate_k = max(top_k, min(40, top_k * 6))
+    candidate_k = max(top_k, min(48, top_k * 6))
 
-    rows = []
-    chunks_matching_filter = None
-    sim_max: Optional[float] = None
-    fts_used = False
-    rerank_used = False
-    rerank_error: Optional[str] = None
+    retrieval = _shared_semantic_retrieval(
+        q=q,
+        company_id=company_id,
+        machine_id=machine_id,
+        candidate_k=candidate_k,
+        top_k=top_k,
+        doc_ids=doc_ids if isinstance(doc_ids, list) else None,
+        bubble_document_id=bubble_document_id,
+        debug=payload.debug,
+        planner_mode="draft_ps",
+        base_threshold=DRAFT_PS_SIM_THRESHOLD,
+        diagnostic_mode=True,
+    )
+
+    planner = retrieval.get("planner") or {}
+    language = _select_response_language(q, planner=planner, preferred=payload.language)
+    sim_max = retrieval.get("similarity_max")
+    citations = list(retrieval.get("citations") or [])
 
     def _finalize(resp: dict) -> dict:
         if payload.debug:
@@ -5074,113 +5677,22 @@ def draft_ps_v1(
                 "machine_id": machine_id,
                 "bubble_document_id": bubble_document_id,
                 "document_ids": doc_ids,
-                "chunks_matching_filter": chunks_matching_filter,
+                "query_plan": planner,
+                "dense_queries": retrieval.get("dense_queries") or [],
+                "lexical_queries": retrieval.get("lexical_queries") or [],
+                "chunks_matching_filter": retrieval.get("chunks_matching_filter"),
                 "similarity_max": sim_max,
-                "fts_used": fts_used,
+                "effective_threshold": retrieval.get("effective_threshold"),
+                "fts_used": bool(retrieval.get("fts_used")),
+                "prefix_fts_used": bool(retrieval.get("prefix_fts_used")),
+                "exact_fts_used": bool(retrieval.get("exact_fts_used")),
                 "rerank_enabled": RERANK_ENABLED,
-                "rerank_used": rerank_used,
-                "rerank_error": rerank_error[:300] if rerank_error else None,
+                "rerank_used": bool(retrieval.get("rerank_used")),
+                "rerank_error": retrieval.get("rerank_error"),
             }
         return resp
 
-    q_vec = _openai_embed_texts([q])[0]
-    q_vec_lit = _vector_literal(q_vec)
-
-    chunks_matching_filter, rows = _fetch_dense_chunk_candidates(
-        company_id=company_id,
-        machine_id=machine_id,
-        q_vec_lit=q_vec_lit,
-        candidate_k=candidate_k,
-        doc_ids=doc_ids if isinstance(doc_ids, list) else None,
-        bubble_document_id=bubble_document_id,
-        debug=payload.debug,
-    )
-
-    if not rows:
-        return _finalize(
-            {
-                "ok": True,
-                "status": "no_sources",
-                "title": "",
-                "problem_summary": "",
-                "possible_causes": [],
-                "citations": [],
-                "rg_links": [],
-                "meta": {
-                    "top_k": top_k,
-                    "max_causes": max_causes,
-                    "similarity_max": None,
-                    "language": language,
-                },
-            }
-        )
-
-    sim_max = max((float(r[6]) for r in rows), default=-1.0)
-    candidates = _raw_rows_to_dense_candidates(rows)
-
-    q_low = q.lower()
-    key_terms = []
-    if (
-        "lubrif" in q_low
-        or "olio" in q_low
-        or "ingrass" in q_low
-        or "cuscinet" in q_low
-        or "riduttor" in q_low
-    ):
-        key_terms = ["lubrif", "olio", "ingrass", "cuscinet", "riduttor"]
-
-    if key_terms:
-        gated = []
-        for c in candidates:
-            hay = (
-                ((c.get("chunk_full") or c.get("snippet") or "") + " " + (c.get("citation_id") or ""))
-                .lower()
-            )
-            if any(t in hay for t in key_terms):
-                gated.append(c)
-
-        if len(gated) >= 2:
-            candidates = gated
-
-    cutoff_delta = 0.08 if key_terms else 0.12
-    cut_candidates = [
-        c for c in candidates
-        if (sim_max - float(c.get("similarity", 0.0))) <= cutoff_delta
-    ]
-    cut_candidates.sort(key=lambda x: float(x.get("similarity", 0.0)), reverse=True)
-
-    if len(cut_candidates) < min(2, len(candidates)):
-        cut_candidates = sorted(
-            candidates,
-            key=lambda x: float(x.get("similarity", 0.0)),
-            reverse=True,
-        )[: min(2, len(candidates))]
-
-    citations = _mmr_select(q_vec, cut_candidates, top_k=top_k, lambda_mult=0.85)
-
-    if _should_use_reranker(q=q, candidates=cut_candidates, sim_max=sim_max, top_k=min(top_k, ASK_MAX_TOP_K)):
-        try:
-            reranked_ids = _llm_rerank_citations(
-                q=q,
-                candidates=cut_candidates,
-                top_k=min(top_k, ASK_MAX_TOP_K),
-            )
-            if reranked_ids:
-                by_id = {str(c.get("citation_id")): c for c in cut_candidates}
-                reranked = [by_id[cid] for cid in reranked_ids if cid in by_id]
-                if reranked:
-                    citations = reranked
-                    rerank_used = True
-        except Exception as e:
-            rerank_error = str(e)
-
-    for c in citations:
-        c.pop("embedding_list", None)
-        c.pop("chunk_full", None)
-
-    citations = _dedup_citations_by_snippet(citations, max_items=top_k)
-
-    if float(sim_max or 0.0) < DRAFT_PS_SIM_THRESHOLD:
+    if not citations:
         return _finalize(
             {
                 "ok": True,
@@ -5195,47 +5707,55 @@ def draft_ps_v1(
                     "max_causes": max_causes,
                     "similarity_max": sim_max,
                     "language": language,
-                    "reason": "WEAK_RETRIEVAL",
                 },
             }
         )
 
-    prompt_citations = _sanitize_citations_for_response(citations)
-    sources_block = _build_sources_block_from_citations(prompt_citations)
+    prompt_citations = []
+    for c in citations:
+        cc = dict(c)
+        cc["snippet"] = (cc.get("chunk_full") or cc.get("snippet") or "").strip()
+        prompt_citations.append(cc)
+
+    sources_block = _build_sources_block_from_citations(
+        prompt_citations,
+        max_context_chars=ASK_MAX_CONTEXT_CHARS,
+        prefer_chunk_full=True,
+    )
 
     schema = _draft_ps_response_schema(max_causes=max_causes)
 
     if language == "en":
         system_msg = (
-            "You are an industrial technical assistant specialized in drafting Problem & Solution entries. "
-            "You must use ONLY the provided sources. "
-            "Do not use outside knowledge. "
-            "Each possible cause must have at least one real citation_id from the sources. "
-            "If the sources are not sufficient, return possible_causes as an empty array. "
-            "Write clearly, technically, and concretely."
+            "You draft grounded Problem & Solution entries for technical equipment. "
+            "Use ONLY the provided sources. "
+            "Work domain-agnostically: do not assume a sector, machine family, or failure taxonomy unless the sources support it. "
+            "It is acceptable to make cautious multi-source inferences, but every proposed cause must stay tightly grounded. "
+            "Each cause label should be compact, canonical, and technically precise. "
+            "Use only citation_id values present in the sources."
         )
 
         user_msg = (
-            f"SYMPTOM / PROBLEM:\n{q}\n\n"
+            f"USER_PROBLEM:\n{q}\n\n"
+            f"NORMALIZED_PROBLEM:\n{planner.get('normalized_query') or q}\n\n"
             f"SOURCES:\n{sources_block}\n\n"
-            "Return valid JSON for a grounded Problem & Solution draft. "
-            "Use only citation_id values that appear in the sources."
+            "Return valid JSON for a grounded Problem & Solution draft."
         )
     else:
         system_msg = (
-            "Sei un assistente tecnico industriale specializzato nella bozza di Problem & Solution. "
-            "Devi usare SOLO le fonti fornite. "
-            "Non usare conoscenza esterna. "
-            "Ogni possibile causa deve avere almeno una citation_id reale presa dalle fonti. "
-            "Se le fonti non bastano, restituisci possible_causes come array vuoto. "
-            "Scrivi in modo tecnico, chiaro e concreto."
+            "Redigi bozze grounded di Problem & Solution per apparecchiature tecniche. "
+            "Usa SOLO le fonti fornite. "
+            "Lavora in modo domain-agnostic: non assumere settore, famiglia macchina o tassonomia guasti se le fonti non lo supportano. "
+            "Sono ammesse inferenze caute multi-fonte, ma ogni possibile causa deve restare strettamente grounded. "
+            "Ogni causa deve avere un'etichetta compatta, canonica e tecnicamente precisa. "
+            "Usa solo citation_id presenti nelle fonti."
         )
 
         user_msg = (
-            f"PROBLEMA / SINTOMO:\n{q}\n\n"
+            f"PROBLEMA_UTENTE:\n{q}\n\n"
+            f"PROBLEMA_NORMALIZZATO:\n{planner.get('normalized_query') or q}\n\n"
             f"FONTI:\n{sources_block}\n\n"
-            "Restituisci JSON valido per una bozza grounded di Problem & Solution. "
-            "Nelle citations usa solo citation_id presenti nelle fonti."
+            "Restituisci JSON valido per una bozza grounded di Problem & Solution."
         )
 
     try:
@@ -5265,7 +5785,7 @@ def draft_ps_v1(
 
     final_title = str((result_json or {}).get("title") or "").strip()
     if not final_title:
-        final_title = f"P&S draft — {q[:80]}"
+        final_title = (f"P&S draft — {q[:80]}" if language == "en" else f"Bozza P&S — {q[:80]}")
 
     final_problem_summary = (
         grounded_result.get("problem_summary")
@@ -5321,6 +5841,7 @@ def draft_ps_v1(
         }
     )
 
+
 @app.post("/v1/ai/root-cause")
 def root_cause_v1(
     payload: RootCauseRequest,
@@ -5351,29 +5872,6 @@ def root_cause_v1(
     max_causes = max(1, min(int(payload.max_causes or 3), 3))
     candidate_k = max(top_k, min(80, top_k * 10))
 
-    inferred_components: list[str] = []
-    diagnostic_queries: list[str] = []
-    diagnostic_keywords: list[str] = []
-    target_subsystems: list[str] = []
-
-    query_vectors: dict[str, list[float]] = {}
-    rows = []
-    chunks_matching_filter = None
-    sim_max: Optional[float] = None
-    fts_used = False
-    rerank_used = False
-    rerank_error: Optional[str] = None
-    generic_downranked_count = 0
-    hard_excluded_count = 0
-    evidence_matrix_used = False
-    evidence_matrix: dict = {}
-    semantic_score_max: Optional[float] = None
-    semantic_score_avg: Optional[float] = None
-    causal_strength_max: Optional[float] = None
-    causal_strength_avg: Optional[float] = None
-    subsystem_score_max: Optional[float] = None
-    subsystem_score_avg: Optional[float] = None
-
     query_signal_summary = _root_cause_query_signal_summary(
         q=q,
         company_id=company_id,
@@ -5384,10 +5882,42 @@ def root_cause_v1(
     )
     query_fail_closed = _should_fail_closed_root_cause_query(query_signal_summary)
 
-    base_q_vec = list(query_signal_summary.get("query_vector") or [])
     prelim = query_signal_summary.get("preliminary_retrieval") or {}
     preliminary_chunks_matching_filter = prelim.get("chunks_matching_filter")
     preliminary_similarity_max = prelim.get("similarity_max")
+
+    retrieval = {
+        "planner": {},
+        "dense_queries": [],
+        "lexical_queries": [],
+        "chunks_matching_filter": None,
+        "similarity_max": None,
+        "effective_threshold": ASK_SIM_THRESHOLD,
+        "citations": [],
+        "fts_used": False,
+        "prefix_fts_used": False,
+        "exact_fts_used": False,
+        "rerank_used": False,
+        "rerank_error": None,
+    }
+
+    if not query_fail_closed:
+        retrieval = _shared_semantic_retrieval(
+            q=q,
+            company_id=company_id,
+            machine_id=machine_id,
+            candidate_k=candidate_k,
+            top_k=top_k,
+            doc_ids=doc_ids if isinstance(doc_ids, list) else None,
+            bubble_document_id=bubble_document_id,
+            debug=payload.debug,
+            planner_mode="root_cause",
+            base_threshold=ASK_SIM_THRESHOLD,
+            diagnostic_mode=True,
+        )
+
+    planner = retrieval.get("planner") or {}
+    sim_max = retrieval.get("similarity_max")
 
     def _finalize(resp: dict) -> dict:
         if payload.debug:
@@ -5400,26 +5930,18 @@ def root_cause_v1(
                 "query_fail_closed": query_fail_closed,
                 "preliminary_chunks_matching_filter": preliminary_chunks_matching_filter,
                 "preliminary_similarity_max": preliminary_similarity_max,
-                "chunks_matching_filter": chunks_matching_filter,
+                "query_plan": planner,
+                "dense_queries": retrieval.get("dense_queries") or [],
+                "lexical_queries": retrieval.get("lexical_queries") or [],
+                "chunks_matching_filter": retrieval.get("chunks_matching_filter"),
                 "similarity_max": sim_max,
-                "fts_used": fts_used,
+                "effective_threshold": retrieval.get("effective_threshold"),
+                "fts_used": bool(retrieval.get("fts_used")),
+                "prefix_fts_used": bool(retrieval.get("prefix_fts_used")),
+                "exact_fts_used": bool(retrieval.get("exact_fts_used")),
                 "rerank_enabled": RERANK_ENABLED,
-                "rerank_used": rerank_used,
-                "rerank_error": rerank_error[:300] if rerank_error else None,
-                "diagnostic_queries": diagnostic_queries,
-                "inferred_components": inferred_components,
-                "diagnostic_keywords": diagnostic_keywords,
-                "target_subsystems": target_subsystems,
-                "generic_downranked_count": generic_downranked_count,
-                "hard_excluded_count": hard_excluded_count,
-                "semantic_score_max": semantic_score_max,
-                "semantic_score_avg": semantic_score_avg,
-                "causal_strength_max": causal_strength_max,
-                "causal_strength_avg": causal_strength_avg,
-                "subsystem_score_max": subsystem_score_max,
-                "subsystem_score_avg": subsystem_score_avg,
-                "evidence_matrix_used": evidence_matrix_used,
-                "evidence_matrix_hypotheses": len(evidence_matrix.get("cause_hypotheses") or []) if isinstance(evidence_matrix, dict) else 0,
+                "rerank_used": bool(retrieval.get("rerank_used")),
+                "rerank_error": retrieval.get("rerank_error"),
             }
         return resp
 
@@ -5439,453 +5961,8 @@ def root_cause_v1(
             }
         )
 
-    inferred_components = _infer_machine_components(q)
-    diagnostic_queries = _build_diagnostic_queries(q, inferred_components)
-    diagnostic_keywords = _collect_candidate_keywords(q, inferred_components)
-    target_subsystems = _root_cause_target_subsystems(q, inferred_components)
-
-    query_texts: list[str] = []
-    seen_q = set()
-    for item in [q] + diagnostic_queries:
-        item_norm = re.sub(r"\s+", " ", str(item or "").strip())
-        if not item_norm:
-            continue
-        key = item_norm.lower()
-        if key in seen_q:
-            continue
-        seen_q.add(key)
-        query_texts.append(item_norm)
-
-    if base_q_vec:
-        query_vectors[q] = base_q_vec
-    else:
-        query_vectors[q] = _openai_embed_texts([q])[0]
-
-    remaining_query_texts = [text for text in query_texts if text != q]
-    if remaining_query_texts:
-        try:
-            batch_vectors = _openai_embed_texts(remaining_query_texts)
-            for text, vec in zip(remaining_query_texts, batch_vectors):
-                if text and vec:
-                    query_vectors[text] = vec
-        except Exception:
-            for text in remaining_query_texts:
-                try:
-                    query_vectors[text] = _openai_embed_texts([text])[0]
-                except Exception:
-                    continue
-
-    dense_ranked_lists: list[list[dict]] = []
-
-    for dq, dq_vec in query_vectors.items():
-        q_vec_lit = _vector_literal(dq_vec)
-
-        current_chunks_matching_filter, raw_rows = _fetch_dense_chunk_candidates(
-            company_id=company_id,
-            machine_id=machine_id,
-            q_vec_lit=q_vec_lit,
-            candidate_k=candidate_k,
-            doc_ids=doc_ids if isinstance(doc_ids, list) else None,
-            bubble_document_id=bubble_document_id,
-            debug=payload.debug,
-        )
-
-        if chunks_matching_filter is None:
-            chunks_matching_filter = current_chunks_matching_filter
-
-        ranked = _raw_rows_to_dense_candidates(raw_rows, query_used=dq)
-
-        if ranked:
-            dense_ranked_lists.append(ranked)
-
-    candidates = _rrf_merge_candidates(dense_ranked_lists, k=60)
-
-    if not candidates:
-        ask_like_vec = query_vectors.get(q)
-        if ask_like_vec:
-            ask_like_q_vec_lit = _vector_literal(ask_like_vec)
-            _, ask_like_rows = _fetch_dense_chunk_candidates(
-                company_id=company_id,
-                machine_id=machine_id,
-                q_vec_lit=ask_like_q_vec_lit,
-                candidate_k=max(top_k, min(40, top_k * 6)),
-                doc_ids=doc_ids if isinstance(doc_ids, list) else None,
-                bubble_document_id=bubble_document_id,
-                debug=payload.debug,
-            )
-            if ask_like_rows:
-                candidates = _raw_rows_to_dense_candidates(ask_like_rows, query_used=q)
-
-    generic_downranked_count = 0
-    hard_excluded_count = 0
-    rescored_candidates = []
-
-    for c in candidates:
-        chunk_text = (c.get("chunk_full") or c.get("snippet") or "").strip()
-        if not chunk_text:
-            continue
-
-        if _should_hard_exclude_root_cause_chunk(
-            q=q,
-            chunk_text=chunk_text,
-            diagnostic_keywords=diagnostic_keywords,
-        ):
-            hard_excluded_count += 1
-            continue
-
-        cc = dict(c)
-
-        is_generic = _should_downrank_generic_root_cause_chunk(
-            q=q,
-            chunk_text=chunk_text,
-            diagnostic_keywords=diagnostic_keywords,
-        )
-        cc["generic_downranked"] = bool(is_generic)
-
-        if is_generic:
-            generic_downranked_count += 1
-            cc["similarity"] = max(0.0, float(cc.get("similarity", 0.0)) - 0.10)
-            cc["rrf_score"] = max(0.0, float(cc.get("rrf_score", 0.0)) - 0.015)
-
-        keyword_hits = sum(
-            1
-            for t in diagnostic_keywords[:12]
-            if t and t in chunk_text.lower()
-        )
-        if keyword_hits >= 2:
-            cc["similarity"] = min(1.0, float(cc.get("similarity", 0.0)) + 0.03)
-            cc["rrf_score"] = float(cc.get("rrf_score", 0.0)) + 0.005
-
-        rescored_candidates.append(cc)
-
-    semantic_candidates = []
-    semantic_scores = []
-    causal_scores = []
-    subsystem_scores = []
-
-    for c in rescored_candidates:
-        cc = dict(c)
-        chunk_text = (cc.get("chunk_full") or cc.get("snippet") or "").strip()
-
-        semantic = _score_root_cause_chunk_semantic(
-            q=q,
-            chunk_text=chunk_text,
-            diagnostic_keywords=diagnostic_keywords,
-        )
-        causal = _score_root_cause_causal_strength(
-            q=q,
-            chunk_text=chunk_text,
-            diagnostic_keywords=diagnostic_keywords,
-        )
-        subsystem = _score_root_cause_subsystem_alignment(
-            q=q,
-            chunk_text=chunk_text,
-            target_subsystems=target_subsystems,
-        )
-
-        cc.update(semantic)
-        cc.update(causal)
-        cc.update(subsystem)
-
-        semantic_candidates.append(cc)
-        semantic_scores.append(float(cc.get("semantic_score", 0.0)))
-        causal_scores.append(float(cc.get("causal_strength_score", 0.0)))
-        subsystem_scores.append(float(cc.get("subsystem_score", 0.0)))
-
-    candidates = semantic_candidates
-
-    if semantic_scores:
-        semantic_score_max = max(semantic_scores)
-        semantic_score_avg = sum(semantic_scores) / len(semantic_scores)
-
-    if causal_scores:
-        causal_strength_max = max(causal_scores)
-        causal_strength_avg = sum(causal_scores) / len(causal_scores)
-
-    if subsystem_scores:
-        subsystem_score_max = max(subsystem_scores)
-        subsystem_score_avg = sum(subsystem_scores) / len(subsystem_scores)
-
-    if not candidates:
-        return _finalize(
-            {
-                "ok": True,
-                "status": "no_sources",
-                "symptom": q,
-                "problem_summary": "",
-                "possible_causes": [],
-                "recommended_next_checks": [],
-                "citations": [],
-                "rg_links": [],
-                "top_k": top_k,
-                "similarity_max": None,
-            }
-        )
-
-    sim_max = max(float(c.get("similarity", 0.0)) for c in candidates) if candidates else None
-
-    q_low = q.lower()
-    tight_cutoff = any(
-        stem in q_low
-        for stem in [
-            "lubrif", "olio", "ingrass", "oil", "grease",
-            "bearing", "cuscinet", "riduttor", "gearbox",
-        ]
-    )
-
-    cutoff_delta = 0.08 if tight_cutoff else 0.12
-    cut_candidates = [
-        c for c in candidates
-        if (float(sim_max or 0.0) - float(c.get("similarity", 0.0))) <= cutoff_delta
-    ]
-
-    sem_good = [c for c in cut_candidates if float(c.get("semantic_score", 0.0)) >= 0.02]
-    if len(sem_good) >= 2:
-        cut_candidates = sem_good
-
-    causal_good = [c for c in cut_candidates if float(c.get("causal_strength_score", 0.0)) >= 0.02]
-    if len(causal_good) >= 2:
-        cut_candidates = causal_good
-
-    subsystem_good = [c for c in cut_candidates if float(c.get("subsystem_score", 0.0)) >= 0.02]
-    if len(subsystem_good) >= 2:
-        cut_candidates = subsystem_good
-
-    cut_candidates.sort(
-        key=lambda x: (
-            float(x.get("subsystem_score", 0.0)),
-            float(x.get("causal_strength_score", 0.0)),
-            float(x.get("semantic_score", 0.0)),
-            float(x.get("rrf_score", 0.0)),
-            float(x.get("similarity", 0.0)),
-        ),
-        reverse=True,
-    )
-
-    if len(cut_candidates) < min(2, len(candidates)):
-        cut_candidates = sorted(
-            candidates,
-            key=lambda x: (
-                float(x.get("subsystem_score", 0.0)),
-                float(x.get("causal_strength_score", 0.0)),
-                float(x.get("semantic_score", 0.0)),
-                float(x.get("rrf_score", 0.0)),
-                float(x.get("similarity", 0.0)),
-            ),
-            reverse=True,
-        )[: min(2, len(candidates))]
-
-    base_q_vec = query_vectors.get(q)
-    if base_q_vec is None:
-        try:
-            base_q_vec = _openai_embed_texts([q])[0]
-        except Exception:
-            base_q_vec = next(iter(query_vectors.values()))
-
-    max_rrf = max(float(c.get("rrf_score", 0.0)) for c in cut_candidates) if cut_candidates else 0.0
-    mmr_candidates = []
-
-    for c in cut_candidates:
-        cc = dict(c)
-        raw_sim = float(c.get("similarity", 0.0))
-        rrf = float(c.get("rrf_score", 0.0))
-        rrf_norm = (rrf / max_rrf) if max_rrf > 0 else 0.0
-
-        semantic_raw = float(c.get("semantic_score", 0.0))
-        semantic_norm = max(0.0, min(1.0, (semantic_raw + 0.45) / 0.90))
-
-        causal_raw = float(c.get("causal_strength_score", 0.0))
-        causal_norm = max(0.0, min(1.0, (causal_raw + 0.40) / 0.80))
-
-        subsystem_raw = float(c.get("subsystem_score", 0.0))
-        subsystem_norm = max(0.0, min(1.0, (subsystem_raw + 0.30) / 0.70))
-
-        cc["raw_similarity"] = raw_sim
-        cc["similarity"] = (
-            0.34 * raw_sim
-            + 0.16 * rrf_norm
-            + 0.16 * semantic_norm
-            + 0.16 * causal_norm
-            + 0.18 * subsystem_norm
-        )
-        mmr_candidates.append(cc)
-
-    citations = _mmr_select(base_q_vec, mmr_candidates, top_k=top_k, lambda_mult=0.85)
-
-    if _should_use_reranker(q=q, candidates=cut_candidates, sim_max=float(sim_max or 0.0), top_k=top_k):
-        try:
-            reranked_ids = _llm_rerank_citations(
-                q=q,
-                candidates=cut_candidates,
-                top_k=top_k,
-                diagnostic_mode=True,
-            )
-            if reranked_ids:
-                by_id = {str(c.get("citation_id")): c for c in cut_candidates}
-                reranked = [by_id[cid] for cid in reranked_ids if cid in by_id]
-                if reranked:
-                    citations = reranked
-                    rerank_used = True
-        except Exception as e:
-            rerank_error = str(e)
-
-    for c in citations:
-        c.pop("embedding_list", None)
-        c.pop("query_used", None)
-
-    citations = _dedup_citations_by_snippet(citations, max_items=top_k)
-    citations = _dedup_root_cause_candidates_semantic(citations, max_items=top_k)
-    citations = _prioritize_root_cause_coverage(citations, max_items=top_k)
-
-    try:
-        selected_diag_ids = _llm_filter_diagnostic_chunks(
-            q=q,
-            candidates=cut_candidates[:18],
-            max_keep=top_k,
-        )
-        if selected_diag_ids:
-            nongeneric_ids = {
-                str(c.get("citation_id") or "").strip()
-                for c in citations
-                if c.get("citation_id") and not bool(c.get("generic_downranked"))
-            }
-
-            priority_ids = [cid for cid in selected_diag_ids if cid in nongeneric_ids]
-            if not priority_ids:
-                priority_ids = selected_diag_ids
-
-            citations = _reorder_citations_by_priority_ids(
-                citations=citations,
-                priority_ids=priority_ids,
-                max_items=top_k,
-            )
-    except Exception as e:
-        rerank_error = str(e) if not rerank_error else rerank_error
-
-    citations = _prioritize_root_cause_coverage(citations, max_items=top_k)
-
-    if float(sim_max or 0.0) < ASK_SIM_THRESHOLD:
-        fts_queries = [q]
-        for dq in diagnostic_queries:
-            dq_low = dq.lower()
-            if dq_low == q.lower():
-                continue
-            if dq_low.startswith(("root cause ", "causa ", "diagnosi ")):
-                continue
-            fts_queries.append(dq)
-            if len(fts_queries) >= 4:
-                break
-
-        fts_merged: list[dict] = []
-
-        for fts_q in fts_queries:
-            fts_hits = _fts_search_chunks(
-                company_id=company_id,
-                machine_id=machine_id,
-                q=fts_q,
-                top_k=top_k,
-                doc_ids=doc_ids if isinstance(doc_ids, list) else None,
-                bubble_document_id=bubble_document_id,
-            )
-
-            for c in fts_hits:
-                chunk_text = (c.get("snippet") or "").strip()
-                if not chunk_text:
-                    continue
-
-                if _should_hard_exclude_root_cause_chunk(
-                    q=q,
-                    chunk_text=chunk_text,
-                    diagnostic_keywords=diagnostic_keywords,
-                ):
-                    continue
-
-                if _should_downrank_generic_root_cause_chunk(
-                    q=q,
-                    chunk_text=chunk_text,
-                    diagnostic_keywords=diagnostic_keywords,
-                ):
-                    c["similarity"] = max(0.0, float(c.get("similarity", 0.0)) - 0.05)
-
-                fts_merged.append(c)
-
-        if fts_merged:
-            fts_used = True
-            citations = _dedup_citations_by_snippet(citations + fts_merged, max_items=top_k)
-
-    try:
-        evidence_matrix = _llm_build_diagnostic_evidence_matrix(
-            q=q,
-            citations=citations,
-            max_causes=max_causes,
-        )
-
-        keep_ids = [
-            str(x).strip()
-            for x in (evidence_matrix.get("keep_ids") or [])
-            if str(x).strip()
-        ]
-        cause_hypotheses = evidence_matrix.get("cause_hypotheses") or []
-
-        priority_ids: list[str] = []
-        seen_priority = set()
-
-        for cid in keep_ids:
-            if cid not in seen_priority:
-                seen_priority.add(cid)
-                priority_ids.append(cid)
-
-        for hyp in cause_hypotheses:
-            if not isinstance(hyp, dict):
-                continue
-            for cid in hyp.get("evidence_ids") or []:
-                cid = str(cid).strip()
-                if cid and cid not in seen_priority:
-                    seen_priority.add(cid)
-                    priority_ids.append(cid)
-
-        if priority_ids:
-            nongeneric_ids = {
-                str(c.get("citation_id") or "").strip()
-                for c in citations
-                if c.get("citation_id") and not bool(c.get("generic_downranked"))
-            }
-
-            filtered_priority_ids = [cid for cid in priority_ids if cid in nongeneric_ids]
-            if not filtered_priority_ids:
-                filtered_priority_ids = priority_ids
-
-            citations = _reorder_citations_by_priority_ids(
-                citations=citations,
-                priority_ids=filtered_priority_ids,
-                max_items=top_k,
-            )
-
-        evidence_matrix_used = bool(cause_hypotheses or keep_ids)
-    except Exception as e:
-        rerank_error = str(e) if not rerank_error else rerank_error
-        evidence_matrix = {}
-        evidence_matrix_used = False
-
-    nongeneric_citations = [
-        c for c in citations
-        if not bool(c.get("generic_downranked"))
-    ]
-
-    if len(nongeneric_citations) >= 2:
-        citations = nongeneric_citations[:top_k]
-
-    citations = _prioritize_root_cause_coverage(citations, max_items=top_k)
-    citations = _dedup_root_cause_candidates_semantic(citations, max_items=top_k)
-
-    sem_strong = [
-        c for c in citations
-        if float(c.get("semantic_score", 0.0)) >= 0.02
-    ]
-    if len(sem_strong) >= 2:
-        citations = sem_strong[:top_k]
-
-    if float(sim_max or 0.0) < ASK_SIM_THRESHOLD and not (fts_used and citations):
+    citations = list(retrieval.get("citations") or [])
+    if not citations:
         return _finalize(
             {
                 "ok": True,
@@ -5901,103 +5978,39 @@ def root_cause_v1(
             }
         )
 
-    enriched_citations: list[dict] = []
-    seen_enriched = set()
-
+    prompt_citations = []
     for c in citations:
-        cid = str(c.get("citation_id") or "").strip()
-        if not cid:
-            continue
+        cc = dict(c)
+        cc["chunk_full"] = (cc.get("chunk_full") or cc.get("snippet") or "").strip()[:1600]
+        cc["snippet"] = (cc.get("snippet") or cc.get("chunk_full") or "").strip()
+        prompt_citations.append(cc)
 
-        central_text = (c.get("chunk_full") or c.get("snippet") or "").strip()
-        if not central_text:
-            continue
-
-        merged = dict(c)
-        merged["evidence_pack"] = f"[{cid}] {central_text[:2200]}"
-
-        if cid not in seen_enriched:
-            seen_enriched.add(cid)
-            enriched_citations.append(merged)
-
-    if enriched_citations:
-        citations = enriched_citations
-
-    ctx_parts: List[str] = []
-    total_chars = 0
-    for c in citations:
-        evidence_text = (c.get("evidence_pack") or c.get("chunk_full") or c.get("snippet") or "").strip()
-        part = (
-            f"[{c['citation_id']}] "
-            f"(doc={c['bubble_document_id']}, p{c['page_from']}-{c['page_to']})\n"
-            f"{evidence_text}\n"
-        )
-        if total_chars + len(part) > ASK_MAX_CONTEXT_CHARS:
-            break
-        ctx_parts.append(part)
-        total_chars += len(part)
-
-    sources_block = "\n\n".join(ctx_parts).strip()
-
-    evidence_matrix_block = ""
-    if evidence_matrix_used:
-        lines = []
-        for i, hyp in enumerate(evidence_matrix.get("cause_hypotheses") or [], start=1):
-            cause = str(hyp.get("cause") or "").strip()
-            ev_ids = [str(x).strip() for x in (hyp.get("evidence_ids") or []) if str(x).strip()]
-            checks = [str(x).strip() for x in (hyp.get("check_focus") or []) if str(x).strip()]
-
-            if not cause:
-                continue
-
-            lines.append(f"IPOTESI_{i}: {cause}")
-            if ev_ids:
-                lines.append("EVIDENZE: " + ", ".join(ev_ids[:3]))
-            if checks:
-                lines.append("VERIFICHE_FOCUS: " + " | ".join(checks[:3]))
-
-        evidence_matrix_block = "\n".join(lines).strip()
-
-    subsystem_focus_block = ", ".join(target_subsystems) if target_subsystems else "(non identificato)"
+    sources_block = _build_sources_block_from_citations(
+        prompt_citations,
+        max_context_chars=ASK_MAX_CONTEXT_CHARS,
+        prefer_chunk_full=True,
+    )
 
     schema = _root_cause_response_schema(max_causes=max_causes)
+    response_language = _select_response_language(q, planner=planner)
 
     system_msg = (
-        "Sei un assistente tecnico industriale specializzato in root cause analysis. "
-        "Devi ragionare come un tecnico esperto che distingue tra sintomo, possibile causa, evidenza e verifica pratica. "
-        "Devi usare SOLO le FONTI fornite. "
-        "Usa la MATRICE_EVIDENZE come pre-sintesi utile, ma verifica sempre coerenza con le fonti. "
-        "Se più evidenze puntano alla stessa area causale, uniscile in un'unica causa e non duplicarle. "
-        "Obiettivo: proporre poche cause plausibili e verifiche pratiche, senza inventare. "
-        f"Regole obbligatorie:\n"
-        f"1) restituisci massimo {max_causes} possibili cause;\n"
-        "2) ogni causa deve avere almeno 1 citation_id preso ESATTAMENTE dalle fonti;\n"
-        "3) non usare conoscenza esterna;\n"
-        "4) se le fonti non bastano, restituisci possible_causes=[] e recommended_next_checks=[];\n"
-        "5) le verifiche devono essere controlli operativi concreti e brevi;\n"
-        "6) privilegia cause coerenti con il sintomo osservato, non manutenzione generica;\n"
-        "7) non duplicare cause quasi uguali;\n"
-        "8) non citare fonti inesistenti.\n"
-        "9) preferisci evidenze provenienti da sezioni operative o di componente; overview, safety, installation, start-up, caratteristiche generali o acoustic sections valgono solo se il sintomo le riguarda direttamente.\n"
-        "10) non proporre cause basate principalmente su sezioni generali di manutenzione, lubrificazione macchina, pneumatica, safety o overview se le fonti non collegano esplicitamente quella causa al gruppo coinvolto dal sintomo.\n"
-        "11) se una fonte parla del sintomo in modo generico ma non del gruppo/processo corretto, non usarla come evidenza centrale.\n"
-        "12) non proporre cause di installazione, posizionamento, fondazione, livellamento o piano di appoggio salvo che la query riguardi esplicitamente setup, installazione, messa in servizio o spostamento macchina.\n"
-        "13) non usare come evidenza centrale sezioni di descrizione generale della macchina o sezioni safety/ripari/porte se non collegano esplicitamente il problema al componente o gruppo coinvolto.\n"
-        "14) evita di usare più citations della stessa famiglia di evidenza per la stessa causa, salvo che siano realmente complementari.\n"
-        "15) privilegia cause diverse ben supportate, non variazioni della stessa causa basate sulla stessa area di testo.\n"
-        "16) privilegia cause supportate da evidenze dirette sul componente o sul processo coinvolto; le evidenze collaterali o indirette valgono meno se esistono fonti più dirette.\n"
-        "17) non promuovere come causa principale istruzioni isolate di avviamento, inversione fasi, verso motore pompa o controlli secondari se non sono il supporto più diretto disponibile.\n"
-        "18) privilegia cause appartenenti ai sottosistemi dominanti implicati dal sintomo.\n"
-        "19) usa sottosistemi secondari solo se la causa è davvero plausibile e ben supportata da fonti specifiche.\n"
-        "20) Rispondi nella stessa lingua del sintomo/problema fornito dall’utente.\n"
+        "You are a root-cause assistant for technical equipment and machine documentation. "
+        "Use ONLY the provided sources. "
+        "Work domain-agnostically: do not assume a sector, machine family, subsystem taxonomy, or standard failure mode unless the sources support it. "
+        "You may make cautious multi-source inferences, but every proposed cause must remain tightly grounded. "
+        "Order causes by groundedness, not by creativity. "
+        "Each 'cause' must be a short canonical label of about 3 to 10 words, preferably a noun phrase, with no trailing period. "
+        "Avoid generic boilerplate causes unless the sources clearly support them. "
+        "Always reply in the same language as the user query."
     )
 
     user_msg = (
-        f"SINTOMO/PROBLEMA:\n{q}\n\n"
-        f"SOTTOSISTEMI_PRIORITARI:\n{subsystem_focus_block}\n\n"
-        f"MATRICE_EVIDENZE:\n{evidence_matrix_block or '(non disponibile)'}\n\n"
-        f"FONTI:\n{sources_block}\n\n"
-        "Restituisci JSON valido. Nelle citations usa solo citation_id presenti nelle fonti."
+        f"USER_PROBLEM:\n{q}\n\n"
+        f"NORMALIZED_PROBLEM:\n{planner.get('normalized_query') or q}\n\n"
+        f"RESPONSE_LANGUAGE:\n{response_language}\n\n"
+        f"SOURCES:\n{sources_block}\n\n"
+        "Return valid JSON. Use only citation_id values present in the sources."
     )
 
     try:
@@ -6026,7 +6039,7 @@ def root_cause_v1(
     )
 
     if not grounded_result.get("problem_summary"):
-        grounded_result["problem_summary"] = q
+        grounded_result["problem_summary"] = planner.get("normalized_query") or q
 
     if not grounded_result.get("possible_causes"):
         return _finalize(
@@ -6069,6 +6082,7 @@ def root_cause_v1(
             "chat_model": OPENAI_CHAT_MODEL,
         }
     )
+
 
 @app.post("/v1/ai/delete/document")
 def delete_document_v1(
