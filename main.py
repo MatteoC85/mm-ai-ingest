@@ -1289,9 +1289,10 @@ def _localized_token_answer(language: str, token: str, citation_id: str) -> str:
     return f"Nel documento compare questa stringa: {token} [{citation_id}]"
 
 
+
 def _ask_response_schema() -> dict:
     return {
-        "name": "ask_grounded_answer_v2",
+        "name": "ask_grounded_answer_v3",
         "strict": True,
         "schema": {
             "type": "object",
@@ -1322,7 +1323,6 @@ def _ask_response_schema() -> dict:
             "required": ["answer_status", "grounded_points"],
         },
     }
-
 
 def _render_grounded_answer_points(
     grounded_points: list[dict],
@@ -1453,6 +1453,278 @@ def _translate_text_preserving_citations(text: str, target_language: str) -> str
     except Exception:
         return text
 
+
+
+
+def _query_translation_schema() -> dict:
+    return {
+        "name": "query_translation_for_retrieval_v1",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "text": {"type": "string"},
+            },
+            "required": ["text"],
+        },
+    }
+
+
+def _translate_query_for_retrieval(text: str, target_language: str) -> str:
+    text = re.sub(r"\s+", " ", _normalize_unicode_advanced(text or "")).strip()
+    target_language = str(target_language or "").strip().lower()
+    if not text or target_language not in {"it", "en"}:
+        return text
+
+    system_msg = (
+        "Translate the user's technical query for document retrieval. "
+        "Preserve meaning exactly, keep it short, do not add explanations, "
+        "do not assume a domain, and preserve codes, identifiers, and proper names exactly."
+    )
+    user_msg = (
+        f"TARGET_LANGUAGE: {target_language}\n\n"
+        f"QUERY:\n{text}"
+    )
+
+    try:
+        parsed = _openai_chat_json(
+            [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            model=SEMANTIC_QUERY_PLANNER_MODEL,
+            json_schema=_query_translation_schema(),
+            timeout=20,
+        )
+        translated = re.sub(r"\s+", " ", str((parsed or {}).get("text") or "")).strip()
+        return translated or text
+    except Exception:
+        return text
+
+
+def _augment_crosslingual_query_plan(q: str, planner: Optional[dict]) -> dict:
+    planner = dict(planner or {})
+    q_norm = re.sub(r"\s+", " ", _normalize_unicode_advanced(q or "")).strip()
+    query_language = str(planner.get("query_language") or _simple_query_language(q_norm)).strip().lower()
+
+    planner["crosslingual_dense_queries"] = []
+    planner["crosslingual_lexical_queries"] = []
+
+    if not q_norm or query_language not in {"it", "en"}:
+        return planner
+
+    target_language = "en" if query_language == "it" else "it"
+    base_text = re.sub(r"\s+", " ", str(planner.get("normalized_query") or q_norm)).strip() or q_norm
+    translated = _translate_query_for_retrieval(base_text, target_language)
+
+    if translated and translated.lower() != base_text.lower():
+        planner["crosslingual_dense_queries"] = _dedup_text_values([translated], limit=1)
+        planner["crosslingual_lexical_queries"] = _dedup_text_values([translated], limit=1)
+
+    return planner
+
+
+def _ask_rescue_response_schema() -> dict:
+    return {
+        "name": "ask_grounded_answer_rescue_v1",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "grounded_points": {
+                    "type": "array",
+                    "maxItems": 3,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "text": {"type": "string"},
+                            "citation_ids": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "maxItems": 3,
+                            },
+                        },
+                        "required": ["text", "citation_ids"],
+                    },
+                },
+            },
+            "required": ["grounded_points"],
+        },
+    }
+
+
+def _extractive_fallback_answer(
+    citations: list[dict],
+    response_language: str,
+    *,
+    max_points: int = 2,
+) -> tuple[str, list[dict]]:
+    if not citations:
+        return "", []
+
+    parts: list[str] = []
+    used: list[dict] = []
+
+    for c in citations[:max_points]:
+        body = re.sub(r"^SECTION:\s*[^\n]+\n?", "", (c.get("chunk_full") or c.get("snippet") or ""), flags=re.IGNORECASE).strip()
+        if not body:
+            continue
+
+        sentence = ""
+        lines = [ln.strip() for ln in body.split("\n") if ln.strip()]
+        if lines:
+            sentence = lines[0]
+        if not sentence:
+            match = re.split(r"(?<=[\.!?])\s+", body)
+            sentence = (match[0] if match else body).strip()
+
+        sentence = re.sub(r"\s+", " ", sentence).strip()
+        if not sentence:
+            continue
+
+        if sentence[-1] not in ".!?":
+            sentence += "."
+        parts.append(f"{sentence} [{c['citation_id']}]")
+        used.append(c)
+
+    answer = " ".join(parts).strip()
+    if answer and not _looks_like_target_language(answer, response_language):
+        answer = _translate_text_preserving_citations(answer, response_language)
+
+    return answer, used
+
+
+def _enrich_ask_prompt_citations(
+    company_id: str,
+    citations: list[dict],
+    *,
+    max_manual_expansions: int = 2,
+    radius: int = 1,
+) -> list[dict]:
+    out: list[dict] = []
+    manual_done = 0
+
+    for c in citations or []:
+        cc = dict(c)
+        source_type = _source_type_from_document_id(cc.get("bubble_document_id") or "")
+        if source_type == "manual" and manual_done < max_manual_expansions:
+            try:
+                neighbors = _expand_with_neighbor_chunks(
+                    company_id=company_id,
+                    bubble_document_id=str(cc.get("bubble_document_id") or ""),
+                    citation_ids=[str(cc.get("citation_id") or "")],
+                    radius=radius,
+                )
+            except Exception:
+                neighbors = []
+
+            texts: list[str] = []
+            seen = set()
+            for n in neighbors:
+                txt = re.sub(r"\s+", " ", (n.get("chunk_full") or n.get("snippet") or "").strip())
+                if not txt:
+                    continue
+                if txt in seen:
+                    continue
+                seen.add(txt)
+                texts.append(txt)
+
+            if texts:
+                cc["chunk_full"] = "\n".join(texts)[:2200]
+                if not cc.get("snippet"):
+                    cc["snippet"] = texts[0][:ASK_SNIPPET_CHARS]
+
+            manual_done += 1
+
+        out.append(cc)
+
+    return out
+
+
+def _generate_ask_grounded_points(
+    *,
+    q: str,
+    planner: dict,
+    response_language: str,
+    company_id: str,
+    citations: list[dict],
+    allow_no_sources: bool,
+) -> tuple[str, list[dict]]:
+    if not citations:
+        return "no_sources", []
+
+    prompt_citations = _enrich_ask_prompt_citations(
+        company_id=company_id,
+        citations=citations,
+        max_manual_expansions=2,
+        radius=1,
+    )
+    sources_block = _build_sources_block_from_citations(
+        prompt_citations,
+        max_context_chars=ASK_MAX_CONTEXT_CHARS,
+        prefer_chunk_full=True,
+    )
+
+    if allow_no_sources:
+        system_msg = (
+            "You are a technical documentation assistant for machinery and industrial equipment. "
+            "Use ONLY the provided sources. "
+            "Procedures and problem-solution entries are valid evidence when directly relevant, "
+            "but a generic procedure or generic P&S must not outweigh a more specific manual passage. "
+            "Prefer the most specific grounded evidence available. "
+            "Never use outside knowledge. "
+            "Always reply in the requested response language. "
+            "If the sources do not directly answer the question but they still contain closely relevant evidence, "
+            "return answered with cautious grounded points that explicitly say the documents do or do not state something directly. "
+            "Use no_sources only when the sources are genuinely not helpful. "
+            "Return 1 to 3 short grounded points only. "
+            "Each point must be directly supported by its citation_ids."
+        )
+        schema = _ask_response_schema()
+    else:
+        system_msg = (
+            "You are a technical documentation assistant for machinery and industrial equipment. "
+            "Use ONLY the provided sources. "
+            "Always reply in the requested response language. "
+            "Return 1 to 3 very short grounded points. "
+            "You MUST return grounded_points, even if the evidence is partial. "
+            "If the documents do not state the requested thing directly, say that explicitly and then report the closest grounded evidence. "
+            "Do not return no_sources. "
+            "Each point must be directly supported by citation_ids from the sources."
+        )
+        schema = _ask_rescue_response_schema()
+
+    user_msg = (
+        f"QUESTION:\n{q}\n\n"
+        f"NORMALIZED_QUESTION:\n{planner.get('normalized_query') or q}\n\n"
+        f"RESPONSE_LANGUAGE:\n{response_language}\n\n"
+        f"SOURCES:\n{sources_block}\n\n"
+        "Return valid JSON. Use only citation ids present in the sources."
+    )
+
+    try:
+        parsed = _openai_chat_json(
+            [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            model=OPENAI_CHAT_MODEL,
+            json_schema=schema,
+            timeout=60,
+        )
+    except Exception:
+        return "no_sources", []
+
+    if allow_no_sources:
+        answer_status = str((parsed or {}).get("answer_status") or "").strip().lower()
+        grounded_points = list((parsed or {}).get("grounded_points") or [])
+        return (answer_status or "no_sources"), grounded_points
+
+    grounded_points = list((parsed or {}).get("grounded_points") or [])
+    return ("answered" if grounded_points else "no_sources"), grounded_points
 
 def _ground_citations_to_ids(citation_ids: list[str], citations: list[dict]) -> list[dict]:
     if not citation_ids or not citations:
@@ -1869,7 +2141,14 @@ def _candidate_specificity_score(item: dict) -> float:
     return max(-0.14, min(0.14, score))
 
 
-def _candidate_source_bias(item: dict, query_terms: set[str]) -> tuple[float, dict]:
+
+def _candidate_source_bias(
+    item: dict,
+    query_terms: set[str],
+    *,
+    query_style: str = "",
+    query_token_count: int = 0,
+) -> tuple[float, dict]:
     text = (item.get("chunk_full") or item.get("snippet") or "").strip()
     text_terms = _content_term_set(text, limit=100)
     overlap = _term_overlap_score(query_terms, text_terms)
@@ -1878,22 +2157,41 @@ def _candidate_source_bias(item: dict, query_terms: set[str]) -> tuple[float, di
     bias = 0.0
 
     if source_type == "manual":
-        if overlap >= 0.14 and len(text_terms) >= 18:
-            bias += 0.05
-    elif source_type == "ps":
-        if len(text_terms) <= 18 and overlap < 0.22:
-            bias -= 0.14
-        elif len(text_terms) <= 28 and overlap < 0.18:
-            bias -= 0.08
-        elif overlap >= 0.24:
-            bias += 0.02
-    elif source_type in {"procedure", "step"}:
-        if len(text_terms) <= 18 and overlap < 0.18:
-            bias -= 0.08
-        elif overlap >= 0.24:
+        if overlap >= 0.10 and len(text_terms) >= 16:
+            bias += 0.04
+        if query_token_count >= 4 and overlap >= 0.08 and len(text_terms) >= 14:
             bias += 0.03
 
-    return max(-0.16, min(0.08, bias)), {
+    elif source_type == "ps":
+        if query_token_count >= 4:
+            if len(text_terms) <= 26 and overlap < 0.24:
+                bias -= 0.16
+            elif len(text_terms) <= 36 and overlap < 0.20:
+                bias -= 0.10
+        else:
+            if len(text_terms) <= 18 and overlap < 0.22:
+                bias -= 0.14
+            elif len(text_terms) <= 28 and overlap < 0.18:
+                bias -= 0.08
+        if overlap >= 0.28 and len(text_terms) >= 16:
+            bias += 0.02
+
+    elif source_type in {"procedure", "step"}:
+        if query_token_count >= 4:
+            if len(text_terms) <= 26 and overlap < 0.22:
+                bias -= 0.11
+            elif len(text_terms) <= 34 and overlap < 0.18:
+                bias -= 0.07
+        else:
+            if len(text_terms) <= 18 and overlap < 0.18:
+                bias -= 0.08
+        if overlap >= 0.26:
+            bias += 0.03
+
+    if query_style == "natural" and source_type in {"ps", "procedure", "step"} and len(text_terms) <= 24:
+        bias -= 0.04
+
+    return max(-0.18, min(0.10, bias)), {
         "source_type": source_type,
         "overlap_score": overlap,
         "content_term_count": len(text_terms),
@@ -1904,6 +2202,9 @@ def _rebalance_selected_citations(
     selected_citations: list[dict],
     ranked_candidates: list[dict],
     top_k: int,
+    *,
+    query_style: str = "",
+    query_token_count: int = 0,
 ) -> list[dict]:
     if not selected_citations:
         return []
@@ -1918,7 +2219,7 @@ def _rebalance_selected_citations(
     top_score = float(out[0].get("retrieval_score", out[0].get("similarity", 0.0)) or 0.0)
     manual_selected = any(source_type(c) == "manual" for c in out)
 
-    if not manual_selected:
+    if query_token_count >= 4 and not manual_selected:
         for cand in ordered_ranked:
             cid = str(cand.get("citation_id") or "").strip()
             if not cid or cid in selected_ids:
@@ -1926,7 +2227,7 @@ def _rebalance_selected_citations(
             if source_type(cand) != "manual":
                 continue
             cand_score = float(cand.get("retrieval_score", cand.get("similarity", 0.0)) or 0.0)
-            if cand_score >= top_score - 0.08:
+            if cand_score >= top_score - 0.14:
                 out = [cand] + out
                 out = _dedup_citations_by_snippet(out, max_items=top_k)
                 selected_ids = {str(c.get("citation_id") or "").strip() for c in out if c.get("citation_id")}
@@ -1935,11 +2236,11 @@ def _rebalance_selected_citations(
     generic_structured = [
         c for c in out
         if source_type(c) in {"ps", "procedure", "step"}
-        and float(c.get("overlap_score", 0.0)) < 0.18
-        and float(c.get("specificity_score", 0.0)) < 0.03
+        and float(c.get("overlap_score", 0.0)) < 0.20
+        and float(c.get("specificity_score", 0.0)) < 0.04
     ]
 
-    if len(generic_structured) > 1:
+    if query_token_count >= 4 and len(generic_structured) > 1:
         keep_first = True
         replacements: list[dict] = []
         for c in out:
@@ -1958,7 +2259,7 @@ def _rebalance_selected_citations(
             if source_type(cand) != "manual":
                 continue
             cand_score = float(cand.get("retrieval_score", cand.get("similarity", 0.0)) or 0.0)
-            if cand_score >= top_score - 0.10:
+            if cand_score >= top_score - 0.16:
                 replacements.append(cand)
                 existing_ids.add(cid)
             if len(replacements) >= top_k:
@@ -1966,7 +2267,46 @@ def _rebalance_selected_citations(
 
         out = _dedup_citations_by_snippet(replacements, max_items=top_k)
 
+    if query_style == "natural" and query_token_count >= 4:
+        reordered: list[dict] = []
+        manuals = [c for c in out if source_type(c) == "manual"]
+        others = [c for c in out if source_type(c) != "manual"]
+        if manuals:
+            reordered.extend(manuals[: max(1, min(len(manuals), top_k))])
+            for c in others:
+                if len(reordered) >= top_k:
+                    break
+                reordered.append(c)
+            out = reordered[:top_k]
+
     return out[:top_k]
+
+
+
+def _retrieval_quality_score(retrieval: dict) -> float:
+    citations = list((retrieval or {}).get("citations") or [])
+    if not citations:
+        return -1.0
+
+    sim_max = float((retrieval or {}).get("similarity_max") or 0.0)
+    manual_count = sum(1 for c in citations if _source_type_from_document_id(c.get("bubble_document_id") or "") == "manual")
+    max_overlap = max((float(c.get("overlap_score", 0.0)) for c in citations), default=0.0)
+    max_specificity = max((float(c.get("specificity_score", 0.0)) for c in citations), default=0.0)
+    generic_structured = sum(
+        1
+        for c in citations
+        if _source_type_from_document_id(c.get("bubble_document_id") or "") in {"ps", "procedure", "step"}
+        and float(c.get("overlap_score", 0.0)) < 0.20
+        and float(c.get("specificity_score", 0.0)) < 0.04
+    )
+
+    return (
+        0.34 * sim_max
+        + (0.22 if manual_count > 0 else 0.0)
+        + 0.24 * max_overlap
+        + 0.16 * max_specificity
+        - 0.07 * generic_structured
+    )
 
 
 def _shared_semantic_retrieval(
@@ -1984,13 +2324,19 @@ def _shared_semantic_retrieval(
     diagnostic_mode: bool = False,
 ) -> dict:
     planner = _semantic_query_plan(q, mode=planner_mode)
+    planner = _augment_crosslingual_query_plan(q, planner)
+
     dense_queries = _dedup_text_values(
-        [q, planner.get("normalized_query")] + list(planner.get("dense_queries") or []),
-        limit=max(2, SEMANTIC_MAX_DENSE_QUERIES + 1),
+        [q, planner.get("normalized_query")]
+        + list(planner.get("dense_queries") or [])
+        + list(planner.get("crosslingual_dense_queries") or []),
+        limit=max(3, SEMANTIC_MAX_DENSE_QUERIES + 2),
     )
     lexical_queries = _dedup_text_values(
-        [q, planner.get("normalized_query")] + list(planner.get("lexical_queries") or []),
-        limit=max(2, SEMANTIC_MAX_LEXICAL_QUERIES + 1),
+        [q, planner.get("normalized_query")]
+        + list(planner.get("lexical_queries") or [])
+        + list(planner.get("crosslingual_lexical_queries") or []),
+        limit=max(3, SEMANTIC_MAX_LEXICAL_QUERIES + 2),
     )
 
     chunks_matching_filter, candidates, query_vectors = _dense_candidates_multi_query(
@@ -2018,16 +2364,23 @@ def _shared_semantic_retrieval(
 
     selected_citations: list[dict] = []
     cut_candidates: list[dict] = []
+    query_terms = _planner_query_term_set(q, planner)
+    query_style = str((planner or {}).get("query_style") or "").strip().lower()
+    query_token_count = _count_query_tokens(q)
 
     if candidates:
         max_rrf = max(float(c.get("rrf_score", 0.0)) for c in candidates) if candidates else 0.0
         prepared: list[dict] = []
-        query_terms = _planner_query_term_set(q, planner)
 
         for c in candidates:
             cc = dict(c)
             rrf_norm = (float(cc.get("rrf_score", 0.0)) / max_rrf) if max_rrf > 0 else 0.0
-            source_bias, source_meta = _candidate_source_bias(cc, query_terms)
+            source_bias, source_meta = _candidate_source_bias(
+                cc,
+                query_terms,
+                query_style=query_style,
+                query_token_count=query_token_count,
+            )
             specificity_score = _candidate_specificity_score(cc)
             overlap_score = float(source_meta.get("overlap_score", 0.0))
 
@@ -2035,9 +2388,9 @@ def _shared_semantic_retrieval(
             cc["specificity_score"] = specificity_score
             cc["source_bias"] = source_bias
             cc["retrieval_score"] = (
-                0.64 * float(cc.get("similarity", 0.0))
-                + 0.20 * rrf_norm
-                + 0.10 * overlap_score
+                0.58 * float(cc.get("similarity", 0.0))
+                + 0.17 * rrf_norm
+                + 0.13 * overlap_score
                 + specificity_score
                 + source_bias
             )
@@ -2060,11 +2413,11 @@ def _shared_semantic_retrieval(
             if (float(sim_max) - float(c.get("similarity", 0.0))) <= sim_delta:
                 cut_candidates.append(c)
 
-        min_keep = min(len(prepared), max(3, top_k))
+        min_keep = min(len(prepared), max(4, top_k))
         if len(cut_candidates) < min_keep:
-            cut_candidates = prepared[:min(len(prepared), max(top_k * 3, 10))]
+            cut_candidates = prepared[:min(len(prepared), max(top_k * 3, 12))]
         else:
-            cut_candidates = cut_candidates[:min(len(cut_candidates), max(top_k * 3, 12))]
+            cut_candidates = cut_candidates[:min(len(cut_candidates), max(top_k * 3, 14))]
 
         q_vec = (
             query_vectors.get(q)
@@ -2076,7 +2429,7 @@ def _shared_semantic_retrieval(
             q_vec,
             cut_candidates,
             top_k=top_k,
-            lambda_mult=0.87 if diagnostic_mode else 0.85,
+            lambda_mult=0.88 if diagnostic_mode else 0.86,
         )
 
         if sim_max is not None and _should_use_reranker(q=q, candidates=cut_candidates, sim_max=float(sim_max), top_k=top_k):
@@ -2101,6 +2454,8 @@ def _shared_semantic_retrieval(
             selected_citations=selected_citations,
             ranked_candidates=cut_candidates,
             top_k=top_k,
+            query_style=query_style,
+            query_token_count=query_token_count,
         )
 
     if (sim_max is None or float(sim_max) < effective_threshold) or not selected_citations:
@@ -2145,7 +2500,6 @@ def _shared_semantic_retrieval(
         "rerank_used": rerank_used,
         "rerank_error": rerank_error[:300] if rerank_error else None,
     }
-
 
 def _expand_with_neighbor_chunks(
     company_id: str,
@@ -4378,6 +4732,126 @@ def _ground_root_cause_result(
 
     return grounded, grounded_citations
 
+
+
+def _root_cause_label_canonicalization_schema(max_causes: int) -> dict:
+    max_causes = max(1, min(int(max_causes or 1), 5))
+    return {
+        "name": "root_cause_label_canonicalization_v1",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "labels": {
+                    "type": "array",
+                    "maxItems": max_causes,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "rank": {"type": "integer"},
+                            "label": {"type": "string"},
+                        },
+                        "required": ["rank", "label"],
+                    },
+                },
+            },
+            "required": ["labels"],
+        },
+    }
+
+
+def _canonicalize_root_cause_labels(
+    result: dict,
+    citations: list[dict],
+    *,
+    language: str,
+) -> dict:
+    result = dict(result or {})
+    possible_causes = list(result.get("possible_causes") or [])
+    if not possible_causes:
+        return result
+
+    by_id = {
+        str(c.get("citation_id") or "").strip(): c
+        for c in (citations or [])
+        if c.get("citation_id")
+    }
+
+    items = []
+    for cause in possible_causes:
+        if not isinstance(cause, dict):
+            continue
+        evidence = []
+        for cid in cause.get("citations") or []:
+            cid = str(cid or "").strip()
+            if not cid or cid not in by_id:
+                continue
+            c = by_id[cid]
+            snippet = re.sub(r"\s+", " ", (c.get("snippet") or c.get("chunk_full") or "")).strip()
+            evidence.append({
+                "citation_id": cid,
+                "snippet": snippet[:220],
+            })
+            if len(evidence) >= 2:
+                break
+
+        items.append(
+            {
+                "rank": int(cause.get("rank") or 0),
+                "current_label": str(cause.get("cause") or "").strip(),
+                "why": str(cause.get("why") or "").strip(),
+                "evidence": evidence,
+            }
+        )
+
+    if not items:
+        return result
+
+    system_msg = (
+        "Normalize root-cause labels into short canonical technical labels. "
+        "Reuse source terminology whenever possible. "
+        "Do not broaden or narrow the meaning. "
+        "Keep each label to about 3 to 8 words, noun-phrase style, with no trailing period. "
+        "Use the requested language."
+    )
+    user_msg = (
+        f"LANGUAGE: {language}\n\n"
+        f"CAUSE_ITEMS_JSON:\n{json.dumps(items, ensure_ascii=False)}"
+    )
+
+    try:
+        parsed = _openai_chat_json(
+            [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            model=OPENAI_CHAT_MODEL,
+            json_schema=_root_cause_label_canonicalization_schema(len(items)),
+            timeout=40,
+        )
+    except Exception:
+        return result
+
+    labels = {
+        int(x.get("rank") or 0): re.sub(r"\s+", " ", str(x.get("label") or "")).strip().rstrip(".")
+        for x in (parsed or {}).get("labels") or []
+        if isinstance(x, dict)
+    }
+
+    out_causes = []
+    for cause in possible_causes:
+        rank = int(cause.get("rank") or 0)
+        label = labels.get(rank)
+        new_cause = dict(cause)
+        if label:
+            new_cause["cause"] = label
+        out_causes.append(new_cause)
+
+    result["possible_causes"] = out_causes
+    return result
+
 def _sanitize_citations_for_response(citations: list[dict]) -> list[dict]:
     out: list[dict] = []
 
@@ -5673,6 +6147,7 @@ def search_chunks(
 
 
 @app.post("/v1/ai/ask")
+
 def ask_v1(
     payload: AskRequest,
     x_ai_internal_secret: Optional[str] = Header(default=None),
@@ -5699,9 +6174,9 @@ def ask_v1(
 
     top_k = int(payload.top_k or 5)
     top_k = max(1, min(top_k, ASK_MAX_TOP_K))
-    candidate_k = max(top_k, min(40, top_k * 6))
+    candidate_k = max(top_k, min(48, top_k * 7))
 
-    retrieval = _shared_semantic_retrieval(
+    primary_retrieval = _shared_semantic_retrieval(
         q=q,
         company_id=company_id,
         machine_id=machine_id,
@@ -5715,10 +6190,62 @@ def ask_v1(
         diagnostic_mode=False,
     )
 
-    planner = retrieval.get("planner") or {}
+    planner = primary_retrieval.get("planner") or {}
     response_language = _select_response_language(q, planner=planner)
     no_sources_text = _localized_no_sources(response_language)
 
+    retrieval = primary_retrieval
+    citations = list(retrieval.get("citations") or [])
+    sim_max = retrieval.get("similarity_max")
+    query_token_count = _count_query_tokens(q)
+
+    rescue_retrieval: Optional[dict] = None
+    need_rescue_retrieval = (
+        query_token_count >= 4
+        and (
+            not citations
+            or response_language == "en"
+            or all(_source_type_from_document_id(c.get("bubble_document_id") or "") in {"ps", "procedure", "step"} for c in citations)
+            or float(sim_max or 0.0) < float(retrieval.get("effective_threshold") or ASK_SIM_THRESHOLD) + 0.05
+        )
+    )
+
+    if need_rescue_retrieval:
+        rescue_retrieval = _shared_semantic_retrieval(
+            q=q,
+            company_id=company_id,
+            machine_id=machine_id,
+            candidate_k=max(candidate_k, top_k * 10),
+            top_k=max(top_k, 5),
+            doc_ids=doc_ids if isinstance(doc_ids, list) else None,
+            bubble_document_id=bubble_document_id,
+            debug=payload.debug,
+            planner_mode="root_cause",
+            base_threshold=min(ASK_SIM_THRESHOLD, ASK_SHORT_QUERY_SIM_THRESHOLD),
+            diagnostic_mode=True,
+        )
+
+        primary_score = _retrieval_quality_score(primary_retrieval)
+        rescue_score = _retrieval_quality_score(rescue_retrieval)
+
+        if rescue_score > primary_score + 0.04:
+            retrieval = rescue_retrieval
+        elif rescue_retrieval.get("citations"):
+            merged = _dedup_citations_by_snippet(
+                list(primary_retrieval.get("citations") or []) + list(rescue_retrieval.get("citations") or []),
+                max_items=max(top_k, 6),
+            )
+            retrieval = dict(primary_retrieval)
+            retrieval["citations"] = merged
+            retrieval["similarity_max"] = max(
+                float(primary_retrieval.get("similarity_max") or 0.0),
+                float(rescue_retrieval.get("similarity_max") or 0.0),
+            )
+            retrieval["fts_used"] = bool(primary_retrieval.get("fts_used")) or bool(rescue_retrieval.get("fts_used"))
+            retrieval["prefix_fts_used"] = bool(primary_retrieval.get("prefix_fts_used")) or bool(rescue_retrieval.get("prefix_fts_used"))
+            retrieval["exact_fts_used"] = bool(primary_retrieval.get("exact_fts_used")) or bool(rescue_retrieval.get("exact_fts_used"))
+
+    planner = retrieval.get("planner") or planner
     citations = list(retrieval.get("citations") or [])
     sim_max = retrieval.get("similarity_max")
 
@@ -5741,6 +6268,9 @@ def ask_v1(
                 "rerank_enabled": RERANK_ENABLED,
                 "rerank_used": bool(retrieval.get("rerank_used")),
                 "rerank_error": retrieval.get("rerank_error"),
+                "rescue_retrieval_used": rescue_retrieval is not None,
+                "rescue_retrieval_quality": _retrieval_quality_score(rescue_retrieval or {}),
+                "primary_retrieval_quality": _retrieval_quality_score(primary_retrieval or {}),
             }
         return resp
 
@@ -5866,75 +6396,39 @@ def ask_v1(
             }
         )
 
-    prompt_citations = []
-    for c in citations:
-        cc = dict(c)
-        cc["snippet"] = (cc.get("snippet") or cc.get("chunk_full") or "").strip()
-        prompt_citations.append(cc)
-
-    sources_block = _build_sources_block_from_citations(
-        prompt_citations,
-        max_context_chars=ASK_MAX_CONTEXT_CHARS,
-        prefer_chunk_full=False,
+    answer_status, grounded_points = _generate_ask_grounded_points(
+        q=q,
+        planner=planner,
+        response_language=response_language,
+        company_id=company_id,
+        citations=citations,
+        allow_no_sources=True,
     )
-
-    system_msg = (
-        "You are a technical documentation assistant for machinery and industrial equipment. "
-        "Use ONLY the provided sources. "
-        "Procedures and problem-solution entries are valid evidence when directly relevant, "
-        "but a generic procedure or generic P&S must not outweigh a more specific manual passage. "
-        "Prefer the most specific grounded evidence available. "
-        "Never use outside knowledge. "
-        "Always reply in the requested response language. "
-        "Return 1 to 3 short grounded points only. "
-        "Each point must be directly supported by its citation_ids. "
-        "If the sources are insufficient, return answer_status='no_sources' and grounded_points=[]."
-    )
-
-    user_msg = (
-        f"QUESTION:\n{q}\n\n"
-        f"NORMALIZED_QUESTION:\n{planner.get('normalized_query') or q}\n\n"
-        f"RESPONSE_LANGUAGE:\n{response_language}\n\n"
-        f"SOURCES:\n{sources_block}\n\n"
-        "Return valid JSON. Use only citation ids present in the sources. "
-        "Do not write a freeform paragraph; return only grounded_points."
-    )
-
-    try:
-        answer_json = _openai_chat_json(
-            [
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_msg},
-            ],
-            model=OPENAI_CHAT_MODEL,
-            json_schema=_ask_response_schema(),
-            timeout=60,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"LLM failed: {str(e)}")
-
-    answer_status = str((answer_json or {}).get("answer_status") or "").strip().lower()
-    grounded_points = list((answer_json or {}).get("grounded_points") or [])
 
     if answer_status == "no_sources" or not grounded_points:
-        return _finalize(
-            {
-                "ok": True,
-                "status": "no_sources",
-                "answer": no_sources_text,
-                "citations": [],
-                "rg_links": [],
-                "top_k": top_k,
-                "similarity_max": sim_max,
-            }
+        answer_status, grounded_points = _generate_ask_grounded_points(
+            q=q,
+            planner=planner,
+            response_language=response_language,
+            company_id=company_id,
+            citations=citations,
+            allow_no_sources=False,
         )
 
-    answer, final_citations = _render_grounded_answer_points(
-        grounded_points=grounded_points,
-        citations=citations,
-        max_points=min(3, top_k),
-    )
-    if not final_citations:
+    if answer_status == "no_sources" or not grounded_points:
+        answer, final_citations = _extractive_fallback_answer(
+            citations=citations,
+            response_language=response_language,
+            max_points=min(2, top_k),
+        )
+    else:
+        answer, final_citations = _render_grounded_answer_points(
+            grounded_points=grounded_points,
+            citations=citations,
+            max_points=min(3, top_k),
+        )
+
+    if not answer or not final_citations:
         return _finalize(
             {
                 "ok": True,
@@ -6138,6 +6632,11 @@ def draft_ps_v1(
         result=grounded_result,
         citations=grounded_citations,
         max_per_cause=2,
+    )
+    grounded_result = _canonicalize_root_cause_labels(
+        grounded_result,
+        grounded_citations,
+        language=language,
     )
 
     final_title = str((result_json or {}).get("title") or "").strip()
@@ -6396,6 +6895,11 @@ def root_cause_v1(
         result=grounded_result,
         citations=grounded_citations,
         max_per_cause=2,
+    )
+    grounded_result = _canonicalize_root_cause_labels(
+        grounded_result,
+        grounded_citations,
+        language=response_language,
     )
 
     if not grounded_result.get("problem_summary"):
