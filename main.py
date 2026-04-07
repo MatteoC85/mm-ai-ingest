@@ -57,6 +57,9 @@ RERANK_MAX_SIM_MAX = float(os.environ.get("MM_RERANK_MAX_SIM_MAX", "0.72"))
 RERANK_MAX_SPREAD = float(os.environ.get("MM_RERANK_MAX_SPREAD", "0.10"))
 RERANK_MIN_CANDIDATES = int(os.environ.get("MM_RERANK_MIN_CANDIDATES", "4"))
 
+FINAL_CITATION_LOCK_DELTA = float(os.environ.get("MM_FINAL_CITATION_LOCK_DELTA", "0.028"))
+FINAL_CITATION_LOCK_DIAGNOSTIC_DELTA = float(os.environ.get("MM_FINAL_CITATION_LOCK_DIAGNOSTIC_DELTA", "0.042"))
+
 ASK_SIM_THRESHOLD = float(os.environ.get("MM_ASK_SIM_THRESHOLD", "0.35"))
 ASK_SHORT_QUERY_SIM_THRESHOLD = float(os.environ.get("MM_ASK_SHORT_QUERY_SIM_THRESHOLD", "0.28"))
 ASK_MAX_TOP_K = int(os.environ.get("MM_ASK_MAX_TOP_K", "8"))
@@ -1675,6 +1678,7 @@ def _generate_ask_grounded_points(
             "Procedures and problem-solution entries are valid evidence when directly relevant, "
             "but a generic procedure or generic P&S must not outweigh a more specific manual passage. "
             "Prefer the most specific grounded evidence available. "
+            "When multiple evidence sets are close in quality, prefer the dominant grounded evidence family rather than mixing weak alternatives. "
             "Never use outside knowledge. "
             "Always reply in the requested response language. "
             "If the sources do not directly answer the question but they still contain closely relevant evidence, "
@@ -2142,6 +2146,230 @@ def _candidate_specificity_score(item: dict) -> float:
 
 
 
+
+def _stable_evidence_family_key(item: dict) -> str:
+    source_type = _source_type_from_document_id(item.get("bubble_document_id") or "")
+    doc_id = str(item.get("bubble_document_id") or "").strip()
+    page_from = int(item.get("page_from") or 0)
+
+    section = _extract_section_from_text(item.get("chunk_full") or item.get("snippet") or "")
+    section = _normalize_unicode_advanced(section or "")
+    section = re.sub(r"\s+", " ", section).strip().lower()[:120]
+
+    if section:
+        return f"{source_type}|{doc_id}|sec:{section}"
+
+    if source_type == "manual":
+        return f"{source_type}|{doc_id}|p{page_from}"
+
+    return f"{source_type}|{doc_id}|p{page_from}"
+
+
+def _locked_family_score(bundle: dict) -> float:
+    members = list(bundle.get("members") or [])
+    if not members:
+        return -1.0
+
+    best = float(members[0].get("retrieval_score", members[0].get("similarity", 0.0)) or 0.0)
+    second = float(members[1].get("retrieval_score", members[1].get("similarity", 0.0)) or 0.0) if len(members) >= 2 else 0.0
+    max_overlap = max((float(m.get("overlap_score", 0.0)) for m in members), default=0.0)
+    max_specificity = max((float(m.get("specificity_score", 0.0)) for m in members), default=0.0)
+    selected_count = int(bundle.get("selected_count") or 0)
+    source_type = str(bundle.get("source_type") or "manual")
+
+    score = (
+        0.78 * best
+        + 0.18 * second
+        + 0.06 * max_overlap
+        + 0.05 * max_specificity
+        + 0.02 * min(selected_count, 2)
+    )
+
+    if source_type == "manual" and (max_overlap >= 0.08 or max_specificity >= 0.04):
+        score += 0.03
+
+    if source_type in {"ps", "procedure", "step"} and max_overlap < 0.20 and max_specificity < 0.05:
+        score -= 0.05
+
+    return score
+
+
+def _locked_member_order_key(item: dict, selected_ids: set[str]) -> tuple:
+    cid = str(item.get("citation_id") or "").strip()
+    return (
+        0 if cid in selected_ids else 1,
+        -float(item.get("retrieval_score", item.get("similarity", 0.0)) or 0.0),
+        -float(item.get("overlap_score", 0.0) or 0.0),
+        -float(item.get("specificity_score", 0.0) or 0.0),
+        -float(item.get("similarity", 0.0) or 0.0),
+        str(item.get("bubble_document_id") or ""),
+        int(item.get("page_from") or 0),
+        int(item.get("page_to") or 0),
+        int(item.get("chunk_index") or 0),
+        cid,
+    )
+
+
+def _lock_final_citations(
+    *,
+    selected_citations: list[dict],
+    ranked_candidates: list[dict],
+    top_k: int,
+    diagnostic_mode: bool = False,
+    query_token_count: int = 0,
+) -> list[dict]:
+    selected_citations = list(selected_citations or [])
+    ranked_candidates = list(ranked_candidates or [])
+
+    if not selected_citations and not ranked_candidates:
+        return []
+
+    selected_ids = {
+        str(c.get("citation_id") or "").strip()
+        for c in selected_citations
+        if c.get("citation_id")
+    }
+
+    ordered_ranked = sorted(ranked_candidates, key=_candidate_order_key)
+
+    by_id: dict[str, dict] = {}
+    for item in ordered_ranked + selected_citations:
+        cid = str(item.get("citation_id") or "").strip()
+        if not cid:
+            continue
+        prev = by_id.get(cid)
+        if prev is None:
+            by_id[cid] = dict(item)
+            continue
+        prev_score = float(prev.get("retrieval_score", prev.get("similarity", 0.0)) or 0.0)
+        cur_score = float(item.get("retrieval_score", item.get("similarity", 0.0)) or 0.0)
+        if cur_score > prev_score:
+            merged = dict(prev)
+            merged.update(item)
+            by_id[cid] = merged
+
+    families: dict[str, dict] = {}
+    for item in [by_id[str(c.get("citation_id") or "").strip()] for c in selected_citations if str(c.get("citation_id") or "").strip() in by_id] + [by_id[cid] for cid in by_id if cid not in selected_ids]:
+        cid = str(item.get("citation_id") or "").strip()
+        if not cid:
+            continue
+        fam = _stable_evidence_family_key(item)
+        bundle = families.setdefault(
+            fam,
+            {
+                "family_key": fam,
+                "source_type": _source_type_from_document_id(item.get("bubble_document_id") or ""),
+                "members": [],
+                "selected_count": 0,
+            },
+        )
+        bundle["members"].append(item)
+        if cid in selected_ids:
+            bundle["selected_count"] += 1
+
+    if not families:
+        return _dedup_citations_by_snippet(selected_citations, max_items=top_k)
+
+    rows = []
+    for fam, bundle in families.items():
+        members = sorted(bundle["members"], key=lambda x: _locked_member_order_key(x, selected_ids))
+        bundle["members"] = members
+        row = dict(bundle)
+        row["family_score"] = _locked_family_score(bundle)
+        row["best_score"] = float(members[0].get("retrieval_score", members[0].get("similarity", 0.0)) or 0.0)
+        row["generic_structured"] = (
+            row["source_type"] in {"ps", "procedure", "step"}
+            and max((float(m.get("overlap_score", 0.0)) for m in members), default=0.0) < 0.20
+            and max((float(m.get("specificity_score", 0.0)) for m in members), default=0.0) < 0.05
+        )
+        rows.append(row)
+
+    rows.sort(
+        key=lambda r: (
+            -float(r.get("family_score", 0.0)),
+            -float(r.get("best_score", 0.0)),
+            0 if str(r.get("source_type") or "") == "manual" else 1,
+            str(r.get("family_key") or ""),
+        )
+    )
+
+    top_score = float(rows[0].get("family_score", 0.0))
+    delta = FINAL_CITATION_LOCK_DIAGNOSTIC_DELTA if diagnostic_mode else FINAL_CITATION_LOCK_DELTA
+    max_families = 3 if diagnostic_mode else 2
+
+    keep_rows = []
+    for idx, row in enumerate(rows):
+        if idx == 0:
+            keep_rows.append(row)
+            continue
+        gap = top_score - float(row.get("family_score", 0.0))
+        if gap <= delta and len(keep_rows) < max_families:
+            keep_rows.append(row)
+
+    if query_token_count >= 4:
+        top_row = keep_rows[0]
+        if bool(top_row.get("generic_structured")):
+            manual_alt = next(
+                (
+                    row for row in rows
+                    if row.get("source_type") == "manual"
+                    and (top_score - float(row.get("family_score", 0.0))) <= (delta + 0.012)
+                ),
+                None,
+            )
+            if manual_alt is not None and manual_alt.get("family_key") != top_row.get("family_key"):
+                keep_rows = [manual_alt] + [row for row in keep_rows if row.get("family_key") != manual_alt.get("family_key")]
+                keep_rows = keep_rows[:max_families]
+
+    quotas = [2, 1, 1] if diagnostic_mode else [2, 1]
+    if not diagnostic_mode and keep_rows and keep_rows[0].get("source_type") == "manual" and query_token_count >= 4:
+        quotas[0] = min(3, top_k)
+
+    locked: list[dict] = []
+    used_ids: set[str] = set()
+
+    for idx, row in enumerate(keep_rows):
+        quota = quotas[min(idx, len(quotas) - 1)]
+        for member in row["members"]:
+            cid = str(member.get("citation_id") or "").strip()
+            if not cid or cid in used_ids:
+                continue
+            locked.append(member)
+            used_ids.add(cid)
+            if len([x for x in locked if _stable_evidence_family_key(x) == row["family_key"]]) >= quota:
+                break
+        if len(locked) >= top_k:
+            break
+
+    if len(locked) < top_k:
+        for row in keep_rows:
+            for member in row["members"]:
+                cid = str(member.get("citation_id") or "").strip()
+                if not cid or cid in used_ids:
+                    continue
+                locked.append(member)
+                used_ids.add(cid)
+                if len(locked) >= top_k:
+                    break
+            if len(locked) >= top_k:
+                break
+
+    if len(locked) < top_k:
+        for row in rows:
+            for member in row["members"]:
+                cid = str(member.get("citation_id") or "").strip()
+                if not cid or cid in used_ids:
+                    continue
+                locked.append(member)
+                used_ids.add(cid)
+                if len(locked) >= top_k:
+                    break
+            if len(locked) >= top_k:
+                break
+
+    return _dedup_citations_by_snippet(locked, max_items=top_k)
+
+
 def _candidate_source_bias(
     item: dict,
     query_terms: set[str],
@@ -2457,6 +2685,13 @@ def _shared_semantic_retrieval(
             query_style=query_style,
             query_token_count=query_token_count,
         )
+        selected_citations = _lock_final_citations(
+            selected_citations=selected_citations,
+            ranked_candidates=cut_candidates,
+            top_k=top_k,
+            diagnostic_mode=diagnostic_mode,
+            query_token_count=query_token_count,
+        )
 
     if (sim_max is None or float(sim_max) < effective_threshold) or not selected_citations:
         prefix_hits = _fts_search_chunks_prefix(
@@ -2484,6 +2719,15 @@ def _shared_semantic_retrieval(
             fts_used = True
             exact_fts_used = True
             selected_citations = _dedup_citations_by_snippet(selected_citations + exact_hits, max_items=top_k)
+
+    if selected_citations:
+        selected_citations = _lock_final_citations(
+            selected_citations=selected_citations,
+            ranked_candidates=list(cut_candidates or []) + list(selected_citations or []),
+            top_k=top_k,
+            diagnostic_mode=diagnostic_mode,
+            query_token_count=query_token_count,
+        )
 
     return {
         "planner": planner,
@@ -4852,6 +5096,217 @@ def _canonicalize_root_cause_labels(
     result["possible_causes"] = out_causes
     return result
 
+
+def _normalized_cause_label_key(label: str) -> str:
+    s = _normalize_unicode_advanced(label or "").lower()
+    s = re.sub(r"[^a-zà-öø-ÿ0-9\s\-_/]", " ", s)
+    s = re.sub(r"\b(?:the|a|an|il|lo|la|i|gli|le|di|del|della|dei|delle|of|for)\b", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _lock_root_cause_result(
+    result: dict,
+    retrieval_citations: list[dict],
+    *,
+    max_causes: int,
+) -> tuple[dict, list[dict]]:
+    result = dict(result or {})
+    possible_causes = list(result.get("possible_causes") or [])
+    retrieval_citations = list(retrieval_citations or [])
+
+    if not possible_causes or not retrieval_citations:
+        return result, retrieval_citations
+
+    locked_pool = _lock_final_citations(
+        selected_citations=retrieval_citations,
+        ranked_candidates=retrieval_citations,
+        top_k=max(len(retrieval_citations), max_causes * 2),
+        diagnostic_mode=True,
+        query_token_count=6,
+    )
+
+    by_id = {
+        str(c.get("citation_id") or "").strip(): c
+        for c in retrieval_citations
+        if c.get("citation_id")
+    }
+
+    family_score_map: dict[str, float] = {}
+    family_rank_map: dict[str, int] = {}
+
+    ordered_family_keys: list[str] = []
+    seen_fams = set()
+    for idx, c in enumerate(locked_pool):
+        fam = _stable_evidence_family_key(c)
+        if fam not in seen_fams:
+            seen_fams.add(fam)
+            ordered_family_keys.append(fam)
+        family_rank_map[fam] = min(idx, family_rank_map.get(fam, idx))
+
+    for c in retrieval_citations:
+        fam = _stable_evidence_family_key(c)
+        score = (
+            float(c.get("retrieval_score", c.get("similarity", 0.0)) or 0.0)
+            + 0.08 * float(c.get("overlap_score", 0.0) or 0.0)
+            + 0.05 * float(c.get("specificity_score", 0.0) or 0.0)
+        )
+        family_score_map[fam] = max(score, family_score_map.get(fam, -1.0))
+        family_rank_map.setdefault(fam, len(family_rank_map) + 100)
+
+    rows = []
+    for cause in possible_causes:
+        if not isinstance(cause, dict):
+            continue
+
+        raw_ids = []
+        for cid in cause.get("citations") or []:
+            cid = str(cid or "").strip()
+            if cid and cid in by_id:
+                raw_ids.append(cid)
+
+        if not raw_ids:
+            continue
+
+        family_best: dict[str, dict] = {}
+        for cid in raw_ids:
+            item = by_id[cid]
+            fam = _stable_evidence_family_key(item)
+            prev = family_best.get(fam)
+            if prev is None or _candidate_order_key(item) < _candidate_order_key(prev):
+                family_best[fam] = item
+
+        ordered_fams = sorted(
+            family_best.keys(),
+            key=lambda fam: (
+                family_rank_map.get(fam, 9999),
+                -family_score_map.get(fam, 0.0),
+                fam,
+            ),
+        )
+
+        kept_ids = [str(family_best[fam].get("citation_id") or "").strip() for fam in ordered_fams[:2] if family_best.get(fam)]
+        kept_ids = [cid for cid in kept_ids if cid]
+
+        if not kept_ids:
+            continue
+
+        dominant_family = ordered_fams[0] if ordered_fams else ""
+        label_key = _normalized_cause_label_key(str(cause.get("cause") or ""))
+        score = family_score_map.get(dominant_family, 0.0) + 0.03 * len(kept_ids)
+
+        row = dict(cause)
+        row["citations"] = kept_ids
+        rows.append(
+            {
+                "cause": row,
+                "label_key": label_key,
+                "dominant_family": dominant_family,
+                "score": score,
+            }
+        )
+
+    if not rows:
+        return result, retrieval_citations
+
+    best_by_label: dict[str, dict] = {}
+    for row in rows:
+        key = row["label_key"] or str(row["cause"].get("cause") or "").strip().lower()
+        prev = best_by_label.get(key)
+        if prev is None or row["score"] > prev["score"] or (
+            row["score"] == prev["score"]
+            and str(row["cause"].get("cause") or "") < str(prev["cause"].get("cause") or "")
+        ):
+            best_by_label[key] = row
+
+    deduped = sorted(
+        best_by_label.values(),
+        key=lambda x: (
+            -float(x.get("score", 0.0)),
+            family_rank_map.get(x.get("dominant_family") or "", 9999),
+            str((x.get("cause") or {}).get("cause") or ""),
+        ),
+    )
+
+    kept_rows: list[dict] = []
+    used_families: dict[str, dict] = {}
+
+    for row in deduped:
+        fam = str(row.get("dominant_family") or "")
+        prev = used_families.get(fam)
+        if prev is None:
+            used_families[fam] = row
+            kept_rows.append(row)
+            continue
+
+        gap = float(prev.get("score", 0.0)) - float(row.get("score", 0.0))
+        if gap >= 0.06:
+            continue
+
+        if len([r for r in kept_rows if str(r.get("dominant_family") or "") == fam]) == 0:
+            kept_rows.append(row)
+
+    kept_rows = sorted(
+        kept_rows,
+        key=lambda x: (
+            -float(x.get("score", 0.0)),
+            family_rank_map.get(x.get("dominant_family") or "", 9999),
+            str((x.get("cause") or {}).get("cause") or ""),
+        ),
+    )[:max_causes]
+
+    final_causes: list[dict] = []
+    final_citation_ids: list[str] = []
+    seen_citation_ids = set()
+
+    for idx, row in enumerate(kept_rows, start=1):
+        cause = dict(row["cause"])
+        cause["rank"] = idx
+        final_causes.append(cause)
+
+        for cid in cause.get("citations") or []:
+            cid = str(cid or "").strip()
+            if cid and cid not in seen_citation_ids and cid in by_id:
+                seen_citation_ids.add(cid)
+                final_citation_ids.append(cid)
+
+    if not final_causes:
+        return result, retrieval_citations
+
+    result["possible_causes"] = final_causes
+
+    recommended = []
+    seen_checks = set()
+    for cause in final_causes:
+        for chk in cause.get("checks") or []:
+            chk = re.sub(r"\s+", " ", str(chk or "")).strip()
+            if not chk:
+                continue
+            key = chk.lower()
+            if key in seen_checks:
+                continue
+            seen_checks.add(key)
+            recommended.append(chk)
+            if len(recommended) >= 6:
+                break
+        if len(recommended) >= 6:
+            break
+
+    if recommended:
+        result["recommended_next_checks"] = recommended
+
+    final_citations = [by_id[cid] for cid in final_citation_ids if cid in by_id]
+    final_citations = _lock_final_citations(
+        selected_citations=final_citations,
+        ranked_candidates=retrieval_citations,
+        top_k=max(len(final_citations), min(len(retrieval_citations), max_causes * 2)),
+        diagnostic_mode=True,
+        query_token_count=6,
+    )
+
+    return result, final_citations
+
+
 def _sanitize_citations_for_response(citations: list[dict]) -> list[dict]:
     out: list[dict] = []
 
@@ -5228,14 +5683,7 @@ def _dedup_root_cause_candidates_semantic(
     return out[:max_items]
 
 def _root_cause_evidence_family_key(c: dict) -> str:
-    doc_id = str(c.get("bubble_document_id") or "").strip()
-    page_from = int(c.get("page_from") or 0)
-
-    section = _extract_section_from_text(c.get("chunk_full") or c.get("snippet") or "")
-    section = _normalize_unicode_advanced(section or "")
-    section = re.sub(r"\s+", " ", section).strip().lower()[:120]
-
-    return f"{doc_id}|p{page_from}|sec:{section}"
+    return _stable_evidence_family_key(c)
 
 
 def _prioritize_root_cause_coverage(
@@ -6235,6 +6683,13 @@ def ask_v1(
                 list(primary_retrieval.get("citations") or []) + list(rescue_retrieval.get("citations") or []),
                 max_items=max(top_k, 6),
             )
+            merged = _lock_final_citations(
+                selected_citations=merged,
+                ranked_candidates=list(primary_retrieval.get("candidates") or []) + list(rescue_retrieval.get("candidates") or []) + list(merged or []),
+                top_k=top_k,
+                diagnostic_mode=False,
+                query_token_count=query_token_count,
+            )
             retrieval = dict(primary_retrieval)
             retrieval["citations"] = merged
             retrieval["similarity_max"] = max(
@@ -6247,6 +6702,15 @@ def ask_v1(
 
     planner = retrieval.get("planner") or planner
     citations = list(retrieval.get("citations") or [])
+    if citations:
+        citations = _lock_final_citations(
+            selected_citations=citations,
+            ranked_candidates=list(retrieval.get("candidates") or []) + list(citations or []),
+            top_k=top_k,
+            diagnostic_mode=False,
+            query_token_count=query_token_count,
+        )
+        retrieval["citations"] = citations
     sim_max = retrieval.get("similarity_max")
 
     def _finalize(resp: dict) -> dict:
@@ -6638,6 +7102,11 @@ def draft_ps_v1(
         grounded_citations,
         language=language,
     )
+    grounded_result, grounded_citations = _lock_root_cause_result(
+        grounded_result,
+        grounded_citations,
+        max_causes=max_causes,
+    )
 
     final_title = str((result_json or {}).get("title") or "").strip()
     if not final_title:
@@ -6861,6 +7330,7 @@ def root_cause_v1(
         "Reuse source terminology when possible and avoid switching between near-synonymous paraphrases across runs. "
         "If the evidence is narrow, return fewer causes rather than broad generic ones. "
         "Avoid generic boilerplate causes unless the sources clearly support them. "
+        "When multiple evidence sets are close in quality, prefer the dominant evidence family rather than mixing weak alternatives. "
         "Always reply in the same language as the user query."
     )
 
@@ -6900,6 +7370,11 @@ def root_cause_v1(
         grounded_result,
         grounded_citations,
         language=response_language,
+    )
+    grounded_result, grounded_citations = _lock_root_cause_result(
+        grounded_result,
+        grounded_citations,
+        max_causes=max_causes,
     )
 
     if not grounded_result.get("problem_summary"):
