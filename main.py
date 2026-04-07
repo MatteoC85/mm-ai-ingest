@@ -1291,7 +1291,7 @@ def _localized_token_answer(language: str, token: str, citation_id: str) -> str:
 
 def _ask_response_schema() -> dict:
     return {
-        "name": "ask_grounded_answer_v1",
+        "name": "ask_grounded_answer_v2",
         "strict": True,
         "schema": {
             "type": "object",
@@ -1301,15 +1301,157 @@ def _ask_response_schema() -> dict:
                     "type": "string",
                     "enum": ["answered", "no_sources"],
                 },
-                "answer": {"type": "string"},
-                "used_citations": {
+                "grounded_points": {
                     "type": "array",
-                    "items": {"type": "string"},
+                    "maxItems": 3,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "text": {"type": "string"},
+                            "citation_ids": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "maxItems": 3,
+                            },
+                        },
+                        "required": ["text", "citation_ids"],
+                    },
                 },
             },
-            "required": ["answer_status", "answer", "used_citations"],
+            "required": ["answer_status", "grounded_points"],
         },
     }
+
+
+def _render_grounded_answer_points(
+    grounded_points: list[dict],
+    citations: list[dict],
+    *,
+    max_points: int = 3,
+) -> tuple[str, list[dict]]:
+    if not grounded_points:
+        return "", []
+
+    by_id = {
+        str(c.get("citation_id") or "").strip(): c
+        for c in citations or []
+        if c.get("citation_id")
+    }
+
+    parts: list[str] = []
+    used_ids: list[str] = []
+    seen_ids = set()
+
+    for point in grounded_points[:max_points]:
+        if not isinstance(point, dict):
+            continue
+
+        text = re.sub(r"\s+", " ", str(point.get("text") or "")).strip()
+        if not text:
+            continue
+
+        cids = []
+        for cid in point.get("citation_ids") or []:
+            cid = str(cid or "").strip()
+            if not cid or cid not in by_id:
+                continue
+            cids.append(cid)
+            if cid not in seen_ids:
+                seen_ids.add(cid)
+                used_ids.append(cid)
+
+        if not cids:
+            continue
+
+        text = re.sub(r"\s*\[[^\]]+\]\s*$", "", text).strip()
+        if text and text[-1] not in ".!?":
+            text += "."
+        parts.append(f"{text} {' '.join(f'[{cid}]' for cid in cids)}")
+
+    final_citations = [by_id[cid] for cid in used_ids if cid in by_id]
+    return " ".join(parts).strip(), final_citations
+
+
+def _language_marker_score(text: str, language: str) -> int:
+    toks = re.findall(r"[a-zà-öø-ÿ']{2,}", _normalize_unicode_advanced(text or "").lower())
+    if not toks:
+        return 0
+
+    markers = {
+        "it": {
+            "il", "lo", "la", "gli", "le", "di", "del", "della", "dei", "delle",
+            "con", "per", "quando", "durante", "mentre", "dopo", "prima", "non", "si",
+            "una", "un", "può", "puo", "quindi", "documenti",
+        },
+        "en": {
+            "the", "with", "for", "when", "during", "while", "after", "before", "not",
+            "does", "is", "are", "can", "cannot", "will", "would", "should", "documents",
+            "this", "that", "these", "those", "mode",
+        },
+    }
+    target = markers.get(str(language or "").lower(), set())
+    return sum(1 for t in toks if t in target)
+
+
+def _looks_like_target_language(text: str, target_language: str) -> bool:
+    target_language = str(target_language or "").lower()
+    if target_language not in {"it", "en"}:
+        return True
+
+    other = "en" if target_language == "it" else "it"
+    target_score = _language_marker_score(text, target_language)
+    other_score = _language_marker_score(text, other)
+
+    if target_score == 0 and other_score == 0:
+        return True
+    return target_score >= other_score
+
+
+def _translation_response_schema() -> dict:
+    return {
+        "name": "translation_preserving_citations_v1",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "text": {"type": "string"},
+            },
+            "required": ["text"],
+        },
+    }
+
+
+def _translate_text_preserving_citations(text: str, target_language: str) -> str:
+    text = str(text or "").strip()
+    target_language = str(target_language or "").strip().lower()
+    if not text or target_language not in {"it", "en"}:
+        return text
+
+    system_msg = (
+        "Translate the text into the requested target language while preserving every citation token "
+        "like [DOC:p1-2:c3] exactly as-is. Do not add or remove content."
+    )
+    user_msg = (
+        f"TARGET_LANGUAGE: {target_language}\n\n"
+        f"TEXT:\n{text}"
+    )
+
+    try:
+        parsed = _openai_chat_json(
+            [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            model=OPENAI_CHAT_MODEL,
+            json_schema=_translation_response_schema(),
+            timeout=30,
+        )
+        translated = re.sub(r"\s+", " ", str((parsed or {}).get("text") or "")).strip()
+        return translated or text
+    except Exception:
+        return text
 
 
 def _ground_citations_to_ids(citation_ids: list[str], citations: list[dict]) -> list[dict]:
@@ -1649,6 +1791,184 @@ def _candidate_order_key(item: dict) -> tuple:
     )
 
 
+def _source_type_from_document_id(value: str) -> str:
+    v = str(value or "").strip().lower()
+    if not v or ":" not in v:
+        return "manual"
+    prefix = v.split(":", 1)[0].strip()
+    if prefix in STRUCTURED_SOURCE_TYPES:
+        return prefix
+    return "manual"
+
+
+def _content_term_set(text: str, limit: int = 80) -> set[str]:
+    stopwords = {
+        "the", "and", "for", "with", "when", "while", "during", "after", "before", "from", "into", "onto",
+        "this", "that", "these", "those", "question", "answer", "issue", "problem", "machine", "system",
+        "document", "documents", "manual", "procedure", "step", "solution",
+        "il", "lo", "la", "i", "gli", "le", "con", "per", "quando", "durante", "mentre", "dopo", "prima",
+        "questo", "questa", "questi", "queste", "domanda", "risposta", "problema", "macchina", "sistema",
+        "procedura", "step", "soluzione", "documenti", "documento",
+    }
+    out = []
+    seen = set()
+    for tok in re.findall(r"[a-zà-öø-ÿ0-9]{3,}", _normalize_unicode_advanced(text or "").lower()):
+        if tok in stopwords:
+            continue
+        if tok in seen:
+            continue
+        seen.add(tok)
+        out.append(tok)
+        if len(out) >= limit:
+            break
+    return set(out)
+
+
+def _planner_query_term_set(q: str, planner: Optional[dict]) -> set[str]:
+    texts = [q]
+    if isinstance(planner, dict):
+        texts.append(str(planner.get("normalized_query") or ""))
+        texts.extend(list(planner.get("lexical_queries") or []))
+    return _content_term_set("\n".join(texts), limit=60)
+
+
+def _term_overlap_score(query_terms: set[str], text_terms: set[str]) -> float:
+    if not query_terms or not text_terms:
+        return 0.0
+    inter = len(query_terms & text_terms)
+    if inter <= 0:
+        return 0.0
+    return inter / math.sqrt(float(len(query_terms)) * float(len(text_terms)))
+
+
+def _candidate_specificity_score(item: dict) -> float:
+    text = (item.get("chunk_full") or item.get("snippet") or "").strip()
+    source_type = _source_type_from_document_id(item.get("bubble_document_id") or "")
+    text_terms = _content_term_set(text, limit=100)
+    char_len = len(text)
+    line_count = len([ln for ln in text.split("\n") if ln.strip()])
+
+    score = 0.0
+    score += min(0.07, 0.0018 * len(text_terms))
+
+    if 160 <= char_len <= 1800:
+        score += 0.04
+    elif char_len < 90:
+        score -= 0.08
+    elif char_len < 160:
+        score -= 0.04
+
+    if line_count >= 2:
+        score += 0.02
+
+    if source_type == "ps" and len(text_terms) < 20:
+        score -= 0.08
+    elif source_type in {"procedure", "step"} and len(text_terms) < 18:
+        score -= 0.05
+
+    return max(-0.14, min(0.14, score))
+
+
+def _candidate_source_bias(item: dict, query_terms: set[str]) -> tuple[float, dict]:
+    text = (item.get("chunk_full") or item.get("snippet") or "").strip()
+    text_terms = _content_term_set(text, limit=100)
+    overlap = _term_overlap_score(query_terms, text_terms)
+    source_type = _source_type_from_document_id(item.get("bubble_document_id") or "")
+
+    bias = 0.0
+
+    if source_type == "manual":
+        if overlap >= 0.14 and len(text_terms) >= 18:
+            bias += 0.05
+    elif source_type == "ps":
+        if len(text_terms) <= 18 and overlap < 0.22:
+            bias -= 0.14
+        elif len(text_terms) <= 28 and overlap < 0.18:
+            bias -= 0.08
+        elif overlap >= 0.24:
+            bias += 0.02
+    elif source_type in {"procedure", "step"}:
+        if len(text_terms) <= 18 and overlap < 0.18:
+            bias -= 0.08
+        elif overlap >= 0.24:
+            bias += 0.03
+
+    return max(-0.16, min(0.08, bias)), {
+        "source_type": source_type,
+        "overlap_score": overlap,
+        "content_term_count": len(text_terms),
+    }
+
+
+def _rebalance_selected_citations(
+    selected_citations: list[dict],
+    ranked_candidates: list[dict],
+    top_k: int,
+) -> list[dict]:
+    if not selected_citations:
+        return []
+
+    ordered_ranked = sorted(ranked_candidates or [], key=_candidate_order_key)
+    out = _dedup_citations_by_snippet(selected_citations, max_items=top_k)
+    selected_ids = {str(c.get("citation_id") or "").strip() for c in out if c.get("citation_id")}
+
+    def source_type(c: dict) -> str:
+        return str(c.get("source_type") or _source_type_from_document_id(c.get("bubble_document_id") or ""))
+
+    top_score = float(out[0].get("retrieval_score", out[0].get("similarity", 0.0)) or 0.0)
+    manual_selected = any(source_type(c) == "manual" for c in out)
+
+    if not manual_selected:
+        for cand in ordered_ranked:
+            cid = str(cand.get("citation_id") or "").strip()
+            if not cid or cid in selected_ids:
+                continue
+            if source_type(cand) != "manual":
+                continue
+            cand_score = float(cand.get("retrieval_score", cand.get("similarity", 0.0)) or 0.0)
+            if cand_score >= top_score - 0.08:
+                out = [cand] + out
+                out = _dedup_citations_by_snippet(out, max_items=top_k)
+                selected_ids = {str(c.get("citation_id") or "").strip() for c in out if c.get("citation_id")}
+                break
+
+    generic_structured = [
+        c for c in out
+        if source_type(c) in {"ps", "procedure", "step"}
+        and float(c.get("overlap_score", 0.0)) < 0.18
+        and float(c.get("specificity_score", 0.0)) < 0.03
+    ]
+
+    if len(generic_structured) > 1:
+        keep_first = True
+        replacements: list[dict] = []
+        for c in out:
+            if c not in generic_structured:
+                replacements.append(c)
+                continue
+            if keep_first:
+                replacements.append(c)
+                keep_first = False
+
+        existing_ids = {str(c.get("citation_id") or "").strip() for c in replacements if c.get("citation_id")}
+        for cand in ordered_ranked:
+            cid = str(cand.get("citation_id") or "").strip()
+            if not cid or cid in existing_ids:
+                continue
+            if source_type(cand) != "manual":
+                continue
+            cand_score = float(cand.get("retrieval_score", cand.get("similarity", 0.0)) or 0.0)
+            if cand_score >= top_score - 0.10:
+                replacements.append(cand)
+                existing_ids.add(cid)
+            if len(replacements) >= top_k:
+                break
+
+        out = _dedup_citations_by_snippet(replacements, max_items=top_k)
+
+    return out[:top_k]
+
+
 def _shared_semantic_retrieval(
     *,
     q: str,
@@ -1702,11 +2022,25 @@ def _shared_semantic_retrieval(
     if candidates:
         max_rrf = max(float(c.get("rrf_score", 0.0)) for c in candidates) if candidates else 0.0
         prepared: list[dict] = []
+        query_terms = _planner_query_term_set(q, planner)
 
         for c in candidates:
             cc = dict(c)
             rrf_norm = (float(cc.get("rrf_score", 0.0)) / max_rrf) if max_rrf > 0 else 0.0
-            cc["retrieval_score"] = 0.72 * float(cc.get("similarity", 0.0)) + 0.28 * rrf_norm
+            source_bias, source_meta = _candidate_source_bias(cc, query_terms)
+            specificity_score = _candidate_specificity_score(cc)
+            overlap_score = float(source_meta.get("overlap_score", 0.0))
+
+            cc.update(source_meta)
+            cc["specificity_score"] = specificity_score
+            cc["source_bias"] = source_bias
+            cc["retrieval_score"] = (
+                0.64 * float(cc.get("similarity", 0.0))
+                + 0.20 * rrf_norm
+                + 0.10 * overlap_score
+                + specificity_score
+                + source_bias
+            )
             prepared.append(cc)
 
         prepared.sort(key=_candidate_order_key)
@@ -1763,6 +2097,11 @@ def _shared_semantic_retrieval(
                 rerank_error = str(e)
 
         selected_citations = _dedup_citations_by_snippet(selected_citations, max_items=top_k)
+        selected_citations = _rebalance_selected_citations(
+            selected_citations=selected_citations,
+            ranked_candidates=cut_candidates,
+            top_k=top_k,
+        )
 
     if (sim_max is None or float(sim_max) < effective_threshold) or not selected_citations:
         prefix_hits = _fts_search_chunks_prefix(
@@ -5542,19 +5881,23 @@ def ask_v1(
     system_msg = (
         "You are a technical documentation assistant for machinery and industrial equipment. "
         "Use ONLY the provided sources. "
-        "You may make cautious grounded inferences when the answer is not stated verbatim but the sources strongly support it. "
+        "Procedures and problem-solution entries are valid evidence when directly relevant, "
+        "but a generic procedure or generic P&S must not outweigh a more specific manual passage. "
+        "Prefer the most specific grounded evidence available. "
         "Never use outside knowledge. "
-        "If the sources are insufficient, return answer_status='no_sources' and answer exactly: "
-        f"\"{no_sources_text}\". "
-        "Always reply in the same language as the user query. "
-        "For every substantive claim include inline citations in square brackets using only the provided citation_id values. "
-        "When the answer is an inference, make that explicit with careful wording such as 'i documenti indicano' or 'the documents indicate'."
+        "Always reply in the requested response language. "
+        "Return 1 to 3 short grounded points only. "
+        "Each point must be directly supported by its citation_ids. "
+        "If the sources are insufficient, return answer_status='no_sources' and grounded_points=[]."
     )
 
     user_msg = (
         f"QUESTION:\n{q}\n\n"
+        f"NORMALIZED_QUESTION:\n{planner.get('normalized_query') or q}\n\n"
+        f"RESPONSE_LANGUAGE:\n{response_language}\n\n"
         f"SOURCES:\n{sources_block}\n\n"
-        "Return valid JSON. Use only citation ids present in the sources."
+        "Return valid JSON. Use only citation ids present in the sources. "
+        "Do not write a freeform paragraph; return only grounded_points."
     )
 
     try:
@@ -5571,10 +5914,9 @@ def ask_v1(
         raise HTTPException(status_code=502, detail=f"LLM failed: {str(e)}")
 
     answer_status = str((answer_json or {}).get("answer_status") or "").strip().lower()
-    answer = str((answer_json or {}).get("answer") or "").strip()
-    used_ids = _dedup_text_values(list((answer_json or {}).get("used_citations") or []), limit=top_k)
+    grounded_points = list((answer_json or {}).get("grounded_points") or [])
 
-    if answer_status == "no_sources" or not answer:
+    if answer_status == "no_sources" or not grounded_points:
         return _finalize(
             {
                 "ok": True,
@@ -5587,11 +5929,26 @@ def ask_v1(
             }
         )
 
-    final_citations = _ground_citations_to_ids(used_ids, citations)
+    answer, final_citations = _render_grounded_answer_points(
+        grounded_points=grounded_points,
+        citations=citations,
+        max_points=min(3, top_k),
+    )
     if not final_citations:
-        final_citations = _ground_citations_to_answer(answer, citations)
-    if not final_citations:
-        final_citations = citations[:top_k]
+        return _finalize(
+            {
+                "ok": True,
+                "status": "no_sources",
+                "answer": no_sources_text,
+                "citations": [],
+                "rg_links": [],
+                "top_k": top_k,
+                "similarity_max": sim_max,
+            }
+        )
+
+    if not _looks_like_target_language(answer, response_language):
+        answer = _translate_text_preserving_citations(answer, response_language)
 
     response_citations = _sanitize_citations_for_response(final_citations)
 
@@ -5998,9 +6355,12 @@ def root_cause_v1(
         "You are a root-cause assistant for technical equipment and machine documentation. "
         "Use ONLY the provided sources. "
         "Work domain-agnostically: do not assume a sector, machine family, subsystem taxonomy, or standard failure mode unless the sources support it. "
+        "Procedures and problem-solution entries are valid evidence when directly relevant, but a generic procedure or generic P&S must not outweigh a more specific manual passage. "
         "You may make cautious multi-source inferences, but every proposed cause must remain tightly grounded. "
-        "Order causes by groundedness, not by creativity. "
+        "Order causes by groundedness and specificity, not by creativity. "
         "Each 'cause' must be a short canonical label of about 3 to 10 words, preferably a noun phrase, with no trailing period. "
+        "Reuse source terminology when possible and avoid switching between near-synonymous paraphrases across runs. "
+        "If the evidence is narrow, return fewer causes rather than broad generic ones. "
         "Avoid generic boilerplate causes unless the sources clearly support them. "
         "Always reply in the same language as the user query."
     )
