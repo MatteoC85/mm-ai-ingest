@@ -43,15 +43,15 @@ OPENAI_EMBED_MODEL = (os.environ.get("OPENAI_EMBED_MODEL") or "text-embedding-3-
 OPENAI_EMBED_URL = (os.environ.get("OPENAI_EMBED_URL") or "https://api.openai.com/v1/embeddings").strip()
 
 # OpenAI Chat
-OPENAI_CHAT_MODEL = (os.environ.get("OPENAI_CHAT_MODEL") or "gpt-4.1-mini").strip()
+OPENAI_CHAT_MODEL = (os.environ.get("OPENAI_CHAT_MODEL") or "gpt-5.4-mini").strip()
 OPENAI_CHAT_URL = (os.environ.get("OPENAI_CHAT_URL") or "https://api.openai.com/v1/chat/completions").strip()
 
 # OpenAI Citation Reranker (on-demand)
-OPENAI_RERANK_MODEL = (os.environ.get("OPENAI_RERANK_MODEL") or "gpt-4.1-nano").strip()
+OPENAI_RERANK_MODEL = (os.environ.get("OPENAI_RERANK_MODEL") or "gpt-5.4-nano").strip()
 RERANK_MAX_CANDIDATES = int(os.environ.get("MM_RERANK_MAX_CANDIDATES", "18"))
 RERANK_SNIPPET_CHARS = int(os.environ.get("MM_RERANK_SNIPPET_CHARS", "320"))
 RERANK_TIMEOUT = int(os.environ.get("MM_RERANK_TIMEOUT_SECONDS", "30"))
-RERANK_ENABLED = (os.environ.get("MM_RERANK_ENABLED") or "0").strip() == "1"
+RERANK_ENABLED = (os.environ.get("MM_RERANK_ENABLED") or "1").strip() == "1"
 RERANK_MIN_SIM_MAX = float(os.environ.get("MM_RERANK_MIN_SIM_MAX", "0.38"))
 RERANK_MAX_SIM_MAX = float(os.environ.get("MM_RERANK_MAX_SIM_MAX", "0.72"))
 RERANK_MAX_SPREAD = float(os.environ.get("MM_RERANK_MAX_SPREAD", "0.10"))
@@ -72,13 +72,13 @@ ASK_MAX_CONTEXT_CHARS = int(os.environ.get("MM_ASK_MAX_CONTEXT_CHARS", "9000"))
 DRAFT_PS_SIM_THRESHOLD = float(os.environ.get("MM_DRAFT_PS_SIM_THRESHOLD", "0.42"))
 
 # Shared semantic retrieval planner
-SEMANTIC_QUERY_PLANNER_MODEL = (os.environ.get("MM_SEMANTIC_QUERY_PLANNER_MODEL") or "gpt-4.1-mini").strip()
+SEMANTIC_QUERY_PLANNER_MODEL = (os.environ.get("MM_SEMANTIC_QUERY_PLANNER_MODEL") or "gpt-5.4-mini").strip()
 SEMANTIC_QUERY_PLANNER_TIMEOUT = int(os.environ.get("MM_SEMANTIC_QUERY_PLANNER_TIMEOUT_SECONDS", "20"))
 SEMANTIC_MAX_DENSE_QUERIES = int(os.environ.get("MM_SEMANTIC_MAX_DENSE_QUERIES", "5"))
 SEMANTIC_MAX_LEXICAL_QUERIES = int(os.environ.get("MM_SEMANTIC_MAX_LEXICAL_QUERIES", "5"))
 
 # Root-cause semantic intent gate
-ROOT_CAUSE_INTENT_MODEL = (os.environ.get("MM_ROOT_CAUSE_INTENT_MODEL") or "gpt-4.1-mini").strip()
+ROOT_CAUSE_INTENT_MODEL = (os.environ.get("MM_ROOT_CAUSE_INTENT_MODEL") or "gpt-5.4-mini").strip()
 ROOT_CAUSE_GATE_MIN_SYMPTOM_SCORE = float(os.environ.get("MM_ROOT_CAUSE_GATE_MIN_SYMPTOM_SCORE", "0.33"))
 ROOT_CAUSE_GATE_MIN_MARGIN = float(os.environ.get("MM_ROOT_CAUSE_GATE_MIN_MARGIN", "0.05"))
 ROOT_CAUSE_GATE_MIN_PRELIM_SIM = float(os.environ.get("MM_ROOT_CAUSE_GATE_MIN_PRELIM_SIM", "0.36"))
@@ -93,6 +93,10 @@ ROOT_CAUSE_MAX_PROMPT_CITATIONS = int(os.environ.get("MM_ROOT_CAUSE_MAX_PROMPT_C
 ROOT_CAUSE_DIRECT_SIGNAL_BONUS = float(os.environ.get("MM_ROOT_CAUSE_DIRECT_SIGNAL_BONUS", "0.12"))
 ROOT_CAUSE_GENERIC_DOWNRANK_PENALTY = float(os.environ.get("MM_ROOT_CAUSE_GENERIC_DOWNRANK_PENALTY", "0.14"))
 ROOT_CAUSE_HARD_EXCLUDE_PENALTY = float(os.environ.get("MM_ROOT_CAUSE_HARD_EXCLUDE_PENALTY", "0.30"))
+ROOT_CAUSE_GENERIC_SUPPORT_ONLY_PENALTY = float(os.environ.get("MM_ROOT_CAUSE_GENERIC_SUPPORT_ONLY_PENALTY", "0.22"))
+ROOT_CAUSE_MATRIX_MIN_DISTINCT_CAUSES = int(os.environ.get("MM_ROOT_CAUSE_MATRIX_MIN_DISTINCT_CAUSES", "2"))
+ROOT_CAUSE_MATRIX_PROMPT_CAUSE_QUOTA = int(os.environ.get("MM_ROOT_CAUSE_MATRIX_PROMPT_CAUSE_QUOTA", "2"))
+ROOT_CAUSE_USE_DETERMINISTIC_CROSSLINGUAL = (os.environ.get("MM_ROOT_CAUSE_USE_DETERMINISTIC_CROSSLINGUAL") or "1").strip() != "0"
 
 
 # -----------------------------
@@ -1497,7 +1501,11 @@ def _translate_query_for_retrieval(text: str, target_language: str) -> str:
     system_msg = (
         "Translate the user's technical query for document retrieval. "
         "Preserve meaning exactly, keep it short, do not add explanations, "
-        "do not assume a domain, and preserve codes, identifiers, and proper names exactly."
+        "do not assume a domain, and preserve codes, identifiers, and proper names exactly. "
+        "Prefer natural industrial wording. For symptoms, use physically plausible verbs like "
+        "'vibrates', 'makes noise', 'jams', 'stops', 'does not start', 'automatic mode', "
+        "'vibra', 'fa rumore', 'si blocca', 'si inceppa', 'non parte', 'in automatico'. "
+        "Avoid software-like or colloquial mistranslations such as 'freezes' for a machine stop."
     )
     user_msg = (
         f"TARGET_LANGUAGE: {target_language}\n\n"
@@ -1520,6 +1528,132 @@ def _translate_query_for_retrieval(text: str, target_language: str) -> str:
         return text
 
 
+def _query_symptom_profile(q: str) -> dict:
+    q_norm = re.sub(r"\s+", " ", _normalize_unicode_advanced(q or "")).strip().lower()
+    tokens = re.findall(r"[a-zà-öø-ÿ0-9]{2,}", q_norm)
+
+    classes: list[str] = []
+    if any(st in q_norm for st in ["vibr", "oscillat", "oscillaz"]):
+        classes.append("vibration")
+    if any(st in q_norm for st in ["noise", "noisy", "rumor", "rumore", "rumoros", "sound", "rattle", "squeal", "strid", "sfreg"]):
+        classes.append("noise")
+    if any(st in q_norm for st in ["jam", "block", "stuck", "bloc", "blocc", "ferma", "arrest", "incepp", "impunt"]):
+        classes.append("jam")
+    if (
+        any(st in q_norm for st in ["non parte", "non si avvia", "does not start", "won't start", "will not start", "cannot start", "can't start", "doesnt start"])
+        or ("start" in q_norm and any(st in q_norm for st in [" non ", " not ", "won't", "will not", "cannot", "can't"]))
+    ):
+        classes.append("no_start")
+
+    has_bending_anchor = any(st in q_norm for st in ["bend", "bending", "pieg", "forming", "formatura", "press", "pressa", "tool", "die", "stampo"])
+    has_feed_anchor = any(st in q_norm for st in ["feed", "advance", "advancement", "avanz", "wire", "filo", "strip", "nastro", "material"])
+    has_process_anchor = has_bending_anchor or has_feed_anchor or any(st in q_norm for st in ["cut", "cutting", "taglio", "drill", "fora", "weld", "sald", "straighten", "raddrizz"])
+    automatic_mode = any(st in q_norm for st in ["automatic", "automatico", "ciclo automatico", "automatic cycle", "auto mode", "modalità automatica"])
+
+    has_support_anchor = any(
+        st in q_norm
+        for st in [
+            "lubric", "lubrif", "oil", "olio", "grease", "grasso",
+            "electr", "elettric", "phase", "fasi", "voltage", "tensione",
+            "pneumat", "hydraul", "idraulic", "pressure", "pression",
+            "safety", "sicurezza", "door", "porta", "interlock", "microinter",
+            "plc", "encoder", "sensor", "sensore", "panel", "quadro"
+        ]
+    )
+
+    generic_symptom = bool(classes) and not has_process_anchor and not has_support_anchor and len(tokens) <= 6
+    if "no_start" in classes and automatic_mode:
+        generic_symptom = False
+
+    return {
+        "classes": _dedup_text_values(classes, limit=4),
+        "has_bending_anchor": has_bending_anchor,
+        "has_feed_anchor": has_feed_anchor,
+        "has_process_anchor": has_process_anchor,
+        "has_support_anchor": has_support_anchor,
+        "automatic_mode": automatic_mode,
+        "generic_symptom": generic_symptom,
+    }
+
+
+def _symptom_crosslingual_expansions(q: str, source_language: str) -> list[str]:
+    if not ROOT_CAUSE_USE_DETERMINISTIC_CROSSLINGUAL:
+        return []
+
+    source_language = str(source_language or "").strip().lower()
+    if source_language not in {"it", "en"}:
+        return []
+
+    profile = _query_symptom_profile(q)
+    classes = set(profile.get("classes") or [])
+    out: list[str] = []
+
+    def add(x: str):
+        x = re.sub(r"\s+", " ", str(x or "").strip())
+        if x:
+            out.append(x)
+
+    if source_language == "it":
+        if "vibration" in classes:
+            if profile.get("has_bending_anchor"):
+                add("the machine vibrates during bending")
+            elif profile.get("has_feed_anchor"):
+                add("the machine vibrates during feed")
+            else:
+                add("the machine vibrates")
+        if "noise" in classes:
+            if profile.get("has_bending_anchor"):
+                add("the machine makes noise during bending")
+            elif profile.get("has_feed_anchor"):
+                add("the machine makes noise during feed")
+            else:
+                add("the machine makes noise")
+        if "jam" in classes:
+            if profile.get("has_feed_anchor"):
+                add("the machine jams during feed")
+                add("the machine stops during feed")
+            else:
+                add("the machine jams")
+                add("the machine stops unexpectedly")
+        if "no_start" in classes:
+            if profile.get("automatic_mode"):
+                add("the machine does not start in automatic mode")
+                add("the machine does not start in automatic cycle")
+            else:
+                add("the machine does not start")
+    else:
+        if "vibration" in classes:
+            if profile.get("has_bending_anchor"):
+                add("la macchina vibra durante la piegatura")
+            elif profile.get("has_feed_anchor"):
+                add("la macchina vibra durante l'avanzamento")
+            else:
+                add("la macchina vibra")
+        if "noise" in classes:
+            if profile.get("has_bending_anchor"):
+                add("la macchina fa rumore durante la piegatura")
+            elif profile.get("has_feed_anchor"):
+                add("la macchina fa rumore durante l'avanzamento")
+            else:
+                add("la macchina fa rumore")
+        if "jam" in classes:
+            if profile.get("has_feed_anchor"):
+                add("la macchina si inceppa durante l'avanzamento")
+                add("la macchina si blocca durante l'avanzamento")
+            else:
+                add("la macchina si blocca")
+                add("la macchina si inceppa")
+        if "no_start" in classes:
+            if profile.get("automatic_mode"):
+                add("la macchina non parte in automatico")
+                add("la macchina non si avvia in ciclo automatico")
+            else:
+                add("la macchina non parte")
+                add("la macchina non si avvia")
+
+    return _dedup_text_values(out, limit=3)
+
+
 def _augment_crosslingual_query_plan(q: str, planner: Optional[dict]) -> dict:
     planner = dict(planner or {})
     q_norm = re.sub(r"\s+", " ", _normalize_unicode_advanced(q or "")).strip()
@@ -1534,10 +1668,15 @@ def _augment_crosslingual_query_plan(q: str, planner: Optional[dict]) -> dict:
     target_language = "en" if query_language == "it" else "it"
     base_text = re.sub(r"\s+", " ", str(planner.get("normalized_query") or q_norm)).strip() or q_norm
     translated = _translate_query_for_retrieval(base_text, target_language)
+    deterministic = _symptom_crosslingual_expansions(base_text, query_language)
 
+    cross_texts = []
     if translated and translated.lower() != base_text.lower():
-        planner["crosslingual_dense_queries"] = _dedup_text_values([translated], limit=1)
-        planner["crosslingual_lexical_queries"] = _dedup_text_values([translated], limit=1)
+        cross_texts.append(translated)
+    cross_texts.extend(deterministic)
+
+    planner["crosslingual_dense_queries"] = _dedup_text_values(cross_texts, limit=3)
+    planner["crosslingual_lexical_queries"] = _dedup_text_values(cross_texts, limit=3)
 
     return planner
 
@@ -4828,7 +4967,9 @@ def _llm_filter_diagnostic_chunks(
         "9) Seleziona fonti che coprono aree causali diverse quando sono ben supportate.\n"
         "10) Preferisci fonti allineate ai sottosistemi dominanti implicati dal sintomo.\n"
         "11) Se esistono fonti di sottosistemi secondari, mantienile solo se spiegano una causa davvero plausibile e non indiretta.\n"
-        "12) Favorisci le evidenze con causal_strength_score e semantic_score più alti.\n"
+        "12) Per sintomi generici come vibrazione, rumore o blocco, non privilegiare lubrificazione, start-up, installazione o sicurezza se il testo non collega esplicitamente quel sottosistema al sintomo.\n"
+        "13) Per il mancato avvio, i blocchi elettrici, interlock e consensi sono più forti di una nota generica di lubrificazione.\n"
+        "14) Favorisci le evidenze con causal_strength_score e semantic_score più alti.\n"
     )
 
     user_msg = (
@@ -4961,7 +5102,9 @@ def _llm_build_diagnostic_evidence_matrix(
         "10) Evita di mantenere più citation_id della stessa evidence_family se una sola fonte è già rappresentativa.\n"
         "11) keep_ids e cause_hypotheses devono massimizzare la copertura di aree causali diverse, non la ripetizione della stessa area.\n"
         "12) Preferisci ipotesi coerenti con i sottosistemi dominanti implicati dal sintomo.\n"
-        "13) Le evidenze con causal_strength_score e semantic_score più alti hanno priorità.\n"
+        "13) Per sintomi generici come vibrazione, rumore o blocco, le fonti di lubrificazione, start-up, installazione o sicurezza non devono diventare ipotesi centrali senza un legame esplicito col sintomo.\n"
+        "14) Per il mancato avvio, preferisci cause elettriche/interlock/consensi rispetto a note generiche di lubrificazione.\n"
+        "15) Le evidenze con causal_strength_score e semantic_score più alti hanno priorità.\n"
     )
 
     user_msg = (
@@ -5629,6 +5772,7 @@ def _diagnostic_evidence_pipeline(
     diagnostic_queries = _build_diagnostic_queries(q, inferred_components)
     diagnostic_keywords = _collect_candidate_keywords(q, inferred_components)
     target_subsystems = _root_cause_target_subsystems(q, inferred_components)
+    symptom_profile = _query_symptom_profile(q)
 
     base_candidates = _ensure_candidate_retrieval_fields(
         list(base_retrieval.get("candidates") or []) + list(base_retrieval.get("citations") or []),
@@ -5673,6 +5817,13 @@ def _diagnostic_evidence_pipeline(
         semantic = _score_root_cause_chunk_semantic(q, chunk_text, diagnostic_keywords)
         causal = _score_root_cause_causal_strength(q, chunk_text, diagnostic_keywords)
         subsystem = _score_root_cause_subsystem_alignment(q, chunk_text, target_subsystems)
+        context_fit = _score_root_cause_context_fit(
+            q=q,
+            chunk_text=chunk_text,
+            diagnostic_keywords=diagnostic_keywords,
+            symptom_profile=symptom_profile,
+            matched_subsystems=subsystem.get("matched_subsystems") or [],
+        )
         generic_downranked = _should_downrank_generic_root_cause_chunk(q, chunk_text, diagnostic_keywords)
         hard_excluded = _should_hard_exclude_root_cause_chunk(q, chunk_text, diagnostic_keywords)
 
@@ -5680,19 +5831,25 @@ def _diagnostic_evidence_pipeline(
         diagnostic_score += float(semantic.get("semantic_score", 0.0) or 0.0)
         diagnostic_score += float(causal.get("causal_strength_score", 0.0) or 0.0)
         diagnostic_score += float(subsystem.get("subsystem_score", 0.0) or 0.0)
+        diagnostic_score += float(context_fit.get("context_fit_score", 0.0) or 0.0)
 
         if str(causal.get("causal_strength_band") or "") == "direct":
             diagnostic_score += ROOT_CAUSE_DIRECT_SIGNAL_BONUS
         if str(cc.get("source_type") or "") == "manual" and str(causal.get("causal_strength_band") or "") in {"direct", "indirect"}:
             diagnostic_score += 0.04
+        if bool(context_fit.get("direct_mechanism_supported")) and bool(symptom_profile.get("generic_symptom")):
+            diagnostic_score += 0.04
         if generic_downranked:
             diagnostic_score -= ROOT_CAUSE_GENERIC_DOWNRANK_PENALTY
+        if bool(context_fit.get("support_only_penalized")):
+            diagnostic_score -= 0.06
         if hard_excluded:
             diagnostic_score -= ROOT_CAUSE_HARD_EXCLUDE_PENALTY
 
         cc.update(semantic)
         cc.update(causal)
         cc.update(subsystem)
+        cc.update(context_fit)
         cc["generic_downranked"] = bool(generic_downranked)
         cc["hard_excluded"] = bool(hard_excluded)
         cc["base_retrieval_score"] = float(cc.get("retrieval_score", 0.0) or 0.0)
@@ -5759,13 +5916,19 @@ def _diagnostic_evidence_pipeline(
             max_items=max(ROOT_CAUSE_MAX_EVIDENCE_POOL, top_k + 2),
         )
 
-    prompt_citations = _lock_final_citations(
-        selected_citations=working_pool[: max(ROOT_CAUSE_MAX_PROMPT_CITATIONS, top_k)],
-        ranked_candidates=working_pool + rescored_pool,
-        top_k=max(ROOT_CAUSE_MAX_PROMPT_CITATIONS, top_k),
-        diagnostic_mode=True,
-        query_token_count=query_token_count,
+    prompt_citations = _select_prompt_citations_from_matrix(
+        rescored_candidates=working_pool,
+        diagnostic_matrix=diagnostic_matrix or {},
+        max_prompt=max(ROOT_CAUSE_MAX_PROMPT_CITATIONS, top_k),
     )
+    if not prompt_citations:
+        prompt_citations = _lock_final_citations(
+            selected_citations=working_pool[: max(ROOT_CAUSE_MAX_PROMPT_CITATIONS, top_k)],
+            ranked_candidates=working_pool + rescored_pool,
+            top_k=max(ROOT_CAUSE_MAX_PROMPT_CITATIONS, top_k),
+            diagnostic_mode=True,
+            query_token_count=query_token_count,
+        )
 
     final_citations = _lock_final_citations(
         selected_citations=prompt_citations,
@@ -5776,7 +5939,10 @@ def _diagnostic_evidence_pipeline(
     )
 
     result = dict(base_retrieval)
-    result["citations"] = final_citations
+    result["citations"] = _dedup_citations_by_snippet(
+        list(prompt_citations or []) + list(final_citations or []),
+        max_items=max(ROOT_CAUSE_MAX_EVIDENCE_POOL, top_k + 3),
+    )
     result["prompt_citations"] = prompt_citations
     result["candidates"] = rescored_pool
     result["candidate_pool"] = working_pool
@@ -5787,6 +5953,7 @@ def _diagnostic_evidence_pipeline(
     result["target_subsystems"] = target_subsystems
     result["llm_priority_ids"] = llm_priority_ids
     result["extra_dense_queries"] = extra_dense_queries
+    result["symptom_profile"] = symptom_profile
     return result
 
 
@@ -6113,6 +6280,253 @@ def _score_root_cause_subsystem_alignment(
         "subsystem_score": score,
         "matched_subsystems": matched_subsystems[:4],
     }
+
+
+def _score_root_cause_context_fit(
+    q: str,
+    chunk_text: str,
+    diagnostic_keywords: list[str],
+    symptom_profile: dict,
+    matched_subsystems: list[str],
+) -> dict:
+    sig = _root_cause_chunk_signal_summary(
+        q=q,
+        chunk_text=chunk_text,
+        diagnostic_keywords=diagnostic_keywords,
+    )
+
+    classes = set(symptom_profile.get("classes") or [])
+    matched_set = {str(x).strip() for x in (matched_subsystems or []) if str(x).strip()}
+    direct_subsystems = {"drive_train", "material_feed", "forming", "straightening"}
+    support_subsystems = {"lubrication", "fluid_power", "electrical_control", "safety_installation"}
+
+    support_only = bool(matched_set) and not (matched_set & direct_subsystems) and (matched_set <= support_subsystems)
+    direct_mechanism_supported = bool(matched_set & direct_subsystems)
+
+    has_support_anchor = bool(symptom_profile.get("has_support_anchor"))
+    automatic_mode = bool(symptom_profile.get("automatic_mode"))
+    generic_symptom = bool(symptom_profile.get("generic_symptom"))
+
+    score = 0.0
+
+    if classes & {"vibration", "noise"}:
+        if direct_mechanism_supported and (
+            int(sig.get("strong_component_hits", 0) or 0) >= 1
+            or int(sig.get("process_hits", 0) or 0) >= 1
+            or int(sig.get("symptom_hits", 0) or 0) >= 1
+        ):
+            score += 0.14
+
+        if support_only and not has_support_anchor:
+            score -= ROOT_CAUSE_GENERIC_SUPPORT_ONLY_PENALTY
+
+        if int(sig.get("lube_control_hits", 0) or 0) >= 2 and not has_support_anchor:
+            score -= 0.12
+        if int(sig.get("startup_install_hits", 0) or 0) >= 2 and not has_support_anchor:
+            score -= 0.12
+        if int(sig.get("safety_access_hits", 0) or 0) >= 2 and not has_support_anchor:
+            score -= 0.10
+
+    if "jam" in classes:
+        if (matched_set & {"material_feed", "straightening", "forming", "drive_train"}) and (
+            int(sig.get("process_hits", 0) or 0) >= 1
+            or int(sig.get("strong_component_hits", 0) or 0) >= 1
+        ):
+            score += 0.14
+
+        if support_only and not has_support_anchor:
+            score -= ROOT_CAUSE_GENERIC_SUPPORT_ONLY_PENALTY
+
+        if int(sig.get("lube_control_hits", 0) or 0) >= 2 and not has_support_anchor:
+            score -= 0.10
+
+    if "no_start" in classes:
+        if "electrical_control" in matched_set:
+            score += 0.14
+        if "safety_installation" in matched_set:
+            score += 0.10
+        if automatic_mode and ({"electrical_control", "safety_installation"} & matched_set):
+            score += 0.06
+        if matched_set == {"lubrication"} and not has_support_anchor:
+            score -= 0.16
+        if int(sig.get("startup_install_hits", 0) or 0) >= 2 and not ({"electrical_control", "safety_installation"} & matched_set):
+            score -= 0.08
+
+    if generic_symptom and support_only:
+        score -= 0.08
+
+    if generic_symptom and direct_mechanism_supported:
+        score += 0.08
+
+    score = max(-0.45, min(0.30, score))
+    return {
+        "context_fit_score": score,
+        "support_only_penalized": bool(score < 0 and support_only and (classes & {"vibration", "noise", "jam"})),
+        "direct_mechanism_supported": direct_mechanism_supported,
+    }
+
+
+def _select_prompt_citations_from_matrix(
+    rescored_candidates: list[dict],
+    diagnostic_matrix: dict,
+    *,
+    max_prompt: int,
+) -> list[dict]:
+    if not rescored_candidates:
+        return []
+
+    by_id = {
+        str(c.get("citation_id") or "").strip(): c
+        for c in rescored_candidates
+        if c.get("citation_id")
+    }
+
+    out: list[dict] = []
+    used_ids = set()
+    used_families = set()
+
+    def try_add(cid: str, prefer_new_family: bool = True) -> bool:
+        cid = str(cid or "").strip()
+        if not cid or cid not in by_id or cid in used_ids:
+            return False
+
+        item = by_id[cid]
+        fam = _root_cause_evidence_family_key(item)
+
+        if prefer_new_family and fam in used_families:
+            return False
+
+        used_ids.add(cid)
+        used_families.add(fam)
+        out.append(item)
+        return True
+
+    for row in (diagnostic_matrix or {}).get("cause_hypotheses") or []:
+        per_cause = 0
+        for cid in row.get("evidence_ids") or []:
+            added = try_add(cid, prefer_new_family=True)
+            if not added:
+                added = try_add(cid, prefer_new_family=False)
+            if added:
+                per_cause += 1
+            if per_cause >= max(1, ROOT_CAUSE_MATRIX_PROMPT_CAUSE_QUOTA):
+                break
+        if len(out) >= max_prompt:
+            return out[:max_prompt]
+
+    for cid in (diagnostic_matrix or {}).get("keep_ids") or []:
+        if try_add(cid, prefer_new_family=True) or try_add(cid, prefer_new_family=False):
+            if len(out) >= max_prompt:
+                return out[:max_prompt]
+
+    for item in rescored_candidates:
+        cid = str(item.get("citation_id") or "").strip()
+        if try_add(cid, prefer_new_family=True) or try_add(cid, prefer_new_family=False):
+            if len(out) >= max_prompt:
+                break
+
+    return out[:max_prompt]
+
+
+def _merge_matrix_supported_causes(
+    *,
+    result: dict,
+    citations: list[dict],
+    matrix: dict,
+    max_causes: int,
+    response_language: str,
+) -> tuple[dict, list[dict]]:
+    result = dict(result or {})
+    possible_causes = list(result.get("possible_causes") or [])
+    if len(possible_causes) >= max_causes:
+        return result, citations
+
+    fallback = _fallback_root_cause_result_from_matrix(
+        q=str(result.get("problem_summary") or "").strip(),
+        matrix=matrix,
+        citations=citations,
+        max_causes=max_causes,
+        response_language=response_language,
+    )
+    if not (fallback or {}).get("possible_causes"):
+        return result, citations
+
+    grounded_fallback, grounded_fallback_citations = _ground_root_cause_result(
+        result=fallback,
+        citations=citations,
+        max_causes=max_causes,
+    )
+    if not grounded_fallback.get("possible_causes"):
+        return result, citations
+
+    existing_labels = {
+        _normalized_cause_label_key(str(c.get("cause") or ""))
+        for c in possible_causes
+        if isinstance(c, dict)
+    }
+
+    by_id = {
+        str(c.get("citation_id") or "").strip(): c
+        for c in citations
+        if c.get("citation_id")
+    }
+    existing_families = set()
+    for cause in possible_causes:
+        for cid in (cause.get("citations") or [])[:1]:
+            item = by_id.get(str(cid or "").strip())
+            if item:
+                existing_families.add(_root_cause_evidence_family_key(item))
+
+    merged_causes = list(possible_causes)
+
+    for cause in grounded_fallback.get("possible_causes") or []:
+        if not isinstance(cause, dict):
+            continue
+
+        label_key = _normalized_cause_label_key(str(cause.get("cause") or ""))
+        if label_key and label_key in existing_labels:
+            continue
+
+        cause_family = None
+        for cid in cause.get("citations") or []:
+            item = by_id.get(str(cid or "").strip())
+            if item:
+                cause_family = _root_cause_evidence_family_key(item)
+                break
+
+        if cause_family and cause_family in existing_families:
+            continue
+
+        merged_causes.append(dict(cause))
+        if label_key:
+            existing_labels.add(label_key)
+        if cause_family:
+            existing_families.add(cause_family)
+
+        if len(merged_causes) >= max_causes:
+            break
+
+    if len(merged_causes) == len(possible_causes):
+        return result, citations
+
+    for idx, cause in enumerate(merged_causes, start=1):
+        cause["rank"] = idx
+
+    recommended = _unique_non_empty_strings(
+        [chk for row in merged_causes for chk in (row.get("checks") or [])],
+        limit=6,
+    )
+
+    merged_result = dict(result)
+    merged_result["possible_causes"] = merged_causes
+    merged_result["recommended_next_checks"] = recommended or list(result.get("recommended_next_checks") or [])
+
+    merged_citations = _dedup_citations_by_snippet(
+        list(citations or []) + list(grounded_fallback_citations or []),
+        max_items=max(ROOT_CAUSE_MAX_EVIDENCE_POOL, len(citations) + len(grounded_fallback_citations)),
+    )
+    return merged_result, merged_citations
+
 
 def _dedup_root_cause_candidates_semantic(
     citations: list[dict],
@@ -7509,6 +7923,7 @@ def draft_ps_v1(
                 "target_subsystems": retrieval.get("target_subsystems") or [],
                 "diagnostic_matrix": retrieval.get("diagnostic_matrix") or {},
                 "llm_priority_ids": retrieval.get("llm_priority_ids") or [],
+                "symptom_profile": retrieval.get("symptom_profile") or {},
                 "chunks_matching_filter": retrieval.get("chunks_matching_filter"),
                 "similarity_max": sim_max,
                 "effective_threshold": retrieval.get("effective_threshold"),
@@ -7570,8 +7985,8 @@ def draft_ps_v1(
             "Treat the evidence matrix as the preferred structure for candidate causes and checks. "
             "It is acceptable to make cautious multi-source inferences, but every proposed cause must stay tightly grounded. "
             "Each cause label should be compact, canonical, and technically precise. "
-            "Prefer direct component/process evidence over generic maintenance or safety content. "
-            "Merge near-duplicate causes instead of listing paraphrases. "
+            "Prefer direct component/process evidence over generic maintenance or safety content. For generic symptoms like vibration, noise, or jams, do not center lubrication, startup, installation, or safety unless the sources explicitly connect them to the symptom. For no-start cases, prefer electrical supply, interlock, consent, mode-selection, and control evidence over generic lubrication notes. "
+            "Merge near-duplicate causes instead of listing paraphrases. If the evidence matrix contains two distinct hypotheses with separate evidence families, preserve more than one cause instead of collapsing to one. Do not narrow to a single component unless the sources support that narrowing directly. "
             "Use only citation_id values present in the sources."
         )
 
@@ -7592,8 +8007,8 @@ def draft_ps_v1(
             "Tratta la matrice di evidenze come struttura preferita per possibili cause e verifiche. "
             "Sono ammesse inferenze caute multi-fonte, ma ogni possibile causa deve restare strettamente grounded. "
             "Ogni causa deve avere un'etichetta compatta, canonica e tecnicamente precisa. "
-            "Preferisci evidenza diretta di componente/processo rispetto a contenuti generici di manutenzione o sicurezza. "
-            "Unisci cause quasi duplicate invece di elencare parafrasi. "
+            "Preferisci evidenza diretta di componente/processo rispetto a contenuti generici di manutenzione o sicurezza. Per sintomi generici come vibrazione, rumore o blocco, non centrare lubrificazione, start-up, installazione o sicurezza se le fonti non le collegano esplicitamente al sintomo. Per il mancato avvio, preferisci evidenze di alimentazione elettrica, interlock, consensi, selezione modalità e controllo rispetto a note generiche di lubrificazione. "
+            "Unisci cause quasi duplicate invece di elencare parafrasi. Se la matrice di evidenze contiene due ipotesi distinte con famiglie di evidenza separate, conserva più di una causa invece di collassare tutto in una sola. Non restringere a un singolo componente se le fonti non supportano direttamente quel restringimento. "
             "Usa solo citation_id presenti nelle fonti."
         )
 
@@ -7655,6 +8070,19 @@ def draft_ps_v1(
         grounded_citations,
         max_causes=max_causes,
     )
+    if matrix and len(matrix.get("cause_hypotheses") or []) >= ROOT_CAUSE_MATRIX_MIN_DISTINCT_CAUSES:
+        grounded_result, grounded_citations = _merge_matrix_supported_causes(
+            result=grounded_result,
+            citations=grounded_citations,
+            matrix=matrix,
+            max_causes=max_causes,
+            response_language=language,
+        )
+        grounded_result = _canonicalize_root_cause_labels(
+            grounded_result,
+            grounded_citations,
+            language=language,
+        )
 
     if not grounded_result.get("possible_causes") and matrix:
         fallback_grounded = _fallback_root_cause_result_from_matrix(
@@ -7794,6 +8222,7 @@ def root_cause_v1(
         "target_subsystems": [],
         "diagnostic_matrix": {},
         "llm_priority_ids": [],
+        "symptom_profile": {},
         "chunks_matching_filter": None,
         "similarity_max": None,
         "effective_threshold": ASK_SIM_THRESHOLD,
@@ -7846,6 +8275,7 @@ def root_cause_v1(
                 "target_subsystems": retrieval.get("target_subsystems") or [],
                 "diagnostic_matrix": retrieval.get("diagnostic_matrix") or {},
                 "llm_priority_ids": retrieval.get("llm_priority_ids") or [],
+                "symptom_profile": retrieval.get("symptom_profile") or {},
                 "chunks_matching_filter": retrieval.get("chunks_matching_filter"),
                 "similarity_max": sim_max,
                 "effective_threshold": retrieval.get("effective_threshold"),
@@ -7926,7 +8356,7 @@ def root_cause_v1(
         "Reuse source terminology when possible and avoid switching between near-synonymous paraphrases across runs. "
         "If the evidence is narrow, return fewer causes rather than broad generic ones. "
         "Avoid generic boilerplate causes unless the sources clearly support them. "
-        "Merge near-duplicate causes instead of listing paraphrases. "
+        "Merge near-duplicate causes instead of listing paraphrases. If the evidence matrix contains two distinct hypotheses with separate evidence families, preserve more than one cause instead of collapsing to one. For generic symptoms like vibration, noise, or jams, do not center lubrication, startup, installation, or safety unless the sources explicitly connect them to the symptom. For no-start cases, prefer electrical supply, interlock, consent, mode-selection, and control evidence over generic lubrication notes. Do not narrow to a single component unless the sources support that narrowing directly. "
         "Always reply in the same language as the user query."
     )
 
@@ -7984,6 +8414,19 @@ def root_cause_v1(
         grounded_citations,
         max_causes=max_causes,
     )
+    if matrix and len(matrix.get("cause_hypotheses") or []) >= ROOT_CAUSE_MATRIX_MIN_DISTINCT_CAUSES:
+        grounded_result, grounded_citations = _merge_matrix_supported_causes(
+            result=grounded_result,
+            citations=grounded_citations,
+            matrix=matrix,
+            max_causes=max_causes,
+            response_language=response_language,
+        )
+        grounded_result = _canonicalize_root_cause_labels(
+            grounded_result,
+            grounded_citations,
+            language=response_language,
+        )
 
     if not grounded_result.get("possible_causes") and matrix:
         fallback_grounded = _fallback_root_cause_result_from_matrix(
