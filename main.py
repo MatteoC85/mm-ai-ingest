@@ -7508,6 +7508,142 @@ def search_chunks(
         conn.close()
 
 
+
+
+def _should_route_ask_through_root_cause(q: str) -> bool:
+    if _is_lookup_or_identifier_query(q):
+        return False
+    profile = _query_symptom_profile(q)
+    classes = set(profile.get("classes") or [])
+    if "no_start" in classes:
+        return True
+    if classes & {"vibration", "noise", "jam"}:
+        return True
+    return False
+
+
+def _build_ask_answer_from_root_cause_response(q: str, root_response: dict, *, max_causes: int = 2) -> tuple[str, list[dict]]:
+    response = dict(root_response or {})
+    causes = [c for c in (response.get("possible_causes") or []) if isinstance(c, dict)][: max(1, max_causes)]
+    citations = list(response.get("citations") or [])
+    if not causes or not citations:
+        return "", []
+
+    by_id = {
+        str(c.get("citation_id") or "").strip(): c
+        for c in citations
+        if c.get("citation_id")
+    }
+
+    used_ids: list[str] = []
+    seen_ids = set()
+
+    def take_ids(cause: dict, limit: int = 2) -> list[str]:
+        out: list[str] = []
+        for cid in cause.get("citations") or []:
+            cid = str(cid or "").strip()
+            if cid and cid in by_id and cid not in out:
+                out.append(cid)
+            if len(out) >= limit:
+                break
+        return out
+
+    primary = causes[0]
+    primary_ids = take_ids(primary, limit=2)
+    secondary = causes[1] if len(causes) >= 2 else None
+    secondary_ids = take_ids(secondary, limit=2) if secondary else []
+
+    checks = _unique_non_empty_strings(
+        (primary.get("checks") or []) + ((secondary.get("checks") or []) if secondary else []),
+        limit=3,
+    )
+
+    def register(ids: list[str]) -> str:
+        local = []
+        for cid in ids:
+            if cid not in seen_ids:
+                seen_ids.add(cid)
+                used_ids.append(cid)
+            local.append(f"[{cid}]")
+        return " ".join(local)
+
+    lang = _select_response_language(q)
+    primary_label = re.sub(r"\s+", " ", str(primary.get("cause") or "")).strip().rstrip(".")
+    secondary_label = re.sub(r"\s+", " ", str((secondary or {}).get("cause") or "")).strip().rstrip(".")
+
+    parts: list[str] = []
+    if lang == "en":
+        if primary_label:
+            cite = register(primary_ids[:1] or primary_ids)
+            parts.append(f"The strongest evidence points to {primary_label}. {cite}".strip())
+        if secondary_label:
+            cite = register(secondary_ids[:1] or secondary_ids)
+            parts.append(f"A secondary possibility is {secondary_label}. {cite}".strip())
+        if checks:
+            check_text = "; ".join(checks)
+            cite_ids = primary_ids[:1] + [cid for cid in secondary_ids[:1] if cid not in primary_ids[:1]]
+            cite = register(cite_ids)
+            parts.append(f"Recommended checks: {check_text}. {cite}".strip())
+    else:
+        if primary_label:
+            cite = register(primary_ids[:1] or primary_ids)
+            parts.append(f"Le evidenze puntano soprattutto a {primary_label}. {cite}".strip())
+        if secondary_label:
+            cite = register(secondary_ids[:1] or secondary_ids)
+            parts.append(f"In seconda battuta è plausibile {secondary_label}. {cite}".strip())
+        if checks:
+            check_text = "; ".join(checks)
+            cite_ids = primary_ids[:1] + [cid for cid in secondary_ids[:1] if cid not in primary_ids[:1]]
+            cite = register(cite_ids)
+            parts.append(f"Verifiche consigliate: {check_text}. {cite}".strip())
+
+    answer = re.sub(r"\s+", " ", " ".join(parts)).strip()
+    final_citations = [by_id[cid] for cid in used_ids if cid in by_id]
+    return answer, final_citations
+
+
+def _build_ask_response_from_root_cause_bridge(
+    *,
+    q: str,
+    company_id: str,
+    top_k: int,
+    root_response: dict,
+    debug: bool = False,
+) -> Optional[dict]:
+    if str((root_response or {}).get("status") or "").strip().lower() != "answered":
+        return None
+
+    answer, final_citations = _build_ask_answer_from_root_cause_response(q, root_response, max_causes=2)
+    if not answer or not final_citations:
+        return None
+
+    response_citations = _sanitize_citations_for_response(final_citations)
+    rg_links = []
+    try:
+        rg_links = _build_rg_links(company_id, response_citations)
+    except Exception as e:
+        print("RG_LINKS_FAIL", str(e))
+        rg_links = []
+
+    resp = {
+        "ok": True,
+        "status": "answered",
+        "answer": answer,
+        "citations": response_citations,
+        "rg_links": rg_links,
+        "top_k": top_k,
+        "similarity_max": (root_response or {}).get("similarity_max"),
+        "chat_model": (root_response or {}).get("chat_model") or ROOT_CAUSE_RESPONSE_MODEL,
+    }
+    if debug:
+        resp["debug"] = {
+            "root_cause_bridge": True,
+            "root_cause_status": str((root_response or {}).get("status") or ""),
+            "root_cause_similarity_max": (root_response or {}).get("similarity_max"),
+            "root_cause_debug": (root_response or {}).get("debug") or {},
+        }
+    return resp
+
 def _ask_v1_baseline_impl(
     payload: AskRequest,
     x_ai_internal_secret: Optional[str] = Header(default=None),
@@ -7535,6 +7671,32 @@ def _ask_v1_baseline_impl(
     top_k = int(payload.top_k or 5)
     top_k = max(1, min(top_k, ASK_MAX_TOP_K))
     candidate_k = max(top_k, min(48, top_k * 7))
+
+    if _should_route_ask_through_root_cause(q):
+        try:
+            root_payload = RootCauseRequest(
+                query=q,
+                company_id=company_id,
+                machine_id=machine_id,
+                bubble_document_id=bubble_document_id,
+                document_ids=doc_ids,
+                top_k=max(6, top_k),
+                max_causes=2,
+                debug=payload.debug,
+            )
+            root_response = root_cause_v1(root_payload, x_ai_internal_secret)
+            bridged = _build_ask_response_from_root_cause_bridge(
+                q=q,
+                company_id=company_id,
+                top_k=top_k,
+                root_response=root_response,
+                debug=bool(payload.debug),
+            )
+            if bridged:
+                return bridged
+        except Exception as e:
+            if payload.debug:
+                print("ASK_ROOT_CAUSE_BRIDGE_FAIL", str(e))
 
     primary_retrieval = _shared_semantic_retrieval(
         q=q,
@@ -8559,6 +8721,47 @@ def _cause_label_specificity_score(label: str) -> float:
     return max(0.0, min(1.0, score))
 
 
+
+
+def _looks_like_installation_positioning_false_positive(text: str) -> bool:
+    txt = re.sub(r"\s+", " ", _normalize_unicode_advanced(text or "")).strip().lower()
+    if not txt:
+        return False
+
+    hard_phrases = [
+        "posizionamento della macchina",
+        "machine positioning",
+        "piano di appoggio",
+        "support surface",
+        "spessori di gomma",
+        "rubber shims",
+        "attutire le vibrazioni",
+        "attenuate the vibrations",
+        "flatness of the support surface",
+        "planarità del piano di appoggio",
+        "fori di fondazione",
+        "foundation holes",
+        "livellamento della macchina",
+        "machine leveling",
+        "spirit level",
+        "livella",
+    ]
+    if any(p in txt for p in hard_phrases):
+        return True
+
+    soft_phrases = [
+        "fondazione",
+        "foundation",
+        "posizionamento",
+        "positioning",
+        "livellamento",
+        "leveling",
+        "planarità",
+        "planarity",
+    ]
+    hits = sum(1 for p in soft_phrases if p in txt)
+    return hits >= 2
+
 def _classify_diagnostic_role_from_text(
     q: str,
     chunk_text: str,
@@ -9332,8 +9535,17 @@ def _ask_response_proxy_score(q: str, response: dict) -> dict:
     top_role_class = str(role_citations[0].get("role_class") or "collateral") if role_citations else "none"
     top_role_group = str(role_citations[0].get("role_group") or "collateral") if role_citations else "none"
 
+    installation_false_positive = False
     if profile.get("generic_symptom") and classes & {"vibration", "noise", "jam"}:
-        if top_role_group == "core":
+        installation_false_positive = _looks_like_installation_positioning_false_positive(answer) or any(
+            _looks_like_installation_positioning_false_positive((c.get("snippet") or "") + "\n" + (c.get("chunk_full") or ""))
+            for c in (role_citations or citations)
+        )
+        if installation_false_positive and not profile.get("has_support_anchor"):
+            score -= 0.42
+            hard_fail = True
+            notes.append("installation_false_positive_generic_symptom")
+        elif top_role_group == "core":
             score += 0.18
         elif top_role_group == "support" and not profile.get("has_support_anchor"):
             score -= 0.24
@@ -9390,6 +9602,8 @@ def _is_lookup_or_identifier_query(q: str) -> bool:
 
 def _should_attempt_ask_candidate(q: str, baseline_response: dict) -> bool:
     if not (RESPONSE_ARB_ENABLED and ASK_CANDIDATE_ENABLED):
+        return False
+    if _should_route_ask_through_root_cause(q):
         return False
     if _is_lookup_or_identifier_query(q):
         return False
