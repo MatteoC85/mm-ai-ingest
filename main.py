@@ -98,6 +98,23 @@ ROOT_CAUSE_MATRIX_MIN_DISTINCT_CAUSES = int(os.environ.get("MM_ROOT_CAUSE_MATRIX
 ROOT_CAUSE_MATRIX_PROMPT_CAUSE_QUOTA = int(os.environ.get("MM_ROOT_CAUSE_MATRIX_PROMPT_CAUSE_QUOTA", "2"))
 ROOT_CAUSE_USE_DETERMINISTIC_CROSSLINGUAL = (os.environ.get("MM_ROOT_CAUSE_USE_DETERMINISTIC_CROSSLINGUAL") or "1").strip() != "0"
 
+RESPONSE_ARB_ENABLED = (os.environ.get("MM_RESPONSE_ARB_ENABLED") or "1").strip() != "0"
+ASK_CANDIDATE_ENABLED = (os.environ.get("MM_ASK_CANDIDATE_ENABLED") or "1").strip() != "0"
+ROOT_CAUSE_CANDIDATE_ENABLED = (os.environ.get("MM_ROOT_CAUSE_CANDIDATE_ENABLED") or "1").strip() != "0"
+RESPONSE_ARB_KEEP_BASELINE_ON_TIE = (os.environ.get("MM_RESPONSE_ARB_KEEP_BASELINE_ON_TIE") or "1").strip() != "0"
+ASK_ARB_MIN_DELTA = float(os.environ.get("MM_ASK_ARB_MIN_DELTA", "0.035"))
+ROOT_CAUSE_ARB_MIN_DELTA = float(os.environ.get("MM_ROOT_CAUSE_ARB_MIN_DELTA", "0.040"))
+ROOT_CAUSE_CANDIDATE_CORE_PROMOTION = float(os.environ.get("MM_ROOT_CAUSE_CANDIDATE_CORE_PROMOTION", "0.08"))
+ROOT_CAUSE_CANDIDATE_SUPPORT_PENALTY = float(os.environ.get("MM_ROOT_CAUSE_CANDIDATE_SUPPORT_PENALTY", "0.16"))
+ROOT_CAUSE_CANDIDATE_NO_START_LUBE_PENALTY = float(os.environ.get("MM_ROOT_CAUSE_CANDIDATE_NO_START_LUBE_PENALTY", "0.20"))
+ROOT_CAUSE_CANDIDATE_STARTUP_PENALTY = float(os.environ.get("MM_ROOT_CAUSE_CANDIDATE_STARTUP_PENALTY", "0.16"))
+ROOT_CAUSE_CANDIDATE_SAFETY_PENALTY = float(os.environ.get("MM_ROOT_CAUSE_CANDIDATE_SAFETY_PENALTY", "0.14"))
+ROOT_CAUSE_CANDIDATE_MATRIX_TOP_K = int(os.environ.get("MM_ROOT_CAUSE_CANDIDATE_MATRIX_TOP_K", "10"))
+ROOT_CAUSE_CANDIDATE_PROMPT_TOP_K = int(os.environ.get("MM_ROOT_CAUSE_CANDIDATE_PROMPT_TOP_K", "7"))
+ROOT_CAUSE_CANDIDATE_ENABLE_ROLE_AWARE_MATRIX = (os.environ.get("MM_ROOT_CAUSE_CANDIDATE_ENABLE_ROLE_AWARE_MATRIX") or "1").strip() != "0"
+ASK_CANDIDATE_MATRIX_TOP_K = int(os.environ.get("MM_ASK_CANDIDATE_MATRIX_TOP_K", "7"))
+ASK_CANDIDATE_PROMPT_TOP_K = int(os.environ.get("MM_ASK_CANDIDATE_PROMPT_TOP_K", "6"))
+
 
 # -----------------------------
 # Entity fallback (URL / email / phone)
@@ -7491,9 +7508,7 @@ def search_chunks(
         conn.close()
 
 
-@app.post("/v1/ai/ask")
-
-def ask_v1(
+def _ask_v1_baseline_impl(
     payload: AskRequest,
     x_ai_internal_secret: Optional[str] = Header(default=None),
 ):
@@ -7543,6 +7558,8 @@ def ask_v1(
     citations = list(retrieval.get("citations") or [])
     sim_max = retrieval.get("similarity_max")
     query_token_count = _count_query_tokens(q)
+    symptom_profile = _query_symptom_profile(q)
+    ask_arbiter_debug: dict = {}
 
     rescue_retrieval: Optional[dict] = None
     need_rescue_retrieval = (
@@ -8167,8 +8184,7 @@ def draft_ps_v1(
     )
 
 
-@app.post("/v1/ai/root-cause")
-def root_cause_v1(
+def _root_cause_v1_baseline_impl(
     payload: RootCauseRequest,
     x_ai_internal_secret: Optional[str] = Header(default=None),
 ):
@@ -8496,6 +8512,1568 @@ def root_cause_v1(
             "chat_model": ROOT_CAUSE_RESPONSE_MODEL,
         }
     )
+
+
+
+
+def _strip_internal_response_artifacts(resp: dict) -> dict:
+    if not isinstance(resp, dict):
+        return resp
+
+    out = {}
+    for k, v in resp.items():
+        if str(k).startswith("_arb_"):
+            continue
+        out[k] = v
+    return out
+
+
+def _cause_label_specificity_score(label: str) -> float:
+    txt = re.sub(r"\s+", " ", _normalize_unicode_advanced(label or "")).strip().lower()
+    if not txt:
+        return 0.0
+
+    generic_markers = {
+        "problem", "issue", "fault", "anomaly", "generic anomaly", "possible cause",
+        "problema", "guasto", "anomalia", "possibile causa", "mancato avviamento intenzionale",
+        "not starting", "does not start", "machine issue", "machine problem", "machine fault",
+    }
+    technical_markers = [
+        "play", "wear", "backlash", "misalignment", "alignment", "transmission", "gear", "gearbox",
+        "bearing", "roller", "slide", "guide", "feed", "straighten", "press", "eccentric", "cam",
+        "drive", "motor", "phase", "power", "interlock", "selector", "panel", "pressure", "hydraulic",
+        "pneumatic", "lubric", "oil", "ridutt", "ingran", "cuscinet", "rullo", "slitta", "guida",
+        "avanz", "raddrizz", "pressa", "eccentric", "camme", "fasi", "aliment", "interblocco",
+        "selettore", "quadro", "pression", "idraulic", "pneumat", "lubr", "olio",
+    ]
+    score = 0.35
+    words = re.findall(r"[a-zà-öø-ÿ0-9]+", txt)
+    if 2 <= len(words) <= 8:
+        score += 0.15
+    if any(m in txt for m in technical_markers):
+        score += 0.35
+    if txt in generic_markers or any(txt == g for g in generic_markers):
+        score -= 0.35
+    if any(g in txt for g in ["generic", "generico", "issue", "problema", "fault", "anomalia"]):
+        score -= 0.12
+    return max(0.0, min(1.0, score))
+
+
+def _classify_diagnostic_role_from_text(
+    q: str,
+    chunk_text: str,
+    symptom_profile: dict,
+    diagnostic_keywords: list[str],
+    target_subsystems: list[str],
+) -> dict:
+    chunk_text = (chunk_text or "").strip()
+    if not chunk_text:
+        return {
+            "role_class": "collateral",
+            "role_group": "collateral",
+            "role_adjustment": -0.06,
+            "matched_subsystems": [],
+            "role_reason": "empty_chunk",
+        }
+
+    sig = _root_cause_chunk_signal_summary(
+        q=q,
+        chunk_text=chunk_text,
+        diagnostic_keywords=diagnostic_keywords,
+    )
+    subsystem = _score_root_cause_subsystem_alignment(
+        q=q,
+        chunk_text=chunk_text,
+        target_subsystems=target_subsystems,
+    )
+
+    classes = set(symptom_profile.get("classes") or [])
+    matched_set = {str(x).strip() for x in (subsystem.get("matched_subsystems") or []) if str(x).strip()}
+    direct_subsystems = {"drive_train", "material_feed", "forming", "straightening"}
+    support_subsystems = {"lubrication", "fluid_power", "electrical_control", "safety_installation"}
+    has_support_anchor = bool(symptom_profile.get("has_support_anchor"))
+    automatic_mode = bool(symptom_profile.get("automatic_mode"))
+
+    strong_component_hits = int(sig.get("strong_component_hits", 0) or 0)
+    process_hits = int(sig.get("process_hits", 0) or 0)
+    symptom_hits = int(sig.get("symptom_hits", 0) or 0)
+    lube_hits = int(sig.get("lube_control_hits", 0) or 0)
+    startup_hits = int(sig.get("startup_install_hits", 0) or 0) + int(sig.get("positioning_hits", 0) or 0)
+    safety_hits = int(sig.get("safety_access_hits", 0) or 0) + int(sig.get("acoustic_protection_hits", 0) or 0)
+
+    direct_mechanism_supported = bool(matched_set & direct_subsystems) and (
+        strong_component_hits >= 1 or process_hits >= 1 or symptom_hits >= 1 or float(subsystem.get("subsystem_score", 0.0) or 0.0) > 0.0
+    )
+
+    if "no_start" in classes:
+        if "electrical_control" in matched_set:
+            return {
+                "role_class": "support_electrical_interlock",
+                "role_group": "support",
+                "role_adjustment": 0.16 if automatic_mode else 0.12,
+                "matched_subsystems": sorted(matched_set),
+                "role_reason": "no_start_electrical_control",
+            }
+        if "safety_installation" in matched_set:
+            return {
+                "role_class": "support_safety",
+                "role_group": "support",
+                "role_adjustment": 0.10 if automatic_mode else 0.04,
+                "matched_subsystems": sorted(matched_set),
+                "role_reason": "no_start_safety_interlock",
+            }
+        if "lubrication" in matched_set or lube_hits >= 2:
+            return {
+                "role_class": "support_lubrication",
+                "role_group": "support",
+                "role_adjustment": -0.18 if not has_support_anchor else -0.05,
+                "matched_subsystems": sorted(matched_set),
+                "role_reason": "no_start_lubrication_secondary",
+            }
+
+    if direct_mechanism_supported:
+        if (matched_set & {"forming", "material_feed", "straightening"}) or process_hits >= 1:
+            return {
+                "role_class": "core_process",
+                "role_group": "core",
+                "role_adjustment": 0.14,
+                "matched_subsystems": sorted(matched_set),
+                "role_reason": "direct_process_mechanism",
+            }
+        return {
+            "role_class": "core_mechanical",
+            "role_group": "core",
+            "role_adjustment": 0.12,
+            "matched_subsystems": sorted(matched_set),
+            "role_reason": "direct_mechanical_mechanism",
+        }
+
+    if matched_set & {"fluid_power"}:
+        return {
+            "role_class": "support_fluid_power",
+            "role_group": "support",
+            "role_adjustment": 0.06 if ("jam" in classes or has_support_anchor) else -0.04,
+            "matched_subsystems": sorted(matched_set),
+            "role_reason": "fluid_power_support",
+        }
+
+    if matched_set & {"electrical_control"}:
+        return {
+            "role_class": "support_electrical_interlock",
+            "role_group": "support",
+            "role_adjustment": 0.08 if ("no_start" in classes or has_support_anchor) else -0.03,
+            "matched_subsystems": sorted(matched_set),
+            "role_reason": "electrical_or_control_support",
+        }
+
+    if matched_set & {"lubrication"} or lube_hits >= 2:
+        return {
+            "role_class": "support_lubrication",
+            "role_group": "support",
+            "role_adjustment": 0.04 if has_support_anchor else -0.12,
+            "matched_subsystems": sorted(matched_set),
+            "role_reason": "lubrication_support",
+        }
+
+    if startup_hits >= 2 or bool(sig.get("overview_section_hit")) or bool(sig.get("description_section_hit")):
+        return {
+            "role_class": "support_startup_install",
+            "role_group": "support",
+            "role_adjustment": -0.16 if not has_support_anchor else -0.03,
+            "matched_subsystems": sorted(matched_set),
+            "role_reason": "startup_install_or_overview",
+        }
+
+    if safety_hits >= 2:
+        return {
+            "role_class": "support_safety",
+            "role_group": "support",
+            "role_adjustment": 0.03 if ("no_start" in classes and automatic_mode) else -0.12,
+            "matched_subsystems": sorted(matched_set),
+            "role_reason": "safety_support",
+        }
+
+    if strong_component_hits >= 1 or process_hits >= 1:
+        return {
+            "role_class": "core_mechanical",
+            "role_group": "core",
+            "role_adjustment": 0.06,
+            "matched_subsystems": sorted(matched_set),
+            "role_reason": "component_or_process_anchor_without_subsystem",
+        }
+
+    return {
+        "role_class": "collateral",
+        "role_group": "collateral",
+        "role_adjustment": -0.08,
+        "matched_subsystems": sorted(matched_set),
+        "role_reason": "collateral_or_weak",
+    }
+
+
+def _summarize_evidence_roles_for_prompt(
+    q: str,
+    citations: list[dict],
+    *,
+    symptom_profile: Optional[dict] = None,
+    diagnostic_keywords: Optional[list[str]] = None,
+    target_subsystems: Optional[list[str]] = None,
+    max_items: int = 8,
+) -> list[dict]:
+    symptom_profile = dict(symptom_profile or _query_symptom_profile(q))
+    inferred_components = _infer_machine_components(q)
+    diagnostic_keywords = list(diagnostic_keywords or _collect_candidate_keywords(q, inferred_components))
+    target_subsystems = list(target_subsystems or _root_cause_target_subsystems(q, inferred_components))
+
+    out = []
+    used = set()
+    for c in citations or []:
+        cid = str(c.get("citation_id") or "").strip()
+        if not cid or cid in used:
+            continue
+        used.add(cid)
+        chunk_text = (c.get("chunk_full") or c.get("snippet") or "").strip()
+        role = _classify_diagnostic_role_from_text(
+            q=q,
+            chunk_text=chunk_text,
+            symptom_profile=symptom_profile,
+            diagnostic_keywords=diagnostic_keywords,
+            target_subsystems=target_subsystems,
+        )
+        out.append(
+            {
+                "citation_id": cid,
+                "role_class": str(c.get("role_class") or role.get("role_class") or "collateral"),
+                "role_group": str(c.get("role_group") or role.get("role_group") or "collateral"),
+                "role_adjustment": round(float(c.get("role_adjustment", role.get("role_adjustment", 0.0)) or 0.0), 4),
+                "matched_subsystems": list(c.get("matched_subsystems") or role.get("matched_subsystems") or []),
+                "source_type": str(c.get("source_type") or _source_type_from_document_id(c.get("bubble_document_id") or "")),
+                "diagnostic_score": round(float(c.get("candidate_score", c.get("diagnostic_score", c.get("retrieval_score", c.get("similarity", 0.0)))) or 0.0), 4),
+                "snippet": re.sub(r"\s+", " ", (c.get("snippet") or chunk_text or "").strip())[:260],
+            }
+        )
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def _llm_build_role_aware_diagnostic_evidence_matrix(
+    q: str,
+    citations: list[dict],
+    max_causes: int,
+) -> dict:
+    if not q or not citations:
+        return {}
+
+    max_causes = max(1, min(int(max_causes or 1), 3))
+    items = []
+    used = set()
+    for c in citations[: max(ROOT_CAUSE_CANDIDATE_MATRIX_TOP_K, max_causes + 5)]:
+        cid = str(c.get("citation_id") or "").strip()
+        if not cid or cid in used:
+            continue
+        used.add(cid)
+        items.append(
+            {
+                "citation_id": cid,
+                "role_class": str(c.get("role_class") or "collateral"),
+                "role_group": str(c.get("role_group") or "collateral"),
+                "role_adjustment": round(float(c.get("role_adjustment", 0.0) or 0.0), 4),
+                "matched_subsystems": list(c.get("matched_subsystems") or []),
+                "evidence_family": _root_cause_evidence_family_key(c),
+                "diagnostic_score": round(float(c.get("candidate_score", c.get("diagnostic_score", c.get("retrieval_score", c.get("similarity", 0.0)))) or 0.0), 4),
+                "source_type": str(c.get("source_type") or _source_type_from_document_id(c.get("bubble_document_id") or "")),
+                "snippet": re.sub(r"\s+", " ", (c.get("chunk_full") or c.get("snippet") or "").strip())[:360],
+            }
+        )
+
+    if not items:
+        return {}
+
+    schema = {
+        "name": "role_aware_diagnostic_evidence_matrix",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "keep_ids": {"type": "array", "items": {"type": "string"}},
+                "discard_ids": {"type": "array", "items": {"type": "string"}},
+                "cause_hypotheses": {
+                    "type": "array",
+                    "maxItems": max_causes,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "cause": {"type": "string"},
+                            "evidence_ids": {"type": "array", "items": {"type": "string"}},
+                            "check_focus": {"type": "array", "items": {"type": "string"}},
+                        },
+                        "required": ["cause", "evidence_ids", "check_focus"],
+                    },
+                },
+            },
+            "required": ["keep_ids", "discard_ids", "cause_hypotheses"],
+        },
+    }
+
+    system_msg = (
+        "You organize evidence for industrial root-cause diagnosis. "
+        "Use the role metadata strictly. core roles are preferred for generic symptoms such as vibration, noise, or jams. "
+        "support roles (lubrication, startup/install, safety, electrical/interlock, fluid power) may stay only when the symptom explicitly anchors them or when no stronger core evidence is available. "
+        "For no-start and automatic-mode failures, support_electrical_interlock can be primary, but support_lubrication should remain secondary unless directly anchored. "
+        "Maximize distinct causal families and avoid duplicate paraphrases. Keep only the most diagnostic evidence."
+    )
+    user_msg = (
+        f"PROBLEM:\n{q}\n\n"
+        f"ROLE_AWARE_CANDIDATES_JSON:\n{json.dumps(items, ensure_ascii=False)}\n\n"
+        "Return valid JSON."
+    )
+
+    return _openai_chat_json_models(
+        [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ],
+        models=[DIAGNOSTIC_EVIDENCE_MODEL, ROOT_CAUSE_RESPONSE_MODEL, OPENAI_CHAT_MODEL],
+        json_schema=schema,
+        timeout=70,
+    )
+
+
+def _diagnostic_evidence_candidate_pipeline(
+    *,
+    q: str,
+    company_id: str,
+    machine_id: str,
+    candidate_k: int,
+    top_k: int,
+    max_causes: int,
+    doc_ids: Optional[list[str]] = None,
+    bubble_document_id: Optional[str] = None,
+    debug: bool = False,
+    planner_mode: str = "root_cause",
+    base_threshold: float = ASK_SIM_THRESHOLD,
+) -> dict:
+    result = _diagnostic_evidence_pipeline(
+        q=q,
+        company_id=company_id,
+        machine_id=machine_id,
+        candidate_k=candidate_k,
+        top_k=top_k,
+        max_causes=max_causes,
+        doc_ids=doc_ids,
+        bubble_document_id=bubble_document_id,
+        debug=debug,
+        planner_mode=planner_mode,
+        base_threshold=base_threshold,
+    )
+
+    symptom_profile = dict(result.get("symptom_profile") or _query_symptom_profile(q))
+    inferred_components = list(result.get("inferred_components") or _infer_machine_components(q))
+    diagnostic_keywords = list(result.get("diagnostic_keywords") or _collect_candidate_keywords(q, inferred_components))
+    target_subsystems = list(result.get("target_subsystems") or _root_cause_target_subsystems(q, inferred_components))
+    classes = set(symptom_profile.get("classes") or [])
+
+    raw_pool = list(result.get("candidate_pool") or [])
+    if not raw_pool:
+        raw_pool = list(result.get("candidates") or []) + list(result.get("citations") or [])
+    raw_pool = _ensure_candidate_retrieval_fields(
+        raw_pool,
+        query_terms=_planner_query_term_set(q, result.get("planner") or {}),
+        query_style=str((result.get("planner") or {}).get("query_style") or "").strip().lower(),
+        query_token_count=_count_query_tokens(q),
+    )
+    if not raw_pool:
+        result["role_summary"] = []
+        return result
+
+    rescored = []
+    for item in raw_pool:
+        cc = dict(item)
+        chunk_text = (cc.get("chunk_full") or cc.get("snippet") or "").strip()
+        role = _classify_diagnostic_role_from_text(
+            q=q,
+            chunk_text=chunk_text,
+            symptom_profile=symptom_profile,
+            diagnostic_keywords=diagnostic_keywords,
+            target_subsystems=target_subsystems,
+        )
+        candidate_score = float(cc.get("diagnostic_score", cc.get("retrieval_score", cc.get("similarity", 0.0))) or 0.0)
+        candidate_score += float(role.get("role_adjustment", 0.0) or 0.0)
+
+        if symptom_profile.get("generic_symptom") and role.get("role_group") == "core":
+            candidate_score += ROOT_CAUSE_CANDIDATE_CORE_PROMOTION
+        if symptom_profile.get("generic_symptom") and role.get("role_group") == "support" and not symptom_profile.get("has_support_anchor") and "no_start" not in classes:
+            candidate_score -= ROOT_CAUSE_CANDIDATE_SUPPORT_PENALTY * 0.45
+        if role.get("role_class") == "support_lubrication" and classes & {"vibration", "noise", "jam"} and not symptom_profile.get("has_support_anchor"):
+            candidate_score -= ROOT_CAUSE_CANDIDATE_SUPPORT_PENALTY
+        if role.get("role_class") == "support_lubrication" and "no_start" in classes and not symptom_profile.get("has_support_anchor"):
+            candidate_score -= ROOT_CAUSE_CANDIDATE_NO_START_LUBE_PENALTY
+        if role.get("role_class") == "support_startup_install" and not symptom_profile.get("has_support_anchor"):
+            candidate_score -= ROOT_CAUSE_CANDIDATE_STARTUP_PENALTY
+        if role.get("role_class") == "support_safety" and not ("no_start" in classes and symptom_profile.get("automatic_mode")) and not symptom_profile.get("has_support_anchor"):
+            candidate_score -= ROOT_CAUSE_CANDIDATE_SAFETY_PENALTY
+        if role.get("role_class") == "collateral":
+            candidate_score -= 0.04
+
+        cc.update(role)
+        cc["candidate_score"] = candidate_score
+        cc["retrieval_score"] = candidate_score
+        rescored.append(cc)
+
+    rescored.sort(
+        key=lambda x: (
+            -float(x.get("candidate_score", x.get("diagnostic_score", x.get("retrieval_score", x.get("similarity", 0.0)))) or 0.0),
+            -float(x.get("similarity", 0.0) or 0.0),
+            str(x.get("bubble_document_id") or ""),
+            int(x.get("page_from") or 0),
+            int(x.get("page_to") or 0),
+            int(x.get("chunk_index") or 0),
+            str(x.get("citation_id") or ""),
+        )
+    )
+
+    working_pool = _dedup_root_cause_candidates_semantic(
+        rescored,
+        max_items=max(ROOT_CAUSE_MAX_EVIDENCE_POOL * 2, top_k * 3, ROOT_CAUSE_CANDIDATE_MATRIX_TOP_K + 4),
+    )
+    working_pool = _prioritize_root_cause_coverage(
+        working_pool,
+        max_items=max(ROOT_CAUSE_CANDIDATE_MATRIX_TOP_K, top_k + 3),
+    )
+
+    matrix = {}
+    if ROOT_CAUSE_CANDIDATE_ENABLE_ROLE_AWARE_MATRIX:
+        try:
+            matrix = _llm_build_role_aware_diagnostic_evidence_matrix(
+                q=q,
+                citations=working_pool[: max(ROOT_CAUSE_CANDIDATE_MATRIX_TOP_K, top_k + 2)],
+                max_causes=max_causes,
+            )
+        except Exception:
+            matrix = {}
+
+    if not matrix:
+        matrix = dict(result.get("diagnostic_matrix") or {})
+
+    prompt_citations = _select_prompt_citations_from_matrix(
+        working_pool,
+        matrix,
+        max_prompt=max(ROOT_CAUSE_CANDIDATE_PROMPT_TOP_K, top_k),
+    )
+    if not prompt_citations:
+        prompt_citations = _lock_final_citations(
+            selected_citations=working_pool[: max(ROOT_CAUSE_CANDIDATE_PROMPT_TOP_K, top_k)],
+            ranked_candidates=working_pool + rescored,
+            top_k=max(ROOT_CAUSE_CANDIDATE_PROMPT_TOP_K, top_k),
+            diagnostic_mode=True,
+            query_token_count=_count_query_tokens(q),
+        )
+
+    final_citations = _lock_final_citations(
+        selected_citations=prompt_citations,
+        ranked_candidates=working_pool + rescored,
+        top_k=max(top_k, min(len(prompt_citations) or top_k, top_k + 2)),
+        diagnostic_mode=True,
+        query_token_count=_count_query_tokens(q),
+    )
+
+    result["candidates"] = rescored
+    result["candidate_pool"] = working_pool
+    result["prompt_citations"] = prompt_citations
+    result["citations"] = _dedup_citations_by_snippet(
+        list(prompt_citations or []) + list(final_citations or []),
+        max_items=max(ROOT_CAUSE_MAX_EVIDENCE_POOL, top_k + 3),
+    )
+    result["diagnostic_matrix"] = matrix or {}
+    result["role_summary"] = _summarize_evidence_roles_for_prompt(
+        q=q,
+        citations=prompt_citations or working_pool,
+        symptom_profile=symptom_profile,
+        diagnostic_keywords=diagnostic_keywords,
+        target_subsystems=target_subsystems,
+        max_items=max(ROOT_CAUSE_CANDIDATE_PROMPT_TOP_K, top_k),
+    )
+    return result
+
+
+def _cause_role_from_response_cause(
+    q: str,
+    cause: dict,
+    by_id: dict[str, dict],
+    *,
+    symptom_profile: Optional[dict] = None,
+    diagnostic_keywords: Optional[list[str]] = None,
+    target_subsystems: Optional[list[str]] = None,
+) -> tuple[str, str]:
+    symptom_profile = dict(symptom_profile or _query_symptom_profile(q))
+    inferred_components = _infer_machine_components(q)
+    diagnostic_keywords = list(diagnostic_keywords or _collect_candidate_keywords(q, inferred_components))
+    target_subsystems = list(target_subsystems or _root_cause_target_subsystems(q, inferred_components))
+
+    roles = []
+    for cid in cause.get("citations") or []:
+        item = by_id.get(str(cid or "").strip())
+        if not item:
+            continue
+        if item.get("role_class") and item.get("role_group"):
+            roles.append((str(item.get("role_class") or "collateral"), str(item.get("role_group") or "collateral")))
+            continue
+        role = _classify_diagnostic_role_from_text(
+            q=q,
+            chunk_text=(item.get("chunk_full") or item.get("snippet") or ""),
+            symptom_profile=symptom_profile,
+            diagnostic_keywords=diagnostic_keywords,
+            target_subsystems=target_subsystems,
+        )
+        roles.append((str(role.get("role_class") or "collateral"), str(role.get("role_group") or "collateral")))
+
+    if not roles:
+        txt = re.sub(r"\s+", " ", _normalize_unicode_advanced(str(cause.get("cause") or ""))).strip().lower()
+        if any(m in txt for m in ["lubric", "olio", "grease", "lubr"]):
+            return "support_lubrication", "support"
+        if any(m in txt for m in ["interlock", "sicur", "safety", "door", "guard", "selector", "mode", "fasi", "power", "phase", "voltage", "panel", "quadro"]):
+            return "support_electrical_interlock", "support"
+        if any(m in txt for m in ["startup", "install", "commission", "avviamento", "messa in servizio"]):
+            return "support_startup_install", "support"
+        if any(m in txt for m in ["gear", "gearbox", "bearing", "roller", "guide", "slide", "press", "eccentric", "cam", "transmission", "motor", "ridutt", "cuscinet", "rullo", "slitta", "guida", "pressa", "camme", "trasmission"]):
+            return "core_mechanical", "core"
+        return "collateral", "collateral"
+
+    if any(group == "core" for _, group in roles):
+        first = next((r for r in roles if r[1] == "core"), roles[0])
+        return first
+    if any(role == "support_electrical_interlock" for role, _ in roles):
+        return "support_electrical_interlock", "support"
+    return roles[0]
+
+
+def _enforce_diverse_root_cause_hypotheses(
+    *,
+    q: str,
+    result: dict,
+    citations: list[dict],
+    retrieval: dict,
+    max_causes: int,
+    response_language: str,
+) -> tuple[dict, list[dict]]:
+    merged_result, merged_citations = _merge_matrix_supported_causes(
+        result=result,
+        citations=citations,
+        matrix=retrieval.get("diagnostic_matrix") or {},
+        max_causes=max_causes,
+        response_language=response_language,
+    )
+
+    by_id = {
+        str(c.get("citation_id") or "").strip(): c
+        for c in (retrieval.get("candidate_pool") or []) + list(merged_citations or [])
+        if c.get("citation_id")
+    }
+    symptom_profile = retrieval.get("symptom_profile") or _query_symptom_profile(q)
+    classes = set(symptom_profile.get("classes") or [])
+    has_support_anchor = bool(symptom_profile.get("has_support_anchor"))
+    automatic_mode = bool(symptom_profile.get("automatic_mode"))
+
+    rows = []
+    for cause in merged_result.get("possible_causes") or []:
+        if not isinstance(cause, dict):
+            continue
+        role_class, role_group = _cause_role_from_response_cause(
+            q=q,
+            cause=cause,
+            by_id=by_id,
+            symptom_profile=symptom_profile,
+            diagnostic_keywords=retrieval.get("diagnostic_keywords") or [],
+            target_subsystems=retrieval.get("target_subsystems") or [],
+        )
+        score = 0.30
+        if role_group == "core":
+            score += 0.60
+        elif role_class == "support_electrical_interlock" and "no_start" in classes:
+            score += 0.48
+        elif role_group == "support":
+            score += 0.18
+        else:
+            score += 0.05
+
+        label_specificity = _cause_label_specificity_score(str(cause.get("cause") or ""))
+        score += 0.10 * label_specificity
+        score += min(0.10, 0.03 * len(cause.get("citations") or []))
+
+        if symptom_profile.get("generic_symptom") and classes & {"vibration", "noise", "jam"} and role_group == "support" and not has_support_anchor:
+            score -= 0.32
+        if "no_start" in classes and role_class == "support_lubrication" and not has_support_anchor:
+            score -= 0.34
+        if "no_start" in classes and automatic_mode and role_class == "support_safety":
+            score += 0.06
+
+        rows.append(
+            {
+                "cause": dict(cause),
+                "role_class": role_class,
+                "role_group": role_group,
+                "score": score,
+                "label_key": _normalized_cause_label_key(str(cause.get("cause") or "")),
+            }
+        )
+
+    dedup = {}
+    for row in rows:
+        key = row["label_key"] or str(row["cause"].get("cause") or "").strip().lower()
+        prev = dedup.get(key)
+        if prev is None or float(row["score"]) > float(prev["score"]):
+            dedup[key] = row
+
+    ordered = sorted(
+        dedup.values(),
+        key=lambda x: (
+            -float(x.get("score", 0.0)),
+            0 if str(x.get("role_group") or "") == "core" else 1,
+            str((x.get("cause") or {}).get("cause") or ""),
+        ),
+    )
+
+    final_causes = []
+    final_citation_ids = []
+    used_roles = set()
+    used_ids = set()
+
+    for row in ordered:
+        role_key = (str(row.get("role_group") or ""), str(row.get("role_class") or ""))
+        if role_key in used_roles and len(final_causes) >= 1:
+            continue
+        final_causes.append(dict(row["cause"]))
+        used_roles.add(role_key)
+        for cid in row["cause"].get("citations") or []:
+            cid = str(cid or "").strip()
+            if cid and cid not in used_ids:
+                used_ids.add(cid)
+                final_citation_ids.append(cid)
+        if len(final_causes) >= max_causes:
+            break
+
+    if not final_causes:
+        return merged_result, merged_citations
+
+    for idx, cause in enumerate(final_causes, start=1):
+        cause["rank"] = idx
+
+    by_id_grounded = {str(c.get("citation_id") or "").strip(): c for c in merged_citations if c.get("citation_id")}
+    final_citations = [by_id_grounded[cid] for cid in final_citation_ids if cid in by_id_grounded]
+
+    final_result = dict(merged_result)
+    final_result["possible_causes"] = final_causes[:max_causes]
+    final_result["recommended_next_checks"] = _unique_non_empty_strings(
+        [chk for row in final_causes for chk in (row.get("checks") or [])],
+        limit=6,
+    )
+    return final_result, final_citations or merged_citations
+
+
+def _infer_response_citation_roles(q: str, citations: list[dict]) -> list[dict]:
+    symptom_profile = _query_symptom_profile(q)
+    inferred_components = _infer_machine_components(q)
+    diagnostic_keywords = _collect_candidate_keywords(q, inferred_components)
+    target_subsystems = _root_cause_target_subsystems(q, inferred_components)
+    out = []
+    for c in citations or []:
+        role = _classify_diagnostic_role_from_text(
+            q=q,
+            chunk_text=(c.get("chunk_full") or c.get("snippet") or ""),
+            symptom_profile=symptom_profile,
+            diagnostic_keywords=diagnostic_keywords,
+            target_subsystems=target_subsystems,
+        )
+        row = dict(c)
+        row.update(role)
+        out.append(row)
+    return out
+
+
+def _root_cause_response_proxy_score(q: str, response: dict) -> dict:
+    response = dict(response or {})
+    status = str(response.get("status") or "").strip().lower()
+    causes = [c for c in (response.get("possible_causes") or []) if isinstance(c, dict)]
+    citations = list(response.get("citations") or [])
+    language = _simple_query_language(q)
+    profile = _query_symptom_profile(q)
+    classes = set(profile.get("classes") or [])
+
+    score = 0.0
+    hard_fail = False
+    notes: list[str] = []
+
+    if status == "answered":
+        score += 0.55
+    elif status == "no_sources":
+        return {"score": 0.0, "hard_fail": False, "top_role_class": "none", "top_role_group": "none", "notes": ["no_sources"]}
+    else:
+        return {"score": 0.0, "hard_fail": True, "top_role_class": "none", "top_role_group": "none", "notes": ["invalid_status"]}
+
+    if not causes:
+        hard_fail = True
+        notes.append("no_causes")
+        score -= 0.35
+
+    if citations:
+        score += min(0.12, 0.05 * len(citations))
+    else:
+        hard_fail = True
+        notes.append("no_citations")
+        score -= 0.18
+
+    problem_summary = str(response.get("problem_summary") or "")
+    cause_text = " | ".join(str(c.get("cause") or "") for c in causes)
+    if _looks_like_target_language(problem_summary + " " + cause_text, language):
+        score += 0.10
+    else:
+        score -= 0.20
+        hard_fail = True
+        notes.append("language_mismatch")
+
+    label_scores = [_cause_label_specificity_score(str(c.get("cause") or "")) for c in causes[:3]]
+    if label_scores:
+        score += 0.12 * (sum(label_scores) / len(label_scores))
+
+    role_citations = _infer_response_citation_roles(q, citations)
+    role_map = {str(c.get("citation_id") or "").strip(): c for c in role_citations if c.get("citation_id")}
+    top_role_class = "collateral"
+    top_role_group = "collateral"
+    if causes:
+        top_role_class, top_role_group = _cause_role_from_response_cause(
+            q=q,
+            cause=causes[0],
+            by_id=role_map,
+            symptom_profile=profile,
+        )
+    elif role_citations:
+        top_role_class = str(role_citations[0].get("role_class") or "collateral")
+        top_role_group = str(role_citations[0].get("role_group") or "collateral")
+
+    if profile.get("generic_symptom") and classes & {"vibration", "noise", "jam"}:
+        if top_role_group == "core":
+            score += 0.22
+        elif top_role_group == "support" and not profile.get("has_support_anchor"):
+            score -= 0.28
+            notes.append("support_dominance_generic_symptom")
+
+    if "no_start" in classes:
+        if top_role_class in {"support_electrical_interlock", "support_safety"} or top_role_group == "core":
+            score += 0.18
+        elif top_role_class == "support_lubrication" and not profile.get("has_support_anchor"):
+            score -= 0.24
+            notes.append("no_start_lubrication_dominance")
+
+    if len(causes) >= 2:
+        distinct = len({_normalized_cause_label_key(str(c.get("cause") or "")) for c in causes})
+        if distinct >= 2:
+            score += 0.08
+
+    top_cause_txt = re.sub(r"\s+", " ", _normalize_unicode_advanced(str(causes[0].get("cause") or ""))).strip().lower() if causes else ""
+    if any(bad in top_cause_txt for bad in ["mancato avviamento intenzionale", "generic problem", "possible cause", "anomalia generica"]):
+        score -= 0.24
+        notes.append("generic_or_bad_top_cause")
+
+    return {
+        "score": max(0.0, min(1.25, score)),
+        "hard_fail": hard_fail,
+        "top_role_class": top_role_class,
+        "top_role_group": top_role_group,
+        "notes": notes,
+    }
+
+
+def _ask_response_proxy_score(q: str, response: dict) -> dict:
+    response = dict(response or {})
+    status = str(response.get("status") or "").strip().lower()
+    answer = str(response.get("answer") or "")
+    citations = list(response.get("citations") or [])
+    language = _simple_query_language(q)
+    profile = _query_symptom_profile(q)
+    classes = set(profile.get("classes") or [])
+
+    score = 0.0
+    hard_fail = False
+    notes: list[str] = []
+
+    if status == "answered":
+        score += 0.52
+    elif status == "no_sources":
+        return {"score": 0.0, "hard_fail": False, "top_role_class": "none", "top_role_group": "none", "notes": ["no_sources"]}
+    else:
+        return {"score": 0.0, "hard_fail": True, "top_role_class": "none", "top_role_group": "none", "notes": ["invalid_status"]}
+
+    if not answer:
+        score -= 0.28
+        hard_fail = True
+        notes.append("empty_answer")
+    else:
+        if 30 <= len(answer) <= 700:
+            score += 0.08
+
+    if citations:
+        score += min(0.12, 0.05 * len(citations))
+    else:
+        score -= 0.18
+        hard_fail = True
+        notes.append("no_citations")
+
+    if _looks_like_target_language(answer, language):
+        score += 0.10
+    else:
+        score -= 0.18
+        hard_fail = True
+        notes.append("language_mismatch")
+
+    role_citations = _infer_response_citation_roles(q, citations)
+    top_role_class = str(role_citations[0].get("role_class") or "collateral") if role_citations else "none"
+    top_role_group = str(role_citations[0].get("role_group") or "collateral") if role_citations else "none"
+
+    if profile.get("generic_symptom") and classes & {"vibration", "noise", "jam"}:
+        if top_role_group == "core":
+            score += 0.18
+        elif top_role_group == "support" and not profile.get("has_support_anchor"):
+            score -= 0.24
+            notes.append("support_dominance_generic_symptom")
+
+    if "no_start" in classes:
+        if top_role_class in {"support_electrical_interlock", "support_safety"} or top_role_group == "core":
+            score += 0.16
+        elif top_role_class == "support_lubrication" and not profile.get("has_support_anchor"):
+            score -= 0.22
+            notes.append("no_start_lubrication_dominance")
+
+    if any(bad in answer.lower() for bad in ["i cannot find enough information", "non trovo informazioni sufficienti"]):
+        score -= 0.10
+
+    return {
+        "score": max(0.0, min(1.20, score)),
+        "hard_fail": hard_fail,
+        "top_role_class": top_role_class,
+        "top_role_group": top_role_group,
+        "notes": notes,
+    }
+
+
+def _should_attempt_root_cause_candidate(q: str, baseline_response: dict) -> bool:
+    if not (RESPONSE_ARB_ENABLED and ROOT_CAUSE_CANDIDATE_ENABLED):
+        return False
+    profile = _query_symptom_profile(q)
+    language = _simple_query_language(q)
+    baseline_eval = _root_cause_response_proxy_score(q, baseline_response)
+
+    if str((baseline_response or {}).get("status") or "").strip().lower() != "answered":
+        return True
+    if baseline_eval.get("hard_fail"):
+        return True
+    if language == "en":
+        return True
+    if profile.get("generic_symptom") or profile.get("automatic_mode"):
+        return True
+    if float(baseline_eval.get("score", 0.0) or 0.0) < 0.84:
+        return True
+    if str(baseline_eval.get("top_role_group") or "") == "support" and not profile.get("has_support_anchor"):
+        return True
+    return False
+
+
+def _is_lookup_or_identifier_query(q: str) -> bool:
+    if _q_has_any(q, URL_HINTS) or _q_has_any(q, EMAIL_HINTS) or _q_has_any(q, PHONE_HINTS):
+        return True
+    if _extract_code_tokens(q):
+        return True
+    return False
+
+
+def _should_attempt_ask_candidate(q: str, baseline_response: dict) -> bool:
+    if not (RESPONSE_ARB_ENABLED and ASK_CANDIDATE_ENABLED):
+        return False
+    if _is_lookup_or_identifier_query(q):
+        return False
+    profile = _query_symptom_profile(q)
+    language = _simple_query_language(q)
+    baseline_eval = _ask_response_proxy_score(q, baseline_response)
+
+    if str((baseline_response or {}).get("status") or "").strip().lower() != "answered":
+        return True
+    if baseline_eval.get("hard_fail"):
+        return True
+    if language == "en":
+        return True
+    if profile.get("generic_symptom") or profile.get("automatic_mode") or bool(profile.get("classes")):
+        return True
+    if float(baseline_eval.get("score", 0.0) or 0.0) < 0.82:
+        return True
+    if str(baseline_eval.get("top_role_group") or "") == "support" and not profile.get("has_support_anchor"):
+        return True
+    return False
+
+
+def _attach_arbiter_debug(
+    resp: dict,
+    *,
+    baseline_eval: dict,
+    candidate_eval: Optional[dict],
+    chosen: str,
+    candidate_attempted: bool,
+    candidate_error: Optional[str] = None,
+) -> dict:
+    if not isinstance(resp, dict):
+        return resp
+    debug = dict(resp.get("debug") or {})
+    debug["arbiter"] = {
+        "candidate_attempted": bool(candidate_attempted),
+        "chosen": chosen,
+        "baseline_proxy": baseline_eval,
+        "candidate_proxy": candidate_eval,
+        "candidate_error": candidate_error,
+    }
+    resp["debug"] = debug
+    return resp
+
+
+def _choose_root_cause_response(q: str, baseline_response: dict, candidate_response: Optional[dict], *, debug: bool) -> dict:
+    baseline_eval = _root_cause_response_proxy_score(q, baseline_response)
+    candidate_eval = _root_cause_response_proxy_score(q, candidate_response or {}) if candidate_response else None
+
+    chosen = baseline_response
+    chosen_name = "baseline"
+    if candidate_response and candidate_eval and not candidate_eval.get("hard_fail"):
+        baseline_score = float(baseline_eval.get("score", 0.0) or 0.0)
+        candidate_score = float(candidate_eval.get("score", 0.0) or 0.0)
+        if candidate_score > baseline_score + ROOT_CAUSE_ARB_MIN_DELTA:
+            chosen = candidate_response
+            chosen_name = "candidate"
+        elif not RESPONSE_ARB_KEEP_BASELINE_ON_TIE and candidate_score >= baseline_score:
+            chosen = candidate_response
+            chosen_name = "candidate"
+
+    if debug:
+        chosen = _attach_arbiter_debug(
+            chosen,
+            baseline_eval=baseline_eval,
+            candidate_eval=candidate_eval,
+            chosen=chosen_name,
+            candidate_attempted=bool(candidate_response),
+        )
+    return chosen
+
+
+def _choose_ask_response(q: str, baseline_response: dict, candidate_response: Optional[dict], *, debug: bool) -> dict:
+    baseline_eval = _ask_response_proxy_score(q, baseline_response)
+    candidate_eval = _ask_response_proxy_score(q, candidate_response or {}) if candidate_response else None
+
+    chosen = baseline_response
+    chosen_name = "baseline"
+    if candidate_response and candidate_eval and not candidate_eval.get("hard_fail"):
+        baseline_score = float(baseline_eval.get("score", 0.0) or 0.0)
+        candidate_score = float(candidate_eval.get("score", 0.0) or 0.0)
+        if candidate_score > baseline_score + ASK_ARB_MIN_DELTA:
+            chosen = candidate_response
+            chosen_name = "candidate"
+        elif not RESPONSE_ARB_KEEP_BASELINE_ON_TIE and candidate_score >= baseline_score:
+            chosen = candidate_response
+            chosen_name = "candidate"
+
+    if debug:
+        chosen = _attach_arbiter_debug(
+            chosen,
+            baseline_eval=baseline_eval,
+            candidate_eval=candidate_eval,
+            chosen=chosen_name,
+            candidate_attempted=bool(candidate_response),
+        )
+    return chosen
+
+
+def _generate_ask_candidate_grounded_points(
+    *,
+    q: str,
+    planner: dict,
+    response_language: str,
+    company_id: str,
+    citations: list[dict],
+    role_summary: list[dict],
+    diagnostic_matrix: dict,
+    allow_no_sources: bool,
+) -> tuple[str, list[dict]]:
+    if not citations:
+        return "no_sources", []
+
+    prompt_citations = _enrich_ask_prompt_citations(
+        company_id=company_id,
+        citations=citations,
+        max_manual_expansions=2,
+        radius=1,
+    )
+    sources_block = _build_sources_block_from_citations(
+        prompt_citations,
+        max_context_chars=ASK_MAX_CONTEXT_CHARS,
+        prefer_chunk_full=True,
+    )
+    roles_json = json.dumps(role_summary or [], ensure_ascii=False)
+    matrix_json = json.dumps(diagnostic_matrix or {}, ensure_ascii=False)
+
+    if allow_no_sources:
+        system_msg = (
+            "You are a technical documentation assistant for machinery and industrial equipment. "
+            "Use ONLY the provided sources, evidence-role summary, and evidence matrix. "
+            "Always answer the user's question directly. For generic symptoms or technical issues, prefer core mechanical or core process evidence before support-only evidence. "
+            "Do not center lubrication, startup/install, or safety unless the question anchors them or the evidence matrix explicitly shows they are primary. "
+            "If the documents do not state the requested thing directly, say that explicitly and then report the closest grounded evidence. "
+            "Always reply in the requested response language. Return 1 to 3 short grounded points only."
+        )
+        schema = _ask_response_schema()
+    else:
+        system_msg = (
+            "You are a technical documentation assistant for machinery and industrial equipment. "
+            "Use ONLY the provided sources, evidence-role summary, and evidence matrix. "
+            "Always reply in the requested response language. Return 1 to 3 very short grounded points. "
+            "If the requested thing is not stated directly, say that explicitly and then report the closest grounded evidence."
+        )
+        schema = _ask_rescue_response_schema()
+
+    user_msg = (
+        f"QUESTION:\n{q}\n\n"
+        f"NORMALIZED_QUESTION:\n{planner.get('normalized_query') or q}\n\n"
+        f"RESPONSE_LANGUAGE:\n{response_language}\n\n"
+        f"ROLE_AWARE_EVIDENCE_JSON:\n{roles_json}\n\n"
+        f"DIAGNOSTIC_EVIDENCE_MATRIX_JSON:\n{matrix_json}\n\n"
+        f"SOURCES:\n{sources_block}\n\n"
+        "Return valid JSON. Use only citation ids present in the sources."
+    )
+
+    try:
+        parsed = _openai_chat_json_models(
+            [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            models=[DIAGNOSTIC_EVIDENCE_MODEL, OPENAI_CHAT_MODEL],
+            json_schema=schema,
+            timeout=70,
+        )
+    except Exception:
+        return "no_sources", []
+
+    if allow_no_sources:
+        answer_status = str((parsed or {}).get("answer_status") or "").strip().lower()
+        grounded_points = list((parsed or {}).get("grounded_points") or [])
+        return (answer_status or "no_sources"), grounded_points
+
+    grounded_points = list((parsed or {}).get("grounded_points") or [])
+    return ("answered" if grounded_points else "no_sources"), grounded_points
+
+
+def _ask_v1_candidate_impl(
+    payload: AskRequest,
+    x_ai_internal_secret: Optional[str] = Header(default=None),
+):
+    if not AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=500, detail="AI_INTERNAL_SECRET missing")
+    if (x_ai_internal_secret or "").strip() != AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    q = (payload.query or "").strip()
+    if not q:
+        raise HTTPException(status_code=400, detail="Missing query")
+
+    scope = _resolve_query_scope(
+        company_id=payload.company_id,
+        machine_id=payload.machine_id,
+        bubble_document_id=payload.bubble_document_id,
+        document_ids=payload.document_ids,
+    )
+    company_id = scope["company_id"]
+    machine_id = scope["machine_id"]
+    bubble_document_id = scope["bubble_document_id"]
+    doc_ids = scope["document_ids"]
+
+    top_k = int(payload.top_k or 5)
+    top_k = max(1, min(top_k, ASK_MAX_TOP_K))
+    candidate_k = max(top_k, min(80, max(ROOT_CAUSE_EXTRA_CANDIDATE_K, top_k * 10)))
+
+    response_language = _select_response_language(q)
+    no_sources_text = _localized_no_sources(response_language)
+    symptom_profile = _query_symptom_profile(q)
+    technical_candidate = bool(symptom_profile.get("classes")) or response_language == "en" or _count_query_tokens(q) >= 4
+
+    if technical_candidate:
+        retrieval = _diagnostic_evidence_candidate_pipeline(
+            q=q,
+            company_id=company_id,
+            machine_id=machine_id,
+            candidate_k=candidate_k,
+            top_k=max(top_k, min(ASK_CANDIDATE_MATRIX_TOP_K, top_k + 1)),
+            max_causes=2,
+            doc_ids=doc_ids if isinstance(doc_ids, list) else None,
+            bubble_document_id=bubble_document_id,
+            debug=payload.debug,
+            planner_mode="ask_candidate",
+            base_threshold=min(ASK_SIM_THRESHOLD, ASK_SHORT_QUERY_SIM_THRESHOLD),
+        )
+    else:
+        retrieval = _shared_semantic_retrieval(
+            q=q,
+            company_id=company_id,
+            machine_id=machine_id,
+            candidate_k=candidate_k,
+            top_k=top_k,
+            doc_ids=doc_ids if isinstance(doc_ids, list) else None,
+            bubble_document_id=bubble_document_id,
+            debug=payload.debug,
+            planner_mode="ask",
+            base_threshold=ASK_SIM_THRESHOLD,
+            diagnostic_mode=False,
+        )
+        retrieval["role_summary"] = _summarize_evidence_roles_for_prompt(
+            q=q,
+            citations=list(retrieval.get("citations") or []),
+            max_items=max(ASK_CANDIDATE_PROMPT_TOP_K, top_k),
+        )
+
+    planner = retrieval.get("planner") or {}
+    response_language = _select_response_language(q, planner=planner)
+    citations = list(retrieval.get("prompt_citations") or retrieval.get("citations") or [])
+    sim_max = retrieval.get("similarity_max")
+
+    def _finalize(resp: dict) -> dict:
+        if payload.debug:
+            resp["debug"] = {
+                "company_id": company_id,
+                "machine_id": machine_id,
+                "bubble_document_id": bubble_document_id,
+                "document_ids": doc_ids,
+                "query_plan": planner,
+                "similarity_max": sim_max,
+                "effective_ask_threshold": retrieval.get("effective_threshold"),
+                "candidate_mode": technical_candidate,
+                "role_summary": retrieval.get("role_summary") or [],
+                "diagnostic_matrix": retrieval.get("diagnostic_matrix") or {},
+            }
+        return resp
+
+    if not citations:
+        return _finalize(
+            {
+                "ok": True,
+                "status": "no_sources",
+                "answer": no_sources_text,
+                "citations": [],
+                "rg_links": [],
+                "top_k": top_k,
+                "similarity_max": sim_max,
+                "chat_model": DIAGNOSTIC_EVIDENCE_MODEL,
+            }
+        )
+
+    answer_status, grounded_points = _generate_ask_candidate_grounded_points(
+        q=q,
+        planner=planner,
+        response_language=response_language,
+        company_id=company_id,
+        citations=citations,
+        role_summary=list(retrieval.get("role_summary") or []),
+        diagnostic_matrix=dict(retrieval.get("diagnostic_matrix") or {}),
+        allow_no_sources=True,
+    )
+
+    if answer_status == "no_sources" or not grounded_points:
+        answer_status, grounded_points = _generate_ask_candidate_grounded_points(
+            q=q,
+            planner=planner,
+            response_language=response_language,
+            company_id=company_id,
+            citations=citations,
+            role_summary=list(retrieval.get("role_summary") or []),
+            diagnostic_matrix=dict(retrieval.get("diagnostic_matrix") or {}),
+            allow_no_sources=False,
+        )
+
+    if answer_status == "no_sources" or not grounded_points:
+        answer, final_citations = _extractive_fallback_answer(
+            citations=citations,
+            response_language=response_language,
+            max_points=min(2, top_k),
+        )
+    else:
+        answer, final_citations = _render_grounded_answer_points(
+            grounded_points=grounded_points,
+            citations=citations,
+            max_points=min(3, top_k),
+        )
+
+    if not answer or not final_citations:
+        return _finalize(
+            {
+                "ok": True,
+                "status": "no_sources",
+                "answer": no_sources_text,
+                "citations": [],
+                "rg_links": [],
+                "top_k": top_k,
+                "similarity_max": sim_max,
+                "chat_model": DIAGNOSTIC_EVIDENCE_MODEL,
+            }
+        )
+
+    if not _looks_like_target_language(answer, response_language):
+        answer = _translate_text_preserving_citations(answer, response_language)
+
+    response_citations = _sanitize_citations_for_response(final_citations)
+    rg_links = []
+    try:
+        rg_links = _build_rg_links(company_id, response_citations)
+    except Exception as e:
+        print("RG_LINKS_FAIL", str(e))
+        rg_links = []
+
+    return _finalize(
+        {
+            "ok": True,
+            "status": "answered",
+            "answer": answer,
+            "citations": response_citations,
+            "rg_links": rg_links,
+            "top_k": top_k,
+            "similarity_max": sim_max,
+            "chat_model": DIAGNOSTIC_EVIDENCE_MODEL,
+        }
+    )
+
+
+def _root_cause_v1_candidate_impl(
+    payload: RootCauseRequest,
+    x_ai_internal_secret: Optional[str] = Header(default=None),
+):
+    if not AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=500, detail="AI_INTERNAL_SECRET missing")
+    if (x_ai_internal_secret or "").strip() != AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    q = (payload.query or "").strip()
+    if not q:
+        raise HTTPException(status_code=400, detail="Missing query")
+
+    scope = _resolve_query_scope(
+        company_id=payload.company_id,
+        machine_id=payload.machine_id,
+        bubble_document_id=payload.bubble_document_id,
+        document_ids=payload.document_ids,
+    )
+    company_id = scope["company_id"]
+    machine_id = scope["machine_id"]
+    bubble_document_id = scope["bubble_document_id"]
+    doc_ids = scope["document_ids"]
+
+    top_k = int(payload.top_k or 8)
+    top_k = max(1, min(top_k, ASK_MAX_TOP_K))
+    max_causes = max(1, min(int(payload.max_causes or 3), 3))
+    candidate_k = max(top_k, min(90, max(ROOT_CAUSE_EXTRA_CANDIDATE_K, top_k * 11)))
+
+    query_signal_summary = _root_cause_query_signal_summary(
+        q=q,
+        company_id=company_id,
+        machine_id=machine_id,
+        bubble_document_id=bubble_document_id,
+        doc_ids=doc_ids if isinstance(doc_ids, list) else None,
+        debug=payload.debug,
+    )
+    query_fail_closed = _should_fail_closed_root_cause_query(query_signal_summary)
+    prelim = query_signal_summary.get("preliminary_retrieval") or {}
+    preliminary_similarity_max = prelim.get("similarity_max")
+
+    if query_fail_closed:
+        resp = {
+            "ok": True,
+            "status": "no_sources",
+            "symptom": q,
+            "problem_summary": "",
+            "possible_causes": [],
+            "recommended_next_checks": [],
+            "citations": [],
+            "rg_links": [],
+            "top_k": top_k,
+            "similarity_max": preliminary_similarity_max,
+        }
+        if payload.debug:
+            resp["debug"] = {
+                "query_signal_summary": query_signal_summary,
+                "query_fail_closed": query_fail_closed,
+                "candidate_mode": True,
+            }
+        return resp
+
+    retrieval = _diagnostic_evidence_candidate_pipeline(
+        q=q,
+        company_id=company_id,
+        machine_id=machine_id,
+        candidate_k=candidate_k,
+        top_k=top_k,
+        max_causes=max_causes,
+        doc_ids=doc_ids if isinstance(doc_ids, list) else None,
+        bubble_document_id=bubble_document_id,
+        debug=payload.debug,
+        planner_mode="root_cause_candidate",
+        base_threshold=ASK_SIM_THRESHOLD,
+    )
+
+    planner = retrieval.get("planner") or {}
+    sim_max = retrieval.get("similarity_max")
+    citations = list(retrieval.get("citations") or [])
+    response_language = _select_response_language(q, planner=planner)
+
+    def _finalize(resp: dict) -> dict:
+        if payload.debug:
+            resp["debug"] = {
+                "company_id": company_id,
+                "machine_id": machine_id,
+                "bubble_document_id": bubble_document_id,
+                "document_ids": doc_ids,
+                "query_signal_summary": query_signal_summary,
+                "query_fail_closed": query_fail_closed,
+                "query_plan": planner,
+                "similarity_max": sim_max,
+                "role_summary": retrieval.get("role_summary") or [],
+                "diagnostic_matrix": retrieval.get("diagnostic_matrix") or {},
+                "candidate_mode": True,
+            }
+        return resp
+
+    if not citations:
+        return _finalize(
+            {
+                "ok": True,
+                "status": "no_sources",
+                "symptom": q,
+                "problem_summary": "",
+                "possible_causes": [],
+                "recommended_next_checks": [],
+                "citations": [],
+                "rg_links": [],
+                "top_k": top_k,
+                "similarity_max": sim_max,
+            }
+        )
+
+    prompt_citations = []
+    for c in (retrieval.get("prompt_citations") or citations):
+        cc = dict(c)
+        cc["chunk_full"] = (cc.get("chunk_full") or cc.get("snippet") or "").strip()[:1800]
+        cc["snippet"] = (cc.get("snippet") or cc.get("chunk_full") or "").strip()
+        prompt_citations.append(cc)
+    prompt_citations = prompt_citations[: max(ROOT_CAUSE_CANDIDATE_PROMPT_TOP_K, top_k)]
+
+    if not prompt_citations:
+        prompt_citations = list(citations[: max(ROOT_CAUSE_CANDIDATE_PROMPT_TOP_K, top_k)])
+
+    sources_block = _build_sources_block_from_citations(
+        prompt_citations,
+        max_context_chars=ASK_MAX_CONTEXT_CHARS,
+        prefer_chunk_full=True,
+    )
+
+    matrix = retrieval.get("diagnostic_matrix") or {}
+    role_summary = retrieval.get("role_summary") or []
+
+    system_msg = (
+        "You are a root-cause assistant for technical equipment and machine documentation. "
+        "Use ONLY the provided sources, evidence-role summary, and evidence matrix. "
+        "Work domain-agnostically: do not assume a sector, machine family, subsystem taxonomy, or standard failure mode unless the sources support it. "
+        "core_process and core_mechanical evidence outrank support-only evidence for generic symptoms such as vibration, noise, or jams. "
+        "support_lubrication, support_startup_install, and support_safety must not become rank-1 causes for generic symptoms unless the evidence matrix explicitly shows that they are primary and no stronger core hypothesis exists. "
+        "For no-start and automatic-mode failures, support_electrical_interlock may be primary; support_lubrication should remain secondary unless directly anchored by the symptom. "
+        "Preserve more than one cause when the evidence matrix contains distinct, separately supported hypotheses. "
+        "Each cause must be a short canonical technical label, 3 to 10 words, noun-phrase style, with no trailing period. Always reply in the same language as the user query."
+    )
+    user_msg = (
+        f"USER_PROBLEM:\n{q}\n\n"
+        f"NORMALIZED_PROBLEM:\n{planner.get('normalized_query') or q}\n\n"
+        f"RESPONSE_LANGUAGE:\n{response_language}\n\n"
+        f"ROLE_AWARE_EVIDENCE_JSON:\n{json.dumps(role_summary, ensure_ascii=False)}\n\n"
+        f"DIAGNOSTIC_EVIDENCE_MATRIX_JSON:\n{json.dumps(matrix, ensure_ascii=False)}\n\n"
+        f"SOURCES:\n{sources_block}\n\n"
+        "Return valid JSON. Use only citation_id values present in the sources."
+    )
+
+    try:
+        result_json = _openai_chat_json_models(
+            [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            models=[ROOT_CAUSE_RESPONSE_MODEL, DIAGNOSTIC_EVIDENCE_MODEL, OPENAI_CHAT_MODEL],
+            json_schema=_root_cause_response_schema(max_causes=max_causes),
+            timeout=90,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"LLM failed: {str(e)}")
+
+    if not (result_json or {}).get("possible_causes") and matrix:
+        result_json = _fallback_root_cause_result_from_matrix(
+            q=planner.get("normalized_query") or q,
+            matrix=matrix,
+            citations=citations,
+            max_causes=max_causes,
+            response_language=response_language,
+        )
+
+    grounded_result, grounded_citations = _ground_root_cause_result(
+        result=result_json,
+        citations=citations,
+        max_causes=max_causes,
+    )
+    grounded_result, grounded_citations = _compact_root_cause_result_citations_by_family(
+        result=grounded_result,
+        citations=grounded_citations,
+        max_per_cause=2,
+    )
+    grounded_result = _canonicalize_root_cause_labels(
+        grounded_result,
+        grounded_citations,
+        language=response_language,
+    )
+    grounded_result, grounded_citations = _lock_root_cause_result(
+        grounded_result,
+        grounded_citations,
+        max_causes=max_causes,
+    )
+    grounded_result, grounded_citations = _enforce_diverse_root_cause_hypotheses(
+        q=q,
+        result=grounded_result,
+        citations=grounded_citations,
+        retrieval=retrieval,
+        max_causes=max_causes,
+        response_language=response_language,
+    )
+    grounded_result = _canonicalize_root_cause_labels(
+        grounded_result,
+        grounded_citations,
+        language=response_language,
+    )
+
+    if not grounded_result.get("problem_summary"):
+        grounded_result["problem_summary"] = planner.get("normalized_query") or q
+
+    if not grounded_result.get("possible_causes"):
+        return _finalize(
+            {
+                "ok": True,
+                "status": "no_sources",
+                "symptom": q,
+                "problem_summary": grounded_result.get("problem_summary") or "",
+                "possible_causes": [],
+                "recommended_next_checks": [],
+                "citations": [],
+                "rg_links": [],
+                "top_k": top_k,
+                "similarity_max": sim_max,
+                "chat_model": ROOT_CAUSE_RESPONSE_MODEL,
+            }
+        )
+
+    response_citations = _sanitize_citations_for_response(grounded_citations)
+    rg_links = []
+    try:
+        rg_links = _build_rg_links(company_id, response_citations)
+    except Exception as e:
+        print("RG_LINKS_FAIL", str(e))
+        rg_links = []
+
+    return _finalize(
+        {
+            "ok": True,
+            "status": "answered",
+            "symptom": q,
+            "problem_summary": grounded_result.get("problem_summary") or q,
+            "possible_causes": grounded_result.get("possible_causes") or [],
+            "recommended_next_checks": grounded_result.get("recommended_next_checks") or [],
+            "citations": response_citations,
+            "rg_links": rg_links,
+            "top_k": top_k,
+            "similarity_max": sim_max,
+            "chat_model": ROOT_CAUSE_RESPONSE_MODEL,
+        }
+    )
+
+
+@app.post("/v1/ai/ask")
+def ask_v1(
+    payload: AskRequest,
+    x_ai_internal_secret: Optional[str] = Header(default=None),
+):
+    baseline_response = _ask_v1_baseline_impl(payload, x_ai_internal_secret)
+
+    if not _should_attempt_ask_candidate(payload.query or "", baseline_response):
+        return _strip_internal_response_artifacts(baseline_response)
+
+    candidate_response = None
+    candidate_error = None
+    try:
+        candidate_response = _ask_v1_candidate_impl(payload, x_ai_internal_secret)
+    except Exception as e:
+        candidate_error = str(e)
+        candidate_response = None
+
+    chosen = _choose_ask_response(
+        payload.query or "",
+        baseline_response,
+        candidate_response,
+        debug=bool(payload.debug),
+    )
+
+    if payload.debug and candidate_error:
+        chosen = _attach_arbiter_debug(
+            chosen,
+            baseline_eval=_ask_response_proxy_score(payload.query or "", baseline_response),
+            candidate_eval=_ask_response_proxy_score(payload.query or "", candidate_response or {}) if candidate_response else None,
+            chosen=(chosen.get("debug") or {}).get("arbiter", {}).get("chosen", "baseline"),
+            candidate_attempted=True,
+            candidate_error=candidate_error,
+        )
+
+    return _strip_internal_response_artifacts(chosen)
+
+
+@app.post("/v1/ai/root-cause")
+def root_cause_v1(
+    payload: RootCauseRequest,
+    x_ai_internal_secret: Optional[str] = Header(default=None),
+):
+    baseline_response = _root_cause_v1_baseline_impl(payload, x_ai_internal_secret)
+
+    if not _should_attempt_root_cause_candidate(payload.query or "", baseline_response):
+        return _strip_internal_response_artifacts(baseline_response)
+
+    candidate_response = None
+    candidate_error = None
+    try:
+        candidate_response = _root_cause_v1_candidate_impl(payload, x_ai_internal_secret)
+    except Exception as e:
+        candidate_error = str(e)
+        candidate_response = None
+
+    chosen = _choose_root_cause_response(
+        payload.query or "",
+        baseline_response,
+        candidate_response,
+        debug=bool(payload.debug),
+    )
+
+    if payload.debug and candidate_error:
+        chosen = _attach_arbiter_debug(
+            chosen,
+            baseline_eval=_root_cause_response_proxy_score(payload.query or "", baseline_response),
+            candidate_eval=_root_cause_response_proxy_score(payload.query or "", candidate_response or {}) if candidate_response else None,
+            chosen=(chosen.get("debug") or {}).get("arbiter", {}).get("chosen", "baseline"),
+            candidate_attempted=True,
+            candidate_error=candidate_error,
+        )
+
+    return _strip_internal_response_artifacts(chosen)
 
 
 @app.post("/v1/ai/delete/document")
