@@ -84,6 +84,16 @@ ROOT_CAUSE_GATE_MIN_MARGIN = float(os.environ.get("MM_ROOT_CAUSE_GATE_MIN_MARGIN
 ROOT_CAUSE_GATE_MIN_PRELIM_SIM = float(os.environ.get("MM_ROOT_CAUSE_GATE_MIN_PRELIM_SIM", "0.36"))
 ROOT_CAUSE_GATE_MIN_PRELIM_HITS = int(os.environ.get("MM_ROOT_CAUSE_GATE_MIN_PRELIM_HITS", "2"))
 ROOT_CAUSE_GATE_PRELIM_TOP_K = int(os.environ.get("MM_ROOT_CAUSE_GATE_PRELIM_TOP_K", "6"))
+DIAGNOSTIC_PIPELINE_ENABLED = (os.environ.get("MM_DIAGNOSTIC_PIPELINE_ENABLED") or "1").strip() == "1"
+DIAGNOSTIC_EVIDENCE_MODEL = (os.environ.get("MM_DIAGNOSTIC_EVIDENCE_MODEL") or "gpt-5.4-mini").strip()
+ROOT_CAUSE_RESPONSE_MODEL = (os.environ.get("MM_ROOT_CAUSE_RESPONSE_MODEL") or "gpt-5.4").strip()
+ROOT_CAUSE_EXTRA_CANDIDATE_K = int(os.environ.get("MM_ROOT_CAUSE_EXTRA_CANDIDATE_K", "60"))
+ROOT_CAUSE_MAX_EVIDENCE_POOL = int(os.environ.get("MM_ROOT_CAUSE_MAX_EVIDENCE_POOL", "10"))
+ROOT_CAUSE_MAX_PROMPT_CITATIONS = int(os.environ.get("MM_ROOT_CAUSE_MAX_PROMPT_CITATIONS", "7"))
+ROOT_CAUSE_DIRECT_SIGNAL_BONUS = float(os.environ.get("MM_ROOT_CAUSE_DIRECT_SIGNAL_BONUS", "0.12"))
+ROOT_CAUSE_GENERIC_DOWNRANK_PENALTY = float(os.environ.get("MM_ROOT_CAUSE_GENERIC_DOWNRANK_PENALTY", "0.14"))
+ROOT_CAUSE_HARD_EXCLUDE_PENALTY = float(os.environ.get("MM_ROOT_CAUSE_HARD_EXCLUDE_PENALTY", "0.30"))
+
 
 # -----------------------------
 # Entity fallback (URL / email / phone)
@@ -852,12 +862,12 @@ def _llm_classify_root_cause_query_intent(q: str) -> dict:
     user_msg = f"QUERY:\n{q}"
 
     try:
-        parsed = _openai_chat_json(
+        parsed = _openai_chat_json_models(
             [
                 {"role": "system", "content": system_msg},
                 {"role": "user", "content": user_msg},
             ],
-            model=ROOT_CAUSE_INTENT_MODEL,
+            models=[ROOT_CAUSE_INTENT_MODEL, DIAGNOSTIC_EVIDENCE_MODEL, OPENAI_CHAT_MODEL],
             json_schema=schema,
             timeout=20,
         )
@@ -879,7 +889,6 @@ def _llm_classify_root_cause_query_intent(q: str) -> dict:
             "confidence": 0.0,
             "rationale": f"classifier_error: {str(e)[:160]}",
         }
-
 
 def _root_cause_preliminary_retrieval_signal(
     *,
@@ -988,16 +997,17 @@ def _should_fail_closed_root_cause_query(signal_summary: dict) -> bool:
     if intent_class == "non_technical_or_nonsense":
         return True
 
+    strong_preliminary_signal = (
+        prelim_sim_max is not None
+        and float(prelim_sim_max) >= ROOT_CAUSE_GATE_MIN_PRELIM_SIM + 0.04
+        and prelim_hits >= max(1, ROOT_CAUSE_GATE_MIN_PRELIM_HITS)
+    )
+
     if intent_class == "technical_information_question":
-        return True
+        return not strong_preliminary_signal
 
     # ambiguous
-    if (
-        intent_confidence < 0.55
-        and prelim_sim_max is not None
-        and float(prelim_sim_max) >= ROOT_CAUSE_GATE_MIN_PRELIM_SIM
-        and prelim_hits >= ROOT_CAUSE_GATE_MIN_PRELIM_HITS
-    ):
+    if intent_confidence < 0.80 and strong_preliminary_signal:
         return False
 
     return True
@@ -1031,12 +1041,12 @@ def _infer_machine_components(q: str) -> list[str]:
     user_msg = f"Symptom:\n{q}"
 
     try:
-        parsed = _openai_chat_json(
+        parsed = _openai_chat_json_models(
             [
                 {"role": "system", "content": system_msg},
                 {"role": "user", "content": user_msg},
             ],
-            model="gpt-4.1-nano",
+            models=[DIAGNOSTIC_EVIDENCE_MODEL, ROOT_CAUSE_INTENT_MODEL, OPENAI_CHAT_MODEL],
             json_schema=schema,
             timeout=20,
         )
@@ -4594,6 +4604,49 @@ def _openai_chat_json(
         raise Exception(f"OpenAI chat JSON parse failed: {str(e)} | raw={text[:500]}")
 
 
+def _normalize_model_candidates(models: Optional[list[str]]) -> list[str]:
+    out: list[str] = []
+    seen = set()
+
+    for model_name in models or []:
+        model_name = str(model_name or "").strip()
+        if not model_name:
+            continue
+        if model_name in seen:
+            continue
+        seen.add(model_name)
+        out.append(model_name)
+
+    return out
+
+
+def _openai_chat_json_models(
+    messages: list[dict],
+    *,
+    models: Optional[list[str]] = None,
+    json_schema: Optional[dict] = None,
+    timeout: int = 60,
+) -> dict:
+    tried = _normalize_model_candidates(models) or [OPENAI_CHAT_MODEL]
+    last_error: Optional[Exception] = None
+
+    for model_name in tried:
+        try:
+            return _openai_chat_json(
+                messages,
+                model=model_name,
+                json_schema=json_schema,
+                timeout=timeout,
+            )
+        except Exception as e:
+            last_error = e
+
+    if last_error is not None:
+        raise last_error
+
+    raise Exception("No model candidates available for JSON chat call")
+
+
 def _llm_rerank_citations(
     q: str,
     candidates: list[dict],
@@ -4739,6 +4792,8 @@ def _llm_filter_diagnostic_chunks(
             "evidence_family": _root_cause_evidence_family_key(c),
             "matched_subsystems": c.get("matched_subsystems") or [],
             "subsystem_score": round(float(c.get("subsystem_score", 0.0)), 4),
+            "causal_strength_score": round(float(c.get("causal_strength_score", 0.0)), 4),
+            "semantic_score": round(float(c.get("semantic_score", 0.0)), 4),
             "generic_downranked": bool(c.get("generic_downranked")),
             "snippet": snippet[:300]
         })
@@ -4773,6 +4828,7 @@ def _llm_filter_diagnostic_chunks(
         "9) Seleziona fonti che coprono aree causali diverse quando sono ben supportate.\n"
         "10) Preferisci fonti allineate ai sottosistemi dominanti implicati dal sintomo.\n"
         "11) Se esistono fonti di sottosistemi secondari, mantienile solo se spiegano una causa davvero plausibile e non indiretta.\n"
+        "12) Favorisci le evidenze con causal_strength_score e semantic_score più alti.\n"
     )
 
     user_msg = (
@@ -4781,12 +4837,12 @@ def _llm_filter_diagnostic_chunks(
         f"Restituisci JSON con gli id delle fonti più utili alla diagnosi."
     )
 
-    parsed = _openai_chat_json(
+    parsed = _openai_chat_json_models(
         [
             {"role": "system", "content": system_msg},
             {"role": "user", "content": user_msg},
         ],
-        model=OPENAI_RERANK_MODEL,
+        models=[DIAGNOSTIC_EVIDENCE_MODEL, OPENAI_RERANK_MODEL, OPENAI_CHAT_MODEL],
         json_schema=schema,
         timeout=RERANK_TIMEOUT,
     )
@@ -4837,6 +4893,8 @@ def _llm_build_diagnostic_evidence_matrix(
                 "evidence_family": _root_cause_evidence_family_key(c),
                 "matched_subsystems": c.get("matched_subsystems") or [],
                 "subsystem_score": round(float(c.get("subsystem_score", 0.0)), 4),
+                "causal_strength_score": round(float(c.get("causal_strength_score", 0.0)), 4),
+                "semantic_score": round(float(c.get("semantic_score", 0.0)), 4),
                 "page_from": int(c.get("page_from") or 0),
                 "page_to": int(c.get("page_to") or 0),
                 "generic_downranked": bool(c.get("generic_downranked")),
@@ -4903,7 +4961,7 @@ def _llm_build_diagnostic_evidence_matrix(
         "10) Evita di mantenere più citation_id della stessa evidence_family se una sola fonte è già rappresentativa.\n"
         "11) keep_ids e cause_hypotheses devono massimizzare la copertura di aree causali diverse, non la ripetizione della stessa area.\n"
         "12) Preferisci ipotesi coerenti con i sottosistemi dominanti implicati dal sintomo.\n"
-        "13) Le evidenze di sottosistemi secondari vanno tenute solo se supportano una causa distinta e plausibile.\n"
+        "13) Le evidenze con causal_strength_score e semantic_score più alti hanno priorità.\n"
     )
 
     user_msg = (
@@ -4913,12 +4971,12 @@ def _llm_build_diagnostic_evidence_matrix(
         "Restituisci JSON valido."
     )
 
-    parsed = _openai_chat_json(
+    parsed = _openai_chat_json_models(
         [
             {"role": "system", "content": system_msg},
             {"role": "user", "content": user_msg},
         ],
-        model=OPENAI_RERANK_MODEL,
+        models=[DIAGNOSTIC_EVIDENCE_MODEL, OPENAI_RERANK_MODEL, OPENAI_CHAT_MODEL],
         json_schema=schema,
         timeout=RERANK_TIMEOUT,
     )
@@ -5172,12 +5230,12 @@ def _canonicalize_root_cause_labels(
     )
 
     try:
-        parsed = _openai_chat_json(
+        parsed = _openai_chat_json_models(
             [
                 {"role": "system", "content": system_msg},
                 {"role": "user", "content": user_msg},
             ],
-            model=OPENAI_CHAT_MODEL,
+            models=[ROOT_CAUSE_RESPONSE_MODEL, DIAGNOSTIC_EVIDENCE_MODEL, OPENAI_CHAT_MODEL],
             json_schema=_root_cause_label_canonicalization_schema(len(items)),
             timeout=40,
         )
@@ -5201,7 +5259,6 @@ def _canonicalize_root_cause_labels(
 
     result["possible_causes"] = out_causes
     return result
-
 
 def _normalized_cause_label_key(label: str) -> str:
     s = _normalize_unicode_advanced(label or "").lower()
@@ -5310,9 +5367,14 @@ def _lock_root_cause_result(
             continue
 
         label_key = _normalized_cause_label_key(str(cause.get("cause") or ""))
+        dominant_item = family_best.get(dominant_family) or {}
         score = (
             family_score_map.get(dominant_family, 0.0)
             + 0.04 * len(kept_ids)
+            + 0.26 * float(dominant_item.get("causal_strength_score", 0.0) or 0.0)
+            + 0.22 * float(dominant_item.get("semantic_score", 0.0) or 0.0)
+            + 0.18 * float(dominant_item.get("subsystem_score", 0.0) or 0.0)
+            - (0.05 if bool(dominant_item.get("generic_downranked")) else 0.0)
             - 0.01 * max(0, set_rank_map.get(dominant_set, 9999))
         )
 
@@ -5410,6 +5472,322 @@ def _lock_root_cause_result(
         result["recommended_next_checks"] = _unique_non_empty_strings(flattened_checks, limit=6)
 
     return result, final_citations
+
+
+def _ensure_candidate_retrieval_fields(
+    citations: list[dict],
+    *,
+    query_terms: set[str],
+    query_style: str = "",
+    query_token_count: int = 0,
+) -> list[dict]:
+    out: list[dict] = []
+    max_rrf = max((float((c or {}).get("rrf_score", 0.0) or 0.0) for c in (citations or [])), default=0.0)
+
+    for c in citations or []:
+        if not isinstance(c, dict):
+            continue
+
+        cc = dict(c)
+        cc["snippet"] = (cc.get("snippet") or cc.get("chunk_full") or "").strip()
+        cc["chunk_full"] = (cc.get("chunk_full") or cc.get("snippet") or "").strip()
+        source_bias, source_meta = _candidate_source_bias(
+            cc,
+            query_terms,
+            query_style=query_style,
+            query_token_count=query_token_count,
+        )
+        specificity_score = _candidate_specificity_score(cc)
+        overlap_score = float(source_meta.get("overlap_score", 0.0))
+        rrf_norm = (float(cc.get("rrf_score", 0.0) or 0.0) / max_rrf) if max_rrf > 0 else 0.0
+        base_retrieval_score = (
+            0.58 * float(cc.get("similarity", 0.0) or 0.0)
+            + 0.17 * rrf_norm
+            + 0.13 * overlap_score
+            + specificity_score
+            + source_bias
+        )
+
+        cc.update(source_meta)
+        cc["specificity_score"] = float(cc.get("specificity_score", specificity_score) or 0.0)
+        cc["source_bias"] = float(cc.get("source_bias", source_bias) or 0.0)
+        cc["overlap_score"] = float(cc.get("overlap_score", overlap_score) or 0.0)
+        cc["retrieval_score"] = float(cc.get("retrieval_score", base_retrieval_score) or 0.0)
+        out.append(cc)
+
+    return out
+
+
+def _fallback_root_cause_result_from_matrix(
+    *,
+    q: str,
+    matrix: dict,
+    citations: list[dict],
+    max_causes: int,
+    response_language: str,
+) -> dict:
+    by_id = {
+        str(c.get("citation_id") or "").strip(): c
+        for c in citations or []
+        if c.get("citation_id")
+    }
+
+    hypotheses = []
+    for idx, row in enumerate((matrix or {}).get("cause_hypotheses") or [], start=1):
+        if not isinstance(row, dict):
+            continue
+
+        cause = re.sub(r"\s+", " ", str(row.get("cause") or "")).strip()
+        checks = _unique_non_empty_strings(row.get("check_focus") or [], limit=4)
+        evidence_ids = [
+            str(cid or "").strip()
+            for cid in (row.get("evidence_ids") or [])
+            if str(cid or "").strip() in by_id
+        ]
+
+        if not cause or not evidence_ids:
+            continue
+
+        why_text = (
+            "Best-supported hypothesis from the retrieved evidence matrix."
+            if response_language == "en"
+            else "Ipotesi meglio supportata dalla matrice di evidenze recuperate."
+        )
+
+        hypotheses.append(
+            {
+                "rank": idx,
+                "cause": cause,
+                "why": why_text,
+                "checks": checks,
+                "citations": evidence_ids[:3],
+            }
+        )
+
+        if len(hypotheses) >= max_causes:
+            break
+
+    return {
+        "problem_summary": q,
+        "possible_causes": hypotheses,
+        "recommended_next_checks": _unique_non_empty_strings(
+            [chk for row in hypotheses for chk in (row.get("checks") or [])],
+            limit=6,
+        ),
+    }
+
+
+def _diagnostic_evidence_pipeline(
+    *,
+    q: str,
+    company_id: str,
+    machine_id: str,
+    candidate_k: int,
+    top_k: int,
+    max_causes: int,
+    doc_ids: Optional[list[str]] = None,
+    bubble_document_id: Optional[str] = None,
+    debug: bool = False,
+    planner_mode: str = "root_cause",
+    base_threshold: float = ASK_SIM_THRESHOLD,
+) -> dict:
+    top_k = max(1, int(top_k or 1))
+    max_causes = max(1, min(int(max_causes or 1), 5))
+    candidate_k = max(int(candidate_k or 0), max(ROOT_CAUSE_EXTRA_CANDIDATE_K, top_k * 8))
+    retrieval_top_k = max(top_k, min(ROOT_CAUSE_MAX_EVIDENCE_POOL, max(top_k + 2, 8)))
+
+    base_retrieval = _shared_semantic_retrieval(
+        q=q,
+        company_id=company_id,
+        machine_id=machine_id,
+        candidate_k=candidate_k,
+        top_k=retrieval_top_k,
+        doc_ids=doc_ids,
+        bubble_document_id=bubble_document_id,
+        debug=debug,
+        planner_mode=planner_mode,
+        base_threshold=base_threshold,
+        diagnostic_mode=True,
+    )
+
+    if not DIAGNOSTIC_PIPELINE_ENABLED:
+        base_retrieval["citations"] = _lock_final_citations(
+            selected_citations=list(base_retrieval.get("citations") or []),
+            ranked_candidates=list(base_retrieval.get("candidates") or []) + list(base_retrieval.get("citations") or []),
+            top_k=top_k,
+            diagnostic_mode=True,
+            query_token_count=_count_query_tokens(q),
+        )
+        return base_retrieval
+
+    planner = base_retrieval.get("planner") or {}
+    query_style = str(planner.get("query_style") or "").strip().lower()
+    query_token_count = _count_query_tokens(q)
+    query_terms = _planner_query_term_set(q, planner)
+
+    inferred_components = _infer_machine_components(q)
+    diagnostic_queries = _build_diagnostic_queries(q, inferred_components)
+    diagnostic_keywords = _collect_candidate_keywords(q, inferred_components)
+    target_subsystems = _root_cause_target_subsystems(q, inferred_components)
+
+    base_candidates = _ensure_candidate_retrieval_fields(
+        list(base_retrieval.get("candidates") or []) + list(base_retrieval.get("citations") or []),
+        query_terms=query_terms,
+        query_style=query_style,
+        query_token_count=query_token_count,
+    )
+
+    extra_dense_queries = _dedup_text_values(
+        diagnostic_queries + [planner.get("normalized_query") or q],
+        limit=max(4, SEMANTIC_MAX_DENSE_QUERIES + 3),
+    )
+
+    extra_candidates: list[dict] = []
+    if extra_dense_queries:
+        _, dense_candidates, _ = _dense_candidates_multi_query(
+            query_texts=extra_dense_queries,
+            company_id=company_id,
+            machine_id=machine_id,
+            candidate_k=max(candidate_k, ROOT_CAUSE_EXTRA_CANDIDATE_K),
+            doc_ids=doc_ids,
+            bubble_document_id=bubble_document_id,
+            debug=debug,
+        )
+        extra_candidates = _ensure_candidate_retrieval_fields(
+            dense_candidates,
+            query_terms=query_terms,
+            query_style=query_style,
+            query_token_count=query_token_count,
+        )
+
+    merged_pool = _dedup_citations_by_snippet(
+        base_candidates + extra_candidates,
+        max_items=max(ROOT_CAUSE_MAX_EVIDENCE_POOL * 3, top_k * 4, 18),
+    )
+
+    rescored_pool: list[dict] = []
+    for item in merged_pool:
+        cc = dict(item)
+        chunk_text = (cc.get("chunk_full") or cc.get("snippet") or "").strip()
+
+        semantic = _score_root_cause_chunk_semantic(q, chunk_text, diagnostic_keywords)
+        causal = _score_root_cause_causal_strength(q, chunk_text, diagnostic_keywords)
+        subsystem = _score_root_cause_subsystem_alignment(q, chunk_text, target_subsystems)
+        generic_downranked = _should_downrank_generic_root_cause_chunk(q, chunk_text, diagnostic_keywords)
+        hard_excluded = _should_hard_exclude_root_cause_chunk(q, chunk_text, diagnostic_keywords)
+
+        diagnostic_score = float(cc.get("retrieval_score", cc.get("similarity", 0.0)) or 0.0)
+        diagnostic_score += float(semantic.get("semantic_score", 0.0) or 0.0)
+        diagnostic_score += float(causal.get("causal_strength_score", 0.0) or 0.0)
+        diagnostic_score += float(subsystem.get("subsystem_score", 0.0) or 0.0)
+
+        if str(causal.get("causal_strength_band") or "") == "direct":
+            diagnostic_score += ROOT_CAUSE_DIRECT_SIGNAL_BONUS
+        if str(cc.get("source_type") or "") == "manual" and str(causal.get("causal_strength_band") or "") in {"direct", "indirect"}:
+            diagnostic_score += 0.04
+        if generic_downranked:
+            diagnostic_score -= ROOT_CAUSE_GENERIC_DOWNRANK_PENALTY
+        if hard_excluded:
+            diagnostic_score -= ROOT_CAUSE_HARD_EXCLUDE_PENALTY
+
+        cc.update(semantic)
+        cc.update(causal)
+        cc.update(subsystem)
+        cc["generic_downranked"] = bool(generic_downranked)
+        cc["hard_excluded"] = bool(hard_excluded)
+        cc["base_retrieval_score"] = float(cc.get("retrieval_score", 0.0) or 0.0)
+        cc["diagnostic_score"] = diagnostic_score
+        cc["retrieval_score"] = diagnostic_score
+        rescored_pool.append(cc)
+
+    rescored_pool.sort(
+        key=lambda x: (
+            -float(x.get("diagnostic_score", x.get("retrieval_score", x.get("similarity", 0.0))) or 0.0),
+            -float(x.get("similarity", 0.0) or 0.0),
+            str(x.get("bubble_document_id") or ""),
+            int(x.get("page_from") or 0),
+            int(x.get("page_to") or 0),
+            int(x.get("chunk_index") or 0),
+            str(x.get("citation_id") or ""),
+        )
+    )
+
+    non_excluded = [c for c in rescored_pool if not bool(c.get("hard_excluded"))]
+    working_pool = non_excluded if len(non_excluded) >= max(top_k, 4) else rescored_pool
+    working_pool = _dedup_root_cause_candidates_semantic(
+        working_pool,
+        max_items=max(ROOT_CAUSE_MAX_EVIDENCE_POOL * 2, top_k * 3, 14),
+    )
+    working_pool = _prioritize_root_cause_coverage(
+        working_pool,
+        max_items=max(ROOT_CAUSE_MAX_EVIDENCE_POOL, top_k + 2),
+    )
+
+    llm_priority_ids: list[str] = []
+    if len(working_pool) >= 4:
+        try:
+            llm_priority_ids = _llm_filter_diagnostic_chunks(
+                q=q,
+                candidates=working_pool,
+                max_keep=max(ROOT_CAUSE_MAX_EVIDENCE_POOL, top_k + 2),
+            )
+        except Exception:
+            llm_priority_ids = []
+
+    if llm_priority_ids:
+        working_pool = _reorder_citations_by_priority_ids(
+            working_pool,
+            llm_priority_ids,
+            max_items=max(ROOT_CAUSE_MAX_EVIDENCE_POOL, top_k + 2),
+        )
+
+    diagnostic_matrix: dict = {}
+    try:
+        diagnostic_matrix = _llm_build_diagnostic_evidence_matrix(
+            q=q,
+            citations=working_pool[: max(ROOT_CAUSE_MAX_EVIDENCE_POOL, top_k + 2)],
+            max_causes=max_causes,
+        )
+    except Exception:
+        diagnostic_matrix = {}
+
+    matrix_keep_ids = _unique_non_empty_strings((diagnostic_matrix or {}).get("keep_ids") or [], limit=max(ROOT_CAUSE_MAX_EVIDENCE_POOL, top_k + 2))
+    if matrix_keep_ids:
+        working_pool = _reorder_citations_by_priority_ids(
+            working_pool,
+            matrix_keep_ids,
+            max_items=max(ROOT_CAUSE_MAX_EVIDENCE_POOL, top_k + 2),
+        )
+
+    prompt_citations = _lock_final_citations(
+        selected_citations=working_pool[: max(ROOT_CAUSE_MAX_PROMPT_CITATIONS, top_k)],
+        ranked_candidates=working_pool + rescored_pool,
+        top_k=max(ROOT_CAUSE_MAX_PROMPT_CITATIONS, top_k),
+        diagnostic_mode=True,
+        query_token_count=query_token_count,
+    )
+
+    final_citations = _lock_final_citations(
+        selected_citations=prompt_citations,
+        ranked_candidates=working_pool + rescored_pool,
+        top_k=top_k,
+        diagnostic_mode=True,
+        query_token_count=query_token_count,
+    )
+
+    result = dict(base_retrieval)
+    result["citations"] = final_citations
+    result["prompt_citations"] = prompt_citations
+    result["candidates"] = rescored_pool
+    result["candidate_pool"] = working_pool
+    result["diagnostic_matrix"] = diagnostic_matrix or {}
+    result["diagnostic_queries"] = diagnostic_queries
+    result["diagnostic_keywords"] = diagnostic_keywords
+    result["inferred_components"] = inferred_components
+    result["target_subsystems"] = target_subsystems
+    result["llm_priority_ids"] = llm_priority_ids
+    result["extra_dense_queries"] = extra_dense_queries
+    return result
 
 
 def _sanitize_citations_for_response(citations: list[dict]) -> list[dict]:
@@ -7093,20 +7471,20 @@ def draft_ps_v1(
     max_causes = int(options.max_causes or 3)
     max_causes = max(1, min(max_causes, 5))
 
-    candidate_k = max(top_k, min(48, top_k * 6))
+    candidate_k = max(top_k, min(80, max(ROOT_CAUSE_EXTRA_CANDIDATE_K, top_k * 10)))
 
-    retrieval = _shared_semantic_retrieval(
+    retrieval = _diagnostic_evidence_pipeline(
         q=q,
         company_id=company_id,
         machine_id=machine_id,
         candidate_k=candidate_k,
         top_k=top_k,
+        max_causes=max_causes,
         doc_ids=doc_ids if isinstance(doc_ids, list) else None,
         bubble_document_id=bubble_document_id,
         debug=payload.debug,
         planner_mode="draft_ps",
         base_threshold=DRAFT_PS_SIM_THRESHOLD,
-        diagnostic_mode=True,
     )
 
     planner = retrieval.get("planner") or {}
@@ -7124,6 +7502,13 @@ def draft_ps_v1(
                 "query_plan": planner,
                 "dense_queries": retrieval.get("dense_queries") or [],
                 "lexical_queries": retrieval.get("lexical_queries") or [],
+                "extra_dense_queries": retrieval.get("extra_dense_queries") or [],
+                "diagnostic_queries": retrieval.get("diagnostic_queries") or [],
+                "diagnostic_keywords": retrieval.get("diagnostic_keywords") or [],
+                "inferred_components": retrieval.get("inferred_components") or [],
+                "target_subsystems": retrieval.get("target_subsystems") or [],
+                "diagnostic_matrix": retrieval.get("diagnostic_matrix") or {},
+                "llm_priority_ids": retrieval.get("llm_priority_ids") or [],
                 "chunks_matching_filter": retrieval.get("chunks_matching_filter"),
                 "similarity_max": sim_max,
                 "effective_threshold": retrieval.get("effective_threshold"),
@@ -7151,69 +7536,103 @@ def draft_ps_v1(
                     "max_causes": max_causes,
                     "similarity_max": sim_max,
                     "language": language,
+                    "chat_model": ROOT_CAUSE_RESPONSE_MODEL,
                 },
             }
         )
 
     prompt_citations = []
-    for c in citations:
+    for c in (retrieval.get("prompt_citations") or citations):
         cc = dict(c)
-        cc["snippet"] = (cc.get("chunk_full") or cc.get("snippet") or "").strip()
+        cc["chunk_full"] = (cc.get("chunk_full") or cc.get("snippet") or "").strip()[:1800]
+        cc["snippet"] = (cc.get("snippet") or cc.get("chunk_full") or "").strip()
         prompt_citations.append(cc)
 
+    prompt_citations = prompt_citations[: max(ROOT_CAUSE_MAX_PROMPT_CITATIONS, top_k)]
     sources_block = _build_sources_block_from_citations(
         prompt_citations,
         max_context_chars=ASK_MAX_CONTEXT_CHARS,
         prefer_chunk_full=True,
     )
 
+    matrix = retrieval.get("diagnostic_matrix") or {}
+    matrix_json = json.dumps(matrix, ensure_ascii=False)
+    inferred_components = json.dumps(retrieval.get("inferred_components") or [], ensure_ascii=False)
+    target_subsystems = json.dumps(retrieval.get("target_subsystems") or [], ensure_ascii=False)
+
     schema = _draft_ps_response_schema(max_causes=max_causes)
 
     if language == "en":
         system_msg = (
             "You draft grounded Problem & Solution entries for technical equipment. "
-            "Use ONLY the provided sources. "
+            "Use ONLY the provided sources and the evidence matrix. "
             "Work domain-agnostically: do not assume a sector, machine family, or failure taxonomy unless the sources support it. "
+            "Treat the evidence matrix as the preferred structure for candidate causes and checks. "
             "It is acceptable to make cautious multi-source inferences, but every proposed cause must stay tightly grounded. "
             "Each cause label should be compact, canonical, and technically precise. "
+            "Prefer direct component/process evidence over generic maintenance or safety content. "
+            "Merge near-duplicate causes instead of listing paraphrases. "
             "Use only citation_id values present in the sources."
         )
 
         user_msg = (
             f"USER_PROBLEM:\n{q}\n\n"
             f"NORMALIZED_PROBLEM:\n{planner.get('normalized_query') or q}\n\n"
+            f"INFERRED_COMPONENTS_JSON:\n{inferred_components}\n\n"
+            f"TARGET_SUBSYSTEMS_JSON:\n{target_subsystems}\n\n"
+            f"DIAGNOSTIC_EVIDENCE_MATRIX_JSON:\n{matrix_json}\n\n"
             f"SOURCES:\n{sources_block}\n\n"
             "Return valid JSON for a grounded Problem & Solution draft."
         )
     else:
         system_msg = (
             "Redigi bozze grounded di Problem & Solution per apparecchiature tecniche. "
-            "Usa SOLO le fonti fornite. "
+            "Usa SOLO le fonti fornite e la matrice di evidenze. "
             "Lavora in modo domain-agnostic: non assumere settore, famiglia macchina o tassonomia guasti se le fonti non lo supportano. "
+            "Tratta la matrice di evidenze come struttura preferita per possibili cause e verifiche. "
             "Sono ammesse inferenze caute multi-fonte, ma ogni possibile causa deve restare strettamente grounded. "
             "Ogni causa deve avere un'etichetta compatta, canonica e tecnicamente precisa. "
+            "Preferisci evidenza diretta di componente/processo rispetto a contenuti generici di manutenzione o sicurezza. "
+            "Unisci cause quasi duplicate invece di elencare parafrasi. "
             "Usa solo citation_id presenti nelle fonti."
         )
 
         user_msg = (
             f"PROBLEMA_UTENTE:\n{q}\n\n"
             f"PROBLEMA_NORMALIZZATO:\n{planner.get('normalized_query') or q}\n\n"
+            f"COMPONENTI_INFERITI_JSON:\n{inferred_components}\n\n"
+            f"SOTTOSISTEMI_TARGET_JSON:\n{target_subsystems}\n\n"
+            f"MATRICE_EVIDENZE_DIAGNOSTICHE_JSON:\n{matrix_json}\n\n"
             f"FONTI:\n{sources_block}\n\n"
             "Restituisci JSON valido per una bozza grounded di Problem & Solution."
         )
 
     try:
-        result_json = _openai_chat_json(
+        result_json = _openai_chat_json_models(
             [
                 {"role": "system", "content": system_msg},
                 {"role": "user", "content": user_msg},
             ],
-            model=OPENAI_CHAT_MODEL,
+            models=[ROOT_CAUSE_RESPONSE_MODEL, DIAGNOSTIC_EVIDENCE_MODEL, OPENAI_CHAT_MODEL],
             json_schema=schema,
-            timeout=60,
+            timeout=90,
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"LLM failed: {str(e)}")
+
+    if not (result_json or {}).get("possible_causes") and matrix:
+        fallback_json = _fallback_root_cause_result_from_matrix(
+            q=planner.get("normalized_query") or q,
+            matrix=matrix,
+            citations=citations,
+            max_causes=max_causes,
+            response_language=language,
+        )
+        result_json = {
+            "title": str((result_json or {}).get("title") or "").strip(),
+            "problem_summary": str((result_json or {}).get("problem_summary") or "").strip() or q,
+            "possible_causes": fallback_json.get("possible_causes") or [],
+        }
 
     grounded_result, grounded_citations = _ground_root_cause_result(
         result=result_json,
@@ -7236,6 +7655,30 @@ def draft_ps_v1(
         grounded_citations,
         max_causes=max_causes,
     )
+
+    if not grounded_result.get("possible_causes") and matrix:
+        fallback_grounded = _fallback_root_cause_result_from_matrix(
+            q=planner.get("normalized_query") or q,
+            matrix=matrix,
+            citations=citations,
+            max_causes=max_causes,
+            response_language=language,
+        )
+        grounded_result, grounded_citations = _ground_root_cause_result(
+            result=fallback_grounded,
+            citations=citations,
+            max_causes=max_causes,
+        )
+        grounded_result, grounded_citations = _compact_root_cause_result_citations_by_family(
+            result=grounded_result,
+            citations=grounded_citations,
+            max_per_cause=2,
+        )
+        grounded_result, grounded_citations = _lock_root_cause_result(
+            grounded_result,
+            grounded_citations,
+            max_causes=max_causes,
+        )
 
     final_title = str((result_json or {}).get("title") or "").strip()
     if not final_title:
@@ -7261,7 +7704,7 @@ def draft_ps_v1(
                     "top_k": top_k,
                     "max_causes": max_causes,
                     "similarity_max": sim_max,
-                    "chat_model": OPENAI_CHAT_MODEL,
+                    "chat_model": ROOT_CAUSE_RESPONSE_MODEL,
                     "language": language,
                 },
             }
@@ -7289,7 +7732,7 @@ def draft_ps_v1(
                 "top_k": top_k,
                 "max_causes": max_causes,
                 "similarity_max": sim_max,
-                "chat_model": OPENAI_CHAT_MODEL,
+                "chat_model": ROOT_CAUSE_RESPONSE_MODEL,
                 "language": language,
             },
         }
@@ -7324,7 +7767,7 @@ def root_cause_v1(
     top_k = int(payload.top_k or 8)
     top_k = max(1, min(top_k, ASK_MAX_TOP_K))
     max_causes = max(1, min(int(payload.max_causes or 3), 3))
-    candidate_k = max(top_k, min(80, top_k * 10))
+    candidate_k = max(top_k, min(80, max(ROOT_CAUSE_EXTRA_CANDIDATE_K, top_k * 10)))
 
     query_signal_summary = _root_cause_query_signal_summary(
         q=q,
@@ -7344,10 +7787,19 @@ def root_cause_v1(
         "planner": {},
         "dense_queries": [],
         "lexical_queries": [],
+        "extra_dense_queries": [],
+        "diagnostic_queries": [],
+        "diagnostic_keywords": [],
+        "inferred_components": [],
+        "target_subsystems": [],
+        "diagnostic_matrix": {},
+        "llm_priority_ids": [],
         "chunks_matching_filter": None,
         "similarity_max": None,
         "effective_threshold": ASK_SIM_THRESHOLD,
         "citations": [],
+        "prompt_citations": [],
+        "candidate_pool": [],
         "fts_used": False,
         "prefix_fts_used": False,
         "exact_fts_used": False,
@@ -7356,18 +7808,18 @@ def root_cause_v1(
     }
 
     if not query_fail_closed:
-        retrieval = _shared_semantic_retrieval(
+        retrieval = _diagnostic_evidence_pipeline(
             q=q,
             company_id=company_id,
             machine_id=machine_id,
             candidate_k=candidate_k,
             top_k=top_k,
+            max_causes=max_causes,
             doc_ids=doc_ids if isinstance(doc_ids, list) else None,
             bubble_document_id=bubble_document_id,
             debug=payload.debug,
             planner_mode="root_cause",
             base_threshold=ASK_SIM_THRESHOLD,
-            diagnostic_mode=True,
         )
 
     planner = retrieval.get("planner") or {}
@@ -7387,6 +7839,13 @@ def root_cause_v1(
                 "query_plan": planner,
                 "dense_queries": retrieval.get("dense_queries") or [],
                 "lexical_queries": retrieval.get("lexical_queries") or [],
+                "extra_dense_queries": retrieval.get("extra_dense_queries") or [],
+                "diagnostic_queries": retrieval.get("diagnostic_queries") or [],
+                "diagnostic_keywords": retrieval.get("diagnostic_keywords") or [],
+                "inferred_components": retrieval.get("inferred_components") or [],
+                "target_subsystems": retrieval.get("target_subsystems") or [],
+                "diagnostic_matrix": retrieval.get("diagnostic_matrix") or {},
+                "llm_priority_ids": retrieval.get("llm_priority_ids") or [],
                 "chunks_matching_filter": retrieval.get("chunks_matching_filter"),
                 "similarity_max": sim_max,
                 "effective_threshold": retrieval.get("effective_threshold"),
@@ -7433,11 +7892,13 @@ def root_cause_v1(
         )
 
     prompt_citations = []
-    for c in citations:
+    for c in (retrieval.get("prompt_citations") or citations):
         cc = dict(c)
-        cc["chunk_full"] = (cc.get("chunk_full") or cc.get("snippet") or "").strip()[:1600]
+        cc["chunk_full"] = (cc.get("chunk_full") or cc.get("snippet") or "").strip()[:1800]
         cc["snippet"] = (cc.get("snippet") or cc.get("chunk_full") or "").strip()
         prompt_citations.append(cc)
+
+    prompt_citations = prompt_citations[: max(ROOT_CAUSE_MAX_PROMPT_CITATIONS, top_k)]
 
     sources_block = _build_sources_block_from_citations(
         prompt_citations,
@@ -7448,18 +7909,24 @@ def root_cause_v1(
     schema = _root_cause_response_schema(max_causes=max_causes)
     response_language = _select_response_language(q, planner=planner)
 
+    matrix = retrieval.get("diagnostic_matrix") or {}
+    matrix_json = json.dumps(matrix, ensure_ascii=False)
+    inferred_components = json.dumps(retrieval.get("inferred_components") or [], ensure_ascii=False)
+    target_subsystems = json.dumps(retrieval.get("target_subsystems") or [], ensure_ascii=False)
+
     system_msg = (
         "You are a root-cause assistant for technical equipment and machine documentation. "
-        "Use ONLY the provided sources. "
+        "Use ONLY the provided sources and evidence matrix. "
         "Work domain-agnostically: do not assume a sector, machine family, subsystem taxonomy, or standard failure mode unless the sources support it. "
+        "Treat the evidence matrix as the preferred structure for candidate causes and checks. "
         "Procedures and problem-solution entries are valid evidence when directly relevant, but a generic procedure or generic P&S must not outweigh a more specific manual passage. "
         "You may make cautious multi-source inferences, but every proposed cause must remain tightly grounded. "
-        "Order causes by groundedness and specificity, not by creativity. "
+        "Order causes by groundedness, causal support, and specificity, not by creativity. "
         "Each 'cause' must be a short canonical label of about 3 to 10 words, preferably a noun phrase, with no trailing period. "
         "Reuse source terminology when possible and avoid switching between near-synonymous paraphrases across runs. "
         "If the evidence is narrow, return fewer causes rather than broad generic ones. "
         "Avoid generic boilerplate causes unless the sources clearly support them. "
-        "When multiple evidence sets are close in quality, prefer the dominant evidence family rather than mixing weak alternatives. "
+        "Merge near-duplicate causes instead of listing paraphrases. "
         "Always reply in the same language as the user query."
     )
 
@@ -7467,22 +7934,34 @@ def root_cause_v1(
         f"USER_PROBLEM:\n{q}\n\n"
         f"NORMALIZED_PROBLEM:\n{planner.get('normalized_query') or q}\n\n"
         f"RESPONSE_LANGUAGE:\n{response_language}\n\n"
+        f"INFERRED_COMPONENTS_JSON:\n{inferred_components}\n\n"
+        f"TARGET_SUBSYSTEMS_JSON:\n{target_subsystems}\n\n"
+        f"DIAGNOSTIC_EVIDENCE_MATRIX_JSON:\n{matrix_json}\n\n"
         f"SOURCES:\n{sources_block}\n\n"
         "Return valid JSON. Use only citation_id values present in the sources."
     )
 
     try:
-        result_json = _openai_chat_json(
+        result_json = _openai_chat_json_models(
             [
                 {"role": "system", "content": system_msg},
                 {"role": "user", "content": user_msg},
             ],
-            model=OPENAI_CHAT_MODEL,
+            models=[ROOT_CAUSE_RESPONSE_MODEL, DIAGNOSTIC_EVIDENCE_MODEL, OPENAI_CHAT_MODEL],
             json_schema=schema,
-            timeout=60,
+            timeout=90,
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"LLM failed: {str(e)}")
+
+    if not (result_json or {}).get("possible_causes") and matrix:
+        result_json = _fallback_root_cause_result_from_matrix(
+            q=planner.get("normalized_query") or q,
+            matrix=matrix,
+            citations=citations,
+            max_causes=max_causes,
+            response_language=response_language,
+        )
 
     grounded_result, grounded_citations = _ground_root_cause_result(
         result=result_json,
@@ -7506,6 +7985,30 @@ def root_cause_v1(
         max_causes=max_causes,
     )
 
+    if not grounded_result.get("possible_causes") and matrix:
+        fallback_grounded = _fallback_root_cause_result_from_matrix(
+            q=planner.get("normalized_query") or q,
+            matrix=matrix,
+            citations=citations,
+            max_causes=max_causes,
+            response_language=response_language,
+        )
+        grounded_result, grounded_citations = _ground_root_cause_result(
+            result=fallback_grounded,
+            citations=citations,
+            max_causes=max_causes,
+        )
+        grounded_result, grounded_citations = _compact_root_cause_result_citations_by_family(
+            result=grounded_result,
+            citations=grounded_citations,
+            max_per_cause=2,
+        )
+        grounded_result, grounded_citations = _lock_root_cause_result(
+            grounded_result,
+            grounded_citations,
+            max_causes=max_causes,
+        )
+
     if not grounded_result.get("problem_summary"):
         grounded_result["problem_summary"] = planner.get("normalized_query") or q
 
@@ -7522,7 +8025,7 @@ def root_cause_v1(
                 "rg_links": [],
                 "top_k": top_k,
                 "similarity_max": sim_max,
-                "chat_model": OPENAI_CHAT_MODEL,
+                "chat_model": ROOT_CAUSE_RESPONSE_MODEL,
             }
         )
 
@@ -7547,7 +8050,7 @@ def root_cause_v1(
             "rg_links": rg_links,
             "top_k": top_k,
             "similarity_max": sim_max,
-            "chat_model": OPENAI_CHAT_MODEL,
+            "chat_model": ROOT_CAUSE_RESPONSE_MODEL,
         }
     )
 
