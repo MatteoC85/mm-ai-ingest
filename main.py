@@ -115,6 +115,22 @@ ROOT_CAUSE_CANDIDATE_ENABLE_ROLE_AWARE_MATRIX = (os.environ.get("MM_ROOT_CAUSE_C
 ASK_CANDIDATE_MATRIX_TOP_K = int(os.environ.get("MM_ASK_CANDIDATE_MATRIX_TOP_K", "7"))
 ASK_CANDIDATE_PROMPT_TOP_K = int(os.environ.get("MM_ASK_CANDIDATE_PROMPT_TOP_K", "6"))
 
+# Retrieval v5 (retrieval-only improvements; do not change ask/root-cause decision logic)
+RETRIEVAL_V5_ENABLED = (os.environ.get("MM_RETRIEVAL_V5_ENABLED") or "1").strip() != "0"
+RETRIEVAL_ROLE_TAGS_IN_EMBEDDINGS = (os.environ.get("MM_RETRIEVAL_ROLE_TAGS_IN_EMBEDDINGS") or "1").strip() != "0"
+RETRIEVAL_LEXICAL_ALWAYS_BLEND = (os.environ.get("MM_RETRIEVAL_LEXICAL_ALWAYS_BLEND") or "1").strip() != "0"
+RETRIEVAL_PHRASE_SEARCH_ENABLED = (os.environ.get("MM_RETRIEVAL_PHRASE_SEARCH_ENABLED") or "1").strip() != "0"
+RETRIEVAL_FTS_BLEND_TOP_K = int(os.environ.get("MM_RETRIEVAL_FTS_BLEND_TOP_K", "10"))
+RETRIEVAL_PHRASE_BLEND_TOP_K = int(os.environ.get("MM_RETRIEVAL_PHRASE_BLEND_TOP_K", "6"))
+RETRIEVAL_SYMPTOM_ROLE_PRIOR_WEIGHT = float(os.environ.get("MM_RETRIEVAL_SYMPTOM_ROLE_PRIOR_WEIGHT", "0.16"))
+RETRIEVAL_SYMPTOM_SUPPORT_PENALTY = float(os.environ.get("MM_RETRIEVAL_SYMPTOM_SUPPORT_PENALTY", "0.18"))
+RETRIEVAL_GENERIC_SUPPORT_PENALTY = float(os.environ.get("MM_RETRIEVAL_GENERIC_SUPPORT_PENALTY", "0.24"))
+RETRIEVAL_POSITIONING_FALSE_POSITIVE_PENALTY = float(os.environ.get("MM_RETRIEVAL_POSITIONING_FALSE_POSITIVE_PENALTY", "0.28"))
+RETRIEVAL_LEXICAL_PHRASE_BONUS = float(os.environ.get("MM_RETRIEVAL_LEXICAL_PHRASE_BONUS", "0.08"))
+RETRIEVAL_LEXICAL_EXACT_BONUS = float(os.environ.get("MM_RETRIEVAL_LEXICAL_EXACT_BONUS", "0.05"))
+RETRIEVAL_LEXICAL_PREFIX_BONUS = float(os.environ.get("MM_RETRIEVAL_LEXICAL_PREFIX_BONUS", "0.03"))
+RETRIEVAL_SURROGATE_MAX_CHARS = int(os.environ.get("MM_RETRIEVAL_SURROGATE_MAX_CHARS", "3200"))
+
 
 # -----------------------------
 # Entity fallback (URL / email / phone)
@@ -380,6 +396,15 @@ def _fetch_dense_chunk_candidates(
     finally:
         conn.close()
 
+def _pgvector_value_to_list(embedding: Any) -> list[float]:
+    if embedding is None:
+        return []
+    if isinstance(embedding, list):
+        return [float(x) for x in embedding]
+    s = str(embedding).strip().strip("[]")
+    return [float(x) for x in s.split(",") if x.strip()]
+
+
 def _raw_rows_to_dense_candidates(
     raw_rows: list[tuple],
     *,
@@ -388,14 +413,7 @@ def _raw_rows_to_dense_candidates(
     candidates: list[dict] = []
 
     for (bdid, chunk_index, page_from, page_to, snippet, chunk_full, similarity, embedding) in raw_rows:
-        if embedding is None:
-            emb_list = None
-        elif isinstance(embedding, list):
-            emb_list = embedding
-        else:
-            s = str(embedding).strip()
-            s = s.strip("[]")
-            emb_list = [float(x) for x in s.split(",") if x.strip()]
+        emb_list = _pgvector_value_to_list(embedding)
 
         item = {
             "citation_id": f"{bdid}:p{int(page_from)}-{int(page_to)}:c{int(chunk_index)}",
@@ -406,7 +424,7 @@ def _raw_rows_to_dense_candidates(
             "snippet": (snippet or "").strip(),
             "chunk_full": (chunk_full or "").strip(),
             "similarity": float(similarity),
-            "embedding_list": emb_list or [],
+            "embedding_list": list(emb_list or []),
         }
 
         if query_used is not None:
@@ -2194,7 +2212,8 @@ def _dense_candidates_multi_query(
     if not cleaned_queries:
         return None, [], {}
 
-    vectors = _openai_embed_texts(cleaned_queries)
+    embed_inputs = [_build_dense_query_embedding_surrogate(q) for q in cleaned_queries]
+    vectors = _openai_embed_texts(embed_inputs)
     query_vectors: dict[str, list[float]] = {}
     dense_ranked_lists: list[list[dict]] = []
     chunks_matching_filter = None
@@ -2245,6 +2264,568 @@ def _source_type_from_document_id(value: str) -> str:
     if prefix in STRUCTURED_SOURCE_TYPES:
         return prefix
     return "manual"
+
+
+def _queryless_chunk_role_signature(
+    chunk_text: str,
+    *,
+    source_type: str = "manual",
+) -> dict:
+    txt = _normalize_unicode_advanced(chunk_text or "").lower()
+    section = _normalize_unicode_advanced(_extract_section_from_text(chunk_text or "") or "").lower()
+    body = re.sub(r"^SECTION:\s*[^\n]+\n?", "", txt, flags=re.IGNORECASE).strip()
+
+    def _score(markers: list[str]) -> float:
+        sec_hits = sum(1 for m in markers if m and m in section)
+        body_hits = sum(1 for m in markers if m and m in body)
+        return sec_hits * 1.7 + body_hits * 1.0
+
+    install_markers = [
+        "posizionamento", "positioning", "installazione", "installation", "commissioning",
+        "messa in servizio", "messa in moto", "startup", "start-up", "foundation", "fondazione",
+        "piano di appoggio", "support surface", "planarità", "planarity", "livellamento", "leveling",
+        "livella", "spirit level", "rubber shims", "spessori di gomma", "transport", "trasporto",
+        "storage", "stoccaggio",
+    ]
+    safety_markers = [
+        "safety", "sicurezza", "riparo", "guard", "porta", "door", "interlock", "microinter",
+        "micro switch", "emergency", "emergenza", "zona di lavoro", "work area",
+    ]
+    lubrication_markers = [
+        "lubrication", "lubrificazione", "lubric", "lubrif", "oil", "olio", "grease", "grasso",
+        "pump", "pompa", "serbatoio", "tank", "pressostato", "pressure switch",
+    ]
+    electrical_markers = [
+        "electrical", "elettric", "phase", "phases", "fasi", "voltage", "tensione", "power",
+        "alimentazione", "quadro", "panel", "selector", "selettore", "automatic", "automatico",
+        "manuale", "manual", "avviamento", "start", "plc", "encoder", "inverter", "control", "controllo",
+    ]
+    fluid_markers = [
+        "pneumat", "hydraul", "idraulic", "pressure", "pression", "aria", "air", "valv", "valvol",
+        "cylind", "cilindr",
+    ]
+    process_markers = [
+        "feed", "advance", "advancement", "avanz", "wire", "filo", "strip", "nastro", "material",
+        "straighten", "straightening", "raddrizz", "bend", "bending", "pieg", "forming", "formatura",
+        "press", "pressa", "die", "stampo", "tool", "utensile", "punzone", "slitta", "slide",
+        "cam", "camme",
+    ]
+    mechanical_markers = [
+        "gear", "gearbox", "ridutt", "ingran", "bearing", "cuscinet", "shaft", "albero", "motor", "motore",
+        "roller", "rullo", "guide", "guida", "transmission", "trasmission", "eccentric", "eccentr",
+        "backlash", "gioco", "wear", "usura", "friction", "attrit", "belt", "cinghia", "chain", "catena",
+    ]
+    overview_markers = [
+        "caratteristiche generali", "general features", "general description", "descrizione generale",
+        "machine description", "technical data", "specifications", "intended use",
+    ]
+
+    install_score = _score(install_markers)
+    safety_score = _score(safety_markers)
+    lubrication_score = _score(lubrication_markers)
+    electrical_score = _score(electrical_markers)
+    fluid_score = _score(fluid_markers)
+    process_score = _score(process_markers)
+    mechanical_score = _score(mechanical_markers)
+    overview_score = _score(overview_markers)
+
+    tags: list[str] = []
+    if any(m in body or m in section for m in ["bend", "bending", "pieg", "forming", "formatura", "press", "pressa", "die", "stampo", "tool", "utensile", "punzone", "slitta", "slide"]):
+        tags.append("forming")
+    if any(m in body or m in section for m in ["feed", "advance", "advancement", "avanz", "wire", "filo", "strip", "nastro", "material", "cam", "camme"]):
+        tags.append("material_feed")
+    if any(m in body or m in section for m in ["straighten", "straightening", "raddrizz"]):
+        tags.append("straightening")
+    if any(m in body or m in section for m in ["gear", "gearbox", "ridutt", "ingran", "bearing", "cuscinet", "shaft", "albero", "motor", "motore", "transmission", "trasmission", "eccentric", "eccentr"]):
+        tags.append("drive_train")
+
+    role_class = "collateral"
+    role_group = "collateral"
+
+    if max(process_score, mechanical_score) >= 2.0:
+        if process_score >= mechanical_score - 0.25:
+            role_class = "core_process"
+            role_group = "core"
+        else:
+            role_class = "core_mechanical"
+            role_group = "core"
+    elif electrical_score >= max(safety_score, lubrication_score, install_score, fluid_score, 2.0):
+        role_class = "support_electrical_interlock"
+        role_group = "support"
+    elif safety_score >= max(lubrication_score, install_score, fluid_score, 2.0):
+        role_class = "support_safety"
+        role_group = "support"
+    elif lubrication_score >= max(fluid_score, install_score, 2.0):
+        role_class = "support_lubrication"
+        role_group = "support"
+    elif fluid_score >= max(install_score, 2.0):
+        role_class = "support_fluid_power"
+        role_group = "support"
+    elif install_score >= 2.0 or overview_score >= 2.0:
+        role_class = "support_startup_install"
+        role_group = "support"
+    elif process_score >= 1.0:
+        role_class = "core_process"
+        role_group = "core"
+    elif mechanical_score >= 1.0:
+        role_class = "core_mechanical"
+        role_group = "core"
+
+    if role_class != "collateral":
+        tags.insert(0, role_class)
+    if install_score >= 2.0:
+        tags.append("installation_positioning")
+    if safety_score >= 2.0:
+        tags.append("safety_interlock")
+    if lubrication_score >= 2.0:
+        tags.append("lubrication")
+    if electrical_score >= 2.0:
+        tags.append("electrical_control")
+    if fluid_score >= 2.0:
+        tags.append("fluid_power")
+    if overview_score >= 2.0:
+        tags.append("overview")
+    if source_type in {"procedure", "step"}:
+        tags.append("structured_procedure")
+    elif source_type == "ps":
+        tags.append("structured_problem_solution")
+
+    role_tags = _dedup_text_values(tags, limit=10)
+    return {
+        "role_class": role_class,
+        "role_group": role_group,
+        "role_tags": role_tags,
+        "install_score": install_score,
+        "safety_score": safety_score,
+        "lubrication_score": lubrication_score,
+        "electrical_score": electrical_score,
+        "fluid_score": fluid_score,
+        "process_score": process_score,
+        "mechanical_score": mechanical_score,
+        "overview_score": overview_score,
+    }
+
+
+def _build_chunk_embedding_surrogate(
+    chunk_text: str,
+    *,
+    source_type: str = "manual",
+) -> str:
+    text = re.sub(r"\s+", " ", _normalize_unicode_advanced(chunk_text or "")).strip()
+    if not text or not RETRIEVAL_ROLE_TAGS_IN_EMBEDDINGS:
+        return text
+
+    role = _queryless_chunk_role_signature(text, source_type=source_type)
+    section = re.sub(r"\s+", " ", _extract_section_from_text(text) or "").strip()
+    tags = list(role.get("role_tags") or [])
+
+    prefix_parts = []
+    if section:
+        prefix_parts.append(f"section: {section}")
+    if role.get("role_class") and role.get("role_class") != "collateral":
+        prefix_parts.append(f"retrieval role: {role.get('role_class')}")
+    if tags:
+        prefix_parts.append("retrieval tags: " + ", ".join(tags[:10]))
+
+    surrogate = "\n".join(prefix_parts + [text]).strip()
+    return surrogate[:RETRIEVAL_SURROGATE_MAX_CHARS]
+
+
+def _build_dense_query_embedding_surrogate(query_text: str) -> str:
+    q = re.sub(r"\s+", " ", _normalize_unicode_advanced(query_text or "")).strip()
+    if not q or not RETRIEVAL_V5_ENABLED:
+        return q
+
+    profile = _query_symptom_profile(q)
+    classes = set(profile.get("classes") or [])
+    if not classes:
+        return q
+
+    hints = [q]
+    if classes & {"vibration", "noise", "jam"}:
+        if profile.get("generic_symptom") and not profile.get("has_support_anchor"):
+            hints.append("retrieval target: core mechanical cause, core process cause")
+            hints.append("deprioritize installation, positioning, startup, safety, lubrication")
+        else:
+            hints.append("retrieval target: direct mechanism, direct process evidence")
+        if profile.get("has_bending_anchor"):
+            hints.append("process anchor: bending press slide die tool")
+        if profile.get("has_feed_anchor"):
+            hints.append("process anchor: feed straightening roller cam material")
+    if "no_start" in classes:
+        if profile.get("automatic_mode"):
+            hints.append("retrieval target: selector automatic mode, electrical interlock, safety interlock, guard closed")
+        else:
+            hints.append("retrieval target: electrical phases, power, panel, interlock")
+        hints.append("deprioritize installation and positioning")
+
+    surrogate = "\n".join(_dedup_text_values(hints, limit=8)).strip()
+    return surrogate[:RETRIEVAL_SURROGATE_MAX_CHARS]
+
+
+def _candidate_lexical_bonus(item: dict) -> float:
+    types = set(str(x).strip().lower() for x in (item.get("lexical_match_types") or []) if str(x).strip())
+    bonus = 0.0
+    if "phrase" in types:
+        bonus += RETRIEVAL_LEXICAL_PHRASE_BONUS
+    if "exact" in types:
+        bonus += RETRIEVAL_LEXICAL_EXACT_BONUS
+    if "prefix" in types:
+        bonus += RETRIEVAL_LEXICAL_PREFIX_BONUS
+    return min(0.14, bonus)
+
+
+def _symptom_retrieval_role_prior(
+    q: str,
+    item: dict,
+) -> tuple[float, dict]:
+    if not RETRIEVAL_V5_ENABLED:
+        return 0.0, {}
+
+    profile = _query_symptom_profile(q)
+    classes = set(profile.get("classes") or [])
+    if not classes:
+        return 0.0, {}
+
+    chunk_text = (item.get("chunk_full") or item.get("snippet") or "").strip()
+    source_type = str(item.get("source_type") or _source_type_from_document_id(item.get("bubble_document_id") or ""))
+    role = dict(item.get("queryless_role") or _queryless_chunk_role_signature(chunk_text, source_type=source_type))
+    role_class = str(role.get("role_class") or "collateral")
+    role_group = str(role.get("role_group") or "collateral")
+    tags = {str(x).strip() for x in (role.get("role_tags") or []) if str(x).strip()}
+
+    bias = 0.0
+    notes: list[str] = []
+
+    if _looks_like_installation_positioning_false_positive(chunk_text) and (profile.get("generic_symptom") or classes & {"vibration", "noise", "jam"}):
+        bias -= RETRIEVAL_POSITIONING_FALSE_POSITIVE_PENALTY
+        notes.append("positioning_false_positive")
+
+    if classes & {"vibration", "noise", "jam"}:
+        if role_group == "core":
+            bias += 0.08
+        if role_class == "support_startup_install" and not profile.get("has_support_anchor"):
+            bias -= RETRIEVAL_GENERIC_SUPPORT_PENALTY
+            notes.append("startup_install_penalty")
+        if role_class == "support_lubrication" and not profile.get("has_support_anchor"):
+            bias -= RETRIEVAL_SYMPTOM_SUPPORT_PENALTY
+            notes.append("lubrication_penalty")
+        if role_class == "support_safety" and not profile.get("has_support_anchor"):
+            bias -= RETRIEVAL_SYMPTOM_SUPPORT_PENALTY
+            notes.append("safety_penalty")
+        if role_class == "support_electrical_interlock" and not profile.get("has_support_anchor"):
+            bias -= 0.10
+            notes.append("electrical_secondary_penalty")
+        if profile.get("has_bending_anchor") and ("forming" in tags or role_class == "core_process"):
+            bias += 0.06
+        if profile.get("has_feed_anchor") and ({"material_feed", "straightening"} & tags or role_class == "core_process"):
+            bias += 0.06
+
+    if "no_start" in classes:
+        if profile.get("automatic_mode"):
+            if role_class == "support_electrical_interlock":
+                bias += 0.12
+            if role_class == "support_safety":
+                bias += 0.09
+            if role_class == "support_startup_install":
+                bias -= 0.14
+            if role_class == "support_lubrication" and not profile.get("has_support_anchor"):
+                bias -= 0.16
+        else:
+            if role_class == "support_electrical_interlock":
+                bias += 0.10
+            if role_class == "support_startup_install":
+                bias -= 0.10
+            if role_class == "support_lubrication" and not profile.get("has_support_anchor"):
+                bias -= 0.12
+
+    bias = max(-0.32, min(RETRIEVAL_SYMPTOM_ROLE_PRIOR_WEIGHT + 0.02, bias))
+    return bias, {
+        "queryless_role": role,
+        "role_class_hint": role_class,
+        "role_group_hint": role_group,
+        "symptom_prior_notes": notes,
+    }
+
+
+def _rich_candidate_from_row(
+    *,
+    bdid: Any,
+    chunk_index: Any,
+    page_from: Any,
+    page_to: Any,
+    snippet: Any,
+    chunk_full: Any,
+    embedding: Any,
+    lexical_rank: float = 0.0,
+    lexical_match_type: Optional[str] = None,
+) -> dict:
+    item = {
+        "citation_id": f"{bdid}:p{int(page_from)}-{int(page_to)}:c{int(chunk_index)}",
+        "bubble_document_id": str(bdid),
+        "chunk_index": int(chunk_index),
+        "page_from": int(page_from),
+        "page_to": int(page_to),
+        "snippet": (snippet or "").strip(),
+        "chunk_full": (chunk_full or snippet or "").strip(),
+        "similarity": 0.0,
+        "embedding_list": _pgvector_value_to_list(embedding),
+        "lexical_rank": float(lexical_rank or 0.0),
+        "lexical_match_types": [lexical_match_type] if lexical_match_type else [],
+    }
+    return item
+
+
+def _fts_search_chunks_prefix_rich(
+    company_id: str,
+    machine_id: str,
+    texts: list[str],
+    top_k: int,
+    doc_ids: Optional[list[str]] = None,
+    bubble_document_id: Optional[str] = None,
+) -> list[dict]:
+    ts_query = _build_prefix_tsquery_from_texts(texts, limit=10)
+    if not ts_query:
+        return []
+
+    conn = _db_conn()
+    try:
+        with conn.cursor() as cur:
+            where = ["company_id = %s"]
+            params: list[Any] = [company_id]
+            if doc_ids:
+                where.append("bubble_document_id = ANY(%s)")
+                params.append(doc_ids)
+            elif bubble_document_id:
+                where.append("bubble_document_id = %s")
+                params.append(bubble_document_id)
+                where.append("(machine_id = %s OR machine_id IS NULL)")
+                params.append(machine_id)
+            else:
+                where.append("(machine_id = %s OR machine_id IS NULL)")
+                params.append(machine_id)
+            where_sql = " AND ".join(where)
+            cur.execute(
+                f"""
+                SELECT bubble_document_id, chunk_index, page_from, page_to,
+                       left(chunk_text, %s) AS snippet,
+                       left(chunk_text, 2000) AS chunk_full,
+                       embedding,
+                       ts_rank_cd(to_tsvector('simple', chunk_text), to_tsquery('simple', %s)) AS rank
+                FROM public.document_chunks
+                WHERE {where_sql}
+                  AND to_tsvector('simple', chunk_text) @@ to_tsquery('simple', %s)
+                ORDER BY rank DESC, bubble_document_id, page_from, chunk_index
+                LIMIT %s;
+                """,
+                [ASK_SNIPPET_CHARS, ts_query, *params, ts_query, top_k],
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    return [
+        _rich_candidate_from_row(
+            bdid=r[0], chunk_index=r[1], page_from=r[2], page_to=r[3],
+            snippet=r[4], chunk_full=r[5], embedding=r[6], lexical_rank=float(r[7] or 0.0), lexical_match_type="prefix"
+        )
+        for r in rows
+    ]
+
+
+def _fts_search_chunks_rich(
+    company_id: str,
+    machine_id: str,
+    q: str,
+    top_k: int,
+    doc_ids: Optional[list[str]] = None,
+    bubble_document_id: Optional[str] = None,
+) -> list[dict]:
+    q = (q or "").strip()
+    if not q:
+        return []
+
+    conn = _db_conn()
+    try:
+        with conn.cursor() as cur:
+            where = ["company_id = %s"]
+            params: list[Any] = [company_id]
+            if doc_ids:
+                where.append("bubble_document_id = ANY(%s)")
+                params.append(doc_ids)
+            elif bubble_document_id:
+                where.append("bubble_document_id = %s")
+                params.append(bubble_document_id)
+                where.append("(machine_id = %s OR machine_id IS NULL)")
+                params.append(machine_id)
+            else:
+                where.append("(machine_id = %s OR machine_id IS NULL)")
+                params.append(machine_id)
+            where_sql = " AND ".join(where)
+            cur.execute(
+                f"""
+                SELECT bubble_document_id, chunk_index, page_from, page_to,
+                       left(chunk_text, %s) AS snippet,
+                       left(chunk_text, 2000) AS chunk_full,
+                       embedding,
+                       ts_rank_cd(to_tsvector('simple', chunk_text), plainto_tsquery('simple', %s)) AS rank
+                FROM public.document_chunks
+                WHERE {where_sql}
+                  AND to_tsvector('simple', chunk_text) @@ plainto_tsquery('simple', %s)
+                ORDER BY rank DESC, bubble_document_id, page_from, chunk_index
+                LIMIT %s;
+                """,
+                [ASK_SNIPPET_CHARS, q, *params, q, top_k],
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    return [
+        _rich_candidate_from_row(
+            bdid=r[0], chunk_index=r[1], page_from=r[2], page_to=r[3],
+            snippet=r[4], chunk_full=r[5], embedding=r[6], lexical_rank=float(r[7] or 0.0), lexical_match_type="exact"
+        )
+        for r in rows
+    ]
+
+
+def _fts_search_chunks_multi_rich(
+    company_id: str,
+    machine_id: str,
+    queries: list[str],
+    top_k: int,
+    doc_ids: Optional[list[str]] = None,
+    bubble_document_id: Optional[str] = None,
+) -> list[dict]:
+    merged: list[dict] = []
+    for q in _dedup_text_values(queries, limit=max(1, SEMANTIC_MAX_LEXICAL_QUERIES + 2)):
+        merged.extend(
+            _fts_search_chunks_rich(
+                company_id=company_id,
+                machine_id=machine_id,
+                q=q,
+                top_k=top_k,
+                doc_ids=doc_ids,
+                bubble_document_id=bubble_document_id,
+            )
+        )
+    return _dedup_citations_by_snippet(merged, max_items=top_k)
+
+
+def _phrase_search_chunks_multi(
+    company_id: str,
+    machine_id: str,
+    queries: list[str],
+    top_k: int,
+    doc_ids: Optional[list[str]] = None,
+    bubble_document_id: Optional[str] = None,
+) -> list[dict]:
+    if not RETRIEVAL_PHRASE_SEARCH_ENABLED:
+        return []
+
+    phrases = []
+    for q in _dedup_text_values(queries, limit=max(1, SEMANTIC_MAX_LEXICAL_QUERIES + 2)):
+        q_clean = re.sub(r"\s+", " ", _normalize_unicode_advanced(q or "")).strip()
+        if len(q_clean) >= 5:
+            phrases.append(q_clean)
+    if not phrases:
+        return []
+
+    conn = _db_conn()
+    try:
+        with conn.cursor() as cur:
+            where = ["company_id = %s"]
+            params: list[Any] = [company_id]
+            if doc_ids:
+                where.append("bubble_document_id = ANY(%s)")
+                params.append(doc_ids)
+            elif bubble_document_id:
+                where.append("bubble_document_id = %s")
+                params.append(bubble_document_id)
+                where.append("(machine_id = %s OR machine_id IS NULL)")
+                params.append(machine_id)
+            else:
+                where.append("(machine_id = %s OR machine_id IS NULL)")
+                params.append(machine_id)
+            phrase_clauses = []
+            for phrase in phrases:
+                phrase_clauses.append("chunk_text ILIKE %s")
+                params.append(f"%{phrase}%")
+            where_sql = " AND ".join(where + ["(" + " OR ".join(phrase_clauses) + ")"])
+            cur.execute(
+                f"""
+                SELECT bubble_document_id, chunk_index, page_from, page_to,
+                       left(chunk_text, %s) AS snippet,
+                       left(chunk_text, 2000) AS chunk_full,
+                       embedding
+                FROM public.document_chunks
+                WHERE {where_sql}
+                ORDER BY bubble_document_id, page_from, chunk_index
+                LIMIT %s;
+                """,
+                [ASK_SNIPPET_CHARS, *params, top_k],
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    return [
+        _rich_candidate_from_row(
+            bdid=r[0], chunk_index=r[1], page_from=r[2], page_to=r[3],
+            snippet=r[4], chunk_full=r[5], embedding=r[6], lexical_rank=1.0, lexical_match_type="phrase"
+        )
+        for r in rows
+    ]
+
+
+def _blend_lexical_candidates_with_dense(
+    *,
+    dense_candidates: list[dict],
+    lexical_candidates: list[dict],
+    q_vec: Optional[list[float]],
+) -> list[dict]:
+    by_id: dict[str, dict] = {}
+
+    for c in dense_candidates or []:
+        cid = str(c.get("citation_id") or "").strip()
+        if cid:
+            cc = dict(c)
+            cc.setdefault("lexical_match_types", [])
+            cc.setdefault("lexical_rank", 0.0)
+            by_id[cid] = cc
+
+    for idx, c in enumerate(lexical_candidates or []):
+        cid = str(c.get("citation_id") or "").strip()
+        if not cid:
+            continue
+        cc = by_id.get(cid, dict(c))
+        cc.setdefault("snippet", (cc.get("snippet") or c.get("snippet") or "").strip())
+        cc.setdefault("chunk_full", (cc.get("chunk_full") or c.get("chunk_full") or cc.get("snippet") or "").strip())
+        if not cc.get("embedding_list") and c.get("embedding_list"):
+            cc["embedding_list"] = list(c.get("embedding_list") or [])
+        if q_vec and cc.get("embedding_list"):
+            computed_sim = _cosine_sim(q_vec, cc.get("embedding_list") or [])
+            if computed_sim > float(cc.get("similarity", 0.0) or 0.0):
+                cc["similarity"] = float(computed_sim)
+        types = set(str(x).strip() for x in (cc.get("lexical_match_types") or []) if str(x).strip())
+        types.update(str(x).strip() for x in (c.get("lexical_match_types") or []) if str(x).strip())
+        cc["lexical_match_types"] = sorted(types)
+        cc["lexical_rank"] = max(float(cc.get("lexical_rank", 0.0) or 0.0), float(c.get("lexical_rank", 0.0) or 0.0))
+        cc["lexical_rrf_score"] = float(cc.get("lexical_rrf_score", 0.0) or 0.0) + 1.0 / float(50 + idx + 1)
+        by_id[cid] = cc
+
+    out = list(by_id.values())
+    out.sort(key=lambda x: (
+        -float(x.get("similarity", 0.0) or 0.0),
+        -float(x.get("lexical_rrf_score", 0.0) or 0.0),
+        str(x.get("bubble_document_id") or ""),
+        int(x.get("page_from") or 0),
+        int(x.get("page_to") or 0),
+        int(x.get("chunk_index") or 0),
+        str(x.get("citation_id") or ""),
+    ))
+    return out
 
 
 def _content_term_set(text: str, limit: int = 80) -> set[str]:
@@ -2849,6 +3430,65 @@ def _shared_semantic_retrieval(
         debug=debug,
     )
 
+    q_vec = (
+        query_vectors.get(q)
+        or query_vectors.get(str(planner.get("normalized_query") or ""))
+        or next(iter(query_vectors.values()), [])
+    )
+
+    fts_used = False
+    prefix_fts_used = False
+    exact_fts_used = False
+    phrase_fts_used = False
+
+    lexical_candidates: list[dict] = []
+    if RETRIEVAL_V5_ENABLED and (RETRIEVAL_LEXICAL_ALWAYS_BLEND or not candidates or _query_symptom_profile(q).get("classes")):
+        prefix_hits_rich = _fts_search_chunks_prefix_rich(
+            company_id=company_id,
+            machine_id=machine_id,
+            texts=lexical_queries,
+            top_k=max(top_k, RETRIEVAL_FTS_BLEND_TOP_K),
+            doc_ids=doc_ids,
+            bubble_document_id=bubble_document_id,
+        )
+        exact_hits_rich = _fts_search_chunks_multi_rich(
+            company_id=company_id,
+            machine_id=machine_id,
+            queries=lexical_queries,
+            top_k=max(top_k, RETRIEVAL_FTS_BLEND_TOP_K),
+            doc_ids=doc_ids,
+            bubble_document_id=bubble_document_id,
+        )
+        phrase_hits = _phrase_search_chunks_multi(
+            company_id=company_id,
+            machine_id=machine_id,
+            queries=lexical_queries,
+            top_k=max(top_k, RETRIEVAL_PHRASE_BLEND_TOP_K),
+            doc_ids=doc_ids,
+            bubble_document_id=bubble_document_id,
+        )
+        lexical_candidates = _blend_lexical_candidates_with_dense(
+            dense_candidates=[],
+            lexical_candidates=prefix_hits_rich + exact_hits_rich + phrase_hits,
+            q_vec=q_vec,
+        )
+        if prefix_hits_rich:
+            fts_used = True
+            prefix_fts_used = True
+        if exact_hits_rich:
+            fts_used = True
+            exact_fts_used = True
+        if phrase_hits:
+            fts_used = True
+            phrase_fts_used = True
+
+    if lexical_candidates:
+        candidates = _blend_lexical_candidates_with_dense(
+            dense_candidates=candidates,
+            lexical_candidates=lexical_candidates,
+            q_vec=q_vec,
+        )
+
     sim_max = max((float(c.get("similarity", 0.0)) for c in candidates), default=None) if candidates else None
     effective_threshold = _effective_similarity_threshold(
         q,
@@ -2858,9 +3498,6 @@ def _shared_semantic_retrieval(
 
     rerank_used = False
     rerank_error: Optional[str] = None
-    fts_used = False
-    prefix_fts_used = False
-    exact_fts_used = False
 
     selected_citations: list[dict] = []
     cut_candidates: list[dict] = []
@@ -2870,11 +3507,14 @@ def _shared_semantic_retrieval(
 
     if candidates:
         max_rrf = max(float(c.get("rrf_score", 0.0)) for c in candidates) if candidates else 0.0
+        max_lexical_rrf = max(float(c.get("lexical_rrf_score", 0.0) or 0.0) for c in candidates) if candidates else 0.0
         prepared: list[dict] = []
 
         for c in candidates:
             cc = dict(c)
+            cc["source_type"] = str(cc.get("source_type") or _source_type_from_document_id(cc.get("bubble_document_id") or ""))
             rrf_norm = (float(cc.get("rrf_score", 0.0)) / max_rrf) if max_rrf > 0 else 0.0
+            lexical_rrf_norm = (float(cc.get("lexical_rrf_score", 0.0) or 0.0) / max_lexical_rrf) if max_lexical_rrf > 0 else 0.0
             source_bias, source_meta = _candidate_source_bias(
                 cc,
                 query_terms,
@@ -2883,16 +3523,23 @@ def _shared_semantic_retrieval(
             )
             specificity_score = _candidate_specificity_score(cc)
             overlap_score = float(source_meta.get("overlap_score", 0.0))
+            lexical_bonus = _candidate_lexical_bonus(cc) + 0.06 * lexical_rrf_norm
+            symptom_prior, symptom_meta = _symptom_retrieval_role_prior(q, cc)
 
             cc.update(source_meta)
+            cc.update(symptom_meta)
             cc["specificity_score"] = specificity_score
             cc["source_bias"] = source_bias
+            cc["lexical_bonus"] = lexical_bonus
+            cc["symptom_retrieval_prior"] = symptom_prior
             cc["retrieval_score"] = (
-                0.58 * float(cc.get("similarity", 0.0))
-                + 0.17 * rrf_norm
-                + 0.13 * overlap_score
+                0.52 * float(cc.get("similarity", 0.0))
+                + 0.14 * rrf_norm
+                + 0.12 * overlap_score
                 + specificity_score
                 + source_bias
+                + lexical_bonus
+                + symptom_prior
             )
             prepared.append(cc)
 
@@ -2907,23 +3554,24 @@ def _shared_semantic_retrieval(
 
         cut_candidates = []
         for c in prepared:
+            lexical_types = set(str(x).strip().lower() for x in (c.get("lexical_match_types") or []) if str(x).strip())
             if sim_max is None:
                 cut_candidates.append(c)
                 continue
             if (float(sim_max) - float(c.get("similarity", 0.0))) <= sim_delta:
+                cut_candidates.append(c)
+                continue
+            if lexical_types & {"phrase", "exact"} and float(c.get("symptom_retrieval_prior", 0.0) or 0.0) > -0.10:
+                cut_candidates.append(c)
+                continue
+            if float(c.get("lexical_rrf_score", 0.0) or 0.0) > 0.0 and float(c.get("symptom_retrieval_prior", 0.0) or 0.0) >= 0.0:
                 cut_candidates.append(c)
 
         min_keep = min(len(prepared), max(4, top_k))
         if len(cut_candidates) < min_keep:
             cut_candidates = prepared[:min(len(prepared), max(top_k * 3, 12))]
         else:
-            cut_candidates = cut_candidates[:min(len(cut_candidates), max(top_k * 3, 14))]
-
-        q_vec = (
-            query_vectors.get(q)
-            or query_vectors.get(str(planner.get("normalized_query") or ""))
-            or next(iter(query_vectors.values()), [])
-        )
+            cut_candidates = cut_candidates[:min(len(cut_candidates), max(top_k * 3, 16))]
 
         selected_citations = _mmr_select(
             q_vec,
@@ -2965,7 +3613,7 @@ def _shared_semantic_retrieval(
             query_token_count=query_token_count,
         )
 
-    if (sim_max is None or float(sim_max) < effective_threshold) or not selected_citations:
+    if ((sim_max is None or float(sim_max) < effective_threshold) or not selected_citations) and not lexical_candidates:
         prefix_hits = _fts_search_chunks_prefix(
             company_id=company_id,
             machine_id=machine_id,
@@ -3013,6 +3661,7 @@ def _shared_semantic_retrieval(
         "fts_used": fts_used,
         "prefix_fts_used": prefix_fts_used,
         "exact_fts_used": exact_fts_used,
+        "phrase_fts_used": phrase_fts_used,
         "rerank_used": rerank_used,
         "rerank_error": rerank_error[:300] if rerank_error else None,
     }
@@ -5668,7 +6317,14 @@ def _ensure_candidate_retrieval_fields(
             + source_bias
         )
 
+        queryless_role = dict(cc.get("queryless_role") or _queryless_chunk_role_signature(
+            cc.get("chunk_full") or cc.get("snippet") or "",
+            source_type=str(cc.get("source_type") or _source_type_from_document_id(cc.get("bubble_document_id") or "")),
+        ))
         cc.update(source_meta)
+        cc.setdefault("queryless_role", queryless_role)
+        cc.setdefault("role_class_hint", str(queryless_role.get("role_class") or "collateral"))
+        cc.setdefault("role_group_hint", str(queryless_role.get("role_group") or "collateral"))
         cc["specificity_score"] = float(cc.get("specificity_score", specificity_score) or 0.0)
         cc["source_bias"] = float(cc.get("source_bias", source_bias) or 0.0)
         cc["overlap_score"] = float(cc.get("overlap_score", overlap_score) or 0.0)
@@ -7353,9 +8009,16 @@ def index_document(
 
             BATCH_SIZE = 32
             chunk_texts = [c["chunk_text"] for c in chunks]
+            chunk_embed_texts = [
+                _build_chunk_embedding_surrogate(
+                    c["chunk_text"],
+                    source_type=_source_type_from_document_id(bubble_document_id),
+                )
+                for c in chunks
+            ]
 
             for batch_start in range(0, len(chunks), BATCH_SIZE):
-                batch_texts = chunk_texts[batch_start: batch_start + BATCH_SIZE]
+                batch_texts = chunk_embed_texts[batch_start: batch_start + BATCH_SIZE]
 
                 try:
                     vectors = _openai_embed_texts(batch_texts)
