@@ -115,38 +115,6 @@ ROOT_CAUSE_CANDIDATE_ENABLE_ROLE_AWARE_MATRIX = (os.environ.get("MM_ROOT_CAUSE_C
 ASK_CANDIDATE_MATRIX_TOP_K = int(os.environ.get("MM_ASK_CANDIDATE_MATRIX_TOP_K", "7"))
 ASK_CANDIDATE_PROMPT_TOP_K = int(os.environ.get("MM_ASK_CANDIDATE_PROMPT_TOP_K", "6"))
 
-# Responses API / V7 reasoning-first overlay
-OPENAI_RESPONSES_URL = (os.environ.get("OPENAI_RESPONSES_URL") or "https://api.openai.com/v1/responses").strip()
-
-V7_REASONING_ENABLED = (os.environ.get("MM_V7_REASONING_ENABLED") or "1").strip() != "0"
-V7_FORCE_EVALUATE = (os.environ.get("MM_V7_FORCE_EVALUATE") or "0").strip() == "1"
-V7_ASK_ENABLED = (os.environ.get("MM_V7_ASK_ENABLED") or "1").strip() != "0"
-V7_ROOT_CAUSE_ENABLED = (os.environ.get("MM_V7_ROOT_CAUSE_ENABLED") or "1").strip() != "0"
-
-V7_ASK_GENERATOR_MODEL = (os.environ.get("MM_V7_ASK_GENERATOR_MODEL") or "gpt-5.4").strip()
-V7_ASK_VERIFIER_MODEL = (os.environ.get("MM_V7_ASK_VERIFIER_MODEL") or "gpt-5.4-mini").strip()
-V7_ASK_ARBITER_MODEL = (os.environ.get("MM_V7_ASK_ARBITER_MODEL") or "gpt-5.4-mini").strip()
-V7_ROOT_CAUSE_GENERATOR_MODEL = (os.environ.get("MM_V7_ROOT_CAUSE_GENERATOR_MODEL") or "gpt-5.4").strip()
-V7_ROOT_CAUSE_VERIFIER_MODEL = (os.environ.get("MM_V7_ROOT_CAUSE_VERIFIER_MODEL") or "gpt-5.4-mini").strip()
-V7_ROOT_CAUSE_ARBITER_MODEL = (os.environ.get("MM_V7_ROOT_CAUSE_ARBITER_MODEL") or "gpt-5.4-mini").strip()
-
-V7_ASK_GENERATOR_REASONING = (os.environ.get("MM_V7_ASK_GENERATOR_REASONING") or "low").strip()
-V7_ASK_VERIFIER_REASONING = (os.environ.get("MM_V7_ASK_VERIFIER_REASONING") or "minimal").strip()
-V7_ASK_ARBITER_REASONING = (os.environ.get("MM_V7_ASK_ARBITER_REASONING") or "minimal").strip()
-V7_ROOT_CAUSE_GENERATOR_REASONING = (os.environ.get("MM_V7_ROOT_CAUSE_GENERATOR_REASONING") or "medium").strip()
-V7_ROOT_CAUSE_VERIFIER_REASONING = (os.environ.get("MM_V7_ROOT_CAUSE_VERIFIER_REASONING") or "low").strip()
-V7_ROOT_CAUSE_ARBITER_REASONING = (os.environ.get("MM_V7_ROOT_CAUSE_ARBITER_REASONING") or "minimal").strip()
-V7_TEXT_VERBOSITY = (os.environ.get("MM_V7_TEXT_VERBOSITY") or "low").strip()
-V7_TIMEOUT = int(os.environ.get("MM_V7_TIMEOUT_SECONDS", "90"))
-V7_ASK_MIN_PROXY_DELTA = float(os.environ.get("MM_V7_ASK_MIN_PROXY_DELTA", "0.020"))
-V7_ROOT_CAUSE_MIN_PROXY_DELTA = float(os.environ.get("MM_V7_ROOT_CAUSE_MIN_PROXY_DELTA", "0.025"))
-V7_MAX_EVIDENCE_CITATIONS = int(os.environ.get("MM_V7_MAX_EVIDENCE_CITATIONS", "8"))
-V7_EVIDENCE_EXPANSION_RADIUS = int(os.environ.get("MM_V7_EVIDENCE_EXPANSION_RADIUS", "1"))
-V7_ASK_PROXY_SKIP_THRESHOLD = float(os.environ.get("MM_V7_ASK_PROXY_SKIP_THRESHOLD", "0.92"))
-V7_ROOT_PROXY_SKIP_THRESHOLD = float(os.environ.get("MM_V7_ROOT_PROXY_SKIP_THRESHOLD", "0.96"))
-V7_REQUIRE_ARBITER_CANDIDATE = (os.environ.get("MM_V7_REQUIRE_ARBITER_CANDIDATE") or "1").strip() != "0"
-V7_REQUIRE_VERIFIER_SAFETY = (os.environ.get("MM_V7_REQUIRE_VERIFIER_SAFETY") or "1").strip() != "0"
-
 
 # -----------------------------
 # Entity fallback (URL / email / phone)
@@ -4835,254 +4803,6 @@ def _openai_chat_json_models(
     raise Exception("No model candidates available for JSON chat call")
 
 
-def _openai_responses_extract_text(data: dict) -> str:
-    data = dict(data or {})
-    txt = str(data.get("output_text") or "").strip()
-    if txt:
-        return txt
-
-    parts: list[str] = []
-    for item in data.get("output") or []:
-        if not isinstance(item, dict):
-            continue
-        if str(item.get("type") or "") != "message":
-            continue
-        for content in item.get("content") or []:
-            if not isinstance(content, dict):
-                continue
-            if str(content.get("type") or "") == "output_text":
-                part = str(content.get("text") or "")
-                if part:
-                    parts.append(part)
-    return "".join(parts).strip()
-
-
-def _openai_responses_usage_meta(data: dict) -> dict:
-    usage = dict((data or {}).get("usage") or {})
-    output_details = dict(usage.get("output_tokens_details") or {})
-    input_details = dict(usage.get("input_tokens_details") or {})
-    return {
-        "input_tokens": int(usage.get("input_tokens") or 0),
-        "output_tokens": int(usage.get("output_tokens") or 0),
-        "total_tokens": int(usage.get("total_tokens") or 0),
-        "cached_input_tokens": int(input_details.get("cached_tokens") or 0),
-        "reasoning_tokens": int(output_details.get("reasoning_tokens") or 0),
-    }
-
-
-def _openai_responses_create(
-    input_items: list[dict],
-    *,
-    model: str,
-    json_schema: Optional[dict] = None,
-    reasoning_effort: Optional[str] = None,
-    text_verbosity: Optional[str] = None,
-    previous_response_id: Optional[str] = None,
-    timeout: int = 60,
-) -> dict:
-    if not OPENAI_API_KEY:
-        raise Exception("OPENAI_API_KEY missing")
-
-    payload: dict[str, Any] = {
-        "model": str(model or OPENAI_CHAT_MODEL).strip(),
-        "input": input_items or [],
-    }
-
-    if previous_response_id:
-        payload["previous_response_id"] = str(previous_response_id).strip()
-
-    if reasoning_effort:
-        payload["reasoning"] = {"effort": str(reasoning_effort).strip()}
-
-    text_cfg: dict[str, Any] = {}
-    if text_verbosity:
-        text_cfg["verbosity"] = str(text_verbosity).strip()
-    if json_schema:
-        text_cfg["format"] = {
-            "type": "json_schema",
-            "name": str(json_schema.get("name") or "structured_output").strip(),
-            "schema": json_schema.get("schema") or {},
-            "strict": bool(json_schema.get("strict", False)),
-        }
-    if text_cfg:
-        payload["text"] = text_cfg
-
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    r = requests.post(OPENAI_RESPONSES_URL, headers=headers, json=payload, timeout=timeout)
-    if r.status_code != 200:
-        raise Exception(f"OpenAI responses failed: {r.status_code} {r.text}")
-    return r.json()
-
-
-def _openai_responses_json(
-    input_items: list[dict],
-    *,
-    model: str,
-    json_schema: dict,
-    reasoning_effort: Optional[str] = None,
-    text_verbosity: Optional[str] = None,
-    previous_response_id: Optional[str] = None,
-    timeout: int = 60,
-) -> tuple[dict, dict]:
-    data = _openai_responses_create(
-        input_items,
-        model=model,
-        json_schema=json_schema,
-        reasoning_effort=reasoning_effort,
-        text_verbosity=text_verbosity,
-        previous_response_id=previous_response_id,
-        timeout=timeout,
-    )
-    text = _openai_responses_extract_text(data)
-    if not text:
-        raise Exception("OpenAI responses JSON empty response")
-    try:
-        parsed = json.loads(text)
-    except Exception as e:
-        raise Exception(f"OpenAI responses JSON parse failed: {str(e)} | raw={text[:500]}")
-    meta = {
-        "response_id": str(data.get("id") or ""),
-        "model": str(data.get("model") or model or ""),
-        "usage": _openai_responses_usage_meta(data),
-    }
-    return parsed, meta
-
-
-def _v7_compact_citations_for_prompt(citations: list[dict], *, max_items: int = 6, snippet_chars: int = 240) -> list[dict]:
-    out: list[dict] = []
-    seen = set()
-    for c in citations or []:
-        cid = str(c.get("citation_id") or "").strip()
-        if not cid or cid in seen:
-            continue
-        seen.add(cid)
-        out.append(
-            {
-                "citation_id": cid,
-                "page_from": int(c.get("page_from") or 0),
-                "page_to": int(c.get("page_to") or 0),
-                "role_class": str(c.get("role_class") or ""),
-                "role_group": str(c.get("role_group") or ""),
-                "snippet": re.sub(r"\s+", " ", str(c.get("snippet") or c.get("chunk_full") or "").strip())[:snippet_chars],
-            }
-        )
-        if len(out) >= max_items:
-            break
-    return out
-
-
-def _v7_compact_ask_response_for_prompt(resp: dict) -> dict:
-    resp = dict(resp or {})
-    return {
-        "status": str(resp.get("status") or ""),
-        "answer": re.sub(r"\s+", " ", str(resp.get("answer") or "").strip())[:1200],
-        "citations": [str(c.get("citation_id") or "").strip() for c in (resp.get("citations") or []) if c.get("citation_id")][:6],
-        "chat_model": str(resp.get("chat_model") or ""),
-    }
-
-
-def _v7_compact_root_cause_response_for_prompt(resp: dict) -> dict:
-    resp = dict(resp or {})
-    causes = []
-    for c in (resp.get("possible_causes") or [])[:3]:
-        if not isinstance(c, dict):
-            continue
-        causes.append(
-            {
-                "cause": re.sub(r"\s+", " ", str(c.get("cause") or "").strip())[:120],
-                "checks": [re.sub(r"\s+", " ", str(x or "").strip())[:140] for x in (c.get("checks") or [])[:3]],
-                "citations": [str(x or "").strip() for x in (c.get("citations") or [])[:3]],
-            }
-        )
-    return {
-        "status": str(resp.get("status") or ""),
-        "problem_summary": re.sub(r"\s+", " ", str(resp.get("problem_summary") or "").strip())[:400],
-        "possible_causes": causes,
-        "recommended_next_checks": [re.sub(r"\s+", " ", str(x or "").strip())[:160] for x in (resp.get("recommended_next_checks") or [])[:4]],
-        "citations": [str(c.get("citation_id") or "").strip() for c in (resp.get("citations") or []) if c.get("citation_id")][:8],
-        "chat_model": str(resp.get("chat_model") or ""),
-    }
-
-
-def _v7_verifier_schema() -> dict:
-    return {
-        "name": "mm_v7_verifier",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "winner": {"type": "string", "enum": ["stable", "candidate", "tie"]},
-                "stable_is_safe": {"type": "boolean"},
-                "candidate_is_safe": {"type": "boolean"},
-                "must_keep_stable": {"type": "boolean"},
-                "candidate_advantage": {"type": "number"},
-                "reason_codes": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
-                "summary": {"type": "string"},
-            },
-            "required": [
-                "winner",
-                "stable_is_safe",
-                "candidate_is_safe",
-                "must_keep_stable",
-                "candidate_advantage",
-                "reason_codes",
-                "summary",
-            ],
-        },
-    }
-
-
-def _v7_arbiter_schema() -> dict:
-    return {
-        "name": "mm_v7_arbiter",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "winner": {"type": "string", "enum": ["stable", "candidate", "tie"]},
-                "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
-                "must_keep_stable": {"type": "boolean"},
-                "reason_codes": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
-                "summary": {"type": "string"},
-            },
-            "required": ["winner", "confidence", "must_keep_stable", "reason_codes", "summary"],
-        },
-    }
-
-
-def _v7_attach_debug(
-    resp: dict,
-    *,
-    stable_eval: dict,
-    candidate_eval: Optional[dict],
-    verifier: Optional[dict],
-    arbiter: Optional[dict],
-    chosen: str,
-    stages: Optional[dict] = None,
-    candidate_error: Optional[str] = None,
-) -> dict:
-    if not isinstance(resp, dict):
-        return resp
-    debug = dict(resp.get("debug") or {})
-    debug["v7"] = {
-        "chosen": chosen,
-        "stable_proxy": stable_eval,
-        "candidate_proxy": candidate_eval,
-        "verifier": verifier,
-        "arbiter": arbiter,
-        "stages": stages or {},
-        "candidate_error": candidate_error,
-    }
-    resp["debug"] = debug
-    return resp
-
-
 def _llm_rerank_citations(
     q: str,
     candidates: list[dict],
@@ -7964,7 +7684,7 @@ def _ask_v1_baseline_impl(
                 max_causes=2,
                 debug=payload.debug,
             )
-            root_response = _root_cause_v1_v4_current_impl(root_payload, x_ai_internal_secret)
+            root_response = root_cause_v1(root_payload, x_ai_internal_secret)
             bridged = _build_ask_response_from_root_cause_bridge(
                 q=q,
                 company_id=company_id,
@@ -10494,897 +10214,8 @@ def _root_cause_v1_candidate_impl(
     )
 
 
-def _should_attempt_v7_ask(q: str, stable_response: dict) -> bool:
-    if not (V7_REASONING_ENABLED and V7_ASK_ENABLED):
-        return False
-    if V7_FORCE_EVALUATE:
-        return True
-    if _is_lookup_or_identifier_query(q):
-        return False
-
-    stable_eval = _ask_response_proxy_score(q, stable_response)
-    profile = _query_symptom_profile(q)
-    language = _simple_query_language(q)
-
-    if str((stable_response or {}).get("status") or "").strip().lower() != "answered":
-        return True
-    if stable_eval.get("hard_fail"):
-        return True
-    if language == "en":
-        return True
-    if profile.get("generic_symptom") or profile.get("automatic_mode") or bool(profile.get("classes")):
-        return True
-    if float(stable_eval.get("score", 0.0) or 0.0) < V7_ASK_PROXY_SKIP_THRESHOLD:
-        return True
-    if str(stable_eval.get("top_role_group") or "") == "support" and not profile.get("has_support_anchor"):
-        return True
-    return False
-
-
-def _should_attempt_v7_root_cause(q: str, stable_response: dict) -> bool:
-    if not (V7_REASONING_ENABLED and V7_ROOT_CAUSE_ENABLED):
-        return False
-    if V7_FORCE_EVALUATE:
-        return True
-
-    stable_eval = _root_cause_response_proxy_score(q, stable_response)
-    profile = _query_symptom_profile(q)
-    language = _simple_query_language(q)
-
-    if str((stable_response or {}).get("status") or "").strip().lower() != "answered":
-        return True
-    if stable_eval.get("hard_fail"):
-        return True
-    if language == "en":
-        return True
-    if profile.get("generic_symptom") or profile.get("automatic_mode") or bool(profile.get("classes")):
-        return True
-    if float(stable_eval.get("score", 0.0) or 0.0) < V7_ROOT_PROXY_SKIP_THRESHOLD:
-        return True
-    if str(stable_eval.get("top_role_group") or "") == "support" and not profile.get("has_support_anchor"):
-        return True
-    return False
-
-
-def _build_v7_ask_evidence_pack(payload: AskRequest, stable_response: dict) -> dict:
-    q = (payload.query or "").strip()
-    scope = _resolve_query_scope(
-        company_id=payload.company_id,
-        machine_id=payload.machine_id,
-        bubble_document_id=payload.bubble_document_id,
-        document_ids=payload.document_ids,
-    )
-    company_id = scope["company_id"]
-    machine_id = scope["machine_id"]
-    bubble_document_id = scope["bubble_document_id"]
-    doc_ids = scope["document_ids"]
-
-    top_k = int(payload.top_k or 5)
-    top_k = max(1, min(top_k, ASK_MAX_TOP_K))
-    candidate_k = max(top_k, min(80, max(ROOT_CAUSE_EXTRA_CANDIDATE_K, top_k * 10)))
-    response_language = _select_response_language(q)
-    symptom_profile = _query_symptom_profile(q)
-    technical_candidate = bool(symptom_profile.get("classes")) or response_language == "en" or _count_query_tokens(q) >= 4
-
-    base_citations = list((stable_response or {}).get("citations") or [])
-    planner = {
-        "normalized_query": q,
-        "query_language": response_language,
-    }
-    role_summary = _summarize_evidence_roles_for_prompt(
-        q=q,
-        citations=base_citations,
-        max_items=max(ASK_CANDIDATE_PROMPT_TOP_K, top_k),
-    )
-    diagnostic_matrix: dict = {}
-    more_citations: list[dict] = []
-
-    try:
-        if technical_candidate or not base_citations or len(base_citations) < 2:
-            if technical_candidate:
-                retrieval = _diagnostic_evidence_candidate_pipeline(
-                    q=q,
-                    company_id=company_id,
-                    machine_id=machine_id,
-                    candidate_k=candidate_k,
-                    top_k=max(top_k, min(ASK_CANDIDATE_MATRIX_TOP_K, top_k + 1)),
-                    max_causes=2,
-                    doc_ids=doc_ids if isinstance(doc_ids, list) else None,
-                    bubble_document_id=bubble_document_id,
-                    debug=payload.debug,
-                    planner_mode="ask_v7",
-                    base_threshold=min(ASK_SIM_THRESHOLD, ASK_SHORT_QUERY_SIM_THRESHOLD),
-                )
-            else:
-                retrieval = _shared_semantic_retrieval(
-                    q=q,
-                    company_id=company_id,
-                    machine_id=machine_id,
-                    candidate_k=candidate_k,
-                    top_k=top_k,
-                    doc_ids=doc_ids if isinstance(doc_ids, list) else None,
-                    bubble_document_id=bubble_document_id,
-                    debug=payload.debug,
-                    planner_mode="ask",
-                    base_threshold=ASK_SIM_THRESHOLD,
-                    diagnostic_mode=False,
-                )
-                retrieval["role_summary"] = _summarize_evidence_roles_for_prompt(
-                    q=q,
-                    citations=list(retrieval.get("citations") or []),
-                    max_items=max(ASK_CANDIDATE_PROMPT_TOP_K, top_k),
-                )
-            planner = retrieval.get("planner") or planner
-            response_language = _select_response_language(q, planner=planner)
-            role_summary = list(retrieval.get("role_summary") or role_summary)
-            diagnostic_matrix = dict(retrieval.get("diagnostic_matrix") or {})
-            more_citations = list(retrieval.get("prompt_citations") or retrieval.get("citations") or [])
-    except Exception:
-        more_citations = []
-
-    combined = _dedup_citations_by_snippet(
-        list(base_citations or []) + list(more_citations or []),
-        max_items=max(V7_MAX_EVIDENCE_CITATIONS, top_k + 2),
-    )
-    if combined:
-        try:
-            combined = _enrich_ask_prompt_citations(
-                company_id=company_id,
-                citations=combined,
-                max_manual_expansions=2,
-                radius=V7_EVIDENCE_EXPANSION_RADIUS,
-            )
-        except Exception:
-            pass
-        combined = _dedup_citations_by_snippet(
-            combined,
-            max_items=max(V7_MAX_EVIDENCE_CITATIONS, top_k + 2),
-        )
-
-    return {
-        "company_id": company_id,
-        "machine_id": machine_id,
-        "bubble_document_id": bubble_document_id,
-        "document_ids": doc_ids,
-        "planner": planner,
-        "response_language": response_language,
-        "citations": combined,
-        "role_summary": role_summary,
-        "diagnostic_matrix": diagnostic_matrix,
-    }
-
-
-def _build_v7_root_cause_evidence_pack(payload: RootCauseRequest, stable_response: dict) -> dict:
-    q = (payload.query or "").strip()
-    scope = _resolve_query_scope(
-        company_id=payload.company_id,
-        machine_id=payload.machine_id,
-        bubble_document_id=payload.bubble_document_id,
-        document_ids=payload.document_ids,
-    )
-    company_id = scope["company_id"]
-    machine_id = scope["machine_id"]
-    bubble_document_id = scope["bubble_document_id"]
-    doc_ids = scope["document_ids"]
-
-    top_k = int(payload.top_k or 8)
-    top_k = max(1, min(top_k, ASK_MAX_TOP_K))
-    max_causes = max(1, min(int(payload.max_causes or 3), 3))
-    candidate_k = max(top_k, min(90, max(ROOT_CAUSE_EXTRA_CANDIDATE_K, top_k * 11)))
-
-    base_citations = list((stable_response or {}).get("citations") or [])
-    planner = {"normalized_query": q, "query_language": _select_response_language(q)}
-    retrieval = {
-        "planner": planner,
-        "citations": list(base_citations),
-        "prompt_citations": list(base_citations),
-        "role_summary": _summarize_evidence_roles_for_prompt(
-            q=q,
-            citations=base_citations,
-            max_items=max(ROOT_CAUSE_CANDIDATE_PROMPT_TOP_K, top_k),
-        ),
-        "diagnostic_matrix": {},
-        "similarity_max": (stable_response or {}).get("similarity_max"),
-    }
-
-    try:
-        retrieval = _diagnostic_evidence_candidate_pipeline(
-            q=q,
-            company_id=company_id,
-            machine_id=machine_id,
-            candidate_k=candidate_k,
-            top_k=top_k,
-            max_causes=max_causes,
-            doc_ids=doc_ids if isinstance(doc_ids, list) else None,
-            bubble_document_id=bubble_document_id,
-            debug=payload.debug,
-            planner_mode="root_cause_v7",
-            base_threshold=ASK_SIM_THRESHOLD,
-        )
-    except Exception:
-        retrieval = dict(retrieval)
-
-    planner = retrieval.get("planner") or planner
-    response_language = _select_response_language(q, planner=planner)
-    prompt_citations = list(retrieval.get("prompt_citations") or retrieval.get("citations") or base_citations)
-    citations = list(retrieval.get("citations") or base_citations)
-
-    prompt_citations = _dedup_citations_by_snippet(
-        list(base_citations or []) + list(prompt_citations or []),
-        max_items=max(V7_MAX_EVIDENCE_CITATIONS, top_k + 2),
-    )
-    citations = _dedup_citations_by_snippet(
-        list(base_citations or []) + list(citations or []),
-        max_items=max(ROOT_CAUSE_MAX_EVIDENCE_POOL, top_k + 3),
-    )
-
-    return {
-        "company_id": company_id,
-        "machine_id": machine_id,
-        "bubble_document_id": bubble_document_id,
-        "document_ids": doc_ids,
-        "planner": planner,
-        "response_language": response_language,
-        "top_k": top_k,
-        "max_causes": max_causes,
-        "similarity_max": retrieval.get("similarity_max"),
-        "citations": citations,
-        "prompt_citations": prompt_citations,
-        "role_summary": list(retrieval.get("role_summary") or []),
-        "diagnostic_matrix": dict(retrieval.get("diagnostic_matrix") or {}),
-        "retrieval": retrieval,
-    }
-
-
-def _generate_v7_ask_candidate(payload: AskRequest, stable_response: dict) -> tuple[dict, dict]:
-    q = (payload.query or "").strip()
-    pack = _build_v7_ask_evidence_pack(payload, stable_response)
-    citations = list(pack.get("citations") or [])
-    response_language = str(pack.get("response_language") or _select_response_language(q)).strip().lower()
-    planner = dict(pack.get("planner") or {})
-
-    if not citations:
-        return (
-            {
-                "ok": True,
-                "status": "no_sources",
-                "answer": _localized_no_sources(response_language),
-                "citations": [],
-                "rg_links": [],
-                "top_k": int(payload.top_k or 5),
-                "similarity_max": (stable_response or {}).get("similarity_max"),
-                "chat_model": V7_ASK_GENERATOR_MODEL,
-            },
-            {"stage": "candidate", "skipped": "no_citations"},
-        )
-
-    sources_block = _build_sources_block_from_citations(
-        citations,
-        max_context_chars=ASK_MAX_CONTEXT_CHARS,
-        prefer_chunk_full=True,
-    )
-
-    system_msg = (
-        "You are MachineMind's v7 ask reasoning layer for technical machinery documentation. "
-        "Use ONLY the provided sources, evidence-role summary, and diagnostic matrix. "
-        "Be direct, short, and grounded. Prefer core causal evidence over collateral or support-only evidence for generic symptoms. "
-        "If the documents do not state the answer directly, say that briefly and then report the closest grounded evidence. "
-        "Never invent details. Always answer in the requested language. Return valid JSON only."
-    )
-    user_msg = (
-        f"QUESTION:\n{q}\n\n"
-        f"NORMALIZED_QUESTION:\n{planner.get('normalized_query') or q}\n\n"
-        f"RESPONSE_LANGUAGE:\n{response_language}\n\n"
-        f"ROLE_AWARE_EVIDENCE_JSON:\n{json.dumps(pack.get('role_summary') or [], ensure_ascii=False)}\n\n"
-        f"DIAGNOSTIC_EVIDENCE_MATRIX_JSON:\n{json.dumps(pack.get('diagnostic_matrix') or {}, ensure_ascii=False)}\n\n"
-        f"SOURCES:\n{sources_block}\n\n"
-        "Return valid JSON. Use only citation ids present in the sources."
-    )
-
-    parsed, meta = _openai_responses_json(
-        [
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": user_msg},
-        ],
-        model=V7_ASK_GENERATOR_MODEL,
-        json_schema=_ask_response_schema(),
-        reasoning_effort=V7_ASK_GENERATOR_REASONING,
-        text_verbosity=V7_TEXT_VERBOSITY,
-        timeout=V7_TIMEOUT,
-    )
-
-    answer_status = str((parsed or {}).get("answer_status") or "").strip().lower()
-    grounded_points = list((parsed or {}).get("grounded_points") or [])
-    answer, final_citations = _render_grounded_answer_points(grounded_points, citations, max_points=3)
-
-    if answer_status != "answered" or not answer or not final_citations:
-        return (
-            {
-                "ok": True,
-                "status": "no_sources",
-                "answer": _localized_no_sources(response_language),
-                "citations": [],
-                "rg_links": [],
-                "top_k": int(payload.top_k or 5),
-                "similarity_max": (stable_response or {}).get("similarity_max"),
-                "chat_model": V7_ASK_GENERATOR_MODEL,
-            },
-            {
-                "stage": "candidate",
-                "response_id": meta.get("response_id"),
-                "model": meta.get("model"),
-                "usage": meta.get("usage"),
-                "pack": {
-                    "planner": planner,
-                    "role_summary": pack.get("role_summary") or [],
-                    "diagnostic_matrix": pack.get("diagnostic_matrix") or {},
-                    "citations": _v7_compact_citations_for_prompt(citations, max_items=6),
-                },
-            },
-        )
-
-    if not _looks_like_target_language(answer, response_language):
-        answer = _translate_text_preserving_citations(answer, response_language)
-
-    response_citations = _sanitize_citations_for_response(final_citations)
-    rg_links = []
-    try:
-        rg_links = _build_rg_links(pack["company_id"], response_citations)
-    except Exception:
-        rg_links = []
-
-    return (
-        {
-            "ok": True,
-            "status": "answered",
-            "answer": answer,
-            "citations": response_citations,
-            "rg_links": rg_links,
-            "top_k": int(payload.top_k or 5),
-            "similarity_max": (stable_response or {}).get("similarity_max"),
-            "chat_model": V7_ASK_GENERATOR_MODEL,
-        },
-        {
-            "stage": "candidate",
-            "response_id": meta.get("response_id"),
-            "model": meta.get("model"),
-            "usage": meta.get("usage"),
-            "pack": {
-                "planner": planner,
-                "role_summary": pack.get("role_summary") or [],
-                "diagnostic_matrix": pack.get("diagnostic_matrix") or {},
-                "citations": _v7_compact_citations_for_prompt(citations, max_items=6),
-            },
-        },
-    )
-
-
-def _generate_v7_root_cause_candidate(payload: RootCauseRequest, stable_response: dict) -> tuple[dict, dict]:
-    q = (payload.query or "").strip()
-    pack = _build_v7_root_cause_evidence_pack(payload, stable_response)
-    citations = list(pack.get("citations") or [])
-    prompt_citations = list(pack.get("prompt_citations") or citations)
-    planner = dict(pack.get("planner") or {})
-    response_language = str(pack.get("response_language") or _select_response_language(q)).strip().lower()
-    max_causes = int(pack.get("max_causes") or 3)
-    top_k = int(pack.get("top_k") or payload.top_k or 8)
-    matrix = dict(pack.get("diagnostic_matrix") or {})
-    role_summary = list(pack.get("role_summary") or [])
-
-    if not citations:
-        return (
-            {
-                "ok": True,
-                "status": "no_sources",
-                "symptom": q,
-                "problem_summary": "",
-                "possible_causes": [],
-                "recommended_next_checks": [],
-                "citations": [],
-                "rg_links": [],
-                "top_k": top_k,
-                "similarity_max": pack.get("similarity_max"),
-                "chat_model": V7_ROOT_CAUSE_GENERATOR_MODEL,
-            },
-            {"stage": "candidate", "skipped": "no_citations"},
-        )
-
-    sources_block = _build_sources_block_from_citations(
-        prompt_citations,
-        max_context_chars=ASK_MAX_CONTEXT_CHARS,
-        prefer_chunk_full=True,
-    )
-
-    system_msg = (
-        "You are MachineMind's v7 root-cause reasoning layer for technical machinery documentation. "
-        "Use ONLY the provided sources, evidence-role summary, and evidence matrix. "
-        "Distinguish causal evidence from collateral evidence. Prefer grounded, causal, specific hypotheses over generic or support-only explanations. "
-        "For generic symptoms like vibration, noise, and jams, do not center lubrication, startup/install, or safety unless the evidence explicitly anchors them. "
-        "For no-start and automatic-mode failures, electrical, interlock, consent, mode, and control evidence may be primary when supported. "
-        "Return fewer causes rather than weak generic ones. Always answer in the user's language. Return valid JSON only."
-    )
-    user_msg = (
-        f"USER_PROBLEM:\n{q}\n\n"
-        f"NORMALIZED_PROBLEM:\n{planner.get('normalized_query') or q}\n\n"
-        f"RESPONSE_LANGUAGE:\n{response_language}\n\n"
-        f"ROLE_AWARE_EVIDENCE_JSON:\n{json.dumps(role_summary, ensure_ascii=False)}\n\n"
-        f"DIAGNOSTIC_EVIDENCE_MATRIX_JSON:\n{json.dumps(matrix, ensure_ascii=False)}\n\n"
-        f"SOURCES:\n{sources_block}\n\n"
-        "Return valid JSON. Use only citation_id values present in the sources."
-    )
-
-    parsed, meta = _openai_responses_json(
-        [
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": user_msg},
-        ],
-        model=V7_ROOT_CAUSE_GENERATOR_MODEL,
-        json_schema=_root_cause_response_schema(max_causes=max_causes),
-        reasoning_effort=V7_ROOT_CAUSE_GENERATOR_REASONING,
-        text_verbosity=V7_TEXT_VERBOSITY,
-        timeout=V7_TIMEOUT,
-    )
-
-    if not (parsed or {}).get("possible_causes") and matrix:
-        parsed = _fallback_root_cause_result_from_matrix(
-            q=planner.get("normalized_query") or q,
-            matrix=matrix,
-            citations=citations,
-            max_causes=max_causes,
-            response_language=response_language,
-        )
-
-    grounded_result, grounded_citations = _ground_root_cause_result(
-        result=parsed,
-        citations=citations,
-        max_causes=max_causes,
-    )
-    grounded_result, grounded_citations = _compact_root_cause_result_citations_by_family(
-        result=grounded_result,
-        citations=grounded_citations,
-        max_per_cause=2,
-    )
-    grounded_result = _canonicalize_root_cause_labels(
-        grounded_result,
-        grounded_citations,
-        language=response_language,
-    )
-    grounded_result, grounded_citations = _lock_root_cause_result(
-        grounded_result,
-        grounded_citations,
-        max_causes=max_causes,
-    )
-    grounded_result, grounded_citations = _enforce_diverse_root_cause_hypotheses(
-        q=q,
-        result=grounded_result,
-        citations=grounded_citations,
-        retrieval=pack.get("retrieval") or {},
-        max_causes=max_causes,
-        response_language=response_language,
-    )
-    grounded_result = _canonicalize_root_cause_labels(
-        grounded_result,
-        grounded_citations,
-        language=response_language,
-    )
-
-    if not grounded_result.get("problem_summary"):
-        grounded_result["problem_summary"] = planner.get("normalized_query") or q
-
-    if not grounded_result.get("possible_causes"):
-        return (
-            {
-                "ok": True,
-                "status": "no_sources",
-                "symptom": q,
-                "problem_summary": grounded_result.get("problem_summary") or "",
-                "possible_causes": [],
-                "recommended_next_checks": [],
-                "citations": [],
-                "rg_links": [],
-                "top_k": top_k,
-                "similarity_max": pack.get("similarity_max"),
-                "chat_model": V7_ROOT_CAUSE_GENERATOR_MODEL,
-            },
-            {
-                "stage": "candidate",
-                "response_id": meta.get("response_id"),
-                "model": meta.get("model"),
-                "usage": meta.get("usage"),
-                "pack": {
-                    "planner": planner,
-                    "role_summary": role_summary,
-                    "diagnostic_matrix": matrix,
-                    "citations": _v7_compact_citations_for_prompt(prompt_citations, max_items=7),
-                },
-            },
-        )
-
-    response_citations = _sanitize_citations_for_response(grounded_citations)
-    rg_links = []
-    try:
-        rg_links = _build_rg_links(pack["company_id"], response_citations)
-    except Exception:
-        rg_links = []
-
-    return (
-        {
-            "ok": True,
-            "status": "answered",
-            "symptom": q,
-            "problem_summary": grounded_result.get("problem_summary") or q,
-            "possible_causes": grounded_result.get("possible_causes") or [],
-            "recommended_next_checks": grounded_result.get("recommended_next_checks") or [],
-            "citations": response_citations,
-            "rg_links": rg_links,
-            "top_k": top_k,
-            "similarity_max": pack.get("similarity_max"),
-            "chat_model": V7_ROOT_CAUSE_GENERATOR_MODEL,
-        },
-        {
-            "stage": "candidate",
-            "response_id": meta.get("response_id"),
-            "model": meta.get("model"),
-            "usage": meta.get("usage"),
-            "pack": {
-                "planner": planner,
-                "role_summary": role_summary,
-                "diagnostic_matrix": matrix,
-                "citations": _v7_compact_citations_for_prompt(prompt_citations, max_items=7),
-            },
-        },
-    )
-
-
-def _run_v7_verifier(
-    *,
-    kind: str,
-    q: str,
-    stable_response: dict,
-    candidate_response: dict,
-    stable_eval: dict,
-    candidate_eval: dict,
-    previous_response_id: Optional[str],
-) -> tuple[dict, dict]:
-    if kind == "ask":
-        model = V7_ASK_VERIFIER_MODEL
-        reasoning = V7_ASK_VERIFIER_REASONING
-        stable_compact = _v7_compact_ask_response_for_prompt(stable_response)
-        candidate_compact = _v7_compact_ask_response_for_prompt(candidate_response)
-        system_msg = (
-            "You are a strict verifier for MachineMind ask responses. "
-            "Compare the stable v4 response and the candidate v7 response against the evidence already in context. "
-            "Prefer the response that is more grounded, more direct, more diagnostically useful, and less likely to overreach. "
-            "Be conservative: if the advantage is unclear, keep stable. Return valid JSON only."
-        )
-    else:
-        model = V7_ROOT_CAUSE_VERIFIER_MODEL
-        reasoning = V7_ROOT_CAUSE_VERIFIER_REASONING
-        stable_compact = _v7_compact_root_cause_response_for_prompt(stable_response)
-        candidate_compact = _v7_compact_root_cause_response_for_prompt(candidate_response)
-        system_msg = (
-            "You are a strict verifier for MachineMind root-cause responses. "
-            "Compare the stable v4 response and the candidate v7 response against the evidence already in context. "
-            "Prefer the response that is more causally grounded, more specific, more diagnostically useful, and less likely to overreach. "
-            "Be conservative: if the advantage is unclear, keep stable. Return valid JSON only."
-        )
-
-    user_msg = (
-        f"QUESTION_OR_SYMPTOM:\n{q}\n\n"
-        f"STABLE_RESPONSE_JSON:\n{json.dumps(stable_compact, ensure_ascii=False)}\n\n"
-        f"CANDIDATE_RESPONSE_JSON:\n{json.dumps(candidate_compact, ensure_ascii=False)}\n\n"
-        f"STABLE_PROXY_JSON:\n{json.dumps(stable_eval, ensure_ascii=False)}\n\n"
-        f"CANDIDATE_PROXY_JSON:\n{json.dumps(candidate_eval, ensure_ascii=False)}\n\n"
-        "Return valid JSON."
-    )
-
-    parsed, meta = _openai_responses_json(
-        [
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": user_msg},
-        ],
-        model=model,
-        json_schema=_v7_verifier_schema(),
-        reasoning_effort=reasoning,
-        text_verbosity=V7_TEXT_VERBOSITY,
-        previous_response_id=previous_response_id,
-        timeout=V7_TIMEOUT,
-    )
-    return parsed, {
-        "stage": "verifier",
-        "response_id": meta.get("response_id"),
-        "model": meta.get("model"),
-        "usage": meta.get("usage"),
-    }
-
-
-def _run_v7_arbiter(
-    *,
-    kind: str,
-    q: str,
-    stable_response: dict,
-    candidate_response: dict,
-    stable_eval: dict,
-    candidate_eval: dict,
-    verifier: dict,
-    previous_response_id: Optional[str],
-) -> tuple[dict, dict]:
-    if kind == "ask":
-        model = V7_ASK_ARBITER_MODEL
-        reasoning = V7_ASK_ARBITER_REASONING
-        stable_compact = _v7_compact_ask_response_for_prompt(stable_response)
-        candidate_compact = _v7_compact_ask_response_for_prompt(candidate_response)
-        system_msg = (
-            "You are the final arbiter for MachineMind ask responses. "
-            "Choose the candidate only if it is clearly better and equally safe. "
-            "If the case is close, keep stable. Return valid JSON only."
-        )
-    else:
-        model = V7_ROOT_CAUSE_ARBITER_MODEL
-        reasoning = V7_ROOT_CAUSE_ARBITER_REASONING
-        stable_compact = _v7_compact_root_cause_response_for_prompt(stable_response)
-        candidate_compact = _v7_compact_root_cause_response_for_prompt(candidate_response)
-        system_msg = (
-            "You are the final arbiter for MachineMind root-cause responses. "
-            "Choose the candidate only if it is clearly better and equally safe. "
-            "If the case is close, keep stable. Return valid JSON only."
-        )
-
-    user_msg = (
-        f"QUESTION_OR_SYMPTOM:\n{q}\n\n"
-        f"VERIFIER_JSON:\n{json.dumps(verifier or {}, ensure_ascii=False)}\n\n"
-        f"STABLE_PROXY_JSON:\n{json.dumps(stable_eval, ensure_ascii=False)}\n\n"
-        f"CANDIDATE_PROXY_JSON:\n{json.dumps(candidate_eval, ensure_ascii=False)}\n\n"
-        f"STABLE_RESPONSE_JSON:\n{json.dumps(stable_compact, ensure_ascii=False)}\n\n"
-        f"CANDIDATE_RESPONSE_JSON:\n{json.dumps(candidate_compact, ensure_ascii=False)}\n\n"
-        "Return valid JSON."
-    )
-
-    parsed, meta = _openai_responses_json(
-        [
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": user_msg},
-        ],
-        model=model,
-        json_schema=_v7_arbiter_schema(),
-        reasoning_effort=reasoning,
-        text_verbosity=V7_TEXT_VERBOSITY,
-        previous_response_id=previous_response_id,
-        timeout=V7_TIMEOUT,
-    )
-    return parsed, {
-        "stage": "arbiter",
-        "response_id": meta.get("response_id"),
-        "model": meta.get("model"),
-        "usage": meta.get("usage"),
-    }
-
-
-def _choose_v7_ask_response(
-    q: str,
-    stable_response: dict,
-    candidate_response: Optional[dict],
-    *,
-    verifier: Optional[dict],
-    arbiter: Optional[dict],
-    debug: bool,
-    stages: Optional[dict] = None,
-    candidate_error: Optional[str] = None,
-) -> dict:
-    stable_eval = _ask_response_proxy_score(q, stable_response)
-    candidate_eval = _ask_response_proxy_score(q, candidate_response or {}) if candidate_response else None
-
-    chosen = stable_response
-    chosen_name = "stable"
-
-    if candidate_response and candidate_eval and not candidate_eval.get("hard_fail"):
-        stable_score = float(stable_eval.get("score", 0.0) or 0.0)
-        candidate_score = float(candidate_eval.get("score", 0.0) or 0.0)
-        verifier_ok = True
-        if V7_REQUIRE_VERIFIER_SAFETY:
-            verifier_ok = bool((verifier or {}).get("candidate_is_safe", False))
-        arbiter_ok = str((arbiter or {}).get("winner") or "").strip().lower() == "candidate"
-        if not V7_REQUIRE_ARBITER_CANDIDATE:
-            arbiter_ok = arbiter_ok or str((verifier or {}).get("winner") or "").strip().lower() == "candidate"
-
-        if (
-            arbiter_ok
-            and verifier_ok
-            and not bool((arbiter or {}).get("must_keep_stable"))
-            and (
-                candidate_score > stable_score + V7_ASK_MIN_PROXY_DELTA
-                or stable_eval.get("hard_fail")
-                or str((stable_response or {}).get("status") or "").strip().lower() != "answered"
-            )
-        ):
-            chosen = candidate_response
-            chosen_name = "candidate"
-
-    if debug:
-        chosen = _v7_attach_debug(
-            chosen,
-            stable_eval=stable_eval,
-            candidate_eval=candidate_eval,
-            verifier=verifier,
-            arbiter=arbiter,
-            chosen=chosen_name,
-            stages=stages,
-            candidate_error=candidate_error,
-        )
-    return chosen
-
-
-def _choose_v7_root_cause_response(
-    q: str,
-    stable_response: dict,
-    candidate_response: Optional[dict],
-    *,
-    verifier: Optional[dict],
-    arbiter: Optional[dict],
-    debug: bool,
-    stages: Optional[dict] = None,
-    candidate_error: Optional[str] = None,
-) -> dict:
-    stable_eval = _root_cause_response_proxy_score(q, stable_response)
-    candidate_eval = _root_cause_response_proxy_score(q, candidate_response or {}) if candidate_response else None
-
-    chosen = stable_response
-    chosen_name = "stable"
-
-    if candidate_response and candidate_eval and not candidate_eval.get("hard_fail"):
-        stable_score = float(stable_eval.get("score", 0.0) or 0.0)
-        candidate_score = float(candidate_eval.get("score", 0.0) or 0.0)
-        verifier_ok = True
-        if V7_REQUIRE_VERIFIER_SAFETY:
-            verifier_ok = bool((verifier or {}).get("candidate_is_safe", False))
-        arbiter_ok = str((arbiter or {}).get("winner") or "").strip().lower() == "candidate"
-        if not V7_REQUIRE_ARBITER_CANDIDATE:
-            arbiter_ok = arbiter_ok or str((verifier or {}).get("winner") or "").strip().lower() == "candidate"
-
-        if (
-            arbiter_ok
-            and verifier_ok
-            and not bool((arbiter or {}).get("must_keep_stable"))
-            and (
-                candidate_score > stable_score + V7_ROOT_CAUSE_MIN_PROXY_DELTA
-                or stable_eval.get("hard_fail")
-                or str((stable_response or {}).get("status") or "").strip().lower() != "answered"
-            )
-        ):
-            chosen = candidate_response
-            chosen_name = "candidate"
-
-    if debug:
-        chosen = _v7_attach_debug(
-            chosen,
-            stable_eval=stable_eval,
-            candidate_eval=candidate_eval,
-            verifier=verifier,
-            arbiter=arbiter,
-            chosen=chosen_name,
-            stages=stages,
-            candidate_error=candidate_error,
-        )
-    return chosen
-
-
-def _ask_v1_reasoning_first_impl(
-    payload: AskRequest,
-    x_ai_internal_secret: Optional[str] = Header(default=None),
-):
-    stable_response = _ask_v1_v4_current_impl(payload, x_ai_internal_secret)
-    if not _should_attempt_v7_ask(payload.query or "", stable_response):
-        return _strip_internal_response_artifacts(stable_response)
-
-    candidate_response = None
-    candidate_error = None
-    verifier = None
-    arbiter = None
-    stages: dict = {}
-
-    try:
-        candidate_response, candidate_stage = _generate_v7_ask_candidate(payload, stable_response)
-        stages["candidate"] = candidate_stage
-        stable_eval = _ask_response_proxy_score(payload.query or "", stable_response)
-        candidate_eval = _ask_response_proxy_score(payload.query or "", candidate_response or {}) if candidate_response else None
-        if candidate_response and candidate_eval:
-            verifier, verifier_stage = _run_v7_verifier(
-                kind="ask",
-                q=payload.query or "",
-                stable_response=stable_response,
-                candidate_response=candidate_response,
-                stable_eval=stable_eval,
-                candidate_eval=candidate_eval,
-                previous_response_id=(candidate_stage or {}).get("response_id"),
-            )
-            stages["verifier"] = verifier_stage
-            arbiter, arbiter_stage = _run_v7_arbiter(
-                kind="ask",
-                q=payload.query or "",
-                stable_response=stable_response,
-                candidate_response=candidate_response,
-                stable_eval=stable_eval,
-                candidate_eval=candidate_eval,
-                verifier=verifier,
-                previous_response_id=(verifier_stage or {}).get("response_id") or (candidate_stage or {}).get("response_id"),
-            )
-            stages["arbiter"] = arbiter_stage
-    except Exception as e:
-        candidate_error = str(e)
-        candidate_response = None
-
-    chosen = _choose_v7_ask_response(
-        payload.query or "",
-        stable_response,
-        candidate_response,
-        verifier=verifier,
-        arbiter=arbiter,
-        debug=bool(payload.debug),
-        stages=stages,
-        candidate_error=candidate_error,
-    )
-    return _strip_internal_response_artifacts(chosen)
-
-
-def _root_cause_v1_reasoning_first_impl(
-    payload: RootCauseRequest,
-    x_ai_internal_secret: Optional[str] = Header(default=None),
-):
-    stable_response = _root_cause_v1_v4_current_impl(payload, x_ai_internal_secret)
-    if not _should_attempt_v7_root_cause(payload.query or "", stable_response):
-        return _strip_internal_response_artifacts(stable_response)
-
-    candidate_response = None
-    candidate_error = None
-    verifier = None
-    arbiter = None
-    stages: dict = {}
-
-    try:
-        candidate_response, candidate_stage = _generate_v7_root_cause_candidate(payload, stable_response)
-        stages["candidate"] = candidate_stage
-        stable_eval = _root_cause_response_proxy_score(payload.query or "", stable_response)
-        candidate_eval = _root_cause_response_proxy_score(payload.query or "", candidate_response or {}) if candidate_response else None
-        if candidate_response and candidate_eval:
-            verifier, verifier_stage = _run_v7_verifier(
-                kind="root_cause",
-                q=payload.query or "",
-                stable_response=stable_response,
-                candidate_response=candidate_response,
-                stable_eval=stable_eval,
-                candidate_eval=candidate_eval,
-                previous_response_id=(candidate_stage or {}).get("response_id"),
-            )
-            stages["verifier"] = verifier_stage
-            arbiter, arbiter_stage = _run_v7_arbiter(
-                kind="root_cause",
-                q=payload.query or "",
-                stable_response=stable_response,
-                candidate_response=candidate_response,
-                stable_eval=stable_eval,
-                candidate_eval=candidate_eval,
-                verifier=verifier,
-                previous_response_id=(verifier_stage or {}).get("response_id") or (candidate_stage or {}).get("response_id"),
-            )
-            stages["arbiter"] = arbiter_stage
-    except Exception as e:
-        candidate_error = str(e)
-        candidate_response = None
-
-    chosen = _choose_v7_root_cause_response(
-        payload.query or "",
-        stable_response,
-        candidate_response,
-        verifier=verifier,
-        arbiter=arbiter,
-        debug=bool(payload.debug),
-        stages=stages,
-        candidate_error=candidate_error,
-    )
-    return _strip_internal_response_artifacts(chosen)
-
-
-def _ask_v1_v4_current_impl(
+@app.post("/v1/ai/ask")
+def ask_v1(
     payload: AskRequest,
     x_ai_internal_secret: Optional[str] = Header(default=None),
 ):
@@ -11421,7 +10252,8 @@ def _ask_v1_v4_current_impl(
     return _strip_internal_response_artifacts(chosen)
 
 
-def _root_cause_v1_v4_current_impl(
+@app.post("/v1/ai/root-cause")
+def root_cause_v1(
     payload: RootCauseRequest,
     x_ai_internal_secret: Optional[str] = Header(default=None),
 ):
@@ -11456,26 +10288,6 @@ def _root_cause_v1_v4_current_impl(
         )
 
     return _strip_internal_response_artifacts(chosen)
-
-
-@app.post("/v1/ai/ask")
-def ask_v1(
-    payload: AskRequest,
-    x_ai_internal_secret: Optional[str] = Header(default=None),
-):
-    if V7_REASONING_ENABLED and V7_ASK_ENABLED:
-        return _ask_v1_reasoning_first_impl(payload, x_ai_internal_secret)
-    return _ask_v1_v4_current_impl(payload, x_ai_internal_secret)
-
-
-@app.post("/v1/ai/root-cause")
-def root_cause_v1(
-    payload: RootCauseRequest,
-    x_ai_internal_secret: Optional[str] = Header(default=None),
-):
-    if V7_REASONING_ENABLED and V7_ROOT_CAUSE_ENABLED:
-        return _root_cause_v1_reasoning_first_impl(payload, x_ai_internal_secret)
-    return _root_cause_v1_v4_current_impl(payload, x_ai_internal_secret)
 
 
 @app.post("/v1/ai/delete/document")
@@ -11538,3 +10350,266 @@ def delete_document_v1(
             "document_files": int(deleted_files),
         },
     }
+
+# Commit: feat(v8): preserve v4 hot paths and add opt-in shadow reasoning endpoints
+V8_SHADOW_REASONING_ENABLED = (os.environ.get("MM_V8_SHADOW_REASONING_ENABLED") or "1").strip() != "0"
+V8_SHADOW_ASK_ENABLED = (os.environ.get("MM_V8_SHADOW_ASK_ENABLED") or "1").strip() != "0"
+V8_SHADOW_ROOT_CAUSE_ENABLED = (os.environ.get("MM_V8_SHADOW_ROOT_CAUSE_ENABLED") or "1").strip() != "0"
+V8_SHADOW_MODEL = (os.environ.get("MM_V8_SHADOW_MODEL") or DIAGNOSTIC_EVIDENCE_MODEL or OPENAI_CHAT_MODEL).strip()
+V8_SHADOW_TIMEOUT = int(os.environ.get("MM_V8_SHADOW_TIMEOUT_SECONDS", "20"))
+V8_SHADOW_MAX_CITATIONS = int(os.environ.get("MM_V8_SHADOW_MAX_CITATIONS", "4"))
+V8_SHADOW_MIN_ASK_PROXY = float(os.environ.get("MM_V8_SHADOW_MIN_ASK_PROXY", "0.78"))
+V8_SHADOW_MIN_ROOT_PROXY = float(os.environ.get("MM_V8_SHADOW_MIN_ROOT_PROXY", "0.86"))
+V8_SHADOW_MAX_CAUSES = int(os.environ.get("MM_V8_SHADOW_MAX_CAUSES", "3"))
+
+
+def _v8_shadow_compact_citations(citations: list[dict], *, max_items: int = 4, snippet_chars: int = 220) -> list[dict]:
+    out: list[dict] = []
+    seen = set()
+    for c in citations or []:
+        cid = str(c.get("citation_id") or "").strip()
+        if not cid or cid in seen:
+            continue
+        seen.add(cid)
+        out.append(
+            {
+                "citation_id": cid,
+                "page_from": int(c.get("page_from") or 0),
+                "page_to": int(c.get("page_to") or 0),
+                "snippet": re.sub(r"\s+", " ", str(c.get("snippet") or c.get("chunk_full") or "").strip())[:snippet_chars],
+            }
+        )
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def _v8_shadow_ask_schema() -> dict:
+    return {
+        "name": "mm_v8_shadow_ask",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
+                "grounded_brief": {"type": "string"},
+                "evidence_map": {
+                    "type": "array",
+                    "maxItems": V8_SHADOW_MAX_CITATIONS,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "citation_id": {"type": "string"},
+                            "why_it_matters": {"type": "string"},
+                        },
+                        "required": ["citation_id", "why_it_matters"],
+                    },
+                },
+            },
+            "required": ["confidence", "grounded_brief", "evidence_map"],
+        },
+    }
+
+
+def _v8_shadow_root_cause_schema() -> dict:
+    return {
+        "name": "mm_v8_shadow_root_cause",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
+                "diagnostic_brief": {"type": "string"},
+                "cause_notes": {
+                    "type": "array",
+                    "maxItems": V8_SHADOW_MAX_CAUSES,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "cause": {"type": "string"},
+                            "why_short": {"type": "string"},
+                            "checks_focus": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "maxItems": 3,
+                            },
+                        },
+                        "required": ["cause", "why_short", "checks_focus"],
+                    },
+                },
+                "evidence_map": {
+                    "type": "array",
+                    "maxItems": V8_SHADOW_MAX_CITATIONS,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "citation_id": {"type": "string"},
+                            "why_it_matters": {"type": "string"},
+                        },
+                        "required": ["citation_id", "why_it_matters"],
+                    },
+                },
+            },
+            "required": ["confidence", "diagnostic_brief", "cause_notes", "evidence_map"],
+        },
+    }
+
+
+def _v8_shadow_build_ask_overlay(q: str, response: dict) -> Optional[dict]:
+    response = dict(response or {})
+    citations = list(response.get("citations") or [])
+    if str(response.get("status") or "").strip().lower() != "answered":
+        return None
+    if not citations:
+        return None
+
+    proxy = _ask_response_proxy_score(q, response)
+    if float(proxy.get("score", 0.0) or 0.0) < V8_SHADOW_MIN_ASK_PROXY:
+        return None
+
+    response_language = _select_response_language(q)
+    compact_response = {
+        "status": str(response.get("status") or ""),
+        "answer": re.sub(r"\s+", " ", str(response.get("answer") or "").strip())[:1200],
+        "citations": [str(c.get("citation_id") or "").strip() for c in citations if c.get("citation_id")][:V8_SHADOW_MAX_CITATIONS],
+    }
+    compact_citations = _v8_shadow_compact_citations(citations, max_items=V8_SHADOW_MAX_CITATIONS)
+
+    system_msg = (
+        "You are producing a shadow reasoning overlay for an already accepted technical answer. "
+        "Do NOT change the answer, do NOT add or remove claims, and do NOT introduce new citations. "
+        "Explain only why the existing answer is grounded in the provided citations. "
+        "Keep it concise, useful to an operator, and in the requested response language."
+    )
+    user_msg = (
+        f"QUESTION:\n{q}\n\n"
+        f"RESPONSE_LANGUAGE:\n{response_language}\n\n"
+        f"ACCEPTED_RESPONSE_JSON:\n{json.dumps(compact_response, ensure_ascii=False)}\n\n"
+        f"CITATIONS_JSON:\n{json.dumps(compact_citations, ensure_ascii=False)}\n\n"
+        "Return valid JSON. Every evidence_map citation_id must be one of the provided citations."
+    )
+
+    try:
+        parsed = _openai_chat_json_models(
+            [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            models=[V8_SHADOW_MODEL, DIAGNOSTIC_EVIDENCE_MODEL, OPENAI_CHAT_MODEL],
+            json_schema=_v8_shadow_ask_schema(),
+            timeout=V8_SHADOW_TIMEOUT,
+        )
+    except Exception:
+        return None
+
+    parsed = dict(parsed or {})
+    parsed["mode"] = "shadow"
+    parsed["base_proxy_score"] = round(float(proxy.get("score", 0.0) or 0.0), 4)
+    parsed["model"] = V8_SHADOW_MODEL
+    return parsed
+
+
+def _v8_shadow_build_root_cause_overlay(q: str, response: dict) -> Optional[dict]:
+    response = dict(response or {})
+    citations = list(response.get("citations") or [])
+    possible_causes = [c for c in (response.get("possible_causes") or []) if isinstance(c, dict)]
+    if str(response.get("status") or "").strip().lower() != "answered":
+        return None
+    if not citations or not possible_causes:
+        return None
+
+    proxy = _root_cause_response_proxy_score(q, response)
+    if float(proxy.get("score", 0.0) or 0.0) < V8_SHADOW_MIN_ROOT_PROXY:
+        return None
+
+    response_language = _select_response_language(q)
+    compact_response = {
+        "status": str(response.get("status") or ""),
+        "problem_summary": re.sub(r"\s+", " ", str(response.get("problem_summary") or "").strip())[:500],
+        "possible_causes": [
+            {
+                "cause": re.sub(r"\s+", " ", str(c.get("cause") or "").strip())[:120],
+                "checks": [re.sub(r"\s+", " ", str(x or "").strip())[:140] for x in (c.get("checks") or [])[:3]],
+                "citations": [str(x or "").strip() for x in (c.get("citations") or [])[:3]],
+            }
+            for c in possible_causes[:V8_SHADOW_MAX_CAUSES]
+        ],
+        "recommended_next_checks": [re.sub(r"\s+", " ", str(x or "").strip())[:140] for x in (response.get("recommended_next_checks") or [])[:4]],
+    }
+    compact_citations = _v8_shadow_compact_citations(citations, max_items=V8_SHADOW_MAX_CITATIONS)
+
+    system_msg = (
+        "You are producing a shadow reasoning overlay for an already accepted industrial root-cause response. "
+        "Do NOT change, add, remove, or reorder causes. Do NOT introduce new citations. "
+        "Explain only why the accepted causes are grounded and what the existing checks are trying to discriminate. "
+        "Keep the output concise, operator-facing, and in the requested response language."
+    )
+    user_msg = (
+        f"PROBLEM:\n{q}\n\n"
+        f"RESPONSE_LANGUAGE:\n{response_language}\n\n"
+        f"ACCEPTED_RESPONSE_JSON:\n{json.dumps(compact_response, ensure_ascii=False)}\n\n"
+        f"CITATIONS_JSON:\n{json.dumps(compact_citations, ensure_ascii=False)}\n\n"
+        "Return valid JSON. cause_notes.cause must reuse the accepted cause labels exactly."
+    )
+
+    try:
+        parsed = _openai_chat_json_models(
+            [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            models=[V8_SHADOW_MODEL, DIAGNOSTIC_EVIDENCE_MODEL, OPENAI_CHAT_MODEL],
+            json_schema=_v8_shadow_root_cause_schema(),
+            timeout=V8_SHADOW_TIMEOUT,
+        )
+    except Exception:
+        return None
+
+    parsed = dict(parsed or {})
+    parsed["mode"] = "shadow"
+    parsed["base_proxy_score"] = round(float(proxy.get("score", 0.0) or 0.0), 4)
+    parsed["model"] = V8_SHADOW_MODEL
+    return parsed
+
+
+def _v8_attach_shadow_overlay(mode: str, q: str, response: dict) -> dict:
+    response = dict(response or {})
+    if not V8_SHADOW_REASONING_ENABLED:
+        return response
+    if mode == "ask" and not V8_SHADOW_ASK_ENABLED:
+        return response
+    if mode == "root_cause" and not V8_SHADOW_ROOT_CAUSE_ENABLED:
+        return response
+
+    overlay = None
+    if mode == "ask":
+        overlay = _v8_shadow_build_ask_overlay(q, response)
+    elif mode == "root_cause":
+        overlay = _v8_shadow_build_root_cause_overlay(q, response)
+
+    if overlay:
+        response["shadow_reasoning"] = overlay
+    return response
+
+
+@app.post("/v1/ai/ask-shadow")
+def ask_v1_shadow(
+    payload: AskRequest,
+    x_ai_internal_secret: Optional[str] = Header(default=None),
+):
+    base_response = ask_v1(payload, x_ai_internal_secret)
+    return _v8_attach_shadow_overlay("ask", payload.query or "", dict(base_response or {}))
+
+
+@app.post("/v1/ai/root-cause-shadow")
+def root_cause_v1_shadow(
+    payload: RootCauseRequest,
+    x_ai_internal_secret: Optional[str] = Header(default=None),
+):
+    base_response = root_cause_v1(payload, x_ai_internal_secret)
+    return _v8_attach_shadow_overlay("root_cause", payload.query or "", dict(base_response or {}))
