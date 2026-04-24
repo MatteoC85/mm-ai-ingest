@@ -10613,3 +10613,351 @@ def root_cause_v1_shadow(
 ):
     base_response = root_cause_v1(payload, x_ai_internal_secret)
     return _v8_attach_shadow_overlay("root_cause", payload.query or "", dict(base_response or {}))
+
+
+# Commit: feat(v8.4): polish root-cause checks and stabilize root-cause language conservatively
+V84_ROOT_CAUSE_TEXT_POLISH_ENABLED = (os.environ.get("MM_V84_ROOT_CAUSE_TEXT_POLISH_ENABLED") or "1").strip() != "0"
+V84_ROOT_CAUSE_TEXT_POLISH_TIMEOUT = int(os.environ.get("MM_V84_ROOT_CAUSE_TEXT_POLISH_TIMEOUT_SECONDS", "45"))
+V84_ROOT_CAUSE_TEXT_POLISH_MAX_CITATIONS = int(os.environ.get("MM_V84_ROOT_CAUSE_TEXT_POLISH_MAX_CITATIONS", "5"))
+V84_ROOT_CAUSE_TEXT_POLISH_MAX_CHECKS = int(os.environ.get("MM_V84_ROOT_CAUSE_TEXT_POLISH_MAX_CHECKS", "3"))
+
+
+_V84_PREV_STRIP_INTERNAL_RESPONSE_ARTIFACTS = _strip_internal_response_artifacts
+
+
+def _v84_is_root_cause_response(resp: dict) -> bool:
+    if not isinstance(resp, dict):
+        return False
+    if str(resp.get("status") or "").strip().lower() != "answered":
+        return False
+    if not isinstance(resp.get("possible_causes"), list):
+        return False
+    return True
+
+
+def _v84_clean_text_line(text: str, *, max_chars: int = 220) -> str:
+    s = re.sub(r"\s+", " ", _normalize_unicode_advanced(str(text or ""))).strip()
+    s = re.sub(r"^[\-•*]+\s*", "", s)
+    s = s.rstrip(" .;,:-")
+    if not s:
+        return ""
+    return s[:max_chars]
+
+
+def _v84_clean_text_list(items: list[Any], *, max_items: int = 6, max_chars: int = 180) -> list[str]:
+    out: list[str] = []
+    seen = set()
+    for item in items or []:
+        s = _v84_clean_text_line(str(item or ""), max_chars=max_chars)
+        if not s:
+            continue
+        key = s.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(s)
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def _v84_check_needs_polish(text: str, language: str) -> bool:
+    s = _v84_clean_text_line(text, max_chars=260)
+    if not s:
+        return True
+    if len(s) > 120:
+        return True
+
+    generic_markers_it = [
+        "controllare la macchina",
+        "verificare la macchina",
+        "eseguire controlli",
+        "controllo visivo generale",
+        "verificare se",
+        "controllare se",
+        "ispezione generale",
+    ]
+    generic_markers_en = [
+        "check the machine",
+        "verify the machine",
+        "perform checks",
+        "general visual inspection",
+        "check if",
+        "verify if",
+        "general inspection",
+    ]
+    low = s.lower()
+    markers = generic_markers_en if str(language or "").lower() == "en" else generic_markers_it
+    if any(m in low for m in markers):
+        return True
+    return False
+
+
+def _v84_root_cause_needs_polish(query: str, resp: dict) -> dict:
+    query = str(query or resp.get("symptom") or resp.get("problem_summary") or "").strip()
+    target_language = _simple_query_language(query)
+    causes = [c for c in (resp.get("possible_causes") or []) if isinstance(c, dict)]
+    recommended = list(resp.get("recommended_next_checks") or [])
+
+    texts = []
+    if resp.get("problem_summary"):
+        texts.append(str(resp.get("problem_summary") or ""))
+    for cause in causes[:3]:
+        texts.append(str(cause.get("cause") or ""))
+        texts.append(str(cause.get("why") or ""))
+        texts.extend([str(x or "") for x in (cause.get("checks") or [])[:3]])
+    texts.extend([str(x or "") for x in recommended[:5]])
+
+    needs_language = any(
+        txt and not _looks_like_target_language(txt, target_language)
+        for txt in texts
+    )
+
+    needs_checks = False
+    if len(recommended) < 2:
+        needs_checks = True
+    for cause in causes:
+        checks = list(cause.get("checks") or [])
+        if not checks:
+            needs_checks = True
+            break
+        if any(_v84_check_needs_polish(chk, target_language) for chk in checks[:3]):
+            needs_checks = True
+            break
+
+    return {
+        "target_language": target_language,
+        "needs_language": needs_language,
+        "needs_checks": needs_checks,
+        "should_run": bool(needs_language or needs_checks),
+    }
+
+
+def _v84_root_cause_polish_schema(max_causes: int) -> dict:
+    max_causes = max(1, min(int(max_causes or 1), 5))
+    return {
+        "name": "mm_v84_root_cause_text_polish",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "problem_summary": {"type": "string"},
+                "possible_causes": {
+                    "type": "array",
+                    "maxItems": max_causes,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "rank": {"type": "integer"},
+                            "cause": {"type": "string"},
+                            "why": {"type": "string"},
+                            "checks": {
+                                "type": "array",
+                                "maxItems": V84_ROOT_CAUSE_TEXT_POLISH_MAX_CHECKS,
+                                "items": {"type": "string"},
+                            },
+                        },
+                        "required": ["rank", "cause", "why", "checks"],
+                    },
+                },
+                "recommended_next_checks": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 6,
+                },
+            },
+            "required": ["problem_summary", "possible_causes", "recommended_next_checks"],
+        },
+    }
+
+
+def _v84_build_root_cause_polish_payload(resp: dict) -> dict:
+    by_id = {
+        str(c.get("citation_id") or "").strip(): c
+        for c in (resp.get("citations") or [])
+        if c.get("citation_id")
+    }
+    compact_citations = _v8_shadow_compact_citations(
+        list(resp.get("citations") or []),
+        max_items=V84_ROOT_CAUSE_TEXT_POLISH_MAX_CITATIONS,
+        snippet_chars=220,
+    )
+    cause_rows = []
+    for cause in (resp.get("possible_causes") or [])[:5]:
+        if not isinstance(cause, dict):
+            continue
+        evidence = []
+        for cid in cause.get("citations") or []:
+            cid = str(cid or "").strip()
+            if not cid or cid not in by_id:
+                continue
+            c = by_id[cid]
+            evidence.append(
+                {
+                    "citation_id": cid,
+                    "snippet": re.sub(r"\s+", " ", str(c.get("snippet") or c.get("chunk_full") or "").strip())[:220],
+                }
+            )
+            if len(evidence) >= 2:
+                break
+        cause_rows.append(
+            {
+                "rank": int(cause.get("rank") or 0),
+                "cause": str(cause.get("cause") or "").strip(),
+                "why": str(cause.get("why") or "").strip(),
+                "checks": _v84_clean_text_list(list(cause.get("checks") or []), max_items=4, max_chars=180),
+                "citations": [str(cid or "").strip() for cid in (cause.get("citations") or []) if str(cid or "").strip()],
+                "evidence": evidence,
+            }
+        )
+    return {
+        "problem_summary": str(resp.get("problem_summary") or resp.get("symptom") or "").strip(),
+        "possible_causes": cause_rows,
+        "recommended_next_checks": _v84_clean_text_list(list(resp.get("recommended_next_checks") or []), max_items=6, max_chars=180),
+        "compact_citations": compact_citations,
+    }
+
+
+def _v84_should_accept_new_cause_label(original_label: str, new_label: str, *, allow_language_override: bool) -> bool:
+    new_label = _v84_clean_text_line(new_label, max_chars=120)
+    if not new_label:
+        return False
+    if allow_language_override:
+        return True
+    orig_score = _cause_label_specificity_score(original_label)
+    new_score = _cause_label_specificity_score(new_label)
+    return new_score >= max(0.20, orig_score - 0.08)
+
+
+
+def _v84_merge_root_cause_polish(original: dict, polished: dict, *, target_language: str, allow_language_override: bool) -> dict:
+    original = dict(original or {})
+    polished = dict(polished or {})
+
+    orig_causes = [c for c in (original.get("possible_causes") or []) if isinstance(c, dict)]
+    polished_by_rank = {
+        int(c.get("rank") or 0): c
+        for c in (polished.get("possible_causes") or [])
+        if isinstance(c, dict)
+    }
+
+    merged_causes: list[dict] = []
+    for cause in orig_causes:
+        rank = int(cause.get("rank") or 0)
+        row = polished_by_rank.get(rank) or {}
+        merged = dict(cause)
+
+        new_cause = _v84_clean_text_line(str(row.get("cause") or ""), max_chars=120)
+        if _v84_should_accept_new_cause_label(str(cause.get("cause") or ""), new_cause, allow_language_override=allow_language_override):
+            merged["cause"] = new_cause
+
+        new_why = _v84_clean_text_line(str(row.get("why") or ""), max_chars=220)
+        if new_why:
+            merged["why"] = new_why
+
+        new_checks = _v84_clean_text_list(list(row.get("checks") or []), max_items=V84_ROOT_CAUSE_TEXT_POLISH_MAX_CHECKS, max_chars=160)
+        if new_checks:
+            merged["checks"] = new_checks
+        else:
+            merged["checks"] = _v84_clean_text_list(list(cause.get("checks") or []), max_items=V84_ROOT_CAUSE_TEXT_POLISH_MAX_CHECKS, max_chars=160)
+
+        merged_causes.append(merged)
+
+    merged = dict(original)
+    merged["possible_causes"] = merged_causes
+
+    new_problem_summary = _v84_clean_text_line(str(polished.get("problem_summary") or ""), max_chars=220)
+    if new_problem_summary:
+        merged["problem_summary"] = new_problem_summary
+
+    recs = _v84_clean_text_list(list(polished.get("recommended_next_checks") or []), max_items=6, max_chars=160)
+    if not recs:
+        recs = _v84_clean_text_list(
+            [chk for cause in merged_causes for chk in (cause.get("checks") or [])],
+            max_items=6,
+            max_chars=160,
+        )
+    merged["recommended_next_checks"] = recs
+    return merged
+
+
+def _v84_postprocess_root_cause_response(resp: dict) -> dict:
+    if not V84_ROOT_CAUSE_TEXT_POLISH_ENABLED:
+        return resp
+    if not _v84_is_root_cause_response(resp):
+        return resp
+
+    q = str(resp.get("symptom") or resp.get("problem_summary") or "").strip()
+    need = _v84_root_cause_needs_polish(q, resp)
+    if not need.get("should_run"):
+        if isinstance(resp.get("debug"), dict):
+            dbg = dict(resp.get("debug") or {})
+            dbg["v84_root_cause_polish"] = {"applied": False, **need}
+            resp["debug"] = dbg
+        return resp
+
+    payload_json = _v84_build_root_cause_polish_payload(resp)
+    max_causes = len([c for c in (resp.get("possible_causes") or []) if isinstance(c, dict)])
+
+    system_msg = (
+        "You are polishing an already accepted industrial root-cause response. "
+        "Do NOT change the number of causes, their rank order, or their causal meaning. "
+        "You may only improve wording quality and target-language consistency. "
+        "Task: rewrite problem_summary, why text, checks, and recommended_next_checks in the requested target language. "
+        "Cause labels may be translated or lightly normalized only if needed, but must preserve the original meaning and stay compact, technical, and noun-phrase style. "
+        "Checks must be short, operational, and technician-friendly. Prefer concrete actions over generic advice. "
+        "Do not invent new components, causes, or evidence beyond the current response and provided snippets. "
+        "Keep output concise and structured."
+    )
+    user_msg = (
+        f"TARGET_LANGUAGE: {need.get('target_language') or 'it'}\n\n"
+        f"CURRENT_ROOT_CAUSE_JSON:\n{json.dumps(payload_json, ensure_ascii=False)}\n\n"
+        "Return valid JSON with the same ranks and the same number of causes."
+    )
+
+    try:
+        polished = _openai_chat_json_models(
+            [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            models=[DIAGNOSTIC_EVIDENCE_MODEL, OPENAI_CHAT_MODEL],
+            json_schema=_v84_root_cause_polish_schema(max_causes=max_causes),
+            timeout=V84_ROOT_CAUSE_TEXT_POLISH_TIMEOUT,
+        )
+    except Exception as e:
+        if isinstance(resp.get("debug"), dict):
+            dbg = dict(resp.get("debug") or {})
+            dbg["v84_root_cause_polish"] = {"applied": False, **need, "error": str(e)[:240]}
+            resp["debug"] = dbg
+        return resp
+
+    merged = _v84_merge_root_cause_polish(
+        resp,
+        polished,
+        target_language=str(need.get("target_language") or "it"),
+        allow_language_override=bool(need.get("needs_language")),
+    )
+
+    if isinstance(merged.get("debug"), dict):
+        dbg = dict(merged.get("debug") or {})
+        dbg["v84_root_cause_polish"] = {"applied": True, **need}
+        merged["debug"] = dbg
+    elif isinstance(resp.get("debug"), dict):
+        dbg = dict(resp.get("debug") or {})
+        dbg["v84_root_cause_polish"] = {"applied": True, **need}
+        merged["debug"] = dbg
+
+    return merged
+
+
+
+def _strip_internal_response_artifacts(resp: dict) -> dict:
+    cleaned = _V8_PREV_STRIP_INTERNAL_RESPONSE_ARTIFACTS(resp)
+    if not isinstance(cleaned, dict):
+        return cleaned
+    if _v84_is_root_cause_response(cleaned):
+        return _v84_postprocess_root_cause_response(cleaned)
+    return cleaned
