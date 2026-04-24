@@ -10955,7 +10955,7 @@ def _v84_postprocess_root_cause_response(resp: dict) -> dict:
 
 
 def _strip_internal_response_artifacts(resp: dict) -> dict:
-    cleaned = _V8_PREV_STRIP_INTERNAL_RESPONSE_ARTIFACTS(resp)
+    cleaned = _V84_PREV_STRIP_INTERNAL_RESPONSE_ARTIFACTS(resp)
     if not isinstance(cleaned, dict):
         return cleaned
     if _v84_is_root_cause_response(cleaned):
