@@ -6158,13 +6158,20 @@ def _sanitize_citations_for_response(citations: list[dict]) -> list[dict]:
         if not cid or not bdid:
             continue
 
+        raw_snippet = (c.get("snippet") or "").strip()
+
+        clean_snippet = re.sub(r"^SECTION:\s*[^\n]+\n?", "", raw_snippet, flags=re.IGNORECASE).strip()
+        clean_snippet = re.sub(r"\s*\n\s*", " ", clean_snippet)
+        clean_snippet = re.sub(r"\s+", " ", clean_snippet).strip()
+
         out.append(
             {
                 "citation_id": cid,
                 "bubble_document_id": bdid,
                 "page_from": int(c.get("page_from") or 0),
                 "page_to": int(c.get("page_to") or 0),
-                "snippet": (c.get("snippet") or "").strip(),
+                "snippet": raw_snippet,
+                "snippet_clean": clean_snippet,
                 "similarity": float(c.get("similarity") or c.get("retrieval_score") or 0.0),
             }
         )
