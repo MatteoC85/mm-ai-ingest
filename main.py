@@ -6165,6 +6165,7 @@ def _sanitize_citations_for_response(citations: list[dict]) -> list[dict]:
                 "page_from": int(c.get("page_from") or 0),
                 "page_to": int(c.get("page_to") or 0),
                 "snippet": (c.get("snippet") or "").strip(),
+                "similarity": float(c.get("similarity") or c.get("retrieval_score") or 0.0),
             }
         )
 
