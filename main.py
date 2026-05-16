@@ -7993,17 +7993,22 @@ def _ask_v1_baseline_impl(
         original_ids = [str(c.get("citation_id") or "").strip() for c in final_citations if c.get("citation_id")]
         relocked_ids = [str(c.get("citation_id") or "").strip() for c in relocked_final_citations if c.get("citation_id")]
 
-        if relocked_ids != original_ids or query_token_count >= 4:
+        if relocked_ids == original_ids:
+            # Safe: same citation ids, just keep any enriched/ranked citation metadata.
+            final_citations = relocked_final_citations
+        elif not grounded_points:
+            # Only the fallback path may be rewritten extractively. Never replace a valid
+            # grounded LLM answer with first-line excerpts: that produces answers like
+            # "TENSIONE" or other manual headings.
             stable_answer, stable_citations = _extractive_fallback_answer(
                 relocked_final_citations,
                 response_language=response_language,
                 max_points=min(2, top_k),
+                q=q,
             )
             if stable_answer and stable_citations:
                 answer = stable_answer
                 final_citations = stable_citations
-            else:
-                final_citations = relocked_final_citations
 
     if not _looks_like_target_language(answer, response_language):
         answer = _translate_text_preserving_citations(answer, response_language)
