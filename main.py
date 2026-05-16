@@ -1316,15 +1316,17 @@ def _localized_no_sources(language: str) -> str:
 
 
 def _localized_value_answer(language: str, value: str, citation_id: str) -> str:
+    # Keep citation_id in the structured citations/rg_links fields, not inside the user-visible answer.
     if str(language or "").lower() == "en":
-        return f"The document contains this value: {value} [{citation_id}]"
-    return f"Nel documento compare questo dato: {value} [{citation_id}]"
+        return f"The document contains this value: {value}."
+    return f"Nel documento compare questo dato: {value}."
 
 
 def _localized_token_answer(language: str, token: str, citation_id: str) -> str:
+    # Keep citation_id in the structured citations/rg_links fields, not inside the user-visible answer.
     if str(language or "").lower() == "en":
-        return f"The document contains this string: {token} [{citation_id}]"
-    return f"Nel documento compare questa stringa: {token} [{citation_id}]"
+        return f"The document contains this string: {token}."
+    return f"Nel documento compare questa stringa: {token}."
 
 
 
@@ -1362,11 +1364,79 @@ def _ask_response_schema() -> dict:
         },
     }
 
+def _strip_inline_citation_markers_for_display(text: str) -> str:
+    """Remove internal citation ids from the user-visible ASK answer.
+
+    Citations and links are already returned as structured fields. Raw ids such as
+    [doc:p32-33:c501] must not be shown inside the answer box.
+    """
+    t = str(text or "")
+    t = re.sub(r"\s*\[[^\]]*:p\d+(?:-\d+)?:c\d+\]\s*", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def _ask_query_is_before_scoped(q: str) -> bool:
+    qn = _normalize_unicode_advanced(q or "").lower()
+    before_markers = [
+        "prima",
+        "before",
+        "preliminar",
+        "preventiv",
+        "pre-oper",
+        "pre operation",
+    ]
+    after_markers = [
+        "dopo",
+        "after",
+        "termine",
+        "conclus",
+        "ripristin",
+    ]
+    return any(x in qn for x in before_markers) and not any(x in qn for x in after_markers)
+
+
+def _ask_point_is_after_completion_instruction(text: str) -> bool:
+    tn = _normalize_unicode_advanced(text or "").lower()
+    after_completion_markers = [
+        "al termine",
+        "terminate le operazioni",
+        "terminata l",
+        "terminate l",
+        "dopo aver",
+        "dopo la manutenzione",
+        "after completion",
+        "after completing",
+        "once completed",
+        "restore the electrical",
+        "ripristinare il collegamento elettrico",
+        "riattivare il collegamento elettrico",
+    ]
+    return any(x in tn for x in after_completion_markers)
+
+
+def _ask_trim_after_completion_sentences(text: str) -> str:
+    """For questions scoped to BEFORE an operation, remove AFTER/restoration sentences."""
+    t = str(text or "").strip()
+    if not t:
+        return ""
+
+    units = [u.strip() for u in re.split(r"(?<=[\.!?])\s+", t) if u.strip()]
+    if not units:
+        return "" if _ask_point_is_after_completion_instruction(t) else t
+
+    kept = [u for u in units if not _ask_point_is_after_completion_instruction(u)]
+    if kept:
+        return " ".join(kept).strip()
+
+    return ""
+
 def _render_grounded_answer_points(
     grounded_points: list[dict],
     citations: list[dict],
     *,
     max_points: int = 3,
+    q: str = "",
 ) -> tuple[str, list[dict]]:
     if not grounded_points:
         return "", []
@@ -1380,14 +1450,20 @@ def _render_grounded_answer_points(
     parts: list[str] = []
     used_ids: list[str] = []
     seen_ids = set()
+    before_scoped = _ask_query_is_before_scoped(q)
 
     for point in grounded_points[:max_points]:
         if not isinstance(point, dict):
             continue
 
-        text = re.sub(r"\s+", " ", str(point.get("text") or "")).strip()
+        text = _strip_inline_citation_markers_for_display(point.get("text") or "")
         if not text:
             continue
+
+        if before_scoped:
+            text = _ask_trim_after_completion_sentences(text)
+            if not text:
+                continue
 
         cids = []
         for cid in point.get("citation_ids") or []:
@@ -1402,14 +1478,22 @@ def _render_grounded_answer_points(
         if not cids:
             continue
 
-        text = re.sub(r"\s*\[[^\]]+\]\s*$", "", text).strip()
         if text and text[-1] not in ".!?":
             text += "."
-        parts.append(f"{text} {' '.join(f'[{cid}]' for cid in cids)}")
+
+        parts.append(text)
 
     final_citations = [by_id[cid] for cid in used_ids if cid in by_id]
-    return " ".join(parts).strip(), final_citations
 
+    if not parts:
+        return "", final_citations
+
+    if len(parts) == 1:
+        answer = parts[0]
+    else:
+        answer = "\n".join(f"{idx}. {part}" for idx, part in enumerate(parts, start=1))
+
+    return answer.strip(), final_citations
 
 def _language_marker_score(text: str, language: str) -> int:
     toks = re.findall(r"[a-zà-öø-ÿ']{2,}", _normalize_unicode_advanced(text or "").lower())
@@ -1734,41 +1818,119 @@ def _extractive_fallback_answer(
     response_language: str,
     *,
     max_points: int = 2,
+    q: str = "",
 ) -> tuple[str, list[dict]]:
+    """Last-resort ASK answer.
+
+    This must never behave like a blind first-line extractor, because technical manuals
+    often contain section headers and OCR-style hard line breaks. The normal path should
+    be the grounded LLM answer; this fallback only returns compact grounded excerpts when
+    the LLM cannot produce grounded points.
+    """
     if not citations:
         return "", []
+
+    query_terms = _content_term_set(q, limit=60) if q else set()
+    before_scoped = _ask_query_is_before_scoped(q)
+
+    def _clean_manual_body(raw: str) -> str:
+        body = re.sub(r"^SECTION:\s*[^\n]+\n?", "", raw or "", flags=re.IGNORECASE).strip()
+        body = re.sub(r"\s*\n\s*", " ", body)
+        body = re.sub(r"\s+", " ", body).strip()
+        return body
+
+    def _looks_like_heading_only(text: str) -> bool:
+        t = re.sub(r"\[[^\]]+\]", "", text or "").strip(" .:;-\t\n")
+        toks = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9]+", t)
+        if not toks:
+            return True
+        if len(toks) <= 5 and len(t) <= 48:
+            letters = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]", t)
+            upper = re.findall(r"[A-ZÀ-ÖØ-Ý]", t)
+            if letters and len(upper) / max(1, len(letters)) >= 0.80:
+                return True
+        return False
+
+    def _candidate_units(body: str) -> list[str]:
+        compact = _clean_manual_body(body)
+        if not compact:
+            return []
+
+        units = [u.strip() for u in re.split(r"(?<=[\.!?])\s+", compact) if u.strip()]
+        if len(units) <= 1:
+            # Many manuals/OCR chunks have no punctuation. Keep a complete excerpt
+            # instead of returning a single broken line or a bare title.
+            cut = compact[:520].strip()
+            if len(compact) > 520:
+                cut = re.sub(r"\s+\S*$", "", cut).strip()
+            units = [cut] if cut else []
+
+        usable = [u for u in units if len(u) >= 24 and not _looks_like_heading_only(u)]
+        if before_scoped:
+            usable = [u for u in usable if not _ask_point_is_after_completion_instruction(u)]
+        return usable
+
+    def _unit_score(unit: str, idx: int) -> float:
+        terms = _content_term_set(unit, limit=100)
+        score = _term_overlap_score(query_terms, terms) if query_terms else 0.0
+
+        u = _normalize_unicode_advanced(unit or "").lower()
+        if any(
+            x in u
+            for x in [
+                "manutenz",
+                "maintenance",
+                "operazione",
+                "operation",
+                "tensione",
+                "voltage",
+                "protezione",
+                "protection",
+            ]
+        ):
+            score += 0.08
+
+        score += max(0.0, 0.025 - 0.005 * idx)
+        return score
 
     parts: list[str] = []
     used: list[dict] = []
 
     for c in citations[:max_points]:
-        body = re.sub(r"^SECTION:\s*[^\n]+\n?", "", (c.get("chunk_full") or c.get("snippet") or ""), flags=re.IGNORECASE).strip()
-        if not body:
+        raw_body = (c.get("chunk_full") or c.get("snippet") or "").strip()
+        units = _candidate_units(raw_body)
+        if not units:
             continue
 
-        sentence = ""
-        lines = [ln.strip() for ln in body.split("\n") if ln.strip()]
-        if lines:
-            sentence = lines[0]
-        if not sentence:
-            match = re.split(r"(?<=[\.!?])\s+", body)
-            sentence = (match[0] if match else body).strip()
+        scored = sorted(
+            enumerate(units),
+            key=lambda pair: (-_unit_score(pair[1], pair[0]), pair[0]),
+        )
 
-        sentence = re.sub(r"\s+", " ", sentence).strip()
+        sentence = scored[0][1].strip() if scored else ""
+        sentence = _strip_inline_citation_markers_for_display(sentence)
         if not sentence:
             continue
 
         if sentence[-1] not in ".!?":
             sentence += "."
-        parts.append(f"{sentence} [{c['citation_id']}]")
+
+        if str(response_language or "").lower() == "en":
+            parts.append(f"The document states: {sentence}")
+        else:
+            parts.append(f"Il documento indica: {sentence}")
+
         used.append(c)
 
-    answer = " ".join(parts).strip()
+    if len(parts) == 1:
+        answer = parts[0].strip()
+    else:
+        answer = "\n".join(f"{idx}. {part}" for idx, part in enumerate(parts, start=1)).strip()
+
     if answer and not _looks_like_target_language(answer, response_language):
         answer = _translate_text_preserving_citations(answer, response_language)
 
     return answer, used
-
 
 def _enrich_ask_prompt_citations(
     company_id: str,
@@ -1850,10 +2012,16 @@ def _generate_ask_grounded_points(
             "Prefer the most specific grounded evidence available. "
             "When multiple evidence sets are close in quality, prefer the dominant grounded evidence family rather than mixing weak alternatives. "
             "Never use outside knowledge. "
+            "Always answer the user's question directly. "
+            "For procedural, maintenance, setup, safety, or troubleshooting questions, return the actual operations/actions to perform, not section titles, headings, or isolated manual fragments. "
+            "Respect temporal qualifiers in the question: if the user asks what to do before an operation, include only preparatory/before-start actions and do not include after-completion, restoration, or restart steps unless explicitly requested. "
+            "If the source text is fragmented by OCR/manual line breaks, reconstruct a short fluent sentence without adding outside knowledge. "
             "Always reply in the requested response language. "
             "If the sources do not directly answer the question but they still contain closely relevant evidence, "
             "return answered with cautious grounded points that explicitly say the documents do or do not state something directly. "
             "Use no_sources only when the sources are genuinely not helpful. "
+            "Do not repeat the same idea in multiple points. "
+            "Do not include raw citation ids inside the text field; put support only in citation_ids. "
             "Return 1 to 3 short grounded points only. "
             "Each point must be directly supported by its citation_ids."
         )
@@ -1862,11 +2030,17 @@ def _generate_ask_grounded_points(
         system_msg = (
             "You are a technical documentation assistant for machinery and industrial equipment. "
             "Use ONLY the provided sources. "
+            "Always answer the user's question directly. "
             "Always reply in the requested response language. "
             "Return 1 to 3 very short grounded points. "
             "You MUST return grounded_points, even if the evidence is partial. "
+            "For procedural, maintenance, setup, safety, or troubleshooting questions, return the actual operations/actions to perform, not section titles, headings, or isolated manual fragments. "
+            "Respect temporal qualifiers in the question: if the user asks what to do before an operation, include only preparatory/before-start actions and do not include after-completion, restoration, or restart steps unless explicitly requested. "
+            "If the source text is fragmented by OCR/manual line breaks, reconstruct a short fluent sentence without adding outside knowledge. "
             "If the documents do not state the requested thing directly, say that explicitly and then report the closest grounded evidence. "
             "Do not return no_sources. "
+            "Do not repeat the same idea in multiple points. "
+            "Do not include raw citation ids inside the text field; put support only in citation_ids. "
             "Each point must be directly supported by citation_ids from the sources."
         )
         schema = _ask_rescue_response_schema()
@@ -7966,6 +8140,7 @@ def _ask_v1_baseline_impl(
             grounded_points=grounded_points,
             citations=citations,
             max_points=min(3, top_k),
+            q=q,
         )
 
     if not answer or not final_citations:
@@ -9740,18 +9915,34 @@ def _generate_ask_candidate_grounded_points(
         system_msg = (
             "You are a technical documentation assistant for machinery and industrial equipment. "
             "Use ONLY the provided sources, evidence-role summary, and evidence matrix. "
-            "Always answer the user's question directly. For generic symptoms or technical issues, prefer core mechanical or core process evidence before support-only evidence. "
+            "Always answer the user's question directly. "
+            "For procedural, maintenance, setup, safety, or troubleshooting questions, return the actual operations/actions to perform, not section titles, headings, or isolated manual fragments. "
+            "Respect temporal qualifiers in the question: if the user asks what to do before an operation, include only preparatory/before-start actions and do not include after-completion, restoration, or restart steps unless explicitly requested. "
+            "For generic symptoms or technical issues, prefer core mechanical or core process evidence before support-only evidence. "
             "Do not center lubrication, startup/install, or safety unless the question anchors them or the evidence matrix explicitly shows they are primary. "
+            "If the source text is fragmented by OCR/manual line breaks, reconstruct a short fluent sentence without adding outside knowledge. "
             "If the documents do not state the requested thing directly, say that explicitly and then report the closest grounded evidence. "
-            "Always reply in the requested response language. Return 1 to 3 short grounded points only."
+            "Do not repeat the same idea in multiple points. "
+            "Do not include raw citation ids inside the text field; put support only in citation_ids. "
+            "Every point must be directly supported by its citation_ids. "
+            "Always reply in the requested response language. "
+            "Return 1 to 3 short grounded points only."
         )
         schema = _ask_response_schema()
     else:
         system_msg = (
             "You are a technical documentation assistant for machinery and industrial equipment. "
             "Use ONLY the provided sources, evidence-role summary, and evidence matrix. "
-            "Always reply in the requested response language. Return 1 to 3 very short grounded points. "
-            "If the requested thing is not stated directly, say that explicitly and then report the closest grounded evidence."
+            "Always answer the user's question directly. "
+            "Always reply in the requested response language. "
+            "Return 1 to 3 very short grounded points. "
+            "For procedural, maintenance, setup, safety, or troubleshooting questions, return the actual operations/actions to perform, not section titles, headings, or isolated manual fragments. "
+            "Respect temporal qualifiers in the question: if the user asks what to do before an operation, include only preparatory/before-start actions and do not include after-completion, restoration, or restart steps unless explicitly requested. "
+            "If the source text is fragmented by OCR/manual line breaks, reconstruct a short fluent sentence without adding outside knowledge. "
+            "If the requested thing is not stated directly, say that explicitly and then report the closest grounded evidence. "
+            "Do not repeat the same idea in multiple points. "
+            "Do not include raw citation ids inside the text field; put support only in citation_ids. "
+            "Every point must be directly supported by citation_ids from the sources."
         )
         schema = _ask_rescue_response_schema()
 
@@ -9923,6 +10114,7 @@ def _ask_v1_candidate_impl(
             grounded_points=grounded_points,
             citations=citations,
             max_points=min(3, top_k),
+            q=q,
         )
 
     if not answer or not final_citations:
