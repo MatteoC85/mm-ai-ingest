@@ -71,6 +71,13 @@ ASK_SNIPPET_CHARS = int(os.environ.get("MM_ASK_SNIPPET_CHARS", "700"))
 ASK_MAX_CONTEXT_CHARS = int(os.environ.get("MM_ASK_MAX_CONTEXT_CHARS", "9000"))
 DRAFT_PS_SIM_THRESHOLD = float(os.environ.get("MM_DRAFT_PS_SIM_THRESHOLD", "0.42"))
 
+# Structured-source rescue for machine-wide Ask queries.
+# Purpose: when the user asks about procedures/steps/P&S/photos/videos or asks a how-to
+# question, do not let long manuals dominate over exact structured records.
+STRUCTURED_RESCUE_ENABLED = (os.environ.get("MM_STRUCTURED_RESCUE_ENABLED") or "1").strip() != "0"
+STRUCTURED_RESCUE_SCAN_LIMIT = int(os.environ.get("MM_STRUCTURED_RESCUE_SCAN_LIMIT", "220"))
+STRUCTURED_RESCUE_MAX_HITS = int(os.environ.get("MM_STRUCTURED_RESCUE_MAX_HITS", "3"))
+
 # Shared semantic retrieval planner
 SEMANTIC_QUERY_PLANNER_MODEL = (os.environ.get("MM_SEMANTIC_QUERY_PLANNER_MODEL") or "gpt-5.4-mini").strip()
 SEMANTIC_QUERY_PLANNER_TIMEOUT = int(os.environ.get("MM_SEMANTIC_QUERY_PLANNER_TIMEOUT_SECONDS", "20"))
@@ -2583,6 +2590,258 @@ def _fts_search_chunks_multi(
     return _dedup_citations_by_snippet(merged, max_items=top_k)
 
 
+def _structured_rescue_query_intent(q: str, planner: Optional[dict] = None) -> bool:
+    """Return True when a user query should explicitly consider structured sources.
+
+    Dense retrieval can prefer long PDF manual chunks. For questions about procedures,
+    steps, P&S, photos/videos, or practical how-to requests, structured Bubble records
+    are first-class evidence and must be allowed into the final citation set.
+    """
+    text_parts = [str(q or "")]
+    if isinstance(planner, dict):
+        text_parts.append(str(planner.get("normalized_query") or ""))
+        text_parts.extend(str(x or "") for x in (planner.get("lexical_queries") or []))
+        text_parts.extend(str(x or "") for x in (planner.get("dense_queries") or []))
+
+    low = _normalize_unicode_advanced(" ".join(text_parts)).lower()
+    low = re.sub(r"\s+", " ", low).strip()
+    if not low:
+        return False
+
+    strong_markers = [
+        "procedur", "procedure", "step", "passagg", "istruzion", "operativ",
+        "p&s", "problem solution", "problema", "problematic", "soluzione", "solution",
+        "foto", "photo", "immagin", "image", "video", "media",
+    ]
+    if any(m in low for m in strong_markers):
+        return True
+
+    howto_markers = [
+        "come faccio", "come fare", "come posso", "cosa devo fare", "cosa devo controllare",
+        "how to", "how do i", "what should i do", "esiste", "conosci", "conosci sulla macchina",
+        "hai info", "hai informazioni", "quali altre informazioni",
+    ]
+    return any(m in low for m in howto_markers) and _count_query_tokens(low) >= 3
+
+
+def _structured_rescue_prefixes_for_query(q: str, planner: Optional[dict] = None) -> list[str]:
+    text_parts = [str(q or "")]
+    if isinstance(planner, dict):
+        text_parts.append(str(planner.get("normalized_query") or ""))
+    low = _normalize_unicode_advanced(" ".join(text_parts)).lower()
+
+    prefixes: list[str] = []
+    def add(prefix: str) -> None:
+        if prefix not in prefixes:
+            prefixes.append(prefix)
+
+    if any(x in low for x in ["procedur", "procedure", "operativ", "istruzion"]):
+        add("procedure")
+        add("step")
+    if any(x in low for x in ["step", "passagg", "fase"]):
+        add("step")
+        add("procedure")
+    if any(x in low for x in ["p&s", "problem solution", "problema", "problematic", "soluzione", "solution"]):
+        add("ps")
+    if any(x in low for x in ["foto", "photo", "immagin", "image"]):
+        add("md_photo")
+    if "video" in low:
+        add("md_video")
+
+    if not prefixes:
+        prefixes = ["procedure", "step", "ps", "md_photo", "md_video"]
+
+    return prefixes
+
+
+def _structured_rescue_terms(q: str, planner: Optional[dict] = None, limit: int = 10) -> list[str]:
+    texts = [str(q or "")]
+    if isinstance(planner, dict):
+        texts.append(str(planner.get("normalized_query") or ""))
+        texts.extend(str(x or "") for x in (planner.get("lexical_queries") or []))
+        texts.extend(str(x or "") for x in (planner.get("dense_queries") or []))
+
+    raw = _normalize_unicode_advanced(" ".join(texts)).lower()
+    raw = re.sub(r"[^a-z0-9à-öø-ÿ]+", " ", raw)
+
+    stop = {
+        "the", "and", "for", "with", "when", "while", "during", "after", "before", "from",
+        "this", "that", "these", "those", "question", "answer", "issue", "problem", "machine",
+        "document", "documents", "manual", "what", "should", "how", "does", "there", "exist",
+        "il", "lo", "la", "i", "gli", "le", "con", "per", "quando", "durante", "mentre", "dopo", "prima",
+        "questo", "questa", "questi", "queste", "domanda", "risposta", "documenti", "documento",
+        "macchina", "sistema", "esiste", "conosci", "info", "informazioni", "quali", "altre", "questa",
+        "come", "faccio", "fare", "posso", "devo", "cosa", "controllare", "hai", "sulla", "sul",
+        # Do not use source-type words as content terms; prefixes handle them.
+        "procedura", "procedure", "step", "passaggio", "passaggi", "problema", "soluzione", "foto", "video",
+    }
+
+    terms: list[str] = []
+    seen = set()
+    for tok in raw.split():
+        tok = tok.strip()
+        if len(tok) < 3 or tok in stop or tok in seen:
+            continue
+        seen.add(tok)
+        terms.append(tok)
+        if len(terms) >= limit:
+            break
+    return terms
+
+
+def _fetch_structured_rescue_candidates(
+    *,
+    company_id: str,
+    machine_id: str,
+    q: str,
+    planner: Optional[dict],
+    top_k: int,
+    doc_ids: Optional[list[str]] = None,
+    bubble_document_id: Optional[str] = None,
+) -> list[dict]:
+    if not STRUCTURED_RESCUE_ENABLED:
+        return []
+    if doc_ids or bubble_document_id:
+        return []
+    if not _structured_rescue_query_intent(q, planner):
+        return []
+
+    prefixes = _structured_rescue_prefixes_for_query(q, planner)
+    terms = _structured_rescue_terms(q, planner)
+
+    like_clauses = " OR ".join(["bubble_document_id LIKE %s" for _ in prefixes])
+    params: list[Any] = [ASK_SNIPPET_CHARS]
+    params.extend([f"{p}:%" for p in prefixes])
+    params.extend([company_id, machine_id, STRUCTURED_RESCUE_SCAN_LIMIT])
+
+    conn = _db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT bubble_document_id, chunk_index, page_from, page_to,
+                       left(chunk_text, %s) AS snippet,
+                       left(chunk_text, 2000) AS chunk_full
+                FROM public.document_chunks
+                WHERE ({like_clauses})
+                  AND company_id = %s
+                  AND embedding IS NOT NULL
+                  AND (machine_id = %s OR machine_id IS NULL OR machine_id = '')
+                ORDER BY bubble_document_id, chunk_index
+                LIMIT %s;
+                """,
+                params,
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        return []
+
+    low_q = _normalize_unicode_advanced(str(q or "")).lower()
+    scored: list[dict] = []
+
+    for (bdid, chunk_index, page_from, page_to, snippet, chunk_full) in rows:
+        bdid_s = str(bdid or "")
+        st = _source_type_from_document_id(bdid_s)
+        text = _normalize_unicode_advanced((chunk_full or snippet or "")).lower()
+
+        term_hits = sum(1 for t in terms if t in text)
+        phrase_bonus = 0.0
+        if len(terms) >= 2:
+            for i in range(len(terms) - 1):
+                if f"{terms[i]} {terms[i + 1]}" in text:
+                    phrase_bonus += 1.25
+
+        source_bonus = 0.0
+        if st == "procedure" and any(x in low_q for x in ["procedur", "procedure", "operativ", "istruzion"]):
+            source_bonus += 1.20
+        if st == "step" and any(x in low_q for x in ["step", "passagg", "fase"]):
+            source_bonus += 1.00
+        if st == "ps" and any(x in low_q for x in ["p&s", "problem", "problema", "soluzione", "solution"]):
+            source_bonus += 1.00
+        if st == "md_photo" and any(x in low_q for x in ["foto", "photo", "immagin", "image"]):
+            source_bonus += 1.00
+        if st == "md_video" and "video" in low_q:
+            source_bonus += 1.00
+
+        # If the query has content terms, require at least one content hit.
+        # If it has no content terms but is a pure listing query, source_bonus/source type is enough.
+        if terms and term_hits <= 0:
+            continue
+
+        score = float(term_hits) + phrase_bonus + source_bonus
+        if score <= 0:
+            continue
+
+        similarity = min(0.84, 0.58 + 0.045 * term_hits + 0.045 * phrase_bonus + 0.04 * source_bonus)
+        retrieval_score = min(0.92, similarity + 0.09)
+        citation_id = f"{bdid_s}:p{int(page_from)}-{int(page_to)}:c{int(chunk_index)}"
+
+        scored.append(
+            {
+                "citation_id": citation_id,
+                "bubble_document_id": bdid_s,
+                "chunk_index": int(chunk_index),
+                "page_from": int(page_from),
+                "page_to": int(page_to),
+                "snippet": (snippet or "").strip(),
+                "chunk_full": (chunk_full or "").strip(),
+                "similarity": float(similarity),
+                "retrieval_score": float(retrieval_score),
+                "source_type": st,
+                "structured_rescue": True,
+                "structured_rescue_score": float(score),
+                "overlap_score": min(1.0, 0.18 * term_hits + 0.10 * phrase_bonus),
+                "specificity_score": 0.08,
+                "embedding_list": [],
+            }
+        )
+
+    scored.sort(
+        key=lambda x: (
+            -float(x.get("structured_rescue_score") or 0.0),
+            0 if str(x.get("source_type")) == "procedure" else 1,
+            str(x.get("bubble_document_id") or ""),
+            int(x.get("chunk_index") or 0),
+        )
+    )
+    return _dedup_citations_by_snippet(scored, max_items=max(1, min(top_k, STRUCTURED_RESCUE_MAX_HITS)))
+
+
+def _promote_structured_rescue_hits(
+    selected_citations: list[dict],
+    structured_hits: list[dict],
+    top_k: int,
+) -> list[dict]:
+    if not structured_hits:
+        return selected_citations or []
+
+    out: list[dict] = []
+    used: set[str] = set()
+
+    for h in structured_hits:
+        cid = str(h.get("citation_id") or "").strip()
+        if not cid or cid in used:
+            continue
+        out.append(h)
+        used.add(cid)
+        if len(out) >= min(STRUCTURED_RESCUE_MAX_HITS, top_k):
+            break
+
+    for c in selected_citations or []:
+        cid = str(c.get("citation_id") or "").strip()
+        if not cid or cid in used:
+            continue
+        out.append(c)
+        used.add(cid)
+        if len(out) >= top_k:
+            break
+
+    return _dedup_citations_by_snippet(out, max_items=top_k)
+
+
 def _dense_candidates_multi_query(
     *,
     query_texts: list[str],
@@ -3271,6 +3530,20 @@ def _shared_semantic_retrieval(
     query_style = str((planner or {}).get("query_style") or "").strip().lower()
     query_token_count = _count_query_tokens(q)
 
+    structured_rescue_hits: list[dict] = []
+    # Keep root-cause diagnostic retrieval untouched: this rescue is for Ask/how-to
+    # and draft support, where exact structured records must not be hidden by manuals.
+    if not diagnostic_mode and str(planner_mode or "").strip().lower() != "root_cause":
+        structured_rescue_hits = _fetch_structured_rescue_candidates(
+            company_id=company_id,
+            machine_id=machine_id,
+            q=q,
+            planner=planner,
+            top_k=top_k,
+            doc_ids=doc_ids,
+            bubble_document_id=bubble_document_id,
+        )
+
     if candidates:
         max_rrf = max(float(c.get("rrf_score", 0.0)) for c in candidates) if candidates else 0.0
         prepared: list[dict] = []
@@ -3402,6 +3675,13 @@ def _shared_semantic_retrieval(
             top_k=top_k,
             diagnostic_mode=diagnostic_mode,
             query_token_count=query_token_count,
+        )
+
+    if structured_rescue_hits:
+        selected_citations = _promote_structured_rescue_hits(
+            selected_citations=selected_citations,
+            structured_hits=structured_rescue_hits,
+            top_k=top_k,
         )
 
     return {
