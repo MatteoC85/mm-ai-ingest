@@ -143,8 +143,9 @@ STRUCTURED_SOURCE_TYPES = {
 class IngestRequest(BaseModel):
     file_url: str
     company_id: str
-    machine_id: str
+    machine_id: Optional[str] = None
     bubble_document_id: str
+    ai_scope: Optional[str] = None
     plan_embed_chars_limit_total: Optional[int] = None
     plan_index_storage_limit_bytes: Optional[int] = None
     embed_chars_used_total: Optional[int] = None
@@ -155,9 +156,10 @@ class IngestRequest(BaseModel):
 
 class IndexDocumentRequest(BaseModel):
     company_id: str
-    machine_id: str
+    machine_id: Optional[str] = None
     bubble_document_id: str
     trace_id: Optional[str] = None
+    ai_scope: Optional[str] = None
 
 
 class SearchRequest(BaseModel):
@@ -173,6 +175,7 @@ class AskRequest(BaseModel):
     machine_id: Optional[str] = None
     bubble_document_id: Optional[str] = None
     document_ids: Optional[Union[List[str], str]] = None
+    ai_scope: Optional[str] = None
     top_k: int = 5
     debug: Optional[bool] = False
 
@@ -183,6 +186,7 @@ class RootCauseRequest(BaseModel):
     machine_id: Optional[str] = None
     bubble_document_id: Optional[str] = None
     document_ids: Optional[Union[List[str], str]] = None
+    ai_scope: Optional[str] = None
     top_k: int = 8
     max_causes: int = 3
     debug: Optional[bool] = False
@@ -198,6 +202,7 @@ class DraftPSRequest(BaseModel):
     machine_id: Optional[str] = None
     bubble_document_id: Optional[str] = None
     document_ids: Optional[Union[List[str], str]] = None
+    ai_scope: Optional[str] = None
     language: Optional[str] = None
     options: Optional[DraftPSOptions] = None
     debug: Optional[bool] = False
@@ -239,28 +244,77 @@ def _normalize_document_ids(value: Optional[Union[List[str], str]]) -> Optional[
 
     return None
 
+COMPANY_GENERAL_MACHINE_SENTINEL = "__MM_COMPANY_GENERAL__"
+
+
+def _normalize_ai_scope(value: Optional[str]) -> str:
+    s = str(value or "").strip().lower()
+
+    if not s:
+        return "machine_all"
+
+    if s in {"machine", "machine_all", "machine_all_plus_company"}:
+        return "machine_all"
+
+    if s in {"company", "company_general", "company_only", "general"}:
+        return "company_general"
+
+    if s in {"document_ids", "documents", "document"}:
+        return "document_ids"
+
+    raise HTTPException(status_code=400, detail=f"Unsupported ai_scope: {value}")
+
+
 def _resolve_query_scope(
     company_id: str,
     machine_id: Optional[str],
     bubble_document_id: Optional[str] = None,
     document_ids: Optional[Union[List[str], str]] = None,
+    ai_scope: Optional[str] = None,
 ) -> dict:
     company_id = (company_id or "").strip()
     if not company_id:
         raise HTTPException(status_code=400, detail="Missing company_id")
 
-    machine_id = (machine_id or "").strip()
-    if not machine_id:
-        raise HTTPException(status_code=400, detail="Missing machine_id")
+    explicit_scope = bool(str(ai_scope or "").strip())
+    resolved_scope = _normalize_ai_scope(ai_scope)
 
+    machine_id = (machine_id or "").strip()
     bubble_document_id = (bubble_document_id or "").strip() or None
     doc_ids = _normalize_document_ids(document_ids)
+
+    # Pagina Machines: solo conoscenza aziendale generale.
+    # Usiamo un machine_id sentinella: con i filtri SQL aggiornati prenderà solo
+    # machine_id NULL oppure machine_id = ''.
+    if resolved_scope == "company_general":
+        machine_id = COMPANY_GENERAL_MACHINE_SENTINEL
+        bubble_document_id = None
+        doc_ids = None
+
+    # Compatibilità vecchia: se NON viene passato ai_scope ma arrivano document_ids
+    # o bubble_document_id, mantieni il vecchio comportamento ristretto ai documenti.
+    elif resolved_scope == "document_ids" or (not explicit_scope and (doc_ids or bubble_document_id)):
+        resolved_scope = "document_ids"
+        if not machine_id:
+            machine_id = COMPANY_GENERAL_MACHINE_SENTINEL
+
+    # Nuovo comportamento pulito: machine_all significa davvero tutta la macchina.
+    # Se ai_scope è esplicito, ignora eventuali document_ids rimasti per errore da Bubble.
+    else:
+        resolved_scope = "machine_all"
+        if not machine_id:
+            raise HTTPException(status_code=400, detail="Missing machine_id")
+
+        if explicit_scope:
+            bubble_document_id = None
+            doc_ids = None
 
     return {
         "company_id": company_id,
         "machine_id": machine_id,
         "bubble_document_id": bubble_document_id,
         "document_ids": doc_ids,
+        "ai_scope": resolved_scope,
     }
 
 def _fetch_dense_chunk_candidates(
@@ -320,7 +374,7 @@ def _fetch_dense_chunk_candidates(
                         WHERE company_id=%s
                           AND bubble_document_id=%s
                           AND embedding IS NOT NULL
-                          AND (machine_id=%s OR machine_id IS NULL);
+                          AND (machine_id=%s OR machine_id IS NULL OR machine_id = '');
                         """,
                         (company_id, bdid, machine_id),
                     )
@@ -337,7 +391,7 @@ def _fetch_dense_chunk_candidates(
                     WHERE company_id = %s
                       AND bubble_document_id = %s
                       AND embedding IS NOT NULL
-                      AND (machine_id = %s OR machine_id IS NULL)
+                      AND (machine_id = %s OR machine_id IS NULL OR machine_id = '')
                     ORDER BY embedding <=> %s::vector, bubble_document_id, page_from, chunk_index
                     LIMIT %s;
                     """,
@@ -352,7 +406,7 @@ def _fetch_dense_chunk_candidates(
                         FROM public.document_chunks
                         WHERE company_id=%s
                           AND embedding IS NOT NULL
-                          AND (machine_id=%s OR machine_id IS NULL);
+                          AND (machine_id=%s OR machine_id IS NULL OR machine_id = '');
                         """,
                         (company_id, machine_id),
                     )
@@ -368,7 +422,7 @@ def _fetch_dense_chunk_candidates(
                     FROM public.document_chunks
                     WHERE company_id = %s
                       AND embedding IS NOT NULL
-                      AND (machine_id = %s OR machine_id IS NULL)
+                      AND (machine_id = %s OR machine_id IS NULL OR machine_id = '')
                     ORDER BY embedding <=> %s::vector, bubble_document_id, page_from, chunk_index
                     LIMIT %s;
                     """,
@@ -2284,10 +2338,10 @@ def _fts_search_chunks_prefix(
             elif bubble_document_id:
                 where.append("bubble_document_id = %s")
                 params.append(bubble_document_id)
-                where.append("(machine_id = %s OR machine_id IS NULL)")
+                where.append("(machine_id = %s OR machine_id IS NULL OR machine_id = '')")
                 params.append(machine_id)
             else:
-                where.append("(machine_id = %s OR machine_id IS NULL)")
+                where.append("(machine_id = %s OR machine_id IS NULL OR machine_id = '')")
                 params.append(machine_id)
 
             where_sql = " AND ".join(where)
@@ -3944,10 +3998,10 @@ def _db_find_token_chunk(
             elif bubble_document_id:
                 where.append("bubble_document_id = %s")
                 params.append(bubble_document_id)
-                where.append("(machine_id = %s OR machine_id IS NULL)")
+                where.append("(machine_id = %s OR machine_id IS NULL OR machine_id = '')")
                 params.append(machine_id)
             else:
-                where.append("(machine_id = %s OR machine_id IS NULL)")
+                where.append("(machine_id = %s OR machine_id IS NULL OR machine_id = '')")
                 params.append(machine_id)
 
             where_sql = " AND ".join(where)
@@ -4013,10 +4067,10 @@ def _db_find_entity_chunk(
             elif bubble_document_id:
                 where.append("bubble_document_id = %s")
                 params.append(bubble_document_id)
-                where.append("(machine_id = %s OR machine_id IS NULL)")
+                where.append("(machine_id = %s OR machine_id IS NULL OR machine_id = '')")
                 params.append(machine_id)
             else:
-                where.append("(machine_id = %s OR machine_id IS NULL)")
+                where.append("(machine_id = %s OR machine_id IS NULL OR machine_id = '')")
                 params.append(machine_id)
 
             where_sql = " AND ".join(where)
@@ -4191,10 +4245,10 @@ def _fts_search_chunks(
             elif bubble_document_id:
                 where.append("bubble_document_id = %s")
                 params.append(bubble_document_id)
-                where.append("(machine_id = %s OR machine_id IS NULL)")
+                where.append("(machine_id = %s OR machine_id IS NULL OR machine_id = '')")
                 params.append(machine_id)
             else:
-                where.append("(machine_id = %s OR machine_id IS NULL)")
+                where.append("(machine_id = %s OR machine_id IS NULL OR machine_id = '')")
                 params.append(machine_id)
 
             where_sql = " AND ".join(where)
@@ -7002,8 +7056,18 @@ def ingest_document(
     company_id = (payload.company_id or "").strip()
     machine_id = (payload.machine_id or "").strip()
     bubble_document_id = (payload.bubble_document_id or "").strip()
-    if not (company_id and machine_id and bubble_document_id):
-        raise HTTPException(status_code=400, detail="Missing company_id/machine_id/bubble_document_id")
+
+    ingest_scope = _normalize_ai_scope(payload.ai_scope)
+    if ingest_scope == "document_ids":
+        ingest_scope = "machine_all"
+
+    if ingest_scope == "company_general":
+        machine_id = ""
+    elif not machine_id:
+        raise HTTPException(status_code=400, detail="Missing machine_id")
+
+    if not (company_id and bubble_document_id):
+        raise HTTPException(status_code=400, detail="Missing company_id/bubble_document_id")
 
     url = payload.file_url.strip()
     if url.startswith("//"):
@@ -7226,6 +7290,7 @@ def ingest_document(
             "machine_id": machine_id,
             "bubble_document_id": bubble_document_id,
             "trace_id": "ingest_auto",
+            "ai_scope": ingest_scope,
         }
 
         task = {
@@ -7420,8 +7485,17 @@ def index_document(
     bubble_document_id = (payload.bubble_document_id or "").strip()
     trace_id = (payload.trace_id or "").strip() or None
 
-    if not (company_id and machine_id and bubble_document_id):
-        raise HTTPException(status_code=400, detail="Missing company_id/machine_id/bubble_document_id")
+    index_scope = _normalize_ai_scope(payload.ai_scope)
+    if index_scope == "document_ids":
+        index_scope = "machine_all"
+
+    if index_scope == "company_general":
+        machine_id = ""
+    elif not machine_id:
+        raise HTTPException(status_code=400, detail="Missing machine_id")
+
+    if not (company_id and bubble_document_id):
+        raise HTTPException(status_code=400, detail="Missing company_id/bubble_document_id")
 
     header_norm, footer_norm = _db_get_cleaning_meta(company_id, bubble_document_id)
 
@@ -7844,6 +7918,7 @@ def _ask_v1_baseline_impl(
         machine_id=payload.machine_id,
         bubble_document_id=payload.bubble_document_id,
         document_ids=payload.document_ids,
+        ai_scope=payload.ai_scope,
     )
     company_id = scope["company_id"]
     machine_id = scope["machine_id"]
@@ -7862,6 +7937,7 @@ def _ask_v1_baseline_impl(
                 machine_id=machine_id,
                 bubble_document_id=bubble_document_id,
                 document_ids=doc_ids,
+                ai_scope=scope.get("ai_scope"),
                 top_k=max(6, top_k),
                 max_causes=2,
                 debug=payload.debug,
@@ -8238,6 +8314,7 @@ def draft_ps_v1(
         machine_id=payload.machine_id,
         bubble_document_id=payload.bubble_document_id,
         document_ids=payload.document_ids,
+        ai_scope=payload.ai_scope,
     )
     company_id = scope["company_id"]
     machine_id = scope["machine_id"]
@@ -8552,6 +8629,7 @@ def _root_cause_v1_baseline_impl(
         machine_id=payload.machine_id,
         bubble_document_id=payload.bubble_document_id,
         document_ids=payload.document_ids,
+        ai_scope=payload.ai_scope,
     )
     company_id = scope["company_id"]
     machine_id = scope["machine_id"]
@@ -10004,6 +10082,7 @@ def _ask_v1_candidate_impl(
         machine_id=payload.machine_id,
         bubble_document_id=payload.bubble_document_id,
         document_ids=payload.document_ids,
+        ai_scope=payload.ai_scope,
     )
     company_id = scope["company_id"]
     machine_id = scope["machine_id"]
@@ -10182,6 +10261,7 @@ def _root_cause_v1_candidate_impl(
         machine_id=payload.machine_id,
         bubble_document_id=payload.bubble_document_id,
         document_ids=payload.document_ids,
+        ai_scope=payload.ai_scope,
     )
     company_id = scope["company_id"]
     machine_id = scope["machine_id"]
