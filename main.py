@@ -655,19 +655,11 @@ def _db_get_index_usage(company_id: str, bubble_document_id: Optional[str] = Non
     finally:
         conn.close()
 
-def _build_rg_links(company_id: str, citations: list[dict]) -> list[dict]:
-    if not citations:
-        return []
-
-    doc_ids = sorted(
-        {
-            str(c.get("bubble_document_id") or "").strip()
-            for c in citations
-            if c.get("bubble_document_id")
-        }
-    )
-    if not doc_ids:
-        return []
+def _fetch_document_file_map(company_id: str, doc_ids: list[str]) -> dict[str, str]:
+    company_id = (company_id or "").strip()
+    doc_ids = sorted({str(x or "").strip() for x in (doc_ids or []) if str(x or "").strip()})
+    if not company_id or not doc_ids:
+        return {}
 
     conn = _db_conn()
     try:
@@ -682,9 +674,190 @@ def _build_rg_links(company_id: str, citations: list[dict]) -> list[dict]:
                 (company_id, doc_ids),
             )
             rows = cur.fetchall()
-            file_map = {str(bdid): (url or "").strip() for (bdid, url) in rows if bdid and url}
+            return {str(bdid): (url or "").strip() for (bdid, url) in rows if bdid and url}
     finally:
         conn.close()
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None or value == "":
+            return default
+        return int(value)
+    except Exception:
+        return default
+
+
+def _clean_display_text(value: Any, max_len: int = 140) -> str:
+    text = re.sub(r"\s+", " ", str(value or "").strip())
+    text = text.strip(" -–—:;,.\t\n")
+    if max_len and len(text) > max_len:
+        text = text[: max_len - 1].rstrip() + "…"
+    return text
+
+
+def _title_from_file_url(file_url: str) -> str:
+    file_url = str(file_url or "").strip()
+    if not file_url:
+        return ""
+
+    try:
+        parsed = urlparse(file_url.split("#", 1)[0].split("?", 1)[0])
+        name = unquote((parsed.path or "").rstrip("/").split("/")[-1])
+    except Exception:
+        name = ""
+
+    name = re.sub(r"[_-]+", " ", name or "")
+    name = re.sub(r"\.(pdf|docx?|xlsx?|pptx?|txt|png|jpe?g|webp|mp4|mov|avi)$", "", name, flags=re.IGNORECASE)
+    return _clean_display_text(name, max_len=90)
+
+
+def _parse_structured_source_fields(text: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for raw_line in str(text or "").replace("\r", "\n").split("\n"):
+        line = raw_line.strip()
+        if not line or ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        key = re.sub(r"\s+", "_", key.strip().lower())
+        value = _clean_display_text(value, max_len=240)
+        if key and value and key not in fields:
+            fields[key] = value
+    return fields
+
+
+def _source_display_meta_for_citation(c: dict, file_url: str = "") -> dict:
+    c = c or {}
+    bdid = str(c.get("bubble_document_id") or "").strip()
+    source_kind = _source_type_from_document_id(bdid)
+    raw_prefix = bdid.split(":", 1)[0].strip().lower() if ":" in bdid else ""
+    if source_kind == "manual" and raw_prefix in {"problem_solution", "problemsolution"}:
+        source_kind = "ps"
+    source_id = bdid.split(":", 1)[1].strip() if ":" in bdid else bdid
+
+    snippet_for_meta = (
+        c.get("chunk_full")
+        or c.get("snippet")
+        or c.get("snippet_clean")
+        or ""
+    )
+    fields = _parse_structured_source_fields(snippet_for_meta)
+
+    page_from = _safe_int(c.get("page_from"), 0)
+    page_to = _safe_int(c.get("page_to"), page_from)
+
+    display_title = ""
+    display_location = ""
+    display_label = ""
+
+    if source_kind == "procedure":
+        title = _clean_display_text(fields.get("title") or fields.get("short_description") or "Procedura", max_len=90)
+        display_title = title
+        display_label = f"Procedura: {title}" if title else "Procedura"
+
+    elif source_kind == "step":
+        title = _clean_display_text(fields.get("title") or fields.get("description") or "Step", max_len=90)
+        step_no = _clean_display_text(fields.get("step_number") or "", max_len=20)
+        display_title = title
+        display_location = f"Step {step_no}" if step_no else "Step"
+        if step_no and title and title.lower() != "step":
+            display_label = f"Step {step_no}: {title}"
+        elif title and title.lower() != "step":
+            display_label = f"Step: {title}"
+        else:
+            display_label = display_location
+
+    elif source_kind == "ps":
+        title = _clean_display_text(fields.get("title") or fields.get("category") or fields.get("description") or "P&S", max_len=90)
+        category = _clean_display_text(fields.get("category") or "", max_len=60)
+        display_title = title
+        if category and category.lower() not in title.lower():
+            display_label = f"P&S: {title} — Categoria: {category}"
+        else:
+            display_label = f"P&S: {title}" if title else "P&S"
+
+    elif source_kind == "md_photo":
+        title = _clean_display_text(fields.get("title") or fields.get("description") or "Foto", max_len=90)
+        display_title = title
+        display_label = f"Foto: {title}" if title and title.lower() != "foto" else "Foto"
+
+    elif source_kind == "md_video":
+        title = _clean_display_text(fields.get("title") or fields.get("description") or "Video", max_len=90)
+        display_title = title
+        display_label = f"Video: {title}" if title and title.lower() != "video" else "Video"
+
+    else:
+        source_kind = "document"
+        title = (
+            _clean_display_text(str(c.get("display_title") or ""), max_len=90)
+            or _title_from_file_url(file_url)
+            or "Documento"
+        )
+        display_title = title
+        if page_from > 0 and page_to > page_from:
+            display_location = f"pag. {page_from}/{page_to}"
+        elif page_from > 0:
+            display_location = f"pag. {page_from}"
+        else:
+            display_location = ""
+        display_label = f"{display_title} - {display_location}" if display_location else display_title
+
+    display_title = _clean_display_text(display_title, max_len=100)
+    display_location = _clean_display_text(display_location, max_len=60)
+    display_label = _clean_display_text(display_label or display_title or bdid, max_len=160)
+
+    return {
+        "source_type": source_kind,
+        "source_id": source_id,
+        "is_structured_source": bool(_is_structured_source_key(bdid) or source_kind in STRUCTURED_SOURCE_TYPES),
+        "display_title": display_title,
+        "display_location": display_location,
+        "display_label": display_label,
+    }
+
+
+def _format_citation_note_lines(citations: list[dict], *, language: str = "it", max_items: int = 6) -> str:
+    citations = [c for c in (citations or []) if isinstance(c, dict)]
+    if not citations:
+        return ""
+
+    header = "Evidence used:" if str(language or "").lower().startswith("en") else "Fonti utilizzate:"
+    lines = [header]
+    seen = set()
+
+    for c in citations:
+        label = _clean_display_text(c.get("display_label") or c.get("citation_id") or "Fonte", max_len=160)
+        if not label or label in seen:
+            continue
+        seen.add(label)
+
+        snippet = _clean_display_text(c.get("snippet_clean") or c.get("snippet") or "", max_len=260)
+        if snippet:
+            lines.append(f"- {label} — {snippet}")
+        else:
+            lines.append(f"- {label}")
+
+        if len(lines) - 1 >= max_items:
+            break
+
+    return "\n".join(lines).strip()
+
+
+def _build_rg_links(company_id: str, citations: list[dict]) -> list[dict]:
+    if not citations:
+        return []
+
+    doc_ids = sorted(
+        {
+            str(c.get("bubble_document_id") or "").strip()
+            for c in citations
+            if c.get("bubble_document_id")
+        }
+    )
+    if not doc_ids:
+        return []
+
+    file_map = _fetch_document_file_map(company_id, doc_ids)
 
     out: list[dict] = []
     for c in citations:
@@ -697,20 +870,22 @@ def _build_rg_links(company_id: str, citations: list[dict]) -> list[dict]:
             continue
 
         base = file_url.split("#", 1)[0]
-        page_from = int(c.get("page_from") or 1)
+        page_from = _safe_int(c.get("page_from"), 1)
         if page_from < 1:
             page_from = 1
 
-        is_structured = _is_structured_source_key(bdid)
+        meta = _source_display_meta_for_citation(c, file_url=file_url)
+        is_structured = bool(meta.get("is_structured_source"))
         final_url = file_url if is_structured else f"{base}#page={page_from}"
 
         out.append(
             {
                 "citation_id": c.get("citation_id"),
                 "bubble_document_id": bdid,
-                "page_from": int(c.get("page_from") or page_from),
-                "page_to": int(c.get("page_to") or page_from),
+                "page_from": _safe_int(c.get("page_from"), page_from),
+                "page_to": _safe_int(c.get("page_to"), page_from),
                 "url": final_url,
+                **meta,
             }
         )
 
@@ -6202,33 +6377,52 @@ def _diagnostic_evidence_pipeline(
     return result
 
 
-def _sanitize_citations_for_response(citations: list[dict]) -> list[dict]:
+def _sanitize_citations_for_response(citations: list[dict], company_id: Optional[str] = None) -> list[dict]:
     out: list[dict] = []
 
+    doc_ids = sorted(
+        {
+            str(c.get("bubble_document_id") or "").strip()
+            for c in citations or []
+            if isinstance(c, dict) and c.get("bubble_document_id")
+        }
+    )
+
+    file_map: dict[str, str] = {}
+    if company_id and doc_ids:
+        try:
+            file_map = _fetch_document_file_map(company_id, doc_ids)
+        except Exception as e:
+            print("CITATION_FILE_MAP_FAIL", str(e))
+            file_map = {}
+
     for c in citations or []:
+        if not isinstance(c, dict):
+            continue
+
         cid = str(c.get("citation_id") or "").strip()
         bdid = str(c.get("bubble_document_id") or "").strip()
 
         if not cid or not bdid:
             continue
 
-        raw_snippet = (c.get("snippet") or "").strip()
+        raw_snippet = (c.get("snippet") or c.get("chunk_full") or "").strip()
 
         clean_snippet = re.sub(r"^SECTION:\s*[^\n]+\n?", "", raw_snippet, flags=re.IGNORECASE).strip()
         clean_snippet = re.sub(r"\s*\n\s*", " ", clean_snippet)
         clean_snippet = re.sub(r"\s+", " ", clean_snippet).strip()
 
-        out.append(
-            {
-                "citation_id": cid,
-                "bubble_document_id": bdid,
-                "page_from": int(c.get("page_from") or 0),
-                "page_to": int(c.get("page_to") or 0),
-                "snippet": raw_snippet,
-                "snippet_clean": clean_snippet,
-                "similarity": float(c.get("similarity") or c.get("retrieval_score") or 0.0),
-            }
-        )
+        base = {
+            "citation_id": cid,
+            "bubble_document_id": bdid,
+            "page_from": _safe_int(c.get("page_from"), 0),
+            "page_to": _safe_int(c.get("page_to"), 0),
+            "snippet": raw_snippet,
+            "snippet_clean": clean_snippet,
+            "similarity": float(c.get("similarity") or c.get("retrieval_score") or 0.0),
+        }
+        base.update(_source_display_meta_for_citation({**c, **base}, file_url=file_map.get(bdid, "")))
+        out.append(base)
 
     return out
 
@@ -7873,7 +8067,7 @@ def _build_ask_response_from_root_cause_bridge(
     if not answer or not final_citations:
         return None
 
-    response_citations = _sanitize_citations_for_response(final_citations)
+    response_citations = _sanitize_citations_for_response(final_citations, company_id=company_id)
     rg_links = []
     try:
         rg_links = _build_rg_links(company_id, response_citations)
@@ -8091,7 +8285,7 @@ def _ask_v1_baseline_impl(
                     "ok": True,
                     "status": "answered",
                     "answer": _localized_value_answer(response_language, value, c["citation_id"]),
-                    "citations": _sanitize_citations_for_response(citations),
+                    "citations": _sanitize_citations_for_response(citations, company_id=company_id),
                     "rg_links": rg_links,
                     "top_k": top_k,
                     "similarity_max": sim_max,
@@ -8134,7 +8328,7 @@ def _ask_v1_baseline_impl(
                         "ok": True,
                         "status": "answered",
                         "answer": _localized_value_answer(response_language, hit["value"], hit["citation_id"]),
-                        "citations": _sanitize_citations_for_response(cit_list),
+                        "citations": _sanitize_citations_for_response(cit_list, company_id=company_id),
                         "rg_links": rg_links,
                         "top_k": top_k,
                         "similarity_max": sim_max,
@@ -8173,7 +8367,7 @@ def _ask_v1_baseline_impl(
                         "ok": True,
                         "status": "answered",
                         "answer": _localized_token_answer(response_language, matched_token, hit["citation_id"]),
-                        "citations": _sanitize_citations_for_response(cit_list),
+                        "citations": _sanitize_citations_for_response(cit_list, company_id=company_id),
                         "rg_links": rg_links,
                         "top_k": top_k,
                         "similarity_max": sim_max,
@@ -8272,7 +8466,7 @@ def _ask_v1_baseline_impl(
     if not _looks_like_target_language(answer, response_language):
         answer = _translate_text_preserving_citations(answer, response_language)
 
-    response_citations = _sanitize_citations_for_response(final_citations)
+    response_citations = _sanitize_citations_for_response(final_citations, company_id=company_id)
 
     rg_links = []
     try:
@@ -8390,6 +8584,11 @@ def draft_ps_v1(
                 "possible_causes": [],
                 "citations": [],
                 "rg_links": [],
+                "citations_text": "",
+                "links_text": "",
+                "citations_text_clean": "",
+                "links_text_clean": "",
+                "notes_clean": "",
                 "meta": {
                     "top_k": top_k,
                     "max_causes": max_causes,
@@ -8572,6 +8771,11 @@ def draft_ps_v1(
                 "possible_causes": [],
                 "citations": [],
                 "rg_links": [],
+                "citations_text": "",
+                "links_text": "",
+                "citations_text_clean": "",
+                "links_text_clean": "",
+                "notes_clean": "",
                 "meta": {
                     "top_k": top_k,
                     "max_causes": max_causes,
@@ -8582,7 +8786,7 @@ def draft_ps_v1(
             }
         )
 
-    response_citations = _sanitize_citations_for_response(grounded_citations)
+    response_citations = _sanitize_citations_for_response(grounded_citations, company_id=company_id)
 
     rg_links = []
     try:
@@ -8590,6 +8794,14 @@ def draft_ps_v1(
     except Exception as e:
         print("RG_LINKS_FAIL", str(e))
         rg_links = []
+
+    citations_text_clean = _format_citation_note_lines(
+        response_citations,
+        language=language,
+        max_items=6,
+    )
+    links_text_clean = ""
+    notes_clean = citations_text_clean
 
     return _finalize(
         {
@@ -8600,6 +8812,11 @@ def draft_ps_v1(
             "possible_causes": grounded_result.get("possible_causes") or [],
             "citations": response_citations,
             "rg_links": rg_links,
+            "citations_text": citations_text_clean,
+            "links_text": links_text_clean,
+            "citations_text_clean": citations_text_clean,
+            "links_text_clean": links_text_clean,
+            "notes_clean": notes_clean,
             "meta": {
                 "top_k": top_k,
                 "max_causes": max_causes,
@@ -8916,7 +9133,7 @@ def _root_cause_v1_baseline_impl(
             }
         )
 
-    response_citations = _sanitize_citations_for_response(grounded_citations)
+    response_citations = _sanitize_citations_for_response(grounded_citations, company_id=company_id)
 
     rg_links = []
     try:
@@ -10221,7 +10438,7 @@ def _ask_v1_candidate_impl(
     if not _looks_like_target_language(answer, response_language):
         answer = _translate_text_preserving_citations(answer, response_language)
 
-    response_citations = _sanitize_citations_for_response(final_citations)
+    response_citations = _sanitize_citations_for_response(final_citations, company_id=company_id)
     rg_links = []
     try:
         rg_links = _build_rg_links(company_id, response_citations)
@@ -10474,7 +10691,7 @@ def _root_cause_v1_candidate_impl(
             }
         )
 
-    response_citations = _sanitize_citations_for_response(grounded_citations)
+    response_citations = _sanitize_citations_for_response(grounded_citations, company_id=company_id)
     rg_links = []
     try:
         rg_links = _build_rg_links(company_id, response_citations)
