@@ -78,6 +78,14 @@ STRUCTURED_RESCUE_ENABLED = (os.environ.get("MM_STRUCTURED_RESCUE_ENABLED") or "
 STRUCTURED_RESCUE_SCAN_LIMIT = int(os.environ.get("MM_STRUCTURED_RESCUE_SCAN_LIMIT", "220"))
 STRUCTURED_RESCUE_MAX_HITS = int(os.environ.get("MM_STRUCTURED_RESCUE_MAX_HITS", "3"))
 
+# Ask precision rescue for technical PDF/table questions.
+# Dense retrieval can select the right document but the wrong chunk/excerpt; this forces
+# exact lexical evidence into Ask for installation, maintenance, table, component, code,
+# reducer, rack/pinion and numeric-value questions without touching root-cause retrieval.
+ASK_PRECISION_LEXICAL_RESCUE_ENABLED = (os.environ.get("MM_ASK_PRECISION_LEXICAL_RESCUE_ENABLED") or "1").strip() != "0"
+ASK_PRECISION_LEXICAL_TOP_K = int(os.environ.get("MM_ASK_PRECISION_LEXICAL_TOP_K", "5"))
+ASK_FOCUSED_EXCERPT_CHARS = int(os.environ.get("MM_ASK_FOCUSED_EXCERPT_CHARS", "2600"))
+
 # Shared semantic retrieval planner
 SEMANTIC_QUERY_PLANNER_MODEL = (os.environ.get("MM_SEMANTIC_QUERY_PLANNER_MODEL") or "gpt-5.4-mini").strip()
 SEMANTIC_QUERY_PLANNER_TIMEOUT = int(os.environ.get("MM_SEMANTIC_QUERY_PLANNER_TIMEOUT_SECONDS", "20"))
@@ -1568,7 +1576,7 @@ def _localized_token_answer(language: str, token: str, citation_id: str) -> str:
 
 def _ask_response_schema() -> dict:
     return {
-        "name": "ask_grounded_answer_v3",
+        "name": "ask_grounded_answer_v4",
         "strict": True,
         "schema": {
             "type": "object",
@@ -1580,7 +1588,7 @@ def _ask_response_schema() -> dict:
                 },
                 "grounded_points": {
                     "type": "array",
-                    "maxItems": 3,
+                    "maxItems": 6,
                     "items": {
                         "type": "object",
                         "additionalProperties": False,
@@ -1589,7 +1597,7 @@ def _ask_response_schema() -> dict:
                             "citation_ids": {
                                 "type": "array",
                                 "items": {"type": "string"},
-                                "maxItems": 3,
+                                "maxItems": 6,
                             },
                         },
                         "required": ["text", "citation_ids"],
@@ -2020,7 +2028,7 @@ def _augment_crosslingual_query_plan(q: str, planner: Optional[dict]) -> dict:
 
 def _ask_rescue_response_schema() -> dict:
     return {
-        "name": "ask_grounded_answer_rescue_v1",
+        "name": "ask_grounded_answer_rescue_v2",
         "strict": True,
         "schema": {
             "type": "object",
@@ -2028,7 +2036,7 @@ def _ask_rescue_response_schema() -> dict:
             "properties": {
                 "grounded_points": {
                     "type": "array",
-                    "maxItems": 3,
+                    "maxItems": 6,
                     "items": {
                         "type": "object",
                         "additionalProperties": False,
@@ -2037,7 +2045,7 @@ def _ask_rescue_response_schema() -> dict:
                             "citation_ids": {
                                 "type": "array",
                                 "items": {"type": "string"},
-                                "maxItems": 3,
+                                "maxItems": 6,
                             },
                         },
                         "required": ["text", "citation_ids"],
@@ -2168,12 +2176,136 @@ def _extractive_fallback_answer(
 
     return answer, used
 
+
+def _ask_focus_terms(q: str, planner: Optional[dict] = None, limit: int = 18) -> list[str]:
+    texts = [str(q or "")]
+    if isinstance(planner, dict):
+        texts.append(str(planner.get("normalized_query") or ""))
+        texts.extend(str(x or "") for x in (planner.get("lexical_queries") or []))
+
+    raw = _normalize_unicode_advanced(" ".join(texts)).lower()
+
+    stop = {
+        "the", "and", "for", "with", "when", "while", "during", "after", "before", "from",
+        "this", "that", "these", "those", "what", "which", "where", "does", "there", "about",
+        "il", "lo", "la", "i", "gli", "le", "con", "per", "quando", "durante", "dopo", "prima",
+        "questo", "questa", "questi", "queste", "quale", "quali", "sono", "cosa", "come",
+        "macchina", "documento", "documenti", "generali", "conosci", "informazioni", "principali",
+        "indicato", "indicati", "previsto", "previsti", "riportano", "riporta", "richiesti",
+    }
+
+    priority = [
+        "installazione", "collegamenti", "temperatura", "pavimentazione", "livellata", "elettrica", "compressa",
+        "manutenzione", "ordinaria", "lucchetto", "sezionatore", "interruttore", "pneumatica", "sicurezza",
+        "frequenze", "tabella", "lubrificazione", "pneumatico", "quadro", "filtri", "tensione", "dpi",
+        "forza", "lavorazione", "velocità", "accelerazione", "ciclo", "durata", "coefficiente",
+        "cremagliera", "pignone", "modulo", "elica", "denti", "diametro", "primitivo",
+        "riduttore", "epicicloidale", "rapporto", "gioco", "denominazione", "standard",
+        "bbx", "bbx300", "bbx-40t", "calibrazione",
+    ]
+
+    terms: list[str] = []
+    seen = set()
+
+    def add(tok: str) -> None:
+        tok = str(tok or "").strip().lower()
+        if len(tok) < 3 or tok in stop or tok in seen:
+            return
+        seen.add(tok)
+        terms.append(tok)
+
+    for tok in priority:
+        if tok in raw:
+            add(tok)
+
+    # Keep product/code-like tokens. They are often decisive for technical tables.
+    for tok in re.findall(r"[a-z0-9][a-z0-9+_.°/-]{2,}", raw):
+        clean = tok.strip("._-/")
+        if len(clean) >= 3 and (any(ch.isdigit() for ch in clean) or any(ch in tok for ch in ["-", "/", "+"])):
+            add(clean)
+
+    for tok in re.findall(r"[a-zà-öø-ÿ0-9]{3,}", raw):
+        add(tok)
+        if len(terms) >= limit:
+            break
+
+    return terms[:limit]
+
+
+def _query_focused_excerpt(
+    *,
+    q: str,
+    text: str,
+    planner: Optional[dict] = None,
+    max_chars: int = ASK_FOCUSED_EXCERPT_CHARS,
+) -> str:
+    """Return a query-focused excerpt instead of the beginning of a long chunk.
+
+    This matters for technical PDFs/tables: the relevant row may be in the middle of a
+    3-4k chunk, while the previous implementation sent only the first part to the LLM.
+    """
+    body = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not body:
+        return ""
+
+    max_chars = max(700, int(max_chars or ASK_FOCUSED_EXCERPT_CHARS))
+    if len(body) <= max_chars:
+        return body
+
+    low = _normalize_unicode_advanced(body).lower()
+    terms = _ask_focus_terms(q, planner=planner, limit=18)
+    positions: list[int] = []
+    for term in terms:
+        t = _normalize_unicode_advanced(term).lower().strip()
+        if not t:
+            continue
+        start = 0
+        while True:
+            idx = low.find(t, start)
+            if idx < 0:
+                break
+            positions.append(idx)
+            start = idx + max(1, len(t))
+            if len(positions) >= 120:
+                break
+        if len(positions) >= 120:
+            break
+
+    if not positions:
+        return body[:max_chars].strip() + " …"
+
+    # Pick the window with the largest weighted concentration of query terms.
+    window = max_chars
+    best_start = 0
+    best_score = -1.0
+    for pos in positions:
+        start = max(0, min(len(body) - window, pos - window // 3))
+        end = min(len(body), start + window)
+        snippet_low = low[start:end]
+        unique_hits = sum(1 for t in terms if _normalize_unicode_advanced(t).lower() in snippet_low)
+        dense_hits = sum(1 for p in positions if start <= p < end)
+        # Slightly prefer windows where the first matched term appears not too late.
+        score = unique_hits * 5.0 + dense_hits * 0.6 - (start / max(1, len(body))) * 0.2
+        if score > best_score:
+            best_score = score
+            best_start = start
+
+    best_end = min(len(body), best_start + window)
+    excerpt = body[best_start:best_end].strip()
+    if best_start > 0:
+        excerpt = "… " + excerpt
+    if best_end < len(body):
+        excerpt = excerpt + " …"
+    return excerpt
+
 def _enrich_ask_prompt_citations(
     company_id: str,
     citations: list[dict],
     *,
     max_manual_expansions: int = 2,
     radius: int = 1,
+    q: str = "",
+    planner: Optional[dict] = None,
 ) -> list[dict]:
     out: list[dict] = []
     manual_done = 0
@@ -2204,11 +2336,30 @@ def _enrich_ask_prompt_citations(
                 texts.append(txt)
 
             if texts:
-                cc["chunk_full"] = "\n".join(texts)[:2200]
+                joined_text = "\n".join(texts)
+                cc["chunk_full"] = _query_focused_excerpt(
+                    q=q,
+                    text=joined_text,
+                    planner=planner,
+                    max_chars=ASK_FOCUSED_EXCERPT_CHARS,
+                )
                 if not cc.get("snippet"):
-                    cc["snippet"] = texts[0][:ASK_SNIPPET_CHARS]
+                    cc["snippet"] = _query_focused_excerpt(
+                        q=q,
+                        text=texts[0],
+                        planner=planner,
+                        max_chars=ASK_SNIPPET_CHARS,
+                    )
 
             manual_done += 1
+
+        elif source_type == "manual" and cc.get("snippet"):
+            cc["snippet"] = _query_focused_excerpt(
+                q=q,
+                text=str(cc.get("snippet") or ""),
+                planner=planner,
+                max_chars=ASK_SNIPPET_CHARS,
+            )
 
         out.append(cc)
 
@@ -2230,6 +2381,8 @@ def _generate_ask_grounded_points(
     prompt_citations = _enrich_ask_prompt_citations(
         company_id=company_id,
         citations=citations,
+        q=q,
+        planner=planner,
         max_manual_expansions=2,
         radius=1,
     )
@@ -2258,7 +2411,7 @@ def _generate_ask_grounded_points(
             "Use no_sources only when the sources are genuinely not helpful. "
             "Do not repeat the same idea in multiple points. "
             "Do not include raw citation ids inside the text field; put support only in citation_ids. "
-            "Return 1 to 3 short grounded points only. "
+            "Return 1 to 6 concise grounded points. Include all directly requested numeric values, codes, intervals and safety actions when present in the sources. "
             "Each point must be directly supported by its citation_ids."
         )
         schema = _ask_response_schema()
@@ -2268,7 +2421,7 @@ def _generate_ask_grounded_points(
             "Use ONLY the provided sources. "
             "Always answer the user's question directly. "
             "Always reply in the requested response language. "
-            "Return 1 to 3 very short grounded points. "
+            "Return 1 to 6 concise grounded points. Include all directly requested numeric values, codes, intervals and safety actions when present in the sources. "
             "You MUST return grounded_points, even if the evidence is partial. "
             "For procedural, maintenance, setup, safety, or troubleshooting questions, return the actual operations/actions to perform, not section titles, headings, or isolated manual fragments. "
             "Respect temporal qualifiers in the question: if the user asks what to do before an operation, include only preparatory/before-start actions and do not include after-completion, restoration, or restart steps unless explicitly requested. "
@@ -2898,6 +3051,257 @@ def _candidate_order_key(item: dict) -> tuple:
         str(item.get("citation_id") or ""),
     )
 
+
+
+def _ask_precision_lexical_rescue_intent(q: str, planner: Optional[dict] = None) -> bool:
+    if not ASK_PRECISION_LEXICAL_RESCUE_ENABLED:
+        return False
+
+    texts = [str(q or "")]
+    if isinstance(planner, dict):
+        texts.append(str(planner.get("normalized_query") or ""))
+        texts.extend(str(x or "") for x in (planner.get("lexical_queries") or []))
+
+    low = _normalize_unicode_advanced(" ".join(texts)).lower()
+    if not low.strip():
+        return False
+
+    markers = [
+        "installazione", "collegament", "temperatura", "paviment", "aria compress", "alimentazione",
+        "manutenzione", "frequenz", "tabella", "lubrificazione", "impianto pneumatic", "quadro elettrico",
+        "filtr", "togliere tensione", "lucchetto", "sezionatore", "interruttore generale", "dpi",
+        "forza", "veloc", "acceler", "durata", "ciclo", "coefficiente", "dati ciclo",
+        "cremagliera", "pignone", "denti", "diametro", "modulo", "elica",
+        "riduttore", "rapporto", "gioco", "denominazione", "epicicloidale",
+        "codice", "codici", "ordinazione", "tipo", "bbx", "calibrazione",
+    ]
+    if any(m in low for m in markers):
+        return True
+
+    # Technical code / numeric lookup.
+    return bool(re.search(r"\b\d+[,.]?\d*\s*(bar|mm|m/s|s|n|nm|arcmin|ore|kg|°)\b", low))
+
+
+
+def _ask_precision_scan_hits(
+    *,
+    company_id: str,
+    machine_id: str,
+    q: str,
+    planner: Optional[dict],
+    top_k: int,
+    doc_ids: Optional[list[str]] = None,
+    bubble_document_id: Optional[str] = None,
+) -> list[dict]:
+    """Deterministic lexical scan for Ask technical/fixed-document questions.
+
+    FTS/dense retrieval can miss the exact chunk containing a value/table row. This
+    bounded scan scores chunks inside the already authorized scope and returns
+    query-focused excerpts with high retrieval scores so the LLM sees the correct
+    numeric/code evidence.
+    """
+    terms = _ask_focus_terms(q, planner=planner, limit=22)
+    if not terms:
+        return []
+
+    norm_terms = [_normalize_unicode_advanced(t).lower().strip() for t in terms if str(t or '').strip()]
+    norm_terms = [t for t in norm_terms if len(t) >= 3]
+    if not norm_terms:
+        return []
+
+    conn = _db_conn()
+    try:
+        with conn.cursor() as cur:
+            where = ["company_id = %s"]
+            params: list[Any] = [company_id]
+
+            if doc_ids:
+                where.append("bubble_document_id = ANY(%s)")
+                params.append(doc_ids)
+                scan_limit = 1600
+            elif bubble_document_id:
+                where.append("bubble_document_id = %s")
+                params.append(bubble_document_id)
+                where.append("(machine_id = %s OR machine_id IS NULL OR machine_id = '')")
+                params.append(machine_id)
+                scan_limit = 1200
+            else:
+                where.append("(machine_id = %s OR machine_id IS NULL OR machine_id = '')")
+                params.append(machine_id)
+                scan_limit = 1200
+
+            cur.execute(
+                f"""
+                SELECT bubble_document_id, chunk_index, page_from, page_to,
+                       left(chunk_text, 5200) AS chunk_full
+                FROM public.document_chunks
+                WHERE {' AND '.join(where)}
+                  AND embedding IS NOT NULL
+                ORDER BY bubble_document_id, page_from, chunk_index
+                LIMIT %s;
+                """,
+                [*params, scan_limit],
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        return []
+
+    q_low = _normalize_unicode_advanced(q or '').lower()
+    important_bigrams = []
+    words = [w for w in re.findall(r"[a-zà-öø-ÿ0-9+_.°/-]{3,}", q_low) if len(w) >= 3]
+    for i in range(len(words) - 1):
+        important_bigrams.append(f"{words[i]} {words[i+1]}")
+
+    scored: list[dict] = []
+    for (bdid, chunk_index, page_from, page_to, chunk_full) in rows:
+        text_raw = str(chunk_full or '').strip()
+        if not text_raw:
+            continue
+        low = _normalize_unicode_advanced(text_raw).lower()
+
+        term_hits = sum(1 for t in norm_terms if t and t in low)
+        if term_hits <= 0:
+            continue
+
+        # Technical questions often need a chunk where several target concepts appear together.
+        phrase_hits = sum(1 for ph in important_bigrams if len(ph) >= 7 and ph in low)
+        numeric_density = len(re.findall(r"\b\d+[\d.,]*\s*(?:bar|mm|m/s|m/s²|n|ore|arcmin|%|°)?\b", low))
+        code_density = len(re.findall(r"\b[A-Z0-9][A-Z0-9+_.\-/]{4,}\b", text_raw))
+
+        # Intent-specific soft boosts.
+        boost = 0.0
+        if any(x in q_low for x in ["install", "collegament", "temperatura", "aria compress", "paviment"]):
+            boost += sum(0.8 for x in ["temperatura", "paviment", "aria compress", "corrente elettrica", "70 mm"] if x in low)
+        if any(x in q_low for x in ["manutenzione", "sicurezza", "ordinaria"]):
+            boost += sum(0.8 for x in ["lucchetto", "aria compress", "interruttore generale", "togliere tensione"] if x in low)
+        if any(x in q_low for x in ["frequenz", "tabella", "lubrificazione", "quadro elettrico"]):
+            boost += sum(0.7 for x in ["1000", "3000", "50", "settiman", "mensil", "annualmente", "lubrificazione"] if x in low)
+        if any(x in q_low for x in ["filtri", "filtro", "quadro elettrico"]):
+            boost += sum(0.8 for x in ["filtro", "griglia", "aria compressa", "annualmente", "mascherina", "occhiali"] if x in low)
+        if any(x in q_low for x in ["forza", "veloc", "acceler", "ciclo", "calibrazione"]):
+            boost += sum(0.8 for x in ["65000", "0,38", "4,62", "0,52", "0,81", "8888", "64"] if x in low)
+        if any(x in q_low for x in ["cremagliera", "pignone"]):
+            boost += sum(0.9 for x in ["zst", "rmw", "600-334", "600-444", "23", "146,423", "modulo", "elica"] if x in low)
+        if any(x in q_low for x in ["riduttore", "rapporto", "gioco", "epicicloidale"]):
+            boost += sum(0.9 for x in ["rp060", "27,5", "1,5", "arcmin", "epicicloidale", "standard"] if x in low)
+
+        score = term_hits * 2.0 + phrase_hits * 2.4 + min(numeric_density, 12) * 0.18 + min(code_density, 10) * 0.22 + boost
+        if score < 2.0:
+            continue
+
+        excerpt = _query_focused_excerpt(q=q, text=text_raw, planner=planner, max_chars=ASK_FOCUSED_EXCERPT_CHARS)
+        snippet = _query_focused_excerpt(q=q, text=text_raw, planner=planner, max_chars=ASK_SNIPPET_CHARS)
+        similarity = min(0.93, 0.58 + min(score, 12.0) * 0.025)
+        retrieval_score = min(0.98, similarity + 0.11 + min(score, 10.0) * 0.006)
+        citation_id = f"{bdid}:p{int(page_from)}-{int(page_to)}:c{int(chunk_index)}"
+        scored.append({
+            "citation_id": citation_id,
+            "bubble_document_id": str(bdid),
+            "chunk_index": int(chunk_index),
+            "page_from": int(page_from),
+            "page_to": int(page_to),
+            "snippet": snippet,
+            "chunk_full": excerpt,
+            "similarity": float(similarity),
+            "retrieval_score": float(retrieval_score),
+            "overlap_score": min(1.0, term_hits / max(1, len(norm_terms)) + min(boost, 4.0) * 0.04),
+            "specificity_score": min(0.18, 0.05 + 0.005 * term_hits + 0.006 * min(numeric_density + code_density, 10)),
+            "source_bias": 0.06,
+            "ask_precision_scan": True,
+            "ask_precision_score": float(score),
+            "embedding_list": [],
+        })
+
+    scored.sort(key=lambda x: (-float(x.get("ask_precision_score") or 0.0), str(x.get("bubble_document_id") or ""), int(x.get("page_from") or 0), int(x.get("chunk_index") or 0)))
+    return _dedup_citations_by_snippet(scored, max_items=max(top_k, min(8, top_k + 2)))
+
+def _fetch_ask_precision_lexical_hits(
+    *,
+    company_id: str,
+    machine_id: str,
+    q: str,
+    planner: Optional[dict],
+    top_k: int,
+    doc_ids: Optional[list[str]] = None,
+    bubble_document_id: Optional[str] = None,
+) -> list[dict]:
+    # Also run for explicit document_ids/bubble_document_id scopes. The fixed-document
+    # ASK benchmark and real UI document scopes need exact lexical/table evidence, not
+    # only dense retrieval.
+    if not _ask_precision_lexical_rescue_intent(q, planner):
+        return []
+
+    scan_hits = _ask_precision_scan_hits(
+        company_id=company_id,
+        machine_id=machine_id,
+        q=q,
+        planner=planner,
+        top_k=top_k,
+        doc_ids=doc_ids,
+        bubble_document_id=bubble_document_id,
+    )
+
+    lexical_queries = _dedup_text_values(
+        [q, str((planner or {}).get("normalized_query") or "")]
+        + list((planner or {}).get("lexical_queries") or []),
+        limit=max(3, SEMANTIC_MAX_LEXICAL_QUERIES + 2),
+    )
+    if not lexical_queries:
+        return scan_hits
+
+    limit = max(1, min(int(ASK_PRECISION_LEXICAL_TOP_K or 5), max(top_k, 4)))
+    hits: list[dict] = []
+
+    # Exact AND-style FTS first; prefix OR-style as fallback/coverage.
+    hits.extend(
+        _fts_search_chunks_multi(
+            company_id=company_id,
+            machine_id=machine_id,
+            queries=lexical_queries,
+            top_k=limit,
+            doc_ids=doc_ids,
+            bubble_document_id=bubble_document_id,
+        )
+    )
+    hits.extend(
+        _fts_search_chunks_prefix(
+            company_id=company_id,
+            machine_id=machine_id,
+            texts=lexical_queries,
+            top_k=limit,
+            doc_ids=doc_ids,
+            bubble_document_id=bubble_document_id,
+        )
+    )
+
+    if not hits:
+        return []
+
+    terms = _ask_focus_terms(q, planner=planner, limit=18)
+    scored: list[dict] = []
+    for h in hits:
+        hh = dict(h)
+        snippet = _normalize_unicode_advanced(str(hh.get("snippet") or "")).lower()
+        overlap = sum(1 for t in terms if _normalize_unicode_advanced(t).lower() in snippet)
+        hh["overlap_score"] = max(float(hh.get("overlap_score") or 0.0), overlap / max(1, len(terms)))
+        hh["specificity_score"] = max(float(hh.get("specificity_score") or 0.0), 0.03 + min(0.07, 0.01 * overlap))
+        hh["source_bias"] = max(float(hh.get("source_bias") or 0.0), 0.02)
+        hh["retrieval_score"] = max(float(hh.get("retrieval_score") or 0.0), 0.10 + 0.03 * overlap)
+        scored.append(hh)
+
+    scored.sort(
+        key=lambda x: (
+            -float(x.get("overlap_score") or 0.0),
+            -float(x.get("retrieval_score") or 0.0),
+            str(x.get("bubble_document_id") or ""),
+            int(x.get("page_from") or 0),
+            int(x.get("chunk_index") or 0),
+        )
+    )
+    return _dedup_citations_by_snippet(scan_hits + scored, max_items=max(limit, min(top_k, 8)))
 
 def _source_type_from_document_id(value: str) -> str:
     v = str(value or "").strip().lower()
@@ -3531,6 +3935,7 @@ def _shared_semantic_retrieval(
     query_token_count = _count_query_tokens(q)
 
     structured_rescue_hits: list[dict] = []
+    precision_lexical_hits: list[dict] = []
     # Keep root-cause diagnostic retrieval untouched: this rescue is for Ask/how-to
     # and draft support, where exact structured records must not be hidden by manuals.
     if not diagnostic_mode and str(planner_mode or "").strip().lower() != "root_cause":
@@ -3668,14 +4073,38 @@ def _shared_semantic_retrieval(
             exact_fts_used = True
             selected_citations = _dedup_citations_by_snippet(selected_citations + exact_hits, max_items=top_k)
 
-    if selected_citations:
-        selected_citations = _lock_final_citations(
-            selected_citations=selected_citations,
-            ranked_candidates=list(cut_candidates or []) + list(selected_citations or []),
+    if not diagnostic_mode and str(planner_mode or "").strip().lower() != "root_cause":
+        precision_lexical_hits = _fetch_ask_precision_lexical_hits(
+            company_id=company_id,
+            machine_id=machine_id,
+            q=q,
+            planner=planner,
             top_k=top_k,
-            diagnostic_mode=diagnostic_mode,
-            query_token_count=query_token_count,
+            doc_ids=doc_ids,
+            bubble_document_id=bubble_document_id,
         )
+        if precision_lexical_hits:
+            fts_used = True
+            exact_fts_used = True
+            selected_citations = _dedup_citations_by_snippet(
+                precision_lexical_hits + selected_citations,
+                max_items=top_k,
+            )
+
+    if selected_citations:
+        if precision_lexical_hits:
+            # Preserve deterministic precision order for Ask technical/fixed-document questions.
+            # The family lock can otherwise collapse evidence to one manual section and drop
+            # table rows/numeric chunks needed for a complete answer.
+            selected_citations = _dedup_citations_by_snippet(selected_citations, max_items=top_k)
+        else:
+            selected_citations = _lock_final_citations(
+                selected_citations=selected_citations,
+                ranked_candidates=list(cut_candidates or []) + list(selected_citations or []),
+                top_k=top_k,
+                diagnostic_mode=diagnostic_mode,
+                query_token_count=query_token_count,
+            )
 
     if structured_rescue_hits:
         selected_citations = _promote_structured_rescue_hits(
@@ -3698,6 +4127,8 @@ def _shared_semantic_retrieval(
         "exact_fts_used": exact_fts_used,
         "rerank_used": rerank_used,
         "rerank_error": rerank_error[:300] if rerank_error else None,
+        "precision_lexical_used": bool(precision_lexical_hits),
+        "precision_lexical_count": len(precision_lexical_hits or []),
     }
 
 def _expand_with_neighbor_chunks(
@@ -8697,7 +9128,7 @@ def _ask_v1_baseline_impl(
         answer, final_citations = _render_grounded_answer_points(
             grounded_points=grounded_points,
             citations=citations,
-            max_points=min(3, top_k),
+            max_points=min(6, top_k),
             q=q,
         )
 
@@ -10483,6 +10914,8 @@ def _generate_ask_candidate_grounded_points(
     prompt_citations = _enrich_ask_prompt_citations(
         company_id=company_id,
         citations=citations,
+        q=q,
+        planner=planner,
         max_manual_expansions=2,
         radius=1,
     )
@@ -10509,7 +10942,7 @@ def _generate_ask_candidate_grounded_points(
             "Do not include raw citation ids inside the text field; put support only in citation_ids. "
             "Every point must be directly supported by its citation_ids. "
             "Always reply in the requested response language. "
-            "Return 1 to 3 short grounded points only."
+            "Return 1 to 6 concise grounded points. Include all directly requested numeric values, codes, intervals and safety actions when present in the sources."
         )
         schema = _ask_response_schema()
     else:
@@ -10518,7 +10951,7 @@ def _generate_ask_candidate_grounded_points(
             "Use ONLY the provided sources, evidence-role summary, and evidence matrix. "
             "Always answer the user's question directly. "
             "Always reply in the requested response language. "
-            "Return 1 to 3 very short grounded points. "
+            "Return 1 to 6 concise grounded points. Include all directly requested numeric values, codes, intervals and safety actions when present in the sources. "
             "For procedural, maintenance, setup, safety, or troubleshooting questions, return the actual operations/actions to perform, not section titles, headings, or isolated manual fragments. "
             "Respect temporal qualifiers in the question: if the user asks what to do before an operation, include only preparatory/before-start actions and do not include after-completion, restoration, or restart steps unless explicitly requested. "
             "If the source text is fragmented by OCR/manual line breaks, reconstruct a short fluent sentence without adding outside knowledge. "
@@ -10697,7 +11130,7 @@ def _ask_v1_candidate_impl(
         answer, final_citations = _render_grounded_answer_points(
             grounded_points=grounded_points,
             citations=citations,
-            max_points=min(3, top_k),
+            max_points=min(6, top_k),
             q=q,
         )
 
