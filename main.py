@@ -71,10 +71,17 @@ ASK_SNIPPET_CHARS = int(os.environ.get("MM_ASK_SNIPPET_CHARS", "700"))
 ASK_MAX_CONTEXT_CHARS = int(os.environ.get("MM_ASK_MAX_CONTEXT_CHARS", "9000"))
 DRAFT_PS_SIM_THRESHOLD = float(os.environ.get("MM_DRAFT_PS_SIM_THRESHOLD", "0.42"))
 
-# ASK generic evidence compiler.
-# This is not question-specific and does not know any benchmark question/document.
-# It improves ASK by scanning authorized full pages/structured records, extracting
-# the facts required by the user's question, and then rendering a grounded answer.
+# Structured-source rescue for machine-wide Ask queries.
+# Purpose: when the user asks about procedures/steps/P&S/photos/videos or asks a how-to
+# question, do not let long manuals dominate over exact structured records.
+STRUCTURED_RESCUE_ENABLED = (os.environ.get("MM_STRUCTURED_RESCUE_ENABLED") or "1").strip() != "0"
+STRUCTURED_RESCUE_SCAN_LIMIT = int(os.environ.get("MM_STRUCTURED_RESCUE_SCAN_LIMIT", "220"))
+STRUCTURED_RESCUE_MAX_HITS = int(os.environ.get("MM_STRUCTURED_RESCUE_MAX_HITS", "3"))
+
+# ASK v2 generic evidence compiler (query-agnostic, multilingual, non-hardcoded)
+# This is NOT a benchmark dictionary: it does not contain expected answers, document ids,
+# product codes or test questions. It improves retrieval by analyzing the user query,
+# scanning authorized pages/structured sources, then verifying groundedness and completeness.
 ASK_EVIDENCE_COMPILER_ENABLED = (os.environ.get("MM_ASK_EVIDENCE_COMPILER_ENABLED") or "1").strip() != "0"
 ASK_EVIDENCE_ANALYZER_MODEL = (os.environ.get("MM_ASK_EVIDENCE_ANALYZER_MODEL") or OPENAI_RERANK_MODEL).strip()
 ASK_EVIDENCE_ANSWER_MODEL = (os.environ.get("MM_ASK_EVIDENCE_ANSWER_MODEL") or os.environ.get("MM_ROOT_CAUSE_RESPONSE_MODEL") or "gpt-5.4").strip()
@@ -83,13 +90,10 @@ ASK_EVIDENCE_TOP_PAGES = int(os.environ.get("MM_ASK_EVIDENCE_TOP_PAGES", "10"))
 ASK_EVIDENCE_MAX_PAGE_CHARS = int(os.environ.get("MM_ASK_EVIDENCE_MAX_PAGE_CHARS", "12000"))
 ASK_EVIDENCE_MAX_CONTEXT_CHARS = int(os.environ.get("MM_ASK_EVIDENCE_MAX_CONTEXT_CHARS", "24000"))
 ASK_EVIDENCE_MIN_PAGE_SCORE = float(os.environ.get("MM_ASK_EVIDENCE_MIN_PAGE_SCORE", "1.5"))
-
-# Structured-source rescue for machine-wide Ask queries.
-# Purpose: when the user asks about procedures/steps/P&S/photos/videos or asks a how-to
-# question, do not let long manuals dominate over exact structured records.
-STRUCTURED_RESCUE_ENABLED = (os.environ.get("MM_STRUCTURED_RESCUE_ENABLED") or "1").strip() != "0"
-STRUCTURED_RESCUE_SCAN_LIMIT = int(os.environ.get("MM_STRUCTURED_RESCUE_SCAN_LIMIT", "220"))
-STRUCTURED_RESCUE_MAX_HITS = int(os.environ.get("MM_STRUCTURED_RESCUE_MAX_HITS", "3"))
+ASK_EVIDENCE_VERIFIER_ENABLED = (os.environ.get("MM_ASK_EVIDENCE_VERIFIER_ENABLED") or "1").strip() != "0"
+ASK_EVIDENCE_VERIFIER_MODEL = (os.environ.get("MM_ASK_EVIDENCE_VERIFIER_MODEL") or OPENAI_RERANK_MODEL).strip()
+ASK_EVIDENCE_VERIFIER_TIMEOUT = int(os.environ.get("MM_ASK_EVIDENCE_VERIFIER_TIMEOUT_SECONDS", "45"))
+ASK_EVIDENCE_VERIFIER_MAX_CONTEXT_CHARS = int(os.environ.get("MM_ASK_EVIDENCE_VERIFIER_MAX_CONTEXT_CHARS", "16000"))
 
 # Shared semantic retrieval planner
 SEMANTIC_QUERY_PLANNER_MODEL = (os.environ.get("MM_SEMANTIC_QUERY_PLANNER_MODEL") or "gpt-5.4-mini").strip()
@@ -6749,7 +6753,6 @@ def _build_sources_block_from_citations(
 
     return "\n".join(ctx_parts).strip()
 
-
 # -----------------------------------------------------------------------------
 # ASK generic evidence compiler (query-agnostic, multilingual, non-hardcoded)
 # -----------------------------------------------------------------------------
@@ -7062,6 +7065,98 @@ def _ask_evidence_answer_schema() -> dict:
     }
 
 
+
+
+def _ask_evidence_verifier_schema() -> dict:
+    return {
+        "name": "ask_generic_evidence_verifier_v1",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "verdict": {"type": "string", "enum": ["pass", "rewrite", "no_sources"]},
+                "correctness_score": {"type": "number"},
+                "source_support_score": {"type": "number"},
+                "completeness_score": {"type": "number"},
+                "groundedness_score": {"type": "number"},
+                "clarity_score": {"type": "number"},
+                "missing_requirements": {"type": "array", "items": {"type": "string"}, "maxItems": 12},
+                "unsupported_claims": {"type": "array", "items": {"type": "string"}, "maxItems": 12},
+                "reason": {"type": "string"},
+            },
+            "required": [
+                "verdict",
+                "correctness_score",
+                "source_support_score",
+                "completeness_score",
+                "groundedness_score",
+                "clarity_score",
+                "missing_requirements",
+                "unsupported_claims",
+                "reason",
+            ],
+        },
+    }
+
+
+def _ask_evidence_verify_answer(
+    *,
+    q: str,
+    answer: str,
+    evidence_citations: list[dict],
+    profile: dict,
+    response_language: str,
+) -> dict:
+    """Generic LLM verifier for ASK v2.
+
+    This verifier is deliberately query/document agnostic: it only checks whether the
+    generated answer is supported by the evidence, complete for the user question, and
+    free of unsupported claims. It never contains benchmark questions, document ids or
+    expected values.
+    """
+    if not ASK_EVIDENCE_VERIFIER_ENABLED or not OPENAI_API_KEY:
+        return {"verdict": "pass", "reason": "verifier disabled"}
+
+    sources_block = _build_sources_block_from_citations(
+        evidence_citations,
+        max_context_chars=int(ASK_EVIDENCE_VERIFIER_MAX_CONTEXT_CHARS or 16000),
+        prefer_chunk_full=True,
+    )
+    if not sources_block:
+        return {"verdict": "pass", "reason": "no verifier sources"}
+
+    system_msg = (
+        "You verify an industrial-document ASK answer. Use ONLY QUESTION, ANSWER and SOURCES. "
+        "Do not use outside knowledge and do not assume hidden expected answers. "
+        "Give pass only when the answer is well supported, sufficiently complete for the question, "
+        "keeps important numbers/units/codes/procedure steps when present in sources, and has no unsupported claims. "
+        "Use rewrite when the answer is grounded but incomplete, too generic, misses important source facts, or needs clearer technical structure. "
+        "Use no_sources only when the SOURCES do not contain enough evidence to answer."
+    )
+    user_msg = (
+        f"QUESTION:\n{q}\n\n"
+        f"RESPONSE_LANGUAGE:\n{response_language}\n\n"
+        f"QUERY_PROFILE:\n{json.dumps(profile or {}, ensure_ascii=False)}\n\n"
+        f"ANSWER_TO_VERIFY:\n{answer}\n\n"
+        f"SOURCES:\n{sources_block}\n\n"
+        "Return JSON. Scores are 0-100. Be strict about missing exact values, units, table rows, ordered steps and unsupported claims."
+    )
+    try:
+        parsed = _openai_chat_json_models(
+            [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            models=[ASK_EVIDENCE_VERIFIER_MODEL, ASK_EVIDENCE_ANALYZER_MODEL, OPENAI_RERANK_MODEL, OPENAI_CHAT_MODEL],
+            json_schema=_ask_evidence_verifier_schema(),
+            timeout=int(ASK_EVIDENCE_VERIFIER_TIMEOUT or 45),
+        )
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception as e:
+        print("ASK_EVIDENCE_VERIFIER_FAIL", str(e)[:500])
+    return {"verdict": "pass", "reason": "verifier failed open"}
 def _ask_generic_evidence_answer(
     *,
     q: str,
@@ -7159,6 +7254,52 @@ def _ask_generic_evidence_answer(
     if not answer or not final_citations:
         return None
 
+    verifier_result = _ask_evidence_verify_answer(
+        q=q,
+        answer=answer,
+        evidence_citations=merged,
+        profile=profile,
+        response_language=response_language,
+    )
+    verifier_verdict = str((verifier_result or {}).get("verdict") or "pass").strip().lower()
+
+    if verifier_verdict == "no_sources":
+        return None
+
+    if verifier_verdict == "rewrite":
+        rewrite_feedback = json.dumps(verifier_result or {}, ensure_ascii=False)[:4000]
+        rewrite_user_msg = (
+            f"QUESTION:\n{q}\n\n"
+            f"RESPONSE_LANGUAGE:\n{response_language}\n\n"
+            f"QUERY_PROFILE:\n{json.dumps(profile, ensure_ascii=False)}\n\n"
+            f"VERIFIER_FEEDBACK_JSON:\n{rewrite_feedback}\n\n"
+            f"SOURCES:\n{sources_block}\n\n"
+            "Rewrite the answer using only SOURCES and addressing the verifier feedback. "
+            "Keep exact values, units, codes, table rows, conditions, exceptions and ordered steps when present. Return JSON only."
+        )
+        try:
+            parsed2 = _openai_chat_json_models(
+                [
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": rewrite_user_msg},
+                ],
+                models=[ASK_EVIDENCE_ANSWER_MODEL, OPENAI_CHAT_MODEL, ROOT_CAUSE_RESPONSE_MODEL],
+                json_schema=_ask_evidence_answer_schema(),
+                timeout=90,
+            )
+            if isinstance(parsed2, dict) and str(parsed2.get("answer_status") or "").strip().lower() == "answered":
+                answer2, final_citations2 = _render_grounded_answer_points(
+                    grounded_points=list(parsed2.get("grounded_points") or []),
+                    citations=merged,
+                    max_points=8,
+                    q=q,
+                )
+                if answer2 and final_citations2:
+                    answer = answer2
+                    final_citations = final_citations2
+        except Exception as e:
+            print("ASK_GENERIC_EVIDENCE_REWRITE_FAIL", str(e)[:500])
+
     if not _looks_like_target_language(answer, response_language):
         answer = _translate_text_preserving_citations(answer, response_language)
 
@@ -7185,8 +7326,10 @@ def _ask_generic_evidence_answer(
             "page_hit_count": len(page_hits or []),
             "page_hit_ids": [c.get("citation_id") for c in page_hits[:10]],
             "merged_count": len(merged or []),
+            "verifier": verifier_result if 'verifier_result' in locals() else {},
         }
     return resp
+
 
 def _reorder_citations_by_priority_ids(
     citations: list[dict],
@@ -10830,11 +10973,13 @@ def _is_lookup_or_identifier_query(q: str) -> bool:
 
 
 def _should_attempt_ask_candidate(q: str, baseline_response: dict) -> bool:
+    # ASK v2 generic evidence answers have already gone through a source-aware
+    # compiler/verifier path. Do not let the generic candidate path overwrite them.
+    if str((baseline_response or {}).get("chat_model") or "").strip() == "ask_generic_evidence_compiler":
+        return False
     if not (RESPONSE_ARB_ENABLED and ASK_CANDIDATE_ENABLED):
         return False
     if _should_route_ask_through_root_cause(q):
-        return False
-    if str((baseline_response or {}).get("chat_model") or "").strip() == "ask_generic_evidence_compiler":
         return False
     if _is_lookup_or_identifier_query(q):
         return False
