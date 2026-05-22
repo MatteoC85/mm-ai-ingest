@@ -106,6 +106,12 @@ ASK_FULL_CONTEXT_MAX_CHARS = int(os.environ.get("MM_ASK_FULL_CONTEXT_MAX_CHARS",
 ASK_FULL_CONTEXT_PAGE_CHARS = int(os.environ.get("MM_ASK_FULL_CONTEXT_PAGE_CHARS", "6500"))
 ASK_FULL_CONTEXT_TIMEOUT = int(os.environ.get("MM_ASK_FULL_CONTEXT_TIMEOUT_SECONDS", "120"))
 ASK_FULL_CONTEXT_MODEL = (os.environ.get("MM_ASK_FULL_CONTEXT_MODEL") or ASK_EVIDENCE_ANSWER_MODEL).strip()
+ASK_STRUCTURED_DIRECT_ENABLED = (os.environ.get("MM_ASK_STRUCTURED_DIRECT_ENABLED") or "1").strip() != "0"
+ASK_STRUCTURED_DIRECT_MAX_ITEMS = int(os.environ.get("MM_ASK_STRUCTURED_DIRECT_MAX_ITEMS", "12"))
+ASK_STRUCTURED_DIRECT_MAX_CONTEXT_CHARS = int(os.environ.get("MM_ASK_STRUCTURED_DIRECT_MAX_CONTEXT_CHARS", "28000"))
+ASK_STRUCTURED_DIRECT_TEXT_CHARS = int(os.environ.get("MM_ASK_STRUCTURED_DIRECT_TEXT_CHARS", "5000"))
+ASK_STRUCTURED_DIRECT_TIMEOUT = int(os.environ.get("MM_ASK_STRUCTURED_DIRECT_TIMEOUT_SECONDS", "60"))
+ASK_STRUCTURED_DIRECT_MODEL = (os.environ.get("MM_ASK_STRUCTURED_DIRECT_MODEL") or ASK_EVIDENCE_ANSWER_MODEL).strip()
 
 # Shared semantic retrieval planner
 SEMANTIC_QUERY_PLANNER_MODEL = (os.environ.get("MM_SEMANTIC_QUERY_PLANNER_MODEL") or "gpt-5.4-mini").strip()
@@ -7179,6 +7185,381 @@ def _ask_full_context_query_has_secret_intent(q: str) -> bool:
     ])
 
 
+
+def _ask_structured_direct_stopwords() -> set[str]:
+    return {
+        "the", "and", "for", "with", "when", "while", "during", "after", "before", "from", "into",
+        "this", "that", "these", "those", "what", "which", "how", "does", "there", "exist", "exists",
+        "machine", "manual", "document", "documents", "source", "sources", "content", "contents",
+        "procedure", "procedures", "step", "steps", "photo", "photos", "image", "images", "video", "videos",
+        "problem", "problems", "solution", "solutions", "issue", "issues", "fault", "faults",
+        "il", "lo", "la", "i", "gli", "le", "un", "una", "di", "del", "della", "dei", "delle",
+        "con", "per", "quando", "durante", "mentre", "dopo", "prima", "come", "cosa", "quali", "quale",
+        "questa", "questo", "queste", "questi", "macchina", "manuale", "documento", "documenti",
+        "fonte", "fonti", "contenuto", "contenuti", "informazioni", "info", "conosci", "presenti",
+        "procedura", "procedure", "step", "passaggio", "passaggi", "fase", "fasi", "foto", "immagine", "immagini",
+        "video", "problema", "problemi", "soluzione", "soluzioni", "errore", "errori", "operativo", "operativi",
+        "extra", "oltre", "riassumi", "fammi", "dimmi", "hai", "c'è", "sono",
+    }
+
+
+def _ask_structured_direct_terms(q: str, planner: Optional[dict] = None, limit: int = 16) -> list[str]:
+    texts = [str(q or "")]
+    if isinstance(planner, dict):
+        texts.append(str(planner.get("normalized_query") or ""))
+        texts.extend(str(x or "") for x in (planner.get("lexical_queries") or []))
+        texts.extend(str(x or "") for x in (planner.get("dense_queries") or []))
+
+    raw = _normalize_unicode_advanced(" ".join(texts)).lower()
+    tokens = re.findall(r"[a-zà-öø-ÿ0-9][a-zà-öø-ÿ0-9_\-/]{2,}", raw)
+    stop = _ask_structured_direct_stopwords()
+    out: list[str] = []
+    seen: set[str] = set()
+    for tok in tokens:
+        tok = tok.strip("_-/")
+        if len(tok) < 3 or tok in stop or tok in seen:
+            continue
+        seen.add(tok)
+        out.append(tok)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _ask_structured_direct_intent(q: str, planner: Optional[dict] = None) -> dict:
+    """Generic routing profile for Bubble structured sources.
+
+    This does not know benchmark questions or object ids. It only detects whether the
+    user is asking for first-class structured records (procedures, steps, P&S, photos,
+    videos) rather than broad manual reading.
+    """
+    parts = [str(q or "")]
+    if isinstance(planner, dict):
+        parts.append(str(planner.get("normalized_query") or ""))
+        parts.extend(str(x or "") for x in (planner.get("lexical_queries") or []))
+    low = _normalize_unicode_advanced(" ".join(parts)).lower()
+    low = re.sub(r"\s+", " ", low).strip()
+
+    prefixes: list[str] = []
+
+    def add_many(values: list[str]) -> None:
+        for v in values:
+            if v not in prefixes:
+                prefixes.append(v)
+
+    # Explicit source-type requests.
+    if any(x in low for x in ["procedur", "procedure", "istruzion", "instruction", "operativ", "operating sequence"]):
+        add_many(["procedure", "step"])
+    if any(x in low for x in ["step", "passagg", "fase", "fasi", "passo", "passi"]):
+        add_many(["step", "procedure"])
+    if any(x in low for x in ["p&s", "problem solution", "problema", "problemi", "problematic", "soluzione", "solution", "errore", "error", "fault", "issue", "reset"]):
+        add_many(["ps"])
+    if any(x in low for x in ["foto", "photo", "immagin", "image", "picture", "visual"]):
+        add_many(["md_photo"])
+    if "video" in low or "filmato" in low or "recording" in low:
+        add_many(["md_video"])
+
+    # Practical/how-to requests should consider operational records before manuals.
+    if any(x in low for x in ["come faccio", "come fare", "cosa devo fare", "how to", "how do i", "what should i do", "procedere", "eseguire"]):
+        add_many(["procedure", "step", "ps"])
+
+    # Machine knowledge overview, especially when the user asks for non-manual content.
+    overview_markers = [
+        "extra manuale", "oltre al manuale", "non manuale", "contenuti operativi", "fonti operative",
+        "procedure, problemi", "procedure problemi", "immagini e video", "foto e video", "riassumi procedure",
+        "operational content", "beyond the manual", "outside the manual",
+    ]
+    broad_overview = any(x in low for x in overview_markers)
+    if broad_overview:
+        add_many(["procedure", "step", "ps", "md_photo", "md_video"])
+
+    # Existence/listing questions with a content term should prefer structured records.
+    if any(x in low for x in ["esiste", "ci sono", "hai un", "hai una", "do you have", "are there", "is there"]):
+        if not prefixes:
+            add_many(["procedure", "step", "ps", "md_photo", "md_video"])
+
+    terms = _ask_structured_direct_terms(q, planner=planner)
+    enabled = bool(prefixes) and _count_query_tokens(q) >= 2
+    return {"enabled": enabled, "prefixes": prefixes, "terms": terms, "broad_overview": broad_overview, "query_text": low}
+
+
+def _ask_structured_direct_score(
+    *,
+    q: str,
+    text: str,
+    source_type: str,
+    terms: list[str],
+    broad_overview: bool,
+) -> float:
+    low_text = _normalize_unicode_advanced(text or "").lower()
+    low_q = _normalize_unicode_advanced(q or "").lower()
+    if not low_text:
+        return 0.0
+
+    term_hits = sum(1 for t in terms if t and t in low_text)
+    score = float(term_hits) * 2.0
+
+    if len(terms) >= 2:
+        for i in range(len(terms) - 1):
+            phrase = f"{terms[i]} {terms[i+1]}"
+            if phrase in low_text:
+                score += 1.25
+
+    # Generic source-type affinity; this does not encode object-specific facts.
+    if source_type in {"procedure", "step"} and any(x in low_q for x in ["procedur", "step", "passagg", "come", "how", "operativ", "istruzion"]):
+        score += 2.0
+    if source_type == "ps" and any(x in low_q for x in ["problema", "problem", "soluzione", "solution", "errore", "error", "fault", "reset"]):
+        score += 2.0
+    if source_type == "md_photo" and any(x in low_q for x in ["foto", "photo", "immagin", "image", "picture", "mostra", "show"]):
+        score += 2.0
+    if source_type == "md_video" and any(x in low_q for x in ["video", "filmato", "recording"]):
+        score += 2.0
+
+    if broad_overview:
+        score += 1.5
+
+    return score
+
+
+def _ask_structured_direct_fetch_sources(
+    *,
+    company_id: str,
+    machine_id: str,
+    q: str,
+    planner: Optional[dict],
+    top_k: int,
+) -> list[dict]:
+    if not ASK_STRUCTURED_DIRECT_ENABLED:
+        return []
+    if not machine_id or str(machine_id).strip() == COMPANY_GENERAL_MACHINE_SENTINEL:
+        return []
+
+    intent = _ask_structured_direct_intent(q, planner=planner)
+    if not intent.get("enabled"):
+        return []
+
+    prefixes = list(intent.get("prefixes") or [])
+    if not prefixes:
+        return []
+
+    text_chars = max(800, int(ASK_STRUCTURED_DIRECT_TEXT_CHARS or 5000))
+    like_clauses = " OR ".join(["bubble_document_id LIKE %s" for _ in prefixes])
+    params: list[Any] = [text_chars, company_id]
+    params.extend([f"{p}:%" for p in prefixes])
+    params.extend([machine_id, max(20, int(ASK_STRUCTURED_DIRECT_MAX_ITEMS or 12) * 6)])
+
+    conn = _db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT bubble_document_id, machine_id, page_number,
+                       LEFT(COALESCE(text, ''), %s) AS page_text
+                FROM public.document_pages
+                WHERE company_id = %s
+                  AND ({like_clauses})
+                  AND (machine_id = %s OR machine_id IS NULL OR machine_id = '')
+                  AND text IS NOT NULL
+                  AND length(text) > 10
+                ORDER BY bubble_document_id, page_number
+                LIMIT %s;
+                """,
+                params,
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        return []
+
+    terms = list(intent.get("terms") or [])
+    broad_overview = bool(intent.get("broad_overview"))
+    scored: list[dict] = []
+    for idx, (bdid, mid, page_number, page_text) in enumerate(rows, start=1):
+        bdid_s = str(bdid or "").strip()
+        st = _source_type_from_document_id(bdid_s)
+        txt = str(page_text or "").strip()
+        if not bdid_s or not txt:
+            continue
+
+        score = _ask_structured_direct_score(q=q, text=txt, source_type=st, terms=terms, broad_overview=broad_overview)
+        # If the user asked for a broad structured overview, keep one representative
+        # source per type even if content terms are generic. Otherwise require either
+        # a content hit or a clear source-type match.
+        if score <= 0.0:
+            continue
+        if terms and not broad_overview and not any(t in _normalize_unicode_advanced(txt).lower() for t in terms):
+            # Source-type-only match is not enough for narrow content questions.
+            continue
+
+        page_no = _safe_int(page_number, 1)
+        similarity = min(0.95, 0.62 + 0.045 * score)
+        citation_id = f"{bdid_s}:p{page_no}-{page_no}:structured:{idx}"
+        scored.append(
+            {
+                "citation_id": citation_id,
+                "bubble_document_id": bdid_s,
+                "chunk_index": 1,
+                "page_from": page_no,
+                "page_to": page_no,
+                "snippet": txt[: int(ASK_SNIPPET_CHARS or 900)],
+                "snippet_clean": txt[: int(ASK_SNIPPET_CHARS or 900)],
+                "chunk_full": txt,
+                "similarity": float(similarity),
+                "retrieval_score": float(similarity + 0.06),
+                "source_type": st,
+                "ask_structured_direct": True,
+                "structured_direct_score": float(score),
+                "embedding_list": [],
+            }
+        )
+
+    if not scored:
+        return []
+
+    # For overview queries, preserve diversity by source type. For narrow queries,
+    # keep the highest scoring records while still allowing linked procedure+steps.
+    scored.sort(key=lambda x: (-float(x.get("structured_direct_score") or 0.0), str(x.get("source_type") or ""), str(x.get("bubble_document_id") or "")))
+
+    max_items = max(1, int(ASK_STRUCTURED_DIRECT_MAX_ITEMS or 12))
+    if broad_overview:
+        out: list[dict] = []
+        used_ids: set[str] = set()
+        desired_order = ["procedure", "step", "ps", "md_photo", "md_video"]
+        for st in desired_order:
+            added_for_type = 0
+            for row in scored:
+                if str(row.get("source_type") or "") != st:
+                    continue
+                cid = str(row.get("citation_id") or "")
+                if cid in used_ids:
+                    continue
+                out.append(row)
+                used_ids.add(cid)
+                added_for_type += 1
+                if added_for_type >= (2 if st in {"procedure", "step"} else 1):
+                    break
+                if len(out) >= max_items:
+                    break
+            if len(out) >= max_items:
+                break
+        for row in scored:
+            if len(out) >= max_items:
+                break
+            cid = str(row.get("citation_id") or "")
+            if cid not in used_ids:
+                out.append(row)
+                used_ids.add(cid)
+        return out[:max_items]
+
+    return _dedup_citations_by_snippet(scored, max_items=max_items)
+
+
+def _ask_structured_direct_answer(
+    *,
+    q: str,
+    company_id: str,
+    machine_id: str,
+    planner: Optional[dict],
+    response_language: str,
+    top_k: int,
+    debug: bool = False,
+) -> Optional[dict]:
+    citations = _ask_structured_direct_fetch_sources(
+        company_id=company_id,
+        machine_id=machine_id,
+        q=q,
+        planner=planner,
+        top_k=top_k,
+    )
+    if not citations:
+        return None
+
+    sources_block = _ask_full_context_sources_block(
+        citations,
+        max_context_chars=max(6000, int(ASK_STRUCTURED_DIRECT_MAX_CONTEXT_CHARS or 28000)),
+    )
+    if not sources_block:
+        return None
+
+    profile = _ask_evidence_query_profile(q, response_language)
+    system_msg = (
+        "You are MachineMind ASK. Answer ONLY from the STRUCTURED SOURCES. "
+        "These sources are first-class machine knowledge records created by users: procedures, steps, problem/solution records, photos and videos. "
+        "Do not prefer PDF manuals over these records when the user asks about procedures, steps, P&S, images, videos or operational content. "
+        "If sources contain procedure and step records, combine them coherently. "
+        "If sources contain P&S, report problem, solution and notes. "
+        "If sources contain photo/video records, state title and description; do not claim you visually inspected the media. "
+        "If the requested information is not present in STRUCTURED SOURCES, return no_sources. "
+        "Every answer point must cite one or more citation_ids from SOURCES. Reply in the requested language."
+    )
+    user_msg = (
+        f"QUESTION:\n{q}\n\n"
+        f"RESPONSE_LANGUAGE:\n{response_language}\n\n"
+        f"QUERY_PROFILE:\n{json.dumps(profile, ensure_ascii=False)}\n\n"
+        f"STRUCTURED SOURCES:\n{sources_block}\n\n"
+        "Return JSON only. Be concrete, operational and concise. Preserve titles, descriptions, step numbers, solutions and notes exactly when present."
+    )
+
+    try:
+        parsed = _openai_chat_json_models(
+            [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            models=[ASK_STRUCTURED_DIRECT_MODEL, ASK_EVIDENCE_ANSWER_MODEL, OPENAI_CHAT_MODEL, ROOT_CAUSE_RESPONSE_MODEL],
+            json_schema=_ask_evidence_answer_schema(),
+            timeout=int(ASK_STRUCTURED_DIRECT_TIMEOUT or 60),
+        )
+    except Exception as e:
+        print("ASK_STRUCTURED_DIRECT_FAIL", str(e)[:700])
+        return None
+
+    if not isinstance(parsed, dict):
+        return None
+    if str(parsed.get("answer_status") or "").strip().lower() != "answered":
+        return None
+
+    answer, final_citations = _render_grounded_answer_points(
+        grounded_points=list(parsed.get("grounded_points") or []),
+        citations=citations,
+        max_points=8,
+        q=q,
+    )
+    if not answer or not final_citations:
+        return None
+
+    if not _looks_like_target_language(answer, response_language):
+        answer = _translate_text_preserving_citations(answer, response_language)
+
+    response_citations = _sanitize_citations_for_response(final_citations, company_id=company_id)
+    try:
+        rg_links = _build_rg_links(company_id, response_citations)
+    except Exception as e:
+        print("RG_LINKS_FAIL", str(e))
+        rg_links = []
+
+    resp = {
+        "ok": True,
+        "status": "answered",
+        "answer": answer,
+        "language": response_language,
+        "citations": response_citations,
+        "rg_links": rg_links,
+        "top_k": top_k,
+        "similarity_max": max([float(c.get("similarity") or 0.0) for c in citations], default=None),
+        "chat_model": "ask_structured_direct_reader",
+    }
+    if debug:
+        resp["ask_structured_direct"] = {
+            "sources_used": len(citations),
+            "source_types_used": sorted(set(str(c.get("source_type") or "") for c in citations)),
+            "doc_ids_used": _dedup_text_values([c.get("bubble_document_id") for c in citations], limit=20),
+            "context_chars": len(sources_block),
+        }
+    return resp
+
 def _ask_full_context_seed_doc_ids(
     *,
     doc_ids: Optional[list[str]],
@@ -9472,6 +9853,20 @@ def _ask_v1_baseline_impl(
         return resp
 
     effective_threshold = float(retrieval.get("effective_threshold") or ASK_SIM_THRESHOLD)
+
+    structured_direct_resp = None
+    if not doc_ids and not bubble_document_id and str(scope.get("ai_scope") or "") == "machine_all":
+        structured_direct_resp = _ask_structured_direct_answer(
+            q=q,
+            company_id=company_id,
+            machine_id=machine_id,
+            planner=planner,
+            response_language=response_language,
+            top_k=top_k,
+            debug=bool(payload.debug),
+        )
+    if structured_direct_resp:
+        return _finalize(structured_direct_resp)
 
     full_context_resp = _ask_full_context_answer(
         q=q,
