@@ -95,6 +95,18 @@ ASK_EVIDENCE_VERIFIER_MODEL = (os.environ.get("MM_ASK_EVIDENCE_VERIFIER_MODEL") 
 ASK_EVIDENCE_VERIFIER_TIMEOUT = int(os.environ.get("MM_ASK_EVIDENCE_VERIFIER_TIMEOUT_SECONDS", "45"))
 ASK_EVIDENCE_VERIFIER_MAX_CONTEXT_CHARS = int(os.environ.get("MM_ASK_EVIDENCE_VERIFIER_MAX_CONTEXT_CHARS", "16000"))
 
+# ASK full-document reader (generic, non-benchmark-specific).
+# When the authorized scope is narrow enough, this gives the answer model a much larger
+# evidence pack instead of only a few top chunks. It is meant to mimic how a human expert
+# would scan the actual manual/procedure before answering factual technical questions.
+ASK_FULL_CONTEXT_ENABLED = (os.environ.get("MM_ASK_FULL_CONTEXT_ENABLED") or "1").strip() != "0"
+ASK_FULL_CONTEXT_MAX_DOCS = int(os.environ.get("MM_ASK_FULL_CONTEXT_MAX_DOCS", "3"))
+ASK_FULL_CONTEXT_MAX_PAGES = int(os.environ.get("MM_ASK_FULL_CONTEXT_MAX_PAGES", "140"))
+ASK_FULL_CONTEXT_MAX_CHARS = int(os.environ.get("MM_ASK_FULL_CONTEXT_MAX_CHARS", "120000"))
+ASK_FULL_CONTEXT_PAGE_CHARS = int(os.environ.get("MM_ASK_FULL_CONTEXT_PAGE_CHARS", "6500"))
+ASK_FULL_CONTEXT_TIMEOUT = int(os.environ.get("MM_ASK_FULL_CONTEXT_TIMEOUT_SECONDS", "120"))
+ASK_FULL_CONTEXT_MODEL = (os.environ.get("MM_ASK_FULL_CONTEXT_MODEL") or ASK_EVIDENCE_ANSWER_MODEL).strip()
+
 # Shared semantic retrieval planner
 SEMANTIC_QUERY_PLANNER_MODEL = (os.environ.get("MM_SEMANTIC_QUERY_PLANNER_MODEL") or "gpt-5.4-mini").strip()
 SEMANTIC_QUERY_PLANNER_TIMEOUT = int(os.environ.get("MM_SEMANTIC_QUERY_PLANNER_TIMEOUT_SECONDS", "20"))
@@ -6851,74 +6863,6 @@ def _ask_evidence_fallback_profile(q: str, response_language: str = "it") -> dic
     }
 
 
-
-
-def _ask_evidence_apply_generic_technical_expansions(profile: dict, q: str) -> dict:
-    """Add generic industrial-document retrieval vocabulary.
-
-    This is deliberately NOT a benchmark/dataset dictionary: it contains no document ids,
-    no expected values, no machine names, and no test-specific answers. It only bridges
-    common IT/EN wording differences and common table/procedure labels used in manuals.
-    The terms are used for retrieval/scoring only; answers still come only from sources.
-    """
-    prof = dict(profile or {})
-    qn = _normalize_unicode_advanced(q or "").lower()
-    joined = " ".join(
-        [qn]
-        + [str(x or "").lower() for x in prof.get("search_phrases") or []]
-        + [str(x or "").lower() for x in prof.get("search_terms_it") or []]
-        + [str(x or "").lower() for x in prof.get("search_terms_en") or []]
-        + [str(x or "").lower() for x in prof.get("required_information") or []]
-    )
-
-    expansions_it: list[str] = []
-    expansions_en: list[str] = []
-    phrases: list[str] = []
-
-    def add(it=None, en=None, ph=None):
-        if it:
-            expansions_it.extend(it)
-        if en:
-            expansions_en.extend(en)
-        if ph:
-            phrases.extend(ph)
-
-    # Generic labels for tables, schedules, specifications and intervals.
-    if any(x in joined for x in ["frequ", "intervall", "period", "tempo", "tempi", "tabella", "table", "schedule", "ogni", "ore", "hours"]):
-        add(
-            it=["frequenza", "frequenze", "intervallo", "intervalli", "periodicità", "periodicita", "scadenza", "scadenze", "ore", "ogni", "settimana", "settimanale", "mensile", "annuale", "giornaliero", "tabella", "valore", "unità", "unita"],
-            en=["frequency", "frequencies", "interval", "intervals", "periodicity", "schedule", "hours", "weekly", "monthly", "annual", "yearly", "daily", "table", "value", "unit"],
-            ph=["tabella manutenzione", "maintenance table", "maintenance schedule", "piano manutenzione"],
-        )
-
-    # Generic maintenance wording; useful across manuals, procedures and checklists.
-    if any(x in joined for x in ["manut", "maintenance", "service", "servicing", "ispez", "control", "controll", "pulizia", "clean", "lubr", "filter", "filtro"]):
-        add(
-            it=["manutenzione", "ordinaria", "straordinaria", "controllo", "controllare", "verifica", "verificare", "ispezione", "pulizia", "pulire", "sostituzione", "sostituire", "lubrificazione", "lubrificare", "olio", "grasso", "filtro", "filtri", "condensa", "scarico condensa", "pneumatico", "quadro elettrico"],
-            en=["maintenance", "ordinary", "extraordinary", "check", "inspection", "inspect", "cleaning", "clean", "replace", "replacement", "lubrication", "lubricate", "oil", "grease", "filter", "filters", "condensate", "condensate drain", "pneumatic", "electrical panel", "electrical cabinet"],
-            ph=["manutenzione ordinaria", "ordinary maintenance", "maintenance instructions"],
-        )
-
-    # Generic safety / LOTO vocabulary. Not an answer rule: only expands retrieval.
-    if any(x in joined for x in ["sicurezza", "safety", "aliment", "elettric", "pneumatic", "aria", "tensione", "lock", "blocco", "interruttore", "sezion"]):
-        add(
-            it=["sicurezza", "attenzione", "avvertenza", "pericolo", "tensione", "senza tensione", "alimentazione", "alimentazione elettrica", "alimentazione pneumatica", "aria compressa", "interruttore generale", "sezionatore", "blocco", "bloccare", "lucchetto", "chiave", "chiave di sblocco", "riparo", "ripari", "protezione", "protezioni", "dpi", "occhiali", "mascherina"],
-            en=["safety", "warning", "danger", "voltage", "power", "power supply", "electrical supply", "pneumatic supply", "compressed air", "main switch", "disconnect switch", "isolator", "lock", "lockout", "padlock", "key", "release key", "guard", "guards", "protection", "ppe", "goggles", "mask"],
-            ph=["lockout", "lock out", "lock-out", "main switch", "interruttore generale", "alimentazione pneumatica", "compressed air"],
-        )
-
-    # Generic component/specification questions often require preserving label-value rows.
-    if any(x in joined for x in ["dato", "dati", "specific", "caratter", "codice", "code", "tipo", "model", "modello", "forza", "veloc", "acceler", "rapporto", "gioco", "pignone", "cremagliera", "ridutt", "gear", "rack", "pinion", "reducer"]):
-        add(
-            it=["dati", "specifiche", "caratteristiche", "codice", "codici", "tipo", "modello", "denominazione", "valore", "unità", "forza", "velocità", "accelerazione", "ciclo", "rapporto", "gioco", "diametro", "modulo", "denti"],
-            en=["data", "specifications", "features", "code", "codes", "type", "model", "designation", "value", "unit", "force", "speed", "acceleration", "cycle", "ratio", "backlash", "diameter", "module", "teeth"],
-        )
-
-    prof["search_terms_it"] = _dedup_text_values(list(prof.get("search_terms_it") or []) + expansions_it, limit=64)
-    prof["search_terms_en"] = _dedup_text_values(list(prof.get("search_terms_en") or []) + expansions_en, limit=64)
-    prof["search_phrases"] = _dedup_text_values(list(prof.get("search_phrases") or []) + phrases, limit=36)
-    return prof
-
 def _ask_evidence_query_profile(q: str, response_language: str) -> dict:
     """Extract query needs without using any document-specific or benchmark-specific facts."""
     fallback = _ask_evidence_fallback_profile(q, response_language)
@@ -6951,10 +6895,10 @@ def _ask_evidence_query_profile(q: str, response_language: str) -> dict:
             parsed["search_terms_it"] = _dedup_text_values(list(parsed.get("search_terms_it") or []) + fallback["search_terms_it"], limit=32)
             parsed["search_terms_en"] = _dedup_text_values(list(parsed.get("search_terms_en") or []) + fallback["search_terms_en"], limit=32)
             parsed["important_codes_or_numbers"] = _dedup_text_values(list(parsed.get("important_codes_or_numbers") or []) + fallback["important_codes_or_numbers"], limit=24)
-            return _ask_evidence_apply_generic_technical_expansions(parsed, q)
+            return parsed
     except Exception as e:
         print("ASK_EVIDENCE_PROFILE_FAIL", str(e)[:300])
-    return _ask_evidence_apply_generic_technical_expansions(fallback, q)
+    return fallback
 
 
 def _ask_evidence_scope_where(
@@ -7049,7 +6993,7 @@ def _ask_evidence_fetch_pages(
 ) -> list[dict]:
     """Fetch and rank full pages/structured pages within the already-authorized scope."""
     limit = max(50, int(ASK_EVIDENCE_SCOPE_PAGE_LIMIT or 900))
-    top_pages = max(3, min(int(top_pages or ASK_EVIDENCE_TOP_PAGES or 10), 24))
+    top_pages = max(3, min(int(top_pages or ASK_EVIDENCE_TOP_PAGES or 10), 16))
     where_sql, params = _ask_evidence_scope_where(
         company_id=company_id,
         machine_id=machine_id,
@@ -7133,120 +7077,6 @@ def _ask_evidence_answer_schema() -> dict:
     }
 
 
-
-
-
-def _ask_evidence_fact_pack_schema() -> dict:
-    return {
-        "name": "ask_generic_evidence_fact_pack_v1",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "coverage_status": {"type": "string", "enum": ["sufficient", "partial", "insufficient"]},
-                "answer_strategy": {"type": "string"},
-                "critical_facts": {
-                    "type": "array",
-                    "maxItems": 18,
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "properties": {
-                            "fact": {"type": "string"},
-                            "why_it_matters": {"type": "string"},
-                            "citation_ids": {"type": "array", "items": {"type": "string"}, "maxItems": 4},
-                        },
-                        "required": ["fact", "why_it_matters", "citation_ids"],
-                    },
-                },
-                "table_rows_or_label_values": {
-                    "type": "array",
-                    "maxItems": 20,
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "properties": {
-                            "label": {"type": "string"},
-                            "value": {"type": "string"},
-                            "unit_or_frequency": {"type": "string"},
-                            "notes": {"type": "string"},
-                            "citation_ids": {"type": "array", "items": {"type": "string"}, "maxItems": 4},
-                        },
-                        "required": ["label", "value", "unit_or_frequency", "notes", "citation_ids"],
-                    },
-                },
-                "ordered_actions": {
-                    "type": "array",
-                    "maxItems": 16,
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "properties": {
-                            "step": {"type": "string"},
-                            "citation_ids": {"type": "array", "items": {"type": "string"}, "maxItems": 4},
-                        },
-                        "required": ["step", "citation_ids"],
-                    },
-                },
-                "missing_or_uncertain": {"type": "array", "items": {"type": "string"}, "maxItems": 10},
-            },
-            "required": ["coverage_status", "answer_strategy", "critical_facts", "table_rows_or_label_values", "ordered_actions", "missing_or_uncertain"],
-        },
-    }
-
-
-def _ask_evidence_extract_fact_pack(
-    *,
-    q: str,
-    sources_block: str,
-    profile: dict,
-    response_language: str,
-) -> dict:
-    """Generic evidence distiller for ASK.
-
-    It converts raw source text into a query-specific fact pack BEFORE the final answer.
-    This is intentionally generic: no document ids, no benchmark values, no machine names,
-    no hard-coded expected answers. It forces the model to first enumerate exact source facts,
-    table rows, label-value pairs and ordered actions that answer the user's question.
-    """
-    if not OPENAI_API_KEY:
-        return {"coverage_status": "partial", "answer_strategy": "LLM disabled; use raw sources", "critical_facts": [], "table_rows_or_label_values": [], "ordered_actions": [], "missing_or_uncertain": []}
-    if not sources_block:
-        return {"coverage_status": "insufficient", "answer_strategy": "No sources", "critical_facts": [], "table_rows_or_label_values": [], "ordered_actions": [], "missing_or_uncertain": ["No source text available"]}
-
-    system_msg = (
-        "You are an evidence extraction engine for industrial manuals, procedures and technical records. "
-        "Use ONLY SOURCES. Do not answer conversationally. Do not use outside knowledge. "
-        "Extract the facts that are directly needed to answer QUESTION. "
-        "For tables, schedules and maintenance plans, preserve rows, frequencies, units, components and notes. "
-        "For procedures or safety instructions, preserve ordered actions and mandatory safety conditions. "
-        "For specifications, preserve label-value-unit triples exactly. "
-        "If the sources do not contain a requested item, list it in missing_or_uncertain. "
-        "Never invent values. Use citation_id values present in SOURCES."
-    )
-    user_msg = (
-        f"QUESTION:\n{q}\n\n"
-        f"RESPONSE_LANGUAGE:\n{response_language}\n\n"
-        f"QUERY_PROFILE:\n{json.dumps(profile or {}, ensure_ascii=False)}\n\n"
-        f"SOURCES:\n{sources_block}\n\n"
-        "Return JSON only. Prioritize exact values/units/codes/frequencies and operational steps over generic summaries."
-    )
-    try:
-        parsed = _openai_chat_json_models(
-            [
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_msg},
-            ],
-            models=[ASK_EVIDENCE_ANALYZER_MODEL, ASK_EVIDENCE_ANSWER_MODEL, OPENAI_CHAT_MODEL],
-            json_schema=_ask_evidence_fact_pack_schema(),
-            timeout=70,
-        )
-        if isinstance(parsed, dict):
-            return parsed
-    except Exception as e:
-        print("ASK_EVIDENCE_FACT_PACK_FAIL", str(e)[:500])
-    return {"coverage_status": "partial", "answer_strategy": "Fact pack extraction failed; use raw sources", "critical_facts": [], "table_rows_or_label_values": [], "ordered_actions": [], "missing_or_uncertain": []}
 
 
 def _ask_evidence_verifier_schema() -> dict:
@@ -7339,6 +7169,302 @@ def _ask_evidence_verify_answer(
     except Exception as e:
         print("ASK_EVIDENCE_VERIFIER_FAIL", str(e)[:500])
     return {"verdict": "pass", "reason": "verifier failed open"}
+
+def _ask_full_context_query_has_secret_intent(q: str) -> bool:
+    q_low = _normalize_unicode_advanced(q or "").lower()
+    return any(x in q_low for x in [
+        "password", "pwd", "pin", "credenzial", "credential", "secret", "token", "plc password", "password plc",
+    ])
+
+
+def _ask_full_context_seed_doc_ids(
+    *,
+    doc_ids: Optional[list[str]],
+    bubble_document_id: Optional[str],
+    seed_citations: Optional[list[dict]],
+) -> Optional[list[str]]:
+    """Pick document/source ids to read fully, without using benchmark-specific ids."""
+    if doc_ids:
+        return _dedup_text_values([str(x or "").strip() for x in doc_ids if str(x or "").strip()], limit=ASK_FULL_CONTEXT_MAX_DOCS)
+    if bubble_document_id:
+        return [str(bubble_document_id).strip()]
+
+    out: list[str] = []
+    seen = set()
+    for c in seed_citations or []:
+        bdid = str((c or {}).get("bubble_document_id") or "").strip()
+        if not bdid or bdid in seen:
+            continue
+        seen.add(bdid)
+        out.append(bdid)
+        if len(out) >= int(ASK_FULL_CONTEXT_MAX_DOCS or 3):
+            break
+    return out or None
+
+
+def _ask_full_context_fetch_pages(
+    *,
+    company_id: str,
+    machine_id: str,
+    doc_ids: Optional[list[str]],
+    bubble_document_id: Optional[str],
+    seed_citations: Optional[list[dict]],
+) -> list[dict]:
+    """Fetch full pages for a narrow authorized scope.
+
+    This is intentionally generic: it does not know any test question, expected answer,
+    document id, product code or component. It simply reads the authorized document pages
+    when the scope is narrow enough to fit in the model context.
+    """
+    target_doc_ids = _ask_full_context_seed_doc_ids(
+        doc_ids=doc_ids,
+        bubble_document_id=bubble_document_id,
+        seed_citations=seed_citations,
+    )
+    if not target_doc_ids:
+        return []
+
+    target_doc_ids = target_doc_ids[: max(1, int(ASK_FULL_CONTEXT_MAX_DOCS or 3))]
+    page_limit = max(10, int(ASK_FULL_CONTEXT_MAX_PAGES or 140))
+    page_chars = max(1200, int(ASK_FULL_CONTEXT_PAGE_CHARS or 6500))
+
+    conn = _db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT bubble_document_id, machine_id, page_number, LEFT(COALESCE(text, ''), %s) AS page_text
+                FROM public.document_pages
+                WHERE company_id = %s
+                  AND bubble_document_id = ANY(%s)
+                  AND text IS NOT NULL
+                  AND length(text) > 20
+                ORDER BY bubble_document_id, page_number
+                LIMIT %s;
+                """,
+                [page_chars, company_id, target_doc_ids, page_limit],
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    citations: list[dict] = []
+    total_chars = 0
+    max_chars = max(20000, int(ASK_FULL_CONTEXT_MAX_CHARS or 120000))
+    for (bdid, mid, page_number, page_text) in rows:
+        txt = str(page_text or "").strip()
+        if not txt:
+            continue
+        page = _safe_int(page_number, 1)
+        # Keep whole pages until the budget is exhausted. This avoids fragment-only answers.
+        if total_chars + len(txt) > max_chars and citations:
+            break
+        if len(txt) > max_chars and not citations:
+            txt = txt[:max_chars]
+        citations.append(
+            {
+                "citation_id": f"{bdid}:p{page}-{page}:full",
+                "bubble_document_id": str(bdid),
+                "chunk_index": 0,
+                "page_from": page,
+                "page_to": page,
+                "snippet": txt[:ASK_SNIPPET_CHARS],
+                "chunk_full": txt,
+                "similarity": 0.99,
+                "retrieval_score": 99.0,
+                "ask_full_context": True,
+            }
+        )
+        total_chars += len(txt)
+    return citations
+
+
+def _ask_full_context_sources_block(citations: list[dict], *, max_context_chars: int) -> str:
+    parts: list[str] = []
+    total = 0
+    for c in citations or []:
+        body = str(c.get("chunk_full") or c.get("snippet") or "").strip()
+        if not body:
+            continue
+        part = (
+            f"[{c['citation_id']}] "
+            f"(doc={c['bubble_document_id']}, p{c['page_from']}-{c['page_to']})\n"
+            f"{body}\n"
+        )
+        if total + len(part) > max_context_chars:
+            if not parts:
+                part = part[:max_context_chars]
+                parts.append(part)
+            break
+        parts.append(part)
+        total += len(part)
+    return "\n".join(parts).strip()
+
+
+def _ask_full_context_answer(
+    *,
+    q: str,
+    company_id: str,
+    machine_id: str,
+    doc_ids: Optional[list[str]],
+    bubble_document_id: Optional[str],
+    response_language: str,
+    top_k: int,
+    seed_citations: Optional[list[dict]] = None,
+    debug: bool = False,
+) -> Optional[dict]:
+    """High-quality ASK path for narrow scopes: read the authorized document(s) broadly.
+
+    This is not a benchmark solver. It is a generic long-context document-reading path.
+    It is used only when the scope is narrow enough (explicit document ids, one document,
+    or top seed documents) and therefore safe/cost-bounded.
+    """
+    if not ASK_FULL_CONTEXT_ENABLED or not OPENAI_API_KEY:
+        return None
+    if _ask_full_context_query_has_secret_intent(q):
+        return None
+
+    full_citations = _ask_full_context_fetch_pages(
+        company_id=company_id,
+        machine_id=machine_id,
+        doc_ids=doc_ids,
+        bubble_document_id=bubble_document_id,
+        seed_citations=seed_citations,
+    )
+    if not full_citations:
+        return None
+
+    profile = _ask_evidence_query_profile(q, response_language)
+    sources_block = _ask_full_context_sources_block(
+        full_citations,
+        max_context_chars=int(ASK_FULL_CONTEXT_MAX_CHARS or 120000),
+    )
+    if not sources_block:
+        return None
+
+    system_msg = (
+        "You are MachineMind ASK, an expert industrial-document reader. "
+        "Answer ONLY from the SOURCES. Do not use outside knowledge. "
+        "Read the sources like a technician: scan titles, paragraphs, warnings, labels, values, tables and page continuations before answering. "
+        "For tables or interval/frequency questions, extract the relevant rows with component/action/frequency/value/notes; do not say that values are missing if they appear in the table. "
+        "For safety or maintenance questions, include all mandatory isolation, lockout, energy-disconnection, PPE, restart and restoration steps present in the sources. "
+        "For technical data, preserve exact codes, numbers, units, decimals, signs and symbols. "
+        "For procedures, give ordered operational steps. "
+        "If the requested information is not present in SOURCES, return no_sources. "
+        "Every answer point must cite one or more citation_ids from SOURCES. Reply in the requested language."
+    )
+    user_msg = (
+        f"QUESTION:\n{q}\n\n"
+        f"RESPONSE_LANGUAGE:\n{response_language}\n\n"
+        f"QUERY_PROFILE:\n{json.dumps(profile, ensure_ascii=False)}\n\n"
+        f"SOURCES:\n{sources_block}\n\n"
+        "Return JSON only. Make the answer complete and concrete enough for an industrial technician. "
+        "Prefer precise extraction over summary. If the question asks for 'some' examples, include the most relevant examples but keep their exact values/frequencies. "
+        "Do not add unsupported claims and do not omit important source facts that directly answer the question."
+    )
+
+    try:
+        parsed = _openai_chat_json_models(
+            [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            models=[ASK_FULL_CONTEXT_MODEL, ASK_EVIDENCE_ANSWER_MODEL, OPENAI_CHAT_MODEL, ROOT_CAUSE_RESPONSE_MODEL],
+            json_schema=_ask_evidence_answer_schema(),
+            timeout=int(ASK_FULL_CONTEXT_TIMEOUT or 120),
+        )
+    except Exception as e:
+        print("ASK_FULL_CONTEXT_ANSWER_FAIL", str(e)[:700])
+        return None
+
+    if not isinstance(parsed, dict):
+        return None
+    answer_status = str(parsed.get("answer_status") or "").strip().lower()
+    grounded_points = list(parsed.get("grounded_points") or [])
+    if answer_status != "answered" or not grounded_points:
+        return None
+
+    answer, final_citations = _render_grounded_answer_points(
+        grounded_points=grounded_points,
+        citations=full_citations,
+        max_points=8,
+        q=q,
+    )
+    if not answer or not final_citations:
+        return None
+
+    # Verify against the same broad context. If incomplete, do one rewrite using verifier feedback.
+    verifier_result = _ask_evidence_verify_answer(
+        q=q,
+        answer=answer,
+        evidence_citations=full_citations,
+        profile=profile,
+        response_language=response_language,
+    )
+    if str((verifier_result or {}).get("verdict") or "pass").strip().lower() == "rewrite":
+        rewrite_user_msg = (
+            f"QUESTION:\n{q}\n\n"
+            f"RESPONSE_LANGUAGE:\n{response_language}\n\n"
+            f"QUERY_PROFILE:\n{json.dumps(profile, ensure_ascii=False)}\n\n"
+            f"VERIFIER_FEEDBACK_JSON:\n{json.dumps(verifier_result or {}, ensure_ascii=False)[:5000]}\n\n"
+            f"SOURCES:\n{sources_block}\n\n"
+            "Rewrite the answer using only SOURCES. Address every missing requirement raised by the verifier if it is present in SOURCES. "
+            "Keep exact numbers, units, codes, table rows, warnings, conditions and ordered steps. Return JSON only."
+        )
+        try:
+            parsed2 = _openai_chat_json_models(
+                [
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": rewrite_user_msg},
+                ],
+                models=[ASK_FULL_CONTEXT_MODEL, ASK_EVIDENCE_ANSWER_MODEL, OPENAI_CHAT_MODEL, ROOT_CAUSE_RESPONSE_MODEL],
+                json_schema=_ask_evidence_answer_schema(),
+                timeout=int(ASK_FULL_CONTEXT_TIMEOUT or 120),
+            )
+            if isinstance(parsed2, dict) and str(parsed2.get("answer_status") or "").strip().lower() == "answered":
+                answer2, final_citations2 = _render_grounded_answer_points(
+                    grounded_points=list(parsed2.get("grounded_points") or []),
+                    citations=full_citations,
+                    max_points=8,
+                    q=q,
+                )
+                if answer2 and final_citations2:
+                    answer = answer2
+                    final_citations = final_citations2
+        except Exception as e:
+            print("ASK_FULL_CONTEXT_REWRITE_FAIL", str(e)[:700])
+
+    if not _looks_like_target_language(answer, response_language):
+        answer = _translate_text_preserving_citations(answer, response_language)
+
+    response_citations = _sanitize_citations_for_response(final_citations, company_id=company_id)
+    try:
+        rg_links = _build_rg_links(company_id, response_citations)
+    except Exception as e:
+        print("RG_LINKS_FAIL", str(e))
+        rg_links = []
+
+    resp = {
+        "ok": True,
+        "status": "answered",
+        "answer": answer,
+        "citations": response_citations,
+        "rg_links": rg_links,
+        "top_k": top_k,
+        "similarity_max": max([float(c.get("similarity") or 0.0) for c in full_citations], default=None),
+        "chat_model": "ask_full_context_reader",
+    }
+    if debug:
+        resp["ask_full_context"] = {
+            "pages_used": len(full_citations),
+            "doc_ids_used": _dedup_text_values([c.get("bubble_document_id") for c in full_citations], limit=20),
+            "context_chars": len(sources_block),
+            "profile": profile,
+            "verifier": verifier_result if 'verifier_result' in locals() else {},
+        }
+    return resp
+
+
 def _ask_generic_evidence_answer(
     *,
     q: str,
@@ -7389,14 +7515,6 @@ def _ask_generic_evidence_answer(
     if not sources_block:
         return None
 
-    fact_pack = _ask_evidence_extract_fact_pack(
-        q=q,
-        sources_block=sources_block,
-        profile=profile,
-        response_language=response_language,
-    )
-    fact_pack_json = json.dumps(fact_pack or {}, ensure_ascii=False)[:9000]
-
     system_msg = (
         "You are MachineMind ASK, a high-precision question-answering engine for industrial documentation. "
         "Answer ONLY from the provided SOURCES. Do not use outside knowledge. "
@@ -7411,11 +7529,8 @@ def _ask_generic_evidence_answer(
         f"QUESTION:\n{q}\n\n"
         f"RESPONSE_LANGUAGE:\n{response_language}\n\n"
         f"QUERY_PROFILE:\n{json.dumps(profile, ensure_ascii=False)}\n\n"
-        f"EXTRACTED_FACT_PACK_JSON:\n{fact_pack_json}\n\n"
         f"SOURCES:\n{sources_block}\n\n"
-        "Return JSON only. Build the answer from EXTRACTED_FACT_PACK_JSON first, then verify against SOURCES. "
-        "Make the answer complete enough for a technician: include relevant numbers, units, component names, codes, intervals, table rows, conditions and exceptions found in SOURCES. "
-        "If EXTRACTED_FACT_PACK_JSON contains table_rows_or_label_values or ordered_actions relevant to the question, include them explicitly instead of summarizing them away. "
+        "Return JSON only. Make the answer complete enough for a technician: include relevant numbers, units, component names, codes, intervals, conditions and exceptions found in SOURCES. "
         "Do not cite a source unless the point is supported by that source."
     )
 
@@ -7465,11 +7580,9 @@ def _ask_generic_evidence_answer(
             f"QUESTION:\n{q}\n\n"
             f"RESPONSE_LANGUAGE:\n{response_language}\n\n"
             f"QUERY_PROFILE:\n{json.dumps(profile, ensure_ascii=False)}\n\n"
-            f"EXTRACTED_FACT_PACK_JSON:\n{fact_pack_json}\n\n"
             f"VERIFIER_FEEDBACK_JSON:\n{rewrite_feedback}\n\n"
             f"SOURCES:\n{sources_block}\n\n"
             "Rewrite the answer using only SOURCES and addressing the verifier feedback. "
-            "Use EXTRACTED_FACT_PACK_JSON as the checklist of facts/actions/table rows that must not be omitted when relevant. "
             "Keep exact values, units, codes, table rows, conditions, exceptions and ordered steps when present. Return JSON only."
         )
         try:
@@ -7522,7 +7635,6 @@ def _ask_generic_evidence_answer(
             "page_hit_ids": [c.get("citation_id") for c in page_hits[:10]],
             "merged_count": len(merged or []),
             "verifier": verifier_result if 'verifier_result' in locals() else {},
-            "fact_pack": fact_pack if 'fact_pack' in locals() else {},
         }
     return resp
 
@@ -9338,6 +9450,20 @@ def _ask_v1_baseline_impl(
         return resp
 
     effective_threshold = float(retrieval.get("effective_threshold") or ASK_SIM_THRESHOLD)
+
+    full_context_resp = _ask_full_context_answer(
+        q=q,
+        company_id=company_id,
+        machine_id=machine_id,
+        doc_ids=doc_ids if isinstance(doc_ids, list) else None,
+        bubble_document_id=bubble_document_id,
+        response_language=response_language,
+        top_k=top_k,
+        seed_citations=citations,
+        debug=bool(payload.debug),
+    )
+    if full_context_resp:
+        return _finalize(full_context_resp)
 
     generic_evidence_resp = _ask_generic_evidence_answer(
         q=q,
