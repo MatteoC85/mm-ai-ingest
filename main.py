@@ -71,20 +71,25 @@ ASK_SNIPPET_CHARS = int(os.environ.get("MM_ASK_SNIPPET_CHARS", "700"))
 ASK_MAX_CONTEXT_CHARS = int(os.environ.get("MM_ASK_MAX_CONTEXT_CHARS", "9000"))
 DRAFT_PS_SIM_THRESHOLD = float(os.environ.get("MM_DRAFT_PS_SIM_THRESHOLD", "0.42"))
 
+# ASK generic evidence compiler.
+# This is not question-specific and does not know any benchmark question/document.
+# It improves ASK by scanning authorized full pages/structured records, extracting
+# the facts required by the user's question, and then rendering a grounded answer.
+ASK_EVIDENCE_COMPILER_ENABLED = (os.environ.get("MM_ASK_EVIDENCE_COMPILER_ENABLED") or "1").strip() != "0"
+ASK_EVIDENCE_ANALYZER_MODEL = (os.environ.get("MM_ASK_EVIDENCE_ANALYZER_MODEL") or OPENAI_RERANK_MODEL).strip()
+ASK_EVIDENCE_ANSWER_MODEL = (os.environ.get("MM_ASK_EVIDENCE_ANSWER_MODEL") or os.environ.get("MM_ROOT_CAUSE_RESPONSE_MODEL") or "gpt-5.4").strip()
+ASK_EVIDENCE_SCOPE_PAGE_LIMIT = int(os.environ.get("MM_ASK_EVIDENCE_SCOPE_PAGE_LIMIT", "900"))
+ASK_EVIDENCE_TOP_PAGES = int(os.environ.get("MM_ASK_EVIDENCE_TOP_PAGES", "10"))
+ASK_EVIDENCE_MAX_PAGE_CHARS = int(os.environ.get("MM_ASK_EVIDENCE_MAX_PAGE_CHARS", "12000"))
+ASK_EVIDENCE_MAX_CONTEXT_CHARS = int(os.environ.get("MM_ASK_EVIDENCE_MAX_CONTEXT_CHARS", "24000"))
+ASK_EVIDENCE_MIN_PAGE_SCORE = float(os.environ.get("MM_ASK_EVIDENCE_MIN_PAGE_SCORE", "1.5"))
+
 # Structured-source rescue for machine-wide Ask queries.
 # Purpose: when the user asks about procedures/steps/P&S/photos/videos or asks a how-to
 # question, do not let long manuals dominate over exact structured records.
 STRUCTURED_RESCUE_ENABLED = (os.environ.get("MM_STRUCTURED_RESCUE_ENABLED") or "1").strip() != "0"
 STRUCTURED_RESCUE_SCAN_LIMIT = int(os.environ.get("MM_STRUCTURED_RESCUE_SCAN_LIMIT", "220"))
 STRUCTURED_RESCUE_MAX_HITS = int(os.environ.get("MM_STRUCTURED_RESCUE_MAX_HITS", "3"))
-
-# Ask precision rescue for technical PDF/table questions.
-# Dense retrieval can select the right document but the wrong chunk/excerpt; this forces
-# exact lexical evidence into Ask for installation, maintenance, table, component, code,
-# reducer, rack/pinion and numeric-value questions without touching root-cause retrieval.
-ASK_PRECISION_LEXICAL_RESCUE_ENABLED = (os.environ.get("MM_ASK_PRECISION_LEXICAL_RESCUE_ENABLED") or "1").strip() != "0"
-ASK_PRECISION_LEXICAL_TOP_K = int(os.environ.get("MM_ASK_PRECISION_LEXICAL_TOP_K", "5"))
-ASK_FOCUSED_EXCERPT_CHARS = int(os.environ.get("MM_ASK_FOCUSED_EXCERPT_CHARS", "2600"))
 
 # Shared semantic retrieval planner
 SEMANTIC_QUERY_PLANNER_MODEL = (os.environ.get("MM_SEMANTIC_QUERY_PLANNER_MODEL") or "gpt-5.4-mini").strip()
@@ -1576,7 +1581,7 @@ def _localized_token_answer(language: str, token: str, citation_id: str) -> str:
 
 def _ask_response_schema() -> dict:
     return {
-        "name": "ask_grounded_answer_v4",
+        "name": "ask_grounded_answer_v3",
         "strict": True,
         "schema": {
             "type": "object",
@@ -1588,7 +1593,7 @@ def _ask_response_schema() -> dict:
                 },
                 "grounded_points": {
                     "type": "array",
-                    "maxItems": 6,
+                    "maxItems": 3,
                     "items": {
                         "type": "object",
                         "additionalProperties": False,
@@ -1597,7 +1602,7 @@ def _ask_response_schema() -> dict:
                             "citation_ids": {
                                 "type": "array",
                                 "items": {"type": "string"},
-                                "maxItems": 6,
+                                "maxItems": 3,
                             },
                         },
                         "required": ["text", "citation_ids"],
@@ -2028,7 +2033,7 @@ def _augment_crosslingual_query_plan(q: str, planner: Optional[dict]) -> dict:
 
 def _ask_rescue_response_schema() -> dict:
     return {
-        "name": "ask_grounded_answer_rescue_v2",
+        "name": "ask_grounded_answer_rescue_v1",
         "strict": True,
         "schema": {
             "type": "object",
@@ -2036,7 +2041,7 @@ def _ask_rescue_response_schema() -> dict:
             "properties": {
                 "grounded_points": {
                     "type": "array",
-                    "maxItems": 6,
+                    "maxItems": 3,
                     "items": {
                         "type": "object",
                         "additionalProperties": False,
@@ -2045,7 +2050,7 @@ def _ask_rescue_response_schema() -> dict:
                             "citation_ids": {
                                 "type": "array",
                                 "items": {"type": "string"},
-                                "maxItems": 6,
+                                "maxItems": 3,
                             },
                         },
                         "required": ["text", "citation_ids"],
@@ -2176,136 +2181,12 @@ def _extractive_fallback_answer(
 
     return answer, used
 
-
-def _ask_focus_terms(q: str, planner: Optional[dict] = None, limit: int = 18) -> list[str]:
-    texts = [str(q or "")]
-    if isinstance(planner, dict):
-        texts.append(str(planner.get("normalized_query") or ""))
-        texts.extend(str(x or "") for x in (planner.get("lexical_queries") or []))
-
-    raw = _normalize_unicode_advanced(" ".join(texts)).lower()
-
-    stop = {
-        "the", "and", "for", "with", "when", "while", "during", "after", "before", "from",
-        "this", "that", "these", "those", "what", "which", "where", "does", "there", "about",
-        "il", "lo", "la", "i", "gli", "le", "con", "per", "quando", "durante", "dopo", "prima",
-        "questo", "questa", "questi", "queste", "quale", "quali", "sono", "cosa", "come",
-        "macchina", "documento", "documenti", "generali", "conosci", "informazioni", "principali",
-        "indicato", "indicati", "previsto", "previsti", "riportano", "riporta", "richiesti",
-    }
-
-    priority = [
-        "installazione", "collegamenti", "temperatura", "pavimentazione", "livellata", "elettrica", "compressa",
-        "manutenzione", "ordinaria", "lucchetto", "sezionatore", "interruttore", "pneumatica", "sicurezza",
-        "frequenze", "tabella", "lubrificazione", "pneumatico", "quadro", "filtri", "tensione", "dpi",
-        "forza", "lavorazione", "velocità", "accelerazione", "ciclo", "durata", "coefficiente",
-        "cremagliera", "pignone", "modulo", "elica", "denti", "diametro", "primitivo",
-        "riduttore", "epicicloidale", "rapporto", "gioco", "denominazione", "standard",
-        "bbx", "bbx300", "bbx-40t", "calibrazione",
-    ]
-
-    terms: list[str] = []
-    seen = set()
-
-    def add(tok: str) -> None:
-        tok = str(tok or "").strip().lower()
-        if len(tok) < 3 or tok in stop or tok in seen:
-            return
-        seen.add(tok)
-        terms.append(tok)
-
-    for tok in priority:
-        if tok in raw:
-            add(tok)
-
-    # Keep product/code-like tokens. They are often decisive for technical tables.
-    for tok in re.findall(r"[a-z0-9][a-z0-9+_.°/-]{2,}", raw):
-        clean = tok.strip("._-/")
-        if len(clean) >= 3 and (any(ch.isdigit() for ch in clean) or any(ch in tok for ch in ["-", "/", "+"])):
-            add(clean)
-
-    for tok in re.findall(r"[a-zà-öø-ÿ0-9]{3,}", raw):
-        add(tok)
-        if len(terms) >= limit:
-            break
-
-    return terms[:limit]
-
-
-def _query_focused_excerpt(
-    *,
-    q: str,
-    text: str,
-    planner: Optional[dict] = None,
-    max_chars: int = ASK_FOCUSED_EXCERPT_CHARS,
-) -> str:
-    """Return a query-focused excerpt instead of the beginning of a long chunk.
-
-    This matters for technical PDFs/tables: the relevant row may be in the middle of a
-    3-4k chunk, while the previous implementation sent only the first part to the LLM.
-    """
-    body = re.sub(r"\s+", " ", str(text or "")).strip()
-    if not body:
-        return ""
-
-    max_chars = max(700, int(max_chars or ASK_FOCUSED_EXCERPT_CHARS))
-    if len(body) <= max_chars:
-        return body
-
-    low = _normalize_unicode_advanced(body).lower()
-    terms = _ask_focus_terms(q, planner=planner, limit=18)
-    positions: list[int] = []
-    for term in terms:
-        t = _normalize_unicode_advanced(term).lower().strip()
-        if not t:
-            continue
-        start = 0
-        while True:
-            idx = low.find(t, start)
-            if idx < 0:
-                break
-            positions.append(idx)
-            start = idx + max(1, len(t))
-            if len(positions) >= 120:
-                break
-        if len(positions) >= 120:
-            break
-
-    if not positions:
-        return body[:max_chars].strip() + " …"
-
-    # Pick the window with the largest weighted concentration of query terms.
-    window = max_chars
-    best_start = 0
-    best_score = -1.0
-    for pos in positions:
-        start = max(0, min(len(body) - window, pos - window // 3))
-        end = min(len(body), start + window)
-        snippet_low = low[start:end]
-        unique_hits = sum(1 for t in terms if _normalize_unicode_advanced(t).lower() in snippet_low)
-        dense_hits = sum(1 for p in positions if start <= p < end)
-        # Slightly prefer windows where the first matched term appears not too late.
-        score = unique_hits * 5.0 + dense_hits * 0.6 - (start / max(1, len(body))) * 0.2
-        if score > best_score:
-            best_score = score
-            best_start = start
-
-    best_end = min(len(body), best_start + window)
-    excerpt = body[best_start:best_end].strip()
-    if best_start > 0:
-        excerpt = "… " + excerpt
-    if best_end < len(body):
-        excerpt = excerpt + " …"
-    return excerpt
-
 def _enrich_ask_prompt_citations(
     company_id: str,
     citations: list[dict],
     *,
     max_manual_expansions: int = 2,
     radius: int = 1,
-    q: str = "",
-    planner: Optional[dict] = None,
 ) -> list[dict]:
     out: list[dict] = []
     manual_done = 0
@@ -2336,30 +2217,11 @@ def _enrich_ask_prompt_citations(
                 texts.append(txt)
 
             if texts:
-                joined_text = "\n".join(texts)
-                cc["chunk_full"] = _query_focused_excerpt(
-                    q=q,
-                    text=joined_text,
-                    planner=planner,
-                    max_chars=ASK_FOCUSED_EXCERPT_CHARS,
-                )
+                cc["chunk_full"] = "\n".join(texts)[:2200]
                 if not cc.get("snippet"):
-                    cc["snippet"] = _query_focused_excerpt(
-                        q=q,
-                        text=texts[0],
-                        planner=planner,
-                        max_chars=ASK_SNIPPET_CHARS,
-                    )
+                    cc["snippet"] = texts[0][:ASK_SNIPPET_CHARS]
 
             manual_done += 1
-
-        elif source_type == "manual" and cc.get("snippet"):
-            cc["snippet"] = _query_focused_excerpt(
-                q=q,
-                text=str(cc.get("snippet") or ""),
-                planner=planner,
-                max_chars=ASK_SNIPPET_CHARS,
-            )
 
         out.append(cc)
 
@@ -2381,8 +2243,6 @@ def _generate_ask_grounded_points(
     prompt_citations = _enrich_ask_prompt_citations(
         company_id=company_id,
         citations=citations,
-        q=q,
-        planner=planner,
         max_manual_expansions=2,
         radius=1,
     )
@@ -2411,7 +2271,7 @@ def _generate_ask_grounded_points(
             "Use no_sources only when the sources are genuinely not helpful. "
             "Do not repeat the same idea in multiple points. "
             "Do not include raw citation ids inside the text field; put support only in citation_ids. "
-            "Return 1 to 6 concise grounded points. Include all directly requested numeric values, codes, intervals and safety actions when present in the sources. "
+            "Return 1 to 3 short grounded points only. "
             "Each point must be directly supported by its citation_ids."
         )
         schema = _ask_response_schema()
@@ -2421,7 +2281,7 @@ def _generate_ask_grounded_points(
             "Use ONLY the provided sources. "
             "Always answer the user's question directly. "
             "Always reply in the requested response language. "
-            "Return 1 to 6 concise grounded points. Include all directly requested numeric values, codes, intervals and safety actions when present in the sources. "
+            "Return 1 to 3 very short grounded points. "
             "You MUST return grounded_points, even if the evidence is partial. "
             "For procedural, maintenance, setup, safety, or troubleshooting questions, return the actual operations/actions to perform, not section titles, headings, or isolated manual fragments. "
             "Respect temporal qualifiers in the question: if the user asks what to do before an operation, include only preparatory/before-start actions and do not include after-completion, restoration, or restart steps unless explicitly requested. "
@@ -3051,257 +2911,6 @@ def _candidate_order_key(item: dict) -> tuple:
         str(item.get("citation_id") or ""),
     )
 
-
-
-def _ask_precision_lexical_rescue_intent(q: str, planner: Optional[dict] = None) -> bool:
-    if not ASK_PRECISION_LEXICAL_RESCUE_ENABLED:
-        return False
-
-    texts = [str(q or "")]
-    if isinstance(planner, dict):
-        texts.append(str(planner.get("normalized_query") or ""))
-        texts.extend(str(x or "") for x in (planner.get("lexical_queries") or []))
-
-    low = _normalize_unicode_advanced(" ".join(texts)).lower()
-    if not low.strip():
-        return False
-
-    markers = [
-        "installazione", "collegament", "temperatura", "paviment", "aria compress", "alimentazione",
-        "manutenzione", "frequenz", "tabella", "lubrificazione", "impianto pneumatic", "quadro elettrico",
-        "filtr", "togliere tensione", "lucchetto", "sezionatore", "interruttore generale", "dpi",
-        "forza", "veloc", "acceler", "durata", "ciclo", "coefficiente", "dati ciclo",
-        "cremagliera", "pignone", "denti", "diametro", "modulo", "elica",
-        "riduttore", "rapporto", "gioco", "denominazione", "epicicloidale",
-        "codice", "codici", "ordinazione", "tipo", "bbx", "calibrazione",
-    ]
-    if any(m in low for m in markers):
-        return True
-
-    # Technical code / numeric lookup.
-    return bool(re.search(r"\b\d+[,.]?\d*\s*(bar|mm|m/s|s|n|nm|arcmin|ore|kg|°)\b", low))
-
-
-
-def _ask_precision_scan_hits(
-    *,
-    company_id: str,
-    machine_id: str,
-    q: str,
-    planner: Optional[dict],
-    top_k: int,
-    doc_ids: Optional[list[str]] = None,
-    bubble_document_id: Optional[str] = None,
-) -> list[dict]:
-    """Deterministic lexical scan for Ask technical/fixed-document questions.
-
-    FTS/dense retrieval can miss the exact chunk containing a value/table row. This
-    bounded scan scores chunks inside the already authorized scope and returns
-    query-focused excerpts with high retrieval scores so the LLM sees the correct
-    numeric/code evidence.
-    """
-    terms = _ask_focus_terms(q, planner=planner, limit=22)
-    if not terms:
-        return []
-
-    norm_terms = [_normalize_unicode_advanced(t).lower().strip() for t in terms if str(t or '').strip()]
-    norm_terms = [t for t in norm_terms if len(t) >= 3]
-    if not norm_terms:
-        return []
-
-    conn = _db_conn()
-    try:
-        with conn.cursor() as cur:
-            where = ["company_id = %s"]
-            params: list[Any] = [company_id]
-
-            if doc_ids:
-                where.append("bubble_document_id = ANY(%s)")
-                params.append(doc_ids)
-                scan_limit = 1600
-            elif bubble_document_id:
-                where.append("bubble_document_id = %s")
-                params.append(bubble_document_id)
-                where.append("(machine_id = %s OR machine_id IS NULL OR machine_id = '')")
-                params.append(machine_id)
-                scan_limit = 1200
-            else:
-                where.append("(machine_id = %s OR machine_id IS NULL OR machine_id = '')")
-                params.append(machine_id)
-                scan_limit = 1200
-
-            cur.execute(
-                f"""
-                SELECT bubble_document_id, chunk_index, page_from, page_to,
-                       left(chunk_text, 5200) AS chunk_full
-                FROM public.document_chunks
-                WHERE {' AND '.join(where)}
-                  AND embedding IS NOT NULL
-                ORDER BY bubble_document_id, page_from, chunk_index
-                LIMIT %s;
-                """,
-                [*params, scan_limit],
-            )
-            rows = cur.fetchall()
-    finally:
-        conn.close()
-
-    if not rows:
-        return []
-
-    q_low = _normalize_unicode_advanced(q or '').lower()
-    important_bigrams = []
-    words = [w for w in re.findall(r"[a-zà-öø-ÿ0-9+_.°/-]{3,}", q_low) if len(w) >= 3]
-    for i in range(len(words) - 1):
-        important_bigrams.append(f"{words[i]} {words[i+1]}")
-
-    scored: list[dict] = []
-    for (bdid, chunk_index, page_from, page_to, chunk_full) in rows:
-        text_raw = str(chunk_full or '').strip()
-        if not text_raw:
-            continue
-        low = _normalize_unicode_advanced(text_raw).lower()
-
-        term_hits = sum(1 for t in norm_terms if t and t in low)
-        if term_hits <= 0:
-            continue
-
-        # Technical questions often need a chunk where several target concepts appear together.
-        phrase_hits = sum(1 for ph in important_bigrams if len(ph) >= 7 and ph in low)
-        numeric_density = len(re.findall(r"\b\d+[\d.,]*\s*(?:bar|mm|m/s|m/s²|n|ore|arcmin|%|°)?\b", low))
-        code_density = len(re.findall(r"\b[A-Z0-9][A-Z0-9+_.\-/]{4,}\b", text_raw))
-
-        # Intent-specific soft boosts.
-        boost = 0.0
-        if any(x in q_low for x in ["install", "collegament", "temperatura", "aria compress", "paviment"]):
-            boost += sum(0.8 for x in ["temperatura", "paviment", "aria compress", "corrente elettrica", "70 mm"] if x in low)
-        if any(x in q_low for x in ["manutenzione", "sicurezza", "ordinaria"]):
-            boost += sum(0.8 for x in ["lucchetto", "aria compress", "interruttore generale", "togliere tensione"] if x in low)
-        if any(x in q_low for x in ["frequenz", "tabella", "lubrificazione", "quadro elettrico"]):
-            boost += sum(0.7 for x in ["1000", "3000", "50", "settiman", "mensil", "annualmente", "lubrificazione"] if x in low)
-        if any(x in q_low for x in ["filtri", "filtro", "quadro elettrico"]):
-            boost += sum(0.8 for x in ["filtro", "griglia", "aria compressa", "annualmente", "mascherina", "occhiali"] if x in low)
-        if any(x in q_low for x in ["forza", "veloc", "acceler", "ciclo", "calibrazione"]):
-            boost += sum(0.8 for x in ["65000", "0,38", "4,62", "0,52", "0,81", "8888", "64"] if x in low)
-        if any(x in q_low for x in ["cremagliera", "pignone"]):
-            boost += sum(0.9 for x in ["zst", "rmw", "600-334", "600-444", "23", "146,423", "modulo", "elica"] if x in low)
-        if any(x in q_low for x in ["riduttore", "rapporto", "gioco", "epicicloidale"]):
-            boost += sum(0.9 for x in ["rp060", "27,5", "1,5", "arcmin", "epicicloidale", "standard"] if x in low)
-
-        score = term_hits * 2.0 + phrase_hits * 2.4 + min(numeric_density, 12) * 0.18 + min(code_density, 10) * 0.22 + boost
-        if score < 2.0:
-            continue
-
-        excerpt = _query_focused_excerpt(q=q, text=text_raw, planner=planner, max_chars=ASK_FOCUSED_EXCERPT_CHARS)
-        snippet = _query_focused_excerpt(q=q, text=text_raw, planner=planner, max_chars=ASK_SNIPPET_CHARS)
-        similarity = min(0.93, 0.58 + min(score, 12.0) * 0.025)
-        retrieval_score = min(0.98, similarity + 0.11 + min(score, 10.0) * 0.006)
-        citation_id = f"{bdid}:p{int(page_from)}-{int(page_to)}:c{int(chunk_index)}"
-        scored.append({
-            "citation_id": citation_id,
-            "bubble_document_id": str(bdid),
-            "chunk_index": int(chunk_index),
-            "page_from": int(page_from),
-            "page_to": int(page_to),
-            "snippet": snippet,
-            "chunk_full": excerpt,
-            "similarity": float(similarity),
-            "retrieval_score": float(retrieval_score),
-            "overlap_score": min(1.0, term_hits / max(1, len(norm_terms)) + min(boost, 4.0) * 0.04),
-            "specificity_score": min(0.18, 0.05 + 0.005 * term_hits + 0.006 * min(numeric_density + code_density, 10)),
-            "source_bias": 0.06,
-            "ask_precision_scan": True,
-            "ask_precision_score": float(score),
-            "embedding_list": [],
-        })
-
-    scored.sort(key=lambda x: (-float(x.get("ask_precision_score") or 0.0), str(x.get("bubble_document_id") or ""), int(x.get("page_from") or 0), int(x.get("chunk_index") or 0)))
-    return _dedup_citations_by_snippet(scored, max_items=max(top_k, min(8, top_k + 2)))
-
-def _fetch_ask_precision_lexical_hits(
-    *,
-    company_id: str,
-    machine_id: str,
-    q: str,
-    planner: Optional[dict],
-    top_k: int,
-    doc_ids: Optional[list[str]] = None,
-    bubble_document_id: Optional[str] = None,
-) -> list[dict]:
-    # Also run for explicit document_ids/bubble_document_id scopes. The fixed-document
-    # ASK benchmark and real UI document scopes need exact lexical/table evidence, not
-    # only dense retrieval.
-    if not _ask_precision_lexical_rescue_intent(q, planner):
-        return []
-
-    scan_hits = _ask_precision_scan_hits(
-        company_id=company_id,
-        machine_id=machine_id,
-        q=q,
-        planner=planner,
-        top_k=top_k,
-        doc_ids=doc_ids,
-        bubble_document_id=bubble_document_id,
-    )
-
-    lexical_queries = _dedup_text_values(
-        [q, str((planner or {}).get("normalized_query") or "")]
-        + list((planner or {}).get("lexical_queries") or []),
-        limit=max(3, SEMANTIC_MAX_LEXICAL_QUERIES + 2),
-    )
-    if not lexical_queries:
-        return scan_hits
-
-    limit = max(1, min(int(ASK_PRECISION_LEXICAL_TOP_K or 5), max(top_k, 4)))
-    hits: list[dict] = []
-
-    # Exact AND-style FTS first; prefix OR-style as fallback/coverage.
-    hits.extend(
-        _fts_search_chunks_multi(
-            company_id=company_id,
-            machine_id=machine_id,
-            queries=lexical_queries,
-            top_k=limit,
-            doc_ids=doc_ids,
-            bubble_document_id=bubble_document_id,
-        )
-    )
-    hits.extend(
-        _fts_search_chunks_prefix(
-            company_id=company_id,
-            machine_id=machine_id,
-            texts=lexical_queries,
-            top_k=limit,
-            doc_ids=doc_ids,
-            bubble_document_id=bubble_document_id,
-        )
-    )
-
-    if not hits:
-        return []
-
-    terms = _ask_focus_terms(q, planner=planner, limit=18)
-    scored: list[dict] = []
-    for h in hits:
-        hh = dict(h)
-        snippet = _normalize_unicode_advanced(str(hh.get("snippet") or "")).lower()
-        overlap = sum(1 for t in terms if _normalize_unicode_advanced(t).lower() in snippet)
-        hh["overlap_score"] = max(float(hh.get("overlap_score") or 0.0), overlap / max(1, len(terms)))
-        hh["specificity_score"] = max(float(hh.get("specificity_score") or 0.0), 0.03 + min(0.07, 0.01 * overlap))
-        hh["source_bias"] = max(float(hh.get("source_bias") or 0.0), 0.02)
-        hh["retrieval_score"] = max(float(hh.get("retrieval_score") or 0.0), 0.10 + 0.03 * overlap)
-        scored.append(hh)
-
-    scored.sort(
-        key=lambda x: (
-            -float(x.get("overlap_score") or 0.0),
-            -float(x.get("retrieval_score") or 0.0),
-            str(x.get("bubble_document_id") or ""),
-            int(x.get("page_from") or 0),
-            int(x.get("chunk_index") or 0),
-        )
-    )
-    return _dedup_citations_by_snippet(scan_hits + scored, max_items=max(limit, min(top_k, 8)))
 
 def _source_type_from_document_id(value: str) -> str:
     v = str(value or "").strip().lower()
@@ -3935,7 +3544,6 @@ def _shared_semantic_retrieval(
     query_token_count = _count_query_tokens(q)
 
     structured_rescue_hits: list[dict] = []
-    precision_lexical_hits: list[dict] = []
     # Keep root-cause diagnostic retrieval untouched: this rescue is for Ask/how-to
     # and draft support, where exact structured records must not be hidden by manuals.
     if not diagnostic_mode and str(planner_mode or "").strip().lower() != "root_cause":
@@ -4073,38 +3681,14 @@ def _shared_semantic_retrieval(
             exact_fts_used = True
             selected_citations = _dedup_citations_by_snippet(selected_citations + exact_hits, max_items=top_k)
 
-    if not diagnostic_mode and str(planner_mode or "").strip().lower() != "root_cause":
-        precision_lexical_hits = _fetch_ask_precision_lexical_hits(
-            company_id=company_id,
-            machine_id=machine_id,
-            q=q,
-            planner=planner,
-            top_k=top_k,
-            doc_ids=doc_ids,
-            bubble_document_id=bubble_document_id,
-        )
-        if precision_lexical_hits:
-            fts_used = True
-            exact_fts_used = True
-            selected_citations = _dedup_citations_by_snippet(
-                precision_lexical_hits + selected_citations,
-                max_items=top_k,
-            )
-
     if selected_citations:
-        if precision_lexical_hits:
-            # Preserve deterministic precision order for Ask technical/fixed-document questions.
-            # The family lock can otherwise collapse evidence to one manual section and drop
-            # table rows/numeric chunks needed for a complete answer.
-            selected_citations = _dedup_citations_by_snippet(selected_citations, max_items=top_k)
-        else:
-            selected_citations = _lock_final_citations(
-                selected_citations=selected_citations,
-                ranked_candidates=list(cut_candidates or []) + list(selected_citations or []),
-                top_k=top_k,
-                diagnostic_mode=diagnostic_mode,
-                query_token_count=query_token_count,
-            )
+        selected_citations = _lock_final_citations(
+            selected_citations=selected_citations,
+            ranked_candidates=list(cut_candidates or []) + list(selected_citations or []),
+            top_k=top_k,
+            diagnostic_mode=diagnostic_mode,
+            query_token_count=query_token_count,
+        )
 
     if structured_rescue_hits:
         selected_citations = _promote_structured_rescue_hits(
@@ -4127,8 +3711,6 @@ def _shared_semantic_retrieval(
         "exact_fts_used": exact_fts_used,
         "rerank_used": rerank_used,
         "rerank_error": rerank_error[:300] if rerank_error else None,
-        "precision_lexical_used": bool(precision_lexical_hits),
-        "precision_lexical_count": len(precision_lexical_hits or []),
     }
 
 def _expand_with_neighbor_chunks(
@@ -7167,6 +6749,445 @@ def _build_sources_block_from_citations(
 
     return "\n".join(ctx_parts).strip()
 
+
+# -----------------------------------------------------------------------------
+# ASK generic evidence compiler (query-agnostic, multilingual, non-hardcoded)
+# -----------------------------------------------------------------------------
+
+def _ask_evidence_stopwords() -> set[str]:
+    return {
+        # IT
+        "che", "cosa", "come", "quale", "quali", "quanto", "quanti", "quando", "dove", "perche", "perché",
+        "sono", "devo", "deve", "fare", "faccio", "indica", "indicati", "indicate", "della", "delle", "degli",
+        "dell", "alla", "allo", "alle", "con", "per", "sul", "sulla", "sulle", "nel", "nella", "nelle",
+        "documento", "documenti", "macchina", "manuale", "principali", "richiesti", "richieste", "alcune",
+        # EN
+        "what", "which", "how", "when", "where", "why", "does", "must", "should", "with", "from", "about",
+        "document", "documents", "machine", "manual", "main", "required", "requirements", "some",
+    }
+
+
+def _ask_evidence_tokenize(text: str) -> list[str]:
+    t = _normalize_unicode_advanced(text or "").lower()
+    toks = re.findall(r"[a-z0-9à-öø-ÿ_+\-.,/°²≤>=]+", t)
+    stop = _ask_evidence_stopwords()
+    out = []
+    for tok in toks:
+        tok = tok.strip(".,;:!?()[]{}\"'")
+        if not tok or tok in stop:
+            continue
+        if len(tok) < 2 and not tok.isdigit():
+            continue
+        out.append(tok)
+    return out
+
+
+def _ask_evidence_code_tokens(text: str) -> list[str]:
+    raw = _normalize_unicode_advanced(text or "")
+    # Codes/part numbers often include hyphens, digits, commas and letters.
+    candidates = re.findall(r"\b[A-Z0-9][A-Z0-9_+./,\-]{4,}[A-Z0-9]\b", raw.upper())
+    out = []
+    seen = set()
+    for x in candidates:
+        x = x.strip(".,;:!?()[]{}")
+        if x and x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out[:24]
+
+
+def _ask_evidence_number_tokens(text: str) -> list[str]:
+    raw = _normalize_unicode_advanced(text or "")
+    vals = re.findall(r"(?<!\w)[+\-]?(?:\d{1,4}(?:[.,]\d{1,6})?|\d{2,})(?:\s?(?:mm|cm|m/s²|m/s2|m/s|bar|n|kn|s|ore|hours|hz|kw|v|a|arcmin|°c|°))?", raw.lower())
+    out = []
+    seen = set()
+    for v in vals:
+        v = re.sub(r"\s+", " ", v.strip())
+        if v and v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out[:30]
+
+
+def _ask_evidence_query_schema() -> dict:
+    return {
+        "name": "ask_evidence_query_profile_v1",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "question_language": {"type": "string", "enum": ["it", "en", "other"]},
+                "answer_type": {
+                    "type": "string",
+                    "enum": ["factual", "procedural", "list", "table", "component_spec", "diagnostic", "comparison", "no_answer_check", "general"],
+                },
+                "search_phrases": {"type": "array", "items": {"type": "string"}, "maxItems": 18},
+                "search_terms_it": {"type": "array", "items": {"type": "string"}, "maxItems": 24},
+                "search_terms_en": {"type": "array", "items": {"type": "string"}, "maxItems": 24},
+                "required_information": {"type": "array", "items": {"type": "string"}, "maxItems": 18},
+                "important_codes_or_numbers": {"type": "array", "items": {"type": "string"}, "maxItems": 18},
+            },
+            "required": ["question_language", "answer_type", "search_phrases", "search_terms_it", "search_terms_en", "required_information", "important_codes_or_numbers"],
+        },
+    }
+
+
+def _ask_evidence_fallback_profile(q: str, response_language: str = "it") -> dict:
+    toks = _ask_evidence_tokenize(q)
+    codes = _ask_evidence_code_tokens(q)
+    nums = _ask_evidence_number_tokens(q)
+    return {
+        "question_language": response_language if response_language in {"it", "en"} else "it",
+        "answer_type": "general",
+        "search_phrases": _dedup_text_values([q] + codes + nums, limit=18),
+        "search_terms_it": _dedup_text_values(toks + codes + nums, limit=24),
+        "search_terms_en": _dedup_text_values(toks + codes + nums, limit=24),
+        "required_information": _dedup_text_values(toks[:12], limit=18),
+        "important_codes_or_numbers": _dedup_text_values(codes + nums, limit=18),
+    }
+
+
+def _ask_evidence_query_profile(q: str, response_language: str) -> dict:
+    """Extract query needs without using any document-specific or benchmark-specific facts."""
+    fallback = _ask_evidence_fallback_profile(q, response_language)
+    if not OPENAI_API_KEY:
+        return fallback
+
+    system_msg = (
+        "You analyze industrial-document questions for retrieval. Do not answer the question. "
+        "Extract generic search phrases, bilingual Italian/English terms, requested attributes, codes and numbers. "
+        "Do not add facts that are not in the user question. Do not use any hidden benchmark knowledge."
+    )
+    user_msg = (
+        f"QUESTION:\n{q}\n\n"
+        "Return a retrieval profile. Include both Italian and English equivalents when useful, because documents and questions may be in either language. "
+        "For technical/specification questions, include component names, attribute labels, units, table labels and code-like tokens found in the question."
+    )
+    try:
+        parsed = _openai_chat_json_models(
+            [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            models=[ASK_EVIDENCE_ANALYZER_MODEL, OPENAI_RERANK_MODEL, OPENAI_CHAT_MODEL],
+            json_schema=_ask_evidence_query_schema(),
+            timeout=35,
+        )
+        if isinstance(parsed, dict):
+            # Merge deterministic tokens so exact codes/numbers from the question cannot be lost.
+            parsed["search_phrases"] = _dedup_text_values(list(parsed.get("search_phrases") or []) + fallback["search_phrases"], limit=24)
+            parsed["search_terms_it"] = _dedup_text_values(list(parsed.get("search_terms_it") or []) + fallback["search_terms_it"], limit=32)
+            parsed["search_terms_en"] = _dedup_text_values(list(parsed.get("search_terms_en") or []) + fallback["search_terms_en"], limit=32)
+            parsed["important_codes_or_numbers"] = _dedup_text_values(list(parsed.get("important_codes_or_numbers") or []) + fallback["important_codes_or_numbers"], limit=24)
+            return parsed
+    except Exception as e:
+        print("ASK_EVIDENCE_PROFILE_FAIL", str(e)[:300])
+    return fallback
+
+
+def _ask_evidence_scope_where(
+    *,
+    company_id: str,
+    machine_id: str,
+    doc_ids: Optional[list[str]] = None,
+    bubble_document_id: Optional[str] = None,
+) -> tuple[str, list[Any]]:
+    where = ["company_id = %s"]
+    params: list[Any] = [company_id]
+    if doc_ids:
+        where.append("bubble_document_id = ANY(%s)")
+        params.append(doc_ids)
+    elif bubble_document_id:
+        where.append("bubble_document_id = %s")
+        params.append(bubble_document_id)
+        where.append("(machine_id = %s OR machine_id IS NULL OR machine_id = '')")
+        params.append(machine_id)
+    else:
+        where.append("(machine_id = %s OR machine_id IS NULL OR machine_id = '')")
+        params.append(machine_id)
+    return " AND ".join(where), params
+
+
+def _ask_evidence_score_text(q: str, text: str, profile: dict) -> float:
+    if not text:
+        return 0.0
+    tn = _normalize_unicode_advanced(text).lower()
+    qn = _normalize_unicode_advanced(q or "").lower()
+
+    q_tokens = [t for t in _ask_evidence_tokenize(qn) if len(t) >= 3]
+    terms = []
+    for key in ["search_phrases", "search_terms_it", "search_terms_en", "required_information", "important_codes_or_numbers"]:
+        terms.extend([str(x or "").strip() for x in (profile.get(key) or [])])
+    terms.extend(q_tokens)
+    terms.extend(_ask_evidence_code_tokens(q))
+    terms.extend(_ask_evidence_number_tokens(q))
+    terms = _dedup_text_values(terms, limit=90)
+
+    score = 0.0
+    hit_terms = 0
+    for term in terms:
+        norm = _normalize_unicode_advanced(term).lower().strip()
+        if not norm or norm in _ask_evidence_stopwords():
+            continue
+        if norm in tn:
+            hit_terms += 1
+            # Phrases, codes and numeric/unit values matter more than isolated generic words.
+            if len(norm) >= 12 or re.search(r"\d", norm):
+                score += 5.0
+            elif len(norm) >= 6:
+                score += 2.2
+            else:
+                score += 1.0
+
+    # Token-level recall from the original question.
+    q_unique = _dedup_text_values(q_tokens, limit=40)
+    if q_unique:
+        matched = sum(1 for t in q_unique if t in tn)
+        score += 10.0 * (matched / max(1, len(q_unique)))
+        if matched >= 2:
+            score += 2.0
+
+    # Exact code/number tokens from the question are strong anchors.
+    for x in _ask_evidence_code_tokens(q) + _ask_evidence_number_tokens(q):
+        xn = _normalize_unicode_advanced(x).lower()
+        if xn and xn in tn:
+            score += 8.0
+
+    # Prefer pages/records that are information dense and contain multiple query anchors.
+    if hit_terms >= 4:
+        score += min(8.0, hit_terms * 0.8)
+
+    # Penalize very generic safety/intro pages unless the question itself asks about them.
+    generic_markers = ["informazioni generali", "general information", "proprietà delle informazioni", "all rights reserved"]
+    if any(x in tn for x in generic_markers) and hit_terms < 3:
+        score -= 3.0
+
+    return max(0.0, score)
+
+
+def _ask_evidence_fetch_pages(
+    *,
+    q: str,
+    profile: dict,
+    company_id: str,
+    machine_id: str,
+    doc_ids: Optional[list[str]] = None,
+    bubble_document_id: Optional[str] = None,
+    top_pages: int = 10,
+) -> list[dict]:
+    """Fetch and rank full pages/structured pages within the already-authorized scope."""
+    limit = max(50, int(ASK_EVIDENCE_SCOPE_PAGE_LIMIT or 900))
+    top_pages = max(3, min(int(top_pages or ASK_EVIDENCE_TOP_PAGES or 10), 16))
+    where_sql, params = _ask_evidence_scope_where(
+        company_id=company_id,
+        machine_id=machine_id,
+        doc_ids=doc_ids,
+        bubble_document_id=bubble_document_id,
+    )
+
+    rows = []
+    conn = _db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT bubble_document_id, machine_id, page_number, left(text, %s) AS page_text
+                FROM public.document_pages
+                WHERE {where_sql}
+                  AND text IS NOT NULL
+                  AND length(text) > 20
+                ORDER BY bubble_document_id, page_number
+                LIMIT %s;
+                """,
+                [int(ASK_EVIDENCE_MAX_PAGE_CHARS or 12000), *params, limit],
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    scored: list[dict] = []
+    for (bdid, mid, page_number, page_text) in rows:
+        txt = str(page_text or "").strip()
+        if not txt:
+            continue
+        score = _ask_evidence_score_text(q, txt, profile)
+        if score < float(ASK_EVIDENCE_MIN_PAGE_SCORE or 0.0):
+            continue
+        page = _safe_int(page_number, 1)
+        scored.append(
+            {
+                "citation_id": f"{bdid}:p{page}-{page}:c0",
+                "bubble_document_id": str(bdid),
+                "chunk_index": 0,
+                "page_from": page,
+                "page_to": page,
+                "snippet": txt[:ASK_SNIPPET_CHARS],
+                "chunk_full": txt[: int(ASK_EVIDENCE_MAX_PAGE_CHARS or 12000)],
+                "similarity": min(0.99, 0.50 + score / 100.0),
+                "retrieval_score": score,
+                "ask_evidence_score": score,
+            }
+        )
+
+    scored.sort(key=lambda c: (-float(c.get("ask_evidence_score") or 0.0), str(c.get("bubble_document_id") or ""), int(c.get("page_from") or 0)))
+    return _dedup_citations_by_snippet(scored, max_items=top_pages)
+
+
+def _ask_evidence_answer_schema() -> dict:
+    return {
+        "name": "ask_generic_evidence_answer_v1",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "answer_status": {"type": "string", "enum": ["answered", "no_sources"]},
+                "grounded_points": {
+                    "type": "array",
+                    "maxItems": 8,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "text": {"type": "string"},
+                            "citation_ids": {"type": "array", "items": {"type": "string"}, "maxItems": 6},
+                        },
+                        "required": ["text", "citation_ids"],
+                    },
+                },
+            },
+            "required": ["answer_status", "grounded_points"],
+        },
+    }
+
+
+def _ask_generic_evidence_answer(
+    *,
+    q: str,
+    company_id: str,
+    machine_id: str,
+    doc_ids: Optional[list[str]],
+    bubble_document_id: Optional[str],
+    response_language: str,
+    top_k: int,
+    seed_citations: Optional[list[dict]] = None,
+    debug: bool = False,
+) -> Optional[dict]:
+    """Generic high-precision ASK path.
+
+    It does not contain benchmark questions, document ids, expected answers, or domain-specific
+    hardcoded facts. It only analyzes the user's query, scans authorized evidence, and asks the
+    model to extract the facts actually present in that evidence.
+    """
+    if not ASK_EVIDENCE_COMPILER_ENABLED:
+        return None
+
+    q_low = _normalize_unicode_advanced(q or "").lower()
+    # Keep credential/no-answer safety on the existing conservative path.
+    if any(x in q_low for x in ["password", "pwd", "credenzial", "pin", "plc password", "password plc"]):
+        return None
+
+    profile = _ask_evidence_query_profile(q, response_language)
+    page_hits = _ask_evidence_fetch_pages(
+        q=q,
+        profile=profile,
+        company_id=company_id,
+        machine_id=machine_id,
+        doc_ids=doc_ids,
+        bubble_document_id=bubble_document_id,
+        top_pages=max(int(ASK_EVIDENCE_TOP_PAGES or 10), top_k),
+    )
+
+    # Merge existing semantic hits as supporting evidence, but rank page scan first.
+    merged = _dedup_citations_by_snippet(list(page_hits or []) + list(seed_citations or []), max_items=max(top_k, 10))
+    if not merged:
+        return None
+
+    sources_block = _build_sources_block_from_citations(
+        merged,
+        max_context_chars=int(ASK_EVIDENCE_MAX_CONTEXT_CHARS or 24000),
+        prefer_chunk_full=True,
+    )
+    if not sources_block:
+        return None
+
+    system_msg = (
+        "You are MachineMind ASK, a high-precision question-answering engine for industrial documentation. "
+        "Answer ONLY from the provided SOURCES. Do not use outside knowledge. "
+        "This is a generic evidence extraction task: do not assume any hidden expected answer. "
+        "For tables/specifications, keep each label with its exact value and unit. Preserve codes, decimals, signs, symbols and units exactly as written. "
+        "For procedural questions, return the operative steps and required safety steps in the correct order. "
+        "For list questions, include all relevant items present in the evidence instead of over-summarizing. "
+        "If the evidence does not contain the requested information, return no_sources. "
+        "Every answer point must cite citation_ids from SOURCES. Reply in the requested language."
+    )
+    user_msg = (
+        f"QUESTION:\n{q}\n\n"
+        f"RESPONSE_LANGUAGE:\n{response_language}\n\n"
+        f"QUERY_PROFILE:\n{json.dumps(profile, ensure_ascii=False)}\n\n"
+        f"SOURCES:\n{sources_block}\n\n"
+        "Return JSON only. Make the answer complete enough for a technician: include relevant numbers, units, component names, codes, intervals, conditions and exceptions found in SOURCES. "
+        "Do not cite a source unless the point is supported by that source."
+    )
+
+    try:
+        parsed = _openai_chat_json_models(
+            [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            models=[ASK_EVIDENCE_ANSWER_MODEL, OPENAI_CHAT_MODEL, ROOT_CAUSE_RESPONSE_MODEL],
+            json_schema=_ask_evidence_answer_schema(),
+            timeout=90,
+        )
+    except Exception as e:
+        print("ASK_GENERIC_EVIDENCE_ANSWER_FAIL", str(e)[:500])
+        return None
+
+    answer_status = str((parsed or {}).get("answer_status") or "").strip().lower()
+    grounded_points = list((parsed or {}).get("grounded_points") or [])
+    if answer_status != "answered" or not grounded_points:
+        return None
+
+    answer, final_citations = _render_grounded_answer_points(
+        grounded_points=grounded_points,
+        citations=merged,
+        max_points=8,
+        q=q,
+    )
+    if not answer or not final_citations:
+        return None
+
+    if not _looks_like_target_language(answer, response_language):
+        answer = _translate_text_preserving_citations(answer, response_language)
+
+    response_citations = _sanitize_citations_for_response(final_citations, company_id=company_id)
+    try:
+        rg_links = _build_rg_links(company_id, response_citations)
+    except Exception as e:
+        print("RG_LINKS_FAIL", str(e))
+        rg_links = []
+
+    resp = {
+        "ok": True,
+        "status": "answered",
+        "answer": answer,
+        "citations": response_citations,
+        "rg_links": rg_links,
+        "top_k": top_k,
+        "similarity_max": max([float(c.get("similarity") or 0.0) for c in merged], default=None),
+        "chat_model": "ask_generic_evidence_compiler",
+    }
+    if debug:
+        resp["ask_evidence_compiler"] = {
+            "profile": profile,
+            "page_hit_count": len(page_hits or []),
+            "page_hit_ids": [c.get("citation_id") for c in page_hits[:10]],
+            "merged_count": len(merged or []),
+        }
+    return resp
+
 def _reorder_citations_by_priority_ids(
     citations: list[dict],
     priority_ids: list[str],
@@ -8979,6 +9000,20 @@ def _ask_v1_baseline_impl(
 
     effective_threshold = float(retrieval.get("effective_threshold") or ASK_SIM_THRESHOLD)
 
+    generic_evidence_resp = _ask_generic_evidence_answer(
+        q=q,
+        company_id=company_id,
+        machine_id=machine_id,
+        doc_ids=doc_ids if isinstance(doc_ids, list) else None,
+        bubble_document_id=bubble_document_id,
+        response_language=response_language,
+        top_k=top_k,
+        seed_citations=citations,
+        debug=bool(payload.debug),
+    )
+    if generic_evidence_resp:
+        return _finalize(generic_evidence_resp)
+
     if (sim_max is None or float(sim_max) < effective_threshold) and citations:
         picked = _pick_entity_from_citations(q, citations)
         if picked:
@@ -9128,7 +9163,7 @@ def _ask_v1_baseline_impl(
         answer, final_citations = _render_grounded_answer_points(
             grounded_points=grounded_points,
             citations=citations,
-            max_points=min(6, top_k),
+            max_points=min(3, top_k),
             q=q,
         )
 
@@ -10799,6 +10834,8 @@ def _should_attempt_ask_candidate(q: str, baseline_response: dict) -> bool:
         return False
     if _should_route_ask_through_root_cause(q):
         return False
+    if str((baseline_response or {}).get("chat_model") or "").strip() == "ask_generic_evidence_compiler":
+        return False
     if _is_lookup_or_identifier_query(q):
         return False
     profile = _query_symptom_profile(q)
@@ -10914,8 +10951,6 @@ def _generate_ask_candidate_grounded_points(
     prompt_citations = _enrich_ask_prompt_citations(
         company_id=company_id,
         citations=citations,
-        q=q,
-        planner=planner,
         max_manual_expansions=2,
         radius=1,
     )
@@ -10942,7 +10977,7 @@ def _generate_ask_candidate_grounded_points(
             "Do not include raw citation ids inside the text field; put support only in citation_ids. "
             "Every point must be directly supported by its citation_ids. "
             "Always reply in the requested response language. "
-            "Return 1 to 6 concise grounded points. Include all directly requested numeric values, codes, intervals and safety actions when present in the sources."
+            "Return 1 to 3 short grounded points only."
         )
         schema = _ask_response_schema()
     else:
@@ -10951,7 +10986,7 @@ def _generate_ask_candidate_grounded_points(
             "Use ONLY the provided sources, evidence-role summary, and evidence matrix. "
             "Always answer the user's question directly. "
             "Always reply in the requested response language. "
-            "Return 1 to 6 concise grounded points. Include all directly requested numeric values, codes, intervals and safety actions when present in the sources. "
+            "Return 1 to 3 very short grounded points. "
             "For procedural, maintenance, setup, safety, or troubleshooting questions, return the actual operations/actions to perform, not section titles, headings, or isolated manual fragments. "
             "Respect temporal qualifiers in the question: if the user asks what to do before an operation, include only preparatory/before-start actions and do not include after-completion, restoration, or restart steps unless explicitly requested. "
             "If the source text is fragmented by OCR/manual line breaks, reconstruct a short fluent sentence without adding outside knowledge. "
@@ -11130,7 +11165,7 @@ def _ask_v1_candidate_impl(
         answer, final_citations = _render_grounded_answer_points(
             grounded_points=grounded_points,
             citations=citations,
-            max_points=min(6, top_k),
+            max_points=min(3, top_k),
             q=q,
         )
 
