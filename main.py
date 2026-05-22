@@ -6812,6 +6812,281 @@ def _ask_evidence_number_tokens(text: str) -> list[str]:
     return out[:30]
 
 
+
+def _ask_text_contains_any(text: str, terms: list[str]) -> bool:
+    tn = _normalize_unicode_advanced(text or "").lower()
+    return any(str(t or "").lower() in tn for t in terms if str(t or "").strip())
+
+
+def _ask_evidence_intent_flags(q: str, profile: Optional[dict] = None) -> dict:
+    """Classify ASK needs using only generic query/profile signals.
+
+    This deliberately contains no document ids, machine models, benchmark questions, or expected
+    technical values. It only recognizes broad information shapes such as maintenance-safety
+    procedures, lockout/isolation instructions, and periodicity tables.
+    """
+    profile = profile or {}
+    blob = _normalize_unicode_advanced(
+        " ".join(
+            [
+                q or "",
+                str(profile.get("answer_type") or ""),
+                " ".join(str(x or "") for x in (profile.get("search_phrases") or [])),
+                " ".join(str(x or "") for x in (profile.get("search_terms_it") or [])),
+                " ".join(str(x or "") for x in (profile.get("search_terms_en") or [])),
+                " ".join(str(x or "") for x in (profile.get("required_information") or [])),
+            ]
+        )
+    ).lower()
+
+    maintenance_terms = [
+        "manutenz", "maintenance", "service", "servicing", "regolaz", "messa a punto", "riparaz", "repair",
+        "intervento", "intervenire", "controll", "check", "verifica", "ispezion", "inspection",
+    ]
+    safety_terms = [
+        "sicurezza", "safety", "rischio", "risk", "dpi", "ppe", "protezione", "protect", "riparo", "guard",
+        "isolamento", "isolation", "sezion", "disconnect", "lockout", "lucchetto", "padlock", "chiave", "key",
+        "tensione", "voltage", "power", "elettric", "pneumatic", "aria compressa", "compressed air",
+    ]
+    interval_terms = [
+        "frequenz", "frequency", "intervall", "interval", "periodic", "periodicità", "periodicita",
+        "ogni quanto", "quando", "scadenz", "schedule", "piano", "tabella", "table", "ore", "hours",
+        "giornal", "daily", "settiman", "weekly", "mensil", "monthly", "annua", "annual", "yearly",
+    ]
+    table_terms = ["tabella", "table", "schema", "schedule", "elenco", "list", "piano", "riepilogo"]
+
+    asks_maintenance = _ask_text_contains_any(blob, maintenance_terms)
+    asks_safety = asks_maintenance and _ask_text_contains_any(blob, safety_terms)
+    asks_intervals = asks_maintenance and _ask_text_contains_any(blob, interval_terms)
+    asks_table = (str(profile.get("answer_type") or "").lower() == "table") or _ask_text_contains_any(blob, table_terms) or asks_intervals
+    asks_procedure = (str(profile.get("answer_type") or "").lower() == "procedural") or _ask_text_contains_any(blob, ["procedura", "procedure", "passi", "steps", "operaz", "operation"])
+
+    return {
+        "maintenance": bool(asks_maintenance),
+        "safety": bool(asks_safety),
+        "intervals": bool(asks_intervals),
+        "table": bool(asks_table),
+        "procedure": bool(asks_procedure),
+    }
+
+
+def _ask_evidence_safety_action_score(text: str) -> float:
+    tn = _normalize_unicode_advanced(text or "").lower()
+    if not tn:
+        return 0.0
+    groups = [
+        ["lucchetto", "padlock", "lockout", "bloccare", "bloccabile", "locked", "lockable"],
+        ["sezionatore", "sezionamento", "isolato", "isolamento", "isolate", "disconnect", "disconnector"],
+        ["alimentazione elettrica", "tensione", "interruttore generale", "quadro", "electrical", "voltage", "main switch", "power"],
+        ["alimentazione pneumatica", "aria compressa", "pneumatica", "pneumatic", "compressed air"],
+        ["chiave", "chiavi", "key", "keys"],
+        ["ripari", "riparo", "guard", "guards", "protezioni", "protections", "condizioni di sicurezza", "safety conditions"],
+        ["dpi", "ppe", "mezzi di protezione", "protezione personale", "personal protective"],
+    ]
+    score = 0.0
+    for group in groups:
+        if any(g in tn for g in group):
+            score += 1.0
+    # Imperative/procedural text is stronger evidence than generic policy prose.
+    if any(x in tn for x in ["deve", "devono", "sempre", "obblig", "prima di", "solo dopo", "must", "shall", "before", "only after"]):
+        score += 1.0
+    return score
+
+
+def _ask_evidence_interval_table_score(text: str) -> float:
+    tn = _normalize_unicode_advanced(text or "").lower()
+    if not tn:
+        return 0.0
+    score = 0.0
+    if any(x in tn for x in ["tabella", "table", "schema", "schedule", "componenti", "components"]):
+        score += 2.0
+    periodic_hits = len(re.findall(r"\b(ogni|every|giornal\w*|daily|settiman\w*|weekly|mensil\w*|monthly|annua\w*|annual\w*|yearly)\b", tn))
+    hour_hits = len(re.findall(r"\b\d+(?:[.,]\d+)?\s*(?:h|ore|hours?)\b", tn))
+    unit_hits = len(re.findall(r"\b(?:olio|oil|filtro|filter|filtri|riduttore|gearbox|lubrific|lubric|pneumatic|pneumatica|elettric|electrical)\b", tn))
+    score += min(6.0, periodic_hits * 0.8)
+    score += min(5.0, hour_hits * 0.9)
+    score += min(4.0, unit_hits * 0.35)
+    # Table-like dense pages often contain many short lines / columns even after PDF extraction.
+    lines = [ln.strip() for ln in str(text or "").splitlines() if ln.strip()]
+    if len(lines) >= 12 and (periodic_hits + hour_hits) >= 2:
+        score += 2.0
+    return score
+
+
+def _ask_evidence_extract_relevant_text(q: str, text: str, profile: Optional[dict], max_chars: int = 5200) -> str:
+    """Compact a page/record around generic query anchors and structural evidence.
+
+    Full PDF pages can be very long; using the entire page for every citation makes the model see
+    only the first one or two pages. This keeps the important paragraphs/table lines while allowing
+    more distinct evidence pages into the same context window.
+    """
+    raw = str(text or "").strip()
+    if len(raw) <= max_chars:
+        return raw
+
+    flags = _ask_evidence_intent_flags(q, profile or {})
+    anchors = []
+    for key in ["search_phrases", "search_terms_it", "search_terms_en", "required_information", "important_codes_or_numbers"]:
+        anchors.extend([str(x or "").strip() for x in ((profile or {}).get(key) or [])])
+    anchors.extend(_ask_evidence_tokenize(q or ""))
+    anchors.extend(_ask_evidence_code_tokens(q or ""))
+    anchors.extend(_ask_evidence_number_tokens(q or ""))
+
+    if flags.get("safety"):
+        anchors.extend([
+            "manutenzione", "maintenance", "sicurezza", "safety", "sezionatore", "isolamento", "isolation",
+            "lucchetto", "padlock", "chiave", "key", "tensione", "interruttore generale", "pneumatica", "aria compressa",
+            "compressed air", "ripari", "guards", "protezione personale", "ppe", "dpi",
+        ])
+    if flags.get("intervals") or flags.get("table"):
+        anchors.extend([
+            "tabella", "table", "componenti", "components", "ore", "hours", "ogni", "every", "giorno", "daily",
+            "settiman", "weekly", "mensil", "monthly", "annua", "annual", "lubrific", "lubric", "filtro", "filter",
+            "pneumatic", "pneumatica", "elettric", "electrical",
+        ])
+
+    anchors_norm = []
+    seen = set()
+    for a in anchors:
+        an = _normalize_unicode_advanced(a).lower().strip()
+        if not an or an in seen or an in _ask_evidence_stopwords():
+            continue
+        seen.add(an)
+        anchors_norm.append(an)
+    anchors_norm = anchors_norm[:120]
+
+    # Split in lines first, because technical manuals/tables survive extraction mostly line-based.
+    lines = raw.splitlines()
+    scored_lines: list[tuple[float, int, str]] = []
+    for i, line in enumerate(lines):
+        ln = _normalize_unicode_advanced(line).lower()
+        if not ln.strip():
+            continue
+        score = 0.0
+        for a in anchors_norm:
+            if a and a in ln:
+                score += 2.0 if len(a) >= 6 else 1.0
+        if flags.get("safety"):
+            score += _ask_evidence_safety_action_score(line) * 2.0
+        if flags.get("intervals") or flags.get("table"):
+            score += _ask_evidence_interval_table_score(line) * 2.0
+            if re.search(r"\b\d+(?:[.,]\d+)?\s*(?:h|ore|hours?)\b", ln):
+                score += 2.5
+            if re.search(r"\b(ogni|every|giornal\w*|daily|settiman\w*|weekly|mensil\w*|monthly|annua\w*|annual\w*)\b", ln):
+                score += 2.0
+        if score > 0:
+            scored_lines.append((score, i, line))
+
+    if not scored_lines:
+        return raw[:max_chars]
+
+    # Keep neighborhoods around strong lines so table rows and procedural sequences remain readable.
+    scored_lines.sort(key=lambda x: (-x[0], x[1]))
+    keep_indexes: set[int] = set()
+    radius = 3 if (flags.get("intervals") or flags.get("table")) else 2
+    for _, idx, _ in scored_lines[:28]:
+        for j in range(max(0, idx - radius), min(len(lines), idx + radius + 1)):
+            keep_indexes.add(j)
+
+    # Preserve nearby headings because they carry section/table meaning.
+    for i, line in enumerate(lines):
+        ln = _normalize_unicode_advanced(line).lower()
+        if i in keep_indexes:
+            for j in range(max(0, i - 2), i + 1):
+                keep_indexes.add(j)
+        elif any(h in ln for h in ["tabella", "table", "manutenzione", "maintenance", "sicurezza", "safety", "isolamento", "isolation"]):
+            if any(abs(i - k) <= 8 for k in keep_indexes):
+                keep_indexes.add(i)
+
+    pieces = []
+    total = 0
+    last = None
+    for i in sorted(keep_indexes):
+        line = lines[i].strip()
+        if not line:
+            continue
+        if last is not None and i > last + 1:
+            sep = "\n---\n"
+            if total + len(sep) <= max_chars:
+                pieces.append(sep.strip("\n"))
+                total += len(sep)
+        add = line + "\n"
+        if total + len(add) > max_chars:
+            break
+        pieces.append(line)
+        total += len(add)
+        last = i
+
+    compact = "\n".join(pieces).strip()
+    return compact or raw[:max_chars]
+
+
+def _ask_evidence_focus_rules(q: str, profile: Optional[dict]) -> str:
+    flags = _ask_evidence_intent_flags(q, profile or {})
+    rules = []
+    if flags.get("safety"):
+        rules.append(
+            "The question is about maintenance/safety. If SOURCES mention isolation/lockout, include the actual operative controls: electrical isolation/main switch, pneumatic/compressed-air isolation, padlocks/keys, PPE, guards/protections restoration and any stated exception/condition. Do not reduce this to generic 'work safely'."
+        )
+    if flags.get("intervals") or flags.get("table"):
+        rules.append(
+            "The question asks for maintenance periodicities or a table/schedule. If SOURCES contain rows with components, intervals, hours, daily/weekly/monthly/annual frequencies, operations or notes, extract them explicitly as a compact table/list. Do not say numeric data are absent when the SOURCES contain periodicity rows."
+        )
+    if flags.get("procedure"):
+        rules.append(
+            "The question is procedural. Preserve the ordered sequence, preconditions, safety prerequisites, checks and final restoration steps stated in SOURCES."
+        )
+    return "\n".join(rules).strip()
+
+
+def _ask_evidence_periodicity_count(text: str) -> int:
+    tn = _normalize_unicode_advanced(text or "").lower()
+    patterns = [
+        r"\b\d+(?:[.,]\d+)?\s*(?:h|ore|hours?)\b",
+        r"\b(?:ogni|every)\s+\w+",
+        r"\b(?:giornal\w*|daily|settiman\w*|weekly|mensil\w*|monthly|annua\w*|annual\w*|yearly)\b",
+    ]
+    return sum(len(re.findall(p, tn)) for p in patterns)
+
+
+def _ask_evidence_structural_gaps(q: str, answer: str, evidence_citations: list[dict], profile: Optional[dict]) -> list[str]:
+    """Deterministic generic completeness checks that force a rewrite when the model missed
+    obvious source structures. No benchmark-specific facts or values are encoded here.
+    """
+    flags = _ask_evidence_intent_flags(q, profile or {})
+    if not answer or not evidence_citations:
+        return []
+    source_text = "\n".join(str(c.get("chunk_full") or c.get("snippet") or "") for c in evidence_citations)
+    src = _normalize_unicode_advanced(source_text).lower()
+    ans = _normalize_unicode_advanced(answer).lower()
+    gaps: list[str] = []
+
+    if flags.get("safety"):
+        source_has_safety_actions = _ask_evidence_safety_action_score(src) >= 4.0
+        if source_has_safety_actions:
+            checks = [
+                (["lucchetto", "padlock", "lockout", "bloccare", "bloccabile"], ["lucchetto", "padlock", "lockout", "bloccare", "bloccabile"], "lockout/padlock step"),
+                (["chiave", "chiavi", "key", "keys"], ["chiave", "chiavi", "key", "keys"], "key custody/removal step"),
+                (["aria compressa", "pneumatica", "pneumatic", "compressed air"], ["aria compressa", "pneumatica", "pneumatic", "compressed air"], "pneumatic/compressed-air isolation step"),
+                (["interruttore generale", "tensione", "alimentazione elettrica", "main switch", "voltage", "power"], ["interruttore generale", "tensione", "alimentazione elettrica", "main switch", "voltage", "power"], "electrical/main-switch isolation step"),
+                (["ripari", "riparo", "guards", "condizioni di sicurezza", "safety conditions"], ["ripari", "riparo", "guards", "condizioni di sicurezza", "safety conditions"], "guard/safety-condition restoration step"),
+            ]
+            for source_terms, answer_terms, label in checks:
+                if any(t in src for t in source_terms) and not any(t in ans for t in answer_terms):
+                    gaps.append(f"Sources contain a {label}, but the answer omits it.")
+
+    if flags.get("intervals") or flags.get("table"):
+        src_periods = _ask_evidence_periodicity_count(src)
+        ans_periods = _ask_evidence_periodicity_count(ans)
+        source_table_like = _ask_evidence_interval_table_score(src) >= 5.0
+        if source_table_like and src_periods >= 3 and ans_periods < max(2, min(5, src_periods // 3)):
+            gaps.append("Sources contain a maintenance schedule/table with multiple periodicities, but the answer does not extract enough interval rows.")
+        if source_table_like and any(t in src for t in ["componenti", "components", "tabella", "table"]) and not any(t in ans for t in ["componente", "component", "operazione", "operation", "nota", "note"]):
+            gaps.append("Sources contain component/table rows, but the answer does not present component-operation-note details.")
+
+    return _dedup_text_values(gaps, limit=10)
+
+
 def _ask_evidence_query_schema() -> dict:
     return {
         "name": "ask_evidence_query_profile_v1",
@@ -6961,6 +7236,18 @@ def _ask_evidence_score_text(q: str, text: str, profile: dict) -> float:
     if hit_terms >= 4:
         score += min(8.0, hit_terms * 0.8)
 
+    # Generic structural boosts: if the user asks about safety/maintenance or intervals/tables,
+    # pages containing those structures must not be hidden behind generic semantic matches.
+    flags = _ask_evidence_intent_flags(q, profile or {})
+    if flags.get("safety"):
+        safety_score = _ask_evidence_safety_action_score(text)
+        if safety_score >= 2.0:
+            score += min(22.0, 5.0 + safety_score * 3.0)
+    if flags.get("intervals") or flags.get("table"):
+        table_score = _ask_evidence_interval_table_score(text)
+        if table_score >= 2.0:
+            score += min(24.0, 5.0 + table_score * 2.0)
+
     # Penalize very generic safety/intro pages unless the question itself asks about them.
     generic_markers = ["informazioni generali", "general information", "proprietà delle informazioni", "all rights reserved"]
     if any(x in tn for x in generic_markers) and hit_terms < 3:
@@ -6981,7 +7268,7 @@ def _ask_evidence_fetch_pages(
 ) -> list[dict]:
     """Fetch and rank full pages/structured pages within the already-authorized scope."""
     limit = max(50, int(ASK_EVIDENCE_SCOPE_PAGE_LIMIT or 900))
-    top_pages = max(3, min(int(top_pages or ASK_EVIDENCE_TOP_PAGES or 10), 16))
+    top_pages = max(3, min(int(top_pages or ASK_EVIDENCE_TOP_PAGES or 10), 24))
     where_sql, params = _ask_evidence_scope_where(
         company_id=company_id,
         machine_id=machine_id,
@@ -7018,6 +7305,12 @@ def _ask_evidence_fetch_pages(
         if score < float(ASK_EVIDENCE_MIN_PAGE_SCORE or 0.0):
             continue
         page = _safe_int(page_number, 1)
+        compact_txt = _ask_evidence_extract_relevant_text(
+            q,
+            txt[: int(ASK_EVIDENCE_MAX_PAGE_CHARS or 12000)],
+            profile,
+            max_chars=5200,
+        )
         scored.append(
             {
                 "citation_id": f"{bdid}:p{page}-{page}:c0",
@@ -7025,8 +7318,8 @@ def _ask_evidence_fetch_pages(
                 "chunk_index": 0,
                 "page_from": page,
                 "page_to": page,
-                "snippet": txt[:ASK_SNIPPET_CHARS],
-                "chunk_full": txt[: int(ASK_EVIDENCE_MAX_PAGE_CHARS or 12000)],
+                "snippet": compact_txt[:ASK_SNIPPET_CHARS],
+                "chunk_full": compact_txt,
                 "similarity": min(0.99, 0.50 + score / 100.0),
                 "retrieval_score": score,
                 "ask_evidence_score": score,
@@ -7138,6 +7431,7 @@ def _ask_evidence_verify_answer(
         f"QUESTION:\n{q}\n\n"
         f"RESPONSE_LANGUAGE:\n{response_language}\n\n"
         f"QUERY_PROFILE:\n{json.dumps(profile or {}, ensure_ascii=False)}\n\n"
+        f"QUERY_FOCUS_RULES:\n{_ask_evidence_focus_rules(q, profile or {}) or 'No extra structural focus.'}\n\n"
         f"ANSWER_TO_VERIFY:\n{answer}\n\n"
         f"SOURCES:\n{sources_block}\n\n"
         "Return JSON. Scores are 0-100. Be strict about missing exact values, units, table rows, ordered steps and unsupported claims."
@@ -7191,11 +7485,11 @@ def _ask_generic_evidence_answer(
         machine_id=machine_id,
         doc_ids=doc_ids,
         bubble_document_id=bubble_document_id,
-        top_pages=max(int(ASK_EVIDENCE_TOP_PAGES or 10), top_k),
+        top_pages=max(int(ASK_EVIDENCE_TOP_PAGES or 10), top_k, 14),
     )
 
     # Merge existing semantic hits as supporting evidence, but rank page scan first.
-    merged = _dedup_citations_by_snippet(list(page_hits or []) + list(seed_citations or []), max_items=max(top_k, 10))
+    merged = _dedup_citations_by_snippet(list(page_hits or []) + list(seed_citations or []), max_items=max(top_k, 14))
     if not merged:
         return None
 
@@ -7206,6 +7500,8 @@ def _ask_generic_evidence_answer(
     )
     if not sources_block:
         return None
+
+    focus_rules = _ask_evidence_focus_rules(q, profile)
 
     system_msg = (
         "You are MachineMind ASK, a high-precision question-answering engine for industrial documentation. "
@@ -7221,8 +7517,10 @@ def _ask_generic_evidence_answer(
         f"QUESTION:\n{q}\n\n"
         f"RESPONSE_LANGUAGE:\n{response_language}\n\n"
         f"QUERY_PROFILE:\n{json.dumps(profile, ensure_ascii=False)}\n\n"
+        f"QUERY_FOCUS_RULES:\n{focus_rules or 'No extra structural focus.'}\n\n"
         f"SOURCES:\n{sources_block}\n\n"
         "Return JSON only. Make the answer complete enough for a technician: include relevant numbers, units, component names, codes, intervals, conditions and exceptions found in SOURCES. "
+        "When SOURCES contain a table, schedule or ordered procedure, preserve its structure instead of paraphrasing it away. "
         "Do not cite a source unless the point is supported by that source."
     )
 
@@ -7266,12 +7564,21 @@ def _ask_generic_evidence_answer(
     if verifier_verdict == "no_sources":
         return None
 
+    structural_gaps = _ask_evidence_structural_gaps(q, answer, merged, profile)
+    if structural_gaps:
+        verifier_verdict = "rewrite"
+        verifier_result = dict(verifier_result or {})
+        existing_missing = list(verifier_result.get("missing_requirements") or [])
+        verifier_result["missing_requirements"] = _dedup_text_values(existing_missing + structural_gaps, limit=12)
+        verifier_result["reason"] = (str(verifier_result.get("reason") or "") + " Generic structural gaps: " + "; ".join(structural_gaps)).strip()[:1800]
+
     if verifier_verdict == "rewrite":
-        rewrite_feedback = json.dumps(verifier_result or {}, ensure_ascii=False)[:4000]
+        rewrite_feedback = json.dumps(verifier_result or {}, ensure_ascii=False)[:5000]
         rewrite_user_msg = (
             f"QUESTION:\n{q}\n\n"
             f"RESPONSE_LANGUAGE:\n{response_language}\n\n"
             f"QUERY_PROFILE:\n{json.dumps(profile, ensure_ascii=False)}\n\n"
+            f"QUERY_FOCUS_RULES:\n{focus_rules or 'No extra structural focus.'}\n\n"
             f"VERIFIER_FEEDBACK_JSON:\n{rewrite_feedback}\n\n"
             f"SOURCES:\n{sources_block}\n\n"
             "Rewrite the answer using only SOURCES and addressing the verifier feedback. "
