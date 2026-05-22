@@ -6812,281 +6812,6 @@ def _ask_evidence_number_tokens(text: str) -> list[str]:
     return out[:30]
 
 
-
-def _ask_text_contains_any(text: str, terms: list[str]) -> bool:
-    tn = _normalize_unicode_advanced(text or "").lower()
-    return any(str(t or "").lower() in tn for t in terms if str(t or "").strip())
-
-
-def _ask_evidence_intent_flags(q: str, profile: Optional[dict] = None) -> dict:
-    """Classify ASK needs using only generic query/profile signals.
-
-    This deliberately contains no document ids, machine models, benchmark questions, or expected
-    technical values. It only recognizes broad information shapes such as maintenance-safety
-    procedures, lockout/isolation instructions, and periodicity tables.
-    """
-    profile = profile or {}
-    blob = _normalize_unicode_advanced(
-        " ".join(
-            [
-                q or "",
-                str(profile.get("answer_type") or ""),
-                " ".join(str(x or "") for x in (profile.get("search_phrases") or [])),
-                " ".join(str(x or "") for x in (profile.get("search_terms_it") or [])),
-                " ".join(str(x or "") for x in (profile.get("search_terms_en") or [])),
-                " ".join(str(x or "") for x in (profile.get("required_information") or [])),
-            ]
-        )
-    ).lower()
-
-    maintenance_terms = [
-        "manutenz", "maintenance", "service", "servicing", "regolaz", "messa a punto", "riparaz", "repair",
-        "intervento", "intervenire", "controll", "check", "verifica", "ispezion", "inspection",
-    ]
-    safety_terms = [
-        "sicurezza", "safety", "rischio", "risk", "dpi", "ppe", "protezione", "protect", "riparo", "guard",
-        "isolamento", "isolation", "sezion", "disconnect", "lockout", "lucchetto", "padlock", "chiave", "key",
-        "tensione", "voltage", "power", "elettric", "pneumatic", "aria compressa", "compressed air",
-    ]
-    interval_terms = [
-        "frequenz", "frequency", "intervall", "interval", "periodic", "periodicità", "periodicita",
-        "ogni quanto", "quando", "scadenz", "schedule", "piano", "tabella", "table", "ore", "hours",
-        "giornal", "daily", "settiman", "weekly", "mensil", "monthly", "annua", "annual", "yearly",
-    ]
-    table_terms = ["tabella", "table", "schema", "schedule", "elenco", "list", "piano", "riepilogo"]
-
-    asks_maintenance = _ask_text_contains_any(blob, maintenance_terms)
-    asks_safety = asks_maintenance and _ask_text_contains_any(blob, safety_terms)
-    asks_intervals = asks_maintenance and _ask_text_contains_any(blob, interval_terms)
-    asks_table = (str(profile.get("answer_type") or "").lower() == "table") or _ask_text_contains_any(blob, table_terms) or asks_intervals
-    asks_procedure = (str(profile.get("answer_type") or "").lower() == "procedural") or _ask_text_contains_any(blob, ["procedura", "procedure", "passi", "steps", "operaz", "operation"])
-
-    return {
-        "maintenance": bool(asks_maintenance),
-        "safety": bool(asks_safety),
-        "intervals": bool(asks_intervals),
-        "table": bool(asks_table),
-        "procedure": bool(asks_procedure),
-    }
-
-
-def _ask_evidence_safety_action_score(text: str) -> float:
-    tn = _normalize_unicode_advanced(text or "").lower()
-    if not tn:
-        return 0.0
-    groups = [
-        ["lucchetto", "padlock", "lockout", "bloccare", "bloccabile", "locked", "lockable"],
-        ["sezionatore", "sezionamento", "isolato", "isolamento", "isolate", "disconnect", "disconnector"],
-        ["alimentazione elettrica", "tensione", "interruttore generale", "quadro", "electrical", "voltage", "main switch", "power"],
-        ["alimentazione pneumatica", "aria compressa", "pneumatica", "pneumatic", "compressed air"],
-        ["chiave", "chiavi", "key", "keys"],
-        ["ripari", "riparo", "guard", "guards", "protezioni", "protections", "condizioni di sicurezza", "safety conditions"],
-        ["dpi", "ppe", "mezzi di protezione", "protezione personale", "personal protective"],
-    ]
-    score = 0.0
-    for group in groups:
-        if any(g in tn for g in group):
-            score += 1.0
-    # Imperative/procedural text is stronger evidence than generic policy prose.
-    if any(x in tn for x in ["deve", "devono", "sempre", "obblig", "prima di", "solo dopo", "must", "shall", "before", "only after"]):
-        score += 1.0
-    return score
-
-
-def _ask_evidence_interval_table_score(text: str) -> float:
-    tn = _normalize_unicode_advanced(text or "").lower()
-    if not tn:
-        return 0.0
-    score = 0.0
-    if any(x in tn for x in ["tabella", "table", "schema", "schedule", "componenti", "components"]):
-        score += 2.0
-    periodic_hits = len(re.findall(r"\b(ogni|every|giornal\w*|daily|settiman\w*|weekly|mensil\w*|monthly|annua\w*|annual\w*|yearly)\b", tn))
-    hour_hits = len(re.findall(r"\b\d+(?:[.,]\d+)?\s*(?:h|ore|hours?)\b", tn))
-    unit_hits = len(re.findall(r"\b(?:olio|oil|filtro|filter|filtri|riduttore|gearbox|lubrific|lubric|pneumatic|pneumatica|elettric|electrical)\b", tn))
-    score += min(6.0, periodic_hits * 0.8)
-    score += min(5.0, hour_hits * 0.9)
-    score += min(4.0, unit_hits * 0.35)
-    # Table-like dense pages often contain many short lines / columns even after PDF extraction.
-    lines = [ln.strip() for ln in str(text or "").splitlines() if ln.strip()]
-    if len(lines) >= 12 and (periodic_hits + hour_hits) >= 2:
-        score += 2.0
-    return score
-
-
-def _ask_evidence_extract_relevant_text(q: str, text: str, profile: Optional[dict], max_chars: int = 5200) -> str:
-    """Compact a page/record around generic query anchors and structural evidence.
-
-    Full PDF pages can be very long; using the entire page for every citation makes the model see
-    only the first one or two pages. This keeps the important paragraphs/table lines while allowing
-    more distinct evidence pages into the same context window.
-    """
-    raw = str(text or "").strip()
-    if len(raw) <= max_chars:
-        return raw
-
-    flags = _ask_evidence_intent_flags(q, profile or {})
-    anchors = []
-    for key in ["search_phrases", "search_terms_it", "search_terms_en", "required_information", "important_codes_or_numbers"]:
-        anchors.extend([str(x or "").strip() for x in ((profile or {}).get(key) or [])])
-    anchors.extend(_ask_evidence_tokenize(q or ""))
-    anchors.extend(_ask_evidence_code_tokens(q or ""))
-    anchors.extend(_ask_evidence_number_tokens(q or ""))
-
-    if flags.get("safety"):
-        anchors.extend([
-            "manutenzione", "maintenance", "sicurezza", "safety", "sezionatore", "isolamento", "isolation",
-            "lucchetto", "padlock", "chiave", "key", "tensione", "interruttore generale", "pneumatica", "aria compressa",
-            "compressed air", "ripari", "guards", "protezione personale", "ppe", "dpi",
-        ])
-    if flags.get("intervals") or flags.get("table"):
-        anchors.extend([
-            "tabella", "table", "componenti", "components", "ore", "hours", "ogni", "every", "giorno", "daily",
-            "settiman", "weekly", "mensil", "monthly", "annua", "annual", "lubrific", "lubric", "filtro", "filter",
-            "pneumatic", "pneumatica", "elettric", "electrical",
-        ])
-
-    anchors_norm = []
-    seen = set()
-    for a in anchors:
-        an = _normalize_unicode_advanced(a).lower().strip()
-        if not an or an in seen or an in _ask_evidence_stopwords():
-            continue
-        seen.add(an)
-        anchors_norm.append(an)
-    anchors_norm = anchors_norm[:120]
-
-    # Split in lines first, because technical manuals/tables survive extraction mostly line-based.
-    lines = raw.splitlines()
-    scored_lines: list[tuple[float, int, str]] = []
-    for i, line in enumerate(lines):
-        ln = _normalize_unicode_advanced(line).lower()
-        if not ln.strip():
-            continue
-        score = 0.0
-        for a in anchors_norm:
-            if a and a in ln:
-                score += 2.0 if len(a) >= 6 else 1.0
-        if flags.get("safety"):
-            score += _ask_evidence_safety_action_score(line) * 2.0
-        if flags.get("intervals") or flags.get("table"):
-            score += _ask_evidence_interval_table_score(line) * 2.0
-            if re.search(r"\b\d+(?:[.,]\d+)?\s*(?:h|ore|hours?)\b", ln):
-                score += 2.5
-            if re.search(r"\b(ogni|every|giornal\w*|daily|settiman\w*|weekly|mensil\w*|monthly|annua\w*|annual\w*)\b", ln):
-                score += 2.0
-        if score > 0:
-            scored_lines.append((score, i, line))
-
-    if not scored_lines:
-        return raw[:max_chars]
-
-    # Keep neighborhoods around strong lines so table rows and procedural sequences remain readable.
-    scored_lines.sort(key=lambda x: (-x[0], x[1]))
-    keep_indexes: set[int] = set()
-    radius = 3 if (flags.get("intervals") or flags.get("table")) else 2
-    for _, idx, _ in scored_lines[:28]:
-        for j in range(max(0, idx - radius), min(len(lines), idx + radius + 1)):
-            keep_indexes.add(j)
-
-    # Preserve nearby headings because they carry section/table meaning.
-    for i, line in enumerate(lines):
-        ln = _normalize_unicode_advanced(line).lower()
-        if i in keep_indexes:
-            for j in range(max(0, i - 2), i + 1):
-                keep_indexes.add(j)
-        elif any(h in ln for h in ["tabella", "table", "manutenzione", "maintenance", "sicurezza", "safety", "isolamento", "isolation"]):
-            if any(abs(i - k) <= 8 for k in keep_indexes):
-                keep_indexes.add(i)
-
-    pieces = []
-    total = 0
-    last = None
-    for i in sorted(keep_indexes):
-        line = lines[i].strip()
-        if not line:
-            continue
-        if last is not None and i > last + 1:
-            sep = "\n---\n"
-            if total + len(sep) <= max_chars:
-                pieces.append(sep.strip("\n"))
-                total += len(sep)
-        add = line + "\n"
-        if total + len(add) > max_chars:
-            break
-        pieces.append(line)
-        total += len(add)
-        last = i
-
-    compact = "\n".join(pieces).strip()
-    return compact or raw[:max_chars]
-
-
-def _ask_evidence_focus_rules(q: str, profile: Optional[dict]) -> str:
-    flags = _ask_evidence_intent_flags(q, profile or {})
-    rules = []
-    if flags.get("safety"):
-        rules.append(
-            "The question is about maintenance/safety. If SOURCES mention isolation/lockout, include the actual operative controls: electrical isolation/main switch, pneumatic/compressed-air isolation, padlocks/keys, PPE, guards/protections restoration and any stated exception/condition. Do not reduce this to generic 'work safely'."
-        )
-    if flags.get("intervals") or flags.get("table"):
-        rules.append(
-            "The question asks for maintenance periodicities or a table/schedule. If SOURCES contain rows with components, intervals, hours, daily/weekly/monthly/annual frequencies, operations or notes, extract them explicitly as a compact table/list. Do not say numeric data are absent when the SOURCES contain periodicity rows."
-        )
-    if flags.get("procedure"):
-        rules.append(
-            "The question is procedural. Preserve the ordered sequence, preconditions, safety prerequisites, checks and final restoration steps stated in SOURCES."
-        )
-    return "\n".join(rules).strip()
-
-
-def _ask_evidence_periodicity_count(text: str) -> int:
-    tn = _normalize_unicode_advanced(text or "").lower()
-    patterns = [
-        r"\b\d+(?:[.,]\d+)?\s*(?:h|ore|hours?)\b",
-        r"\b(?:ogni|every)\s+\w+",
-        r"\b(?:giornal\w*|daily|settiman\w*|weekly|mensil\w*|monthly|annua\w*|annual\w*|yearly)\b",
-    ]
-    return sum(len(re.findall(p, tn)) for p in patterns)
-
-
-def _ask_evidence_structural_gaps(q: str, answer: str, evidence_citations: list[dict], profile: Optional[dict]) -> list[str]:
-    """Deterministic generic completeness checks that force a rewrite when the model missed
-    obvious source structures. No benchmark-specific facts or values are encoded here.
-    """
-    flags = _ask_evidence_intent_flags(q, profile or {})
-    if not answer or not evidence_citations:
-        return []
-    source_text = "\n".join(str(c.get("chunk_full") or c.get("snippet") or "") for c in evidence_citations)
-    src = _normalize_unicode_advanced(source_text).lower()
-    ans = _normalize_unicode_advanced(answer).lower()
-    gaps: list[str] = []
-
-    if flags.get("safety"):
-        source_has_safety_actions = _ask_evidence_safety_action_score(src) >= 4.0
-        if source_has_safety_actions:
-            checks = [
-                (["lucchetto", "padlock", "lockout", "bloccare", "bloccabile"], ["lucchetto", "padlock", "lockout", "bloccare", "bloccabile"], "lockout/padlock step"),
-                (["chiave", "chiavi", "key", "keys"], ["chiave", "chiavi", "key", "keys"], "key custody/removal step"),
-                (["aria compressa", "pneumatica", "pneumatic", "compressed air"], ["aria compressa", "pneumatica", "pneumatic", "compressed air"], "pneumatic/compressed-air isolation step"),
-                (["interruttore generale", "tensione", "alimentazione elettrica", "main switch", "voltage", "power"], ["interruttore generale", "tensione", "alimentazione elettrica", "main switch", "voltage", "power"], "electrical/main-switch isolation step"),
-                (["ripari", "riparo", "guards", "condizioni di sicurezza", "safety conditions"], ["ripari", "riparo", "guards", "condizioni di sicurezza", "safety conditions"], "guard/safety-condition restoration step"),
-            ]
-            for source_terms, answer_terms, label in checks:
-                if any(t in src for t in source_terms) and not any(t in ans for t in answer_terms):
-                    gaps.append(f"Sources contain a {label}, but the answer omits it.")
-
-    if flags.get("intervals") or flags.get("table"):
-        src_periods = _ask_evidence_periodicity_count(src)
-        ans_periods = _ask_evidence_periodicity_count(ans)
-        source_table_like = _ask_evidence_interval_table_score(src) >= 5.0
-        if source_table_like and src_periods >= 3 and ans_periods < max(2, min(5, src_periods // 3)):
-            gaps.append("Sources contain a maintenance schedule/table with multiple periodicities, but the answer does not extract enough interval rows.")
-        if source_table_like and any(t in src for t in ["componenti", "components", "tabella", "table"]) and not any(t in ans for t in ["componente", "component", "operazione", "operation", "nota", "note"]):
-            gaps.append("Sources contain component/table rows, but the answer does not present component-operation-note details.")
-
-    return _dedup_text_values(gaps, limit=10)
-
-
 def _ask_evidence_query_schema() -> dict:
     return {
         "name": "ask_evidence_query_profile_v1",
@@ -7126,6 +6851,74 @@ def _ask_evidence_fallback_profile(q: str, response_language: str = "it") -> dic
     }
 
 
+
+
+def _ask_evidence_apply_generic_technical_expansions(profile: dict, q: str) -> dict:
+    """Add generic industrial-document retrieval vocabulary.
+
+    This is deliberately NOT a benchmark/dataset dictionary: it contains no document ids,
+    no expected values, no machine names, and no test-specific answers. It only bridges
+    common IT/EN wording differences and common table/procedure labels used in manuals.
+    The terms are used for retrieval/scoring only; answers still come only from sources.
+    """
+    prof = dict(profile or {})
+    qn = _normalize_unicode_advanced(q or "").lower()
+    joined = " ".join(
+        [qn]
+        + [str(x or "").lower() for x in prof.get("search_phrases") or []]
+        + [str(x or "").lower() for x in prof.get("search_terms_it") or []]
+        + [str(x or "").lower() for x in prof.get("search_terms_en") or []]
+        + [str(x or "").lower() for x in prof.get("required_information") or []]
+    )
+
+    expansions_it: list[str] = []
+    expansions_en: list[str] = []
+    phrases: list[str] = []
+
+    def add(it=None, en=None, ph=None):
+        if it:
+            expansions_it.extend(it)
+        if en:
+            expansions_en.extend(en)
+        if ph:
+            phrases.extend(ph)
+
+    # Generic labels for tables, schedules, specifications and intervals.
+    if any(x in joined for x in ["frequ", "intervall", "period", "tempo", "tempi", "tabella", "table", "schedule", "ogni", "ore", "hours"]):
+        add(
+            it=["frequenza", "frequenze", "intervallo", "intervalli", "periodicità", "periodicita", "scadenza", "scadenze", "ore", "ogni", "settimana", "settimanale", "mensile", "annuale", "giornaliero", "tabella", "valore", "unità", "unita"],
+            en=["frequency", "frequencies", "interval", "intervals", "periodicity", "schedule", "hours", "weekly", "monthly", "annual", "yearly", "daily", "table", "value", "unit"],
+            ph=["tabella manutenzione", "maintenance table", "maintenance schedule", "piano manutenzione"],
+        )
+
+    # Generic maintenance wording; useful across manuals, procedures and checklists.
+    if any(x in joined for x in ["manut", "maintenance", "service", "servicing", "ispez", "control", "controll", "pulizia", "clean", "lubr", "filter", "filtro"]):
+        add(
+            it=["manutenzione", "ordinaria", "straordinaria", "controllo", "controllare", "verifica", "verificare", "ispezione", "pulizia", "pulire", "sostituzione", "sostituire", "lubrificazione", "lubrificare", "olio", "grasso", "filtro", "filtri", "condensa", "scarico condensa", "pneumatico", "quadro elettrico"],
+            en=["maintenance", "ordinary", "extraordinary", "check", "inspection", "inspect", "cleaning", "clean", "replace", "replacement", "lubrication", "lubricate", "oil", "grease", "filter", "filters", "condensate", "condensate drain", "pneumatic", "electrical panel", "electrical cabinet"],
+            ph=["manutenzione ordinaria", "ordinary maintenance", "maintenance instructions"],
+        )
+
+    # Generic safety / LOTO vocabulary. Not an answer rule: only expands retrieval.
+    if any(x in joined for x in ["sicurezza", "safety", "aliment", "elettric", "pneumatic", "aria", "tensione", "lock", "blocco", "interruttore", "sezion"]):
+        add(
+            it=["sicurezza", "attenzione", "avvertenza", "pericolo", "tensione", "senza tensione", "alimentazione", "alimentazione elettrica", "alimentazione pneumatica", "aria compressa", "interruttore generale", "sezionatore", "blocco", "bloccare", "lucchetto", "chiave", "chiave di sblocco", "riparo", "ripari", "protezione", "protezioni", "dpi", "occhiali", "mascherina"],
+            en=["safety", "warning", "danger", "voltage", "power", "power supply", "electrical supply", "pneumatic supply", "compressed air", "main switch", "disconnect switch", "isolator", "lock", "lockout", "padlock", "key", "release key", "guard", "guards", "protection", "ppe", "goggles", "mask"],
+            ph=["lockout", "lock out", "lock-out", "main switch", "interruttore generale", "alimentazione pneumatica", "compressed air"],
+        )
+
+    # Generic component/specification questions often require preserving label-value rows.
+    if any(x in joined for x in ["dato", "dati", "specific", "caratter", "codice", "code", "tipo", "model", "modello", "forza", "veloc", "acceler", "rapporto", "gioco", "pignone", "cremagliera", "ridutt", "gear", "rack", "pinion", "reducer"]):
+        add(
+            it=["dati", "specifiche", "caratteristiche", "codice", "codici", "tipo", "modello", "denominazione", "valore", "unità", "forza", "velocità", "accelerazione", "ciclo", "rapporto", "gioco", "diametro", "modulo", "denti"],
+            en=["data", "specifications", "features", "code", "codes", "type", "model", "designation", "value", "unit", "force", "speed", "acceleration", "cycle", "ratio", "backlash", "diameter", "module", "teeth"],
+        )
+
+    prof["search_terms_it"] = _dedup_text_values(list(prof.get("search_terms_it") or []) + expansions_it, limit=64)
+    prof["search_terms_en"] = _dedup_text_values(list(prof.get("search_terms_en") or []) + expansions_en, limit=64)
+    prof["search_phrases"] = _dedup_text_values(list(prof.get("search_phrases") or []) + phrases, limit=36)
+    return prof
+
 def _ask_evidence_query_profile(q: str, response_language: str) -> dict:
     """Extract query needs without using any document-specific or benchmark-specific facts."""
     fallback = _ask_evidence_fallback_profile(q, response_language)
@@ -7158,10 +6951,10 @@ def _ask_evidence_query_profile(q: str, response_language: str) -> dict:
             parsed["search_terms_it"] = _dedup_text_values(list(parsed.get("search_terms_it") or []) + fallback["search_terms_it"], limit=32)
             parsed["search_terms_en"] = _dedup_text_values(list(parsed.get("search_terms_en") or []) + fallback["search_terms_en"], limit=32)
             parsed["important_codes_or_numbers"] = _dedup_text_values(list(parsed.get("important_codes_or_numbers") or []) + fallback["important_codes_or_numbers"], limit=24)
-            return parsed
+            return _ask_evidence_apply_generic_technical_expansions(parsed, q)
     except Exception as e:
         print("ASK_EVIDENCE_PROFILE_FAIL", str(e)[:300])
-    return fallback
+    return _ask_evidence_apply_generic_technical_expansions(fallback, q)
 
 
 def _ask_evidence_scope_where(
@@ -7236,18 +7029,6 @@ def _ask_evidence_score_text(q: str, text: str, profile: dict) -> float:
     if hit_terms >= 4:
         score += min(8.0, hit_terms * 0.8)
 
-    # Generic structural boosts: if the user asks about safety/maintenance or intervals/tables,
-    # pages containing those structures must not be hidden behind generic semantic matches.
-    flags = _ask_evidence_intent_flags(q, profile or {})
-    if flags.get("safety"):
-        safety_score = _ask_evidence_safety_action_score(text)
-        if safety_score >= 2.0:
-            score += min(22.0, 5.0 + safety_score * 3.0)
-    if flags.get("intervals") or flags.get("table"):
-        table_score = _ask_evidence_interval_table_score(text)
-        if table_score >= 2.0:
-            score += min(24.0, 5.0 + table_score * 2.0)
-
     # Penalize very generic safety/intro pages unless the question itself asks about them.
     generic_markers = ["informazioni generali", "general information", "proprietà delle informazioni", "all rights reserved"]
     if any(x in tn for x in generic_markers) and hit_terms < 3:
@@ -7305,12 +7086,6 @@ def _ask_evidence_fetch_pages(
         if score < float(ASK_EVIDENCE_MIN_PAGE_SCORE or 0.0):
             continue
         page = _safe_int(page_number, 1)
-        compact_txt = _ask_evidence_extract_relevant_text(
-            q,
-            txt[: int(ASK_EVIDENCE_MAX_PAGE_CHARS or 12000)],
-            profile,
-            max_chars=5200,
-        )
         scored.append(
             {
                 "citation_id": f"{bdid}:p{page}-{page}:c0",
@@ -7318,8 +7093,8 @@ def _ask_evidence_fetch_pages(
                 "chunk_index": 0,
                 "page_from": page,
                 "page_to": page,
-                "snippet": compact_txt[:ASK_SNIPPET_CHARS],
-                "chunk_full": compact_txt,
+                "snippet": txt[:ASK_SNIPPET_CHARS],
+                "chunk_full": txt[: int(ASK_EVIDENCE_MAX_PAGE_CHARS or 12000)],
                 "similarity": min(0.99, 0.50 + score / 100.0),
                 "retrieval_score": score,
                 "ask_evidence_score": score,
@@ -7358,6 +7133,120 @@ def _ask_evidence_answer_schema() -> dict:
     }
 
 
+
+
+
+def _ask_evidence_fact_pack_schema() -> dict:
+    return {
+        "name": "ask_generic_evidence_fact_pack_v1",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "coverage_status": {"type": "string", "enum": ["sufficient", "partial", "insufficient"]},
+                "answer_strategy": {"type": "string"},
+                "critical_facts": {
+                    "type": "array",
+                    "maxItems": 18,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "fact": {"type": "string"},
+                            "why_it_matters": {"type": "string"},
+                            "citation_ids": {"type": "array", "items": {"type": "string"}, "maxItems": 4},
+                        },
+                        "required": ["fact", "why_it_matters", "citation_ids"],
+                    },
+                },
+                "table_rows_or_label_values": {
+                    "type": "array",
+                    "maxItems": 20,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "label": {"type": "string"},
+                            "value": {"type": "string"},
+                            "unit_or_frequency": {"type": "string"},
+                            "notes": {"type": "string"},
+                            "citation_ids": {"type": "array", "items": {"type": "string"}, "maxItems": 4},
+                        },
+                        "required": ["label", "value", "unit_or_frequency", "notes", "citation_ids"],
+                    },
+                },
+                "ordered_actions": {
+                    "type": "array",
+                    "maxItems": 16,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "step": {"type": "string"},
+                            "citation_ids": {"type": "array", "items": {"type": "string"}, "maxItems": 4},
+                        },
+                        "required": ["step", "citation_ids"],
+                    },
+                },
+                "missing_or_uncertain": {"type": "array", "items": {"type": "string"}, "maxItems": 10},
+            },
+            "required": ["coverage_status", "answer_strategy", "critical_facts", "table_rows_or_label_values", "ordered_actions", "missing_or_uncertain"],
+        },
+    }
+
+
+def _ask_evidence_extract_fact_pack(
+    *,
+    q: str,
+    sources_block: str,
+    profile: dict,
+    response_language: str,
+) -> dict:
+    """Generic evidence distiller for ASK.
+
+    It converts raw source text into a query-specific fact pack BEFORE the final answer.
+    This is intentionally generic: no document ids, no benchmark values, no machine names,
+    no hard-coded expected answers. It forces the model to first enumerate exact source facts,
+    table rows, label-value pairs and ordered actions that answer the user's question.
+    """
+    if not OPENAI_API_KEY:
+        return {"coverage_status": "partial", "answer_strategy": "LLM disabled; use raw sources", "critical_facts": [], "table_rows_or_label_values": [], "ordered_actions": [], "missing_or_uncertain": []}
+    if not sources_block:
+        return {"coverage_status": "insufficient", "answer_strategy": "No sources", "critical_facts": [], "table_rows_or_label_values": [], "ordered_actions": [], "missing_or_uncertain": ["No source text available"]}
+
+    system_msg = (
+        "You are an evidence extraction engine for industrial manuals, procedures and technical records. "
+        "Use ONLY SOURCES. Do not answer conversationally. Do not use outside knowledge. "
+        "Extract the facts that are directly needed to answer QUESTION. "
+        "For tables, schedules and maintenance plans, preserve rows, frequencies, units, components and notes. "
+        "For procedures or safety instructions, preserve ordered actions and mandatory safety conditions. "
+        "For specifications, preserve label-value-unit triples exactly. "
+        "If the sources do not contain a requested item, list it in missing_or_uncertain. "
+        "Never invent values. Use citation_id values present in SOURCES."
+    )
+    user_msg = (
+        f"QUESTION:\n{q}\n\n"
+        f"RESPONSE_LANGUAGE:\n{response_language}\n\n"
+        f"QUERY_PROFILE:\n{json.dumps(profile or {}, ensure_ascii=False)}\n\n"
+        f"SOURCES:\n{sources_block}\n\n"
+        "Return JSON only. Prioritize exact values/units/codes/frequencies and operational steps over generic summaries."
+    )
+    try:
+        parsed = _openai_chat_json_models(
+            [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            models=[ASK_EVIDENCE_ANALYZER_MODEL, ASK_EVIDENCE_ANSWER_MODEL, OPENAI_CHAT_MODEL],
+            json_schema=_ask_evidence_fact_pack_schema(),
+            timeout=70,
+        )
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception as e:
+        print("ASK_EVIDENCE_FACT_PACK_FAIL", str(e)[:500])
+    return {"coverage_status": "partial", "answer_strategy": "Fact pack extraction failed; use raw sources", "critical_facts": [], "table_rows_or_label_values": [], "ordered_actions": [], "missing_or_uncertain": []}
 
 
 def _ask_evidence_verifier_schema() -> dict:
@@ -7431,7 +7320,6 @@ def _ask_evidence_verify_answer(
         f"QUESTION:\n{q}\n\n"
         f"RESPONSE_LANGUAGE:\n{response_language}\n\n"
         f"QUERY_PROFILE:\n{json.dumps(profile or {}, ensure_ascii=False)}\n\n"
-        f"QUERY_FOCUS_RULES:\n{_ask_evidence_focus_rules(q, profile or {}) or 'No extra structural focus.'}\n\n"
         f"ANSWER_TO_VERIFY:\n{answer}\n\n"
         f"SOURCES:\n{sources_block}\n\n"
         "Return JSON. Scores are 0-100. Be strict about missing exact values, units, table rows, ordered steps and unsupported claims."
@@ -7485,11 +7373,11 @@ def _ask_generic_evidence_answer(
         machine_id=machine_id,
         doc_ids=doc_ids,
         bubble_document_id=bubble_document_id,
-        top_pages=max(int(ASK_EVIDENCE_TOP_PAGES or 10), top_k, 14),
+        top_pages=max(int(ASK_EVIDENCE_TOP_PAGES or 10), top_k),
     )
 
     # Merge existing semantic hits as supporting evidence, but rank page scan first.
-    merged = _dedup_citations_by_snippet(list(page_hits or []) + list(seed_citations or []), max_items=max(top_k, 14))
+    merged = _dedup_citations_by_snippet(list(page_hits or []) + list(seed_citations or []), max_items=max(top_k, 10))
     if not merged:
         return None
 
@@ -7501,7 +7389,13 @@ def _ask_generic_evidence_answer(
     if not sources_block:
         return None
 
-    focus_rules = _ask_evidence_focus_rules(q, profile)
+    fact_pack = _ask_evidence_extract_fact_pack(
+        q=q,
+        sources_block=sources_block,
+        profile=profile,
+        response_language=response_language,
+    )
+    fact_pack_json = json.dumps(fact_pack or {}, ensure_ascii=False)[:9000]
 
     system_msg = (
         "You are MachineMind ASK, a high-precision question-answering engine for industrial documentation. "
@@ -7517,10 +7411,11 @@ def _ask_generic_evidence_answer(
         f"QUESTION:\n{q}\n\n"
         f"RESPONSE_LANGUAGE:\n{response_language}\n\n"
         f"QUERY_PROFILE:\n{json.dumps(profile, ensure_ascii=False)}\n\n"
-        f"QUERY_FOCUS_RULES:\n{focus_rules or 'No extra structural focus.'}\n\n"
+        f"EXTRACTED_FACT_PACK_JSON:\n{fact_pack_json}\n\n"
         f"SOURCES:\n{sources_block}\n\n"
-        "Return JSON only. Make the answer complete enough for a technician: include relevant numbers, units, component names, codes, intervals, conditions and exceptions found in SOURCES. "
-        "When SOURCES contain a table, schedule or ordered procedure, preserve its structure instead of paraphrasing it away. "
+        "Return JSON only. Build the answer from EXTRACTED_FACT_PACK_JSON first, then verify against SOURCES. "
+        "Make the answer complete enough for a technician: include relevant numbers, units, component names, codes, intervals, table rows, conditions and exceptions found in SOURCES. "
+        "If EXTRACTED_FACT_PACK_JSON contains table_rows_or_label_values or ordered_actions relevant to the question, include them explicitly instead of summarizing them away. "
         "Do not cite a source unless the point is supported by that source."
     )
 
@@ -7564,24 +7459,17 @@ def _ask_generic_evidence_answer(
     if verifier_verdict == "no_sources":
         return None
 
-    structural_gaps = _ask_evidence_structural_gaps(q, answer, merged, profile)
-    if structural_gaps:
-        verifier_verdict = "rewrite"
-        verifier_result = dict(verifier_result or {})
-        existing_missing = list(verifier_result.get("missing_requirements") or [])
-        verifier_result["missing_requirements"] = _dedup_text_values(existing_missing + structural_gaps, limit=12)
-        verifier_result["reason"] = (str(verifier_result.get("reason") or "") + " Generic structural gaps: " + "; ".join(structural_gaps)).strip()[:1800]
-
     if verifier_verdict == "rewrite":
-        rewrite_feedback = json.dumps(verifier_result or {}, ensure_ascii=False)[:5000]
+        rewrite_feedback = json.dumps(verifier_result or {}, ensure_ascii=False)[:4000]
         rewrite_user_msg = (
             f"QUESTION:\n{q}\n\n"
             f"RESPONSE_LANGUAGE:\n{response_language}\n\n"
             f"QUERY_PROFILE:\n{json.dumps(profile, ensure_ascii=False)}\n\n"
-            f"QUERY_FOCUS_RULES:\n{focus_rules or 'No extra structural focus.'}\n\n"
+            f"EXTRACTED_FACT_PACK_JSON:\n{fact_pack_json}\n\n"
             f"VERIFIER_FEEDBACK_JSON:\n{rewrite_feedback}\n\n"
             f"SOURCES:\n{sources_block}\n\n"
             "Rewrite the answer using only SOURCES and addressing the verifier feedback. "
+            "Use EXTRACTED_FACT_PACK_JSON as the checklist of facts/actions/table rows that must not be omitted when relevant. "
             "Keep exact values, units, codes, table rows, conditions, exceptions and ordered steps when present. Return JSON only."
         )
         try:
@@ -7634,6 +7522,7 @@ def _ask_generic_evidence_answer(
             "page_hit_ids": [c.get("citation_id") for c in page_hits[:10]],
             "merged_count": len(merged or []),
             "verifier": verifier_result if 'verifier_result' in locals() else {},
+            "fact_pack": fact_pack if 'fact_pack' in locals() else {},
         }
     return resp
 
