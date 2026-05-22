@@ -212,6 +212,7 @@ class AskRequest(BaseModel):
     bubble_document_id: Optional[str] = None
     document_ids: Optional[Union[List[str], str]] = None
     ai_scope: Optional[str] = None
+    language: Optional[str] = None
     top_k: int = 5
     debug: Optional[bool] = False
 
@@ -223,6 +224,7 @@ class RootCauseRequest(BaseModel):
     bubble_document_id: Optional[str] = None
     document_ids: Optional[Union[List[str], str]] = None
     ai_scope: Optional[str] = None
+    language: Optional[str] = None
     top_k: int = 8
     max_causes: int = 3
     debug: Optional[bool] = False
@@ -7448,6 +7450,7 @@ def _ask_full_context_answer(
         "ok": True,
         "status": "answered",
         "answer": answer,
+        "language": response_language,
         "citations": response_citations,
         "rg_links": rg_links,
         "top_k": top_k,
@@ -7622,6 +7625,7 @@ def _ask_generic_evidence_answer(
         "ok": True,
         "status": "answered",
         "answer": answer,
+        "language": response_language,
         "citations": response_citations,
         "rg_links": rg_links,
         "top_k": top_k,
@@ -9155,7 +9159,13 @@ def _should_route_ask_through_root_cause(q: str) -> bool:
     return False
 
 
-def _build_ask_answer_from_root_cause_response(q: str, root_response: dict, *, max_causes: int = 2) -> tuple[str, list[dict]]:
+def _build_ask_answer_from_root_cause_response(
+    q: str,
+    root_response: dict,
+    *,
+    max_causes: int = 2,
+    response_language: Optional[str] = None,
+) -> tuple[str, list[dict]]:
     response = dict(root_response or {})
     causes = [c for c in (response.get("possible_causes") or []) if isinstance(c, dict)][: max(1, max_causes)]
     citations = list(response.get("citations") or [])
@@ -9200,7 +9210,7 @@ def _build_ask_answer_from_root_cause_response(q: str, root_response: dict, *, m
             local.append(f"[{cid}]")
         return " ".join(local)
 
-    lang = _select_response_language(q)
+    lang = _select_response_language(q, preferred=response_language)
     primary_label = re.sub(r"\s+", " ", str(primary.get("cause") or "")).strip().rstrip(".")
     secondary_label = re.sub(r"\s+", " ", str((secondary or {}).get("cause") or "")).strip().rstrip(".")
 
@@ -9241,12 +9251,18 @@ def _build_ask_response_from_root_cause_bridge(
     company_id: str,
     top_k: int,
     root_response: dict,
+    response_language: Optional[str] = None,
     debug: bool = False,
 ) -> Optional[dict]:
     if str((root_response or {}).get("status") or "").strip().lower() != "answered":
         return None
 
-    answer, final_citations = _build_ask_answer_from_root_cause_response(q, root_response, max_causes=2)
+    answer, final_citations = _build_ask_answer_from_root_cause_response(
+        q,
+        root_response,
+        max_causes=2,
+        response_language=response_language,
+    )
     if not answer or not final_citations:
         return None
 
@@ -9262,6 +9278,7 @@ def _build_ask_response_from_root_cause_bridge(
         "ok": True,
         "status": "answered",
         "answer": answer,
+        "language": _select_response_language(q, preferred=response_language),
         "citations": response_citations,
         "rg_links": rg_links,
         "top_k": top_k,
@@ -9290,6 +9307,8 @@ def _ask_v1_baseline_impl(
     if not q:
         raise HTTPException(status_code=400, detail="Missing query")
 
+    requested_language = _select_response_language(q, preferred=payload.language)
+
     scope = _resolve_query_scope(
         company_id=payload.company_id,
         machine_id=payload.machine_id,
@@ -9315,6 +9334,7 @@ def _ask_v1_baseline_impl(
                 bubble_document_id=bubble_document_id,
                 document_ids=doc_ids,
                 ai_scope=scope.get("ai_scope"),
+                language=requested_language,
                 top_k=max(6, top_k),
                 max_causes=2,
                 debug=payload.debug,
@@ -9325,6 +9345,7 @@ def _ask_v1_baseline_impl(
                 company_id=company_id,
                 top_k=top_k,
                 root_response=root_response,
+                response_language=requested_language,
                 debug=bool(payload.debug),
             )
             if bridged:
@@ -9348,7 +9369,8 @@ def _ask_v1_baseline_impl(
     )
 
     planner = primary_retrieval.get("planner") or {}
-    response_language = _select_response_language(q, planner=planner)
+    query_language_for_retrieval = _select_response_language(q, planner=planner)
+    response_language = _select_response_language(q, planner=planner, preferred=payload.language)
     no_sources_text = _localized_no_sources(response_language)
 
     retrieval = primary_retrieval
@@ -9363,7 +9385,7 @@ def _ask_v1_baseline_impl(
         query_token_count >= 4
         and (
             not citations
-            or response_language == "en"
+            or query_language_for_retrieval == "en"
             or all(_source_type_from_document_id(c.get("bubble_document_id") or "") in {"ps", "procedure", "step"} for c in citations)
             or float(sim_max or 0.0) < float(retrieval.get("effective_threshold") or ASK_SIM_THRESHOLD) + 0.05
         )
@@ -9496,6 +9518,7 @@ def _ask_v1_baseline_impl(
                     "ok": True,
                     "status": "answered",
                     "answer": _localized_value_answer(response_language, value, c["citation_id"]),
+                    "language": response_language,
                     "citations": _sanitize_citations_for_response(citations, company_id=company_id),
                     "rg_links": rg_links,
                     "top_k": top_k,
@@ -9539,6 +9562,7 @@ def _ask_v1_baseline_impl(
                         "ok": True,
                         "status": "answered",
                         "answer": _localized_value_answer(response_language, hit["value"], hit["citation_id"]),
+                        "language": response_language,
                         "citations": _sanitize_citations_for_response(cit_list, company_id=company_id),
                         "rg_links": rg_links,
                         "top_k": top_k,
@@ -9578,6 +9602,7 @@ def _ask_v1_baseline_impl(
                         "ok": True,
                         "status": "answered",
                         "answer": _localized_token_answer(response_language, matched_token, hit["citation_id"]),
+                        "language": response_language,
                         "citations": _sanitize_citations_for_response(cit_list, company_id=company_id),
                         "rg_links": rg_links,
                         "top_k": top_k,
@@ -9691,6 +9716,7 @@ def _ask_v1_baseline_impl(
             "ok": True,
             "status": "answered",
             "answer": answer,
+            "language": response_language,
             "citations": response_citations,
             "rg_links": rg_links,
             "top_k": top_k,
@@ -10052,6 +10078,8 @@ def _root_cause_v1_baseline_impl(
     if not q:
         raise HTTPException(status_code=400, detail="Missing query")
 
+    response_language = _select_response_language(q, preferred=payload.language)
+
     scope = _resolve_query_scope(
         company_id=payload.company_id,
         machine_id=payload.machine_id,
@@ -10209,7 +10237,7 @@ def _root_cause_v1_baseline_impl(
     )
 
     schema = _root_cause_response_schema(max_causes=max_causes)
-    response_language = _select_response_language(q, planner=planner)
+    response_language = _select_response_language(q, planner=planner, preferred=payload.language)
 
     matrix = retrieval.get("diagnostic_matrix") or {}
     matrix_json = json.dumps(matrix, ensure_ascii=False)
@@ -10229,7 +10257,7 @@ def _root_cause_v1_baseline_impl(
         "If the evidence is narrow, return fewer causes rather than broad generic ones. "
         "Avoid generic boilerplate causes unless the sources clearly support them. "
         "Merge near-duplicate causes instead of listing paraphrases. If the evidence matrix contains two distinct hypotheses with separate evidence families, preserve more than one cause instead of collapsing to one. For generic symptoms like vibration, noise, or jams, do not center lubrication, startup, installation, or safety unless the sources explicitly connect them to the symptom. For no-start cases, prefer electrical supply, interlock, consent, mode-selection, and control evidence over generic lubrication notes. Do not narrow to a single component unless the sources support that narrowing directly. "
-        "Always reply in the same language as the user query."
+        "Always reply in the requested response language."
     )
 
     user_msg = (
@@ -10358,6 +10386,7 @@ def _root_cause_v1_baseline_impl(
             "ok": True,
             "status": "answered",
             "symptom": q,
+            "language": response_language,
             "problem_summary": grounded_result.get("problem_summary") or q,
             "possible_causes": grounded_result.get("possible_causes") or [],
             "recommended_next_checks": grounded_result.get("recommended_next_checks") or [],
@@ -11090,12 +11119,28 @@ def _infer_response_citation_roles(q: str, citations: list[dict]) -> list[dict]:
     return out
 
 
+def _response_language_from_response(q: str, response: dict) -> str:
+    response = dict(response or {})
+    meta = response.get("meta") if isinstance(response.get("meta"), dict) else {}
+
+    lang = str(
+        response.get("language")
+        or meta.get("language")
+        or ""
+    ).strip().lower()
+
+    if lang in {"it", "en"}:
+        return lang
+
+    return _simple_query_language(q)
+
+
 def _root_cause_response_proxy_score(q: str, response: dict) -> dict:
     response = dict(response or {})
     status = str(response.get("status") or "").strip().lower()
     causes = [c for c in (response.get("possible_causes") or []) if isinstance(c, dict)]
     citations = list(response.get("citations") or [])
-    language = _simple_query_language(q)
+    language = _response_language_from_response(q, response)
     profile = _query_symptom_profile(q)
     classes = set(profile.get("classes") or [])
 
@@ -11188,7 +11233,7 @@ def _ask_response_proxy_score(q: str, response: dict) -> dict:
     status = str(response.get("status") or "").strip().lower()
     answer = str(response.get("answer") or "")
     citations = list(response.get("citations") or [])
-    language = _simple_query_language(q)
+    language = _response_language_from_response(q, response)
     profile = _query_symptom_profile(q)
     classes = set(profile.get("classes") or [])
 
@@ -11509,6 +11554,8 @@ def _ask_v1_candidate_impl(
     if not q:
         raise HTTPException(status_code=400, detail="Missing query")
 
+    response_language = _select_response_language(q, preferred=payload.language)
+
     scope = _resolve_query_scope(
         company_id=payload.company_id,
         machine_id=payload.machine_id,
@@ -11525,10 +11572,11 @@ def _ask_v1_candidate_impl(
     top_k = max(1, min(top_k, ASK_MAX_TOP_K))
     candidate_k = max(top_k, min(80, max(ROOT_CAUSE_EXTRA_CANDIDATE_K, top_k * 10)))
 
-    response_language = _select_response_language(q)
+    query_language_for_retrieval = _select_response_language(q)
+    response_language = _select_response_language(q, preferred=payload.language)
     no_sources_text = _localized_no_sources(response_language)
     symptom_profile = _query_symptom_profile(q)
-    technical_candidate = bool(symptom_profile.get("classes")) or response_language == "en" or _count_query_tokens(q) >= 4
+    technical_candidate = bool(symptom_profile.get("classes")) or query_language_for_retrieval == "en" or _count_query_tokens(q) >= 4
 
     if technical_candidate:
         retrieval = _diagnostic_evidence_candidate_pipeline(
@@ -11565,7 +11613,7 @@ def _ask_v1_candidate_impl(
         )
 
     planner = retrieval.get("planner") or {}
-    response_language = _select_response_language(q, planner=planner)
+    response_language = _select_response_language(q, planner=planner, preferred=payload.language)
     citations = list(retrieval.get("prompt_citations") or retrieval.get("citations") or [])
     sim_max = retrieval.get("similarity_max")
 
@@ -11666,6 +11714,7 @@ def _ask_v1_candidate_impl(
             "ok": True,
             "status": "answered",
             "answer": answer,
+            "language": response_language,
             "citations": response_citations,
             "rg_links": rg_links,
             "top_k": top_k,
@@ -11687,6 +11736,8 @@ def _root_cause_v1_candidate_impl(
     q = (payload.query or "").strip()
     if not q:
         raise HTTPException(status_code=400, detail="Missing query")
+
+    response_language = _select_response_language(q, preferred=payload.language)
 
     scope = _resolve_query_scope(
         company_id=payload.company_id,
@@ -11755,7 +11806,7 @@ def _root_cause_v1_candidate_impl(
     planner = retrieval.get("planner") or {}
     sim_max = retrieval.get("similarity_max")
     citations = list(retrieval.get("citations") or [])
-    response_language = _select_response_language(q, planner=planner)
+    response_language = _select_response_language(q, planner=planner, preferred=payload.language)
 
     def _finalize(resp: dict) -> dict:
         if payload.debug:
@@ -11818,7 +11869,7 @@ def _root_cause_v1_candidate_impl(
         "support_lubrication, support_startup_install, and support_safety must not become rank-1 causes for generic symptoms unless the evidence matrix explicitly shows that they are primary and no stronger core hypothesis exists. "
         "For no-start and automatic-mode failures, support_electrical_interlock may be primary; support_lubrication should remain secondary unless directly anchored by the symptom. "
         "Preserve more than one cause when the evidence matrix contains distinct, separately supported hypotheses. "
-        "Each cause must be a short canonical technical label, 3 to 10 words, noun-phrase style, with no trailing period. Always reply in the same language as the user query."
+        "Each cause must be a short canonical technical label, 3 to 10 words, noun-phrase style, with no trailing period. Always reply in the requested response language."
     )
     user_msg = (
         f"USER_PROBLEM:\n{q}\n\n"
@@ -11919,6 +11970,7 @@ def _root_cause_v1_candidate_impl(
             "ok": True,
             "status": "answered",
             "symptom": q,
+            "language": response_language,
             "problem_summary": grounded_result.get("problem_summary") or q,
             "possible_causes": grounded_result.get("possible_causes") or [],
             "recommended_next_checks": grounded_result.get("recommended_next_checks") or [],
@@ -12189,7 +12241,7 @@ def _v8_shadow_build_ask_overlay(q: str, response: dict) -> Optional[dict]:
     if float(proxy.get("score", 0.0) or 0.0) < V8_SHADOW_MIN_ASK_PROXY:
         return None
 
-    response_language = _select_response_language(q)
+    response_language = _response_language_from_response(q, response)
     compact_response = {
         "status": str(response.get("status") or ""),
         "answer": re.sub(r"\s+", " ", str(response.get("answer") or "").strip())[:1200],
@@ -12244,7 +12296,7 @@ def _v8_shadow_build_root_cause_overlay(q: str, response: dict) -> Optional[dict
     if float(proxy.get("score", 0.0) or 0.0) < V8_SHADOW_MIN_ROOT_PROXY:
         return None
 
-    response_language = _select_response_language(q)
+    response_language = _response_language_from_response(q, response)
     compact_response = {
         "status": str(response.get("status") or ""),
         "problem_summary": re.sub(r"\s+", " ", str(response.get("problem_summary") or "").strip())[:500],
