@@ -7899,6 +7899,125 @@ def _ask_structured_manual_support_score(text: str, terms: list[str]) -> float:
     return float(_ask_structured_manual_support_score_details(text, terms).get("total_score") or 0.0)
 
 
+def _ask_structured_manual_support_selector_schema() -> dict:
+    return {
+        "name": "ask_structured_manual_support_selector_v1",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "operation_support_indices": {"type": "array", "items": {"type": "integer"}, "maxItems": 3},
+                "safety_support_indices": {"type": "array", "items": {"type": "integer"}, "maxItems": 2},
+                "operation_note": {"type": "string"},
+                "safety_note": {"type": "string"},
+                "rejected_reason": {"type": "string"},
+                "reason": {"type": "string"},
+            },
+            "required": [
+                "operation_support_indices",
+                "safety_support_indices",
+                "operation_note",
+                "safety_note",
+                "rejected_reason",
+                "reason",
+            ],
+        },
+    }
+
+
+def _ask_structured_manual_support_select_with_llm(
+    *,
+    q: str,
+    response_language: str,
+    structured_citations: list[dict],
+    candidates: list[dict],
+) -> dict:
+    """Reason about whether manual pages directly support a structured operation.
+
+    This selector is intentionally semantic, not keyword/dictionary based. It receives
+    the user's question, the primary structured procedure/step/P&S/photo/video records,
+    and candidate manual pages. It must select manual pages only when they directly add
+    information for the same requested operation or a directly applicable safety
+    prerequisite. Generic safety, generic maintenance, adjacent processes, or pages that
+    merely share broad machine vocabulary must be rejected.
+    """
+    if not OPENAI_API_KEY or not candidates:
+        return {
+            "operation_support_indices": [],
+            "safety_support_indices": [],
+            "operation_note": "",
+            "safety_note": "",
+            "reason": "selector disabled or no candidates",
+            "rejected_reason": "",
+        }
+
+    structured_block = _ask_full_context_sources_block(
+        structured_citations,
+        max_context_chars=9000,
+    )
+    cand_parts: list[str] = []
+    for c in candidates:
+        idx = int(c.get("selector_index") or 0)
+        label = str(c.get("display_label") or c.get("citation_id") or "Manual page").strip()
+        page_text = str(c.get("chunk_full") or c.get("snippet") or "")
+        page_text = re.sub(r"\s+", " ", page_text).strip()
+        page_text = _clean_display_text(page_text, max_len=1800)
+        if idx and page_text:
+            cand_parts.append(f"[PAGE_INDEX {idx}] {label}\n{page_text}")
+    candidates_block = "\n\n---\n\n".join(cand_parts)
+    if not candidates_block:
+        return {
+            "operation_support_indices": [],
+            "safety_support_indices": [],
+            "operation_note": "",
+            "safety_note": "",
+            "reason": "no readable candidates",
+            "rejected_reason": "",
+        }
+
+    system_msg = (
+        "You are a strict evidence selector for an industrial AI assistant. "
+        "Use semantic reasoning, not keyword matching. The structured sources are the primary source. "
+        "Manual pages are optional secondary support. Select a manual page ONLY if it directly helps answer the user's exact operation/problem, "
+        "or if it contains a safety/prerequisite instruction directly applicable to that same operation. "
+        "Reject pages that are merely generic safety, generic maintenance, setup overview, adjacent machine processes, or broadly similar machine vocabulary. "
+        "If unsure, select nothing. Do not infer from outside knowledge."
+    )
+    user_msg = (
+        f"QUESTION:\n{q}\n\n"
+        f"RESPONSE_LANGUAGE:\n{response_language}\n\n"
+        f"PRIMARY STRUCTURED SOURCES:\n{structured_block}\n\n"
+        f"CANDIDATE MANUAL PAGES:\n{candidates_block}\n\n"
+        "Return JSON only. operation_support_indices are manual PAGE_INDEX values that directly add operational instructions for the exact requested operation. "
+        "safety_support_indices are manual PAGE_INDEX values that provide directly applicable prerequisites/safety for that exact operation. "
+        "operation_note and safety_note must be short, user-facing, and based only on selected pages. If no selected page exists for a note, leave it empty."
+    )
+    try:
+        parsed = _openai_chat_json_models(
+            [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            models=[ASK_STRUCTURED_DIRECT_MODEL, ASK_EVIDENCE_ANALYZER_MODEL, OPENAI_RERANK_MODEL, OPENAI_CHAT_MODEL],
+            json_schema=_ask_structured_manual_support_selector_schema(),
+            timeout=min(int(ASK_STRUCTURED_DIRECT_TIMEOUT or 60), 55),
+        )
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception as e:
+        print("ASK_STRUCTURED_MANUAL_SELECTOR_FAIL", str(e)[:700])
+
+    return {
+        "operation_support_indices": [],
+        "safety_support_indices": [],
+        "operation_note": "",
+        "safety_note": "",
+        "reason": "selector failed closed",
+        "rejected_reason": "selector failed",
+    }
+
+
 def _ask_structured_direct_fetch_manual_support(
     *,
     company_id: str,
@@ -7906,17 +8025,22 @@ def _ask_structured_direct_fetch_manual_support(
     q: str,
     planner: Optional[dict],
     structured_citations: list[dict],
+    response_language: str = "it",
 ) -> list[dict]:
+    """Fetch optional manual support for structured answers.
+
+    Structured records remain primary. Manual pages are selected by a strict LLM
+    relevance selector, not by a fixed operation dictionary. A manual page is kept
+    only when it directly supports the same operation/problem as the structured
+    source, or when it provides directly applicable safety/prerequisite context.
+    Generic safety pages and adjacent processes are rejected.
+    """
     if not ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_ENABLED:
         return []
     if not structured_citations or not machine_id or str(machine_id).strip() == COMPANY_GENERAL_MACHINE_SENTINEL:
         return []
 
-    terms = _ask_structured_manual_support_terms(q, planner, structured_citations)
-    if not terms:
-        return []
-
-    text_chars = max(800, int(ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_TEXT_CHARS or 4200))
+    text_chars = max(1200, int(ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_TEXT_CHARS or 4200))
     scan_limit = max(20, int(ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_SCAN_LIMIT or 180))
 
     conn = _db_conn()
@@ -7945,23 +8069,16 @@ def _ask_structured_direct_fetch_manual_support(
     finally:
         conn.close()
 
-    scored: list[dict] = []
+    candidates: list[dict] = []
     for idx, (bdid, mid, page_number, page_text) in enumerate(rows or [], start=1):
         bdid_s = str(bdid or "").strip()
         txt = str(page_text or "").strip()
         if not bdid_s or not txt:
             continue
-        detail = _ask_structured_manual_support_score_details(txt, terms)
-        score = float(detail.get("total_score") or 0.0)
-        op_score = float(detail.get("operation_score") or 0.0)
-        safety_score = float(detail.get("safety_score") or 0.0)
-        if op_score < 1.0 and safety_score < 3.0:
-            continue
         page_no = _safe_int(page_number, 1)
-        # Keep manual support below structured records in UI relevance while still
-        # retaining a meaningful score for debugging.
-        similarity = min(0.88, 0.50 + 0.018 * score)
-        scored.append({
+        similarity = 0.58
+        c = {
+            "selector_index": idx,
             "citation_id": f"{bdid_s}:p{page_no}-{page_no}:manualsupport:{idx}",
             "bubble_document_id": bdid_s,
             "chunk_index": 1,
@@ -7971,57 +8088,77 @@ def _ask_structured_direct_fetch_manual_support(
             "snippet_clean": txt[: int(ASK_SNIPPET_CHARS or 900)],
             "chunk_full": txt,
             "similarity": float(similarity),
-            "retrieval_score": float(similarity + 0.02),
+            "retrieval_score": float(similarity),
             "source_type": "document",
             "ask_structured_manual_support": True,
-            "structured_manual_support_score": float(score),
-            "structured_manual_operation_score": float(op_score),
-            "structured_manual_safety_score": float(safety_score),
+            "structured_manual_support_score": float(similarity),
+            "structured_manual_operation_score": 0.0,
+            "structured_manual_safety_score": 0.0,
             "embedding_list": [],
-        })
+        }
+        # Provide a readable label to the selector and to debug traces.
+        try:
+            label_meta = _source_display_metadata_from_citation(c, company_id=company_id)
+            c["display_label"] = str(label_meta.get("display_label") or "")
+        except Exception:
+            c["display_label"] = f"Manuale - pag. {page_no}"
+        candidates.append(c)
 
-    if not scored:
+    if not candidates:
+        return []
+
+    # Let the model reason about direct relevance. To avoid accidental huge calls on
+    # very large manuals, keep the first scan_limit pages but compact each preview in
+    # the selector prompt. This is intentionally more conservative than keyword
+    # scoring: if the selector is unsure, manual support is omitted rather than wrong.
+    selected_meta = _ask_structured_manual_support_select_with_llm(
+        q=q,
+        response_language=response_language,
+        structured_citations=structured_citations,
+        candidates=candidates,
+    )
+
+    op_indices = {int(x) for x in (selected_meta.get("operation_support_indices") or []) if str(x).strip().lstrip("-").isdigit()}
+    safety_indices = {int(x) for x in (selected_meta.get("safety_support_indices") or []) if str(x).strip().lstrip("-").isdigit()}
+    if not op_indices and not safety_indices:
         return []
 
     max_items = max(0, int(ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_MAX_ITEMS or 2))
     if max_items <= 0:
         return []
 
-    op_candidates = sorted(
-        [x for x in scored if float(x.get("structured_manual_operation_score") or 0.0) >= 1.0],
-        key=lambda x: (-float(x.get("structured_manual_operation_score") or 0.0), -float(x.get("structured_manual_support_score") or 0.0), str(x.get("bubble_document_id") or ""), int(x.get("page_from") or 0)),
-    )
-    safety_candidates = sorted(
-        [x for x in scored if float(x.get("structured_manual_safety_score") or 0.0) >= 3.0],
-        key=lambda x: (-float(x.get("structured_manual_safety_score") or 0.0), -float(x.get("structured_manual_support_score") or 0.0), str(x.get("bubble_document_id") or ""), int(x.get("page_from") or 0)),
-    )
-    remaining = sorted(
-        scored,
-        key=lambda x: (-float(x.get("structured_manual_support_score") or 0.0), str(x.get("bubble_document_id") or ""), int(x.get("page_from") or 0)),
-    )
+    operation_note = _clean_display_text(str(selected_meta.get("operation_note") or ""), max_len=360)
+    safety_note = _clean_display_text(str(selected_meta.get("safety_note") or ""), max_len=320)
 
+    by_idx = {int(c.get("selector_index") or 0): c for c in candidates}
     selected: list[dict] = []
-    used_keys: set[tuple[str, int]] = set()
+    used: set[int] = set()
 
-    def add_one(c: dict) -> None:
-        if len(selected) >= max_items:
+    def add_selected(idx: int, kind: str) -> None:
+        if len(selected) >= max_items or idx in used:
             return
-        k = (str(c.get("bubble_document_id") or ""), int(c.get("page_from") or 0))
-        if k in used_keys:
+        c = dict(by_idx.get(idx) or {})
+        if not c:
             return
+        used.add(idx)
+        c["ask_manual_support_kind"] = kind
+        c["structured_manual_operation_score"] = 10.0 if kind == "operation" else 0.0
+        c["structured_manual_safety_score"] = 10.0 if kind == "safety" else 0.0
+        c["structured_manual_support_score"] = 10.0
+        c["similarity"] = 0.86 if kind == "operation" else 0.82
+        c["retrieval_score"] = float(c["similarity"])
+        if kind == "operation" and operation_note:
+            c["llm_operation_note"] = operation_note
+        if kind == "safety" and safety_note:
+            c["llm_safety_note"] = safety_note
         selected.append(c)
-        used_keys.add(k)
 
-    if op_candidates:
-        add_one(op_candidates[0])
-    if safety_candidates:
-        add_one(safety_candidates[0])
-    for c in remaining:
-        add_one(c)
-        if len(selected) >= max_items:
-            break
+    for idx in sorted(op_indices):
+        add_selected(idx, "operation")
+    for idx in sorted(safety_indices):
+        add_selected(idx, "safety")
 
-    return _dedup_citations_by_snippet(selected, max_items=max_items)
+    return selected[:max_items]
 
 
 def _ask_structured_field_value(c: dict, *keys: str, limit: int = 240) -> str:
@@ -8088,13 +8225,24 @@ def _manual_operation_and_safety_notes_from_support_citations(
     structured_citations: list[dict],
     language: str,
 ) -> tuple[str, str]:
-    """Return (operation_note, safety_note) from manual support pages.
+    """Return (operation_note, safety_note) from selected manual support pages.
 
-    The operation note is selected using query/structured-source terms. The safety
-    note uses generic safety markers. This prevents generic safety pages from
-    being the only manual contribution when the manual also contains operation-
-    specific details.
+    Prefer notes produced by the strict semantic selector. The older sentence
+    scoring below is only a fallback after a page has already been selected as
+    directly relevant by the selector.
     """
+    llm_op = ""
+    llm_safe = ""
+    for c in citations or []:
+        if not isinstance(c, dict):
+            continue
+        if not llm_op:
+            llm_op = _clean_display_text(str(c.get("llm_operation_note") or ""), max_len=360)
+        if not llm_safe:
+            llm_safe = _clean_display_text(str(c.get("llm_safety_note") or ""), max_len=320)
+    if llm_op or llm_safe:
+        return llm_op, llm_safe
+
     text = " ".join(str(c.get("chunk_full") or c.get("snippet") or "") for c in (citations or []) if isinstance(c, dict))
     text = re.sub(r"\s+", " ", text).strip()
     if not text:
@@ -8191,16 +8339,17 @@ def _format_structured_procedure_answer_for_ui(
 
     if steps:
         header = "Operational steps:" if is_en else "Passaggi operativi:"
-        lines = [header]
+        step_blocks: list[str] = []
         for idx, c in enumerate(steps, start=1):
             step_no = _ask_structured_field_value(c, "step_number", limit=20) or str(idx)
             title = _ask_structured_field_value(c, "title", limit=100) or (f"Step {step_no}" if is_en else f"Step {step_no}")
             desc = _ask_structured_field_value(c, "description", limit=280)
             if desc and desc.lower() not in title.lower():
-                lines.append(f"{step_no}. {title}\n   {desc}")
+                step_blocks.append(f"{step_no}. {title}\n   {desc}")
             else:
-                lines.append(f"{step_no}. {title}")
-        parts.append("\n".join(lines))
+                step_blocks.append(f"{step_no}. {title}")
+        if step_blocks:
+            parts.append(header + "\n" + "\n\n".join(step_blocks))
 
     if manual_support_citations:
         operation_note, safety_note = _manual_operation_and_safety_notes_from_support_citations(
@@ -8291,6 +8440,7 @@ def _ask_structured_direct_answer(
         q=q,
         planner=planner,
         structured_citations=citations,
+        response_language=response_language,
     )
     manual_support_block = _ask_full_context_sources_block(
         manual_support_citations,
