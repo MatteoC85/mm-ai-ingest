@@ -3000,7 +3000,11 @@ def _structured_rescue_query_intent(q: str, planner: Optional[dict] = None) -> b
         "how to", "how do i", "what should i do", "esiste", "conosci", "conosci sulla macchina",
         "hai info", "hai informazioni", "quali altre informazioni",
     ]
-    return any(m in low for m in howto_markers) and _count_query_tokens(low) >= 3
+    # Generic Italian how-to form: "come si <verbo/azione> ...".
+    # This is not operation-specific; it prevents practical questions such as
+    # "come si raddrizza il filo?" from falling back to long PDF manuals only.
+    generic_howto = bool(re.search(r"\bcome\s+si\s+[a-zà-öø-ÿ0-9][a-zà-öø-ÿ0-9_\-/]{2,}", low))
+    return (any(m in low for m in howto_markers) or generic_howto) and _count_query_tokens(low) >= 3
 
 
 def _structured_rescue_prefixes_for_query(q: str, planner: Optional[dict] = None) -> list[str]:
@@ -7670,7 +7674,8 @@ def _ask_structured_direct_intent(q: str, planner: Optional[dict] = None) -> dic
         "installare", "install", "montare", "montaggio", "smontare", "smontaggio",
         "rimuovere", "remove", "togliere", "mettere",
     ]
-    if any(x in low for x in how_to_markers):
+    generic_howto = bool(re.search(r"\bcome\s+si\s+[a-zà-öø-ÿ0-9][a-zà-öø-ÿ0-9_\-/]{2,}", low))
+    if any(x in low for x in how_to_markers) or generic_howto:
         add_many(["procedure", "step", "ps"])
 
     # Machine knowledge overview, especially when the user asks for non-manual content.
