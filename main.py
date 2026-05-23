@@ -7372,6 +7372,10 @@ def _ask_structured_direct_stopwords() -> set[str]:
         "procedura", "procedure", "step", "passaggio", "passaggi", "fase", "fasi", "foto", "immagine", "immagini",
         "video", "problema", "problemi", "soluzione", "soluzioni", "errore", "errori", "operativo", "operativi",
         "extra", "oltre", "riassumi", "fammi", "dimmi", "hai", "c'è", "sono",
+        # Generic action words: useful for routing but not for lexical matching.
+        "fare", "faccio", "fai", "fa", "eseguire", "eseguo", "esegui", "esegue",
+        "operazione", "operazioni", "attività", "attivita", "intervento", "interventi",
+        "task", "activity", "activities", "operation", "operations", "execute", "perform",
     }
 
 
@@ -7420,7 +7424,7 @@ def _ask_structured_direct_intent(q: str, planner: Optional[dict] = None) -> dic
                 prefixes.append(v)
 
     # Explicit source-type requests.
-    if any(x in low for x in ["procedur", "procedure", "istruzion", "instruction", "operativ", "operating sequence"]):
+    if any(x in low for x in ["procedur", "procedure", "istruzion", "instruction", "operativ", "operating sequence", "sequenza", "operazione", "operation"]):
         add_many(["procedure", "step"])
     if any(x in low for x in ["step", "passagg", "fase", "fasi", "passo", "passi"]):
         add_many(["step", "procedure"])
@@ -7431,8 +7435,22 @@ def _ask_structured_direct_intent(q: str, planner: Optional[dict] = None) -> dic
     if "video" in low or "filmato" in low or "recording" in low:
         add_many(["md_video"])
 
-    # Practical/how-to requests should consider operational records before manuals.
-    if any(x in low for x in ["come faccio", "come fare", "cosa devo fare", "how to", "how do i", "what should i do", "procedere", "eseguire"]):
+    # Practical/how-to and operation-execution requests should consider operational
+    # records before manuals. This is generic source hierarchy, not test-specific:
+    # user-authored procedures/steps/P&S are more authoritative than a manual for
+    # "how do I perform this operation?" questions.
+    how_to_markers = [
+        "come faccio", "come fare", "come si fa", "come si esegue", "come eseguire",
+        "come posso", "in che modo", "cosa devo fare", "cosa fare",
+        "how to", "how do i", "how can i", "how should i", "how is", "what should i do",
+        "procedere", "eseguire", "esecuzione", "operazione", "operazioni",
+        "sequenza", "sequenza operativa", "intervento", "attività", "attivita",
+        "operation", "operations", "operational sequence", "task", "workflow",
+        "sostituire", "sostituzione", "cambiare", "cambio", "change", "replacement",
+        "installare", "install", "montare", "montaggio", "smontare", "smontaggio",
+        "rimuovere", "remove", "togliere", "mettere",
+    ]
+    if any(x in low for x in how_to_markers):
         add_many(["procedure", "step", "ps"])
 
     # Machine knowledge overview, especially when the user asks for non-manual content.
@@ -7451,7 +7469,9 @@ def _ask_structured_direct_intent(q: str, planner: Optional[dict] = None) -> dic
             add_many(["procedure", "step", "ps", "md_photo", "md_video"])
 
     terms = _ask_structured_direct_terms(q, planner=planner)
-    enabled = bool(prefixes) and _count_query_tokens(q) >= 2
+    # Do not require many query tokens: a short request such as "coil change" or
+    # "reset error" can be a valid structured-source request if it has content terms.
+    enabled = bool(prefixes) and (_count_query_tokens(q) >= 2 or bool(terms))
     return {"enabled": enabled, "prefixes": prefixes, "terms": terms, "broad_overview": broad_overview, "query_text": low}
 
 
@@ -7478,7 +7498,7 @@ def _ask_structured_direct_score(
                 score += 1.25
 
     # Generic source-type affinity; this does not encode object-specific facts.
-    if source_type in {"procedure", "step"} and any(x in low_q for x in ["procedur", "step", "passagg", "come", "how", "operativ", "istruzion"]):
+    if source_type in {"procedure", "step"} and any(x in low_q for x in ["procedur", "step", "passagg", "come", "how", "operativ", "istruzion", "operazione", "operation", "cambio", "change", "sostitu", "replace", "montar", "smontar", "rimuov", "remove", "togliere", "mettere"]):
         score += 2.0
     if source_type == "ps" and any(x in low_q for x in ["problema", "problem", "soluzione", "solution", "errore", "error", "fault", "reset"]):
         score += 2.0
