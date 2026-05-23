@@ -1755,12 +1755,22 @@ def _strip_inline_citation_markers_for_display(text: str) -> str:
     # Defensive cleanup for naked Bubble ids followed by page markers.
     t = re.sub(r"\b[0-9]{10,}x[0-9A-Za-z]+:p\d+(?:-\d+)?(?::(?:c\d+|full|structured(?::\d+)?))?", " ", t)
 
-    # Keep paragraph/newline structure, but normalize spaces inside lines.
+    # Keep paragraph/newline structure, including deliberate blank lines used by
+    # sectioned structured answers. Normalize spaces inside non-empty lines and
+    # collapse runs of more than one blank line to a single blank line.
     lines = []
+    blank_pending = False
     for line in t.replace("\r", "\n").split("\n"):
         line = re.sub(r"[ \t]+", " ", line).strip()
         if line:
             lines.append(line)
+            blank_pending = False
+        else:
+            if lines and not blank_pending:
+                lines.append("")
+                blank_pending = True
+    while lines and not lines[-1]:
+        lines.pop()
     return "\n".join(lines).strip()
 
 
@@ -7926,6 +7936,110 @@ def _ask_structured_manual_support_selector_schema() -> dict:
     }
 
 
+def _ask_structured_manual_support_search_schema() -> dict:
+    return {
+        "name": "ask_structured_manual_support_search_v1",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "manual_search_terms": {"type": "array", "items": {"type": "string"}, "maxItems": 18},
+                "manual_search_concepts": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
+                "reason": {"type": "string"},
+            },
+            "required": ["manual_search_terms", "manual_search_concepts", "reason"],
+        },
+    }
+
+
+def _ask_structured_manual_support_search_terms_with_llm(
+    *,
+    q: str,
+    response_language: str,
+    structured_citations: list[dict],
+) -> list[str]:
+    """Infer how a manual may describe support for a structured operation.
+
+    This is not a dictionary of expected answers. The model receives the user
+    question plus the primary structured records and produces search expressions
+    that an official manual might use for the same operation, its immediate
+    prerequisite, or its immediate continuation. This is needed because shop-floor
+    structured procedures can use shorthand while manuals use formal wording.
+    """
+    if not OPENAI_API_KEY or not structured_citations:
+        return []
+
+    structured_block = _ask_full_context_sources_block(
+        structured_citations,
+        max_context_chars=7000,
+    )
+    system_msg = (
+        "You prepare search terms for an industrial machine manual. You are not answering the user. "
+        "Given a user question and primary structured procedure/step records, infer the formal wording the official manual may use for: "
+        "the same operation, an immediate prerequisite, or an immediate continuation needed to complete that operation. "
+        "Use semantic reasoning, not fixed keywords. Include terms in the user's language and likely manual language when useful. "
+        "Do not invent values, ids, page numbers, or facts. Do not add broad generic safety unless it is necessary to find directly applicable prerequisites."
+    )
+    user_msg = (
+        f"QUESTION:\n{q}\n\n"
+        f"RESPONSE_LANGUAGE:\n{response_language}\n\n"
+        f"PRIMARY STRUCTURED SOURCES:\n{structured_block}\n\n"
+        "Return concise search terms/concepts only. Prefer manual phrasing, component names, actions, materials, and immediate before/after operations. "
+        "If a structured procedure uses workshop shorthand, infer plausible formal manual terms without asserting they exist."
+    )
+    try:
+        parsed = _openai_chat_json_models(
+            [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            models=[ASK_STRUCTURED_DIRECT_MODEL, ASK_EVIDENCE_ANALYZER_MODEL, OPENAI_RERANK_MODEL, OPENAI_CHAT_MODEL],
+            json_schema=_ask_structured_manual_support_search_schema(),
+            timeout=min(int(ASK_STRUCTURED_DIRECT_TIMEOUT or 60), 45),
+        )
+    except Exception as e:
+        print("ASK_STRUCTURED_MANUAL_SEARCH_TERMS_FAIL", str(e)[:700])
+        return []
+
+    if not isinstance(parsed, dict):
+        return []
+
+    out: list[str] = []
+    seen: set[str] = set()
+    raw_items = list(parsed.get("manual_search_terms") or []) + list(parsed.get("manual_search_concepts") or [])
+    stop = _ask_structured_direct_stopwords()
+    for raw in raw_items:
+        t = _normalize_unicode_advanced(str(raw or "")).lower().strip(" -–—:;,.()[]{}")
+        t = re.sub(r"\s+", " ", t).strip()
+        if len(t) < 3 or t in stop or t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+        if len(out) >= 26:
+            break
+    return out
+
+
+def _ask_structured_manual_support_candidate_score(text: str, profile_terms: list[str], fallback_terms: list[str]) -> float:
+    low = _normalize_unicode_advanced(text or "").lower()
+    if not low:
+        return 0.0
+    score = 0.0
+    for t in profile_terms or []:
+        tt = _normalize_unicode_advanced(str(t or "")).lower().strip()
+        if len(tt) < 3:
+            continue
+        if tt in low:
+            # Multi-word concepts are stronger because they usually reflect a
+            # reasoned manual phrase rather than a generic single term.
+            score += 2.5 if " " in tt else 1.2
+    # Fallback terms are useful but must not dominate the LLM-inferred manual profile.
+    details = _ask_structured_manual_support_score_details(text, fallback_terms or [])
+    score += float(details.get("total_score") or 0.0) * 0.18
+    return float(score)
+
+
 def _ask_structured_manual_support_select_with_llm(
     *,
     q: str,
@@ -7980,8 +8094,10 @@ def _ask_structured_manual_support_select_with_llm(
         "You are a strict evidence selector for an industrial AI assistant. "
         "Use semantic reasoning, not keyword matching. The structured sources are the primary source. "
         "Manual pages are optional secondary support. Select a manual page ONLY if it directly helps answer the user's exact operation/problem, "
-        "or if it contains a safety/prerequisite instruction directly applicable to that same operation. "
-        "Reject pages that are merely generic safety, generic maintenance, setup overview, adjacent machine processes, or broadly similar machine vocabulary. "
+        "or if it describes an immediate prerequisite/continuation that a technician must perform around the structured operation. "
+        "If a manual page does not use the same workshop wording as the structured procedure but explains the formal manual operation that follows or supports it, it may be selected as related manual support. "
+        "Reject pages that are merely generic safety, generic maintenance, setup overview, unrelated adjustment, or broadly similar machine vocabulary. "
+        "Safety pages may be selected only when the safety instruction is directly applicable to the operation, not as a generic disclaimer. "
         "If unsure, select nothing. Do not infer from outside knowledge."
     )
     user_msg = (
@@ -7989,9 +8105,11 @@ def _ask_structured_manual_support_select_with_llm(
         f"RESPONSE_LANGUAGE:\n{response_language}\n\n"
         f"PRIMARY STRUCTURED SOURCES:\n{structured_block}\n\n"
         f"CANDIDATE MANUAL PAGES:\n{candidates_block}\n\n"
-        "Return JSON only. operation_support_indices are manual PAGE_INDEX values that directly add operational instructions for the exact requested operation. "
+        "Return JSON only. operation_support_indices are manual PAGE_INDEX values that either directly add operational instructions for the exact requested operation "
+        "or explain an immediate connected manual phase/prerequisite needed around the structured operation. "
         "safety_support_indices are manual PAGE_INDEX values that provide directly applicable prerequisites/safety for that exact operation. "
-        "operation_note and safety_note must be short, user-facing, and based only on selected pages. If no selected page exists for a note, leave it empty."
+        "operation_note and safety_note must be short, user-facing, and based only on selected pages. "
+        "When the manual page is related support rather than the exact internal procedure, say that clearly. If no selected page exists for a note, leave it empty."
     )
     try:
         parsed = _openai_chat_json_models(
@@ -8107,10 +8225,33 @@ def _ask_structured_direct_fetch_manual_support(
     if not candidates:
         return []
 
-    # Let the model reason about direct relevance. To avoid accidental huge calls on
-    # very large manuals, keep the first scan_limit pages but compact each preview in
-    # the selector prompt. This is intentionally more conservative than keyword
-    # scoring: if the selector is unsure, manual support is omitted rather than wrong.
+    profile_terms = _ask_structured_manual_support_search_terms_with_llm(
+        q=q,
+        response_language=response_language,
+        structured_citations=structured_citations,
+    )
+    fallback_terms = _ask_structured_manual_support_terms(q, planner, structured_citations)
+    for c in candidates:
+        txt = str(c.get("chunk_full") or c.get("snippet") or "")
+        cand_score = _ask_structured_manual_support_candidate_score(txt, profile_terms, fallback_terms)
+        c["manual_support_candidate_score"] = float(cand_score)
+
+    # Do not send the whole manual to the selector: it dilutes attention and can
+    # cause it to miss the relevant manual phase. Use the LLM-inferred search
+    # profile to shortlist pages, then let the selector make the final semantic
+    # decision. This is still reasoning-based; it is not a hard-coded answer map.
+    candidates.sort(key=lambda x: (-float(x.get("manual_support_candidate_score") or 0.0), str(x.get("bubble_document_id") or ""), _safe_int(x.get("page_from"), 0)))
+    selector_limit = max(8, min(16, int(os.getenv("MM_ASK_STRUCTURED_MANUAL_SELECTOR_CANDIDATES", "12") or "12")))
+    if float(candidates[0].get("manual_support_candidate_score") or 0.0) > 0.0:
+        candidates = candidates[:selector_limit]
+    else:
+        candidates = candidates[:min(len(candidates), selector_limit)]
+
+    for idx, c in enumerate(candidates, start=1):
+        c["selector_index"] = idx
+
+    # Let the model reason about direct relevance on the shortlisted manual pages.
+    # If the selector is unsure, manual support is omitted rather than wrong.
     selected_meta = _ask_structured_manual_support_select_with_llm(
         q=q,
         response_language=response_language,
