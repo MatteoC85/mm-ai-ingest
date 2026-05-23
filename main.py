@@ -113,6 +113,14 @@ ASK_STRUCTURED_DIRECT_TEXT_CHARS = int(os.environ.get("MM_ASK_STRUCTURED_DIRECT_
 ASK_STRUCTURED_DIRECT_TIMEOUT = int(os.environ.get("MM_ASK_STRUCTURED_DIRECT_TIMEOUT_SECONDS", "60"))
 ASK_STRUCTURED_DIRECT_MODEL = (os.environ.get("MM_ASK_STRUCTURED_DIRECT_MODEL") or ASK_EVIDENCE_ANSWER_MODEL).strip()
 
+# ASK user-facing output polish. Retrieval/citations remain rich; the answer box
+# must not expose internal ids or become an unreadable evidence dump.
+ASK_UI_MAX_POINTS = int(os.environ.get("MM_ASK_UI_MAX_POINTS", "5"))
+ASK_UI_MAX_ANSWER_CHARS = int(os.environ.get("MM_ASK_UI_MAX_ANSWER_CHARS", "2200"))
+ASK_UI_MAX_LINKS = int(os.environ.get("MM_ASK_UI_MAX_LINKS", "8"))
+ASK_UI_MAX_CITATIONS = int(os.environ.get("MM_ASK_UI_MAX_CITATIONS", "8"))
+ASK_UI_MAX_SNIPPET_CLEAN_CHARS = int(os.environ.get("MM_ASK_UI_MAX_SNIPPET_CLEAN_CHARS", "520"))
+
 # Shared semantic retrieval planner
 SEMANTIC_QUERY_PLANNER_MODEL = (os.environ.get("MM_SEMANTIC_QUERY_PLANNER_MODEL") or "gpt-5.4-mini").strip()
 SEMANTIC_QUERY_PLANNER_TIMEOUT = int(os.environ.get("MM_SEMANTIC_QUERY_PLANNER_TIMEOUT_SECONDS", "20"))
@@ -1638,15 +1646,179 @@ def _ask_response_schema() -> dict:
     }
 
 def _strip_inline_citation_markers_for_display(text: str) -> str:
-    """Remove internal citation ids from the user-visible ASK answer.
+    """Remove internal citation/source ids from the user-visible ASK answer.
 
-    Citations and links are already returned as structured fields. Raw ids such as
-    [doc:p32-33:c501] must not be shown inside the answer box.
+    Citations and links are returned as structured fields. Raw ids such as
+    [doc:p32-33:c501], [doc:p41-41:full] or [step:...:structured:1]
+    must never be shown inside the answer box.
     """
     t = str(text or "")
-    t = re.sub(r"\s*\[[^\]]*:p\d+(?:-\d+)?:c\d+\]\s*", " ", t)
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
+
+    # Bracketed internal citation identifiers produced by chunk/full-context readers.
+    t = re.sub(
+        r"\s*\[[^\]\n]{1,220}:p\d+(?:-\d+)?:(?:c\d+|full|structured(?::\d+)?)[^\]\n]*\]\s*",
+        " ",
+        t,
+        flags=re.IGNORECASE,
+    )
+
+    # Raw debug fragments sometimes copied by the model.
+    t = re.sub(r"\s*\(\s*doc\s*=\s*[^)]{1,180}\)\s*", " ", t, flags=re.IGNORECASE)
+    t = re.sub(r"\b(?:doc|chunk|chunk_id|citation_id|bubble_document_id)\s*=\s*[^\s,;\]]+", " ", t, flags=re.IGNORECASE)
+
+    # Defensive cleanup for naked Bubble ids followed by page markers.
+    t = re.sub(r"\b[0-9]{10,}x[0-9A-Za-z]+:p\d+(?:-\d+)?(?::(?:c\d+|full|structured(?::\d+)?))?", " ", t)
+
+    # Keep paragraph/newline structure, but normalize spaces inside lines.
+    lines = []
+    for line in t.replace("\r", "\n").split("\n"):
+        line = re.sub(r"[ \t]+", " ", line).strip()
+        if line:
+            lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def _split_answer_points_for_ui(text: str) -> list[str]:
+    t = str(text or "").replace("\r", "\n").strip()
+    if not t:
+        return []
+
+    # Preserve already numbered answers.
+    matches = list(re.finditer(r"(?:^|\n)\s*(\d{1,2})[\.\)]\s+", t))
+    if matches:
+        out: list[str] = []
+        for i, m in enumerate(matches):
+            start = m.end()
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(t)
+            point = t[start:end].strip()
+            point = re.sub(r"\s+", " ", point).strip()
+            if point:
+                out.append(point)
+        return out
+
+    # Otherwise split paragraphs; if it is one long paragraph, split sentences.
+    paras = [re.sub(r"\s+", " ", x).strip() for x in re.split(r"\n{2,}|\n", t) if x.strip()]
+    if len(paras) >= 2:
+        return paras
+
+    sentences = [x.strip() for x in re.split(r"(?<=[\.!?])\s+", t) if x.strip()]
+    if len(sentences) <= 1:
+        return [t]
+
+    # Pack sentences into readable points.
+    points: list[str] = []
+    cur = ""
+    for sent in sentences:
+        if not cur:
+            cur = sent
+        elif len(cur) + 1 + len(sent) <= 420:
+            cur += " " + sent
+        else:
+            points.append(cur.strip())
+            cur = sent
+    if cur:
+        points.append(cur.strip())
+    return points
+
+
+def _compact_answer_for_ui(text: str, *, language: str = "it") -> str:
+    """Make ASK answers readable in the UI without changing retrieval.
+
+    The full evidence is still available in citations/rg_links. The answer box should
+    be a concise, grounded synthesis, not a dump of every citation.
+    """
+    clean = _strip_inline_citation_markers_for_display(text)
+    if not clean:
+        return ""
+
+    max_chars = max(600, int(ASK_UI_MAX_ANSWER_CHARS or 2200))
+    max_points = max(1, int(ASK_UI_MAX_POINTS or 5))
+
+    points = _split_answer_points_for_ui(clean)
+    if not points:
+        return clean[:max_chars].strip()
+
+    compact_points: list[str] = []
+    total = 0
+    for point in points:
+        point = _strip_inline_citation_markers_for_display(point)
+        point = re.sub(r"\s+", " ", point).strip(" -•\t")
+        if not point:
+            continue
+        if len(point) > 650:
+            # Keep the point readable; detailed excerpts remain in FONTE/LINK.
+            cut = point[:650].rsplit(" ", 1)[0].strip()
+            point = cut + "…"
+        projected = total + len(point) + 4
+        if compact_points and (len(compact_points) >= max_points or projected > max_chars):
+            break
+        compact_points.append(point)
+        total = projected
+
+    if not compact_points:
+        compact = clean[:max_chars].rsplit(" ", 1)[0].strip()
+        return compact + ("…" if len(clean) > len(compact) else "")
+
+    if len(compact_points) == 1:
+        out = compact_points[0]
+    else:
+        out = "\n".join(f"{i}. {p}" for i, p in enumerate(compact_points, start=1))
+
+    if len(clean) > len(out) + 300:
+        suffix = "Altri dettagli sono disponibili nelle fonti." if str(language or "it").lower().startswith("it") else "Additional details are available in the sources."
+        if len(out) + len(suffix) + 2 <= max_chars + 120:
+            out = out.rstrip() + "\n" + suffix
+
+    return out.strip()
+
+
+def _dedupe_response_items_for_ui(items: list[dict], *, max_items: int) -> list[dict]:
+    out: list[dict] = []
+    seen: set[tuple[str, str, int, int]] = set()
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        bdid = str(item.get("bubble_document_id") or "").strip()
+        label = str(item.get("display_label") or item.get("citation_id") or "").strip()
+        p1 = _safe_int(item.get("page_from"), 0)
+        p2 = _safe_int(item.get("page_to"), p1)
+        key = (bdid, label, p1, p2)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def _finalize_ask_response_for_ui(resp: dict, *, language: str = "it") -> dict:
+    if not isinstance(resp, dict):
+        return resp
+
+    out = dict(resp)
+    if str(out.get("status") or "").lower() == "answered":
+        out["answer"] = _compact_answer_for_ui(str(out.get("answer") or ""), language=language)
+
+    if isinstance(out.get("citations"), list):
+        # Keep snippets readable in Bubble's FONTE section.
+        cleaned = []
+        for c in out.get("citations") or []:
+            if not isinstance(c, dict):
+                continue
+            cc = dict(c)
+            if cc.get("snippet_clean"):
+                sn = str(cc.get("snippet_clean") or "")
+                max_sn = max(220, int(ASK_UI_MAX_SNIPPET_CLEAN_CHARS or 520))
+                if len(sn) > max_sn:
+                    cc["snippet_clean"] = sn[:max_sn].rsplit(" ", 1)[0].strip() + "…"
+            cleaned.append(cc)
+        out["citations"] = _dedupe_response_items_for_ui(cleaned, max_items=max(1, int(ASK_UI_MAX_CITATIONS or 8)))
+
+    if isinstance(out.get("rg_links"), list):
+        out["rg_links"] = _dedupe_response_items_for_ui(out.get("rg_links") or [], max_items=max(1, int(ASK_UI_MAX_LINKS or 8)))
+
+    return out
 
 
 def _ask_query_is_before_scoped(q: str) -> bool:
@@ -7492,14 +7664,16 @@ def _ask_structured_direct_answer(
         "If sources contain P&S, report problem, solution and notes. "
         "If sources contain photo/video records, state title and description; do not claim you visually inspected the media. "
         "If the requested information is not present in STRUCTURED SOURCES, return no_sources. "
-        "Every answer point must cite one or more citation_ids from SOURCES. Reply in the requested language."
+        "Every answer point must cite one or more citation_ids from SOURCES, but never copy citation_ids or raw document ids into the visible text. "
+        "Keep the visible answer concise: normally 3-5 points, maximum 6 unless the user explicitly asks for exhaustive detail. Reply in the requested language."
     )
     user_msg = (
         f"QUESTION:\n{q}\n\n"
         f"RESPONSE_LANGUAGE:\n{response_language}\n\n"
         f"QUERY_PROFILE:\n{json.dumps(profile, ensure_ascii=False)}\n\n"
         f"STRUCTURED SOURCES:\n{sources_block}\n\n"
-        "Return JSON only. Be concrete, operational and concise. Preserve titles, descriptions, step numbers, solutions and notes exactly when present."
+        "Return JSON only. Be concrete, operational and concise. Preserve titles, descriptions, step numbers, solutions and notes exactly when present. "
+        "Do not put citation ids, raw Bubble ids, doc=, chunk= or page debug tokens in the text fields."
     )
 
     try:
@@ -7524,7 +7698,7 @@ def _ask_structured_direct_answer(
     answer, final_citations = _render_grounded_answer_points(
         grounded_points=list(parsed.get("grounded_points") or []),
         citations=citations,
-        max_points=8,
+        max_points=max(1, int(ASK_UI_MAX_POINTS or 5)),
         q=q,
     )
     if not answer or not final_citations:
@@ -7734,15 +7908,17 @@ def _ask_full_context_answer(
         "For technical data, preserve exact codes, numbers, units, decimals, signs and symbols. "
         "For procedures, give ordered operational steps. "
         "If the requested information is not present in SOURCES, return no_sources. "
-        "Every answer point must cite one or more citation_ids from SOURCES. Reply in the requested language."
+        "Every answer point must cite one or more citation_ids from SOURCES, but never copy citation_ids or raw document ids into the visible text. "
+        "Keep the visible answer concise: normally 3-5 points, maximum 6 unless the user explicitly asks for exhaustive detail. Reply in the requested language."
     )
     user_msg = (
         f"QUESTION:\n{q}\n\n"
         f"RESPONSE_LANGUAGE:\n{response_language}\n\n"
         f"QUERY_PROFILE:\n{json.dumps(profile, ensure_ascii=False)}\n\n"
         f"SOURCES:\n{sources_block}\n\n"
-        "Return JSON only. Make the answer complete and concrete enough for an industrial technician. "
-        "Prefer precise extraction over summary. If the question asks for 'some' examples, include the most relevant examples but keep their exact values/frequencies. "
+        "Return JSON only. Make the answer complete and concrete enough for an industrial technician, but not verbose. "
+        "Prefer precise extraction over generic summary. If the question asks for examples, include only the most relevant ones with exact values/frequencies. "
+        "Do not put citation ids, raw Bubble ids, doc=, chunk= or page debug tokens in the text fields. "
         "Do not add unsupported claims and do not omit important source facts that directly answer the question."
     )
 
@@ -7770,7 +7946,7 @@ def _ask_full_context_answer(
     answer, final_citations = _render_grounded_answer_points(
         grounded_points=grounded_points,
         citations=full_citations,
-        max_points=8,
+        max_points=max(1, int(ASK_UI_MAX_POINTS or 5)),
         q=q,
     )
     if not answer or not final_citations:
@@ -7792,7 +7968,8 @@ def _ask_full_context_answer(
             f"VERIFIER_FEEDBACK_JSON:\n{json.dumps(verifier_result or {}, ensure_ascii=False)[:5000]}\n\n"
             f"SOURCES:\n{sources_block}\n\n"
             "Rewrite the answer using only SOURCES. Address every missing requirement raised by the verifier if it is present in SOURCES. "
-            "Keep exact numbers, units, codes, table rows, warnings, conditions and ordered steps. Return JSON only."
+            "Keep exact numbers, units, codes, table rows, warnings, conditions and ordered steps. "
+            "Do not put citation ids, raw Bubble ids, doc=, chunk= or page debug tokens in the text fields. Return JSON only."
         )
         try:
             parsed2 = _openai_chat_json_models(
@@ -7808,7 +7985,7 @@ def _ask_full_context_answer(
                 answer2, final_citations2 = _render_grounded_answer_points(
                     grounded_points=list(parsed2.get("grounded_points") or []),
                     citations=full_citations,
-                    max_points=8,
+                    max_points=max(1, int(ASK_UI_MAX_POINTS or 5)),
                     q=q,
                 )
                 if answer2 and final_citations2:
@@ -7907,7 +8084,8 @@ def _ask_generic_evidence_answer(
         "For procedural questions, return the operative steps and required safety steps in the correct order. "
         "For list questions, include all relevant items present in the evidence instead of over-summarizing. "
         "If the evidence does not contain the requested information, return no_sources. "
-        "Every answer point must cite citation_ids from SOURCES. Reply in the requested language."
+        "Every answer point must cite citation_ids from SOURCES, but never copy citation_ids or raw document ids into the visible text. "
+        "Keep the visible answer concise: normally 3-5 points, maximum 6 unless the user explicitly asks for exhaustive detail. Reply in the requested language."
     )
     user_msg = (
         f"QUESTION:\n{q}\n\n"
@@ -7915,7 +8093,8 @@ def _ask_generic_evidence_answer(
         f"QUERY_PROFILE:\n{json.dumps(profile, ensure_ascii=False)}\n\n"
         f"SOURCES:\n{sources_block}\n\n"
         "Return JSON only. Make the answer complete enough for a technician: include relevant numbers, units, component names, codes, intervals, conditions and exceptions found in SOURCES. "
-        "Do not cite a source unless the point is supported by that source."
+        "Keep it concise for the UI: group related facts, avoid repeating sources, and do not cite a source unless the point is supported by that source. "
+        "Do not put citation ids, raw Bubble ids, doc=, chunk= or page debug tokens in the text fields."
     )
 
     try:
@@ -7940,7 +8119,7 @@ def _ask_generic_evidence_answer(
     answer, final_citations = _render_grounded_answer_points(
         grounded_points=grounded_points,
         citations=merged,
-        max_points=8,
+        max_points=max(1, int(ASK_UI_MAX_POINTS or 5)),
         q=q,
     )
     if not answer or not final_citations:
@@ -7967,7 +8146,8 @@ def _ask_generic_evidence_answer(
             f"VERIFIER_FEEDBACK_JSON:\n{rewrite_feedback}\n\n"
             f"SOURCES:\n{sources_block}\n\n"
             "Rewrite the answer using only SOURCES and addressing the verifier feedback. "
-            "Keep exact values, units, codes, table rows, conditions, exceptions and ordered steps when present. Return JSON only."
+            "Keep exact values, units, codes, table rows, conditions, exceptions and ordered steps when present. "
+            "Do not put citation ids, raw Bubble ids, doc=, chunk= or page debug tokens in the text fields. Return JSON only."
         )
         try:
             parsed2 = _openai_chat_json_models(
@@ -7983,7 +8163,7 @@ def _ask_generic_evidence_answer(
                 answer2, final_citations2 = _render_grounded_answer_points(
                     grounded_points=list(parsed2.get("grounded_points") or []),
                     citations=merged,
-                    max_points=8,
+                    max_points=max(1, int(ASK_UI_MAX_POINTS or 5)),
                     q=q,
                 )
                 if answer2 and final_citations2:
@@ -9730,7 +9910,7 @@ def _ask_v1_baseline_impl(
                 debug=bool(payload.debug),
             )
             if bridged:
-                return bridged
+                return _finalize_ask_response_for_ui(bridged, language=requested_language)
         except Exception as e:
             if payload.debug:
                 print("ASK_ROOT_CAUSE_BRIDGE_FAIL", str(e))
@@ -9850,7 +10030,7 @@ def _ask_v1_baseline_impl(
                 "rescue_retrieval_quality": _retrieval_quality_score(rescue_retrieval or {}),
                 "primary_retrieval_quality": _retrieval_quality_score(primary_retrieval or {}),
             }
-        return resp
+        return _finalize_ask_response_for_ui(resp, language=response_language)
 
     effective_threshold = float(retrieval.get("effective_threshold") or ASK_SIM_THRESHOLD)
 
