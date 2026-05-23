@@ -124,6 +124,7 @@ ASK_UI_MAX_ANSWER_CHARS = int(os.environ.get("MM_ASK_UI_MAX_ANSWER_CHARS", "2200
 ASK_UI_MAX_LINKS = int(os.environ.get("MM_ASK_UI_MAX_LINKS", "8"))
 ASK_UI_MAX_CITATIONS = int(os.environ.get("MM_ASK_UI_MAX_CITATIONS", "8"))
 ASK_UI_MAX_SNIPPET_CLEAN_CHARS = int(os.environ.get("MM_ASK_UI_MAX_SNIPPET_CLEAN_CHARS", "520"))
+ASK_UI_MANUAL_SUPPORT_SNIPPET_CHARS = int(os.environ.get("MM_ASK_UI_MANUAL_SUPPORT_SNIPPET_CHARS", "260"))
 
 # Shared semantic retrieval planner
 SEMANTIC_QUERY_PLANNER_MODEL = (os.environ.get("MM_SEMANTIC_QUERY_PLANNER_MODEL") or "gpt-5.4-mini").strip()
@@ -1819,6 +1820,15 @@ def _compact_answer_for_ui(text: str, *, language: str = "it") -> str:
     max_chars = max(600, int(ASK_UI_MAX_ANSWER_CHARS or 2200))
     max_points = max(1, int(ASK_UI_MAX_POINTS or 5))
 
+    # Preserve deliberate sectioned ASK answers (for example structured procedure + steps +
+    # manual safety note). Re-numbering these sections would make the UI less readable.
+    if re.search(r"(?mi)^(Procedura interna|Passaggi operativi|Nota di sicurezza dal manuale|Internal procedure|Operational steps|Manual safety note)\s*:", clean):
+        out = clean.strip()
+        if len(out) > max_chars:
+            cut = out[:max_chars].rsplit(" ", 1)[0].strip()
+            out = cut + "…"
+        return out
+
     points = _split_answer_points_for_ui(clean)
     if not points:
         return clean[:max_chars].strip()
@@ -1894,7 +1904,10 @@ def _finalize_ask_response_for_ui(resp: dict, *, language: str = "it") -> dict:
             cc = dict(c)
             if cc.get("snippet_clean"):
                 sn = str(cc.get("snippet_clean") or "")
-                max_sn = max(220, int(ASK_UI_MAX_SNIPPET_CLEAN_CHARS or 520))
+                if bool(cc.get("ask_structured_manual_support")):
+                    max_sn = max(180, int(ASK_UI_MANUAL_SUPPORT_SNIPPET_CHARS or 260))
+                else:
+                    max_sn = max(220, int(ASK_UI_MAX_SNIPPET_CLEAN_CHARS or 520))
                 if len(sn) > max_sn:
                     cc["snippet_clean"] = sn[:max_sn].rsplit(" ", 1)[0].strip() + "…"
             cleaned.append(cc)
@@ -7003,6 +7016,11 @@ def _sanitize_citations_for_response(citations: list[dict], company_id: Optional
             clean_snippet = re.sub(r"^SECTION:\s*[^\n]+\n?", "", raw_snippet, flags=re.IGNORECASE).strip()
             clean_snippet = re.sub(r"\s*\n\s*", " ", clean_snippet)
             clean_snippet = re.sub(r"\s+", " ", clean_snippet).strip()
+            if bool(c.get("ask_structured_manual_support")):
+                clean_snippet = _compact_manual_support_snippet_for_display(
+                    clean_snippet,
+                    max_len=max(180, int(ASK_UI_MANUAL_SUPPORT_SNIPPET_CHARS or 260)),
+                )
 
         base = {
             "citation_id": cid,
@@ -7012,6 +7030,8 @@ def _sanitize_citations_for_response(citations: list[dict], company_id: Optional
             "snippet": raw_snippet,
             "snippet_clean": clean_snippet,
             "similarity": float(c.get("similarity") or c.get("retrieval_score") or 0.0),
+            "ask_structured_manual_support": bool(c.get("ask_structured_manual_support")),
+            "ask_structured_direct": bool(c.get("ask_structured_direct")),
         }
         base.update(meta)
         out.append(base)
@@ -7897,6 +7917,154 @@ def _ask_structured_direct_fetch_manual_support(
     )
 
 
+def _ask_structured_field_value(c: dict, *keys: str, limit: int = 240) -> str:
+    text = str((c or {}).get("chunk_full") or (c or {}).get("snippet") or (c or {}).get("snippet_clean") or "")
+    fields = _parse_structured_source_fields(text)
+    for k in keys:
+        v = _clean_display_text(fields.get(k) or "", max_len=limit)
+        if v:
+            return v
+    return ""
+
+
+def _manual_note_from_grounded_points(grounded_points: list[dict], *, language: str) -> str:
+    markers = [
+        "manuale", "manual", "sicurezza", "safety", "dpi", "ppe",
+        "operatore qualificato", "qualified operator", "guanti", "gloves",
+        "occhiali", "goggles", "protezione", "protection",
+        "sezionatore", "disconnect", "lucchetto", "lock", "energia", "energy",
+    ]
+    for p in grounded_points or []:
+        if not isinstance(p, dict):
+            continue
+        txt = _strip_inline_citation_markers_for_display(p.get("text") or "")
+        low = _normalize_unicode_advanced(txt).lower()
+        if txt and any(m in low for m in markers):
+            txt = re.sub(r"^\s*(?:nota\s+(?:dal|del)\s+manuale|manual\s+safety\s+note|safety\s+note)\s*[:：-]\s*", "", txt, flags=re.IGNORECASE).strip()
+            txt = re.sub(r"\s+", " ", txt).strip()
+            return _clean_display_text(txt, max_len=360)
+    return ""
+
+
+def _manual_note_from_support_citations(citations: list[dict], *, language: str) -> str:
+    text = " ".join(str(c.get("chunk_full") or c.get("snippet") or "") for c in (citations or []) if isinstance(c, dict))
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return ""
+
+    sentences = [x.strip() for x in re.split(r"(?<=[\.!?])\s+", text) if x.strip()]
+    markers = [
+        "sicurezza", "safety", "operatore", "operator", "qualificato", "qualified",
+        "dpi", "ppe", "guanti", "gloves", "occhiali", "goggles",
+        "protezione", "protection", "sezionatore", "disconnect", "interruttore",
+        "lock", "lucchetto", "energia", "energy", "pneumatica", "pneumatic",
+    ]
+    chosen: list[str] = []
+    for sent in sentences:
+        low = _normalize_unicode_advanced(sent).lower()
+        if any(m in low for m in markers):
+            chosen.append(sent)
+        if len(chosen) >= 2:
+            break
+    if not chosen and sentences:
+        chosen = sentences[:1]
+    note = " ".join(chosen)
+    note = re.sub(r"\s+", " ", note).strip()
+    return _clean_display_text(note, max_len=360)
+
+
+def _format_structured_procedure_answer_for_ui(
+    *,
+    structured_citations: list[dict],
+    manual_support_citations: list[dict],
+    grounded_points: list[dict],
+    response_language: str,
+) -> str:
+    """Readable sectioned answer for structured procedure/step questions.
+
+    This is deliberately generic: it formats first-class Bubble structured sources
+    (procedure + steps) and, when present, appends a short manual support note. It
+    does not contain object ids, benchmark terms, or document-specific values.
+    """
+    lang = str(response_language or "it").strip().lower()
+    is_en = lang.startswith("en")
+
+    procedures = [c for c in structured_citations or [] if _source_type_from_document_id(str(c.get("bubble_document_id") or "")) == "procedure"]
+    steps = [c for c in structured_citations or [] if _source_type_from_document_id(str(c.get("bubble_document_id") or "")) == "step"]
+    if not procedures and not steps:
+        return ""
+
+    def step_sort_key(c: dict) -> tuple[int, str]:
+        raw = _ask_structured_field_value(c, "step_number", limit=20)
+        n = _safe_int(raw, 9999)
+        return (n, str(c.get("bubble_document_id") or ""))
+
+    steps = sorted(steps, key=step_sort_key)
+    parts: list[str] = []
+
+    if procedures:
+        p0 = procedures[0]
+        title = _ask_structured_field_value(p0, "title", limit=90) or ("Procedure" if is_en else "Procedura")
+        ptype = _ask_structured_field_value(p0, "procedure_type", limit=80)
+        desc = _ask_structured_field_value(p0, "short_description", "description", limit=220)
+        header = "Internal procedure:" if is_en else "Procedura interna:"
+        lines = [header, f"- {('Procedure' if is_en else 'Procedura')}: {title}"]
+        if ptype:
+            lines.append(f"- {('Type' if is_en else 'Tipo')}: {ptype}")
+        if desc:
+            lines.append(f"- {('Description' if is_en else 'Descrizione')}: {desc}")
+        parts.append("\n".join(lines))
+
+    if steps:
+        header = "Operational steps:" if is_en else "Passaggi operativi:"
+        lines = [header]
+        for idx, c in enumerate(steps, start=1):
+            step_no = _ask_structured_field_value(c, "step_number", limit=20) or str(idx)
+            title = _ask_structured_field_value(c, "title", limit=100) or (f"Step {step_no}" if is_en else f"Step {step_no}")
+            desc = _ask_structured_field_value(c, "description", limit=280)
+            if desc and desc.lower() not in title.lower():
+                lines.append(f"{step_no}. {title}\n   {desc}")
+            else:
+                lines.append(f"{step_no}. {title}")
+        parts.append("\n".join(lines))
+
+    if manual_support_citations:
+        note = _manual_note_from_grounded_points(grounded_points, language=response_language)
+        if not note:
+            note = _manual_note_from_support_citations(manual_support_citations, language=response_language)
+        if note:
+            header = "Manual safety note:" if is_en else "Nota di sicurezza dal manuale:"
+            parts.append(f"{header}\n- {note}")
+
+    return "\n\n".join([p for p in parts if p]).strip()
+
+
+def _compact_manual_support_snippet_for_display(text: str, *, max_len: int) -> str:
+    text = re.sub(r"^SECTION:\s*[^\n]+\n?", "", str(text or ""), flags=re.IGNORECASE).strip()
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return ""
+    sentences = [x.strip() for x in re.split(r"(?<=[\.!?])\s+", text) if x.strip()]
+    markers = [
+        "sicurezza", "safety", "operatore", "operator", "qualificato", "qualified",
+        "dpi", "ppe", "protezione", "protection", "sezionatore", "disconnect",
+        "interruttore", "lock", "lucchetto", "energia", "energy", "pneumatica", "pneumatic",
+    ]
+    chosen: list[str] = []
+    for sent in sentences:
+        low = _normalize_unicode_advanced(sent).lower()
+        if any(m in low for m in markers):
+            chosen.append(sent)
+        if len(" ".join(chosen)) >= max_len * 0.75:
+            break
+    if not chosen and sentences:
+        chosen = sentences[:2]
+    out = " ".join(chosen).strip() or text
+    out = re.sub(r"\s+", " ", out).strip()
+    if len(out) > max_len:
+        out = out[:max_len].rsplit(" ", 1)[0].strip() + "…"
+    return out
+
 
 def _ask_structured_direct_answer(
     *,
@@ -7983,12 +8151,27 @@ def _ask_structured_direct_answer(
     if str(parsed.get("answer_status") or "").strip().lower() != "answered":
         return None
 
+    grounded_points = list(parsed.get("grounded_points") or [])
     answer, final_citations = _render_grounded_answer_points(
-        grounded_points=list(parsed.get("grounded_points") or []),
+        grounded_points=grounded_points,
         citations=all_answer_citations,
         max_points=max(1, int(ASK_UI_MAX_POINTS or 5)),
         q=q,
     )
+
+    sectioned_answer = _format_structured_procedure_answer_for_ui(
+        structured_citations=citations,
+        manual_support_citations=manual_support_citations,
+        grounded_points=grounded_points,
+        response_language=response_language,
+    )
+    if sectioned_answer:
+        answer = sectioned_answer
+        final_citations = _dedup_citations_by_snippet(
+            list(citations or []) + list(manual_support_citations or []),
+            max_items=max(1, int(ASK_UI_MAX_CITATIONS or 8)),
+        )
+
     if not answer or not final_citations:
         return None
 
