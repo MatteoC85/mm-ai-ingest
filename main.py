@@ -1817,6 +1817,68 @@ def _split_answer_points_for_ui(text: str) -> list[str]:
     return points
 
 
+def _polish_answer_spacing_for_ui(text: str) -> str:
+    """Add readable spacing in the ASK answer box without changing content.
+
+    Bubble renders plain text; using a single blank line between numbered items
+    and major sections makes operational answers readable without creating
+    excessive vertical gaps.
+    """
+    t = str(text or "").replace("\r", "\n").strip()
+    if not t:
+        return ""
+
+    section_headings = (
+        "Procedura interna:",
+        "Passaggi operativi:",
+        "Supporto operativo dal manuale:",
+        "Nota di sicurezza dal manuale:",
+        "Internal procedure:",
+        "Operational steps:",
+        "Manual operation support:",
+        "Manual safety note:",
+    )
+
+    raw_lines = [re.sub(r"[ \t]+", " ", line).strip() for line in t.split("\n")]
+    out: list[str] = []
+    prev_nonblank = ""
+
+    for line in raw_lines:
+        if not line:
+            if out and out[-1] != "":
+                out.append("")
+            continue
+
+        is_numbered = bool(re.match(r"^\d{1,2}[\.\)]\s+", line))
+        is_heading = line in section_headings
+
+        # Add one blank line before a new numbered paragraph or a major section,
+        # but not immediately after a heading such as "Passaggi operativi:".
+        if out and out[-1] != "" and (is_numbered or is_heading):
+            if not (is_numbered and prev_nonblank in section_headings):
+                out.append("")
+
+        out.append(line)
+        prev_nonblank = line
+
+    # Collapse accidental runs of more than one blank line.
+    compact: list[str] = []
+    blank = False
+    for line in out:
+        if line == "":
+            if compact and not blank:
+                compact.append(line)
+            blank = True
+        else:
+            compact.append(line)
+            blank = False
+
+    while compact and compact[-1] == "":
+        compact.pop()
+
+    return "\n".join(compact).strip()
+
+
 def _compact_answer_for_ui(text: str, *, language: str = "it") -> str:
     """Make ASK answers readable in the UI without changing retrieval.
 
@@ -1832,8 +1894,8 @@ def _compact_answer_for_ui(text: str, *, language: str = "it") -> str:
 
     # Preserve deliberate sectioned ASK answers (for example structured procedure + steps +
     # manual safety note). Re-numbering these sections would make the UI less readable.
-    if re.search(r"(?mi)^(Procedura interna|Passaggi operativi|Nota di sicurezza dal manuale|Internal procedure|Operational steps|Manual safety note)\s*:", clean):
-        out = clean.strip()
+    if re.search(r"(?mi)^(Procedura interna|Passaggi operativi|Supporto operativo dal manuale|Nota di sicurezza dal manuale|Internal procedure|Operational steps|Manual operation support|Manual safety note)\s*:", clean):
+        out = _polish_answer_spacing_for_ui(clean.strip())
         if len(out) > max_chars:
             cut = out[:max_chars].rsplit(" ", 1)[0].strip()
             out = cut + "…"
@@ -1867,14 +1929,14 @@ def _compact_answer_for_ui(text: str, *, language: str = "it") -> str:
     if len(compact_points) == 1:
         out = compact_points[0]
     else:
-        out = "\n".join(f"{i}. {p}" for i, p in enumerate(compact_points, start=1))
+        out = "\n\n".join(f"{i}. {p}" for i, p in enumerate(compact_points, start=1))
 
     if len(clean) > len(out) + 300:
         suffix = "Altri dettagli sono disponibili nelle fonti." if str(language or "it").lower().startswith("it") else "Additional details are available in the sources."
         if len(out) + len(suffix) + 2 <= max_chars + 120:
-            out = out.rstrip() + "\n" + suffix
+            out = out.rstrip() + "\n\n" + suffix
 
-    return out.strip()
+    return _polish_answer_spacing_for_ui(out)
 
 
 def _dedupe_response_items_for_ui(items: list[dict], *, max_items: int) -> list[dict]:
