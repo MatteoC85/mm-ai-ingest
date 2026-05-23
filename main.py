@@ -112,6 +112,10 @@ ASK_STRUCTURED_DIRECT_MAX_CONTEXT_CHARS = int(os.environ.get("MM_ASK_STRUCTURED_
 ASK_STRUCTURED_DIRECT_TEXT_CHARS = int(os.environ.get("MM_ASK_STRUCTURED_DIRECT_TEXT_CHARS", "5000"))
 ASK_STRUCTURED_DIRECT_TIMEOUT = int(os.environ.get("MM_ASK_STRUCTURED_DIRECT_TIMEOUT_SECONDS", "60"))
 ASK_STRUCTURED_DIRECT_MODEL = (os.environ.get("MM_ASK_STRUCTURED_DIRECT_MODEL") or ASK_EVIDENCE_ANSWER_MODEL).strip()
+ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_ENABLED = (os.environ.get("MM_ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_ENABLED") or "1").strip() != "0"
+ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_MAX_ITEMS = int(os.environ.get("MM_ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_MAX_ITEMS", "2"))
+ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_SCAN_LIMIT = int(os.environ.get("MM_ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_SCAN_LIMIT", "180"))
+ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_TEXT_CHARS = int(os.environ.get("MM_ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_TEXT_CHARS", "4200"))
 
 # ASK user-facing output polish. Retrieval/citations remain rich; the answer box
 # must not expose internal ids or become an unreadable evidence dump.
@@ -866,6 +870,87 @@ def _source_display_meta_for_citation(c: dict, file_url: str = "") -> dict:
         "display_location": display_location,
         "display_label": display_label,
     }
+
+
+
+
+def _structured_source_snippet_for_display(c: dict, *, max_len: int = 520) -> str:
+    """Human-readable snippet for Bubble structured sources.
+
+    Structured records are indexed with machine-readable labels such as
+    SOURCE_TYPE, STEP_NUMBER, DESCRIPTION. Those are useful for retrieval, but
+    they must not be shown raw in the customer UI.
+    """
+    c = c or {}
+    bdid = str(c.get("bubble_document_id") or "").strip()
+    source_kind = _source_type_from_document_id(bdid)
+    raw_text = str(c.get("chunk_full") or c.get("snippet") or c.get("snippet_clean") or "")
+    fields = _parse_structured_source_fields(raw_text)
+
+    def val(*keys: str, limit: int = 240) -> str:
+        for k in keys:
+            v = _clean_display_text(fields.get(k) or "", max_len=limit)
+            if v:
+                return v
+        return ""
+
+    lines: list[str] = []
+    if source_kind == "procedure":
+        title = val("title", limit=90) or "Procedura"
+        ptype = val("procedure_type", limit=80)
+        desc = val("short_description", "description", limit=260)
+        lines.append(f"Procedura: {title}")
+        if ptype:
+            lines.append(f"Tipo: {ptype}")
+        if desc:
+            lines.append(f"Descrizione: {desc}")
+
+    elif source_kind == "step":
+        step_no = val("step_number", limit=20)
+        title = val("title", limit=90) or "Step"
+        desc = val("description", limit=320)
+        prefix = f"Step {step_no}:" if step_no else "Step:"
+        lines.append(f"{prefix} {title}")
+        if desc and desc.lower() not in title.lower():
+            lines.append(desc)
+
+    elif source_kind == "ps":
+        title = val("title", limit=100) or "Problema/Soluzione"
+        category = val("category", limit=70)
+        desc = val("description", limit=300)
+        sol = val("solution", limit=300)
+        notes = val("notes", limit=220)
+        lines.append(f"P&S: {title}")
+        if category:
+            lines.append(f"Categoria: {category}")
+        if desc:
+            lines.append(f"Problema: {desc}")
+        if sol:
+            lines.append(f"Soluzione: {sol}")
+        if notes:
+            lines.append(f"Note: {notes}")
+
+    elif source_kind == "md_photo":
+        title = val("title", limit=100) or "Foto"
+        desc = val("description", limit=320)
+        lines.append(f"Foto: {title}")
+        if desc and desc.lower() not in title.lower():
+            lines.append(desc)
+
+    elif source_kind == "md_video":
+        title = val("title", limit=100) or "Video"
+        desc = val("description", limit=320)
+        lines.append(f"Video: {title}")
+        if desc and desc.lower() not in title.lower():
+            lines.append(desc)
+
+    else:
+        return ""
+
+    text = " — ".join([x for x in lines if x]).strip()
+    text = re.sub(r"\bSOURCE_TYPE\s*:\s*[^—]+", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text).strip(" -–—")
+    return _clean_display_text(text, max_len=max_len)
 
 
 def _format_citation_note_lines(citations: list[dict], *, language: str = "it", max_items: int = 6) -> str:
@@ -6897,9 +6982,27 @@ def _sanitize_citations_for_response(citations: list[dict], company_id: Optional
 
         raw_snippet = (c.get("snippet") or c.get("chunk_full") or "").strip()
 
-        clean_snippet = re.sub(r"^SECTION:\s*[^\n]+\n?", "", raw_snippet, flags=re.IGNORECASE).strip()
-        clean_snippet = re.sub(r"\s*\n\s*", " ", clean_snippet)
-        clean_snippet = re.sub(r"\s+", " ", clean_snippet).strip()
+        base_for_meta = {
+            **c,
+            "citation_id": cid,
+            "bubble_document_id": bdid,
+            "page_from": _safe_int(c.get("page_from"), 0),
+            "page_to": _safe_int(c.get("page_to"), 0),
+            "snippet": raw_snippet,
+        }
+        meta = _source_display_meta_for_citation(base_for_meta, file_url=file_map.get(bdid, ""))
+
+        if bool(meta.get("is_structured_source")):
+            clean_snippet = _structured_source_snippet_for_display(base_for_meta, max_len=int(ASK_UI_MAX_SNIPPET_CLEAN_CHARS or 520))
+            if not clean_snippet:
+                clean_snippet = re.sub(r"\b(?:SOURCE_TYPE|TITLE|STEP_NUMBER|PROCEDURE_TYPE|SHORT_DESCRIPTION|DESCRIPTION|SOLUTION|NOTES|CATEGORY)\s*:\s*", "", raw_snippet, flags=re.IGNORECASE)
+                clean_snippet = re.sub(r"\s*\n\s*", " — ", clean_snippet)
+                clean_snippet = re.sub(r"\s+", " ", clean_snippet).strip(" -–—")
+                clean_snippet = _clean_display_text(clean_snippet, max_len=int(ASK_UI_MAX_SNIPPET_CLEAN_CHARS or 520))
+        else:
+            clean_snippet = re.sub(r"^SECTION:\s*[^\n]+\n?", "", raw_snippet, flags=re.IGNORECASE).strip()
+            clean_snippet = re.sub(r"\s*\n\s*", " ", clean_snippet)
+            clean_snippet = re.sub(r"\s+", " ", clean_snippet).strip()
 
         base = {
             "citation_id": cid,
@@ -6910,7 +7013,7 @@ def _sanitize_citations_for_response(citations: list[dict], company_id: Optional
             "snippet_clean": clean_snippet,
             "similarity": float(c.get("similarity") or c.get("retrieval_score") or 0.0),
         }
-        base.update(_source_display_meta_for_citation({**c, **base}, file_url=file_map.get(bdid, "")))
+        base.update(meta)
         out.append(base)
 
     return out
@@ -7648,6 +7751,153 @@ def _ask_structured_direct_fetch_sources(
     return _dedup_citations_by_snippet(scored, max_items=max_items)
 
 
+
+def _ask_structured_manual_support_terms(q: str, planner: Optional[dict], structured_citations: list[dict]) -> list[str]:
+    """Generic support terms for adding a small manual safety/context note.
+
+    These terms are not benchmark-specific. They are industrial safety / operating-context
+    anchors used only to find a short supporting manual excerpt after a structured
+    procedure/step/P&S match has already been found. Structured records remain primary.
+    """
+    terms = list(_ask_structured_direct_terms(q, planner=planner, limit=18))
+
+    text = "\n".join(str(c.get("chunk_full") or c.get("snippet") or "") for c in (structured_citations or []))
+    terms.extend(list(_content_term_set(text, limit=18)))
+
+    low_q = _normalize_unicode_advanced(q or "").lower()
+    operational = any(x in low_q for x in [
+        "come", "how", "proced", "operation", "operazione", "sostitu", "change", "cambio",
+        "replacement", "montare", "smontare", "remove", "togliere", "mettere", "install",
+    ])
+    if operational:
+        terms.extend([
+            "sicurezza", "safety", "messa", "punto", "manuale", "manual", "manutenzione", "maintenance",
+            "operatore", "operator", "qualificato", "qualified", "dpi", "ppe", "guanti", "gloves",
+            "occhiali", "goggles", "elettrica", "electrical", "pneumatica", "pneumatic",
+            "sezionatore", "disconnect", "interruttore", "switch", "lucchetto", "lock", "blocco", "lockout",
+        ])
+
+    out: list[str] = []
+    seen: set[str] = set()
+    stop = _ask_structured_direct_stopwords()
+    for raw in terms:
+        t = _normalize_unicode_advanced(str(raw or "")).lower().strip(" -–—:;,.")
+        if len(t) < 3 or t in stop or t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+        if len(out) >= 42:
+            break
+    return out
+
+
+def _ask_structured_manual_support_score(text: str, terms: list[str]) -> float:
+    low = _normalize_unicode_advanced(text or "").lower()
+    if not low:
+        return 0.0
+    score = 0.0
+    for t in terms:
+        if t and t in low:
+            score += 1.0
+
+    # Generic boosts for pages that provide safety/prerequisite context for operations.
+    for marker in [
+        "sicurezza", "safety", "messa a punto", "manutenzione", "maintenance",
+        "operatore qualificato", "qualified operator", "dpi", "ppe",
+        "alimentazione elettrica", "electrical", "alimentazione pneumatica", "pneumatic",
+        "sezionatore", "interruttore generale", "lucchetto", "lockout", "disconnect",
+    ]:
+        if marker in low:
+            score += 1.15
+
+    return score
+
+
+def _ask_structured_direct_fetch_manual_support(
+    *,
+    company_id: str,
+    machine_id: str,
+    q: str,
+    planner: Optional[dict],
+    structured_citations: list[dict],
+) -> list[dict]:
+    if not ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_ENABLED:
+        return []
+    if not structured_citations or not machine_id or str(machine_id).strip() == COMPANY_GENERAL_MACHINE_SENTINEL:
+        return []
+
+    terms = _ask_structured_manual_support_terms(q, planner, structured_citations)
+    if not terms:
+        return []
+
+    text_chars = max(800, int(ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_TEXT_CHARS or 4200))
+    scan_limit = max(20, int(ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_SCAN_LIMIT or 180))
+
+    conn = _db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT bubble_document_id, machine_id, page_number,
+                       LEFT(COALESCE(text, ''), %s) AS page_text
+                FROM public.document_pages
+                WHERE company_id = %s
+                  AND (machine_id = %s OR machine_id IS NULL OR machine_id = '')
+                  AND text IS NOT NULL
+                  AND length(text) > 40
+                  AND bubble_document_id NOT LIKE 'procedure:%%'
+                  AND bubble_document_id NOT LIKE 'step:%%'
+                  AND bubble_document_id NOT LIKE 'ps:%%'
+                  AND bubble_document_id NOT LIKE 'md_photo:%%'
+                  AND bubble_document_id NOT LIKE 'md_video:%%'
+                ORDER BY bubble_document_id, page_number
+                LIMIT %s;
+                """,
+                (text_chars, company_id, machine_id, scan_limit),
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    scored: list[dict] = []
+    for idx, (bdid, mid, page_number, page_text) in enumerate(rows or [], start=1):
+        bdid_s = str(bdid or "").strip()
+        txt = str(page_text or "").strip()
+        if not bdid_s or not txt:
+            continue
+        score = _ask_structured_manual_support_score(txt, terms)
+        if score < 2.0:
+            continue
+        page_no = _safe_int(page_number, 1)
+        similarity = min(0.92, 0.56 + 0.035 * score)
+        scored.append({
+            "citation_id": f"{bdid_s}:p{page_no}-{page_no}:manualsupport:{idx}",
+            "bubble_document_id": bdid_s,
+            "chunk_index": 1,
+            "page_from": page_no,
+            "page_to": page_no,
+            "snippet": txt[: int(ASK_SNIPPET_CHARS or 900)],
+            "snippet_clean": txt[: int(ASK_SNIPPET_CHARS or 900)],
+            "chunk_full": txt,
+            "similarity": float(similarity),
+            "retrieval_score": float(similarity + 0.02),
+            "source_type": "document",
+            "ask_structured_manual_support": True,
+            "structured_manual_support_score": float(score),
+            "embedding_list": [],
+        })
+
+    if not scored:
+        return []
+
+    scored.sort(key=lambda x: (-float(x.get("structured_manual_support_score") or 0.0), str(x.get("bubble_document_id") or ""), int(x.get("page_from") or 0)))
+    return _dedup_citations_by_snippet(
+        scored,
+        max_items=max(0, int(ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_MAX_ITEMS or 2)),
+    )
+
+
+
 def _ask_structured_direct_answer(
     *,
     q: str,
@@ -7668,31 +7918,49 @@ def _ask_structured_direct_answer(
     if not citations:
         return None
 
-    sources_block = _ask_full_context_sources_block(
+    structured_sources_block = _ask_full_context_sources_block(
         citations,
         max_context_chars=max(6000, int(ASK_STRUCTURED_DIRECT_MAX_CONTEXT_CHARS or 28000)),
     )
-    if not sources_block:
+    if not structured_sources_block:
         return None
+
+    manual_support_citations = _ask_structured_direct_fetch_manual_support(
+        company_id=company_id,
+        machine_id=machine_id,
+        q=q,
+        planner=planner,
+        structured_citations=citations,
+    )
+    manual_support_block = _ask_full_context_sources_block(
+        manual_support_citations,
+        max_context_chars=9000,
+    ) if manual_support_citations else ""
+
+    all_answer_citations = list(citations or []) + list(manual_support_citations or [])
 
     profile = _ask_evidence_query_profile(q, response_language)
     system_msg = (
-        "You are MachineMind ASK. Answer ONLY from the STRUCTURED SOURCES. "
-        "These sources are first-class machine knowledge records created by users: procedures, steps, problem/solution records, photos and videos. "
-        "Do not prefer PDF manuals over these records when the user asks about procedures, steps, P&S, images, videos or operational content. "
+        "You are MachineMind ASK. Answer primarily from STRUCTURED SOURCES. "
+        "Structured sources are first-class machine knowledge records created by users: procedures, steps, problem/solution records, photos and videos. "
+        "For operational/how-to questions, structured procedure and step records are the primary authority. "
+        "SUPPORTING MANUAL SOURCES, when provided, are secondary: use them only for a short safety/prerequisite/context note, never to replace or override the structured procedure/steps. "
         "If sources contain procedure and step records, combine them coherently. "
         "If sources contain P&S, report problem, solution and notes. "
         "If sources contain photo/video records, state title and description; do not claim you visually inspected the media. "
-        "If the requested information is not present in STRUCTURED SOURCES, return no_sources. "
-        "Every answer point must cite one or more citation_ids from SOURCES, but never copy citation_ids or raw document ids into the visible text. "
+        "If the requested information is not present in the structured sources and no useful supporting manual source is provided, return no_sources. "
+        "Every answer point must cite one or more citation_ids from the provided sources, but never copy citation_ids or raw document ids into the visible text. "
         "Keep the visible answer concise: normally 3-5 points, maximum 6 unless the user explicitly asks for exhaustive detail. Reply in the requested language."
     )
     user_msg = (
         f"QUESTION:\n{q}\n\n"
         f"RESPONSE_LANGUAGE:\n{response_language}\n\n"
         f"QUERY_PROFILE:\n{json.dumps(profile, ensure_ascii=False)}\n\n"
-        f"STRUCTURED SOURCES:\n{sources_block}\n\n"
-        "Return JSON only. Be concrete, operational and concise. Preserve titles, descriptions, step numbers, solutions and notes exactly when present. "
+        f"STRUCTURED SOURCES — PRIMARY:\n{structured_sources_block}\n\n"
+        f"SUPPORTING MANUAL SOURCES — SECONDARY, USE ONLY FOR BRIEF SAFETY/CONTEXT NOTE:\n{manual_support_block or 'None'}\n\n"
+        "Return JSON only. First answer from the procedure/step/P&S/photo/video records. "
+        "If supporting manual sources are relevant, add one brief final point such as 'Manual safety note' / 'Nota dal manuale' with only the essential safety/prerequisite context. "
+        "Preserve structured titles, descriptions, step numbers, solutions and notes exactly when present. "
         "Do not put citation ids, raw Bubble ids, doc=, chunk= or page debug tokens in the text fields."
     )
 
@@ -7717,7 +7985,7 @@ def _ask_structured_direct_answer(
 
     answer, final_citations = _render_grounded_answer_points(
         grounded_points=list(parsed.get("grounded_points") or []),
-        citations=citations,
+        citations=all_answer_citations,
         max_points=max(1, int(ASK_UI_MAX_POINTS or 5)),
         q=q,
     )
@@ -7742,15 +8010,17 @@ def _ask_structured_direct_answer(
         "citations": response_citations,
         "rg_links": rg_links,
         "top_k": top_k,
-        "similarity_max": max([float(c.get("similarity") or 0.0) for c in citations], default=None),
+        "similarity_max": max([float(c.get("similarity") or 0.0) for c in all_answer_citations], default=None),
         "chat_model": "ask_structured_direct_reader",
     }
     if debug:
         resp["ask_structured_direct"] = {
-            "sources_used": len(citations),
-            "source_types_used": sorted(set(str(c.get("source_type") or "") for c in citations)),
-            "doc_ids_used": _dedup_text_values([c.get("bubble_document_id") for c in citations], limit=20),
-            "context_chars": len(sources_block),
+            "sources_used": len(all_answer_citations),
+            "structured_sources_used": len(citations),
+            "manual_support_sources_used": len(manual_support_citations),
+            "source_types_used": sorted(set(str(c.get("source_type") or "") for c in all_answer_citations)),
+            "doc_ids_used": _dedup_text_values([c.get("bubble_document_id") for c in all_answer_citations], limit=20),
+            "context_chars": len(structured_sources_block) + len(manual_support_block),
         }
     return resp
 
