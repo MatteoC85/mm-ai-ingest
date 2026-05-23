@@ -4928,6 +4928,31 @@ def _dedup_citations_by_snippet(citations: list[dict], max_items: int) -> list[d
     return out[:max_items]
 
 
+def _dedup_citations_preserve_order(citations: list[dict], max_items: int) -> list[dict]:
+    """Deduplicate citations while preserving supplied priority order.
+
+    Used for structured answers where procedure/step records must remain before
+    secondary manual support, regardless of similarity/debug score.
+    """
+    out: list[dict] = []
+    seen: set[tuple[str, int, int, str]] = set()
+    for c in citations or []:
+        if not isinstance(c, dict):
+            continue
+        bdid = str(c.get("bubble_document_id") or "").strip()
+        pf = int(c.get("page_from") or 0)
+        pt = int(c.get("page_to") or 0)
+        cid = str(c.get("citation_id") or "").strip()
+        key = (bdid, pf, pt, cid or str(c.get("snippet") or "")[:120])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(c)
+        if len(out) >= max_items:
+            break
+    return out
+
+
 def _cosine_sim(a: list[float], b: list[float]) -> float:
     dot = 0.0
     na = 0.0
@@ -7773,64 +7798,105 @@ def _ask_structured_direct_fetch_sources(
 
 
 def _ask_structured_manual_support_terms(q: str, planner: Optional[dict], structured_citations: list[dict]) -> list[str]:
-    """Generic support terms for adding a small manual safety/context note.
+    """Operation-specific manual support terms.
 
-    These terms are not benchmark-specific. They are industrial safety / operating-context
-    anchors used only to find a short supporting manual excerpt after a structured
-    procedure/step/P&S match has already been found. Structured records remain primary.
+    Structured records remain primary. Manual support must be relevant to the
+    user operation, not merely a generic safety page. The terms are generated
+    from the question and the structured records, with small bilingual IT/EN
+    expansions for common industrial verbs/nouns. No document ids, expected test
+    answers or machine-specific values are encoded here.
     """
-    terms = list(_ask_structured_direct_terms(q, planner=planner, limit=18))
+    raw_terms = list(_ask_structured_direct_terms(q, planner=planner, limit=22))
+    structured_text = "\n".join(str(c.get("chunk_full") or c.get("snippet") or "") for c in (structured_citations or []))
+    raw_terms.extend(list(_content_term_set(structured_text, limit=24)))
 
-    text = "\n".join(str(c.get("chunk_full") or c.get("snippet") or "") for c in (structured_citations or []))
-    terms.extend(list(_content_term_set(text, limit=18)))
+    joined = _normalize_unicode_advanced((q or "") + "\n" + structured_text).lower()
+    expansions: list[str] = []
+    bilingual_groups = [
+        (["coil", "bobina", "bobine"], ["coil", "bobina", "bobine"]),
+        (["change", "cambio", "cambiare", "sostitu", "replacement", "replace"], ["change", "cambio", "cambiare", "sostituzione", "sostituire", "replacement", "replace"]),
+        (["old", "vecchio", "vecchia", "remove", "rimuovere", "togliere"], ["old", "vecchio", "vecchia", "remove", "rimuovere", "togliere"]),
+        (["new", "nuovo", "nuova", "insert", "inserire", "mettere", "install"], ["new", "nuovo", "nuova", "insert", "inserire", "mettere", "installare", "montare"]),
+        (["procedure", "procedura", "procedimento", "sequence", "sequenza"], ["procedure", "procedura", "procedimento", "sequence", "sequenza"]),
+        (["step", "passo", "fase"], ["step", "passo", "fase"]),
+        (["operation", "operazione", "operativo", "operativa"], ["operation", "operazione", "operativo", "operativa"]),
+    ]
+    for triggers, adds in bilingual_groups:
+        if any(t in joined for t in triggers):
+            expansions.extend(adds)
 
-    low_q = _normalize_unicode_advanced(q or "").lower()
-    operational = any(x in low_q for x in [
-        "come", "how", "proced", "operation", "operazione", "sostitu", "change", "cambio",
-        "replacement", "montare", "smontare", "remove", "togliere", "mettere", "install",
-    ])
-    if operational:
-        terms.extend([
-            "sicurezza", "safety", "messa", "punto", "manuale", "manual", "manutenzione", "maintenance",
-            "operatore", "operator", "qualificato", "qualified", "dpi", "ppe", "guanti", "gloves",
-            "occhiali", "goggles", "elettrica", "electrical", "pneumatica", "pneumatic",
-            "sezionatore", "disconnect", "interruttore", "switch", "lucchetto", "lock", "blocco", "lockout",
-        ])
-
+    # Keep only terms that help find the same operation in the manual. Generic
+    # safety words are handled separately so they cannot outrank operational pages.
+    generic_safety = {
+        "sicurezza", "safety", "manuale", "manual", "manutenzione", "maintenance",
+        "operatore", "operator", "qualificato", "qualified", "dpi", "ppe",
+        "guanti", "gloves", "occhiali", "goggles", "protezione", "protection",
+        "elettrica", "electrical", "pneumatica", "pneumatic", "sezionatore",
+        "disconnect", "interruttore", "switch", "lucchetto", "lock", "blocco", "lockout",
+    }
     out: list[str] = []
     seen: set[str] = set()
     stop = _ask_structured_direct_stopwords()
-    for raw in terms:
+    for raw in list(raw_terms) + expansions:
         t = _normalize_unicode_advanced(str(raw or "")).lower().strip(" -–—:;,.")
-        if len(t) < 3 or t in stop or t in seen:
+        if len(t) < 3 or t in stop or t in generic_safety or t in seen:
             continue
         seen.add(t)
         out.append(t)
-        if len(out) >= 42:
+        if len(out) >= 44:
             break
     return out
 
 
-def _ask_structured_manual_support_score(text: str, terms: list[str]) -> float:
-    low = _normalize_unicode_advanced(text or "").lower()
-    if not low:
-        return 0.0
-    score = 0.0
-    for t in terms:
-        if t and t in low:
-            score += 1.0
-
-    # Generic boosts for pages that provide safety/prerequisite context for operations.
-    for marker in [
-        "sicurezza", "safety", "messa a punto", "manutenzione", "maintenance",
-        "operatore qualificato", "qualified operator", "dpi", "ppe",
+def _ask_structured_manual_support_safety_terms() -> list[str]:
+    return [
+        "sicurezza", "safety", "messa a punto", "operatore qualificato", "qualified operator",
+        "dpi", "ppe", "guanti", "gloves", "occhiali", "goggles", "protezione", "protection",
         "alimentazione elettrica", "electrical", "alimentazione pneumatica", "pneumatic",
         "sezionatore", "interruttore generale", "lucchetto", "lockout", "disconnect",
-    ]:
-        if marker in low:
-            score += 1.15
+    ]
 
-    return score
+
+def _ask_structured_manual_support_score_details(text: str, terms: list[str]) -> dict:
+    low = _normalize_unicode_advanced(text or "").lower()
+    if not low:
+        return {"operation_score": 0.0, "safety_score": 0.0, "total_score": 0.0}
+
+    operation_score = 0.0
+    matched_terms = 0
+    for t in terms:
+        if t and t in low:
+            matched_terms += 1
+            operation_score += 1.0
+
+    # Phrase synergy: if an operation noun and operation verb both appear, prefer
+    # that page over generic safety pages.
+    change_words = ["change", "cambio", "cambiare", "sostituzione", "sostituire", "replacement", "replace"]
+    coil_words = ["coil", "bobina", "bobine"]
+    if any(w in low for w in change_words) and any(w in low for w in coil_words):
+        operation_score += 5.0
+    if any(w in low for w in ["procedura", "procedure", "sequenza", "sequence", "operazione", "operation"]):
+        operation_score += 1.2
+
+    safety_score = 0.0
+    for marker in _ask_structured_manual_support_safety_terms():
+        if marker in low:
+            safety_score += 1.0
+
+    # Operational relevance dominates. Safety is still useful, but it cannot be
+    # the only reason a manual page is selected when the user asked how to perform
+    # an operation.
+    total_score = (operation_score * 3.0) + (safety_score * 0.35)
+    return {
+        "operation_score": float(operation_score),
+        "safety_score": float(safety_score),
+        "total_score": float(total_score),
+        "matched_operation_terms": int(matched_terms),
+    }
+
+
+def _ask_structured_manual_support_score(text: str, terms: list[str]) -> float:
+    return float(_ask_structured_manual_support_score_details(text, terms).get("total_score") or 0.0)
 
 
 def _ask_structured_direct_fetch_manual_support(
@@ -7885,11 +7951,16 @@ def _ask_structured_direct_fetch_manual_support(
         txt = str(page_text or "").strip()
         if not bdid_s or not txt:
             continue
-        score = _ask_structured_manual_support_score(txt, terms)
-        if score < 2.0:
+        detail = _ask_structured_manual_support_score_details(txt, terms)
+        score = float(detail.get("total_score") or 0.0)
+        op_score = float(detail.get("operation_score") or 0.0)
+        safety_score = float(detail.get("safety_score") or 0.0)
+        if op_score < 1.0 and safety_score < 3.0:
             continue
         page_no = _safe_int(page_number, 1)
-        similarity = min(0.92, 0.56 + 0.035 * score)
+        # Keep manual support below structured records in UI relevance while still
+        # retaining a meaningful score for debugging.
+        similarity = min(0.88, 0.50 + 0.018 * score)
         scored.append({
             "citation_id": f"{bdid_s}:p{page_no}-{page_no}:manualsupport:{idx}",
             "bubble_document_id": bdid_s,
@@ -7904,17 +7975,53 @@ def _ask_structured_direct_fetch_manual_support(
             "source_type": "document",
             "ask_structured_manual_support": True,
             "structured_manual_support_score": float(score),
+            "structured_manual_operation_score": float(op_score),
+            "structured_manual_safety_score": float(safety_score),
             "embedding_list": [],
         })
 
     if not scored:
         return []
 
-    scored.sort(key=lambda x: (-float(x.get("structured_manual_support_score") or 0.0), str(x.get("bubble_document_id") or ""), int(x.get("page_from") or 0)))
-    return _dedup_citations_by_snippet(
-        scored,
-        max_items=max(0, int(ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_MAX_ITEMS or 2)),
+    max_items = max(0, int(ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_MAX_ITEMS or 2))
+    if max_items <= 0:
+        return []
+
+    op_candidates = sorted(
+        [x for x in scored if float(x.get("structured_manual_operation_score") or 0.0) >= 1.0],
+        key=lambda x: (-float(x.get("structured_manual_operation_score") or 0.0), -float(x.get("structured_manual_support_score") or 0.0), str(x.get("bubble_document_id") or ""), int(x.get("page_from") or 0)),
     )
+    safety_candidates = sorted(
+        [x for x in scored if float(x.get("structured_manual_safety_score") or 0.0) >= 3.0],
+        key=lambda x: (-float(x.get("structured_manual_safety_score") or 0.0), -float(x.get("structured_manual_support_score") or 0.0), str(x.get("bubble_document_id") or ""), int(x.get("page_from") or 0)),
+    )
+    remaining = sorted(
+        scored,
+        key=lambda x: (-float(x.get("structured_manual_support_score") or 0.0), str(x.get("bubble_document_id") or ""), int(x.get("page_from") or 0)),
+    )
+
+    selected: list[dict] = []
+    used_keys: set[tuple[str, int]] = set()
+
+    def add_one(c: dict) -> None:
+        if len(selected) >= max_items:
+            return
+        k = (str(c.get("bubble_document_id") or ""), int(c.get("page_from") or 0))
+        if k in used_keys:
+            return
+        selected.append(c)
+        used_keys.add(k)
+
+    if op_candidates:
+        add_one(op_candidates[0])
+    if safety_candidates:
+        add_one(safety_candidates[0])
+    for c in remaining:
+        add_one(c)
+        if len(selected) >= max_items:
+            break
+
+    return _dedup_citations_by_snippet(selected, max_items=max_items)
 
 
 def _ask_structured_field_value(c: dict, *keys: str, limit: int = 240) -> str:
@@ -7973,12 +8080,79 @@ def _manual_note_from_support_citations(citations: list[dict], *, language: str)
     return _clean_display_text(note, max_len=360)
 
 
+
+def _manual_operation_and_safety_notes_from_support_citations(
+    citations: list[dict],
+    *,
+    q: str,
+    structured_citations: list[dict],
+    language: str,
+) -> tuple[str, str]:
+    """Return (operation_note, safety_note) from manual support pages.
+
+    The operation note is selected using query/structured-source terms. The safety
+    note uses generic safety markers. This prevents generic safety pages from
+    being the only manual contribution when the manual also contains operation-
+    specific details.
+    """
+    text = " ".join(str(c.get("chunk_full") or c.get("snippet") or "") for c in (citations or []) if isinstance(c, dict))
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return "", ""
+
+    sentences = [x.strip() for x in re.split(r"(?<=[\.!?])\s+", text) if x.strip()]
+    if not sentences:
+        return "", ""
+
+    op_terms = _ask_structured_manual_support_terms(q, None, structured_citations)
+    safety_terms = _ask_structured_manual_support_safety_terms()
+
+    def score_op(sent: str) -> float:
+        low = _normalize_unicode_advanced(sent).lower()
+        score = sum(1.0 for t in op_terms if t and t in low)
+        if any(w in low for w in ["cambio", "change", "sostituzione", "replace", "replacement"]) and any(w in low for w in ["bobina", "coil"]):
+            score += 4.0
+        return score
+
+    def score_safe(sent: str) -> float:
+        low = _normalize_unicode_advanced(sent).lower()
+        return sum(1.0 for t in safety_terms if t and t in low)
+
+    op_ranked = sorted(((score_op(s), s) for s in sentences), key=lambda x: -x[0])
+    safe_ranked = sorted(((score_safe(s), s) for s in sentences), key=lambda x: -x[0])
+
+    op_note = ""
+    if op_ranked and op_ranked[0][0] >= 1.0:
+        op_note = op_ranked[0][1]
+        # Add one adjacent operational sentence when it is also relevant and short enough.
+        try:
+            idx = sentences.index(op_note)
+            if idx + 1 < len(sentences) and score_op(sentences[idx + 1]) >= 1.0:
+                op_note = f"{op_note} {sentences[idx + 1]}"
+        except Exception:
+            pass
+
+    safety_note = ""
+    if safe_ranked and safe_ranked[0][0] >= 2.0:
+        safety_note = safe_ranked[0][1]
+        if op_note and safety_note.strip() == op_note.strip():
+            for sc, sent in safe_ranked[1:]:
+                if sc >= 2.0 and sent.strip() != op_note.strip():
+                    safety_note = sent
+                    break
+
+    op_note = _clean_display_text(re.sub(r"\s+", " ", op_note).strip(), max_len=360) if op_note else ""
+    safety_note = _clean_display_text(re.sub(r"\s+", " ", safety_note).strip(), max_len=320) if safety_note else ""
+    return op_note, safety_note
+
+
 def _format_structured_procedure_answer_for_ui(
     *,
     structured_citations: list[dict],
     manual_support_citations: list[dict],
     grounded_points: list[dict],
     response_language: str,
+    q: str = "",
 ) -> str:
     """Readable sectioned answer for structured procedure/step questions.
 
@@ -8029,12 +8203,24 @@ def _format_structured_procedure_answer_for_ui(
         parts.append("\n".join(lines))
 
     if manual_support_citations:
-        note = _manual_note_from_grounded_points(grounded_points, language=response_language)
-        if not note:
-            note = _manual_note_from_support_citations(manual_support_citations, language=response_language)
-        if note:
+        operation_note, safety_note = _manual_operation_and_safety_notes_from_support_citations(
+            manual_support_citations,
+            q=q,
+            structured_citations=structured_citations,
+            language=response_language,
+        )
+        # If the LLM already produced a useful manual safety point, keep it as a
+        # fallback, but do not let it hide an operation-specific manual note.
+        llm_safety_note = _manual_note_from_grounded_points(grounded_points, language=response_language)
+        if not safety_note:
+            safety_note = llm_safety_note or _manual_note_from_support_citations(manual_support_citations, language=response_language)
+
+        if operation_note:
+            header = "Manual operation support:" if is_en else "Supporto operativo dal manuale:"
+            parts.append(f"{header}\n- {operation_note}")
+        if safety_note:
             header = "Manual safety note:" if is_en else "Nota di sicurezza dal manuale:"
-            parts.append(f"{header}\n- {note}")
+            parts.append(f"{header}\n- {safety_note}")
 
     return "\n\n".join([p for p in parts if p]).strip()
 
@@ -8046,6 +8232,12 @@ def _compact_manual_support_snippet_for_display(text: str, *, max_len: int) -> s
         return ""
     sentences = [x.strip() for x in re.split(r"(?<=[\.!?])\s+", text) if x.strip()]
     markers = [
+        # Prefer operation-specific manual text when present; generic safety remains
+        # useful but should not be the only displayed support snippet.
+        "cambio", "change", "sostituzione", "sostituire", "replacement", "replace",
+        "bobina", "coil", "procedura", "procedure", "operazione", "operation",
+        "montare", "smontare", "rimuovere", "togliere", "mettere", "inserire",
+        "materiale", "rulli", "aspo", "carrello",
         "sicurezza", "safety", "operatore", "operator", "qualificato", "qualified",
         "dpi", "ppe", "protezione", "protection", "sezionatore", "disconnect",
         "interruttore", "lock", "lucchetto", "energia", "energy", "pneumatica", "pneumatic",
@@ -8164,10 +8356,11 @@ def _ask_structured_direct_answer(
         manual_support_citations=manual_support_citations,
         grounded_points=grounded_points,
         response_language=response_language,
+        q=q,
     )
     if sectioned_answer:
         answer = sectioned_answer
-        final_citations = _dedup_citations_by_snippet(
+        final_citations = _dedup_citations_preserve_order(
             list(citations or []) + list(manual_support_citations or []),
             max_items=max(1, int(ASK_UI_MAX_CITATIONS or 8)),
         )
