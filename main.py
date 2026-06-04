@@ -11856,6 +11856,9 @@ def _root_cause_v1_baseline_impl(
         "If the evidence is narrow, return fewer causes rather than broad generic ones. "
         "Avoid generic boilerplate causes unless the sources clearly support them. "
         "Merge near-duplicate causes instead of listing paraphrases. If the evidence matrix contains two distinct hypotheses with separate evidence families, preserve more than one cause instead of collapsing to one. For generic symptoms like vibration, noise, or jams, do not center lubrication, startup, installation, or safety unless the sources explicitly connect them to the symptom. For no-start cases, prefer electrical supply, interlock, consent, mode-selection, and control evidence over generic lubrication notes. Do not narrow to a single component unless the sources support that narrowing directly. "
+        "User statements that exclude a cause are not technical evidence by themselves. "
+        "If the symptom explicitly names a subsystem, state, alarm family, consent, interlock, or control condition, keep that family as a hypothesis to verify or exclude even if the user claims it is not involved. "
+        "When the user asks which causes to exclude, answer as a prioritized exclusion checklist and do not treat the user's exclusion as already proven. "
         "Always reply in the requested response language."
     )
 
