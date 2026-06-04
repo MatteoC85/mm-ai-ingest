@@ -156,6 +156,14 @@ ROOT_CAUSE_USE_DETERMINISTIC_CROSSLINGUAL = (os.environ.get("MM_ROOT_CAUSE_USE_D
 RESPONSE_ARB_ENABLED = (os.environ.get("MM_RESPONSE_ARB_ENABLED") or "1").strip() != "0"
 ASK_CANDIDATE_ENABLED = (os.environ.get("MM_ASK_CANDIDATE_ENABLED") or "1").strip() != "0"
 ROOT_CAUSE_CANDIDATE_ENABLED = (os.environ.get("MM_ROOT_CAUSE_CANDIDATE_ENABLED") or "1").strip() != "0"
+
+# Root Cause candidate gating:
+# If the baseline proxy score is already high enough, do not run the expensive
+# candidate/arbiter branch. Set to 1.30 to effectively disable this skip.
+ROOT_CAUSE_SKIP_CANDIDATE_IF_BASELINE_PROXY_GTE = float(
+    os.environ.get("MM_ROOT_CAUSE_SKIP_CANDIDATE_IF_BASELINE_PROXY_GTE", "0.80")
+)
+
 RESPONSE_ARB_KEEP_BASELINE_ON_TIE = (os.environ.get("MM_RESPONSE_ARB_KEEP_BASELINE_ON_TIE") or "1").strip() != "0"
 ASK_ARB_MIN_DELTA = float(os.environ.get("MM_ASK_ARB_MIN_DELTA", "0.035"))
 ROOT_CAUSE_ARB_MIN_DELTA = float(os.environ.get("MM_ROOT_CAUSE_ARB_MIN_DELTA", "0.040"))
@@ -12914,22 +12922,40 @@ def _ask_response_proxy_score(q: str, response: dict) -> dict:
 def _should_attempt_root_cause_candidate(q: str, baseline_response: dict) -> bool:
     if not (RESPONSE_ARB_ENABLED and ROOT_CAUSE_CANDIDATE_ENABLED):
         return False
+
     profile = _query_symptom_profile(q)
     language = _simple_query_language(q)
     baseline_eval = _root_cause_response_proxy_score(q, baseline_response)
+    baseline_score = float(baseline_eval.get("score", 0.0) or 0.0)
 
+    # Always allow the candidate branch when the baseline is not a valid answer.
     if str((baseline_response or {}).get("status") or "").strip().lower() != "answered":
         return True
+
+    # Always allow the candidate branch when the baseline proxy detects a hard failure.
     if baseline_eval.get("hard_fail"):
         return True
+
+    # Latency guard:
+    # If the baseline answer is already strong enough, skip the expensive candidate branch.
+    # This preserves candidate for low-score cases such as 0.760, where our probes showed
+    # candidate can still be useful, while skipping high-confidence 0.802+ cases.
+    skip_threshold = float(ROOT_CAUSE_SKIP_CANDIDATE_IF_BASELINE_PROXY_GTE or 0.0)
+    if 0.0 < skip_threshold <= 1.25 and baseline_score >= skip_threshold:
+        return False
+
     if language == "en":
         return True
+
     if profile.get("generic_symptom") or profile.get("automatic_mode"):
         return True
-    if float(baseline_eval.get("score", 0.0) or 0.0) < 0.84:
+
+    if baseline_score < 0.84:
         return True
+
     if str(baseline_eval.get("top_role_group") or "") == "support" and not profile.get("has_support_anchor"):
         return True
+
     return False
 
 
