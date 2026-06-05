@@ -2046,13 +2046,42 @@ def _sanitize_media_no_vision_answer(text: str, citations: list[dict], *, langua
     t = re.sub(r"[ \t]+", " ", t)
     return t.strip()
 
+
+def _sanitize_secret_like_answer_for_display(text: str) -> str:
+    """Never expose secret-like key/value strings in the visible ASK answer.
+
+    This is a final UI safety guard, independent of retrieval. It removes patterns
+    such as "password: value" or "token=value" even when the value was supplied by
+    the user or by a document. It also removes the colon after words like password
+    so harmless sentences do not look like credential disclosure.
+    """
+    t = str(text or "")
+    if not t:
+        return ""
+
+    # Remove explicit secret assignments. Keep a safe indication that the value is
+    # not being shown, without preserving the secret-like token after ':' or '='.
+    secret_label = r"(?:password|pwd|pin|token|secret|api[_\s-]?key|chiave\s+api|credenziali?|admin\s+password|administrator\s+password)"
+    t = re.sub(
+        rf"\b({secret_label})\b\s*[:=]\s*[^\s,;\n\)\]]+",
+        lambda m: f"{m.group(1)} non indicata",
+        t,
+        flags=re.IGNORECASE,
+    )
+
+    # Avoid UI/judge false positives like "password: i dati..." while keeping the
+    # natural meaning of the sentence.
+    t = re.sub(rf"\b({secret_label})\b\s*[:：]\s*", r"\1 ", t, flags=re.IGNORECASE)
+    return t
+
 def _finalize_ask_response_for_ui(resp: dict, *, language: str = "it") -> dict:
     if not isinstance(resp, dict):
         return resp
 
     out = dict(resp)
     if str(out.get("status") or "").lower() == "answered":
-        out["answer"] = _compact_answer_for_ui(str(out.get("answer") or ""), language=language)
+        safe_answer_text = _sanitize_secret_like_answer_for_display(str(out.get("answer") or ""))
+        out["answer"] = _compact_answer_for_ui(safe_answer_text, language=language)
         out["answer"] = _sanitize_media_no_vision_answer(
             str(out.get("answer") or ""),
             out.get("citations") if isinstance(out.get("citations"), list) else [],
@@ -10038,6 +10067,273 @@ def _ask_secondary_support_citations(
     return out
 
 
+
+def _ask_fetch_manual_maintenance_target_pages(
+    *,
+    q: str,
+    company_id: str,
+    machine_id: str,
+    doc_ids: Optional[list[str]],
+    bubble_document_id: Optional[str],
+    top_k: int,
+) -> list[dict]:
+    """Fetch high-signal manual maintenance pages for explicit manual questions.
+
+    This is a narrow ASK-only supplement used when the user asks what the machine
+    manual says about maintenance/periodic checks. It does not hardcode document
+    IDs or answers: it scans authorized manual/PDF pages for real maintenance
+    evidence and keeps document-specific pages whenever they are available.
+    """
+    where_sql, params = _ask_evidence_scope_where(
+        company_id=company_id,
+        machine_id=machine_id,
+        doc_ids=doc_ids,
+        bubble_document_id=bubble_document_id,
+    )
+    page_chars = max(1200, int(ASK_FULL_CONTEXT_PAGE_CHARS or 6500))
+    patterns = [
+        "%tabella per manutenzione%",
+        "%tabella generale di manutenzione%",
+        "%ore di%funzionamento%",
+        "%componenti%ore di%",
+        "%tipo di lubrificante%",
+        "%controllare il livello%",
+        "%cambio olio%",
+        "%pulizia dei filtri%",
+        "%sostituzione completa dei filtri%",
+        "%scarico della condensa%",
+        "%verifica integrità%",
+        "%verifica integrita%",
+        "%verifica corretto funzionamento%",
+        "%impianto elettrico%",
+        "%impianto pneumatico%",
+        "%raddrizzatura%",
+        "%lubrificazione%",
+        "%ogni 50 ore%",
+        "%ogni 300 ore%",
+        "%ogni 1000 ore%",
+        "%ogni 3000 ore%",
+        "%ogni giorno%",
+        "%mensilmente%",
+        "%settiman%",
+        "%annualmente%",
+    ]
+    clauses = " OR ".join(["LOWER(COALESCE(text, '')) LIKE %s" for _ in patterns])
+
+    rows = []
+    try:
+        conn = _db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT bubble_document_id, machine_id, page_number, LEFT(COALESCE(text, ''), %s) AS page_text
+                    FROM public.document_pages
+                    WHERE {where_sql}
+                      AND text IS NOT NULL
+                      AND length(text) > 20
+                      AND ({clauses})
+                    ORDER BY
+                      CASE
+                        WHEN machine_id = %s THEN 0
+                        WHEN machine_id IS NULL OR machine_id = '' THEN 1
+                        ELSE 2
+                      END,
+                      bubble_document_id,
+                      page_number
+                    LIMIT %s;
+                    """,
+                    [page_chars, *params, *patterns, machine_id, 240],
+                )
+                rows = cur.fetchall()
+        finally:
+            conn.close()
+    except Exception as e:
+        print("ASK_MANUAL_MAINTENANCE_DIRECT_FETCH_FAIL", str(e)[:300])
+        return []
+
+    scored: list[dict] = []
+    for idx, (bdid, mid, page_number, page_text) in enumerate(rows or [], start=1):
+        bdid_s = str(bdid or "").strip()
+        txt = str(page_text or "").strip()
+        if not bdid_s or not txt:
+            continue
+        if _is_structured_source_key(bdid_s) or _is_xlsx_indexed_page_text(txt):
+            continue
+        if not _ask_manual_priority_page_has_real_maintenance_content(txt):
+            continue
+        if _ask_manual_priority_page_is_meta_or_index(txt):
+            continue
+
+        row_mid = str(mid or "").strip()
+        exact_machine = bool(machine_id and machine_id != COMPANY_GENERAL_MACHINE_SENTINEL and row_mid == str(machine_id or "").strip())
+        base_score = float(_ask_evidence_score_text(q, txt, _ask_evidence_fallback_profile(q, _simple_query_language(q))))
+        score = _ask_manual_priority_page_score(
+            q=q,
+            page_text=txt,
+            base_score=base_score + 80.0,
+            row_machine_id=row_mid,
+            requested_machine_id=machine_id,
+        )
+        if exact_machine:
+            score += 80.0
+
+        page = _safe_int(page_number, 1)
+        scored.append(
+            {
+                "citation_id": f"{bdid_s}:p{page}-{page}:manualmaint:{idx}",
+                "bubble_document_id": bdid_s,
+                "chunk_index": 0,
+                "page_from": page,
+                "page_to": page,
+                "snippet": txt[:ASK_SNIPPET_CHARS],
+                "chunk_full": txt,
+                "similarity": min(0.99, 0.80 + score / 300.0),
+                "retrieval_score": score,
+                "ask_manual_maintenance_direct": True,
+                "manual_priority_exact_machine": exact_machine,
+                "manual_priority_real_maintenance": True,
+                "manual_priority_weak_meta": False,
+            }
+        )
+
+    scored.sort(
+        key=lambda c: (
+            0 if bool(c.get("manual_priority_exact_machine")) else 1,
+            -float(c.get("retrieval_score") or 0.0),
+            str(c.get("bubble_document_id") or ""),
+            _safe_int(c.get("page_from"), 0),
+        )
+    )
+
+    # Preserve duplicate-looking pages from different documents when one is a
+    # machine-specific manual; normal snippet dedupe can otherwise keep the company
+    # copy and drop the machine copy.
+    out: list[dict] = []
+    seen_pages: set[tuple[str, int]] = set()
+    for c in scored:
+        key = (str(c.get("bubble_document_id") or ""), _safe_int(c.get("page_from"), 0))
+        if key in seen_pages:
+            continue
+        seen_pages.add(key)
+        out.append(c)
+        if len(out) >= max(1, min(max(top_k, 8), 12)):
+            break
+    return out
+
+
+def _ask_manual_maintenance_direct_answer(
+    *,
+    q: str,
+    company_id: str,
+    machine_id: str,
+    doc_ids: Optional[list[str]],
+    bubble_document_id: Optional[str],
+    response_language: str,
+    top_k: int,
+    source_profile: dict,
+    debug: bool = False,
+) -> Optional[dict]:
+    preferred = str((source_profile or {}).get("preferred_source") or "").strip().lower()
+    if preferred != "manual" or not _ask_manual_priority_query_is_maintenance(q):
+        return None
+
+    citations = _ask_fetch_manual_maintenance_target_pages(
+        q=q,
+        company_id=company_id,
+        machine_id=machine_id,
+        doc_ids=doc_ids,
+        bubble_document_id=bubble_document_id,
+        top_k=top_k,
+    )
+    if not citations:
+        return None
+
+    sources_block = _ask_full_context_sources_block(
+        citations,
+        max_context_chars=max(12000, int(ASK_EVIDENCE_MAX_CONTEXT_CHARS or 24000)),
+    )
+    if not sources_block:
+        return None
+
+    profile = _ask_evidence_query_profile(q, response_language)
+    system_msg = (
+        "You are MachineMind ASK. The user is asking what the machine manual says about maintenance or periodic checks. "
+        "Use ONLY the provided MANUAL MAINTENANCE SOURCES. These sources were preselected because they contain actual maintenance tables, intervals, operations or periodic checks. "
+        "Do not answer from index pages, cover pages, general information, role definitions, or generic disclaimers. "
+        "Extract concrete maintenance/control items, components, intervals/frequencies, operations and notes when present. "
+        "If there are multiple manual documents, prefer machine-specific pages but you may use company/manual copies as support. "
+        "Do not say that maintenance intervals are unavailable if the sources contain intervals such as daily, weekly, monthly, annually, every shift, or every N hours. "
+        "Every point must cite citation_ids from the provided sources. Do not put raw citation ids in visible text. Reply in the requested language."
+    )
+    user_msg = (
+        f"QUESTION:\n{q}\n\n"
+        f"RESPONSE_LANGUAGE:\n{response_language}\n\n"
+        f"QUERY_PROFILE:\n{json.dumps(profile, ensure_ascii=False)}\n\n"
+        f"MANUAL MAINTENANCE SOURCES:\n{sources_block}\n\n"
+        "Return JSON only. Include the most relevant maintenance/control categories and frequencies/intervals when present."
+    )
+
+    try:
+        parsed = _openai_chat_json_models(
+            [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            models=[ASK_FULL_CONTEXT_MODEL, ASK_EVIDENCE_ANSWER_MODEL, OPENAI_CHAT_MODEL, ROOT_CAUSE_RESPONSE_MODEL],
+            json_schema=_ask_evidence_answer_schema(),
+            timeout=min(int(ASK_FULL_CONTEXT_TIMEOUT or 120), 100),
+        )
+    except Exception as e:
+        print("ASK_MANUAL_MAINTENANCE_DIRECT_ANSWER_FAIL", str(e)[:700])
+        return None
+
+    if not isinstance(parsed, dict) or str(parsed.get("answer_status") or "").strip().lower() != "answered":
+        return None
+
+    grounded_points = list(parsed.get("grounded_points") or [])
+    answer, used_citations = _render_grounded_answer_points(
+        grounded_points=grounded_points,
+        citations=citations,
+        max_points=max(1, int(ASK_UI_MAX_POINTS or 5)),
+        q=q,
+    )
+    if not answer:
+        return None
+
+    # Keep the selected maintenance citations in the response even when the model
+    # cites only one of several equivalent maintenance-table pages. This preserves
+    # machine-specific manual links while remaining grounded in the same evidence set.
+    final_citations = _dedupe_response_items_for_ui(
+        list(used_citations or []) + list(citations or []),
+        max_items=max(1, int(ASK_UI_MAX_CITATIONS or 8)),
+    )
+    response_citations = _sanitize_citations_for_response(final_citations, company_id=company_id)
+    try:
+        rg_links = _build_rg_links(company_id, response_citations)
+    except Exception as e:
+        print("RG_LINKS_FAIL", str(e))
+        rg_links = []
+
+    resp = {
+        "ok": True,
+        "status": "answered",
+        "answer": answer,
+        "language": response_language,
+        "citations": response_citations,
+        "rg_links": rg_links,
+        "top_k": top_k,
+        "similarity_max": max([float(c.get("similarity") or 0.0) for c in citations], default=None),
+        "chat_model": "ask_manual_maintenance_direct_reader",
+    }
+    if debug:
+        resp["ask_manual_maintenance_direct"] = {
+            "source_count": len(citations),
+            "doc_ids_used": _dedup_text_values([c.get("bubble_document_id") for c in citations], limit=20),
+        }
+    return resp
+
+
 def _ask_source_preferred_answer(
     *,
     q: str,
@@ -12492,6 +12788,20 @@ def _ask_v1_baseline_impl(
         return _finalize_ask_response_for_ui(resp, language=response_language)
 
     effective_threshold = float(retrieval.get("effective_threshold") or ASK_SIM_THRESHOLD)
+
+    manual_maintenance_direct_resp = _ask_manual_maintenance_direct_answer(
+        q=q,
+        company_id=company_id,
+        machine_id=machine_id,
+        doc_ids=doc_ids if isinstance(doc_ids, list) else None,
+        bubble_document_id=bubble_document_id,
+        response_language=response_language,
+        top_k=top_k,
+        source_profile=source_preference,
+        debug=bool(payload.debug),
+    )
+    if manual_maintenance_direct_resp:
+        return _finalize(manual_maintenance_direct_resp)
 
     source_priority_resp = _ask_source_preferred_answer(
         q=q,
