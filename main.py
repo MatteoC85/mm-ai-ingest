@@ -2,12 +2,19 @@ import os
 import re
 import math
 import json
+import io
+import zipfile
 import unicodedata
+from datetime import date, datetime, time
 from typing import Optional, List, Any, Union
 
 import requests
 import psycopg2
 import fitz  # PyMuPDF
+try:
+    import openpyxl
+except Exception:
+    openpyxl = None
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from google.cloud import tasks_v2
@@ -18,6 +25,21 @@ app = FastAPI()
 AI_INTERNAL_SECRET = (os.environ.get("AI_INTERNAL_SECRET") or "").strip()
 FETCH_TIMEOUT = int(os.environ.get("MM_FETCH_TIMEOUT_SECONDS", "30"))
 MAX_PDF_BYTES = int(os.environ.get("MM_MAX_PDF_BYTES", str(50 * 1024 * 1024)))
+
+# XLSX ingest is intentionally feature-flagged and isolated from the PDF path.
+# Default OFF: deploy the code safely, then enable only after PDF regression tests pass.
+XLSX_INGEST_ENABLED = (os.environ.get("MM_XLSX_INGEST_ENABLED") or "0").strip() == "1"
+MAX_XLSX_BYTES = int(os.environ.get("MM_MAX_XLSX_BYTES", str(20 * 1024 * 1024)))
+XLSX_MAX_SHEETS = int(os.environ.get("MM_XLSX_MAX_SHEETS", "25"))
+XLSX_MAX_ROWS_PER_SHEET = int(os.environ.get("MM_XLSX_MAX_ROWS_PER_SHEET", "5000"))
+XLSX_MAX_COLS_PER_SHEET = int(os.environ.get("MM_XLSX_MAX_COLS_PER_SHEET", "80"))
+XLSX_MAX_CELLS_TOTAL = int(os.environ.get("MM_XLSX_MAX_CELLS_TOTAL", "150000"))
+XLSX_MAX_TEXT_CHARS = int(os.environ.get("MM_XLSX_MAX_TEXT_CHARS", "500000"))
+XLSX_PAGE_TARGET_CHARS = int(os.environ.get("MM_XLSX_PAGE_TARGET_CHARS", "12000"))
+XLSX_MAX_CELL_CHARS = int(os.environ.get("MM_XLSX_MAX_CELL_CHARS", "260"))
+XLSX_MAX_ROW_CHARS = int(os.environ.get("MM_XLSX_MAX_ROW_CHARS", "2400"))
+XLSX_MIN_TEXT_CHARS = int(os.environ.get("MM_XLSX_MIN_TEXT_CHARS", "120"))
+XLSX_INCLUDE_HIDDEN_SHEETS = (os.environ.get("MM_XLSX_INCLUDE_HIDDEN_SHEETS") or "0").strip() == "1"
 
 # DB
 DB_HOST = (os.environ.get("MM_DB_HOST") or "").strip()
@@ -5271,6 +5293,360 @@ def _extract_pages_with_layout_blocks(pdf_bytes: bytes) -> list[str]:
         doc.close()
 
 
+class XlsxIngestError(Exception):
+    def __init__(self, reason: str, message: str, detail: Optional[dict] = None):
+        super().__init__(message)
+        self.reason = str(reason or "XLSX_PARSE_FAILED")
+        self.message = str(message or "XLSX parse failed")
+        self.detail = detail or {}
+
+
+def _xlsx_zip_has_expected_structure(xlsx_bytes: bytes) -> bool:
+    try:
+        with zipfile.ZipFile(io.BytesIO(xlsx_bytes)) as zf:
+            names = set(zf.namelist())
+            if "xl/vbaProject.bin" in names:
+                # This is macro-enabled content. Keep v1 strictly .xlsx-only.
+                return False
+            return "[Content_Types].xml" in names and "xl/workbook.xml" in names
+    except Exception:
+        return False
+
+
+def _looks_like_xlsx_document(xlsx_bytes: bytes, detected_extension: str, content_type: str) -> bool:
+    ext = str(detected_extension or "").strip().lower()
+    ctype = str(content_type or "").strip().lower()
+
+    if ext in {".xls", ".xlsm", ".xlsb"}:
+        return False
+
+    xlsx_content_types = {
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/octet-stream",
+        "binary/octet-stream",
+        "application/zip",
+    }
+
+    has_xlsx_hint = ext == ".xlsx" or ctype in xlsx_content_types
+    if not has_xlsx_hint and not (xlsx_bytes or b"")[:2] == b"PK":
+        return False
+
+    return _xlsx_zip_has_expected_structure(xlsx_bytes)
+
+
+def _xlsx_clean_cell_text(value: str, max_len: Optional[int] = None) -> str:
+    s = _normalize_unicode_advanced(str(value or ""))
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    s = s.strip()
+    if max_len and len(s) > max_len:
+        cut = s[: max_len - 1].rsplit(" ", 1)[0].strip() or s[: max_len - 1].strip()
+        return cut + "…"
+    return s
+
+
+def _xlsx_cell_to_text(cell: Any) -> str:
+    try:
+        value = cell.value
+    except Exception:
+        value = cell
+
+    if value is None:
+        return ""
+
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+
+    if isinstance(value, datetime):
+        # Preserve date and time without noisy seconds when not needed.
+        if value.second or value.microsecond:
+            return value.isoformat(sep=" ", timespec="seconds")
+        return value.isoformat(sep=" ", timespec="minutes")
+
+    if isinstance(value, date):
+        return value.isoformat()
+
+    if isinstance(value, time):
+        if value.second or value.microsecond:
+            return value.isoformat(timespec="seconds")
+        return value.isoformat(timespec="minutes")
+
+    if isinstance(value, int):
+        return str(value)
+
+    if isinstance(value, float):
+        if math.isfinite(value):
+            if value.is_integer():
+                return str(int(value))
+            return f"{value:.12g}"
+        return ""
+
+    return _xlsx_clean_cell_text(str(value), max_len=XLSX_MAX_CELL_CHARS)
+
+
+def _xlsx_trim_trailing_empty(values: list[str]) -> list[str]:
+    vals = list(values or [])
+    while vals and not str(vals[-1] or "").strip():
+        vals.pop()
+    return vals
+
+
+def _xlsx_value_looks_numeric(value: str) -> bool:
+    s = str(value or "").strip()
+    if not s:
+        return False
+    return re.fullmatch(r"[-+]?\d+(?:[.,]\d+)?(?:\s*[%€$£]|\s*[a-zA-Z]{1,6})?", s) is not None
+
+
+def _xlsx_detect_header_index(rows: list[dict]) -> Optional[int]:
+    if not rows:
+        return None
+
+    best_idx: Optional[int] = None
+    best_score = 0.0
+
+    for idx, row in enumerate(rows[: min(20, len(rows))]):
+        vals = [str(v or "").strip() for v in row.get("values") or []]
+        non_empty = [v for v in vals if v]
+        if len(non_empty) < 2:
+            continue
+
+        textish = sum(1 for v in non_empty if not _xlsx_value_looks_numeric(v))
+        if textish < max(1, math.ceil(len(non_empty) * 0.45)):
+            continue
+
+        next_rows = rows[idx + 1: idx + 6]
+        next_non_empty_avg = 0.0
+        if next_rows:
+            next_non_empty_avg = sum(
+                len([v for v in (r.get("values") or []) if str(v or "").strip()])
+                for r in next_rows
+            ) / max(1, len(next_rows))
+
+        score = float(len(non_empty)) + 0.75 * float(textish) + 0.35 * min(float(len(non_empty)), next_non_empty_avg) - 0.05 * idx
+        if score > best_score:
+            best_score = score
+            best_idx = idx
+
+    return best_idx if best_score >= 3.0 else None
+
+
+def _xlsx_make_unique_headers(header_values: list[str], max_cols: int) -> list[str]:
+    headers: list[str] = []
+    seen: dict[str, int] = {}
+
+    for col_idx in range(1, max_cols + 1):
+        raw = header_values[col_idx - 1] if col_idx - 1 < len(header_values) else ""
+        label = _clean_display_text(raw, max_len=90) if raw else ""
+        if not label:
+            label = f"COL {openpyxl.utils.get_column_letter(col_idx) if openpyxl else col_idx}"
+
+        key = label.lower()
+        seen[key] = seen.get(key, 0) + 1
+        if seen[key] > 1:
+            label = f"{label} ({seen[key]})"
+        headers.append(label)
+
+    return headers
+
+
+def _xlsx_row_to_line(row_number: int, values: list[str], headers: Optional[list[str]], is_header_row: bool) -> str:
+    values = list(values or [])
+    if not values:
+        return ""
+
+    parts: list[str] = []
+    for col_idx, value in enumerate(values, start=1):
+        value = _xlsx_clean_cell_text(value, max_len=XLSX_MAX_CELL_CHARS)
+        if not value:
+            continue
+
+        col_label = openpyxl.utils.get_column_letter(col_idx) if openpyxl else str(col_idx)
+        if headers and not is_header_row:
+            label = headers[col_idx - 1] if col_idx - 1 < len(headers) else f"COL {col_label}"
+            parts.append(f"{label}: {value}")
+        else:
+            parts.append(f"{col_label}: {value}")
+
+    if not parts:
+        return ""
+
+    prefix = f"HEADER ROW {row_number}:" if is_header_row else f"ROW {row_number}:"
+    line = prefix + " " + " | ".join(parts)
+    if len(line) > XLSX_MAX_ROW_CHARS:
+        line = line[: XLSX_MAX_ROW_CHARS - 1].rsplit(" ", 1)[0].strip() + "…"
+    return line
+
+
+def _xlsx_append_page(pages: list[str], base_header: list[str], body_lines: list[str]) -> None:
+    if not body_lines:
+        return
+    text = "\n".join(base_header + body_lines).strip()
+    if text:
+        pages.append(text)
+
+
+def _xlsx_sheet_rows_to_pages(sheet_name: str, rows: list[dict], sheet_index: int) -> list[str]:
+    if not rows:
+        return []
+
+    max_cols = max((len(r.get("values") or []) for r in rows), default=0)
+    header_idx = _xlsx_detect_header_index(rows)
+    headers = None
+    header_row_number = None
+    if header_idx is not None:
+        header_values = list(rows[header_idx].get("values") or [])
+        headers = _xlsx_make_unique_headers(header_values, max_cols=max_cols)
+        header_row_number = int(rows[header_idx].get("row_number") or 0)
+
+    base_header = [
+        f"SHEET: {sheet_name}",
+        f"SHEET_INDEX: {sheet_index}",
+        "EXTRACTION_MODE: XLSX values converted to structured text for AI retrieval",
+    ]
+    if header_row_number:
+        base_header.append(f"DETECTED_HEADER_ROW: {header_row_number}")
+
+    pages: list[str] = []
+    current_lines: list[str] = []
+    current_chars = sum(len(x) + 1 for x in base_header)
+    part_no = 1
+
+    def flush() -> None:
+        nonlocal current_lines, current_chars, part_no
+        if not current_lines:
+            return
+        header = list(base_header)
+        header.append(f"SHEET_PART: {part_no}")
+        _xlsx_append_page(pages, header, current_lines)
+        part_no += 1
+        current_lines = []
+        current_chars = sum(len(x) + 1 for x in base_header)
+
+    for idx, row in enumerate(rows):
+        row_number = int(row.get("row_number") or 0)
+        vals = list(row.get("values") or [])
+        line = _xlsx_row_to_line(
+            row_number=row_number,
+            values=vals,
+            headers=headers,
+            is_header_row=(header_idx is not None and idx == header_idx),
+        )
+        if not line:
+            continue
+
+        if current_lines and current_chars + len(line) + 1 > max(2000, XLSX_PAGE_TARGET_CHARS):
+            flush()
+
+        current_lines.append(line)
+        current_chars += len(line) + 1
+
+    flush()
+    return pages
+
+
+def _extract_xlsx_sheets_as_pages(xlsx_bytes: bytes) -> list[str]:
+    if openpyxl is None:
+        raise XlsxIngestError(
+            "XLSX_DEPENDENCY_MISSING",
+            "Documento non indicizzabile: supporto XLSX non installato nel backend.",
+        )
+
+    if len(xlsx_bytes or b"") > MAX_XLSX_BYTES:
+        raise XlsxIngestError(
+            "XLSX_FILE_TOO_LARGE",
+            "Documento non indicizzabile: file XLSX troppo grande per l'ingest.",
+            {"max_xlsx_bytes": MAX_XLSX_BYTES, "actual_bytes": len(xlsx_bytes or b"")},
+        )
+
+    try:
+        workbook = openpyxl.load_workbook(
+            filename=io.BytesIO(xlsx_bytes),
+            read_only=True,
+            data_only=True,
+        )
+    except Exception as e:
+        raise XlsxIngestError(
+            "XLSX_PARSE_FAILED",
+            "Documento non indicizzabile: impossibile leggere il file XLSX.",
+            {"detail": str(e)[:300]},
+        )
+
+    pages: list[str] = []
+    total_cells = 0
+    total_text_chars = 0
+    processed_sheets = 0
+
+    try:
+        for ws in workbook.worksheets:
+            if processed_sheets >= max(1, XLSX_MAX_SHEETS):
+                break
+
+            if not XLSX_INCLUDE_HIDDEN_SHEETS and str(getattr(ws, "sheet_state", "visible") or "visible") != "visible":
+                continue
+
+            processed_sheets += 1
+            sheet_name = _clean_display_text(getattr(ws, "title", "Sheet"), max_len=90) or f"Sheet {processed_sheets}"
+
+            sheet_rows: list[dict] = []
+            max_rows = max(1, XLSX_MAX_ROWS_PER_SHEET)
+            max_cols = max(1, XLSX_MAX_COLS_PER_SHEET)
+
+            for row in ws.iter_rows(max_row=max_rows, max_col=max_cols):
+                values = [_xlsx_cell_to_text(cell) for cell in row]
+                values = _xlsx_trim_trailing_empty(values)
+                if not any(str(v or "").strip() for v in values):
+                    continue
+
+                row_number = int(getattr(row[0], "row", len(sheet_rows) + 1) or len(sheet_rows) + 1) if row else len(sheet_rows) + 1
+                non_empty_cells = sum(1 for v in values if str(v or "").strip())
+                total_cells += non_empty_cells
+                if total_cells > max(1, XLSX_MAX_CELLS_TOTAL):
+                    raise XlsxIngestError(
+                        "XLSX_TOO_MANY_CELLS",
+                        "Documento non indicizzabile: file XLSX troppo grande o troppo denso di celle.",
+                        {"max_cells_total": XLSX_MAX_CELLS_TOTAL},
+                    )
+
+                row_text_chars = sum(len(str(v or "")) for v in values)
+                total_text_chars += row_text_chars
+                if total_text_chars > max(1000, XLSX_MAX_TEXT_CHARS):
+                    raise XlsxIngestError(
+                        "XLSX_TEXT_TOO_LARGE",
+                        "Documento non indicizzabile: testo estratto da XLSX troppo grande per l'ingest sicuro.",
+                        {"max_text_chars": XLSX_MAX_TEXT_CHARS},
+                    )
+
+                sheet_rows.append({"row_number": row_number, "values": values})
+
+            new_pages = _xlsx_sheet_rows_to_pages(sheet_name, sheet_rows, processed_sheets)
+            pages.extend(new_pages)
+
+            converted_text_chars = sum(len(p or "") for p in pages)
+            if converted_text_chars > max(2000, XLSX_MAX_TEXT_CHARS * 2):
+                raise XlsxIngestError(
+                    "XLSX_TEXT_TOO_LARGE",
+                    "Documento non indicizzabile: testo strutturato da XLSX troppo grande per l'ingest sicuro.",
+                    {"max_structured_text_chars": XLSX_MAX_TEXT_CHARS * 2},
+                )
+
+    finally:
+        try:
+            workbook.close()
+        except Exception:
+            pass
+
+    pages = [p for p in pages if str(p or "").strip()]
+    if not pages:
+        raise XlsxIngestError(
+            "XLSX_NO_READABLE_TEXT",
+            "Documento non indicizzabile: nessun testo leggibile trovato nel file XLSX.",
+        )
+
+    return pages
+
+
 def _hf_norm_line(s: str) -> str:
     s = _normalize_text_keep_lines(s)
     s = s.lower()
@@ -10077,8 +10453,9 @@ def ingest_document(
         or detected_extension == ".pdf"
         or content_type == "application/pdf"
     )
+    looks_like_xlsx = _looks_like_xlsx_document(data, detected_extension, content_type)
 
-    if not looks_like_pdf:
+    if not looks_like_pdf and not looks_like_xlsx:
         return {
             "ok": False,
             "error": {
@@ -10091,36 +10468,93 @@ def ingest_document(
             "detected_extension": detected_extension or None,
         }
 
-    if len(data) > MAX_PDF_BYTES:
-        raise HTTPException(status_code=413, detail="PDF too large")
+    pages_text: list[str] = []
+    pages_total = 0
+    pages_with_text = 0
+    text_chars = 0
+    source_file_type = "pdf" if looks_like_pdf else "xlsx"
 
-    try:
-        raw_pages = _extract_pages_with_layout_blocks(data)
-        pages_total = len(raw_pages)
-
-        header_norm, footer_norm = _detect_repeated_headers_footers(raw_pages)
+    if looks_like_pdf:
+        if len(data) > MAX_PDF_BYTES:
+            raise HTTPException(status_code=413, detail="PDF too large")
 
         try:
-            _db_upsert_cleaning_meta(company_id, bubble_document_id, header_norm, footer_norm)
+            raw_pages = _extract_pages_with_layout_blocks(data)
+            pages_total = len(raw_pages)
+
+            header_norm, footer_norm = _detect_repeated_headers_footers(raw_pages)
+
+            try:
+                _db_upsert_cleaning_meta(company_id, bubble_document_id, header_norm, footer_norm)
+            except Exception as e:
+                print("CLEANING_META_UPSERT_FAIL", str(e))
+
+            for t in raw_pages:
+                cleaned = _remove_headers_footers_from_page(t, header_norm, footer_norm)
+                cleaned = _reflow_paragraphs_conservative(cleaned)
+                cleaned = _maybe_remove_toc(cleaned)
+                pages_text.append(cleaned)
+                text_chars += len(cleaned)
+                if len(cleaned) >= MIN_PAGE_CHARS:
+                    pages_with_text += 1
+        except Exception:
+            raise HTTPException(status_code=422, detail="PDF parse failed")
+
+    else:
+        if not XLSX_INGEST_ENABLED:
+            return {
+                "ok": False,
+                "error": {
+                    "code": "NOT_INDEXABLE",
+                    "message": "Documento non indicizzabile: supporto XLSX non ancora abilitato nel backend.",
+                },
+                "reason": "XLSX_INGEST_DISABLED",
+                "detected_content_type": content_type or None,
+                "detected_filename": detected_filename or None,
+                "detected_extension": detected_extension or None,
+            }
+
+        if len(data) > MAX_XLSX_BYTES:
+            raise HTTPException(status_code=413, detail="XLSX too large")
+
+        try:
+            pages_text = _extract_xlsx_sheets_as_pages(data)
+            pages_total = len(pages_text)
+            text_chars = sum(len(t or "") for t in pages_text)
+            pages_with_text = sum(1 for t in pages_text if len(t or "") >= MIN_PAGE_CHARS)
+        except XlsxIngestError as e:
+            return {
+                "ok": False,
+                "error": {
+                    "code": "NOT_INDEXABLE",
+                    "message": e.message,
+                    "detail": e.detail or {},
+                },
+                "reason": e.reason,
+                "detected_content_type": content_type or None,
+                "detected_filename": detected_filename or None,
+                "detected_extension": detected_extension or None,
+            }
         except Exception as e:
-            print("CLEANING_META_UPSERT_FAIL", str(e))
+            raise HTTPException(status_code=422, detail=f"XLSX parse failed: {str(e)[:200]}")
 
-        pages_text: list[str] = []
-        pages_with_text = 0
-        text_chars = 0
-
-        for t in raw_pages:
-            cleaned = _remove_headers_footers_from_page(t, header_norm, footer_norm)
-            cleaned = _reflow_paragraphs_conservative(cleaned)
-            cleaned = _maybe_remove_toc(cleaned)
-            pages_text.append(cleaned)
-            text_chars += len(cleaned)
-            if len(cleaned) >= MIN_PAGE_CHARS:
-                pages_with_text += 1
-    except Exception:
-        raise HTTPException(status_code=422, detail="PDF parse failed")
-
-    if pages_total <= 2:
+    if source_file_type == "xlsx":
+        if pages_with_text < 1 or text_chars < max(1, XLSX_MIN_TEXT_CHARS):
+            reason = "LOW_TEXT_COVERAGE" if pages_with_text < 1 else "LOW_TEXT_CHARS"
+            return {
+                "ok": False,
+                "error": {
+                    "code": "NOT_INDEXABLE",
+                    "message": "Documento XLSX non indicizzabile: testo leggibile insufficiente.",
+                },
+                "reason": reason,
+                "pages_total": pages_total,
+                "pages_with_text": pages_with_text,
+                "pages_detected": pages_total,
+                "text_chars": text_chars,
+                "source_file_type": source_file_type,
+            }
+    elif pages_total <= 2:
         if pages_with_text < 1 or text_chars < MIN_TEXT_CHARS_SHORT:
             reason = "LOW_TEXT_COVERAGE" if pages_with_text < 1 else "LOW_TEXT_CHARS"
             return {
@@ -10290,7 +10724,9 @@ def ingest_document(
         "pages_detected": pages_total,
         "text_chars": text_chars,
         "est_storage_bytes": est_storage_bytes,
+        "source_file_type": source_file_type,
     }
+
 
 @app.post("/v1/ai/ingest/source")
 def ingest_structured_source(
