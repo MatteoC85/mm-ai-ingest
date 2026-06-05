@@ -5334,6 +5334,13 @@ def _looks_like_xlsx_document(xlsx_bytes: bytes, detected_extension: str, conten
     return _xlsx_zip_has_expected_structure(xlsx_bytes)
 
 
+def _xlsx_document_title_from_filename(filename: str) -> str:
+    name = os.path.basename(str(filename or "").strip())
+    name = re.sub(r"\.xlsx$", "", name, flags=re.IGNORECASE)
+    name = re.sub(r"[_-]+", " ", name)
+    return _clean_display_text(name, max_len=120)
+
+
 def _xlsx_clean_cell_text(value: str, max_len: Optional[int] = None) -> str:
     s = _normalize_unicode_advanced(str(value or ""))
     s = s.replace("\r\n", "\n").replace("\r", "\n")
@@ -5487,7 +5494,12 @@ def _xlsx_append_page(pages: list[str], base_header: list[str], body_lines: list
         pages.append(text)
 
 
-def _xlsx_sheet_rows_to_pages(sheet_name: str, rows: list[dict], sheet_index: int) -> list[str]:
+def _xlsx_sheet_rows_to_pages(
+    sheet_name: str,
+    rows: list[dict],
+    sheet_index: int,
+    document_title: str = "",
+) -> list[str]:
     if not rows:
         return []
 
@@ -5500,11 +5512,20 @@ def _xlsx_sheet_rows_to_pages(sheet_name: str, rows: list[dict], sheet_index: in
         headers = _xlsx_make_unique_headers(header_values, max_cols=max_cols)
         header_row_number = int(rows[header_idx].get("row_number") or 0)
 
+    document_title = _clean_display_text(document_title, max_len=120)
     base_header = [
+        "DOCUMENT_FILE_TYPE: XLSX",
+        "DOCUMENT_KIND: Excel file; file Excel; foglio di calcolo; spreadsheet; workbook",
+        "DOCUMENT_FORMAT_HINTS: xlsx excel spreadsheet workbook worksheet sheet table tabella righe colonne fogli",
+    ]
+    if document_title:
+        base_header.append(f"DOCUMENT_TITLE: {document_title}")
+    base_header.extend([
         f"SHEET: {sheet_name}",
+        f"SHEET_NAME: {sheet_name}",
         f"SHEET_INDEX: {sheet_index}",
         "EXTRACTION_MODE: XLSX values converted to structured text for AI retrieval",
-    ]
+    ])
     if header_row_number:
         base_header.append(f"DETECTED_HEADER_ROW: {header_row_number}")
 
@@ -5546,7 +5567,7 @@ def _xlsx_sheet_rows_to_pages(sheet_name: str, rows: list[dict], sheet_index: in
     return pages
 
 
-def _extract_xlsx_sheets_as_pages(xlsx_bytes: bytes) -> list[str]:
+def _extract_xlsx_sheets_as_pages(xlsx_bytes: bytes, detected_filename: str = "") -> list[str]:
     if openpyxl is None:
         raise XlsxIngestError(
             "XLSX_DEPENDENCY_MISSING",
@@ -5577,6 +5598,7 @@ def _extract_xlsx_sheets_as_pages(xlsx_bytes: bytes) -> list[str]:
     total_cells = 0
     total_text_chars = 0
     processed_sheets = 0
+    document_title = _xlsx_document_title_from_filename(detected_filename)
 
     try:
         for ws in workbook.worksheets:
@@ -5620,7 +5642,12 @@ def _extract_xlsx_sheets_as_pages(xlsx_bytes: bytes) -> list[str]:
 
                 sheet_rows.append({"row_number": row_number, "values": values})
 
-            new_pages = _xlsx_sheet_rows_to_pages(sheet_name, sheet_rows, processed_sheets)
+            new_pages = _xlsx_sheet_rows_to_pages(
+                sheet_name,
+                sheet_rows,
+                processed_sheets,
+                document_title=document_title,
+            )
             pages.extend(new_pages)
 
             converted_text_chars = sum(len(p or "") for p in pages)
@@ -7449,6 +7476,60 @@ def _diagnostic_evidence_pipeline(
     return result
 
 
+def _looks_like_xlsx_indexed_text(text: str) -> bool:
+    t = str(text or "")
+    return (
+        "DOCUMENT_FILE_TYPE: XLSX" in t
+        or "EXTRACTION_MODE: XLSX" in t
+        or "DOCUMENT_KIND: Excel file" in t
+    )
+
+
+def _clean_xlsx_snippet_for_display(text: str, *, max_len: int = 520) -> str:
+    lines: list[str] = []
+
+    for raw_line in str(text or "").replace("\r", "\n").split("\n"):
+        line = re.sub(r"\s+", " ", raw_line).strip()
+        if not line:
+            continue
+
+        if re.match(
+            r"^(?:DOCUMENT_FILE_TYPE|DOCUMENT_KIND|DOCUMENT_FORMAT_HINTS|EXTRACTION_MODE|SHEET_INDEX|SHEET_NAME|SHEET_PART|DETECTED_HEADER_ROW)\s*:",
+            line,
+            flags=re.IGNORECASE,
+        ):
+            continue
+
+        m = re.match(r"^DOCUMENT_TITLE\s*:\s*(.+)$", line, flags=re.IGNORECASE)
+        if m:
+            title = _clean_display_text(m.group(1), max_len=120)
+            if title:
+                lines.append(f"Documento Excel: {title}")
+            continue
+
+        m = re.match(r"^SHEET\s*:\s*(.+)$", line, flags=re.IGNORECASE)
+        if m:
+            sheet = _clean_display_text(m.group(1), max_len=90)
+            if sheet:
+                lines.append(f"Foglio: {sheet}")
+            continue
+
+        m = re.match(r"^HEADER ROW\s+\d+\s*:\s*(.+)$", line, flags=re.IGNORECASE)
+        if m:
+            header = _clean_display_text(m.group(1), max_len=260)
+            if header:
+                lines.append(f"Intestazioni: {header}")
+            continue
+
+        lines.append(line)
+
+    clean = " — ".join(lines)
+    clean = re.sub(r"\s+", " ", clean).strip(" -–—")
+    if len(clean) > max_len:
+        clean = clean[: max_len - 1].rsplit(" ", 1)[0].strip() + "…"
+    return clean
+
+
 def _sanitize_citations_for_response(citations: list[dict], company_id: Optional[str] = None) -> list[dict]:
     out: list[dict] = []
 
@@ -7498,14 +7579,20 @@ def _sanitize_citations_for_response(citations: list[dict], company_id: Optional
                 clean_snippet = re.sub(r"\s+", " ", clean_snippet).strip(" -–—")
                 clean_snippet = _clean_display_text(clean_snippet, max_len=int(ASK_UI_MAX_SNIPPET_CLEAN_CHARS or 520))
         else:
-            clean_snippet = re.sub(r"^SECTION:\s*[^\n]+\n?", "", raw_snippet, flags=re.IGNORECASE).strip()
-            clean_snippet = re.sub(r"\s*\n\s*", " ", clean_snippet)
-            clean_snippet = re.sub(r"\s+", " ", clean_snippet).strip()
-            if bool(c.get("ask_structured_manual_support")):
-                clean_snippet = _compact_manual_support_snippet_for_display(
-                    clean_snippet,
-                    max_len=max(180, int(ASK_UI_MANUAL_SUPPORT_SNIPPET_CHARS or 260)),
+            if _looks_like_xlsx_indexed_text(raw_snippet):
+                clean_snippet = _clean_xlsx_snippet_for_display(
+                    raw_snippet,
+                    max_len=int(ASK_UI_MAX_SNIPPET_CLEAN_CHARS or 520),
                 )
+            else:
+                clean_snippet = re.sub(r"^SECTION:\s*[^\n]+\n?", "", raw_snippet, flags=re.IGNORECASE).strip()
+                clean_snippet = re.sub(r"\s*\n\s*", " ", clean_snippet)
+                clean_snippet = re.sub(r"\s+", " ", clean_snippet).strip()
+                if bool(c.get("ask_structured_manual_support")):
+                    clean_snippet = _compact_manual_support_snippet_for_display(
+                        clean_snippet,
+                        max_len=max(180, int(ASK_UI_MANUAL_SUPPORT_SNIPPET_CHARS or 260)),
+                    )
 
         base = {
             "citation_id": cid,
@@ -10518,7 +10605,7 @@ def ingest_document(
             raise HTTPException(status_code=413, detail="XLSX too large")
 
         try:
-            pages_text = _extract_xlsx_sheets_as_pages(data)
+            pages_text = _extract_xlsx_sheets_as_pages(data, detected_filename=detected_filename)
             pages_total = len(pages_text)
             text_chars = sum(len(t or "") for t in pages_text)
             pages_with_text = sum(1 for t in pages_text if len(t or "") >= MIN_PAGE_CHARS)
