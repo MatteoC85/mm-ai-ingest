@@ -1,5 +1,7 @@
 import os
 import re
+import base64
+import binascii
 import math
 import json
 import io
@@ -226,7 +228,10 @@ STRUCTURED_SOURCE_TYPES = {
 }
 
 class IngestRequest(BaseModel):
-    file_url: str
+    file_url: Optional[str] = None
+    file_base64: Optional[str] = None
+    filename: Optional[str] = None
+    content_type: Optional[str] = None
     company_id: str
     machine_id: Optional[str] = None
     bubble_document_id: str
@@ -11672,6 +11677,87 @@ def version():
         "commit_sha": os.environ.get("COMMIT_SHA"),
     }
 
+def _strip_data_url_prefix(value: str) -> str:
+    raw = (value or "").strip()
+    if "," in raw and raw.split(",", 1)[0].lower().startswith("data:"):
+        return raw.split(",", 1)[1]
+    return raw
+
+
+def _decode_file_base64(file_base64: str) -> bytes:
+    raw = _strip_data_url_prefix(file_base64)
+    try:
+        return base64.b64decode(raw, validate=True)
+    except (binascii.Error, ValueError):
+        raise HTTPException(status_code=400, detail="Invalid file_base64")
+
+
+def _detect_filename_from_url(url: str) -> str:
+    try:
+        url_path = unquote(urlparse(url).path or "")
+        return os.path.basename(url_path) or ""
+    except Exception:
+        return ""
+
+
+def _load_ingest_document_file(payload: IngestRequest, bubble_document_id: str) -> dict:
+    url = (payload.file_url or "").strip()
+    if url.startswith("//"):
+        url = "https:" + url
+
+    file_base64 = (payload.file_base64 or "").strip()
+    payload_filename = (payload.filename or "").strip()
+    payload_content_type = (payload.content_type or "").split(";", 1)[0].strip().lower()
+
+    if not url and not file_base64:
+        raise HTTPException(status_code=400, detail="Missing file_url or file_base64")
+
+    if file_base64:
+        data = _decode_file_base64(file_base64)
+
+        detected_filename = payload_filename or _detect_filename_from_url(url) or bubble_document_id
+        detected_extension = os.path.splitext(detected_filename)[1].lower()
+
+        return {
+            "data": data,
+            "url": url,
+            "content_type": payload_content_type,
+            "content_disposition": "",
+            "detected_filename": detected_filename,
+            "detected_extension": detected_extension,
+            "source_mode": "file_base64",
+        }
+
+    try:
+        r = requests.get(url, timeout=FETCH_TIMEOUT)
+        r.raise_for_status()
+        data = r.content
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=502, detail="Fetch failed")
+
+    content_type = (r.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+    content_disposition = (r.headers.get("Content-Disposition") or "").strip()
+
+    detected_filename = _detect_filename_from_url(url)
+    detected_extension = os.path.splitext(detected_filename)[1].lower()
+
+    if "filename=" in content_disposition:
+        cd_filename = content_disposition.split("filename=", 1)[1].strip().strip('"').strip("'")
+        if cd_filename:
+            detected_filename = cd_filename
+            detected_extension = os.path.splitext(detected_filename)[1].lower()
+
+    return {
+        "data": data,
+        "url": url,
+        "content_type": content_type,
+        "content_disposition": content_disposition,
+        "detected_filename": detected_filename,
+        "detected_extension": detected_extension,
+        "source_mode": "file_url",
+    }
 
 @app.post("/v1/ai/ingest/document")
 def ingest_document(
@@ -11699,33 +11785,18 @@ def ingest_document(
     if not (company_id and bubble_document_id):
         raise HTTPException(status_code=400, detail="Missing company_id/bubble_document_id")
 
-    url = payload.file_url.strip()
-    if url.startswith("//"):
-        url = "https:" + url
+        loaded_file = _load_ingest_document_file(payload, bubble_document_id)
 
-    _db_upsert_document_file(company_id, bubble_document_id, url)
+    data = loaded_file["data"]
+    url = loaded_file["url"]
+    content_type = loaded_file["content_type"]
+    content_disposition = loaded_file["content_disposition"]
+    detected_filename = loaded_file["detected_filename"]
+    detected_extension = loaded_file["detected_extension"]
+    source_mode = loaded_file["source_mode"]
 
-    try:
-        r = requests.get(url, timeout=FETCH_TIMEOUT)
-        r.raise_for_status()
-        data = r.content
-    except HTTPException:
-        raise
-    except Exception:
-        raise HTTPException(status_code=502, detail="Fetch failed")
-
-    content_type = (r.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
-    content_disposition = (r.headers.get("Content-Disposition") or "").strip()
-
-    url_path = unquote(urlparse(url).path or "")
-    detected_filename = os.path.basename(url_path) or ""
-    detected_extension = os.path.splitext(detected_filename)[1].lower()
-
-    if "filename=" in content_disposition:
-        cd_filename = content_disposition.split("filename=", 1)[1].strip().strip('"').strip("'")
-        if cd_filename:
-            detected_filename = cd_filename
-            detected_extension = os.path.splitext(detected_filename)[1].lower()
+    if url:
+        _db_upsert_document_file(company_id, bubble_document_id, url)
 
     pdf_magic = b"%PDF" in data[:1024]
     looks_like_pdf = (
