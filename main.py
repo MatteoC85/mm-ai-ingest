@@ -11785,7 +11785,7 @@ def ingest_document(
     if not (company_id and bubble_document_id):
         raise HTTPException(status_code=400, detail="Missing company_id/bubble_document_id")
 
-        loaded_file = _load_ingest_document_file(payload, bubble_document_id)
+    loaded_file = _load_ingest_document_file(payload, bubble_document_id)
 
     data = loaded_file["data"]
     url = loaded_file["url"]
