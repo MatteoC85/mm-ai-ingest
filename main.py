@@ -303,6 +303,9 @@ class DeleteDocumentRequest(BaseModel):
     company_id: str
     bubble_document_id: str
 
+class DeleteCompanyIndexRequest(BaseModel):
+    company_id: str
+
 class StructuredSourceIngestRequest(BaseModel):
     company_id: str
     machine_id: str
@@ -15569,6 +15572,60 @@ def delete_document_v1(
             "document_pages": int(deleted_pages),
             "document_files": int(deleted_files),
         },
+    }
+
+@app.post("/v1/ai/delete/company-index")
+@app.post("/v1/ai/delete/company_index")
+def delete_company_index_v1(
+    payload: DeleteCompanyIndexRequest,
+    x_ai_internal_secret: Optional[str] = Header(default=None),
+):
+    if not AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=500, detail="AI_INTERNAL_SECRET missing")
+
+    if (x_ai_internal_secret or "").strip() != AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    company_id = (payload.company_id or "").strip()
+    if not company_id:
+        raise HTTPException(status_code=400, detail="Missing company_id")
+
+    deleted = {
+        "document_chunks": 0,
+        "document_pages": 0,
+        "document_cleaning_meta": 0,
+        "document_files": 0,
+    }
+
+    conn = _db_conn()
+    try:
+        with conn.cursor() as cur:
+            for table_name in (
+                "document_chunks",
+                "document_pages",
+                "document_cleaning_meta",
+                "document_files",
+            ):
+                cur.execute(
+                    f"DELETE FROM public.{table_name} WHERE company_id=%s;",
+                    (company_id,),
+                )
+                deleted[table_name] = int(cur.rowcount or 0)
+
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.close()
+
+    return {
+        "ok": True,
+        "status": "deleted",
+        "company_id": company_id,
+        "deleted": deleted,
     }
 
 # Commit: feat(v8): preserve v4 hot paths and add opt-in shadow reasoning endpoints
