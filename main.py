@@ -12037,12 +12037,30 @@ def ingest_document(
         conn.close()
 
     try:
-        project = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT") or "machinemind-ai-2a"
-        location = "europe-west1"
-        queue = "mm-ai-index-dev"
-        service_url = os.environ.get("K_SERVICE_URL") or os.environ.get("SERVICE_URL")
+        project = (
+            os.environ.get("GOOGLE_CLOUD_PROJECT")
+            or os.environ.get("GCP_PROJECT")
+            or "machinemind-ai-2a"
+        ).strip()
+
+        location = (
+            os.environ.get("MM_CLOUD_TASKS_LOCATION")
+            or "europe-west1"
+        ).strip()
+
+        queue = (
+            os.environ.get("MM_CLOUD_TASKS_QUEUE")
+            or "mm-ai-index-dev"
+        ).strip()
+
+        service_url = (
+            os.environ.get("SERVICE_URL")
+            or os.environ.get("K_SERVICE_URL")
+            or ""
+        ).strip().rstrip("/")
+
         if not service_url:
-            service_url = "https://mm-ai-ingest-fixed-pvgxe6eo5q-ew.a.run.app"
+            raise RuntimeError("SERVICE_URL/K_SERVICE_URL missing; Cloud Tasks enqueue skipped")
 
         client = tasks_v2.CloudTasksClient()
         parent = client.queue_path(project, location, queue)
@@ -12068,7 +12086,8 @@ def ingest_document(
         }
 
         client.create_task(request={"parent": parent, "task": task})
-    except Exception:
+    except Exception as e:
+        print("CLOUD_TASKS_ENQUEUE_SKIPPED", str(e))
         pass
 
     return {
