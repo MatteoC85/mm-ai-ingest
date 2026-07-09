@@ -15909,3 +15909,1223 @@ def root_cause_v1_shadow(
 ):
     base_response = root_cause_v1(payload, x_ai_internal_secret)
     return _v8_attach_shadow_overlay("root_cause", payload.query or "", dict(base_response or {}))
+
+# =============================================================================
+# SMART DIAGNOSTIC V1 — append-only module
+# -----------------------------------------------------------------------------
+# Safety rule for MachineMind deployment:
+# - This block is intentionally appended at the end of main.py.
+# - It does NOT modify /v1/ai/ask, /v1/ai/root-cause, Draft P&S, ingest, or delete.
+# - It exposes new isolated endpoints only:
+#     /v1/ai/smart-diagnostic/start
+#     /v1/ai/smart-diagnostic/answer
+#     /v1/ai/smart-diagnostic/finalize
+# - Default OFF via MM_SMART_DIAGNOSTIC_ENABLED=0.
+# =============================================================================
+
+SMART_DIAGNOSTIC_ENABLED = (os.environ.get("MM_SMART_DIAGNOSTIC_ENABLED") or "0").strip() == "1"
+SMART_DIAGNOSTIC_MODEL = (os.environ.get("MM_SMART_DIAGNOSTIC_MODEL") or ROOT_CAUSE_RESPONSE_MODEL).strip()
+SMART_DIAGNOSTIC_MAX_QUESTIONS = int(os.environ.get("MM_SMART_DIAGNOSTIC_MAX_QUESTIONS", "6"))
+SMART_DIAGNOSTIC_MAX_HYPOTHESES = int(os.environ.get("MM_SMART_DIAGNOSTIC_MAX_HYPOTHESES", "4"))
+SMART_DIAGNOSTIC_TOP_K = int(os.environ.get("MM_SMART_DIAGNOSTIC_TOP_K", "8"))
+SMART_DIAGNOSTIC_MAX_CONTEXT_CHARS = int(os.environ.get("MM_SMART_DIAGNOSTIC_MAX_CONTEXT_CHARS", "22000"))
+SMART_DIAGNOSTIC_MAX_EVIDENCE_IN_STATE = int(os.environ.get("MM_SMART_DIAGNOSTIC_MAX_EVIDENCE_IN_STATE", "8"))
+SMART_DIAGNOSTIC_LLM_TIMEOUT = int(os.environ.get("MM_SMART_DIAGNOSTIC_LLM_TIMEOUT_SECONDS", "70"))
+
+
+class SmartDiagnosticContext(BaseModel):
+    context_type: Optional[str] = None
+    context_id: Optional[str] = None
+    context_label: Optional[str] = None
+
+
+class SmartDiagnosticOptions(BaseModel):
+    max_questions: int = 6
+    max_hypotheses: int = 4
+    top_k: int = 8
+
+
+class SmartDiagnosticStartRequest(BaseModel):
+    company_id: str
+    machine_id: str
+    session_id: str
+    symptom_text: str
+    language: Optional[str] = "it"
+    context: Optional[SmartDiagnosticContext] = None
+    options: Optional[SmartDiagnosticOptions] = None
+    debug: Optional[bool] = False
+
+
+class SmartDiagnosticAnswerPayload(BaseModel):
+    value: str
+    api_value: Optional[str] = None
+    label: Optional[str] = None
+    free_text: Optional[str] = None
+
+
+class SmartDiagnosticAnswerRequest(BaseModel):
+    company_id: str
+    machine_id: str
+    session_id: str
+    question_id: str
+    answer: SmartDiagnosticAnswerPayload
+    state_json: Optional[Union[str, dict]] = None
+    language: Optional[str] = "it"
+    debug: Optional[bool] = False
+
+
+class SmartDiagnosticFinalizeRequest(BaseModel):
+    company_id: str
+    machine_id: str
+    session_id: str
+    state_json: Optional[Union[str, dict]] = None
+    language: Optional[str] = "it"
+    debug: Optional[bool] = False
+
+
+def _sd_auth_guard(x_ai_internal_secret: Optional[str]) -> None:
+    if not SMART_DIAGNOSTIC_ENABLED:
+        raise HTTPException(status_code=503, detail="Smart Diagnostic disabled")
+    if not AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=500, detail="AI_INTERNAL_SECRET missing")
+    if (x_ai_internal_secret or "").strip() != AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def _sd_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    s = str(value or "").strip().lower()
+    return s in {"1", "true", "yes", "si", "sì"}
+
+
+def _sd_language(value: Optional[str], fallback_text: str = "") -> str:
+    lang = str(value or "").strip().lower()
+    if lang in {"it", "en"}:
+        return lang
+    return _select_response_language(fallback_text or "", preferred=value)
+
+
+def _sd_json_dumps(value: Any) -> str:
+    return json.dumps(value if value is not None else {}, ensure_ascii=False, separators=(",", ":"))
+
+
+def _sd_parse_json(value: Any, default: Optional[dict] = None) -> dict:
+    if default is None:
+        default = {}
+    if isinstance(value, dict):
+        return value
+    if value is None:
+        return dict(default)
+    s = str(value or "").strip()
+    if not s:
+        return dict(default)
+    try:
+        parsed = json.loads(s)
+        return parsed if isinstance(parsed, dict) else dict(default)
+    except Exception:
+        return dict(default)
+
+
+def _sd_clamp_int(value: Any, default: int, min_value: int, max_value: int) -> int:
+    try:
+        n = int(value)
+    except Exception:
+        n = int(default)
+    return max(int(min_value), min(int(max_value), n))
+
+
+def _sd_probability_band(pct: Any) -> str:
+    try:
+        p = float(pct)
+    except Exception:
+        return "unknown"
+    if p >= 65.0:
+        return "high"
+    if p >= 35.0:
+        return "medium"
+    if p >= 10.0:
+        return "low"
+    if p >= 0.0:
+        return "very_low"
+    return "unknown"
+
+
+def _sd_normalize_band(value: Any, pct: Any = None) -> str:
+    s = str(value or "").strip().lower()
+    aliases = {
+        "alta": "high",
+        "high": "high",
+        "media": "medium",
+        "medium": "medium",
+        "bassa": "low",
+        "low": "low",
+        "molto_bassa": "very_low",
+        "molto bassa": "very_low",
+        "very_low": "very_low",
+        "very low": "very_low",
+        "unknown": "unknown",
+        "non determinata": "unknown",
+    }
+    if s in aliases:
+        return aliases[s]
+    return _sd_probability_band(pct)
+
+
+def _sd_normalize_hypothesis_status(value: Any, pct: Any = None) -> str:
+    s = str(value or "").strip().lower()
+    aliases = {
+        "open": "open",
+        "aperta": "open",
+        "likely": "likely",
+        "probabile": "likely",
+        "unlikely": "unlikely",
+        "poco probabile": "unlikely",
+        "excluded": "excluded",
+        "esclusa": "excluded",
+        "confirmed": "confirmed",
+        "confermata": "confirmed",
+        "rejected": "rejected",
+        "scartata": "rejected",
+    }
+    if s in aliases:
+        return aliases[s]
+    try:
+        p = float(pct)
+    except Exception:
+        p = 0.0
+    if p >= 55.0:
+        return "likely"
+    if p < 10.0:
+        return "unlikely"
+    return "open"
+
+
+def _sd_normalize_question_type(value: Any) -> str:
+    s = str(value or "").strip().lower()
+    if s in {"yes_no", "single_choice", "multi_choice", "numeric", "checklist", "info"}:
+        return s
+    if s in {"yesno", "yes/no", "si_no", "sì_no", "vero_falso"}:
+        return "yes_no"
+    if s in {"choice", "single", "scelta_singola"}:
+        return "single_choice"
+    return "yes_no"
+
+
+def _sd_normalize_safety_level(value: Any) -> str:
+    s = str(value or "").strip().lower()
+    aliases = {
+        "normal": "normal",
+        "normale": "normal",
+        "caution": "caution",
+        "attenzione": "caution",
+        "warning": "caution",
+        "stop": "stop",
+        "fermare": "stop",
+        "fermare_la_macchina": "stop",
+        "qualified_personnel": "qualified_personnel",
+        "qualified personnel": "qualified_personnel",
+        "personale_qualificato": "qualified_personnel",
+        "personale qualificato": "qualified_personnel",
+    }
+    return aliases.get(s, "normal")
+
+
+def _sd_option_label(option_id: str, language: str) -> str:
+    option_id = str(option_id or "").strip()
+    labels = {
+        "yes": ("Sì", "Yes"),
+        "no": ("No", "No"),
+        "unknown": ("Non so", "I don't know"),
+        "skipped": ("Salta", "Skip"),
+        "continue": ("Continua", "Continue"),
+    }
+    it, en = labels.get(option_id, (option_id, option_id))
+    return en if str(language or "it").lower().startswith("en") else it
+
+
+def _sd_default_yes_no_options(language: str) -> list[dict]:
+    return [
+        {"id": "yes", "label_it": "Sì", "label_en": "Yes"},
+        {"id": "no", "label_it": "No", "label_en": "No"},
+        {"id": "unknown", "label_it": "Non so", "label_en": "I don't know"},
+    ]
+
+
+def _sd_clean_text(value: Any, max_len: int = 600) -> str:
+    return _clean_display_text(str(value or ""), max_len=max_len)
+
+
+def _sd_compact_evidence_for_state(citations: list[dict], *, max_items: int) -> list[dict]:
+    out: list[dict] = []
+    for c in (citations or [])[: max(1, max_items)]:
+        if not isinstance(c, dict):
+            continue
+        cid = str(c.get("citation_id") or "").strip()
+        if not cid:
+            continue
+        snippet = str(c.get("snippet_clean") or c.get("snippet") or c.get("chunk_full") or "").strip()
+        out.append(
+            {
+                "citation_id": cid,
+                "bubble_document_id": str(c.get("bubble_document_id") or "").strip(),
+                "source_type": str(c.get("source_type") or _source_type_from_document_id(str(c.get("bubble_document_id") or ""))).strip(),
+                "display_label": _sd_clean_text(c.get("display_label") or cid, 160),
+                "page_from": _safe_int(c.get("page_from"), 0),
+                "page_to": _safe_int(c.get("page_to"), 0),
+                "snippet": _sd_clean_text(snippet, 900),
+            }
+        )
+    return out
+
+
+def _sd_evidence_block_from_state_evidence(evidence: list[dict], max_context_chars: int = SMART_DIAGNOSTIC_MAX_CONTEXT_CHARS) -> str:
+    parts: list[str] = []
+    total = 0
+    for e in evidence or []:
+        if not isinstance(e, dict):
+            continue
+        cid = str(e.get("citation_id") or "").strip()
+        if not cid:
+            continue
+        body = str(e.get("snippet") or "").strip()
+        label = str(e.get("display_label") or cid).strip()
+        part = f"[{cid}] {label}\n{body}\n"
+        if total + len(part) > max_context_chars:
+            break
+        parts.append(part)
+        total += len(part)
+    return "\n".join(parts).strip()
+
+
+def _sd_schema(max_hypotheses: int = 4, max_options: int = 4) -> dict:
+    max_hypotheses = max(1, min(int(max_hypotheses or 4), 4))
+    max_options = max(1, min(int(max_options or 4), 4))
+    return {
+        "name": "smart_diagnostic_step_v1",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "status": {"type": "string", "enum": ["in_progress", "completed", "no_sources"]},
+                "final_ready": {"type": "boolean"},
+                "operator_summary": {"type": "string"},
+                "question": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "question_id": {"type": "string"},
+                        "question_number": {"type": "integer"},
+                        "question_type": {"type": "string", "enum": ["yes_no", "single_choice", "info"]},
+                        "question_text": {"type": "string"},
+                        "why_asked": {"type": "string"},
+                        "safety_level": {"type": "string", "enum": ["normal", "caution", "stop", "qualified_personnel"]},
+                        "safety_note": {"type": "string"},
+                        "options": {
+                            "type": "array",
+                            "maxItems": max_options,
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "id": {"type": "string"},
+                                    "label_it": {"type": "string"},
+                                    "label_en": {"type": "string"},
+                                },
+                                "required": ["id", "label_it", "label_en"],
+                            },
+                        },
+                        "target_hypotheses": {"type": "array", "items": {"type": "string"}, "maxItems": max_hypotheses},
+                    },
+                    "required": [
+                        "question_id",
+                        "question_number",
+                        "question_type",
+                        "question_text",
+                        "why_asked",
+                        "safety_level",
+                        "safety_note",
+                        "options",
+                        "target_hypotheses",
+                    ],
+                },
+                "hypotheses": {
+                    "type": "array",
+                    "maxItems": max_hypotheses,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "id": {"type": "string"},
+                            "rank": {"type": "integer"},
+                            "label": {"type": "string"},
+                            "description": {"type": "string"},
+                            "why": {"type": "string"},
+                            "probability_pct": {"type": "number"},
+                            "probability_band": {"type": "string", "enum": ["high", "medium", "low", "very_low", "unknown"]},
+                            "status": {"type": "string", "enum": ["open", "likely", "unlikely", "excluded"]},
+                            "checks": {"type": "array", "items": {"type": "string"}, "maxItems": 5},
+                            "evidence_ids": {"type": "array", "items": {"type": "string"}, "maxItems": 5},
+                        },
+                        "required": [
+                            "id",
+                            "rank",
+                            "label",
+                            "description",
+                            "why",
+                            "probability_pct",
+                            "probability_band",
+                            "status",
+                            "checks",
+                            "evidence_ids",
+                        ],
+                    },
+                },
+                "final_result": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "summary": {"type": "string"},
+                        "most_likely_hypothesis_id": {"type": "string"},
+                        "most_likely_label": {"type": "string"},
+                        "probability_pct": {"type": "number"},
+                        "probability_band": {"type": "string", "enum": ["high", "medium", "low", "very_low", "unknown"]},
+                        "recommended_checks": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
+                    },
+                    "required": ["summary", "most_likely_hypothesis_id", "most_likely_label", "probability_pct", "probability_band", "recommended_checks"],
+                },
+            },
+            "required": ["status", "final_ready", "operator_summary", "question", "hypotheses", "final_result"],
+        },
+    }
+
+
+def _sd_finalize_schema() -> dict:
+    return {
+        "name": "smart_diagnostic_finalize_v1",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "summary": {"type": "string"},
+                "most_likely_hypothesis_id": {"type": "string"},
+                "most_likely_label": {"type": "string"},
+                "probability_pct": {"type": "number"},
+                "probability_band": {"type": "string", "enum": ["high", "medium", "low", "very_low", "unknown"]},
+                "recommended_checks": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
+                "alternative_hypotheses": {
+                    "type": "array",
+                    "maxItems": 3,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "id": {"type": "string"},
+                            "label": {"type": "string"},
+                            "probability_pct": {"type": "number"},
+                            "probability_band": {"type": "string", "enum": ["high", "medium", "low", "very_low", "unknown"]},
+                        },
+                        "required": ["id", "label", "probability_pct", "probability_band"],
+                    },
+                },
+            },
+            "required": ["summary", "most_likely_hypothesis_id", "most_likely_label", "probability_pct", "probability_band", "recommended_checks", "alternative_hypotheses"],
+        },
+    }
+
+
+def _sd_empty_question(question_number: int = 0) -> dict:
+    return {
+        "question_id": "",
+        "question_number": int(question_number or 0),
+        "question_type": "info",
+        "question_text": "",
+        "why_asked": "",
+        "safety_level": "normal",
+        "safety_note": "",
+        "options": [],
+        "target_hypotheses": [],
+    }
+
+
+def _sd_no_sources_response(language: str, session_id: str, symptom_text: str, debug: bool = False) -> dict:
+    msg = (
+        "I cannot find enough indexed machine knowledge to start a guided diagnosis."
+        if language == "en"
+        else "Non trovo conoscenza indicizzata sufficiente per avviare una diagnosi guidata."
+    )
+    state = {
+        "mode": "smart_diagnostic_v1",
+        "session_id": session_id,
+        "status": "no_sources",
+        "language": language,
+        "symptom_text": symptom_text,
+        "history": [],
+        "hypotheses": [],
+        "evidence": [],
+    }
+    return {
+        "ok": True,
+        "status": "no_sources",
+        "final_ready": False,
+        "language": language,
+        "session_state_json": _sd_json_dumps(state),
+        "question": _sd_empty_question(0),
+        "hypotheses": [],
+        "citations": [],
+        "rg_links": [],
+        "citations_json": "[]",
+        "rg_links_json": "[]",
+        "message": msg,
+        "operator_summary": msg,
+        "meta": {"mode": "smart_diagnostic_v1", "reason": "no_sources"},
+    }
+
+
+def _sd_fallback_step(*, symptom_text: str, language: str, state: dict, answer_label: str = "") -> dict:
+    is_en = language == "en"
+    history = list((state or {}).get("history") or [])
+    qn = min(len(history) + 1, _sd_clamp_int((state or {}).get("max_questions"), 6, 1, 8))
+    next_qn = min(qn + 1, _sd_clamp_int((state or {}).get("max_questions"), 6, 1, 8))
+    final_ready = len(history) >= 2
+
+    hypotheses = list((state or {}).get("hypotheses") or [])[:4]
+    if not hypotheses:
+        if is_en:
+            labels = ["Missing automatic-cycle consent/interlock", "Mode or sequence error", "Power supply or drive issue", "Other / not determined"]
+        else:
+            labels = ["Consenso/interlock ciclo automatico mancante", "Errore modalità o sequenza ciclo", "Problema alimentazione o azionamento", "Altro/non determinato"]
+        probs = [40, 25, 20, 15]
+        hypotheses = [
+            {
+                "id": f"H{i+1}",
+                "rank": i + 1,
+                "label": labels[i],
+                "description": labels[i],
+                "why": ("Initial fallback hypothesis." if is_en else "Ipotesi fallback iniziale."),
+                "probability_pct": probs[i],
+                "probability_band": _sd_probability_band(probs[i]),
+                "status": _sd_normalize_hypothesis_status("", probs[i]),
+                "checks": [],
+                "evidence_ids": [],
+            }
+            for i in range(4)
+        ]
+
+    if final_ready:
+        best = sorted(hypotheses, key=lambda x: -float(x.get("probability_pct") or 0.0))[0]
+        return {
+            "status": "completed",
+            "final_ready": True,
+            "operator_summary": "Fallback completion." if is_en else "Conclusione fallback.",
+            "question": _sd_empty_question(next_qn),
+            "hypotheses": hypotheses,
+            "final_result": {
+                "summary": ("Guided diagnostic completed with the available answers." if is_en else "Diagnosi guidata completata con le risposte disponibili."),
+                "most_likely_hypothesis_id": str(best.get("id") or "H1"),
+                "most_likely_label": str(best.get("label") or ""),
+                "probability_pct": float(best.get("probability_pct") or 0.0),
+                "probability_band": _sd_normalize_band(best.get("probability_band"), best.get("probability_pct")),
+                "recommended_checks": list(best.get("checks") or [])[:5],
+            },
+        }
+
+    if is_en:
+        question_text = "Does the fault always occur at the same point of the automatic sequence?"
+        why_asked = "This distinguishes a repeatable sequence/consent fault from an intermittent or supply-related issue."
+        safety_note = "Observe only from a safe position and do not bypass guards, emergency stops or safety consents."
+    else:
+        question_text = "Il difetto si presenta sempre nello stesso punto del ciclo automatico?"
+        why_asked = "Serve a distinguere un problema ripetibile di sequenza/consenso da un problema intermittente o di alimentazione."
+        safety_note = "Osservare solo da posizione sicura e non bypassare ripari, emergenze o consensi di sicurezza."
+
+    return {
+        "status": "in_progress",
+        "final_ready": False,
+        "operator_summary": "Fallback next question." if is_en else "Prossima domanda fallback.",
+        "question": {
+            "question_id": f"Q{next_qn}",
+            "question_number": next_qn,
+            "question_type": "yes_no",
+            "question_text": question_text,
+            "why_asked": why_asked,
+            "safety_level": "caution",
+            "safety_note": safety_note,
+            "options": _sd_default_yes_no_options(language),
+            "target_hypotheses": [str(h.get("id") or "") for h in hypotheses[:3]],
+        },
+        "hypotheses": hypotheses,
+        "final_result": {"summary": "", "most_likely_hypothesis_id": "", "most_likely_label": "", "probability_pct": 0, "probability_band": "unknown", "recommended_checks": []},
+    }
+
+
+def _sd_normalize_options(options: list[dict], question_type: str, language: str) -> list[dict]:
+    out: list[dict] = []
+    seen: set[str] = set()
+    for opt in options or []:
+        if not isinstance(opt, dict):
+            continue
+        oid = re.sub(r"[^a-zA-Z0-9_\-]+", "_", str(opt.get("id") or "").strip().lower()).strip("_")
+        if not oid or oid in seen:
+            continue
+        seen.add(oid)
+        label_it = _sd_clean_text(opt.get("label_it") or opt.get("label") or oid, 120)
+        label_en = _sd_clean_text(opt.get("label_en") or opt.get("label") or oid, 120)
+        out.append({"id": oid, "label_it": label_it, "label_en": label_en})
+        if len(out) >= 4:
+            break
+    if question_type == "yes_no":
+        base = _sd_default_yes_no_options(language)
+        # Always use canonical yes/no/unknown buttons for yes_no questions.
+        return base
+    if question_type == "info":
+        return [{"id": "continue", "label_it": "Continua", "label_en": "Continue"}]
+    if not out:
+        return _sd_default_yes_no_options(language)
+    return out[:4]
+
+
+def _sd_normalize_question(question: dict, *, number_default: int, language: str) -> dict:
+    q = dict(question or {})
+    qtype = _sd_normalize_question_type(q.get("question_type"))
+    qid = _sd_clean_text(q.get("question_id") or f"Q{number_default}", 40)
+    qn = _sd_clamp_int(q.get("question_number"), number_default, 0, 99)
+    options = _sd_normalize_options(q.get("options") or [], qtype, language)
+    return {
+        "question_id": qid,
+        "question_number": qn,
+        "question_type": qtype,
+        "question_text": _sd_clean_text(q.get("question_text"), 900),
+        "why_asked": _sd_clean_text(q.get("why_asked"), 900),
+        "safety_level": _sd_normalize_safety_level(q.get("safety_level")),
+        "safety_note": _sd_clean_text(q.get("safety_note"), 900),
+        "options": options,
+        "target_hypotheses": _unique_non_empty_strings([str(x or "") for x in (q.get("target_hypotheses") or [])], limit=4),
+    }
+
+
+def _sd_normalize_hypotheses(items: list[dict], *, language: str, max_hypotheses: int = 4) -> list[dict]:
+    out: list[dict] = []
+    used: set[str] = set()
+    for idx, raw in enumerate(items or [], start=1):
+        if not isinstance(raw, dict):
+            continue
+        hid = _sd_clean_text(raw.get("id") or f"H{idx}", 40)
+        if not hid or hid in used:
+            hid = f"H{idx}"
+        used.add(hid)
+        pct = max(0.0, min(100.0, float(raw.get("probability_pct") or 0.0)))
+        band = _sd_normalize_band(raw.get("probability_band"), pct)
+        status = _sd_normalize_hypothesis_status(raw.get("status"), pct)
+        checks = _unique_non_empty_strings([_sd_clean_text(x, 180) for x in (raw.get("checks") or [])], limit=5)
+        evidence_ids = _unique_non_empty_strings([str(x or "").strip() for x in (raw.get("evidence_ids") or [])], limit=5)
+        out.append(
+            {
+                "id": hid,
+                "rank": _sd_clamp_int(raw.get("rank"), idx, 1, max_hypotheses),
+                "label": _sd_clean_text(raw.get("label") or hid, 180),
+                "description": _sd_clean_text(raw.get("description") or raw.get("label") or "", 500),
+                "why": _sd_clean_text(raw.get("why"), 900),
+                "probability_pct": round(pct, 1),
+                "probability_band": band,
+                "status": status,
+                "checks": checks,
+                "evidence_ids": evidence_ids,
+                "checks_json": _sd_json_dumps(checks),
+                "evidence_ids_json": _sd_json_dumps(evidence_ids),
+                "citations_json": _sd_json_dumps(evidence_ids),
+                "score_raw": round(pct / 100.0, 4),
+            }
+        )
+        if len(out) >= max_hypotheses:
+            break
+
+    if not out:
+        out = _sd_fallback_step(symptom_text="", language=language, state={}, answer_label="").get("hypotheses") or []
+
+    out.sort(key=lambda x: (int(x.get("rank") or 999), -float(x.get("probability_pct") or 0.0), str(x.get("id") or "")))
+    for i, h in enumerate(out, start=1):
+        h["rank"] = i
+    return out[:max_hypotheses]
+
+
+def _sd_normalize_step(parsed: dict, *, language: str, question_number_default: int, max_hypotheses: int) -> dict:
+    parsed = dict(parsed or {})
+    status = str(parsed.get("status") or "in_progress").strip().lower()
+    if status not in {"in_progress", "completed", "no_sources"}:
+        status = "in_progress"
+    final_ready = _sd_bool(parsed.get("final_ready")) or status == "completed"
+    q = _sd_normalize_question(parsed.get("question") or {}, number_default=question_number_default, language=language)
+    hyps = _sd_normalize_hypotheses(parsed.get("hypotheses") or [], language=language, max_hypotheses=max_hypotheses)
+
+    fr = dict(parsed.get("final_result") or {})
+    if final_ready and not fr.get("most_likely_label") and hyps:
+        best = sorted(hyps, key=lambda x: -float(x.get("probability_pct") or 0.0))[0]
+        fr = {
+            "summary": parsed.get("operator_summary") or "",
+            "most_likely_hypothesis_id": best.get("id") or "",
+            "most_likely_label": best.get("label") or "",
+            "probability_pct": best.get("probability_pct") or 0,
+            "probability_band": best.get("probability_band") or "unknown",
+            "recommended_checks": best.get("checks") or [],
+        }
+    final_result = {
+        "summary": _sd_clean_text(fr.get("summary"), 1200),
+        "most_likely_hypothesis_id": _sd_clean_text(fr.get("most_likely_hypothesis_id"), 40),
+        "most_likely_label": _sd_clean_text(fr.get("most_likely_label"), 180),
+        "probability_pct": round(max(0.0, min(100.0, float(fr.get("probability_pct") or 0.0))), 1),
+        "probability_band": _sd_normalize_band(fr.get("probability_band"), fr.get("probability_pct")),
+        "recommended_checks": _unique_non_empty_strings([_sd_clean_text(x, 180) for x in (fr.get("recommended_checks") or [])], limit=8),
+    }
+
+    if final_ready:
+        q = _sd_empty_question(q.get("question_number") or question_number_default)
+        status = "completed"
+
+    return {
+        "status": status,
+        "final_ready": final_ready,
+        "operator_summary": _sd_clean_text(parsed.get("operator_summary"), 1200),
+        "question": q,
+        "hypotheses": hyps,
+        "final_result": final_result,
+    }
+
+
+def _sd_llm_step_start(
+    *,
+    symptom_text: str,
+    language: str,
+    max_questions: int,
+    max_hypotheses: int,
+    evidence_block: str,
+    evidence_ids: list[str],
+    context_label: str = "",
+) -> dict:
+    is_en = language == "en"
+    system_msg = (
+        "You are MachineMind Smart Diagnostic, a guided diagnostic engine for industrial machinery. "
+        "You are NOT a free chat. You must create a professional guided diagnostic session with one closed question at a time. "
+        "Use ONLY the provided indexed machine evidence. Do not invent machine-specific facts. "
+        "Generate 2-4 plausible hypotheses with estimated probabilities from evidence + symptom. "
+        "Ask the next best closed question that separates the leading hypotheses. "
+        "Questions must be practical for an operator/technician and answerable as yes/no or single-choice. "
+        "Never instruct to bypass guards, interlocks, emergency stops, safety devices, or legal safety procedures. "
+        "Use safety_level=caution/stop/qualified_personnel when appropriate. "
+        "Reply in the requested language for all user-facing text. "
+        "Probabilities are evidence-based estimates, not statistical truth. "
+        "Use only citation_ids present in EVIDENCE_IDS."
+    )
+    user_msg = (
+        f"RESPONSE_LANGUAGE: {language}\n"
+        f"MAX_QUESTIONS: {max_questions}\n"
+        f"MAX_HYPOTHESES: {max_hypotheses}\n"
+        f"CONTEXT_LABEL: {context_label}\n\n"
+        f"SYMPTOM:\n{symptom_text}\n\n"
+        f"EVIDENCE_IDS:\n{json.dumps(evidence_ids, ensure_ascii=False)}\n\n"
+        f"INDEXED_MACHINE_EVIDENCE:\n{evidence_block}\n\n"
+        "Return JSON. Start the guided diagnostic. The first question should be the most discriminating safe observation. "
+        "If evidence is insufficient, return no_sources."
+    )
+    try:
+        return _openai_chat_json_models(
+            [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            models=[SMART_DIAGNOSTIC_MODEL, DIAGNOSTIC_EVIDENCE_MODEL, OPENAI_CHAT_MODEL],
+            json_schema=_sd_schema(max_hypotheses=max_hypotheses, max_options=4),
+            timeout=SMART_DIAGNOSTIC_LLM_TIMEOUT,
+        )
+    except Exception as e:
+        print("SMART_DIAGNOSTIC_START_LLM_FAIL", str(e)[:500])
+        return _sd_fallback_step(symptom_text=symptom_text, language=language, state={}, answer_label="")
+
+
+def _sd_llm_step_answer(*, state: dict, answer: dict, language: str, max_hypotheses: int) -> dict:
+    symptom_text = str(state.get("symptom_text") or "").strip()
+    max_questions = _sd_clamp_int(state.get("max_questions"), SMART_DIAGNOSTIC_MAX_QUESTIONS, 1, 8)
+    history = list(state.get("history") or [])
+    evidence = list(state.get("evidence") or [])
+    evidence_ids = [str(e.get("citation_id") or "") for e in evidence if isinstance(e, dict)]
+    evidence_block = _sd_evidence_block_from_state_evidence(evidence)
+    current_hypotheses = list(state.get("hypotheses") or [])
+    current_question = dict(state.get("current_question") or {})
+    question_number_default = _sd_clamp_int(current_question.get("question_number"), len(history) + 1, 1, 99) + 1
+
+    system_msg = (
+        "You are MachineMind Smart Diagnostic, a guided diagnostic engine for industrial machinery. "
+        "You are NOT a free chat. Update the diagnostic session after the user's closed answer. "
+        "Use ONLY the provided state, answer and indexed evidence. Do not invent machine-specific facts. "
+        "Update probabilities and ask ONE next closed question, unless the diagnosis is ready to finalize. "
+        "Choose the next question to discriminate the top remaining hypotheses. "
+        "Do not repeat already asked questions. Do not ask unsafe actions. "
+        "Never instruct to bypass guards, interlocks, emergency stops, safety devices, or legal safety procedures. "
+        "Reply in the requested language for all user-facing text. "
+        "Use only citation_ids present in EVIDENCE_IDS."
+    )
+    user_msg = (
+        f"RESPONSE_LANGUAGE: {language}\n"
+        f"MAX_QUESTIONS: {max_questions}\n"
+        f"MAX_HYPOTHESES: {max_hypotheses}\n\n"
+        f"SYMPTOM:\n{symptom_text}\n\n"
+        f"CURRENT_QUESTION_JSON:\n{json.dumps(current_question, ensure_ascii=False)}\n\n"
+        f"USER_ANSWER_JSON:\n{json.dumps(answer, ensure_ascii=False)}\n\n"
+        f"ANSWER_HISTORY_JSON:\n{json.dumps(history, ensure_ascii=False)}\n\n"
+        f"CURRENT_HYPOTHESES_JSON:\n{json.dumps(current_hypotheses, ensure_ascii=False)}\n\n"
+        f"EVIDENCE_IDS:\n{json.dumps(evidence_ids, ensure_ascii=False)}\n\n"
+        f"INDEXED_MACHINE_EVIDENCE:\n{evidence_block}\n\n"
+        "Return JSON. If enough information exists, set status=completed and final_ready=true. "
+        "Otherwise set status=in_progress and return the next closed question. "
+        "If max_questions is reached, finalize with the best supported result."
+    )
+    try:
+        return _openai_chat_json_models(
+            [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            models=[SMART_DIAGNOSTIC_MODEL, DIAGNOSTIC_EVIDENCE_MODEL, OPENAI_CHAT_MODEL],
+            json_schema=_sd_schema(max_hypotheses=max_hypotheses, max_options=4),
+            timeout=SMART_DIAGNOSTIC_LLM_TIMEOUT,
+        )
+    except Exception as e:
+        print("SMART_DIAGNOSTIC_ANSWER_LLM_FAIL", str(e)[:500])
+        return _sd_fallback_step(symptom_text=symptom_text, language=language, state=state, answer_label=str(answer.get("label") or ""))
+
+
+def _sd_llm_finalize(*, state: dict, language: str) -> dict:
+    symptom_text = str(state.get("symptom_text") or "").strip()
+    hypotheses = list(state.get("hypotheses") or [])
+    history = list(state.get("history") or [])
+    evidence = list(state.get("evidence") or [])
+    evidence_block = _sd_evidence_block_from_state_evidence(evidence)
+    system_msg = (
+        "You finalize a MachineMind Smart Diagnostic guided session. "
+        "Use only the symptom, answer history, current hypotheses and indexed evidence. "
+        "Return a concise technical conclusion with recommended checks. "
+        "Do not invent facts. Do not claim statistical certainty. Reply in the requested language."
+    )
+    user_msg = (
+        f"RESPONSE_LANGUAGE: {language}\n\n"
+        f"SYMPTOM:\n{symptom_text}\n\n"
+        f"ANSWER_HISTORY_JSON:\n{json.dumps(history, ensure_ascii=False)}\n\n"
+        f"CURRENT_HYPOTHESES_JSON:\n{json.dumps(hypotheses, ensure_ascii=False)}\n\n"
+        f"INDEXED_MACHINE_EVIDENCE:\n{evidence_block}\n\n"
+        "Return JSON."
+    )
+    try:
+        return _openai_chat_json_models(
+            [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
+            models=[SMART_DIAGNOSTIC_MODEL, DIAGNOSTIC_EVIDENCE_MODEL, OPENAI_CHAT_MODEL],
+            json_schema=_sd_finalize_schema(),
+            timeout=SMART_DIAGNOSTIC_LLM_TIMEOUT,
+        )
+    except Exception as e:
+        print("SMART_DIAGNOSTIC_FINALIZE_LLM_FAIL", str(e)[:500])
+        best = sorted(hypotheses, key=lambda x: -float(x.get("probability_pct") or 0.0))[0] if hypotheses else {}
+        return {
+            "summary": "Guided diagnostic completed." if language == "en" else "Diagnosi guidata completata.",
+            "most_likely_hypothesis_id": str(best.get("id") or ""),
+            "most_likely_label": str(best.get("label") or ""),
+            "probability_pct": float(best.get("probability_pct") or 0.0),
+            "probability_band": _sd_normalize_band(best.get("probability_band"), best.get("probability_pct")),
+            "recommended_checks": list(best.get("checks") or [])[:8],
+            "alternative_hypotheses": [],
+        }
+
+
+def _sd_flatten_question(resp: dict, question: dict) -> None:
+    q = dict(question or {})
+    options = list(q.get("options") or [])[:4]
+    resp.update(
+        {
+            "question_id": str(q.get("question_id") or ""),
+            "question_number": _safe_int(q.get("question_number"), 0),
+            "question_type": _sd_normalize_question_type(q.get("question_type")),
+            "question_text": str(q.get("question_text") or ""),
+            "why_asked": str(q.get("why_asked") or ""),
+            "safety_level": _sd_normalize_safety_level(q.get("safety_level")),
+            "safety_note": str(q.get("safety_note") or ""),
+            "option_count": len(options),
+            "target_hypotheses_json": _sd_json_dumps(q.get("target_hypotheses") or []),
+            "options_json": _sd_json_dumps(options),
+        }
+    )
+    for i in range(1, 5):
+        opt = options[i - 1] if i - 1 < len(options) else {}
+        resp[f"option_{i}_id"] = str(opt.get("id") or "")
+        resp[f"option_{i}_label_it"] = str(opt.get("label_it") or "")
+        resp[f"option_{i}_label_en"] = str(opt.get("label_en") or "")
+
+
+def _sd_flatten_hypotheses(resp: dict, hypotheses: list[dict]) -> None:
+    hyps = list(hypotheses or [])[:4]
+    resp["hypotheses_json"] = _sd_json_dumps(hyps)
+    for i in range(1, 5):
+        h = hyps[i - 1] if i - 1 < len(hyps) else {}
+        prefix = f"h{i}"
+        resp[f"{prefix}_id"] = str(h.get("id") or "")
+        resp[f"{prefix}_rank"] = _safe_int(h.get("rank"), i)
+        resp[f"{prefix}_label"] = str(h.get("label") or "")
+        resp[f"{prefix}_description"] = str(h.get("description") or "")
+        resp[f"{prefix}_why"] = str(h.get("why") or "")
+        resp[f"{prefix}_probability_pct"] = float(h.get("probability_pct") or 0.0)
+        resp[f"{prefix}_probability_band"] = _sd_normalize_band(h.get("probability_band"), h.get("probability_pct"))
+        resp[f"{prefix}_status"] = _sd_normalize_hypothesis_status(h.get("status"), h.get("probability_pct"))
+        resp[f"{prefix}_score_raw"] = float(h.get("score_raw") or (float(h.get("probability_pct") or 0.0) / 100.0))
+        resp[f"{prefix}_checks_json"] = _sd_json_dumps(h.get("checks") or [])
+        resp[f"{prefix}_evidence_ids_json"] = _sd_json_dumps(h.get("evidence_ids") or [])
+        resp[f"{prefix}_citations_json"] = _sd_json_dumps(h.get("evidence_ids") or [])
+
+
+def _sd_flatten_citations(resp: dict, citations: list[dict], rg_links: list[dict]) -> None:
+    links_by_id = {str(x.get("citation_id") or "").strip(): x for x in (rg_links or []) if isinstance(x, dict)}
+    cits = [c for c in (citations or []) if isinstance(c, dict)]
+    resp["citations_json"] = _sd_json_dumps(cits)
+    resp["rg_links_json"] = _sd_json_dumps(rg_links or [])
+    for i in range(1, 7):
+        c = cits[i - 1] if i - 1 < len(cits) else {}
+        cid = str(c.get("citation_id") or "").strip()
+        link = links_by_id.get(cid) or {}
+        prefix = f"c{i}"
+        resp[f"{prefix}_citation_id"] = cid
+        resp[f"{prefix}_bubble_document_id"] = str(c.get("bubble_document_id") or "")
+        resp[f"{prefix}_source_type"] = str(c.get("source_type") or "")
+        resp[f"{prefix}_source_id"] = str(c.get("source_id") or "")
+        resp[f"{prefix}_display_label"] = str(c.get("display_label") or "")
+        resp[f"{prefix}_display_title"] = str(c.get("display_title") or "")
+        resp[f"{prefix}_display_location"] = str(c.get("display_location") or "")
+        resp[f"{prefix}_snippet_clean"] = str(c.get("snippet_clean") or c.get("snippet") or "")
+        resp[f"{prefix}_page_from"] = _safe_int(c.get("page_from"), 0)
+        resp[f"{prefix}_page_to"] = _safe_int(c.get("page_to"), 0)
+        resp[f"{prefix}_url"] = str(link.get("url") or c.get("url") or "")
+        resp[f"{prefix}_is_structured_source"] = bool(c.get("is_structured_source"))
+
+
+def _sd_response_from_step(
+    *,
+    session_id: str,
+    company_id: str,
+    machine_id: str,
+    symptom_text: str,
+    language: str,
+    state: dict,
+    step: dict,
+    citations: list[dict],
+    rg_links: list[dict],
+    debug: bool = False,
+) -> dict:
+    status = str(step.get("status") or "in_progress").strip().lower()
+    final_ready = bool(step.get("final_ready")) or status == "completed"
+    question = dict(step.get("question") or {})
+    hypotheses = list(step.get("hypotheses") or [])
+    final_result = dict(step.get("final_result") or {})
+
+    current_state = dict(state or {})
+    current_state.update(
+        {
+            "mode": "smart_diagnostic_v1",
+            "session_id": session_id,
+            "company_id": company_id,
+            "machine_id": machine_id,
+            "status": status,
+            "language": language,
+            "symptom_text": symptom_text,
+            "current_question": question if not final_ready else {},
+            "current_step_number": _safe_int(question.get("question_number"), _safe_int(current_state.get("current_step_number"), 0)),
+            "hypotheses": hypotheses,
+            "final_result": final_result if final_ready else {},
+            "citations": citations,
+            "rg_links": rg_links,
+        }
+    )
+
+    resp = {
+        "ok": True,
+        "status": status,
+        "final_ready": final_ready,
+        "language": language,
+        "session_state_json": _sd_json_dumps(current_state),
+        "question": question,
+        "hypotheses": hypotheses,
+        "final_result": final_result if final_ready else {},
+        "citations": citations,
+        "rg_links": rg_links,
+        "operator_summary": str(step.get("operator_summary") or ""),
+        "final_result_json": _sd_json_dumps(final_result if final_ready else {}),
+        "final_summary_text": str(final_result.get("summary") or "") if final_ready else "",
+        "final_most_likely_label": str(final_result.get("most_likely_label") or "") if final_ready else "",
+        "final_probability_pct": float(final_result.get("probability_pct") or 0.0) if final_ready else 0.0,
+        "final_probability_band": _sd_normalize_band(final_result.get("probability_band"), final_result.get("probability_pct")) if final_ready else "unknown",
+        "final_recommended_checks_json": _sd_json_dumps(final_result.get("recommended_checks") or []) if final_ready else "[]",
+        "meta": {
+            "mode": "smart_diagnostic_v1",
+            "model": SMART_DIAGNOSTIC_MODEL,
+            "max_questions": _safe_int(current_state.get("max_questions"), SMART_DIAGNOSTIC_MAX_QUESTIONS),
+            "max_hypotheses": len(hypotheses),
+        },
+    }
+    _sd_flatten_question(resp, question)
+    _sd_flatten_hypotheses(resp, hypotheses)
+    _sd_flatten_citations(resp, citations, rg_links)
+    if debug:
+        resp["debug"] = {
+            "state_keys": sorted(list(current_state.keys())),
+            "evidence_count": len(current_state.get("evidence") or []),
+            "citation_count": len(citations or []),
+        }
+    return resp
+
+
+@app.post("/v1/ai/smart-diagnostic/start")
+def smart_diagnostic_start_v1(
+    payload: SmartDiagnosticStartRequest,
+    x_ai_internal_secret: Optional[str] = Header(default=None),
+):
+    _sd_auth_guard(x_ai_internal_secret)
+
+    company_id = (payload.company_id or "").strip()
+    machine_id = (payload.machine_id or "").strip()
+    session_id = (payload.session_id or "").strip()
+    symptom_text = re.sub(r"\s+", " ", str(payload.symptom_text or "")).strip()
+    if not (company_id and machine_id and session_id and symptom_text):
+        raise HTTPException(status_code=400, detail="Missing company_id/machine_id/session_id/symptom_text")
+
+    language = _sd_language(payload.language, symptom_text)
+    opts = payload.options or SmartDiagnosticOptions()
+    max_questions = _sd_clamp_int(opts.max_questions, SMART_DIAGNOSTIC_MAX_QUESTIONS, 1, 8)
+    max_hypotheses = _sd_clamp_int(opts.max_hypotheses, SMART_DIAGNOSTIC_MAX_HYPOTHESES, 2, 4)
+    top_k = _sd_clamp_int(opts.top_k, SMART_DIAGNOSTIC_TOP_K, 3, 12)
+
+    try:
+        retrieval = _diagnostic_evidence_pipeline(
+            q=symptom_text,
+            company_id=company_id,
+            machine_id=machine_id,
+            candidate_k=max(ROOT_CAUSE_EXTRA_CANDIDATE_K, top_k * 8),
+            top_k=top_k,
+            max_causes=max_hypotheses,
+            doc_ids=None,
+            bubble_document_id=None,
+            debug=bool(payload.debug),
+            planner_mode="root_cause",
+            base_threshold=ASK_SIM_THRESHOLD,
+        )
+    except Exception as e:
+        print("SMART_DIAGNOSTIC_RETRIEVAL_FAIL", str(e)[:500])
+        retrieval = {"citations": [], "prompt_citations": [], "diagnostic_matrix": {}, "similarity_max": None}
+
+    raw_citations = list(retrieval.get("prompt_citations") or retrieval.get("citations") or [])
+    if not raw_citations:
+        return _sd_no_sources_response(language, session_id, symptom_text, debug=bool(payload.debug))
+
+    response_citations = _sanitize_citations_for_response(raw_citations, company_id=company_id)
+    try:
+        rg_links = _build_rg_links(company_id, response_citations)
+    except Exception as e:
+        print("SMART_DIAGNOSTIC_RG_LINKS_FAIL", str(e)[:300])
+        rg_links = []
+
+    evidence_state = _sd_compact_evidence_for_state(
+        response_citations,
+        max_items=max(1, min(SMART_DIAGNOSTIC_MAX_EVIDENCE_IN_STATE, top_k)),
+    )
+    evidence_block = _build_sources_block_from_citations(
+        raw_citations,
+        max_context_chars=SMART_DIAGNOSTIC_MAX_CONTEXT_CHARS,
+        prefer_chunk_full=True,
+    )
+    evidence_ids = [str(c.get("citation_id") or "").strip() for c in raw_citations if c.get("citation_id")]
+    context_label = ""
+    if payload.context:
+        context_label = str(payload.context.context_label or payload.context.context_type or "").strip()
+
+    parsed = _sd_llm_step_start(
+        symptom_text=symptom_text,
+        language=language,
+        max_questions=max_questions,
+        max_hypotheses=max_hypotheses,
+        evidence_block=evidence_block,
+        evidence_ids=evidence_ids,
+        context_label=context_label,
+    )
+    step = _sd_normalize_step(parsed, language=language, question_number_default=1, max_hypotheses=max_hypotheses)
+
+    state = {
+        "mode": "smart_diagnostic_v1",
+        "session_id": session_id,
+        "company_id": company_id,
+        "machine_id": machine_id,
+        "status": step.get("status"),
+        "language": language,
+        "symptom_text": symptom_text,
+        "context": payload.context.dict() if payload.context else {},
+        "max_questions": max_questions,
+        "max_hypotheses": max_hypotheses,
+        "top_k": top_k,
+        "history": [],
+        "evidence": evidence_state,
+        "retrieval_meta": {
+            "similarity_max": retrieval.get("similarity_max"),
+            "diagnostic_matrix": retrieval.get("diagnostic_matrix") or {},
+        },
+    }
+
+    return _sd_response_from_step(
+        session_id=session_id,
+        company_id=company_id,
+        machine_id=machine_id,
+        symptom_text=symptom_text,
+        language=language,
+        state=state,
+        step=step,
+        citations=response_citations,
+        rg_links=rg_links,
+        debug=bool(payload.debug),
+    )
+
+
+@app.post("/v1/ai/smart-diagnostic/answer")
+def smart_diagnostic_answer_v1(
+    payload: SmartDiagnosticAnswerRequest,
+    x_ai_internal_secret: Optional[str] = Header(default=None),
+):
+    _sd_auth_guard(x_ai_internal_secret)
+
+    company_id = (payload.company_id or "").strip()
+    machine_id = (payload.machine_id or "").strip()
+    session_id = (payload.session_id or "").strip()
+    question_id = (payload.question_id or "").strip()
+    if not (company_id and machine_id and session_id and question_id):
+        raise HTTPException(status_code=400, detail="Missing company_id/machine_id/session_id/question_id")
+
+    state = _sd_parse_json(payload.state_json)
+    if not state:
+        raise HTTPException(status_code=400, detail="Missing or invalid state_json")
+
+    symptom_text = str(state.get("symptom_text") or "").strip()
+    language = _sd_language(payload.language or state.get("language"), symptom_text)
+    max_hypotheses = _sd_clamp_int(state.get("max_hypotheses"), SMART_DIAGNOSTIC_MAX_HYPOTHESES, 2, 4)
+    answer_value = str((payload.answer.value or "")).strip()
+    answer_api_value = str((payload.answer.api_value or payload.answer.value or "")).strip()
+    answer_label = str((payload.answer.label or answer_api_value or answer_value)).strip()
+    answer = {
+        "question_id": question_id,
+        "value": answer_value,
+        "api_value": answer_api_value,
+        "label": answer_label,
+        "free_text": str(payload.answer.free_text or "").strip(),
+    }
+
+    history = list(state.get("history") or [])
+    current_question = dict(state.get("current_question") or {})
+    history.append({"question": current_question, "answer": answer})
+    state["history"] = history
+
+    parsed = _sd_llm_step_answer(state=state, answer=answer, language=language, max_hypotheses=max_hypotheses)
+    question_number_default = _sd_clamp_int((current_question or {}).get("question_number"), len(history), 1, 99) + 1
+    step = _sd_normalize_step(parsed, language=language, question_number_default=question_number_default, max_hypotheses=max_hypotheses)
+
+    response_citations = list(state.get("citations") or [])
+    if not response_citations and state.get("evidence"):
+        # Keep response citations displayable even when the previous state had only compact evidence.
+        response_citations = []
+        for e in state.get("evidence") or []:
+            if not isinstance(e, dict):
+                continue
+            response_citations.append(
+                {
+                    "citation_id": str(e.get("citation_id") or ""),
+                    "bubble_document_id": str(e.get("bubble_document_id") or ""),
+                    "source_type": str(e.get("source_type") or ""),
+                    "display_label": str(e.get("display_label") or ""),
+                    "page_from": _safe_int(e.get("page_from"), 0),
+                    "page_to": _safe_int(e.get("page_to"), 0),
+                    "snippet_clean": str(e.get("snippet") or ""),
+                    "is_structured_source": _is_structured_source_key(str(e.get("bubble_document_id") or "")),
+                }
+            )
+    rg_links = list(state.get("rg_links") or [])
+
+    return _sd_response_from_step(
+        session_id=session_id,
+        company_id=company_id,
+        machine_id=machine_id,
+        symptom_text=symptom_text,
+        language=language,
+        state=state,
+        step=step,
+        citations=response_citations,
+        rg_links=rg_links,
+        debug=bool(payload.debug),
+    )
+
+
+@app.post("/v1/ai/smart-diagnostic/finalize")
+def smart_diagnostic_finalize_v1(
+    payload: SmartDiagnosticFinalizeRequest,
+    x_ai_internal_secret: Optional[str] = Header(default=None),
+):
+    _sd_auth_guard(x_ai_internal_secret)
+
+    company_id = (payload.company_id or "").strip()
+    machine_id = (payload.machine_id or "").strip()
+    session_id = (payload.session_id or "").strip()
+    if not (company_id and machine_id and session_id):
+        raise HTTPException(status_code=400, detail="Missing company_id/machine_id/session_id")
+
+    state = _sd_parse_json(payload.state_json)
+    if not state:
+        raise HTTPException(status_code=400, detail="Missing or invalid state_json")
+
+    symptom_text = str(state.get("symptom_text") or "").strip()
+    language = _sd_language(payload.language or state.get("language"), symptom_text)
+    final = _sd_llm_finalize(state=state, language=language)
+    hyps = _sd_normalize_hypotheses(state.get("hypotheses") or [], language=language, max_hypotheses=_sd_clamp_int(state.get("max_hypotheses"), 4, 2, 4))
+    if not final.get("most_likely_label") and hyps:
+        best = sorted(hyps, key=lambda x: -float(x.get("probability_pct") or 0.0))[0]
+        final["most_likely_hypothesis_id"] = best.get("id") or ""
+        final["most_likely_label"] = best.get("label") or ""
+        final["probability_pct"] = best.get("probability_pct") or 0
+        final["probability_band"] = best.get("probability_band") or "unknown"
+        final["recommended_checks"] = best.get("checks") or []
+
+    step = _sd_normalize_step(
+        {
+            "status": "completed",
+            "final_ready": True,
+            "operator_summary": str(final.get("summary") or ""),
+            "question": _sd_empty_question(_safe_int(state.get("current_step_number"), 0)),
+            "hypotheses": hyps,
+            "final_result": {
+                "summary": final.get("summary") or "",
+                "most_likely_hypothesis_id": final.get("most_likely_hypothesis_id") or "",
+                "most_likely_label": final.get("most_likely_label") or "",
+                "probability_pct": final.get("probability_pct") or 0,
+                "probability_band": final.get("probability_band") or "unknown",
+                "recommended_checks": final.get("recommended_checks") or [],
+            },
+        },
+        language=language,
+        question_number_default=_safe_int(state.get("current_step_number"), 0),
+        max_hypotheses=len(hyps) or 4,
+    )
+
+    response_citations = list(state.get("citations") or [])
+    rg_links = list(state.get("rg_links") or [])
+    return _sd_response_from_step(
+        session_id=session_id,
+        company_id=company_id,
+        machine_id=machine_id,
+        symptom_text=symptom_text,
+        language=language,
+        state=state,
+        step=step,
+        citations=response_citations,
+        rg_links=rg_links,
+        debug=bool(payload.debug),
+    )
+
