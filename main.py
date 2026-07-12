@@ -16156,10 +16156,141 @@ def _sd_default_yes_no_options(language: str) -> list[dict]:
 def _sd_clean_text(value: Any, max_len: int = 600) -> str:
     return _clean_display_text(str(value or ""), max_len=max_len)
 
+def _sd_clean_citation_snippet_for_display(value: Any, max_len: int = 520) -> str:
+    """Smart Diagnostic-only cleanup for user-visible citation snippets.
+
+    This intentionally does NOT modify the shared ASK/Root Cause citation sanitizer.
+    It only removes display noise commonly produced by PDF table extraction.
+    """
+    s = str(value or "").strip()
+    if not s:
+        return ""
+
+    s = _normalize_unicode_advanced(s)
+    s = s.replace("\r", "\n")
+    s = re.sub(r"\s+", " ", s).strip(" -–—")
+
+    # PDF/table extraction noise seen in calculation reports.
+    # Example: "38 mm Informazioni For ideal drive behaviour..."
+    s = re.sub(
+        r"^(?:\d+(?:[,.]\d+)?\s*(?:mm|cm|m|nm|n|kn|rpm|min-1|min⁻¹|rad/s2|rad/s²|kgcm2|kgcm²|°c|v|a|hz|kw)\s+)+(?=(?:Informazioni|For)\b)",
+        "",
+        s,
+        flags=re.IGNORECASE,
+    )
+
+    # Example: "Informazioni For ideal drive behaviour..."
+    s = re.sub(r"^\s*Informazioni\s+(?=For\b)", "", s, flags=re.IGNORECASE)
+
+    # Repeated table headers at the end/middle of linearized PDF text.
+    s = re.sub(r"\bParametro\s+Valore\s+Parametro\s+Valore\b", " ", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bParametro\s+Valore\s+Valore\b", " ", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bParametro\s+Valore\b", " ", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bValore\s+Valore\b", " ", s, flags=re.IGNORECASE)
+
+    s = re.sub(r"\s+", " ", s).strip(" -–—")
+    if max_len and len(s) > max_len:
+        s = s[: max_len - 1].rsplit(" ", 1)[0].strip() + "…"
+    return s
+
+
+def _sd_citation_dedup_key(citation: dict) -> str:
+    """Normalized key for Smart Diagnostic display dedup.
+
+    Do not use bubble_document_id as the main key: the same PDF can exist as
+    multiple Bubble documents but still produce the same user-visible source.
+    """
+    c = citation or {}
+
+    title = _normalize_unicode_advanced(str(c.get("display_title") or "")).lower()
+    location = _normalize_unicode_advanced(str(c.get("display_location") or "")).lower()
+    label = _normalize_unicode_advanced(str(c.get("display_label") or "")).lower()
+
+    page_from = _safe_int(c.get("page_from"), 0)
+    page_to = _safe_int(c.get("page_to"), page_from)
+
+    snippet = str(c.get("snippet_clean") or c.get("snippet") or "").strip()
+    snippet = _sd_clean_citation_snippet_for_display(snippet, max_len=900)
+    snippet = _normalize_unicode_advanced(snippet).lower()
+
+    # Normalize small extraction differences that should not create separate sources.
+    snippet = re.sub(
+        r"^(?:\d+(?:[,.]\d+)?\s*(?:mm|cm|m|nm|n|kn|rpm|min-1|min⁻¹|rad/s2|rad/s²|kgcm2|kgcm²|°c|v|a|hz|kw)\s+)+(?=(?:informazioni|for)\b)",
+        "",
+        snippet,
+        flags=re.IGNORECASE,
+    )
+    snippet = re.sub(r"^\s*informazioni\s+(?=for\b)", "", snippet, flags=re.IGNORECASE)
+    snippet = re.sub(r"\bparametro\s+valore(?:\s+parametro\s+valore|\s+valore)?\b", " ", snippet, flags=re.IGNORECASE)
+    snippet = re.sub(r"\bvalore\s+valore\b", " ", snippet, flags=re.IGNORECASE)
+    snippet = re.sub(r"[^a-z0-9à-öø-ÿ]+", " ", snippet)
+    snippet = re.sub(r"\s+", " ", snippet).strip()
+
+    return "|".join(
+        [
+            title[:120],
+            location[:80],
+            label[:160],
+            str(page_from),
+            str(page_to),
+            snippet[:260],
+        ]
+    )
+
+
+def _sd_prepare_citations_for_response(citations: list[dict], max_items: int = 6) -> list[dict]:
+    """Clean and deduplicate citations only for Smart Diagnostic responses."""
+    out: list[dict] = []
+    seen: set[str] = set()
+
+    for item in citations or []:
+        if not isinstance(item, dict):
+            continue
+
+        c = dict(item)
+
+        raw_clean = str(c.get("snippet_clean") or c.get("snippet") or "").strip()
+        cleaned = _sd_clean_citation_snippet_for_display(raw_clean, max_len=520)
+        if cleaned:
+            c["snippet_clean"] = cleaned
+
+        key = _sd_citation_dedup_key(c)
+        if key and key in seen:
+            continue
+
+        if key:
+            seen.add(key)
+
+        out.append(c)
+
+        if len(out) >= max(1, int(max_items or 6)):
+            break
+
+    return out
+
+
+def _sd_filter_rg_links_for_citations(rg_links: list[dict], citations: list[dict]) -> list[dict]:
+    """Keep rg_links aligned with the deduplicated Smart Diagnostic citations."""
+    wanted_ids = [
+        str(c.get("citation_id") or "").strip()
+        for c in citations or []
+        if isinstance(c, dict) and str(c.get("citation_id") or "").strip()
+    ]
+    if not wanted_ids:
+        return []
+
+    by_id = {
+        str(x.get("citation_id") or "").strip(): x
+        for x in rg_links or []
+        if isinstance(x, dict) and str(x.get("citation_id") or "").strip()
+    }
+
+    return [by_id[cid] for cid in wanted_ids if cid in by_id]
 
 def _sd_compact_evidence_for_state(citations: list[dict], *, max_items: int) -> list[dict]:
+    citations = _sd_prepare_citations_for_response(citations, max_items=max_items)
     out: list[dict] = []
-    for c in (citations or [])[: max(1, max_items)]:
+    for c in citations[: max(1, max_items)]:
         if not isinstance(c, dict):
             continue
         cid = str(c.get("citation_id") or "").strip()
@@ -16824,6 +16955,9 @@ def _sd_response_from_step(
     question = dict(step.get("question") or {})
     hypotheses = list(step.get("hypotheses") or [])
     final_result = dict(step.get("final_result") or {})
+    
+    citations = _sd_prepare_citations_for_response(citations, max_items=6)
+    rg_links = _sd_filter_rg_links_for_citations(rg_links, citations)
 
     current_state = dict(state or {})
     current_state.update(
@@ -16924,6 +17058,10 @@ def smart_diagnostic_start_v1(
         return _sd_no_sources_response(language, session_id, symptom_text, debug=bool(payload.debug))
 
     response_citations = _sanitize_citations_for_response(raw_citations, company_id=company_id)
+    response_citations = _sd_prepare_citations_for_response(
+        response_citations,
+        max_items=SMART_DIAGNOSTIC_MAX_EVIDENCE_IN_STATE,
+    )
     try:
         rg_links = _build_rg_links(company_id, response_citations)
     except Exception as e:
