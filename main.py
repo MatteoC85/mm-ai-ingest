@@ -1,4 +1,3 @@
-#test for commit#
 import os
 import re
 import base64
@@ -8,6 +7,7 @@ import json
 import io
 import zipfile
 import unicodedata
+from difflib import SequenceMatcher
 from datetime import date, datetime, time
 from typing import Optional, List, Any, Union
 
@@ -16156,11 +16156,115 @@ def _sd_default_yes_no_options(language: str) -> list[dict]:
 def _sd_clean_text(value: Any, max_len: int = 600) -> str:
     return _clean_display_text(str(value or ""), max_len=max_len)
 
-def _sd_clean_citation_snippet_for_display(value: Any, max_len: int = 520) -> str:
-    """Smart Diagnostic-only cleanup for user-visible citation snippets.
+def _sd_word_token(value: Any) -> str:
+    """Normalize a single token for Smart Diagnostic citation display cleanup."""
+    t = _normalize_unicode_advanced(str(value or "")).lower()
+    t = re.sub(r"^\W+|\W+$", "", t, flags=re.UNICODE)
+    return t
 
-    This intentionally does NOT modify the shared ASK/Root Cause citation sanitizer.
-    It only removes display noise commonly produced by PDF table extraction.
+
+def _sd_tokenize_for_citation_compare(value: Any, *, keep_numeric: bool = False) -> list[str]:
+    """Language-independent tokenization for Smart Diagnostic citation comparison.
+
+    The goal is not linguistic understanding; it is robust evidence equivalence.
+    Numeric-only tokens are ignored by default so OCR/table coordinates do not
+    turn equivalent snippets into separate citations.
+    """
+    s = _normalize_unicode_advanced(str(value or "")).lower()
+    raw = re.findall(r"[a-z0-9à-öø-ÿ][a-z0-9à-öø-ÿ_\-/]*", s, flags=re.IGNORECASE)
+
+    out: list[str] = []
+    for tok in raw:
+        tok = _sd_word_token(tok)
+        if not tok:
+            continue
+
+        has_alpha = any(ch.isalpha() for ch in tok)
+        if not keep_numeric and not has_alpha:
+            continue
+
+        # Single-letter alphabetic fragments are usually OCR/table leftovers.
+        if has_alpha and len(tok) < 2:
+            continue
+
+        out.append(tok)
+
+    return out
+
+
+def _sd_collapse_adjacent_repeated_tokens(text: str, *, max_ngram: int = 4) -> str:
+    """Collapse adjacent repeated tokens/ngrams without using language-specific words.
+
+    Examples handled generically:
+    - "X X" -> "X"
+    - "A B A B" -> "A B"
+    """
+    parts = re.findall(r"\S+", str(text or ""))
+    if len(parts) < 2:
+        return str(text or "").strip()
+
+    out: list[str] = []
+    i = 0
+    while i < len(parts):
+        matched = False
+        max_n = min(max_ngram, (len(parts) - i) // 2)
+        for n in range(max_n, 0, -1):
+            a = [_sd_word_token(x) for x in parts[i : i + n]]
+            b = [_sd_word_token(x) for x in parts[i + n : i + 2 * n]]
+            if a and a == b and all(x for x in a):
+                out.extend(parts[i : i + n])
+                i += 2 * n
+                matched = True
+                break
+        if not matched:
+            out.append(parts[i])
+            i += 1
+
+    return " ".join(out).strip()
+
+
+def _sd_trim_low_information_trailing_fragment(text: str) -> str:
+    """Trim short trailing extraction fragments after a complete sentence.
+
+    This is structural, not lexical. It removes tails like short table remnants
+    after a period, regardless of language or actual words.
+    """
+    s = str(text or "").strip()
+    if len(s) < 80:
+        return s
+
+    # Find the last sentence-ending punctuation that leaves a short tail.
+    matches = list(re.finditer(r"[\.!?]\s+", s))
+    if not matches:
+        return s
+
+    last = matches[-1]
+    tail = s[last.end() :].strip()
+    head = s[: last.end()].strip()
+    if not tail or not head:
+        return s
+
+    tail_tokens = _sd_tokenize_for_citation_compare(tail, keep_numeric=True)
+    alpha_tail_tokens = _sd_tokenize_for_citation_compare(tail, keep_numeric=False)
+
+    # Conservative: only trim very short tails that are not sentence-like.
+    if (
+        len(tail) <= 80
+        and len(tail_tokens) <= 7
+        and len(alpha_tail_tokens) <= 6
+        and not re.search(r"[\.!?]", tail)
+    ):
+        return head
+
+    return s
+
+
+def _sd_clean_citation_snippet_for_display(value: Any, max_len: int = 520) -> str:
+    """Smart Diagnostic-only display cleanup for citation snippets.
+
+    This intentionally does NOT modify shared ASK/Root Cause sanitizers.
+    It is language-independent: no Italian/English keyword stripping. It only
+    normalizes spacing, repeated extraction fragments, and short table/OCR tails.
     """
     s = str(value or "").strip()
     if not s:
@@ -16169,98 +16273,301 @@ def _sd_clean_citation_snippet_for_display(value: Any, max_len: int = 520) -> st
     s = _normalize_unicode_advanced(s)
     s = s.replace("\r", "\n")
     s = re.sub(r"\s+", " ", s).strip(" -–—")
-
-    # PDF/table extraction noise seen in calculation reports.
-    # Example: "38 mm Informazioni For ideal drive behaviour..."
-    s = re.sub(
-        r"^(?:\d+(?:[,.]\d+)?\s*(?:mm|cm|m|nm|n|kn|rpm|min-1|min⁻¹|rad/s2|rad/s²|kgcm2|kgcm²|°c|v|a|hz|kw)\s+)+(?=(?:Informazioni|For)\b)",
-        "",
-        s,
-        flags=re.IGNORECASE,
-    )
-
-    # Example: "Informazioni For ideal drive behaviour..."
-    s = re.sub(r"^\s*Informazioni\s+(?=For\b)", "", s, flags=re.IGNORECASE)
-
-    # Repeated table headers at the end/middle of linearized PDF text.
-    s = re.sub(r"\bParametro\s+Valore\s+Parametro\s+Valore\b", " ", s, flags=re.IGNORECASE)
-    s = re.sub(r"\bParametro\s+Valore\s+Valore\b", " ", s, flags=re.IGNORECASE)
-    s = re.sub(r"\bParametro\s+Valore\b", " ", s, flags=re.IGNORECASE)
-    s = re.sub(r"\bValore\s+Valore\b", " ", s, flags=re.IGNORECASE)
-
+    s = _sd_collapse_adjacent_repeated_tokens(s)
+    s = _sd_trim_low_information_trailing_fragment(s)
     s = re.sub(r"\s+", " ", s).strip(" -–—")
+
     if max_len and len(s) > max_len:
-        s = s[: max_len - 1].rsplit(" ", 1)[0].strip() + "…"
+        cut = s[: max_len - 1].rsplit(" ", 1)[0].strip() or s[: max_len - 1].strip()
+        s = cut + "…"
+
     return s
 
 
-def _sd_citation_dedup_key(citation: dict) -> str:
-    """Normalized key for Smart Diagnostic display dedup.
+def _sd_shingles(tokens: list[str], n: int) -> set[tuple[str, ...]]:
+    if not tokens:
+        return set()
+    if len(tokens) < n:
+        return {tuple(tokens)} if tokens else set()
+    return {tuple(tokens[i : i + n]) for i in range(0, len(tokens) - n + 1)}
 
-    Do not use bubble_document_id as the main key: the same PDF can exist as
-    multiple Bubble documents but still produce the same user-visible source.
+
+def _sd_token_sequence_contains(long_tokens: list[str], short_tokens: list[str]) -> bool:
+    if not long_tokens or not short_tokens or len(short_tokens) > len(long_tokens):
+        return False
+    if len(short_tokens) == 1:
+        return short_tokens[0] in long_tokens
+    limit = len(long_tokens) - len(short_tokens) + 1
+    for i in range(limit):
+        if long_tokens[i : i + len(short_tokens)] == short_tokens:
+            return True
+    return False
+
+
+def _sd_source_pages_overlap(a: dict, b: dict) -> bool:
+    a_from = _safe_int((a or {}).get("page_from"), 0)
+    a_to = _safe_int((a or {}).get("page_to"), a_from)
+    b_from = _safe_int((b or {}).get("page_from"), 0)
+    b_to = _safe_int((b or {}).get("page_to"), b_from)
+
+    if a_from <= 0 or b_from <= 0:
+        return True
+
+    if a_to < a_from:
+        a_to = a_from
+    if b_to < b_from:
+        b_to = b_from
+
+    return max(a_from, b_from) <= min(a_to, b_to)
+
+
+def _sd_citation_same_source_context(a: dict, b: dict) -> bool:
+    """Source-aware guard for citation equivalence.
+
+    Dedup is intentionally conservative: citations must refer to the same
+    user-visible source context and overlapping pages. This avoids collapsing
+    genuinely different documents that happen to contain similar warnings.
+    """
+    a = a or {}
+    b = b or {}
+
+    if not _sd_source_pages_overlap(a, b):
+        return False
+
+    a_title = re.sub(r"\s+", " ", _normalize_unicode_advanced(str(a.get("display_title") or "")).lower()).strip()
+    b_title = re.sub(r"\s+", " ", _normalize_unicode_advanced(str(b.get("display_title") or "")).lower()).strip()
+
+    a_source_type = str(a.get("source_type") or "").strip().lower()
+    b_source_type = str(b.get("source_type") or "").strip().lower()
+    a_source_id = str(a.get("source_id") or "").strip()
+    b_source_id = str(b.get("source_id") or "").strip()
+    a_doc = str(a.get("bubble_document_id") or "").strip()
+    b_doc = str(b.get("bubble_document_id") or "").strip()
+
+    if a_source_type and b_source_type and a_source_type != b_source_type:
+        return False
+
+    if a_source_id and b_source_id and a_source_id == b_source_id:
+        return True
+
+    if a_doc and b_doc and a_doc == b_doc:
+        return True
+
+    # Same visible PDF title across copied Bubble documents.
+    if a_title and b_title and a_title == b_title:
+        return True
+
+    return False
+
+
+def _sd_citation_text_similarity(a_text: Any, b_text: Any) -> dict:
+    a_clean = _sd_clean_citation_snippet_for_display(a_text, max_len=1200)
+    b_clean = _sd_clean_citation_snippet_for_display(b_text, max_len=1200)
+
+    a_tokens = _sd_tokenize_for_citation_compare(a_clean, keep_numeric=False)
+    b_tokens = _sd_tokenize_for_citation_compare(b_clean, keep_numeric=False)
+
+    if not a_tokens or not b_tokens:
+        return {
+            "duplicate": False,
+            "containment": 0.0,
+            "jaccard": 0.0,
+            "sequence": 0.0,
+            "a_tokens": a_tokens,
+            "b_tokens": b_tokens,
+        }
+
+    min_len = min(len(a_tokens), len(b_tokens))
+    max_len = max(len(a_tokens), len(b_tokens))
+
+    # For very short snippets, only exact/near-exact matches are safe.
+    if min_len < 8:
+        a_join = " ".join(a_tokens)
+        b_join = " ".join(b_tokens)
+        seq = SequenceMatcher(None, a_join, b_join).ratio()
+        duplicate = a_join == b_join or seq >= 0.94
+        return {
+            "duplicate": duplicate,
+            "containment": 1.0 if duplicate else 0.0,
+            "jaccard": 1.0 if duplicate else 0.0,
+            "sequence": seq,
+            "a_tokens": a_tokens,
+            "b_tokens": b_tokens,
+        }
+
+    n = 5 if min_len >= 12 else 4
+    a_sh = _sd_shingles(a_tokens, n)
+    b_sh = _sd_shingles(b_tokens, n)
+    inter = len(a_sh & b_sh)
+    containment = inter / max(1, min(len(a_sh), len(b_sh)))
+    jaccard = inter / max(1, len(a_sh | b_sh))
+
+    a_join = " ".join(a_tokens)
+    b_join = " ".join(b_tokens)
+    sequence = SequenceMatcher(None, a_join[:1600], b_join[:1600]).ratio()
+
+    shorter_contained = (
+        _sd_token_sequence_contains(a_tokens, b_tokens)
+        or _sd_token_sequence_contains(b_tokens, a_tokens)
+    )
+
+    # High-confidence duplicate conditions. These are deliberately strict and
+    # source-context guarded by _sd_citation_same_source_context.
+    duplicate = False
+    if shorter_contained and min_len / max(1, max_len) >= 0.55:
+        duplicate = True
+    elif containment >= 0.86 and sequence >= 0.72:
+        duplicate = True
+    elif containment >= 0.78 and jaccard >= 0.62 and sequence >= 0.84:
+        duplicate = True
+    elif sequence >= 0.93 and containment >= 0.70:
+        duplicate = True
+
+    return {
+        "duplicate": duplicate,
+        "containment": containment,
+        "jaccard": jaccard,
+        "sequence": sequence,
+        "a_tokens": a_tokens,
+        "b_tokens": b_tokens,
+    }
+
+
+def _sd_citation_near_duplicate(a: dict, b: dict) -> bool:
+    if not _sd_citation_same_source_context(a, b):
+        return False
+
+    a_snippet = str((a or {}).get("snippet_clean") or (a or {}).get("snippet") or "")
+    b_snippet = str((b or {}).get("snippet_clean") or (b or {}).get("snippet") or "")
+    return bool(_sd_citation_text_similarity(a_snippet, b_snippet).get("duplicate"))
+
+
+def _sd_repetition_penalty_for_text(text: str) -> float:
+    toks = _sd_tokenize_for_citation_compare(text, keep_numeric=False)
+    if len(toks) < 6:
+        return 0.0
+    unique_ratio = len(set(toks)) / max(1, len(toks))
+    penalty = 0.0
+    if unique_ratio < 0.48:
+        penalty += (0.48 - unique_ratio) * 40.0
+
+    # Adjacent repeated token/ngram evidence.
+    repeats = 0
+    for i in range(1, len(toks)):
+        if toks[i] == toks[i - 1]:
+            repeats += 1
+    for n in (2, 3, 4):
+        for i in range(0, max(0, len(toks) - 2 * n + 1)):
+            if toks[i : i + n] == toks[i + n : i + 2 * n]:
+                repeats += 1
+    penalty += min(18.0, repeats * 2.5)
+    return penalty
+
+
+def _sd_citation_quality_score(citation: dict) -> float:
+    c = citation or {}
+    snippet = _sd_clean_citation_snippet_for_display(
+        str(c.get("snippet_clean") or c.get("snippet") or ""),
+        max_len=900,
+    )
+    tokens = _sd_tokenize_for_citation_compare(snippet, keep_numeric=False)
+
+    if not snippet or not tokens:
+        return -100.0
+
+    sentence_count = len(re.findall(r"[\.!?]", snippet))
+    length_score = min(len(snippet), 620) / 18.0
+    token_score = min(len(set(tokens)), 90) * 0.55
+    sentence_score = min(sentence_count, 4) * 2.0
+    repetition_penalty = _sd_repetition_penalty_for_text(snippet)
+
+    # Prefer snippets that do not need ellipsis truncation.
+    trunc_penalty = 4.0 if snippet.endswith("…") else 0.0
+
+    return length_score + token_score + sentence_score - repetition_penalty - trunc_penalty
+
+
+def _sd_pick_better_citation(current: dict, candidate: dict) -> dict:
+    """Choose the cleaner representative for equivalent Smart Diagnostic citations."""
+    cur = current or {}
+    cand = candidate or {}
+
+    cur_text = str(cur.get("snippet_clean") or cur.get("snippet") or "")
+    cand_text = str(cand.get("snippet_clean") or cand.get("snippet") or "")
+    sim = _sd_citation_text_similarity(cur_text, cand_text)
+    cur_tokens = sim.get("a_tokens") or []
+    cand_tokens = sim.get("b_tokens") or []
+
+    # If one snippet is just the other plus a short prefix/suffix, keep the shorter.
+    if cur_tokens and cand_tokens:
+        if _sd_token_sequence_contains(cand_tokens, cur_tokens) and len(cand_tokens) - len(cur_tokens) <= 8:
+            return cur
+        if _sd_token_sequence_contains(cur_tokens, cand_tokens) and len(cur_tokens) - len(cand_tokens) <= 8:
+            return cand
+
+    return cand if _sd_citation_quality_score(cand) > _sd_citation_quality_score(cur) else cur
+
+
+def _sd_citation_dedup_key(citation: dict) -> str:
+    """Exact normalized key for Smart Diagnostic display dedup.
+
+    This is intentionally secondary to near-duplicate clustering. It catches exact
+    repeats cheaply while the clusterer handles equivalent evidence with noise.
     """
     c = citation or {}
 
-    title = _normalize_unicode_advanced(str(c.get("display_title") or "")).lower()
-    location = _normalize_unicode_advanced(str(c.get("display_location") or "")).lower()
-    label = _normalize_unicode_advanced(str(c.get("display_label") or "")).lower()
-
+    title = re.sub(r"\s+", " ", _normalize_unicode_advanced(str(c.get("display_title") or "")).lower()).strip()
+    source_type = str(c.get("source_type") or "").strip().lower()
+    source_id = str(c.get("source_id") or "").strip()
     page_from = _safe_int(c.get("page_from"), 0)
     page_to = _safe_int(c.get("page_to"), page_from)
 
     snippet = str(c.get("snippet_clean") or c.get("snippet") or "").strip()
-    snippet = _sd_clean_citation_snippet_for_display(snippet, max_len=900)
-    snippet = _normalize_unicode_advanced(snippet).lower()
+    snippet = _sd_clean_citation_snippet_for_display(snippet, max_len=1000)
+    tokens = _sd_tokenize_for_citation_compare(snippet, keep_numeric=False)
+    token_sig = " ".join(tokens[:90])
 
-    # Normalize small extraction differences that should not create separate sources.
-    snippet = re.sub(
-        r"^(?:\d+(?:[,.]\d+)?\s*(?:mm|cm|m|nm|n|kn|rpm|min-1|min⁻¹|rad/s2|rad/s²|kgcm2|kgcm²|°c|v|a|hz|kw)\s+)+(?=(?:informazioni|for)\b)",
-        "",
-        snippet,
-        flags=re.IGNORECASE,
-    )
-    snippet = re.sub(r"^\s*informazioni\s+(?=for\b)", "", snippet, flags=re.IGNORECASE)
-    snippet = re.sub(r"\bparametro\s+valore(?:\s+parametro\s+valore|\s+valore)?\b", " ", snippet, flags=re.IGNORECASE)
-    snippet = re.sub(r"\bvalore\s+valore\b", " ", snippet, flags=re.IGNORECASE)
-    snippet = re.sub(r"[^a-z0-9à-öø-ÿ]+", " ", snippet)
-    snippet = re.sub(r"\s+", " ", snippet).strip()
-
-    return "|".join(
-        [
-            title[:120],
-            location[:80],
-            label[:160],
-            str(page_from),
-            str(page_to),
-            snippet[:260],
-        ]
-    )
+    return "|".join([source_type, source_id, title[:140], str(page_from), str(page_to), token_sig[:360]])
 
 
 def _sd_prepare_citations_for_response(citations: list[dict], max_items: int = 6) -> list[dict]:
-    """Clean and deduplicate citations only for Smart Diagnostic responses."""
+    """Clean, cluster and deduplicate citations only for Smart Diagnostic responses.
+
+    ASK, Root Cause and Draft P&S are not affected: this function is only called
+    from Smart Diagnostic code paths.
+    """
     out: list[dict] = []
-    seen: set[str] = set()
+    seen_exact: set[str] = set()
 
     for item in citations or []:
         if not isinstance(item, dict):
             continue
 
         c = dict(item)
-
         raw_clean = str(c.get("snippet_clean") or c.get("snippet") or "").strip()
         cleaned = _sd_clean_citation_snippet_for_display(raw_clean, max_len=520)
         if cleaned:
             c["snippet_clean"] = cleaned
 
-        key = _sd_citation_dedup_key(c)
-        if key and key in seen:
+        exact_key = _sd_citation_dedup_key(c)
+        if exact_key and exact_key in seen_exact:
             continue
 
-        if key:
-            seen.add(key)
+        duplicate_index: Optional[int] = None
+        for idx, kept in enumerate(out):
+            if _sd_citation_near_duplicate(c, kept):
+                duplicate_index = idx
+                break
 
+        if duplicate_index is not None:
+            chosen = _sd_pick_better_citation(out[duplicate_index], c)
+            out[duplicate_index] = chosen
+            # Refresh exact keys after representative replacement.
+            seen_exact = {_sd_citation_dedup_key(x) for x in out if isinstance(x, dict)}
+            continue
+
+        if exact_key:
+            seen_exact.add(exact_key)
         out.append(c)
 
         if len(out) >= max(1, int(max_items or 6)):
