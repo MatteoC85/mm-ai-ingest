@@ -17262,6 +17262,10 @@ def _sd_response_from_step(
     question = dict(step.get("question") or {})
     hypotheses = list(step.get("hypotheses") or [])
     final_result = dict(step.get("final_result") or {})
+
+    if status == "no_sources":
+        citations = []
+        rg_links = []
     
     citations = _sd_prepare_citations_for_response(citations, max_items=6)
     rg_links = _sd_filter_rg_links_for_citations(rg_links, citations)
