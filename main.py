@@ -16958,6 +16958,29 @@ def _sd_classify_initial_input(symptom_text: str, language: str) -> dict:
     }
 
 
+def _sd_state_has_blocked_initial_input(state: dict) -> bool:
+    """True only for a state explicitly rejected by the Smart Diagnostic input gate."""
+    if not isinstance(state, dict):
+        return False
+
+    gate = state.get("input_gate")
+    if not isinstance(gate, dict):
+        return False
+
+    if gate.get("accepted") is False:
+        return True
+
+    classification = str(gate.get("classification") or "").strip().lower()
+    reason_code = str(gate.get("reason_code") or "").strip().lower()
+    invalid_reason_codes = {
+        "machine_related_but_too_vague",
+        "non_diagnostic_or_unrelated",
+        "random_or_nonsensical_input",
+        "test_or_no_fault_statement",
+    }
+    return classification == "needs_symptom" or reason_code in invalid_reason_codes
+
+
 def _sd_invalid_initial_input_response(
     language: str,
     session_id: str,
@@ -16966,7 +16989,7 @@ def _sd_invalid_initial_input_response(
     gate_result: dict,
     debug: bool = False,
 ) -> dict:
-    """Return the existing Bubble-compatible terminal shape without retrieval."""
+    """Return an explicit validation failure so Bubble stops before creating a session UI."""
     msg = (
         "Describe an observable machine anomaly, failed operation, alarm, or fault code. For example: the machine does not start; an alarm appears; the motor vibrates; the gearbox overheats."
         if language == "en"
@@ -16981,15 +17004,30 @@ def _sd_invalid_initial_input_response(
     )
 
     state = _sd_parse_json(response.get("session_state_json"), {})
+    state["status"] = "error"
     state["input_gate"] = {
+        "accepted": False,
         "classification": str(gate_result.get("classification") or "needs_symptom"),
         "confidence": float(gate_result.get("confidence") or 0.0),
         "reason_code": str(gate_result.get("reason_code") or "non_diagnostic_or_unrelated"),
+        "detected_language": str(gate_result.get("detected_language") or "unknown"),
     }
 
+    # The Worker already treats ok=false as the normal error branch and forwards
+    # error.code/error.message to Bubble. Returning ok=true/no_sources here would
+    # make the existing Bubble start workflow create an empty question and mark
+    # the session in_progress, which is exactly what this validation must prevent.
+    response["ok"] = False
+    response["status"] = "error"
     response["session_state_json"] = _sd_json_dumps(state)
     response["message"] = msg
     response["operator_summary"] = msg
+    response["error_code"] = "INVALID_SYMPTOM"
+    response["error_message"] = msg
+    response["error"] = {
+        "code": "INVALID_SYMPTOM",
+        "message": msg,
+    }
     response["meta"] = {
         **dict(response.get("meta") or {}),
         "reason": "invalid_symptom",
@@ -17743,6 +17781,19 @@ def smart_diagnostic_finalize_v1(
 
     symptom_text = str(state.get("symptom_text") or "").strip()
     language = _sd_language(payload.language or state.get("language"), symptom_text)
+
+    # Defensive guard for sessions created while an older input-gate response
+    # contract was deployed. A rejected initial input must never be finalizable
+    # into generic fallback hypotheses or a misleading technical conclusion.
+    if _sd_state_has_blocked_initial_input(state):
+        return _sd_invalid_initial_input_response(
+            language=language,
+            session_id=session_id,
+            symptom_text=symptom_text,
+            gate_result=dict(state.get("input_gate") or {}),
+            debug=bool(payload.debug),
+        )
+
     final = _sd_llm_finalize(state=state, language=language)
     hyps = _sd_normalize_hypotheses(state.get("hypotheses") or [], language=language, max_hypotheses=_sd_clamp_int(state.get("max_hypotheses"), 4, 2, 4))
     if not final.get("most_likely_label") and hyps:
