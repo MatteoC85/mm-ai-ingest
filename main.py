@@ -16878,6 +16878,38 @@ def _sd_initial_input_gate_schema() -> dict:
         },
     }
 
+def _sd_looks_like_compact_fault_code(value: str) -> bool:
+    """Return True only for a compact alphanumeric alarm/fault-code shape.
+
+    This helper is Smart-Diagnostic-only. It does not verify that the code
+    exists in the indexed documentation: it only allows opaque codes such as
+    E58 to reach the normal retrieval path.
+    """
+    token = re.sub(r"\s+", "", str(value or "").strip()).upper()
+
+    if not (2 <= len(token) <= 20):
+        return False
+
+    # Sono ammessi soltanto lettere, cifre e separatori tipici dei codici.
+    if not re.fullmatch(r"[A-Z0-9][A-Z0-9._:/-]*", token):
+        return False
+
+    # Un codice deve contenere almeno una lettera e almeno una cifra.
+    # In questo modo "CIAO" e "123" non vengono accettati.
+    if not re.search(r"[A-Z]", token) or not re.search(r"\d", token):
+        return False
+
+    return bool(
+        re.fullmatch(
+            r"(?:"
+            r"[A-Z]{1,3}\d[A-Z0-9._:/-]*"
+            r"|[A-Z]{1,6}[-_.:/]\d[A-Z0-9._:/-]*"
+            r"|\d{1,6}[A-Z]{1,3}(?:\d[A-Z0-9._:/-]*)?"
+            r"|\d{1,6}[-_.:/][A-Z]{1,6}[A-Z0-9._:/-]*"
+            r")",
+            token,
+        )
+    )
 
 def _sd_classify_initial_input(symptom_text: str, language: str) -> dict:
     """Semantically decide whether the text itself contains a diagnosable symptom.
@@ -16888,6 +16920,18 @@ def _sd_classify_initial_input(symptom_text: str, language: str) -> dict:
     valid; arbitrary names/words, small talk, tests, and component names without
     an abnormal condition are not.
     """
+
+    if _sd_looks_like_compact_fault_code(symptom_text):
+        return {
+            "accepted": True,
+            "classification": "valid_symptom",
+            "confidence": 1.0,
+            "reason_code": "alarm_or_fault_code",
+            "detected_language": language if language in {"it", "en"} else "unknown",
+            "rationale": "Compact alphanumeric alarm/fault-code candidate.",
+            "model": "deterministic_code_shape_guard",
+        }
+        
     system_msg = (
         "You are the input gate for MachineMind Smart Diagnostic. "
         "Classify the MEANING of the user's text; never use keyword or exact-string matching. "
