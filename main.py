@@ -44,6 +44,11 @@ XLSX_MAX_ROW_CHARS = int(os.environ.get("MM_XLSX_MAX_ROW_CHARS", "2400"))
 XLSX_MIN_TEXT_CHARS = int(os.environ.get("MM_XLSX_MIN_TEXT_CHARS", "120"))
 XLSX_INCLUDE_HIDDEN_SHEETS = (os.environ.get("MM_XLSX_INCLUDE_HIDDEN_SHEETS") or "0").strip() == "1"
 
+# Electrical schematic structured-index registry.
+# Safe default OFF: with the flag disabled the existing generic ingest path is unchanged.
+ELECTRICAL_INGEST_ENABLED = (os.environ.get("MM_ELECTRICAL_INGEST_ENABLED") or "0").strip() == "1"
+ELECTRICAL_CATEGORY_CODE = (os.environ.get("MM_ELECTRICAL_CATEGORY_CODE") or "electrical_diagrams").strip().lower()
+
 # DB
 DB_HOST = (os.environ.get("MM_DB_HOST") or "").strip()
 DB_NAME = (os.environ.get("MM_DB_NAME") or "postgres").strip()
@@ -237,6 +242,8 @@ class IngestRequest(BaseModel):
     machine_id: Optional[str] = None
     bubble_document_id: str
     ai_scope: Optional[str] = None
+    document_category_code: Optional[str] = None
+    document_is_technical: Optional[bool] = None
     plan_embed_chars_limit_total: Optional[int] = None
     plan_index_storage_limit_bytes: Optional[int] = None
     embed_chars_used_total: Optional[int] = None
@@ -579,6 +586,119 @@ def _db_conn():
 
 def _vector_literal(vec: list[float]) -> str:
     return "[" + ",".join(f"{x:.8f}" for x in vec) + "]"
+
+
+def _normalize_document_category_code(value: Any) -> str:
+    return re.sub(r"\s+", "_", str(value or "").strip().lower())
+
+
+def _is_electrical_schematic_candidate(
+    *,
+    category_code: str,
+    is_technical: bool,
+    looks_like_pdf: bool,
+) -> bool:
+    return bool(
+        is_technical
+        and looks_like_pdf
+        and category_code
+        and category_code == ELECTRICAL_CATEGORY_CODE
+    )
+
+
+def _db_register_electrical_document(
+    *,
+    company_id: str,
+    machine_id: str,
+    bubble_document_id: str,
+    category_code: str,
+    source_filename: Optional[str],
+    source_file_size_bytes: Optional[int],
+) -> dict:
+    """Register an electrical candidate without parsing it yet.
+
+    This Phase 1B helper is intentionally limited to electrical_documents.
+    It creates no version, page, entity, edge, OpenAI artifact, or search card.
+    """
+    company_id = str(company_id or "").strip()
+    machine_id = str(machine_id or "").strip()
+    bubble_document_id = str(bubble_document_id or "").strip()
+    category_code = _normalize_document_category_code(category_code)
+    source_filename = str(source_filename or "").strip() or None
+
+    if not (company_id and machine_id and bubble_document_id and category_code):
+        raise ValueError("Missing electrical document registry scope")
+
+    size_bytes = None
+    if source_file_size_bytes is not None:
+        size_bytes = max(0, int(source_file_size_bytes))
+
+    conn = _db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO public.electrical_documents(
+                    company_id,
+                    machine_id,
+                    bubble_document_id,
+                    document_kind,
+                    category_code,
+                    source_filename,
+                    source_file_size_bytes,
+                    index_status,
+                    last_error_code,
+                    last_error_message,
+                    last_requested_at,
+                    updated_at
+                )
+                VALUES (
+                    %s, %s, %s,
+                    'electrical_schematic',
+                    %s, %s, %s,
+                    'not_started',
+                    NULL, NULL, NOW(), NOW()
+                )
+                ON CONFLICT (company_id, bubble_document_id)
+                DO UPDATE SET
+                    machine_id = EXCLUDED.machine_id,
+                    document_kind = EXCLUDED.document_kind,
+                    category_code = EXCLUDED.category_code,
+                    source_filename = EXCLUDED.source_filename,
+                    source_file_size_bytes = EXCLUDED.source_file_size_bytes,
+                    index_status = CASE
+                        WHEN public.electrical_documents.index_status IN ('ready', 'review_required')
+                            THEN public.electrical_documents.index_status
+                        ELSE 'not_started'
+                    END,
+                    last_error_code = NULL,
+                    last_error_message = NULL,
+                    last_requested_at = NOW(),
+                    updated_at = NOW()
+                RETURNING id, index_status, latest_version_no;
+                """,
+                (
+                    company_id,
+                    machine_id,
+                    bubble_document_id,
+                    category_code,
+                    source_filename,
+                    size_bytes,
+                ),
+            )
+            row = cur.fetchone()
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    return {
+        "electrical_document_id": int(row[0]),
+        "electrical_index_status": str(row[1] or "not_started"),
+        "electrical_latest_version_no": int(row[2] or 0),
+    }
 
 
 def _get_table_columns(cur, table_name: str) -> set[str]:
@@ -11810,6 +11930,14 @@ def ingest_document(
     )
     looks_like_xlsx = _looks_like_xlsx_document(data, detected_extension, content_type)
 
+    document_category_code = _normalize_document_category_code(payload.document_category_code)
+    document_is_technical = bool(payload.document_is_technical)
+    electrical_candidate = _is_electrical_schematic_candidate(
+        category_code=document_category_code,
+        is_technical=document_is_technical,
+        looks_like_pdf=looks_like_pdf,
+    )
+
     if not looks_like_pdf and not looks_like_xlsx:
         return {
             "ok": False,
@@ -12091,6 +12219,59 @@ def ingest_document(
         print("CLOUD_TASKS_ENQUEUE_SKIPPED", str(e))
         pass
 
+    electrical_meta = {
+        "electrical_candidate": bool(electrical_candidate),
+        "electrical_pipeline_enabled": bool(ELECTRICAL_INGEST_ENABLED),
+        "electrical_document_id": None,
+        "electrical_index_status": (
+            "disabled" if electrical_candidate and not ELECTRICAL_INGEST_ENABLED else "not_applicable"
+        ),
+        "electrical_latest_version_no": 0,
+        "electrical_registry_error": None,
+    }
+
+    if electrical_candidate and ELECTRICAL_INGEST_ENABLED:
+        try:
+            electrical_meta.update(
+                _db_register_electrical_document(
+                    company_id=company_id,
+                    machine_id=machine_id,
+                    bubble_document_id=bubble_document_id,
+                    category_code=document_category_code,
+                    source_filename=detected_filename,
+                    source_file_size_bytes=len(data),
+                )
+            )
+            print(
+                "ELECTRICAL_DOCUMENT_REGISTERED",
+                json.dumps(
+                    {
+                        "company_id": company_id,
+                        "machine_id": machine_id,
+                        "bubble_document_id": bubble_document_id,
+                        "category_code": document_category_code,
+                        "electrical_document_id": electrical_meta.get("electrical_document_id"),
+                        "index_status": electrical_meta.get("electrical_index_status"),
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+        except Exception as e:
+            electrical_meta["electrical_index_status"] = "registry_failed"
+            electrical_meta["electrical_registry_error"] = str(e)[:500]
+            print(
+                "ELECTRICAL_DOCUMENT_REGISTER_FAIL",
+                json.dumps(
+                    {
+                        "company_id": company_id,
+                        "machine_id": machine_id,
+                        "bubble_document_id": bubble_document_id,
+                        "error": str(e)[:500],
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+
     return {
         "ok": True,
         "pages_total": pages_total,
@@ -12099,6 +12280,9 @@ def ingest_document(
         "text_chars": text_chars,
         "est_storage_bytes": est_storage_bytes,
         "source_file_type": source_file_type,
+        "document_category_code": document_category_code or None,
+        "document_is_technical": document_is_technical,
+        **electrical_meta,
     }
 
 
@@ -15551,10 +15735,19 @@ def delete_document_v1(
     deleted_chunks = 0
     deleted_pages = 0
     deleted_files = 0
+    deleted_electrical_documents = 0
 
     conn = _db_conn()
     try:
         with conn.cursor() as cur:
+            cur.execute("SELECT to_regclass('public.electrical_documents');")
+            if cur.fetchone()[0] is not None:
+                cur.execute(
+                    "DELETE FROM public.electrical_documents WHERE company_id=%s AND bubble_document_id=%s;",
+                    (company_id, bubble_document_id),
+                )
+                deleted_electrical_documents = cur.rowcount or 0
+
             cur.execute(
                 "DELETE FROM public.document_chunks WHERE company_id=%s AND bubble_document_id=%s;",
                 (company_id, bubble_document_id),
@@ -15591,6 +15784,7 @@ def delete_document_v1(
             "document_chunks": int(deleted_chunks),
             "document_pages": int(deleted_pages),
             "document_files": int(deleted_files),
+            "electrical_documents": int(deleted_electrical_documents),
         },
     }
 
@@ -15615,11 +15809,20 @@ def delete_company_index_v1(
         "document_pages": 0,
         "document_cleaning_meta": 0,
         "document_files": 0,
+        "electrical_documents": 0,
     }
 
     conn = _db_conn()
     try:
         with conn.cursor() as cur:
+            cur.execute("SELECT to_regclass('public.electrical_documents');")
+            if cur.fetchone()[0] is not None:
+                cur.execute(
+                    "DELETE FROM public.electrical_documents WHERE company_id=%s;",
+                    (company_id,),
+                )
+                deleted["electrical_documents"] = int(cur.rowcount or 0)
+
             for table_name in (
                 "document_chunks",
                 "document_pages",
