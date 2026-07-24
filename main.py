@@ -12860,6 +12860,10 @@ def version():
         "service": os.environ.get("K_SERVICE"),
         "revision": os.environ.get("K_REVISION"),
         "commit_sha": os.environ.get("COMMIT_SHA"),
+        "electrical_code_marker": "phase1c-inventory-v1",
+        "electrical_ingest_enabled": bool(ELECTRICAL_INGEST_ENABLED),
+        "electrical_inventory_enabled": bool(ELECTRICAL_INVENTORY_ENABLED),
+        "electrical_parser_version": ELECTRICAL_PARSER_VERSION,
     }
 
 def _strip_data_url_prefix(value: str) -> str:
