@@ -4,6 +4,7 @@ import base64
 import binascii
 import math
 import json
+import hashlib
 import io
 import zipfile
 import unicodedata
@@ -13,6 +14,7 @@ from typing import Optional, List, Any, Union
 
 import requests
 import psycopg2
+from psycopg2.extras import execute_values
 import fitz  # PyMuPDF
 try:
     import openpyxl
@@ -48,6 +50,15 @@ XLSX_INCLUDE_HIDDEN_SHEETS = (os.environ.get("MM_XLSX_INCLUDE_HIDDEN_SHEETS") or
 # Safe default OFF: with the flag disabled the existing generic ingest path is unchanged.
 ELECTRICAL_INGEST_ENABLED = (os.environ.get("MM_ELECTRICAL_INGEST_ENABLED") or "0").strip() == "1"
 ELECTRICAL_CATEGORY_CODE = (os.environ.get("MM_ELECTRICAL_CATEGORY_CODE") or "electrical_diagrams").strip().lower()
+
+# Phase 1C: deterministic PDF inventory. This is intentionally separate from
+# the registry flag so the code can be deployed with zero behavior change.
+ELECTRICAL_INVENTORY_ENABLED = (os.environ.get("MM_ELECTRICAL_INVENTORY_ENABLED") or "0").strip() == "1"
+ELECTRICAL_PARSER_VERSION = (os.environ.get("MM_ELECTRICAL_PARSER_VERSION") or "mm-electrical-inventory-v1").strip()
+ELECTRICAL_MAX_PAGES = int(os.environ.get("MM_ELECTRICAL_MAX_PAGES", "500"))
+ELECTRICAL_MAX_WORDS_PER_PAGE = int(os.environ.get("MM_ELECTRICAL_MAX_WORDS_PER_PAGE", "25000"))
+ELECTRICAL_MAX_LINKS_PER_PAGE = int(os.environ.get("MM_ELECTRICAL_MAX_LINKS_PER_PAGE", "5000"))
+ELECTRICAL_MAX_RAW_TEXT_CHARS_PER_PAGE = int(os.environ.get("MM_ELECTRICAL_MAX_RAW_TEXT_CHARS_PER_PAGE", "250000"))
 
 # DB
 DB_HOST = (os.environ.get("MM_DB_HOST") or "").strip()
@@ -699,6 +710,1056 @@ def _db_register_electrical_document(
         "electrical_index_status": str(row[1] or "not_started"),
         "electrical_latest_version_no": int(row[2] or 0),
     }
+
+def _electrical_pipeline_signature() -> str:
+    fitz_version = str(getattr(fitz, "VersionBind", "unknown") or "unknown").strip()
+    return f"{ELECTRICAL_PARSER_VERSION}|pymupdf-{fitz_version}|inventory-v1|no-openai"
+
+
+def _electrical_source_sha256(data: bytes) -> str:
+    return hashlib.sha256(data or b"").hexdigest()
+
+
+def _electrical_idempotency_key(
+    *,
+    company_id: str,
+    bubble_document_id: str,
+    source_sha256: str,
+    pipeline_signature: str,
+) -> str:
+    raw = "|".join(
+        [
+            str(company_id or "").strip(),
+            str(bubble_document_id or "").strip(),
+            str(source_sha256 or "").strip().lower(),
+            str(pipeline_signature or "").strip(),
+        ]
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _db_prepare_electrical_version(
+    *,
+    electrical_document_id: int,
+    company_id: str,
+    machine_id: str,
+    bubble_document_id: str,
+    source_sha256: str,
+    source_filename: Optional[str],
+    source_file_size_bytes: int,
+    source_mode: str,
+    content_type: str,
+) -> dict:
+    company_id = str(company_id or "").strip()
+    machine_id = str(machine_id or "").strip()
+    bubble_document_id = str(bubble_document_id or "").strip()
+    source_sha256 = str(source_sha256 or "").strip().lower()
+    pipeline_signature = _electrical_pipeline_signature()
+    idempotency_key = _electrical_idempotency_key(
+        company_id=company_id,
+        bubble_document_id=bubble_document_id,
+        source_sha256=source_sha256,
+        pipeline_signature=pipeline_signature,
+    )
+
+    if not re.fullmatch(r"[0-9a-f]{64}", source_sha256):
+        raise ValueError("Invalid electrical source SHA-256")
+
+    conn = _db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, latest_version_no
+                FROM public.electrical_documents
+                WHERE id=%s
+                  AND company_id=%s
+                  AND machine_id=%s
+                  AND bubble_document_id=%s
+                FOR UPDATE;
+                """,
+                (
+                    int(electrical_document_id),
+                    company_id,
+                    machine_id,
+                    bubble_document_id,
+                ),
+            )
+            parent = cur.fetchone()
+            if not parent:
+                raise ValueError("Electrical document registry row not found")
+
+            cur.execute(
+                """
+                SELECT id, version_no, status, metadata, pdf_page_count
+                FROM public.electrical_versions
+                WHERE company_id=%s
+                  AND idempotency_key=%s
+                LIMIT 1;
+                """,
+                (company_id, idempotency_key),
+            )
+            existing = cur.fetchone()
+
+            if existing:
+                version_id = int(existing[0])
+                version_no = int(existing[1])
+                existing_status = str(existing[2] or "queued")
+                existing_metadata = existing[3] if isinstance(existing[3], dict) else {}
+                existing_pdf_page_count = int(existing[4] or 0)
+
+                cur.execute(
+                    "SELECT COUNT(*) FROM public.electrical_pages WHERE version_id=%s;",
+                    (version_id,),
+                )
+                page_rows = int(cur.fetchone()[0] or 0)
+
+                inventory_ready = bool(
+                    existing_metadata.get("inventory_status") == "ready"
+                    and existing_pdf_page_count > 0
+                    and page_rows == existing_pdf_page_count
+                )
+
+                next_status = (
+                    existing_status
+                    if existing_status in {"ready", "review_required", "superseded"}
+                    else ("queued" if inventory_ready else "parsing")
+                )
+
+                cur.execute(
+                    """
+                    UPDATE public.electrical_versions
+                    SET status=%s,
+                        error_code=NULL,
+                        error_message=NULL,
+                        started_at=COALESCE(started_at, NOW()),
+                        updated_at=NOW()
+                    WHERE id=%s;
+                    """,
+                    (next_status, version_id),
+                )
+
+                document_status = (
+                    existing_status
+                    if existing_status in {"ready", "review_required"}
+                    else ("queued" if inventory_ready else "parsing")
+                )
+                cur.execute(
+                    """
+                    UPDATE public.electrical_documents
+                    SET index_status=%s,
+                        latest_version_no=GREATEST(latest_version_no, %s),
+                        source_filename=COALESCE(%s, source_filename),
+                        source_file_size_bytes=%s,
+                        last_error_code=NULL,
+                        last_error_message=NULL,
+                        last_requested_at=NOW(),
+                        updated_at=NOW()
+                    WHERE id=%s;
+                    """,
+                    (
+                        document_status,
+                        version_no,
+                        str(source_filename or "").strip() or None,
+                        max(0, int(source_file_size_bytes or 0)),
+                        int(electrical_document_id),
+                    ),
+                )
+
+                conn.commit()
+                return {
+                    "electrical_version_id": version_id,
+                    "electrical_version_no": version_no,
+                    "electrical_version_reused": True,
+                    "electrical_inventory_reused": inventory_ready,
+                    "electrical_source_sha256": source_sha256,
+                    "electrical_pipeline_signature": pipeline_signature,
+                    "electrical_parser_version": ELECTRICAL_PARSER_VERSION,
+                    "electrical_inventory_status": "ready" if inventory_ready else "parsing",
+                }
+
+            version_no = int(parent[1] or 0) + 1
+            initial_metadata = {
+                "phase": "electrical_inventory",
+                "inventory_status": "pending",
+                "source_filename": str(source_filename or "").strip() or None,
+                "source_file_size_bytes": max(0, int(source_file_size_bytes or 0)),
+                "source_mode": str(source_mode or "").strip() or None,
+                "content_type": str(content_type or "").strip() or None,
+            }
+
+            cur.execute(
+                """
+                INSERT INTO public.electrical_versions(
+                    electrical_document_id,
+                    company_id,
+                    machine_id,
+                    bubble_document_id,
+                    version_no,
+                    idempotency_key,
+                    source_sha256,
+                    pipeline_signature,
+                    parser_version,
+                    status,
+                    is_active,
+                    deterministic_only,
+                    openai_used,
+                    metadata,
+                    started_at,
+                    created_at,
+                    updated_at
+                )
+                VALUES (
+                    %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s,
+                    'parsing', false, true, false,
+                    %s::jsonb,
+                    NOW(), NOW(), NOW()
+                )
+                RETURNING id;
+                """,
+                (
+                    int(electrical_document_id),
+                    company_id,
+                    machine_id,
+                    bubble_document_id,
+                    version_no,
+                    idempotency_key,
+                    source_sha256,
+                    pipeline_signature,
+                    ELECTRICAL_PARSER_VERSION,
+                    json.dumps(initial_metadata, ensure_ascii=False),
+                ),
+            )
+            version_id = int(cur.fetchone()[0])
+
+            cur.execute(
+                """
+                UPDATE public.electrical_documents
+                SET index_status='parsing',
+                    latest_version_no=%s,
+                    source_filename=COALESCE(%s, source_filename),
+                    source_file_size_bytes=%s,
+                    last_error_code=NULL,
+                    last_error_message=NULL,
+                    last_requested_at=NOW(),
+                    updated_at=NOW()
+                WHERE id=%s;
+                """,
+                (
+                    version_no,
+                    str(source_filename or "").strip() or None,
+                    max(0, int(source_file_size_bytes or 0)),
+                    int(electrical_document_id),
+                ),
+            )
+
+        conn.commit()
+        return {
+            "electrical_version_id": version_id,
+            "electrical_version_no": version_no,
+            "electrical_version_reused": False,
+            "electrical_inventory_reused": False,
+            "electrical_source_sha256": source_sha256,
+            "electrical_pipeline_signature": pipeline_signature,
+            "electrical_parser_version": ELECTRICAL_PARSER_VERSION,
+            "electrical_inventory_status": "parsing",
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _electrical_ascii_upper(value: Any) -> str:
+    text = unicodedata.normalize("NFKD", str(value or ""))
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    return re.sub(r"\s+", " ", text).strip().upper()
+
+
+def _electrical_parse_outline_title(title: str) -> tuple[Optional[str], str]:
+    value = re.sub(r"\s+", " ", str(title or "")).strip()
+    if "|" in value:
+        left, right = value.split("|", 1)
+        return left.strip() or None, right.strip()
+
+    m = re.match(r"^([0-9]+(?:\.[A-Za-z])?)\s+(.+)$", value)
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+
+    return None, value
+
+
+def _electrical_build_outline_map(doc: fitz.Document) -> tuple[dict[int, dict], int]:
+    mapping: dict[int, dict] = {}
+    current_group: Optional[str] = None
+    outline_entries = 0
+
+    try:
+        toc = doc.get_toc(simple=False) or []
+    except Exception:
+        toc = []
+
+    for item in toc:
+        if not isinstance(item, (list, tuple)) or len(item) < 3:
+            continue
+        level = int(item[0] or 0)
+        title = re.sub(r"\s+", " ", str(item[1] or "")).strip()
+        page_no = int(item[2] or 0)
+        outline_entries += 1
+
+        if level == 1:
+            current_group = title or current_group
+
+        if page_no <= 0 or page_no > len(doc):
+            continue
+
+        sheet_code, sheet_title = _electrical_parse_outline_title(title)
+        candidate = {
+            "level": level,
+            "group_code": current_group,
+            "sheet_code": sheet_code,
+            "sheet_title": sheet_title or None,
+        }
+        previous = mapping.get(page_no)
+        if previous is None or int(candidate["level"] or 0) >= int(previous.get("level") or 0):
+            mapping[page_no] = candidate
+
+    return mapping, outline_entries
+
+
+def _electrical_classify_page(
+    *,
+    group_code: Optional[str],
+    sheet_code: Optional[str],
+    sheet_title: Optional[str],
+    raw_text: str,
+    has_outline: bool,
+) -> tuple[str, float]:
+    group_norm = _electrical_ascii_upper(group_code)
+    title_norm = _electrical_ascii_upper(sheet_title)
+    text_norm = _electrical_ascii_upper(raw_text[:6000])
+    combined = f"{group_norm} {title_norm} {text_norm}"
+
+    if "COPERTINA" in title_norm or "COVER" in title_norm:
+        page_type = "cover"
+    elif "INDICE PAGINE" in title_norm or "PAGE INDEX" in title_norm:
+        page_type = "index"
+    elif "SIMBOLI GRAFICI" in title_norm or "GRAPHIC SYMBOL" in title_norm:
+        page_type = "symbol_legend"
+    elif "TARGA" in title_norm or "NAMEPLATE" in title_norm:
+        page_type = "nameplate"
+    elif "DISTINTA MATERIALI" in combined or "BILL OF MATERIAL" in combined:
+        page_type = "bom_table"
+    elif "MORSETTIER" in combined or "TERMINAL STRIP" in combined:
+        page_type = "terminal_table"
+    elif "TABELLE" in title_norm and "SAFETY" in title_norm:
+        page_type = "safety_io_table"
+    elif "TABLE" in title_norm and "SAFETY" in title_norm:
+        page_type = "safety_io_table"
+    elif "TABELLE" in title_norm and "PLC" in title_norm:
+        page_type = "plc_io_table"
+    elif "TABLE" in title_norm and "PLC" in title_norm:
+        page_type = "plc_io_table"
+    elif "PLC SAFETY" in title_norm or "SAFETY PLC" in title_norm:
+        page_type = "safety_plc_configuration"
+    elif title_norm.startswith("PLC ") or title_norm == "PLC":
+        page_type = "plc_configuration"
+    elif "LAYOUT DI RETE" in title_norm or "NETWORK LAYOUT" in title_norm:
+        page_type = "network_layout"
+    elif "LAYOUT" in title_norm or "VISTA FRONTALE" in title_norm or "VISTA LATERALE" in title_norm:
+        page_type = "layout"
+    elif has_outline and (sheet_code or sheet_title):
+        page_type = "schematic"
+    elif any(x in combined for x in ["INPUT PLC", "OUTPUT PLC", "SAFE INPUT", "SAFE OUTPUT"]):
+        page_type = "schematic"
+    else:
+        page_type = "unknown"
+
+    confidence = 1.0 if has_outline else (0.80 if page_type != "unknown" else 0.40)
+    return page_type, confidence
+
+
+def _electrical_compact_words(words: list[tuple]) -> list[list[Any]]:
+    compact: list[list[Any]] = []
+    for w in words:
+        if len(w) < 5:
+            continue
+        compact.append(
+            [
+                round(float(w[0]), 2),
+                round(float(w[1]), 2),
+                round(float(w[2]), 2),
+                round(float(w[3]), 2),
+                str(w[4] or "").replace("\x00", ""),
+                int(w[5] or 0) if len(w) > 5 else 0,
+                int(w[6] or 0) if len(w) > 6 else 0,
+                int(w[7] or 0) if len(w) > 7 else 0,
+            ]
+        )
+    return compact
+
+
+def _electrical_link_label(words: list[tuple], rect: fitz.Rect) -> str:
+    expanded = fitz.Rect(rect.x0 - 2.0, rect.y0 - 2.0, rect.x1 + 2.0, rect.y1 + 2.0)
+    hits: list[tuple] = []
+    for w in words:
+        if len(w) < 5:
+            continue
+        wr = fitz.Rect(float(w[0]), float(w[1]), float(w[2]), float(w[3]))
+        if not wr.intersects(expanded):
+            continue
+        inter = wr & expanded
+        overlap = float(inter.get_area()) / max(1.0, float(wr.get_area()))
+        center = fitz.Point((wr.x0 + wr.x1) / 2.0, (wr.y0 + wr.y1) / 2.0)
+        if overlap >= 0.15 or expanded.contains(center):
+            hits.append(w)
+
+    hits.sort(key=lambda x: (int(x[5] or 0), int(x[6] or 0), int(x[7] or 0), float(x[1]), float(x[0])))
+    label = " ".join(str(w[4] or "").strip() for w in hits if str(w[4] or "").strip())
+    return re.sub(r"\s+", " ", label).strip()[:240]
+
+
+def _electrical_compact_link(link: dict, words: list[tuple]) -> dict:
+    source_rect = link.get("from")
+    if not isinstance(source_rect, fitz.Rect):
+        try:
+            source_rect = fitz.Rect(source_rect)
+        except Exception:
+            source_rect = fitz.Rect(0, 0, 0, 0)
+
+    target_point = link.get("to")
+    target_x = target_y = None
+    if isinstance(target_point, fitz.Point):
+        target_x = round(float(target_point.x), 2)
+        target_y = round(float(target_point.y), 2)
+
+    return {
+        "kind": int(link.get("kind") or 0),
+        "xref": int(link.get("xref") or 0),
+        "source_bbox": [
+            round(float(source_rect.x0), 2),
+            round(float(source_rect.y0), 2),
+            round(float(source_rect.x1), 2),
+            round(float(source_rect.y1), 2),
+        ],
+        "source_label": _electrical_link_label(words, source_rect),
+        "target_pdf_page_number": (
+            int(link.get("page")) + 1
+            if isinstance(link.get("page"), int) and int(link.get("page")) >= 0
+            else None
+        ),
+        "target_x": target_x,
+        "target_y": target_y,
+        "zoom": float(link.get("zoom") or 0.0),
+        "uri": str(link.get("uri") or "").replace("\x00", "").strip() or None,
+    }
+
+
+def _electrical_page_sha256(
+    doc: fitz.Document,
+    page: fitz.Page,
+    *,
+    raw_text: str,
+    compact_words: list[list[Any]],
+    compact_links: list[dict],
+) -> str:
+    h = hashlib.sha256()
+    try:
+        h.update(doc.xref_object(page.xref, compressed=False).encode("utf-8", errors="ignore"))
+        for xref in page.get_contents() or []:
+            try:
+                h.update(doc.xref_stream(int(xref)) or b"")
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    h.update(raw_text.encode("utf-8", errors="ignore"))
+    h.update(json.dumps(compact_words, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    h.update(json.dumps(compact_links, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    return h.hexdigest()
+
+
+def _electrical_largest_image_coverage(page: fitz.Page) -> float:
+    page_area = max(1.0, float(page.rect.get_area()))
+    largest = 0.0
+    try:
+        images = page.get_images(full=True) or []
+    except Exception:
+        images = []
+
+    for img in images[:100]:
+        try:
+            xref = int(img[0])
+            rects = page.get_image_rects(xref) or []
+        except Exception:
+            rects = []
+        for rect in rects:
+            try:
+                largest = max(largest, float(rect.get_area()) / page_area)
+            except Exception:
+                continue
+    return min(1.0, max(0.0, largest))
+
+
+def _electrical_cover_metadata(raw_text: str) -> dict:
+    text = str(raw_text or "")
+    patterns = {
+        "machine_code": r"Codice\s+Macchina:[ \t]*([^\n]+?)(?=\s{2,}Descrizione:|\n)",
+        "description": r"Descrizione:[ \t]*([^\n]+)",
+        "machine_type": r"Macchina\s+Tipo:[ \t]*([^\n]+)",
+        "scheme_number": r"Schema\s+Numero:[ \t]*([^\n]+)",
+        "reference_bom": r"Distinta\s+di\s+riferimento:[ \t]*([^\n]*)",
+        "order_number": r"Commessa:[ \t]*([^\n]+)",
+        "serial_number": r"Matricola:[ \t]*([^\n]+)",
+        "declared_sheet_count": r"Numero\s+Fogli:[ \t]*(\d+)",
+        "drawing_date": r"Data:[ \t]*([^\n]+)",
+        "operating_voltage": r"Tensione\s+Esercizio:[ \t]*([^\n]+)",
+        "auxiliary_voltage": r"Tensione\s+Ausiliari:[ \t]*([^\n]+)",
+        "signal_voltage": r"Tensione\s+Segnali:[ \t]*([^\n]+)",
+        "frequency": r"Frequenza:[ \t]*([^\n]+)",
+        "nominal_current": r"Corrente\s+nominale:[ \t]*([^\n]+)",
+        "total_power": r"Potenza\s+totale:[ \t]*([^\n]+)",
+        "protection_rating": r"Grado\s+di\s+protezione:[ \t]*([^\n]+)",
+    }
+
+    out: dict[str, Any] = {}
+    for key, pattern in patterns.items():
+        m = re.search(pattern, text, flags=re.IGNORECASE)
+        if not m:
+            continue
+        value = re.sub(r"\s+", " ", str(m.group(1) or "")).strip()
+        if key == "declared_sheet_count":
+            try:
+                out[key] = int(value)
+            except Exception:
+                continue
+        elif value:
+            out[key] = value[:500]
+    return out
+
+
+def _extract_electrical_inventory(data: bytes) -> dict:
+    try:
+        doc = fitz.open(stream=data, filetype="pdf")
+    except Exception as e:
+        raise ValueError(f"Electrical PDF open failed: {str(e)[:200]}")
+
+    try:
+        pdf_page_count = len(doc)
+        if pdf_page_count <= 0:
+            raise ValueError("Electrical PDF has no pages")
+        if pdf_page_count > ELECTRICAL_MAX_PAGES:
+            raise ValueError(
+                f"Electrical PDF exceeds MM_ELECTRICAL_MAX_PAGES ({pdf_page_count}>{ELECTRICAL_MAX_PAGES})"
+            )
+
+        outline_map, outline_entries = _electrical_build_outline_map(doc)
+        pages: list[dict] = []
+        cross_references: list[dict] = []
+        page_type_counts: dict[str, int] = {}
+        vector_page_count = 0
+        internal_link_count = 0
+        external_link_count = 0
+        words_truncated_pages = 0
+        links_truncated_pages = 0
+
+        first_page_text = doc[0].get_text("text", sort=True) if pdf_page_count > 0 else ""
+        cover_fields = _electrical_cover_metadata(first_page_text)
+        declared_sheet_count = cover_fields.get("declared_sheet_count")
+
+        for page_index in range(pdf_page_count):
+            page = doc[page_index]
+            pdf_page_number = page_index + 1
+            warnings: list[dict] = []
+
+            raw_text = (page.get_text("text", sort=True) or "").replace("\x00", "")
+            if len(raw_text) > ELECTRICAL_MAX_RAW_TEXT_CHARS_PER_PAGE:
+                raw_text = raw_text[:ELECTRICAL_MAX_RAW_TEXT_CHARS_PER_PAGE]
+                warnings.append(
+                    {
+                        "code": "RAW_TEXT_TRUNCATED",
+                        "limit": ELECTRICAL_MAX_RAW_TEXT_CHARS_PER_PAGE,
+                    }
+                )
+
+            words = list(page.get_text("words", sort=True) or [])
+            if len(words) > ELECTRICAL_MAX_WORDS_PER_PAGE:
+                words = words[:ELECTRICAL_MAX_WORDS_PER_PAGE]
+                words_truncated_pages += 1
+                warnings.append(
+                    {
+                        "code": "WORDS_TRUNCATED",
+                        "limit": ELECTRICAL_MAX_WORDS_PER_PAGE,
+                    }
+                )
+            compact_words = _electrical_compact_words(words)
+
+            links = list(page.get_links() or [])
+            if len(links) > ELECTRICAL_MAX_LINKS_PER_PAGE:
+                links = links[:ELECTRICAL_MAX_LINKS_PER_PAGE]
+                links_truncated_pages += 1
+                warnings.append(
+                    {
+                        "code": "LINKS_TRUNCATED",
+                        "limit": ELECTRICAL_MAX_LINKS_PER_PAGE,
+                    }
+                )
+            compact_links = [_electrical_compact_link(link, words) for link in links]
+
+            outline = outline_map.get(pdf_page_number) or {}
+            sheet_code = str(outline.get("sheet_code") or "").strip() or None
+            sheet_title = str(outline.get("sheet_title") or "").strip() or None
+            group_code = str(outline.get("group_code") or "").strip() or None
+            has_outline = bool(outline)
+
+            if not sheet_title:
+                first_lines = [re.sub(r"\s+", " ", x).strip() for x in raw_text.splitlines() if x.strip()]
+                sheet_title = (first_lines[0][:240] if first_lines else None)
+
+            page_type, classification_confidence = _electrical_classify_page(
+                group_code=group_code,
+                sheet_code=sheet_code,
+                sheet_title=sheet_title,
+                raw_text=raw_text,
+                has_outline=has_outline,
+            )
+            page_type_counts[page_type] = int(page_type_counts.get(page_type, 0)) + 1
+
+            largest_image_coverage = _electrical_largest_image_coverage(page)
+            is_vector_pdf = bool(compact_words) and largest_image_coverage < 0.80
+            if is_vector_pdf:
+                vector_page_count += 1
+
+            has_internal_links = any(
+                int(link.get("kind") or 0) == int(getattr(fitz, "LINK_GOTO", 1))
+                and link.get("target_pdf_page_number") is not None
+                for link in compact_links
+            )
+
+            page_sha256 = _electrical_page_sha256(
+                doc,
+                page,
+                raw_text=raw_text,
+                compact_words=compact_words,
+                compact_links=compact_links,
+            )
+
+            pages.append(
+                {
+                    "pdf_page_number": pdf_page_number,
+                    "sheet_code": sheet_code,
+                    "sheet_title": sheet_title,
+                    "group_code": group_code,
+                    "page_type": page_type,
+                    "page_width_pt": round(float(page.rect.width), 2),
+                    "page_height_pt": round(float(page.rect.height), 2),
+                    "rotation_degrees": int(page.rotation or 0) % 360,
+                    "page_sha256": page_sha256,
+                    "is_vector_pdf": is_vector_pdf,
+                    "has_internal_links": has_internal_links,
+                    "classification_confidence": classification_confidence,
+                    "raw_text": raw_text,
+                    "text_spans_json": compact_words,
+                    "drawings_json": [],
+                    "links_json": compact_links,
+                    "tables_json": [],
+                    "parser_warnings_json": warnings,
+                    "properties": {
+                        "largest_image_coverage": round(largest_image_coverage, 4),
+                        "word_count": len(compact_words),
+                        "link_count": len(compact_links),
+                    },
+                }
+            )
+
+            for link_index, link in enumerate(compact_links, start=1):
+                kind = int(link.get("kind") or 0)
+                target_page_number = link.get("target_pdf_page_number")
+                is_internal = (
+                    kind == int(getattr(fitz, "LINK_GOTO", 1))
+                    and isinstance(target_page_number, int)
+                    and 1 <= int(target_page_number) <= pdf_page_count
+                )
+                is_external = kind == int(getattr(fitz, "LINK_URI", 2)) and bool(link.get("uri"))
+
+                if not (is_internal or is_external):
+                    continue
+
+                if is_internal:
+                    internal_link_count += 1
+                else:
+                    external_link_count += 1
+
+                source_bbox = link.get("source_bbox") or [None, None, None, None]
+                target_outline = outline_map.get(int(target_page_number)) if is_internal else None
+                pdf_xref = int(link.get("xref") or 0)
+                xref_suffix = str(pdf_xref) if pdf_xref > 0 else str(link_index)
+
+                cross_references.append(
+                    {
+                        "source_pdf_page_number": pdf_page_number,
+                        "target_pdf_page_number": int(target_page_number) if is_internal else None,
+                        "xref_key": f"pdf-link:{pdf_page_number}:{xref_suffix}",
+                        "relation_type": "pdf_internal_link" if is_internal else "external_uri",
+                        "source_label": str(link.get("source_label") or "").strip() or None,
+                        "target_sheet_code": (
+                            str((target_outline or {}).get("sheet_code") or "").strip() or None
+                        ),
+                        "target_x": link.get("target_x"),
+                        "target_y": link.get("target_y"),
+                        "source_x0": source_bbox[0],
+                        "source_y0": source_bbox[1],
+                        "source_x1": source_bbox[2],
+                        "source_y1": source_bbox[3],
+                        "link_uri": link.get("uri"),
+                        "confidence": 1.0,
+                        "extraction_method": "pdf_internal_link" if is_internal else "pdf_external_link",
+                        "properties": {
+                            "pdf_link_kind": kind,
+                            "pdf_xref": pdf_xref,
+                            "zoom": link.get("zoom"),
+                        },
+                    }
+                )
+
+        metadata = {
+            "phase": "electrical_inventory",
+            "inventory_status": "ready",
+            "inventory_format": "words_v1_links_v1",
+            "parser_version": ELECTRICAL_PARSER_VERSION,
+            "pipeline_signature": _electrical_pipeline_signature(),
+            "pymupdf_version": str(getattr(fitz, "VersionBind", "unknown") or "unknown"),
+            "outline_entries": outline_entries,
+            "outline_mapped_pages": len(outline_map),
+            "page_type_counts": page_type_counts,
+            "vector_page_count": vector_page_count,
+            "non_vector_page_count": pdf_page_count - vector_page_count,
+            "internal_link_count": internal_link_count,
+            "external_link_count": external_link_count,
+            "words_truncated_pages": words_truncated_pages,
+            "links_truncated_pages": links_truncated_pages,
+            "cover_fields": cover_fields,
+            "pdf_metadata": {
+                str(k): str(v)[:2000]
+                for k, v in (doc.metadata or {}).items()
+                if v not in (None, "")
+            },
+            "drawings_extracted": False,
+            "tables_extracted": False,
+            "openai_used": False,
+            "next_phase": "deterministic_tables_and_geometry",
+            "inventory_generated_at": datetime.now().astimezone().isoformat(),
+        }
+
+        return {
+            "pdf_page_count": pdf_page_count,
+            "declared_sheet_count": (
+                int(declared_sheet_count) if isinstance(declared_sheet_count, int) else None
+            ),
+            "pages": pages,
+            "cross_references": cross_references,
+            "metadata": metadata,
+            "internal_link_count": internal_link_count,
+            "external_link_count": external_link_count,
+            "outline_entries": outline_entries,
+        }
+    finally:
+        doc.close()
+
+
+def _db_write_electrical_inventory(
+    *,
+    version_id: int,
+    version_no: int,
+    electrical_document_id: int,
+    company_id: str,
+    machine_id: str,
+    bubble_document_id: str,
+    inventory: dict,
+) -> dict:
+    pages = list(inventory.get("pages") or [])
+    cross_references = list(inventory.get("cross_references") or [])
+    metadata = dict(inventory.get("metadata") or {})
+    pdf_page_count = int(inventory.get("pdf_page_count") or 0)
+    declared_sheet_count = inventory.get("declared_sheet_count")
+
+    if pdf_page_count <= 0 or len(pages) != pdf_page_count:
+        raise ValueError("Electrical inventory page count mismatch")
+
+    conn = _db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM public.electrical_pages WHERE version_id=%s;",
+                (int(version_id),),
+            )
+
+            page_id_by_number: dict[int, int] = {}
+            for p in pages:
+                cur.execute(
+                    """
+                    INSERT INTO public.electrical_pages(
+                        version_id,
+                        company_id,
+                        machine_id,
+                        bubble_document_id,
+                        pdf_page_number,
+                        sheet_code,
+                        sheet_title,
+                        group_code,
+                        page_type,
+                        page_width_pt,
+                        page_height_pt,
+                        rotation_degrees,
+                        page_sha256,
+                        is_vector_pdf,
+                        has_internal_links,
+                        classification_confidence,
+                        raw_text,
+                        text_spans_json,
+                        drawings_json,
+                        links_json,
+                        tables_json,
+                        parser_warnings_json,
+                        raw_artifact_uri,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (
+                        %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s, %s,
+                        %s,
+                        %s::jsonb,
+                        %s::jsonb,
+                        %s::jsonb,
+                        %s::jsonb,
+                        %s::jsonb,
+                        NULL,
+                        NOW(), NOW()
+                    )
+                    RETURNING id;
+                    """,
+                    (
+                        int(version_id),
+                        company_id,
+                        machine_id,
+                        bubble_document_id,
+                        int(p["pdf_page_number"]),
+                        p.get("sheet_code"),
+                        p.get("sheet_title"),
+                        p.get("group_code"),
+                        p.get("page_type") or "unknown",
+                        p.get("page_width_pt"),
+                        p.get("page_height_pt"),
+                        int(p.get("rotation_degrees") or 0),
+                        p.get("page_sha256"),
+                        bool(p.get("is_vector_pdf")),
+                        bool(p.get("has_internal_links")),
+                        p.get("classification_confidence"),
+                        p.get("raw_text") or "",
+                        json.dumps(p.get("text_spans_json") or [], ensure_ascii=False),
+                        json.dumps(p.get("drawings_json") or [], ensure_ascii=False),
+                        json.dumps(p.get("links_json") or [], ensure_ascii=False),
+                        json.dumps(p.get("tables_json") or [], ensure_ascii=False),
+                        json.dumps(p.get("parser_warnings_json") or [], ensure_ascii=False),
+                    ),
+                )
+                page_id_by_number[int(p["pdf_page_number"])] = int(cur.fetchone()[0])
+
+            xref_rows: list[tuple] = []
+            for x in cross_references:
+                source_no = int(x.get("source_pdf_page_number") or 0)
+                source_page_id = page_id_by_number.get(source_no)
+                if not source_page_id:
+                    continue
+                target_no = x.get("target_pdf_page_number")
+                target_page_id = page_id_by_number.get(int(target_no)) if target_no else None
+
+                xref_rows.append(
+                    (
+                        int(version_id),
+                        company_id,
+                        machine_id,
+                        bubble_document_id,
+                        source_page_id,
+                        target_page_id,
+                        x.get("xref_key"),
+                        x.get("relation_type") or "cross_reference",
+                        x.get("source_label"),
+                        x.get("target_sheet_code"),
+                        int(target_no) if target_no else None,
+                        x.get("target_x"),
+                        x.get("target_y"),
+                        x.get("source_x0"),
+                        x.get("source_y0"),
+                        x.get("source_x1"),
+                        x.get("source_y1"),
+                        x.get("link_uri"),
+                        json.dumps(x.get("properties") or {}, ensure_ascii=False),
+                        x.get("confidence"),
+                        x.get("extraction_method") or "deterministic",
+                        False,
+                    )
+                )
+
+            if xref_rows:
+                execute_values(
+                    cur,
+                    """
+                    INSERT INTO public.electrical_cross_references(
+                        version_id,
+                        company_id,
+                        machine_id,
+                        bubble_document_id,
+                        source_page_id,
+                        target_page_id,
+                        xref_key,
+                        relation_type,
+                        source_label,
+                        target_sheet_code,
+                        target_pdf_page_number,
+                        target_x,
+                        target_y,
+                        source_x0,
+                        source_y0,
+                        source_x1,
+                        source_y1,
+                        link_uri,
+                        properties,
+                        confidence,
+                        extraction_method,
+                        is_verified,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES %s
+                    """,
+                    [
+                        row + (datetime.now().astimezone(), datetime.now().astimezone())
+                        for row in xref_rows
+                    ],
+                    template=(
+                        "(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"
+                        "%s::jsonb,%s,%s,%s,%s,%s)"
+                    ),
+                    page_size=500,
+                )
+
+            xrefs_written = len(xref_rows)
+
+            cur.execute(
+                """
+                UPDATE public.electrical_versions
+                SET status='queued',
+                    pdf_page_count=%s,
+                    declared_sheet_count=%s,
+                    deterministic_only=true,
+                    openai_used=false,
+                    metadata=COALESCE(metadata, '{}'::jsonb) || %s::jsonb,
+                    error_code=NULL,
+                    error_message=NULL,
+                    updated_at=NOW()
+                WHERE id=%s
+                  AND electrical_document_id=%s;
+                """,
+                (
+                    pdf_page_count,
+                    int(declared_sheet_count) if declared_sheet_count is not None else None,
+                    json.dumps(metadata, ensure_ascii=False),
+                    int(version_id),
+                    int(electrical_document_id),
+                ),
+            )
+
+            cur.execute(
+                """
+                UPDATE public.electrical_documents
+                SET index_status='queued',
+                    latest_version_no=GREATEST(latest_version_no, %s),
+                    last_error_code=NULL,
+                    last_error_message=NULL,
+                    updated_at=NOW()
+                WHERE id=%s;
+                """,
+                (int(version_no), int(electrical_document_id)),
+            )
+
+        conn.commit()
+        return {
+            "electrical_inventory_status": "ready",
+            "electrical_pages_written": pdf_page_count,
+            "electrical_cross_references_written": xrefs_written,
+            "electrical_internal_links_written": int(inventory.get("internal_link_count") or 0),
+            "electrical_external_links_written": int(inventory.get("external_link_count") or 0),
+            "electrical_outline_entries": int(inventory.get("outline_entries") or 0),
+            "electrical_index_status": "queued",
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _db_mark_electrical_inventory_failed(
+    *,
+    electrical_document_id: int,
+    version_id: Optional[int],
+    error_code: str,
+    error_message: str,
+) -> None:
+    error_code = str(error_code or "ELECTRICAL_INVENTORY_FAILED").strip()[:120]
+    error_message = str(error_message or "Electrical inventory failed").strip()[:2000]
+
+    conn = _db_conn()
+    try:
+        with conn.cursor() as cur:
+            if version_id:
+                cur.execute(
+                    """
+                    UPDATE public.electrical_versions
+                    SET status='failed',
+                        error_code=%s,
+                        error_message=%s,
+                        finished_at=NOW(),
+                        updated_at=NOW(),
+                        metadata=COALESCE(metadata, '{}'::jsonb) || %s::jsonb
+                    WHERE id=%s;
+                    """,
+                    (
+                        error_code,
+                        error_message,
+                        json.dumps(
+                            {
+                                "inventory_status": "failed",
+                                "inventory_failed_at": datetime.now().astimezone().isoformat(),
+                            }
+                        ),
+                        int(version_id),
+                    ),
+                )
+
+            cur.execute(
+                """
+                UPDATE public.electrical_documents
+                SET index_status='failed',
+                    last_error_code=%s,
+                    last_error_message=%s,
+                    updated_at=NOW()
+                WHERE id=%s;
+                """,
+                (error_code, error_message, int(electrical_document_id)),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def _get_table_columns(cur, table_name: str) -> set[str]:
@@ -12222,12 +13283,28 @@ def ingest_document(
     electrical_meta = {
         "electrical_candidate": bool(electrical_candidate),
         "electrical_pipeline_enabled": bool(ELECTRICAL_INGEST_ENABLED),
+        "electrical_inventory_enabled": bool(ELECTRICAL_INVENTORY_ENABLED),
         "electrical_document_id": None,
         "electrical_index_status": (
             "disabled" if electrical_candidate and not ELECTRICAL_INGEST_ENABLED else "not_applicable"
         ),
         "electrical_latest_version_no": 0,
         "electrical_registry_error": None,
+        "electrical_version_id": None,
+        "electrical_version_no": 0,
+        "electrical_version_reused": False,
+        "electrical_inventory_reused": False,
+        "electrical_source_sha256": None,
+        "electrical_parser_version": ELECTRICAL_PARSER_VERSION,
+        "electrical_inventory_status": (
+            "disabled" if electrical_candidate and not ELECTRICAL_INVENTORY_ENABLED else "not_applicable"
+        ),
+        "electrical_pages_written": 0,
+        "electrical_cross_references_written": 0,
+        "electrical_internal_links_written": 0,
+        "electrical_external_links_written": 0,
+        "electrical_outline_entries": 0,
+        "electrical_inventory_error": None,
     }
 
     if electrical_candidate and ELECTRICAL_INGEST_ENABLED:
@@ -12256,6 +13333,100 @@ def ingest_document(
                     ensure_ascii=False,
                 ),
             )
+
+            if ELECTRICAL_INVENTORY_ENABLED:
+                version_id = None
+                try:
+                    source_sha256 = _electrical_source_sha256(data)
+                    version_meta = _db_prepare_electrical_version(
+                        electrical_document_id=int(electrical_meta["electrical_document_id"]),
+                        company_id=company_id,
+                        machine_id=machine_id,
+                        bubble_document_id=bubble_document_id,
+                        source_sha256=source_sha256,
+                        source_filename=detected_filename,
+                        source_file_size_bytes=len(data),
+                        source_mode=source_mode,
+                        content_type=content_type,
+                    )
+                    electrical_meta.update(version_meta)
+                    version_id = int(version_meta["electrical_version_id"])
+
+                    if bool(version_meta.get("electrical_inventory_reused")):
+                        electrical_meta["electrical_inventory_status"] = "ready"
+                        print(
+                            "ELECTRICAL_INVENTORY_REUSED",
+                            json.dumps(
+                                {
+                                    "company_id": company_id,
+                                    "bubble_document_id": bubble_document_id,
+                                    "electrical_document_id": electrical_meta.get("electrical_document_id"),
+                                    "electrical_version_id": version_id,
+                                    "electrical_version_no": version_meta.get("electrical_version_no"),
+                                    "source_sha256": source_sha256,
+                                },
+                                ensure_ascii=False,
+                            ),
+                        )
+                    else:
+                        inventory = _extract_electrical_inventory(data)
+                        write_meta = _db_write_electrical_inventory(
+                            version_id=version_id,
+                            version_no=int(version_meta["electrical_version_no"]),
+                            electrical_document_id=int(electrical_meta["electrical_document_id"]),
+                            company_id=company_id,
+                            machine_id=machine_id,
+                            bubble_document_id=bubble_document_id,
+                            inventory=inventory,
+                        )
+                        electrical_meta.update(write_meta)
+                        print(
+                            "ELECTRICAL_INVENTORY_READY",
+                            json.dumps(
+                                {
+                                    "company_id": company_id,
+                                    "machine_id": machine_id,
+                                    "bubble_document_id": bubble_document_id,
+                                    "electrical_document_id": electrical_meta.get("electrical_document_id"),
+                                    "electrical_version_id": version_id,
+                                    "electrical_version_no": version_meta.get("electrical_version_no"),
+                                    "source_sha256": source_sha256,
+                                    "pages_written": write_meta.get("electrical_pages_written"),
+                                    "cross_references_written": write_meta.get("electrical_cross_references_written"),
+                                    "internal_links": write_meta.get("electrical_internal_links_written"),
+                                    "external_links": write_meta.get("electrical_external_links_written"),
+                                    "outline_entries": write_meta.get("electrical_outline_entries"),
+                                },
+                                ensure_ascii=False,
+                            ),
+                        )
+                except Exception as e:
+                    electrical_meta["electrical_inventory_status"] = "failed"
+                    electrical_meta["electrical_index_status"] = "failed"
+                    electrical_meta["electrical_inventory_error"] = str(e)[:1000]
+                    try:
+                        _db_mark_electrical_inventory_failed(
+                            electrical_document_id=int(electrical_meta["electrical_document_id"]),
+                            version_id=version_id,
+                            error_code="ELECTRICAL_INVENTORY_FAILED",
+                            error_message=str(e),
+                        )
+                    except Exception as mark_error:
+                        print("ELECTRICAL_INVENTORY_MARK_FAIL", str(mark_error)[:500])
+                    print(
+                        "ELECTRICAL_INVENTORY_FAIL",
+                        json.dumps(
+                            {
+                                "company_id": company_id,
+                                "machine_id": machine_id,
+                                "bubble_document_id": bubble_document_id,
+                                "electrical_document_id": electrical_meta.get("electrical_document_id"),
+                                "electrical_version_id": version_id,
+                                "error": str(e)[:1000],
+                            },
+                            ensure_ascii=False,
+                        ),
+                    )
         except Exception as e:
             electrical_meta["electrical_index_status"] = "registry_failed"
             electrical_meta["electrical_registry_error"] = str(e)[:500]
