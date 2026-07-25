@@ -6,7 +6,7 @@ substitutions:
   _SERVICE: "mm-ai-ingest-fixed"
   _AR_REPOSITORY: "mm-ai-ingest"
   _IMAGE_NAME: "mm-ai-ingest"
-  _EXPECTED_CODE_MARKER: "phase2-vision-v2"
+  _EXPECTED_CODE_MARKER: "phase2-vision-v2-source-snapshot"
 
 steps:
   - id: "01-source-preflight"
@@ -22,6 +22,7 @@ steps:
           main.py \
           electrical_semantic.py \
           electrical_structured.py \
+          electrical_source_store.py \
           requirements.txt
         do
           test -f "$${file}" || {
@@ -33,7 +34,8 @@ steps:
         python3 -m py_compile \
           main.py \
           electrical_semantic.py \
-          electrical_structured.py
+          electrical_structured.py \
+          electrical_source_store.py
 
         echo "SOURCE PREFLIGHT: OK"
 
@@ -67,6 +69,8 @@ steps:
         docker run -d \
           --name "$${NAME}" \
           -e PORT=8080 \
+          -e MM_ELECTRICAL_SOURCE_SNAPSHOT_ENABLED=1 \
+          -e MM_ELECTRICAL_SOURCE_BUCKET=mm-ai-electrical-sources-443517556116 \
           "$${IMAGE}" >/dev/null
 
         READY=0
@@ -117,9 +121,16 @@ steps:
             == 'mm-electrical-structured-materializer-v2'
         ), version
 
+        assert version.get('electrical_source_snapshot_enabled') is True, version
+        assert (
+            version.get('electrical_source_snapshot_bucket')
+            == 'mm-ai-electrical-sources-443517556116'
+        ), version
+
         required = {
             '/v1/ai/electrical/normalize',
             '/v1/ai/electrical/extract-structured',
+            '/v1/ai/electrical/source/snapshot',
         }
         missing = required - set(openapi.get('paths', {}))
         assert not missing, f'ROUTE MANCANTI: {sorted(missing)}'
@@ -203,7 +214,7 @@ steps:
           --revision-suffix="$${REV_SUFFIX}" \
           --timeout="600s" \
           --remove-env-vars="MM_ELECTRICAL_STRUCTURED_MODEL,MM_ELECTRICAL_STRUCTURED_PROMPT_VERSION,MM_ELECTRICAL_STRUCTURED_MIN_CONFIDENCE,MM_ELECTRICAL_STRUCTURED_MAX_WORDS_PER_PAGE" \
-          --update-env-vars="COMMIT_SHA=$COMMIT_SHA,MM_ELECTRICAL_STRUCTURED_ENABLED=1,MM_ELECTRICAL_STRUCTURED_DETECTOR_MODEL=gpt-5.4,MM_ELECTRICAL_STRUCTURED_EXTRACTOR_MODEL=gpt-5.4,MM_ELECTRICAL_STRUCTURED_VERIFIER_MODEL=gpt-5.4,MM_ELECTRICAL_STRUCTURED_DETECTOR_PROMPT_VERSION=mm-electrical-region-detector-v2,MM_ELECTRICAL_STRUCTURED_EXTRACTOR_PROMPT_VERSION=mm-electrical-table-extractor-v2,MM_ELECTRICAL_STRUCTURED_VERIFIER_PROMPT_VERSION=mm-electrical-page-verifier-v2,MM_ELECTRICAL_STRUCTURED_MATERIALIZER_VERSION=mm-electrical-structured-materializer-v2,MM_ELECTRICAL_STRUCTURED_ROW_MIN_CONFIDENCE=0.80,MM_ELECTRICAL_STRUCTURED_PAGE_PASS_MIN_CONFIDENCE=0.90,MM_ELECTRICAL_STRUCTURED_RENDER_DPI=220,MM_ELECTRICAL_STRUCTURED_MAX_COMPLETION_TOKENS=16000,MM_ELECTRICAL_STRUCTURED_FETCH_TIMEOUT_SECONDS=60,MM_ELECTRICAL_STRUCTURED_TIMEOUT_SECONDS=240,MM_ELECTRICAL_STRUCTURED_MAX_SOURCE_BYTES=100000000,MM_ELECTRICAL_STRUCTURED_INPUT_USD_PER_MILLION=0,MM_ELECTRICAL_STRUCTURED_OUTPUT_USD_PER_MILLION=0" \
+          --update-env-vars="COMMIT_SHA=$COMMIT_SHA,MM_ELECTRICAL_STRUCTURED_ENABLED=1,MM_ELECTRICAL_STRUCTURED_DETECTOR_MODEL=gpt-5.4,MM_ELECTRICAL_STRUCTURED_EXTRACTOR_MODEL=gpt-5.4,MM_ELECTRICAL_STRUCTURED_VERIFIER_MODEL=gpt-5.4,MM_ELECTRICAL_STRUCTURED_DETECTOR_PROMPT_VERSION=mm-electrical-region-detector-v2,MM_ELECTRICAL_STRUCTURED_EXTRACTOR_PROMPT_VERSION=mm-electrical-table-extractor-v2,MM_ELECTRICAL_STRUCTURED_VERIFIER_PROMPT_VERSION=mm-electrical-page-verifier-v2,MM_ELECTRICAL_STRUCTURED_MATERIALIZER_VERSION=mm-electrical-structured-materializer-v2,MM_ELECTRICAL_STRUCTURED_ROW_MIN_CONFIDENCE=0.80,MM_ELECTRICAL_STRUCTURED_PAGE_PASS_MIN_CONFIDENCE=0.90,MM_ELECTRICAL_STRUCTURED_RENDER_DPI=220,MM_ELECTRICAL_STRUCTURED_MAX_COMPLETION_TOKENS=16000,MM_ELECTRICAL_STRUCTURED_FETCH_TIMEOUT_SECONDS=60,MM_ELECTRICAL_STRUCTURED_TIMEOUT_SECONDS=240,MM_ELECTRICAL_STRUCTURED_MAX_SOURCE_BYTES=100000000,MM_ELECTRICAL_STRUCTURED_INPUT_USD_PER_MILLION=0,MM_ELECTRICAL_STRUCTURED_OUTPUT_USD_PER_MILLION=0,MM_ELECTRICAL_SOURCE_SNAPSHOT_ENABLED=1,MM_ELECTRICAL_SOURCE_BUCKET=mm-ai-electrical-sources-443517556116,MM_ELECTRICAL_SOURCE_PREFIX=electrical-source-v1,MM_ELECTRICAL_SOURCE_TIMEOUT_SECONDS=90,MM_ELECTRICAL_SOURCE_MAX_BYTES=100000000" \
           --quiet
 
         gcloud run services describe "${_SERVICE}" \
@@ -317,6 +328,11 @@ steps:
             version.get('electrical_code_marker')
             == os.environ['EXPECTED_MARKER']
         ), version
+        assert version.get('electrical_source_snapshot_enabled') is True, version
+        assert (
+            version.get('electrical_source_snapshot_bucket')
+            == 'mm-ai-electrical-sources-443517556116'
+        ), version
         assert version.get('electrical_structured_enabled') is True, version
         assert (
             version.get('electrical_structured_pipeline_marker')
@@ -345,6 +361,7 @@ steps:
         required = {
             '/v1/ai/electrical/normalize',
             '/v1/ai/electrical/extract-structured',
+            '/v1/ai/electrical/source/snapshot',
         }
         missing = required - set(openapi.get('paths', {}))
         assert not missing, f'ROUTE MANCANTI: {sorted(missing)}'
@@ -459,6 +476,11 @@ steps:
         assert (
             version.get('electrical_code_marker')
             == os.environ['EXPECTED_MARKER']
+        ), version
+        assert version.get('electrical_source_snapshot_enabled') is True, version
+        assert (
+            version.get('electrical_source_snapshot_bucket')
+            == 'mm-ai-electrical-sources-443517556116'
         ), version
         assert version.get('electrical_structured_enabled') is True, version
         assert (

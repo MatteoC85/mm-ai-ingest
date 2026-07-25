@@ -35,6 +35,12 @@ from electrical_structured import (
     extract_electrical_structured_version,
 )
 
+from electrical_source_store import (
+    get_electrical_source_runtime_config,
+    snapshot_electrical_source_pdf,
+    delete_electrical_source_uris,
+)
+
 app = FastAPI()
 
 AI_INTERNAL_SECRET = (os.environ.get("AI_INTERNAL_SECRET") or "").strip()
@@ -296,6 +302,16 @@ class ElectricalStructuredExtractRequest(BaseModel):
     page_types: Optional[List[str]] = None
     pdf_page_numbers: Optional[List[int]] = None
     force: Optional[bool] = False
+
+
+class ElectricalSourceSnapshotRequest(BaseModel):
+    company_id: str
+    machine_id: str
+    bubble_document_id: str
+    version_id: int
+    file_url: Optional[str] = None
+    file_base64: Optional[str] = None
+    filename: Optional[str] = None
 
 class SearchRequest(BaseModel):
     query: str
@@ -996,6 +1012,159 @@ def _db_prepare_electrical_version(
         raise
     finally:
         conn.close()
+
+
+def _db_attach_electrical_source_snapshot(
+    *,
+    version_id: int,
+    electrical_document_id: int,
+    company_id: str,
+    machine_id: str,
+    bubble_document_id: str,
+    snapshot: dict,
+) -> None:
+    conn = _db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE public.electrical_versions
+                SET metadata = jsonb_set(
+                        COALESCE(metadata, '{}'::jsonb),
+                        '{source_snapshot}',
+                        %s::jsonb,
+                        true
+                    ),
+                    updated_at = NOW()
+                WHERE id=%s
+                  AND electrical_document_id=%s
+                  AND company_id=%s
+                  AND machine_id=%s
+                  AND bubble_document_id=%s;
+                """,
+                (
+                    json.dumps(snapshot, ensure_ascii=False),
+                    int(version_id),
+                    int(electrical_document_id),
+                    company_id,
+                    machine_id,
+                    bubble_document_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("Electrical source snapshot version scope not found")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _db_get_electrical_source_identity(
+    *,
+    version_id: int,
+    company_id: str,
+    machine_id: str,
+    bubble_document_id: str,
+) -> dict:
+    conn = _db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT d.id, d.source_filename, v.source_sha256, v.pdf_page_count
+                FROM public.electrical_documents d
+                JOIN public.electrical_versions v
+                  ON v.electrical_document_id=d.id
+                 AND v.company_id=d.company_id
+                 AND v.machine_id=d.machine_id
+                 AND v.bubble_document_id=d.bubble_document_id
+                WHERE v.id=%s
+                  AND d.company_id=%s
+                  AND d.machine_id=%s
+                  AND d.bubble_document_id=%s
+                LIMIT 1;
+                """,
+                (
+                    int(version_id),
+                    company_id,
+                    machine_id,
+                    bubble_document_id,
+                ),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise ValueError("Electrical source version not found")
+            return {
+                "electrical_document_id": int(row[0]),
+                "source_filename": str(row[1] or ""),
+                "source_sha256": str(row[2] or "").strip().lower(),
+                "pdf_page_count": int(row[3] or 0),
+            }
+    finally:
+        conn.close()
+
+
+def _db_collect_electrical_source_snapshot_uris(
+    *,
+    company_id: str,
+    bubble_document_id: Optional[str] = None,
+) -> list[str]:
+    conn = _db_conn()
+    try:
+        with conn.cursor() as cur:
+            if bubble_document_id:
+                cur.execute(
+                    """
+                    SELECT metadata #>> '{source_snapshot,uri}'
+                    FROM public.electrical_versions
+                    WHERE company_id=%s AND bubble_document_id=%s;
+                    """,
+                    (company_id, bubble_document_id),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT metadata #>> '{source_snapshot,uri}'
+                    FROM public.electrical_versions
+                    WHERE company_id=%s;
+                    """,
+                    (company_id,),
+                )
+            return [str(row[0]).strip() for row in cur.fetchall() if row and row[0]]
+    finally:
+        conn.close()
+
+
+def _snapshot_and_attach_electrical_source(
+    *,
+    data: bytes,
+    version_id: int,
+    electrical_document_id: int,
+    company_id: str,
+    machine_id: str,
+    bubble_document_id: str,
+    source_sha256: str,
+    source_filename: Optional[str],
+) -> dict:
+    snapshot = snapshot_electrical_source_pdf(
+        data=data,
+        company_id=company_id,
+        machine_id=machine_id,
+        bubble_document_id=bubble_document_id,
+        source_sha256=source_sha256,
+        source_filename=source_filename,
+    )
+    _db_attach_electrical_source_snapshot(
+        version_id=version_id,
+        electrical_document_id=electrical_document_id,
+        company_id=company_id,
+        machine_id=machine_id,
+        bubble_document_id=bubble_document_id,
+        snapshot=snapshot,
+    )
+    return snapshot
 
 
 def _electrical_ascii_upper(value: Any) -> str:
@@ -12931,6 +13100,7 @@ def ping():
 def version():
     semantic_config = get_electrical_semantic_runtime_config()
     structured_config = get_electrical_structured_runtime_config()
+    source_config = get_electrical_source_runtime_config()
 
     return {
         "ok": True,
@@ -12963,6 +13133,11 @@ def version():
         "electrical_structured_min_confidence": structured_config["min_confidence"],
         "electrical_structured_page_pass_min_confidence": structured_config["page_pass_min_confidence"],
         "electrical_structured_render_dpi": structured_config["render_dpi"],
+
+        "electrical_source_snapshot_enabled": source_config["enabled"],
+        "electrical_source_snapshot_backend": source_config["backend"],
+        "electrical_source_snapshot_bucket": source_config["bucket"],
+        "electrical_source_snapshot_prefix": source_config["prefix"],
     }
 
 @app.post("/v1/ai/electrical/normalize")
@@ -13018,6 +13193,90 @@ def normalize_electrical_document(
             status_code=500,
             detail=f"Electrical semantic normalization failed: {str(e)[:1000]}",
         )
+
+@app.post("/v1/ai/electrical/source/snapshot")
+def snapshot_electrical_source_document(
+    payload: ElectricalSourceSnapshotRequest,
+    x_ai_internal_secret: Optional[str] = Header(default=None),
+):
+    if not AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=500, detail="AI_INTERNAL_SECRET missing")
+    if (x_ai_internal_secret or "").strip() != AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    company_id = str(payload.company_id or "").strip()
+    machine_id = str(payload.machine_id or "").strip()
+    bubble_document_id = str(payload.bubble_document_id or "").strip()
+    if not (company_id and machine_id and bubble_document_id):
+        raise HTTPException(
+            status_code=400,
+            detail="company_id, machine_id and bubble_document_id are required",
+        )
+    if not (str(payload.file_url or "").strip() or str(payload.file_base64 or "").strip()):
+        raise HTTPException(status_code=400, detail="file_url or file_base64 is required")
+
+    try:
+        identity = _db_get_electrical_source_identity(
+            version_id=int(payload.version_id),
+            company_id=company_id,
+            machine_id=machine_id,
+            bubble_document_id=bubble_document_id,
+        )
+        loaded = _load_ingest_document_file(
+            IngestRequest(
+                file_url=payload.file_url,
+                file_base64=payload.file_base64,
+                filename=payload.filename or identity["source_filename"],
+                content_type="application/pdf",
+                company_id=company_id,
+                machine_id=machine_id,
+                bubble_document_id=bubble_document_id,
+            ),
+            bubble_document_id,
+        )
+        data = loaded["data"]
+        if b"%PDF" not in data[:1024]:
+            raise ValueError("Source snapshot payload is not a PDF")
+        snapshot = _snapshot_and_attach_electrical_source(
+            data=data,
+            version_id=int(payload.version_id),
+            electrical_document_id=int(identity["electrical_document_id"]),
+            company_id=company_id,
+            machine_id=machine_id,
+            bubble_document_id=bubble_document_id,
+            source_sha256=identity["source_sha256"],
+            source_filename=payload.filename or identity["source_filename"],
+        )
+        return {
+            "ok": True,
+            "status": "ready",
+            "electrical_document_id": identity["electrical_document_id"],
+            "electrical_version_id": int(payload.version_id),
+            "source_snapshot": snapshot,
+        }
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except Exception as exc:
+        print(
+            "ELECTRICAL_SOURCE_SNAPSHOT_FAIL",
+            json.dumps(
+                {
+                    "company_id": company_id,
+                    "machine_id": machine_id,
+                    "bubble_document_id": bubble_document_id,
+                    "version_id": payload.version_id,
+                    "error": str(exc)[:2000],
+                },
+                ensure_ascii=False,
+            ),
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Electrical source snapshot failed: {str(exc)[:1000]}",
+        )
+
 
 @app.post("/v1/ai/electrical/extract-structured")
 def extract_electrical_structured_document(
@@ -13521,6 +13780,10 @@ def ingest_document(
         "electrical_external_links_written": 0,
         "electrical_outline_entries": 0,
         "electrical_inventory_error": None,
+        "electrical_source_snapshot_status": "not_applicable",
+        "electrical_source_snapshot_uri": None,
+        "electrical_source_snapshot_reused": False,
+        "electrical_source_snapshot_error": None,
     }
 
     if electrical_candidate and ELECTRICAL_INGEST_ENABLED:
@@ -13567,6 +13830,34 @@ def ingest_document(
                     )
                     electrical_meta.update(version_meta)
                     version_id = int(version_meta["electrical_version_id"])
+
+                    source_snapshot = _snapshot_and_attach_electrical_source(
+                        data=data,
+                        version_id=version_id,
+                        electrical_document_id=int(electrical_meta["electrical_document_id"]),
+                        company_id=company_id,
+                        machine_id=machine_id,
+                        bubble_document_id=bubble_document_id,
+                        source_sha256=source_sha256,
+                        source_filename=detected_filename,
+                    )
+                    electrical_meta["electrical_source_snapshot_status"] = "ready"
+                    electrical_meta["electrical_source_snapshot_uri"] = source_snapshot.get("uri")
+                    electrical_meta["electrical_source_snapshot_reused"] = bool(source_snapshot.get("reused"))
+                    print(
+                        "ELECTRICAL_SOURCE_SNAPSHOT_READY",
+                        json.dumps(
+                            {
+                                "company_id": company_id,
+                                "machine_id": machine_id,
+                                "bubble_document_id": bubble_document_id,
+                                "electrical_version_id": version_id,
+                                "uri": source_snapshot.get("uri"),
+                                "reused": bool(source_snapshot.get("reused")),
+                            },
+                            ensure_ascii=False,
+                        ),
+                    )
 
                     if bool(version_meta.get("electrical_inventory_reused")):
                         electrical_meta["electrical_inventory_status"] = "ready"
@@ -17123,6 +17414,10 @@ def delete_document_v1(
     deleted_pages = 0
     deleted_files = 0
     deleted_electrical_documents = 0
+    snapshot_uris = _db_collect_electrical_source_snapshot_uris(
+        company_id=company_id,
+        bubble_document_id=bubble_document_id,
+    )
 
     conn = _db_conn()
     try:
@@ -17162,6 +17457,13 @@ def delete_document_v1(
     finally:
         conn.close()
 
+    source_snapshot_delete = delete_electrical_source_uris(snapshot_uris)
+    if source_snapshot_delete.get("errors"):
+        print(
+            "ELECTRICAL_SOURCE_SNAPSHOT_DELETE_WARN",
+            json.dumps(source_snapshot_delete, ensure_ascii=False),
+        )
+
     return {
         "ok": True,
         "status": "deleted",
@@ -17172,7 +17474,9 @@ def delete_document_v1(
             "document_pages": int(deleted_pages),
             "document_files": int(deleted_files),
             "electrical_documents": int(deleted_electrical_documents),
+            "electrical_source_snapshots": int(source_snapshot_delete.get("deleted") or 0),
         },
+        "source_snapshot_delete": source_snapshot_delete,
     }
 
 @app.post("/v1/ai/delete/company-index")
@@ -17197,7 +17501,9 @@ def delete_company_index_v1(
         "document_cleaning_meta": 0,
         "document_files": 0,
         "electrical_documents": 0,
+        "electrical_source_snapshots": 0,
     }
+    snapshot_uris = _db_collect_electrical_source_snapshot_uris(company_id=company_id)
 
     conn = _db_conn()
     try:
@@ -17231,11 +17537,20 @@ def delete_company_index_v1(
     finally:
         conn.close()
 
+    source_snapshot_delete = delete_electrical_source_uris(snapshot_uris)
+    deleted["electrical_source_snapshots"] = int(source_snapshot_delete.get("deleted") or 0)
+    if source_snapshot_delete.get("errors"):
+        print(
+            "ELECTRICAL_SOURCE_SNAPSHOT_DELETE_WARN",
+            json.dumps(source_snapshot_delete, ensure_ascii=False),
+        )
+
     return {
         "ok": True,
         "status": "deleted",
         "company_id": company_id,
         "deleted": deleted,
+        "source_snapshot_delete": source_snapshot_delete,
     }
 
 # Commit: feat(v8): preserve v4 hot paths and add opt-in shadow reasoning endpoints

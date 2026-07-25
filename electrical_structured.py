@@ -12,6 +12,8 @@ import fitz
 import psycopg2
 import requests
 
+from electrical_source_store import download_electrical_source_pdf
+
 # MachineMind Phase 2 V2
 # Multimodal, geometry-first, page -> region -> row extraction with independent audit.
 # The deterministic layer never classifies by fixed Italian/English keywords.
@@ -106,7 +108,7 @@ MAX_SOURCE_BYTES = _env_int(
     "MM_ELECTRICAL_STRUCTURED_MAX_SOURCE_BYTES", 100_000_000, 1_000_000, 500_000_000
 )
 
-PIPELINE_MARKER = "phase2-vision-v2"
+PIPELINE_MARKER = "phase2-vision-v2-source-snapshot"
 EXTRACTION_METHOD = "openai_vision_structured_v2"
 PHASE_NAME = "structured_vision_v2"
 IO_PAGE_TYPES = {"plc_io_table", "safety_io_table"}
@@ -648,16 +650,26 @@ def _load_context(
             )
             all_io_pages_total = int(cur.fetchone()[0] or 0)
 
+            version_metadata = _json_obj(row[5], {}) or {}
+            source_snapshot = version_metadata.get("source_snapshot") or {}
+            if not isinstance(source_snapshot, dict):
+                source_snapshot = {}
+
             return {
                 "electrical_document_id": int(row[0]),
                 "source_filename": str(row[1] or ""),
                 "version_id": int(row[2]),
                 "version_no": int(row[3]),
                 "version_status": str(row[4] or ""),
-                "metadata": _json_obj(row[5], {}) or {},
+                "metadata": version_metadata,
                 "pdf_page_count": int(row[6] or 0),
                 "declared_sheet_count": int(row[7]) if row[7] is not None else None,
                 "source_sha256": str(row[8] or ""),
+                "source_snapshot_uri": str(
+                    source_snapshot.get("uri")
+                    or version_metadata.get("source_snapshot_uri")
+                    or ""
+                ).strip(),
                 "file_url": str(row[9] or ""),
                 "pages": pages,
                 "all_io_pages_total": all_io_pages_total,
@@ -669,21 +681,54 @@ def _load_context(
 
 
 def _fetch_source_pdf(context: dict) -> tuple[bytes, fitz.Document]:
-    url = str(context.get("file_url") or "").strip()
-    if url.startswith("//"):
-        url = "https:" + url
-    if not url:
-        raise ValueError(
-            "The persisted source PDF URL is missing. V2 will not fabricate a page "
-            "from flattened text; refresh the document file URL before retrying."
-        )
-    response = requests.get(url, timeout=FETCH_TIMEOUT_SECONDS, allow_redirects=True)
-    response.raise_for_status()
-    data = response.content
+    expected_sha = str(context.get("source_sha256") or "").strip().lower()
+    snapshot_uri = str(context.get("source_snapshot_uri") or "").strip()
+
+    if snapshot_uri:
+        try:
+            data = download_electrical_source_pdf(
+                uri=snapshot_uri,
+                expected_sha256=expected_sha or None,
+                max_bytes=MAX_SOURCE_BYTES,
+            )
+        except Exception as exc:
+            raise ValueError(
+                "SOURCE_SNAPSHOT_READ_FAILED: the private persisted electrical PDF "
+                f"could not be read: {str(exc)[:700]}"
+            ) from exc
+    else:
+        # Legacy fallback only. New ingests persist an immutable private GCS snapshot
+        # and never depend on an expiring Bubble/CDN signed URL after ingest.
+        url = str(context.get("file_url") or "").strip()
+        if url.startswith("//"):
+            url = "https:" + url
+        if not url:
+            raise ValueError(
+                "SOURCE_SNAPSHOT_MISSING: this legacy electrical version has no private "
+                "source snapshot and no usable fallback URL. Backfill the source snapshot "
+                "once, then retry."
+            )
+        try:
+            response = requests.get(
+                url,
+                timeout=FETCH_TIMEOUT_SECONDS,
+                allow_redirects=True,
+            )
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            status = getattr(exc.response, "status_code", None)
+            if status in {401, 403}:
+                raise ValueError(
+                    "SOURCE_SNAPSHOT_MISSING: the legacy Bubble/CDN signed URL is no "
+                    "longer authorized. Backfill the immutable private source snapshot "
+                    "once; do not keep refreshing signed URLs."
+                ) from exc
+            raise
+        data = response.content
+
     if not data or len(data) > MAX_SOURCE_BYTES:
         raise ValueError("Electrical source PDF is empty or exceeds the configured size limit")
     actual_sha = _sha256_bytes(data)
-    expected_sha = str(context.get("source_sha256") or "").lower()
     if expected_sha and actual_sha != expected_sha:
         raise ValueError(
             "Electrical source PDF SHA-256 does not match the indexed version; "
