@@ -1204,8 +1204,11 @@ def _electrical_largest_image_coverage(page: fitz.Page) -> float:
     return min(1.0, max(0.0, largest))
 
 
-def _electrical_cover_metadata(raw_text: str) -> dict:
-    text = str(raw_text or "")
+def _electrical_cover_metadata(
+    raw_text: str,
+    words: Optional[list[tuple]] = None,
+) -> dict:
+    text = str(raw_text or "").replace("\u00a0", " ")
     patterns = {
         "machine_code": r"Codice\s+Macchina:[ \t]*([^\n]+?)(?=\s{2,}Descrizione:|\n)",
         "description": r"Descrizione:[ \t]*([^\n]+)",
@@ -1214,7 +1217,9 @@ def _electrical_cover_metadata(raw_text: str) -> dict:
         "reference_bom": r"Distinta\s+di\s+riferimento:[ \t]*([^\n]*)",
         "order_number": r"Commessa:[ \t]*([^\n]+)",
         "serial_number": r"Matricola:[ \t]*([^\n]+)",
-        "declared_sheet_count": r"Numero\s+Fogli:[ \t]*(\d+)",
+        # Use \s* after ':' because older PyMuPDF builds may place the value
+        # on the following text line even when it is visually on the same row.
+        "declared_sheet_count": r"Numero\s+Fogli\s*:\s*(\d{1,4})",
         "drawing_date": r"Data:[ \t]*([^\n]+)",
         "operating_voltage": r"Tensione\s+Esercizio:[ \t]*([^\n]+)",
         "auxiliary_voltage": r"Tensione\s+Ausiliari:[ \t]*([^\n]+)",
@@ -1238,6 +1243,41 @@ def _electrical_cover_metadata(raw_text: str) -> dict:
                 continue
         elif value:
             out[key] = value[:500]
+
+    # Geometry fallback: locate the visual label "Numero Fogli" and then the
+    # nearest integer to its right on the same row. This is resilient to text
+    # ordering differences across PyMuPDF versions and PDF producers.
+    if "declared_sheet_count" not in out and words:
+        normalized_words = []
+        for w in words:
+            if not isinstance(w, (list, tuple)) or len(w) < 5:
+                continue
+            token = re.sub(r"[^a-z0-9]+", "", str(w[4] or "").lower())
+            normalized_words.append((float(w[0]), float(w[1]), float(w[2]), float(w[3]), token, str(w[4] or "")))
+
+        for i in range(max(0, len(normalized_words) - 1)):
+            x0, y0, x1, y1, token, _raw = normalized_words[i]
+            nx0, ny0, nx1, ny1, next_token, _next_raw = normalized_words[i + 1]
+            if token != "numero" or next_token != "fogli":
+                continue
+
+            label_right = max(x1, nx1)
+            label_y = (min(y0, ny0) + max(y1, ny1)) / 2.0
+            candidates = []
+            for wx0, wy0, wx1, wy1, wtoken, wraw in normalized_words:
+                if wx0 <= label_right:
+                    continue
+                if abs(((wy0 + wy1) / 2.0) - label_y) > 6.0:
+                    continue
+                if not re.fullmatch(r"\d{1,4}", wtoken):
+                    continue
+                candidates.append((wx0 - label_right, int(wtoken)))
+
+            if candidates:
+                candidates.sort(key=lambda item: item[0])
+                out["declared_sheet_count"] = candidates[0][1]
+                break
+
     return out
 
 
@@ -1267,7 +1307,8 @@ def _extract_electrical_inventory(data: bytes) -> dict:
         links_truncated_pages = 0
 
         first_page_text = doc[0].get_text("text", sort=True) if pdf_page_count > 0 else ""
-        cover_fields = _electrical_cover_metadata(first_page_text)
+        first_page_words = doc[0].get_text("words", sort=True) if pdf_page_count > 0 else []
+        cover_fields = _electrical_cover_metadata(first_page_text, first_page_words)
         declared_sheet_count = cover_fields.get("declared_sheet_count")
 
         for page_index in range(pdf_page_count):
