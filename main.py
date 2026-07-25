@@ -25,6 +25,11 @@ from pydantic import BaseModel
 from google.cloud import tasks_v2
 from urllib.parse import urlparse, unquote
 
+from electrical_semantic import (
+    get_electrical_semantic_runtime_config,
+    normalize_electrical_version_semantics,
+)
+
 app = FastAPI()
 
 AI_INTERNAL_SECRET = (os.environ.get("AI_INTERNAL_SECRET") or "").strip()
@@ -269,6 +274,14 @@ class IndexDocumentRequest(BaseModel):
     bubble_document_id: str
     trace_id: Optional[str] = None
     ai_scope: Optional[str] = None
+
+
+class ElectricalNormalizeRequest(BaseModel):
+    company_id: str
+    machine_id: str
+    bubble_document_id: str
+    version_id: Optional[int] = None
+    force: Optional[bool] = False
 
 
 class SearchRequest(BaseModel):
@@ -1552,6 +1565,9 @@ def _db_write_electrical_inventory(
                         sheet_title,
                         group_code,
                         page_type,
+                        structural_page_type,
+                        structural_confidence,
+                        classification_method,
                         page_width_pt,
                         page_height_pt,
                         rotation_degrees,
@@ -1572,6 +1588,7 @@ def _db_write_electrical_inventory(
                     VALUES (
                         %s, %s, %s, %s,
                         %s, %s, %s, %s, %s,
+                        %s, %s, %s,
                         %s, %s, %s, %s, %s, %s, %s,
                         %s,
                         %s::jsonb,
@@ -1594,6 +1611,9 @@ def _db_write_electrical_inventory(
                         p.get("sheet_title"),
                         p.get("group_code"),
                         p.get("page_type") or "unknown",
+                        p.get("page_type") or "unknown",
+                        p.get("classification_confidence"),
+                        "inventory_provisional_v1",
                         p.get("page_width_pt"),
                         p.get("page_height_pt"),
                         int(p.get("rotation_degrees") or 0),
@@ -12896,16 +12916,76 @@ def ping():
 
 @app.get("/version")
 def version():
+    semantic_config = get_electrical_semantic_runtime_config()
     return {
         "ok": True,
         "service": os.environ.get("K_SERVICE"),
         "revision": os.environ.get("K_REVISION"),
         "commit_sha": os.environ.get("COMMIT_SHA"),
-        "electrical_code_marker": "phase1c-inventory-v1",
+        "electrical_code_marker": "phase1d-semantic-v1",
         "electrical_ingest_enabled": bool(ELECTRICAL_INGEST_ENABLED),
         "electrical_inventory_enabled": bool(ELECTRICAL_INVENTORY_ENABLED),
         "electrical_parser_version": ELECTRICAL_PARSER_VERSION,
+        "electrical_semantic_enabled": semantic_config["enabled"],
+        "electrical_semantic_model": semantic_config["model"],
+        "electrical_semantic_prompt_version": semantic_config["prompt_version"],
+        "electrical_semantic_min_confidence": semantic_config["min_confidence"],
     }
+
+@app.post("/v1/ai/electrical/normalize")
+def normalize_electrical_document(
+    payload: ElectricalNormalizeRequest,
+    x_ai_internal_secret: Optional[str] = Header(default=None),
+):
+    if not AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=500, detail="AI_INTERNAL_SECRET missing")
+    if (x_ai_internal_secret or "").strip() != AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    company_id = str(payload.company_id or "").strip()
+    machine_id = str(payload.machine_id or "").strip()
+    bubble_document_id = str(payload.bubble_document_id or "").strip()
+    if not (company_id and machine_id and bubble_document_id):
+        raise HTTPException(status_code=400, detail="company_id, machine_id and bubble_document_id are required")
+
+    try:
+        result = normalize_electrical_version_semantics(
+            company_id=company_id,
+            machine_id=machine_id,
+            bubble_document_id=bubble_document_id,
+            version_id=payload.version_id,
+            force=bool(payload.force),
+        )
+        print(
+            "ELECTRICAL_SEMANTIC_READY",
+            json.dumps({
+                "company_id": company_id,
+                "machine_id": machine_id,
+                "bubble_document_id": bubble_document_id,
+                **result,
+            }, ensure_ascii=False),
+        )
+        return {"ok": True, **result}
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(
+            "ELECTRICAL_SEMANTIC_FAIL",
+            json.dumps({
+                "company_id": company_id,
+                "machine_id": machine_id,
+                "bubble_document_id": bubble_document_id,
+                "version_id": payload.version_id,
+                "error": str(e)[:2000],
+            }, ensure_ascii=False),
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Electrical semantic normalization failed: {str(e)[:1000]}",
+        )
+
 
 def _strip_data_url_prefix(value: str) -> str:
     raw = (value or "").strip()
