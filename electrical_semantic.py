@@ -67,6 +67,88 @@ ELECTRICAL_CANONICAL_PAGE_TYPES = (
     "unknown",
 )
 
+ELECTRICAL_TABLE_PAGE_TYPES = {
+    "plc_io_table",
+    "safety_io_table",
+    "terminal_table",
+    "bom_table",
+}
+
+
+def _electrical_resolve_page_type(
+    *,
+    structural_type: str,
+    structural_confidence: float,
+    semantic_type: str,
+    semantic_confidence: float,
+    evidence_basis: str,
+    min_confidence: float,
+) -> dict:
+    """Resolve structural and semantic classifications conservatively.
+
+    This policy is language-independent. A semantic result may freely confirm the
+    structural type or replace a weak/unknown structural result. When a high-confidence
+    non-table structural page is reclassified as a table, the model must explicitly base
+    the decision on table structure. Text mentioning PLC, safety, terminals, or materials
+    is not enough by itself.
+    """
+    structural_type = str(structural_type or "unknown")
+    semantic_type = str(semantic_type or "unknown")
+    evidence_basis = str(evidence_basis or "insufficient")
+    structural_confidence = max(0.0, min(1.0, float(structural_confidence or 0.0)))
+    semantic_confidence = max(0.0, min(1.0, float(semantic_confidence or 0.0)))
+
+    semantic_threshold_ok = (
+        semantic_type != "unknown"
+        and semantic_confidence >= float(min_confidence)
+    )
+
+    if not semantic_threshold_ok:
+        return {
+            "final_type": "unknown",
+            "final_confidence": 0.0,
+            "classification_method": "semantic_review_required_v1",
+            "override_accepted": False,
+            "override_rejected_reason": "semantic_below_threshold_or_unknown",
+        }
+
+    same_type = semantic_type == structural_type
+    weak_or_unknown_structural = (
+        structural_type in {"", "unknown"}
+        or structural_confidence < 0.95
+    )
+
+    if same_type or weak_or_unknown_structural:
+        return {
+            "final_type": semantic_type,
+            "final_confidence": semantic_confidence,
+            "classification_method": "openai_semantic_v1",
+            "override_accepted": True,
+            "override_rejected_reason": None,
+        }
+
+    if (
+        semantic_type in ELECTRICAL_TABLE_PAGE_TYPES
+        and structural_type not in ELECTRICAL_TABLE_PAGE_TYPES
+        and evidence_basis != "table_structure"
+    ):
+        return {
+            "final_type": structural_type,
+            "final_confidence": structural_confidence,
+            "classification_method": "semantic_structural_guard_v1",
+            "override_accepted": False,
+            "override_rejected_reason": "table_override_without_table_structure_evidence",
+        }
+
+    return {
+        "final_type": semantic_type,
+        "final_confidence": semantic_confidence,
+        "classification_method": "openai_semantic_v1",
+        "override_accepted": True,
+        "override_rejected_reason": None,
+    }
+
+
 ELECTRICAL_CANONICAL_COVER_FIELDS = (
     "machine_code",
     "description",
@@ -952,18 +1034,52 @@ def _db_apply_electrical_semantic_normalization(
                 if not page:
                     continue
                 semantic_type = str(result.get("canonical_page_type") or "unknown")
-                confidence = float(result.get("confidence") or 0.0)
-                accepted = semantic_type != "unknown" and confidence >= min_confidence
-                final_type = semantic_type if accepted else "unknown"
-                if not accepted:
+                confidence = max(0.0, min(1.0, float(result.get("confidence") or 0.0)))
+                structural_type = str(
+                    page.get("structural_page_type")
+                    or page.get("page_type")
+                    or "unknown"
+                )
+                structural_confidence = max(
+                    0.0,
+                    min(
+                        1.0,
+                        float(
+                            page.get("structural_confidence")
+                            if page.get("structural_confidence") is not None
+                            else (page.get("classification_confidence") or 0.0)
+                        ),
+                    ),
+                )
+                evidence_basis = str(result.get("evidence_basis") or "insufficient")
+                decision = _electrical_resolve_page_type(
+                    structural_type=structural_type,
+                    structural_confidence=structural_confidence,
+                    semantic_type=semantic_type,
+                    semantic_confidence=confidence,
+                    evidence_basis=evidence_basis,
+                    min_confidence=min_confidence,
+                )
+                final_type = str(decision["final_type"])
+                final_confidence = float(decision["final_confidence"])
+                classification_method = str(decision["classification_method"])
+                requires_review = final_type == "unknown"
+                if requires_review:
                     ambiguous += 1
 
                 semantic_type_counts[final_type] = int(semantic_type_counts.get(final_type, 0)) + 1
                 classification_metadata = {
                     "semantic_prompt_version": ELECTRICAL_SEMANTIC_PROMPT_VERSION,
                     "semantic_model": ELECTRICAL_SEMANTIC_MODEL,
-                    "semantic_accepted": accepted,
-                    "semantic_evidence_basis": result.get("evidence_basis"),
+                    "semantic_candidate_above_threshold": (
+                        semantic_type != "unknown" and confidence >= min_confidence
+                    ),
+                    "semantic_override_accepted": bool(decision["override_accepted"]),
+                    "semantic_override_rejected_reason": decision["override_rejected_reason"],
+                    "semantic_evidence_basis": evidence_basis,
+                    "structural_candidate_type": structural_type,
+                    "structural_candidate_confidence": structural_confidence,
+                    "final_page_type": final_type,
                     "artifact_fingerprint": result.get("artifact_fingerprint"),
                     "normalized_at": now_iso,
                 }
@@ -987,8 +1103,8 @@ def _db_apply_electrical_semantic_normalization(
                         semantic_type,
                         confidence,
                         final_type,
-                        confidence if accepted else 0.0,
-                        "openai_semantic_v1" if accepted else "semantic_review_required_v1",
+                        final_confidence,
+                        classification_method,
                         str(result.get("language") or "unknown")[:32],
                         json.dumps(classification_metadata, ensure_ascii=False),
                         page_id,
@@ -997,7 +1113,7 @@ def _db_apply_electrical_semantic_normalization(
                 )
 
                 issue_key = f"semantic-page-classification:{page_id}"
-                if accepted:
+                if not requires_review:
                     cur.execute(
                         "DELETE FROM public.electrical_review_issues WHERE version_id=%s AND issue_key=%s;",
                         (version_id, issue_key),
