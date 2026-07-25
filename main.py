@@ -30,6 +30,11 @@ from electrical_semantic import (
     normalize_electrical_version_semantics,
 )
 
+from electrical_structured import (
+    get_electrical_structured_runtime_config,
+    extract_electrical_structured_version,
+)
+
 app = FastAPI()
 
 AI_INTERNAL_SECRET = (os.environ.get("AI_INTERNAL_SECRET") or "").strip()
@@ -283,6 +288,13 @@ class ElectricalNormalizeRequest(BaseModel):
     version_id: Optional[int] = None
     force: Optional[bool] = False
 
+class ElectricalStructuredExtractRequest(BaseModel):
+    company_id: str
+    machine_id: str
+    bubble_document_id: str
+    version_id: Optional[int] = None
+    page_types: Optional[List[str]] = None
+    force: Optional[bool] = False
 
 class SearchRequest(BaseModel):
     query: str
@@ -12917,19 +12929,30 @@ def ping():
 @app.get("/version")
 def version():
     semantic_config = get_electrical_semantic_runtime_config()
+    structured_config = get_electrical_structured_runtime_config()
+
     return {
         "ok": True,
         "service": os.environ.get("K_SERVICE"),
         "revision": os.environ.get("K_REVISION"),
         "commit_sha": os.environ.get("COMMIT_SHA"),
-        "electrical_code_marker": "phase1d-semantic-v1",
+
+        "electrical_code_marker": "phase2-structured-v1",
+
         "electrical_ingest_enabled": bool(ELECTRICAL_INGEST_ENABLED),
         "electrical_inventory_enabled": bool(ELECTRICAL_INVENTORY_ENABLED),
         "electrical_parser_version": ELECTRICAL_PARSER_VERSION,
+
         "electrical_semantic_enabled": semantic_config["enabled"],
         "electrical_semantic_model": semantic_config["model"],
         "electrical_semantic_prompt_version": semantic_config["prompt_version"],
         "electrical_semantic_min_confidence": semantic_config["min_confidence"],
+
+        "electrical_structured_enabled": structured_config["enabled"],
+        "electrical_structured_model": structured_config["model"],
+        "electrical_structured_prompt_version": structured_config["prompt_version"],
+        "electrical_structured_materializer_version": structured_config["materializer_version"],
+        "electrical_structured_min_confidence": structured_config["min_confidence"],
     }
 
 @app.post("/v1/ai/electrical/normalize")
@@ -12986,6 +13009,63 @@ def normalize_electrical_document(
             detail=f"Electrical semantic normalization failed: {str(e)[:1000]}",
         )
 
+@app.post("/v1/ai/electrical/extract-structured")
+def extract_electrical_structured_document(
+    payload: ElectricalStructuredExtractRequest,
+    x_ai_internal_secret: Optional[str] = Header(default=None),
+):
+    if not AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=500, detail="AI_INTERNAL_SECRET missing")
+    if (x_ai_internal_secret or "").strip() != AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    company_id = str(payload.company_id or "").strip()
+    machine_id = str(payload.machine_id or "").strip()
+    bubble_document_id = str(payload.bubble_document_id or "").strip()
+    if not (company_id and machine_id and bubble_document_id):
+        raise HTTPException(
+            status_code=400,
+            detail="company_id, machine_id and bubble_document_id are required",
+        )
+
+    try:
+        result = extract_electrical_structured_version(
+            company_id=company_id,
+            machine_id=machine_id,
+            bubble_document_id=bubble_document_id,
+            version_id=payload.version_id,
+            page_types=payload.page_types,
+            force=bool(payload.force),
+        )
+        print(
+            "ELECTRICAL_STRUCTURED_READY",
+            json.dumps({
+                "company_id": company_id,
+                "machine_id": machine_id,
+                "bubble_document_id": bubble_document_id,
+                **result,
+            }, ensure_ascii=False),
+        )
+        return {"ok": True, **result}
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(
+            "ELECTRICAL_STRUCTURED_FAIL",
+            json.dumps({
+                "company_id": company_id,
+                "machine_id": machine_id,
+                "bubble_document_id": bubble_document_id,
+                "version_id": payload.version_id,
+                "error": str(e)[:2000],
+            }, ensure_ascii=False),
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Electrical structured extraction failed: {str(e)[:1000]}",
+        )
 
 def _strip_data_url_prefix(value: str) -> str:
     raw = (value or "").strip()
