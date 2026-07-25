@@ -6,7 +6,7 @@ substitutions:
   _SERVICE: "mm-ai-ingest-fixed"
   _AR_REPOSITORY: "mm-ai-ingest"
   _IMAGE_NAME: "mm-ai-ingest"
-  _EXPECTED_CODE_MARKER: "phase2-structured-v1"
+  _EXPECTED_CODE_MARKER: "phase2-vision-v2"
 
 steps:
   - id: "01-source-preflight"
@@ -108,6 +108,14 @@ steps:
             version.get('electrical_code_marker')
             == '${_EXPECTED_CODE_MARKER}'
         ), version
+        assert (
+            version.get('electrical_structured_pipeline_marker')
+            == '${_EXPECTED_CODE_MARKER}'
+        ), version
+        assert (
+            version.get('electrical_structured_materializer_version')
+            == 'mm-electrical-structured-materializer-v2'
+        ), version
 
         required = {
             '/v1/ai/electrical/normalize',
@@ -193,7 +201,9 @@ steps:
           --no-traffic \
           --tag="$${TAG}" \
           --revision-suffix="$${REV_SUFFIX}" \
-          --update-env-vars="COMMIT_SHA=$COMMIT_SHA" \
+          --timeout="600s" \
+          --remove-env-vars="MM_ELECTRICAL_STRUCTURED_MODEL,MM_ELECTRICAL_STRUCTURED_PROMPT_VERSION,MM_ELECTRICAL_STRUCTURED_MIN_CONFIDENCE,MM_ELECTRICAL_STRUCTURED_MAX_WORDS_PER_PAGE" \
+          --update-env-vars="COMMIT_SHA=$COMMIT_SHA,MM_ELECTRICAL_STRUCTURED_ENABLED=1,MM_ELECTRICAL_STRUCTURED_DETECTOR_MODEL=gpt-5.4,MM_ELECTRICAL_STRUCTURED_EXTRACTOR_MODEL=gpt-5.4,MM_ELECTRICAL_STRUCTURED_VERIFIER_MODEL=gpt-5.4,MM_ELECTRICAL_STRUCTURED_DETECTOR_PROMPT_VERSION=mm-electrical-region-detector-v2,MM_ELECTRICAL_STRUCTURED_EXTRACTOR_PROMPT_VERSION=mm-electrical-table-extractor-v2,MM_ELECTRICAL_STRUCTURED_VERIFIER_PROMPT_VERSION=mm-electrical-page-verifier-v2,MM_ELECTRICAL_STRUCTURED_MATERIALIZER_VERSION=mm-electrical-structured-materializer-v2,MM_ELECTRICAL_STRUCTURED_ROW_MIN_CONFIDENCE=0.80,MM_ELECTRICAL_STRUCTURED_PAGE_PASS_MIN_CONFIDENCE=0.90,MM_ELECTRICAL_STRUCTURED_RENDER_DPI=220,MM_ELECTRICAL_STRUCTURED_MAX_COMPLETION_TOKENS=16000,MM_ELECTRICAL_STRUCTURED_FETCH_TIMEOUT_SECONDS=60,MM_ELECTRICAL_STRUCTURED_TIMEOUT_SECONDS=240,MM_ELECTRICAL_STRUCTURED_MAX_SOURCE_BYTES=100000000,MM_ELECTRICAL_STRUCTURED_INPUT_USD_PER_MILLION=0,MM_ELECTRICAL_STRUCTURED_OUTPUT_USD_PER_MILLION=0" \
           --quiet
 
         gcloud run services describe "${_SERVICE}" \
@@ -306,6 +316,30 @@ steps:
         assert (
             version.get('electrical_code_marker')
             == os.environ['EXPECTED_MARKER']
+        ), version
+        assert version.get('electrical_structured_enabled') is True, version
+        assert (
+            version.get('electrical_structured_pipeline_marker')
+            == os.environ['EXPECTED_MARKER']
+        ), version
+        assert version.get('electrical_structured_detector_model') == 'gpt-5.4', version
+        assert version.get('electrical_structured_extractor_model') == 'gpt-5.4', version
+        assert version.get('electrical_structured_verifier_model') == 'gpt-5.4', version
+        assert (
+            version.get('electrical_structured_detector_prompt_version')
+            == 'mm-electrical-region-detector-v2'
+        ), version
+        assert (
+            version.get('electrical_structured_extractor_prompt_version')
+            == 'mm-electrical-table-extractor-v2'
+        ), version
+        assert (
+            version.get('electrical_structured_verifier_prompt_version')
+            == 'mm-electrical-page-verifier-v2'
+        ), version
+        assert (
+            version.get('electrical_structured_materializer_version')
+            == 'mm-electrical-structured-materializer-v2'
         ), version
 
         required = {
@@ -425,6 +459,18 @@ steps:
         assert (
             version.get('electrical_code_marker')
             == os.environ['EXPECTED_MARKER']
+        ), version
+        assert version.get('electrical_structured_enabled') is True, version
+        assert (
+            version.get('electrical_structured_pipeline_marker')
+            == os.environ['EXPECTED_MARKER']
+        ), version
+        assert version.get('electrical_structured_detector_model') == 'gpt-5.4', version
+        assert version.get('electrical_structured_extractor_model') == 'gpt-5.4', version
+        assert version.get('electrical_structured_verifier_model') == 'gpt-5.4', version
+        assert (
+            version.get('electrical_structured_materializer_version')
+            == 'mm-electrical-structured-materializer-v2'
         ), version
 
         print('PROMOZIONE VERIFICATA: OK')

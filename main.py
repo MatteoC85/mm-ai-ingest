@@ -294,6 +294,7 @@ class ElectricalStructuredExtractRequest(BaseModel):
     bubble_document_id: str
     version_id: Optional[int] = None
     page_types: Optional[List[str]] = None
+    pdf_page_numbers: Optional[List[int]] = None
     force: Optional[bool] = False
 
 class SearchRequest(BaseModel):
@@ -12937,7 +12938,7 @@ def version():
         "revision": os.environ.get("K_REVISION"),
         "commit_sha": os.environ.get("COMMIT_SHA"),
 
-        "electrical_code_marker": "phase2-structured-v1",
+        "electrical_code_marker": structured_config["pipeline_marker"],
 
         "electrical_ingest_enabled": bool(ELECTRICAL_INGEST_ENABLED),
         "electrical_inventory_enabled": bool(ELECTRICAL_INVENTORY_ENABLED),
@@ -12949,10 +12950,19 @@ def version():
         "electrical_semantic_min_confidence": semantic_config["min_confidence"],
 
         "electrical_structured_enabled": structured_config["enabled"],
+        "electrical_structured_pipeline_marker": structured_config["pipeline_marker"],
         "electrical_structured_model": structured_config["model"],
+        "electrical_structured_detector_model": structured_config["detector_model"],
+        "electrical_structured_extractor_model": structured_config["extractor_model"],
+        "electrical_structured_verifier_model": structured_config["verifier_model"],
         "electrical_structured_prompt_version": structured_config["prompt_version"],
+        "electrical_structured_detector_prompt_version": structured_config["detector_prompt_version"],
+        "electrical_structured_extractor_prompt_version": structured_config["extractor_prompt_version"],
+        "electrical_structured_verifier_prompt_version": structured_config["verifier_prompt_version"],
         "electrical_structured_materializer_version": structured_config["materializer_version"],
         "electrical_structured_min_confidence": structured_config["min_confidence"],
+        "electrical_structured_page_pass_min_confidence": structured_config["page_pass_min_confidence"],
+        "electrical_structured_render_dpi": structured_config["render_dpi"],
     }
 
 @app.post("/v1/ai/electrical/normalize")
@@ -13035,6 +13045,7 @@ def extract_electrical_structured_document(
             bubble_document_id=bubble_document_id,
             version_id=payload.version_id,
             page_types=payload.page_types,
+            pdf_page_numbers=payload.pdf_page_numbers,
             force=bool(payload.force),
         )
         print(
