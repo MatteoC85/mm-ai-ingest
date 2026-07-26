@@ -1,5 +1,6 @@
 import base64
 import concurrent.futures
+import difflib
 import hashlib
 import json
 import os
@@ -75,11 +76,11 @@ EXTRACTOR_PROMPT_VERSION = (
 ).strip()
 VERIFIER_PROMPT_VERSION = (
     os.environ.get("MM_ELECTRICAL_STRUCTURED_VERIFIER_PROMPT_VERSION")
-    or "mm-electrical-page-verifier-v2.3"
+    or "mm-electrical-page-verifier-v2.4"
 ).strip()
 MATERIALIZER_VERSION = (
     os.environ.get("MM_ELECTRICAL_STRUCTURED_MATERIALIZER_VERSION")
-    or "mm-electrical-structured-materializer-v2.3"
+    or "mm-electrical-structured-materializer-v2.4"
 ).strip()
 
 OPENAI_TIMEOUT_SECONDS = _env_int(
@@ -114,7 +115,7 @@ MAX_SOURCE_BYTES = _env_int(
     "MM_ELECTRICAL_STRUCTURED_MAX_SOURCE_BYTES", 100_000_000, 1_000_000, 500_000_000
 )
 
-PIPELINE_MARKER = "phase2-vision-v2.3-source-snapshot"
+PIPELINE_MARKER = "phase2-vision-v2.4-source-snapshot"
 EXTRACTION_METHOD = "openai_vision_structured_v2"
 PHASE_NAME = "structured_vision_v2"
 IO_PAGE_TYPES = {"plc_io_table", "safety_io_table"}
@@ -140,6 +141,39 @@ ROW_ROLES = {
 }
 SEVERITIES = {"info", "warning", "high", "critical"}
 VISUAL_TEXT_FIELDS = {"signal_name", "description", "expected_normal_state"}
+
+COLUMN_BINDING_ROLES = {
+    "channel_ref",
+    "terminal_reference",
+    "wire_reference",
+    "plc_address",
+    "connector_reference",
+    "signal_name",
+    "description",
+    "expected_normal_state",
+    "other_data",
+}
+REFERENCE_COLUMN_ROLES = {
+    "channel_ref",
+    "terminal_reference",
+    "wire_reference",
+    "plc_address",
+    "connector_reference",
+}
+REFERENCE_ROLE_TO_RESULT_FIELD = {
+    "channel_ref": "channel_ref_original",
+    "terminal_reference": "terminal_reference_original",
+    "wire_reference": "wire_reference_original",
+    "plc_address": "plc_address_original",
+    "connector_reference": "connector_ref_original",
+}
+REFERENCE_ROLE_MAX_LENGTH = {
+    "channel_ref": 160,
+    "terminal_reference": 300,
+    "wire_reference": 300,
+    "plc_address": 200,
+    "connector_reference": 200,
+}
 
 
 def _db_conn():
@@ -1416,7 +1450,7 @@ def _extractor_schema() -> dict:
 
 def _verifier_schema() -> dict:
     return {
-        "name": "electrical_io_page_verifier_v2_3",
+        "name": "electrical_io_page_verifier_v2_4",
         "strict": True,
         "schema": {
             "type": "object",
@@ -1429,8 +1463,69 @@ def _verifier_schema() -> dict:
                 "all_module_tags_supported_by_own_headers": {"type": "boolean"},
                 "all_published_text_visually_supported": {"type": "boolean"},
                 "all_visible_text_resolved_or_blocked": {"type": "boolean"},
+                "all_visible_columns_accounted_for": {"type": "boolean"},
+                "all_reference_columns_materialized": {"type": "boolean"},
                 "sheet_code_used_as_module_tag_without_visual_support": {
                     "type": "boolean"
+                },
+                "column_binding_decisions": {
+                    "type": "array",
+                    "maxItems": 96,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "region_id": {"type": "string"},
+                            "source_column_index": {
+                                "type": "integer",
+                                "minimum": 0
+                            },
+                            "header_text_original": {"type": "string"},
+                            "canonical_roles": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string",
+                                    "enum": sorted(COLUMN_BINDING_ROLES),
+                                },
+                                "minItems": 1,
+                                "maxItems": 6,
+                            },
+                            "use_for_missing_values": {"type": "boolean"},
+                            "confidence": {"type": "number"},
+                            "reason": {"type": "string"},
+                        },
+                        "required": [
+                            "region_id",
+                            "source_column_index",
+                            "header_text_original",
+                            "canonical_roles",
+                            "use_for_missing_values",
+                            "confidence",
+                            "reason",
+                        ],
+                    },
+                },
+                "column_binding_checks": {
+                    "type": "array",
+                    "maxItems": 24,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "region_id": {"type": "string"},
+                            "visible_column_count": {"type": "integer"},
+                            "accounted_column_count": {"type": "integer"},
+                            "pass": {"type": "boolean"},
+                            "reason": {"type": "string"},
+                        },
+                        "required": [
+                            "region_id",
+                            "visible_column_count",
+                            "accounted_column_count",
+                            "pass",
+                            "reason",
+                        ],
+                    },
                 },
                 "region_checks": {
                     "type": "array",
@@ -1552,7 +1647,11 @@ def _verifier_schema() -> dict:
                 "all_module_tags_supported_by_own_headers",
                 "all_published_text_visually_supported",
                 "all_visible_text_resolved_or_blocked",
+                "all_visible_columns_accounted_for",
+                "all_reference_columns_materialized",
                 "sheet_code_used_as_module_tag_without_visual_support",
+                "column_binding_decisions",
+                "column_binding_checks",
                 "region_checks",
                 "text_overrides",
                 "blocked_text_rows",
@@ -1696,6 +1795,7 @@ def _verifier_messages(
     detector: dict,
     proposals: list[dict],
     extractions: list[dict],
+    column_binding_proposals: list[dict],
     page_image: bytes,
     region_images: dict[str, bytes],
 ) -> list[dict]:
@@ -1777,37 +1877,51 @@ def _verifier_messages(
         "electrical-schematic reader. Re-read the complete page and every supplied "
         "high-resolution table crop. The source may be in any language. Do not trust "
         "OCR spacing or the previous extraction when the image contradicts it. Verify "
-        "that every visible table and physical body row is accounted for and that each "
-        "module tag comes from its own header. The field "
+        "that every visible table, physical body row, and physical data column is "
+        "accounted for and that each module tag comes from its own header. The field "
         "module_hardware_model_candidate is optional and is NOT the full header; do not "
         "fail a region merely because it is blank, contains only a functional label, or "
         "does not repeat words such as a generic device label. A hardware model is valid "
         "only when a distinct model/code is actually visible. "
+        "Semantically bind every physical source column to one or more canonical roles "
+        "without relying on a fixed Italian/English vocabulary. Return exactly one "
+        "column_binding_decision for every source_column_index in every region. A single "
+        "physical column may legitimately serve multiple roles only when its own visible "
+        "header, body values, and table function support that interpretation. For "
+        "example, a visible row/terminal index can also identify the module channel, but "
+        "do not duplicate one field into another merely because their values happen to "
+        "match. Use peer tables on the same page only as corroborating evidence; each "
+        "decision must remain supported by the region's own crop. Set "
+        "use_for_missing_values=true only when exact body-cell text can safely populate "
+        "a missing short reference field (channel, terminal, wire, address, or connector). "
+        "Every visible column must be assigned at least one role; use other_data only for "
+        "a genuinely non-canonical column. Confirm that every visible reference column "
+        "is materialized for every row, including placeholders. "
         "For each non-placeholder row with free text, compare the candidate against the "
         "high-resolution crop. In region_checks, visible_text_row_count and "
         "supported_text_row_count count only included non-placeholder rows that have "
         "at least one non-empty signal, description, or expected-state field. If the "
-        "candidate is already an exact readable visual "
-        "transcription, leave it unchanged. If OCR introduced or split characters and "
-        "the crop clearly supports the exact printed text, return a text_override with "
-        "the exact visible transcription. Return a separate override for every affected "
-        "field, including both signal_name and description when they repeat the same "
-        "visible text. Such an override may correct OCR characters, word boundaries, "
-        "punctuation, or spacing, but must preserve the original "
-        "language and must not translate, paraphrase, expand abbreviations, infer hidden "
-        "meaning, or invent technical terms. If an extractor row has "
-        "text_reconstruction_confidence below 0.90, return an override for every "
+        "candidate is already an exact readable visual transcription, leave it unchanged. "
+        "If OCR introduced or split characters and the crop clearly supports the exact "
+        "printed text, return a text_override with the exact visible transcription. "
+        "Return a separate override for every affected field, including both signal_name "
+        "and description when they repeat the same visible text. Such an override may "
+        "correct OCR characters, word boundaries, punctuation, or spacing, but must "
+        "preserve the original language and must not translate, paraphrase, expand "
+        "abbreviations, infer hidden meaning, or invent technical terms. If an extractor "
+        "row has text_reconstruction_confidence below 0.90, return an override for every "
         "non-empty free-text field even when the approved transcription is unchanged; "
-        "this records independent visual confirmation. If the crop is ambiguous, add "
-        "the field to blocked_text_rows instead of guessing. Count every reviewed "
-        "non-placeholder "
-        "text row in each region. Return pass only when all visible content is complete "
-        "and every published text value is either visually confirmed or safely corrected."
+        "this records independent visual confirmation. If the crop or a column meaning "
+        "is ambiguous, block rather than guess. Count every reviewed non-placeholder "
+        "text row in each region. Return pass only when all visible content and columns "
+        "are complete and every published value is visually supported."
     )
     user_text = (
-        "Audit this page and adjudicate exact visible text. The full page is followed "
-        "by one high-resolution crop for every region. Return overrides only where the "
-        "candidate needs correction.\n\n"
+        "Audit this page, bind every physical column semantically, and adjudicate "
+        "exact visible text. The full page is followed by one high-resolution crop "
+        "for every region. Return exactly one column-binding decision for each "
+        "physical source column, and return text overrides only where a candidate "
+        "needs correction.\n\n"
         + json.dumps(
             {
                 "page_id": page["id"],
@@ -1816,6 +1930,7 @@ def _verifier_messages(
                 "sheet_title_original": page.get("sheet_title"),
                 "detector": detector,
                 "proposal_region_ids": [p["region_id"] for p in proposals],
+                "column_binding_proposals": column_binding_proposals,
                 "extractions": extraction_summary,
             },
             ensure_ascii=False,
@@ -1960,6 +2075,319 @@ def _assessment_map(detector: dict) -> dict[str, dict]:
     return out
 
 
+def _reference_signature(value: Any) -> str:
+    """Normalize a short technical reference without changing its characters."""
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    text = (
+        text.replace("–", "-")
+        .replace("—", "-")
+        .replace("‐", "-")
+        .replace("−", "-")
+        .upper()
+    )
+    return re.sub(r"\s+", "", text)
+
+
+def _safe_bound_reference_cell_value(value: Any, role: str) -> str:
+    """Return an exact atomic cell value safe for reference-field publication.
+
+    The semantic role comes from the visual verifier. This local guard only
+    prevents a malformed table boundary from copying an entire prose cell into
+    a short technical-reference field.
+    """
+    max_len = int(REFERENCE_ROLE_MAX_LENGTH.get(role, 200))
+    text = _clean_text(value, max_len)
+    if not text:
+        return ""
+    if len(text) > min(max_len, 120):
+        return ""
+    tokens = [token for token in text.split(" ") if token]
+    if len(tokens) > 6:
+        return ""
+    alnum = sum(ch.isalnum() for ch in text)
+    if alnum == 0:
+        return ""
+    # A no-digit reference can still be valid (A, B, L+, PE, etc.), but a long
+    # alphabetic phrase is not an atomic terminal/channel/address reference.
+    if not any(ch.isdigit() for ch in text):
+        letters = sum(ch.isalpha() for ch in text)
+        if letters > 24:
+            return ""
+    return text
+
+
+def _build_column_binding_proposals(
+    *,
+    proposals: list[dict],
+    detector: dict,
+    extractions: list[dict],
+) -> list[dict]:
+    """Build language-independent column-role evidence for the visual verifier.
+
+    No header vocabulary is hardcoded. Evidence comes from:
+      * physical column index and exact header/body cell text;
+      * exact agreement between body cells and already extracted canonical
+        reference fields;
+      * full-page peer tables, which the verifier sees together.
+    """
+    assessments = _assessment_map(detector)
+    extraction_by_region = {
+        _clean_text(item.get("region_id"), 120): item
+        for item in extractions
+        if _clean_text(item.get("region_id"), 120)
+    }
+    output: list[dict] = []
+
+    for proposal in proposals:
+        rid = _clean_text(proposal.get("region_id"), 120)
+        assessment = assessments.get(rid) or {}
+        extraction = extraction_by_region.get(rid) or {}
+        header_count = max(
+            0,
+            min(
+                int(assessment.get("visible_header_row_count") or 0),
+                len(proposal.get("row_candidates") or []),
+            ),
+        )
+        column_count = int(proposal.get("deterministic_column_count") or 0)
+        row_result_map = {
+            _clean_text(row.get("row_id"), 50): row
+            for row in (extraction.get("row_results") or [])
+            if _clean_text(row.get("row_id"), 50)
+        }
+        row_candidates = proposal.get("row_candidates") or []
+        body_candidates = row_candidates[header_count:]
+        columns: list[dict] = []
+
+        for column_index in range(column_count):
+            header_cells: list[str] = []
+            for row in row_candidates[:header_count]:
+                cells = row.get("deterministic_cell_text_original") or []
+                value = _clean_text(
+                    cells[column_index] if column_index < len(cells) else "",
+                    800,
+                )
+                if value and value not in header_cells:
+                    header_cells.append(value)
+
+            body_cell_values: list[dict] = []
+            for row in body_candidates:
+                row_id = _clean_text(row.get("row_id"), 50)
+                cells = row.get("deterministic_cell_text_original") or []
+                cell_text = _clean_text(
+                    cells[column_index] if column_index < len(cells) else "",
+                    1200,
+                )
+                body_cell_values.append(
+                    {
+                        "row_id": row_id,
+                        "cell_text_original": cell_text,
+                    }
+                )
+
+            role_evidence: dict[str, dict] = {}
+            suggested_roles: list[str] = []
+            for role, field_name in REFERENCE_ROLE_TO_RESULT_FIELD.items():
+                visible_nonempty = 0
+                extractor_nonempty = 0
+                comparable = 0
+                exact_matches = 0
+                for body in body_cell_values:
+                    row_id = body["row_id"]
+                    cell_text = body["cell_text_original"]
+                    extracted = _clean_text(
+                        (row_result_map.get(row_id) or {}).get(field_name),
+                        int(REFERENCE_ROLE_MAX_LENGTH.get(role, 200)),
+                    )
+                    if cell_text:
+                        visible_nonempty += 1
+                    if extracted:
+                        extractor_nonempty += 1
+                    if cell_text and extracted:
+                        comparable += 1
+                        if _reference_signature(cell_text) == _reference_signature(
+                            extracted
+                        ):
+                            exact_matches += 1
+
+                visible_coverage = (
+                    round(exact_matches / visible_nonempty, 4)
+                    if visible_nonempty
+                    else 0.0
+                )
+                comparable_accuracy = (
+                    round(exact_matches / comparable, 4)
+                    if comparable
+                    else 0.0
+                )
+                role_evidence[role] = {
+                    "visible_nonempty_count": visible_nonempty,
+                    "extractor_nonempty_count": extractor_nonempty,
+                    "comparable_count": comparable,
+                    "exact_match_count": exact_matches,
+                    "visible_coverage_ratio": visible_coverage,
+                    "comparable_accuracy_ratio": comparable_accuracy,
+                }
+                minimum_support = min(3, visible_nonempty)
+                if (
+                    visible_nonempty > 0
+                    and exact_matches >= minimum_support
+                    and visible_coverage >= 0.80
+                    and comparable_accuracy >= 0.90
+                ):
+                    suggested_roles.append(role)
+
+            nonempty_values = [
+                item["cell_text_original"]
+                for item in body_cell_values
+                if item["cell_text_original"]
+            ]
+            atomic_values = [
+                value
+                for value in nonempty_values
+                if any(
+                    _safe_bound_reference_cell_value(value, role)
+                    for role in REFERENCE_COLUMN_ROLES
+                )
+            ]
+            integer_values: list[int] = []
+            for value in nonempty_values:
+                compact = _reference_signature(value)
+                if compact.isdigit():
+                    integer_values.append(int(compact))
+            is_monotonic_integer_sequence = bool(integer_values) and integer_values == sorted(
+                integer_values
+            )
+
+            columns.append(
+                {
+                    "source_column_index": column_index,
+                    "header_cell_texts_original": header_cells,
+                    "body_cell_values": body_cell_values,
+                    "body_nonempty_count": len(nonempty_values),
+                    "body_distinct_count": len(set(nonempty_values)),
+                    "atomic_reference_value_ratio": (
+                        round(len(atomic_values) / len(nonempty_values), 4)
+                        if nonempty_values
+                        else 0.0
+                    ),
+                    "is_monotonic_integer_sequence": (
+                        is_monotonic_integer_sequence
+                    ),
+                    "local_reference_role_evidence": role_evidence,
+                    "locally_suggested_roles": sorted(set(suggested_roles)),
+                }
+            )
+
+        output.append(
+            {
+                "region_id": rid,
+                "visible_column_count": column_count,
+                "columns": columns,
+            }
+        )
+
+    # Add corroborating, language-independent peer evidence. This does not
+    # publish or copy values by itself; it helps the visual verifier recognize
+    # equivalent columns across independently bordered tables on the same page.
+    for region in output:
+        for column in region.get("columns") or []:
+            header_cells = column.get("header_cell_texts_original") or []
+            own_header = _clean_text(
+                header_cells[-1] if header_cells else "",
+                800,
+            )
+            own_signature = _semantic_character_signature(own_header)
+            peer_evidence: list[dict] = []
+            consensus_roles = set(column.get("locally_suggested_roles") or [])
+
+            for peer_region in output:
+                if peer_region.get("region_id") == region.get("region_id"):
+                    continue
+                if int(peer_region.get("visible_column_count") or 0) != int(
+                    region.get("visible_column_count") or 0
+                ):
+                    continue
+                peer_column = next(
+                    (
+                        item
+                        for item in (peer_region.get("columns") or [])
+                        if int(item.get("source_column_index", -1))
+                        == int(column.get("source_column_index", -2))
+                    ),
+                    None,
+                )
+                if not peer_column:
+                    continue
+                peer_headers = (
+                    peer_column.get("header_cell_texts_original") or []
+                )
+                peer_header = _clean_text(
+                    peer_headers[-1] if peer_headers else "",
+                    800,
+                )
+                peer_signature = _semantic_character_signature(peer_header)
+                if not own_signature or not peer_signature:
+                    similarity = 0.0
+                else:
+                    similarity = difflib.SequenceMatcher(
+                        None,
+                        own_signature,
+                        peer_signature,
+                    ).ratio()
+                    shorter = min(len(own_signature), len(peer_signature))
+                    longer = max(len(own_signature), len(peer_signature))
+                    if (
+                        shorter > 0
+                        and longer > 0
+                        and (
+                            own_signature in peer_signature
+                            or peer_signature in own_signature
+                        )
+                        and shorter / longer >= 0.55
+                    ):
+                        similarity = max(similarity, 0.90)
+
+                comparable_shape = (
+                    bool(column.get("is_monotonic_integer_sequence"))
+                    == bool(peer_column.get("is_monotonic_integer_sequence"))
+                    and abs(
+                        float(
+                            column.get("atomic_reference_value_ratio") or 0.0
+                        )
+                        - float(
+                            peer_column.get(
+                                "atomic_reference_value_ratio"
+                            )
+                            or 0.0
+                        )
+                    )
+                    <= 0.30
+                )
+                peer_roles = sorted(
+                    set(peer_column.get("locally_suggested_roles") or [])
+                )
+                if similarity >= 0.72 and comparable_shape:
+                    consensus_roles.update(peer_roles)
+                peer_evidence.append(
+                    {
+                        "peer_region_id": peer_region.get("region_id"),
+                        "peer_source_column_index": peer_column.get(
+                            "source_column_index"
+                        ),
+                        "header_similarity": round(similarity, 4),
+                        "comparable_value_shape": comparable_shape,
+                        "peer_locally_suggested_roles": peer_roles,
+                    }
+                )
+
+            column["peer_equivalent_column_evidence"] = peer_evidence
+            column["page_consensus_suggested_roles"] = sorted(
+                consensus_roles
+            )
+    return output
+
+
 def _validate_and_materialize(
     *,
     page: dict,
@@ -1968,6 +2396,7 @@ def _validate_and_materialize(
     detector: dict,
     extractions: list[dict],
     verifier: dict,
+    column_binding_proposals: list[dict],
     fingerprints: dict,
 ) -> tuple[bool, list[dict], list[dict], dict]:
     issues: list[dict] = []
@@ -2084,6 +2513,166 @@ def _validate_and_materialize(
             returned=sorted(extraction_by_region),
         )
 
+    binding_proposal_by_region = {
+        _clean_text(item.get("region_id"), 120): item
+        for item in column_binding_proposals
+        if _clean_text(item.get("region_id"), 120)
+    }
+    if set(binding_proposal_by_region) != set(proposal_ids):
+        fail(
+            "column_binding_proposal_accounting_mismatch",
+            "Column-binding proposals do not exactly match deterministic regions",
+            expected=proposal_ids,
+            returned=sorted(binding_proposal_by_region),
+        )
+
+    expected_column_keys: set[tuple[str, int]] = set()
+    for proposal in proposals:
+        rid = proposal["region_id"]
+        for column_index in range(
+            int(proposal.get("deterministic_column_count") or 0)
+        ):
+            expected_column_keys.add((rid, column_index))
+
+    column_binding_map: dict[str, dict[int, dict]] = {}
+    decision_keys: set[tuple[str, int]] = set()
+    for decision in verifier.get("column_binding_decisions") or []:
+        rid = _clean_text(decision.get("region_id"), 120)
+        try:
+            column_index = int(decision.get("source_column_index"))
+        except Exception:
+            column_index = -1
+        key = (rid, column_index)
+        if key in decision_keys:
+            fail(
+                "duplicate_column_binding_decision",
+                "Verifier returned the same column-binding decision more than once",
+                region_id=rid,
+                source_column_index=column_index,
+            )
+            continue
+        decision_keys.add(key)
+
+        roles: list[str] = []
+        for raw_role in decision.get("canonical_roles") or []:
+            role = _clean_text(raw_role, 80)
+            if role in COLUMN_BINDING_ROLES and role not in roles:
+                roles.append(role)
+        if not rid or key not in expected_column_keys:
+            fail(
+                "invalid_column_binding_key",
+                "Verifier returned a column-binding decision outside the deterministic table geometry",
+                region_id=rid,
+                source_column_index=column_index,
+            )
+            continue
+        if not roles:
+            fail(
+                "empty_column_binding_roles",
+                "Verifier returned a source column without a canonical role",
+                region_id=rid,
+                source_column_index=column_index,
+            )
+
+        proposal_column = next(
+            (
+                item
+                for item in (
+                    (binding_proposal_by_region.get(rid) or {}).get(
+                        "columns"
+                    )
+                    or []
+                )
+                if int(item.get("source_column_index", -1))
+                == column_index
+            ),
+            None,
+        )
+        consensus_reference_roles = set(
+            (proposal_column or {}).get(
+                "page_consensus_suggested_roles"
+            )
+            or []
+        ).intersection(REFERENCE_COLUMN_ROLES)
+        omitted_consensus_roles = sorted(
+            consensus_reference_roles.difference(roles)
+        )
+        if omitted_consensus_roles:
+            fail(
+                "verifier_omitted_consensus_reference_role",
+                "Verifier omitted a strongly corroborated reference-column role",
+                region_id=rid,
+                source_column_index=column_index,
+                omitted_roles=omitted_consensus_roles,
+                returned_roles=roles,
+                peer_evidence=(proposal_column or {}).get(
+                    "peer_equivalent_column_evidence"
+                )
+                or [],
+            )
+
+        if "other_data" in roles and len(roles) > 1:
+            fail(
+                "other_data_column_binding_conflict",
+                "other_data cannot be combined with canonical data roles",
+                region_id=rid,
+                source_column_index=column_index,
+                canonical_roles=roles,
+            )
+        confidence = _clamp_conf(decision.get("confidence"))
+        if confidence < ROW_MIN_CONFIDENCE:
+            fail(
+                "column_binding_confidence_below_threshold",
+                "Column semantic binding confidence is below the minimum threshold",
+                region_id=rid,
+                source_column_index=column_index,
+                binding_confidence=confidence,
+                threshold=ROW_MIN_CONFIDENCE,
+            )
+        use_for_missing = bool(decision.get("use_for_missing_values"))
+        if use_for_missing and not set(roles).intersection(
+            REFERENCE_COLUMN_ROLES
+        ):
+            fail(
+                "column_binding_fill_without_reference_role",
+                "A column can fill missing values only when it has a canonical reference role",
+                region_id=rid,
+                source_column_index=column_index,
+                canonical_roles=roles,
+            )
+        if use_for_missing and confidence < PAGE_PASS_MIN_CONFIDENCE:
+            fail(
+                "column_binding_fill_confidence_below_threshold",
+                "A column used to fill missing references requires page-level confidence",
+                region_id=rid,
+                source_column_index=column_index,
+                binding_confidence=confidence,
+                threshold=PAGE_PASS_MIN_CONFIDENCE,
+            )
+
+        normalized_decision = {
+            "region_id": rid,
+            "source_column_index": column_index,
+            "header_text_original": _clean_text(
+                decision.get("header_text_original"), 1000
+            ),
+            "canonical_roles": roles,
+            "use_for_missing_values": use_for_missing,
+            "confidence": confidence,
+            "reason": _clean_text(decision.get("reason"), 1200),
+        }
+        column_binding_map.setdefault(rid, {})[
+            column_index
+        ] = normalized_decision
+
+    if decision_keys != expected_column_keys:
+        fail(
+            "column_binding_decision_accounting_mismatch",
+            "Verifier did not return exactly one semantic decision for every physical source column",
+            expected=[list(item) for item in sorted(expected_column_keys)],
+            returned=[list(item) for item in sorted(decision_keys)],
+        )
+
     io_rows: list[dict] = []
     region_stats: list[dict] = []
     region_text_row_counts: dict[str, int] = {}
@@ -2194,6 +2783,26 @@ def _validate_and_materialize(
                 module_tag=module_tag,
                 sheet_code=str(page.get("sheet_code") or ""),
             )
+        )
+
+        region_column_bindings = column_binding_map.get(rid) or {}
+        expected_region_column_count = int(
+            proposal.get("deterministic_column_count") or 0
+        )
+        if len(region_column_bindings) != expected_region_column_count:
+            fail(
+                "region_column_binding_count_mismatch",
+                f"Region {rid} does not have one semantic binding per physical column",
+                region_id=rid,
+                expected_column_count=expected_region_column_count,
+                returned_column_count=len(region_column_bindings),
+            )
+        region_reference_fill_count = 0
+        region_binding_fingerprint = _sha256_json(
+            [
+                region_column_bindings[index]
+                for index in sorted(region_column_bindings)
+            ]
         )
 
         included_rows = [row for row in row_results if bool(row.get("include_in_io"))]
@@ -2405,6 +3014,167 @@ def _validate_and_materialize(
                 "expected_normal_state"
             ]
 
+            extractor_reference_values = {
+                "channel_ref": _clean_text(
+                    result.get("channel_ref_original"), 160
+                ),
+                "terminal_reference": _clean_text(
+                    result.get("terminal_reference_original"), 300
+                ),
+                "wire_reference": _clean_text(
+                    result.get("wire_reference_original"), 300
+                ),
+                "plc_address": _clean_text(
+                    result.get("plc_address_original"), 200
+                ),
+                "connector_reference": _clean_text(
+                    result.get("connector_ref_original"), 200
+                ),
+            }
+            published_reference_values = dict(extractor_reference_values)
+            reference_value_sources = {
+                role: ("extractor" if value else "")
+                for role, value in extractor_reference_values.items()
+            }
+            reference_value_column_indexes: dict[str, list[int]] = {
+                role: [] for role in REFERENCE_COLUMN_ROLES
+            }
+            bound_reference_candidates: dict[str, list[tuple[int, str]]] = {
+                role: [] for role in REFERENCE_COLUMN_ROLES
+            }
+            deterministic_cells = (
+                candidate.get("deterministic_cell_text_original") or []
+            )
+
+            for column_index, binding in sorted(
+                region_column_bindings.items()
+            ):
+                if not bool(binding.get("use_for_missing_values")):
+                    continue
+                cell_text = _clean_text(
+                    deterministic_cells[column_index]
+                    if column_index < len(deterministic_cells)
+                    else "",
+                    1200,
+                )
+                if not cell_text:
+                    continue
+                for role in binding.get("canonical_roles") or []:
+                    if role not in REFERENCE_COLUMN_ROLES:
+                        continue
+                    safe_value = _safe_bound_reference_cell_value(
+                        cell_text,
+                        role,
+                    )
+                    if not safe_value:
+                        if not published_reference_values.get(role):
+                            fail(
+                                "bound_reference_cell_not_atomic",
+                                f"Region {rid} row {row_id} column {column_index} "
+                                f"cannot safely populate missing {role}",
+                                region_id=rid,
+                                row_ids=[row_id],
+                                source_column_index=column_index,
+                                canonical_role=role,
+                                cell_text_original=cell_text,
+                            )
+                        continue
+                    bound_reference_candidates[role].append(
+                        (column_index, safe_value)
+                    )
+
+            for role in sorted(REFERENCE_COLUMN_ROLES):
+                candidates_for_role = bound_reference_candidates.get(role) or []
+                distinct_by_signature: dict[str, tuple[int, str]] = {}
+                for column_index, value in candidates_for_role:
+                    signature = _reference_signature(value)
+                    if signature and signature not in distinct_by_signature:
+                        distinct_by_signature[signature] = (
+                            column_index,
+                            value,
+                        )
+                existing = published_reference_values.get(role) or ""
+
+                if existing:
+                    if distinct_by_signature:
+                        existing_signature = _reference_signature(existing)
+                        if existing_signature in distinct_by_signature:
+                            reference_value_sources[role] = (
+                                "extractor_verified_by_column_binding"
+                            )
+                            reference_value_column_indexes[role] = sorted(
+                                {
+                                    column_index
+                                    for column_index, value
+                                    in candidates_for_role
+                                    if _reference_signature(value)
+                                    == existing_signature
+                                }
+                            )
+                        elif len(distinct_by_signature) == 1:
+                            column_index, bound_value = next(
+                                iter(distinct_by_signature.values())
+                            )
+                            fail(
+                                "extractor_reference_conflicts_with_bound_column",
+                                f"Region {rid} row {row_id} extractor {role} "
+                                "conflicts with the verifier-approved source column",
+                                region_id=rid,
+                                row_ids=[row_id],
+                                canonical_role=role,
+                                extractor_value=existing,
+                                bound_cell_value=bound_value,
+                                source_column_index=column_index,
+                            )
+                        else:
+                            fail(
+                                "multiple_bound_reference_values",
+                                f"Region {rid} row {row_id} has conflicting "
+                                f"column-bound values for {role}",
+                                region_id=rid,
+                                row_ids=[row_id],
+                                canonical_role=role,
+                                candidates=[
+                                    {
+                                        "source_column_index": column_index,
+                                        "value": value,
+                                    }
+                                    for column_index, value
+                                    in candidates_for_role
+                                ],
+                            )
+                    continue
+
+                if not distinct_by_signature:
+                    continue
+                if len(distinct_by_signature) > 1:
+                    fail(
+                        "multiple_bound_reference_values",
+                        f"Region {rid} row {row_id} has conflicting "
+                        f"column-bound values for missing {role}",
+                        region_id=rid,
+                        row_ids=[row_id],
+                        canonical_role=role,
+                        candidates=[
+                            {
+                                "source_column_index": column_index,
+                                "value": value,
+                            }
+                            for column_index, value in candidates_for_role
+                        ],
+                    )
+                    continue
+
+                column_index, bound_value = next(
+                    iter(distinct_by_signature.values())
+                )
+                published_reference_values[role] = bound_value
+                reference_value_sources[role] = (
+                    "verifier_approved_column_binding"
+                )
+                reference_value_column_indexes[role] = [column_index]
+                region_reference_fill_count += 1
+
             io_type = str(extraction.get("io_type") or "other")
             if io_type not in IO_TYPES:
                 io_type = "other"
@@ -2416,12 +3186,12 @@ def _validate_and_materialize(
                     ),
                     "module_tag": module_tag,
                     "module_model": module_model,
-                    "channel_ref": _clean_text(
-                        result.get("channel_ref_original"), 160
-                    ),
-                    "plc_address": _clean_text(
-                        result.get("plc_address_original"), 200
-                    ),
+                    "channel_ref": published_reference_values[
+                        "channel_ref"
+                    ],
+                    "plc_address": published_reference_values[
+                        "plc_address"
+                    ],
                     "io_type": io_type,
                     "is_safety": bool(extraction.get("is_safety"))
                     or io_type.startswith("safety_"),
@@ -2430,12 +3200,12 @@ def _validate_and_materialize(
                     "expected_normal_state": (
                         normalized_expected_normal_state
                     ),
-                    "wire_reference": _clean_text(
-                        result.get("wire_reference_original"), 300
-                    ),
-                    "terminal_reference": _clean_text(
-                        result.get("terminal_reference_original"), 300
-                    ),
+                    "wire_reference": published_reference_values[
+                        "wire_reference"
+                    ],
+                    "terminal_reference": published_reference_values[
+                        "terminal_reference"
+                    ],
                     "bbox": evidence_bbox,
                     "source_text": source_text,
                     "confidence": round(
@@ -2469,6 +3239,26 @@ def _validate_and_materialize(
                         "module_model_canonical": module_model,
                         "module_model_evidence_quality": (
                             module_model_evidence_quality
+                        ),
+                        "column_binding_version": "semantic-column-binding-v1",
+                        "column_binding_fingerprint": (
+                            region_binding_fingerprint
+                        ),
+                        "column_binding_decisions": [
+                            region_column_bindings[index]
+                            for index in sorted(region_column_bindings)
+                        ],
+                        "published_reference_values": (
+                            published_reference_values
+                        ),
+                        "reference_value_sources": reference_value_sources,
+                        "reference_value_column_indexes": (
+                            reference_value_column_indexes
+                        ),
+                        "published_connector_reference": (
+                            published_reference_values[
+                                "connector_reference"
+                            ]
                         ),
                         "text_reconstruction_confidence": (
                             final_text_confidence
@@ -2526,6 +3316,11 @@ def _validate_and_materialize(
                 "header_rows": header_count,
                 "physical_rows": physical_count,
                 "materialized_rows": len(included_rows),
+                "reference_values_filled": region_reference_fill_count,
+                "column_bindings": [
+                    region_column_bindings[index]
+                    for index in sorted(region_column_bindings)
+                ],
             }
         )
 
@@ -2547,6 +3342,14 @@ def _validate_and_materialize(
         (
             "all_visible_text_resolved_or_blocked",
             "verifier_text_review_incomplete",
+        ),
+        (
+            "all_visible_columns_accounted_for",
+            "verifier_column_accounting_incomplete",
+        ),
+        (
+            "all_reference_columns_materialized",
+            "verifier_reference_materialization_incomplete",
         ),
     ]:
         if not bool(verifier.get(field)):
@@ -2633,6 +3436,55 @@ def _validate_and_materialize(
                 region_id=rid,
                 expected_text_rows=expected_text_rows,
                 supported_text_rows=int(check.get("supported_text_row_count") or 0),
+            )
+
+    binding_checks = verifier.get("column_binding_checks") or []
+    binding_check_map = {
+        _clean_text(check.get("region_id"), 120): check
+        for check in binding_checks
+        if _clean_text(check.get("region_id"), 120)
+    }
+    if set(binding_check_map) != set(proposal_ids):
+        fail(
+            "verifier_column_binding_check_mismatch",
+            "Verifier did not return exactly one column-binding check per region",
+            expected=proposal_ids,
+            returned=sorted(binding_check_map),
+        )
+    proposal_by_id = {proposal["region_id"]: proposal for proposal in proposals}
+    for rid, check in binding_check_map.items():
+        expected_columns = int(
+            (proposal_by_id.get(rid) or {}).get(
+                "deterministic_column_count"
+            )
+            or 0
+        )
+        if not bool(check.get("pass")):
+            fail(
+                "verifier_column_binding_failed",
+                f"Verifier failed semantic column binding for {rid}: "
+                f"{check.get('reason')}",
+                region_id=rid,
+            )
+        if int(check.get("visible_column_count") or -1) != expected_columns:
+            fail(
+                "verifier_visible_column_count_mismatch",
+                f"Verifier visible column count differs for {rid}",
+                region_id=rid,
+                expected_column_count=expected_columns,
+                verifier_column_count=int(
+                    check.get("visible_column_count") or -1
+                ),
+            )
+        if int(check.get("accounted_column_count") or -1) != expected_columns:
+            fail(
+                "verifier_accounted_column_count_mismatch",
+                f"Verifier did not account for every source column in {rid}",
+                region_id=rid,
+                expected_column_count=expected_columns,
+                accounted_column_count=int(
+                    check.get("accounted_column_count") or -1
+                ),
             )
 
     blocking = [i for i in issues if i["severity"] in {"high", "critical"}]
@@ -2821,9 +3673,9 @@ def _publish_page(
                 SELECT COUNT(DISTINCT page_id), COUNT(*)
                 FROM public.electrical_io
                 WHERE version_id=%s AND extraction_method=%s
-                  AND properties ->> 'pipeline_marker' = %s;
+                  AND properties ->> 'phase' = %s;
                 """,
-                (version_id, EXTRACTION_METHOD, PIPELINE_MARKER),
+                (version_id, EXTRACTION_METHOD, PHASE_NAME),
             )
             current_row = cur.fetchone()
             passed_pages = int(current_row[0] or 0)
@@ -3196,6 +4048,12 @@ def extract_electrical_structured_version(
                 _add_usage(totals, "region_extractor", region_usage, region_reused)
         extraction_results.sort(key=lambda x: str(x.get("region_id") or ""))
 
+        column_binding_proposals = _build_column_binding_proposals(
+            proposals=proposals,
+            detector=detector,
+            extractions=extraction_results,
+        )
+
         verifier_request = {
             "phase": PHASE_NAME,
             "task": "independent_full_page_visual_adjudication",
@@ -3208,6 +4066,9 @@ def extract_electrical_structured_version(
             },
             "detector_response_sha256": _sha256_json(detector),
             "extraction_response_sha256": _sha256_json(extraction_results),
+            "column_binding_proposals_sha256": _sha256_json(
+                column_binding_proposals
+            ),
             "region_hashes": [p["region_hash"] for p in proposals],
         }
         verifier, usage, reused, verifier_fp = _cached_call(
@@ -3223,6 +4084,7 @@ def extract_electrical_structured_version(
                 detector,
                 proposals,
                 extraction_results,
+                column_binding_proposals,
                 page_image,
                 crop_images,
             ),
@@ -3240,6 +4102,7 @@ def extract_electrical_structured_version(
             detector=detector,
             extractions=extraction_results,
             verifier=verifier,
+            column_binding_proposals=column_binding_proposals,
             fingerprints=fingerprints,
         )
         language = _clean_text(detector.get("language"), 50) or "unknown"
