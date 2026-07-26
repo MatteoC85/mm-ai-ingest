@@ -118,7 +118,7 @@ steps:
         ), version
         assert (
             version.get('electrical_structured_materializer_version')
-            == 'mm-electrical-structured-materializer-v2.1'
+            == 'mm-electrical-structured-materializer-v2.2'
         ), version
 
         assert version.get('electrical_source_snapshot_enabled') is True, version
@@ -355,7 +355,7 @@ steps:
         ), version
         assert (
             version.get('electrical_structured_materializer_version')
-            == 'mm-electrical-structured-materializer-v2.1'
+            == 'mm-electrical-structured-materializer-v2.2'
         ), version
 
         required = {
@@ -492,7 +492,7 @@ steps:
         assert version.get('electrical_structured_verifier_model') == 'gpt-5.4', version
         assert (
             version.get('electrical_structured_materializer_version')
-            == 'mm-electrical-structured-materializer-v2.1'
+            == 'mm-electrical-structured-materializer-v2.2'
         ), version
 
         print('PROMOZIONE VERIFICATA: OK')
