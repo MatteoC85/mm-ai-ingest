@@ -6,12 +6,12 @@ substitutions:
   _SERVICE: "mm-ai-ingest-fixed"
   _AR_REPOSITORY: "mm-ai-ingest"
   _IMAGE_NAME: "mm-ai-ingest"
-  _EXPECTED_CODE_MARKER: "phase2-vision-v2.6-source-snapshot"
+  _EXPECTED_CODE_MARKER: "phase2-vision-v2.7-source-snapshot"
   _EXPECTED_STRUCTURED_MODEL: "gpt-5.4"
   _EXPECTED_DETECTOR_PROMPT: "mm-electrical-region-detector-v2"
   _EXPECTED_EXTRACTOR_PROMPT: "mm-electrical-table-extractor-v2.2"
-  _EXPECTED_VERIFIER_PROMPT: "mm-electrical-page-verifier-v2.6"
-  _EXPECTED_MATERIALIZER_VERSION: "mm-electrical-structured-materializer-v2.6"
+  _EXPECTED_VERIFIER_PROMPT: "mm-electrical-page-verifier-v2.7"
+  _EXPECTED_MATERIALIZER_VERSION: "mm-electrical-structured-materializer-v2.7"
 
 steps:
   - id: "01-source-preflight"
@@ -151,6 +151,7 @@ steps:
             _adjudicate_io_context,
             _adjudicate_row_semantics,
             _looks_artificially_fragmented_text,
+            _text_row_accounting,
         )
 
         safety_context = _adjudicate_io_context(
@@ -160,6 +161,50 @@ steps:
         )
         assert safety_context['final_io_type'] == 'safety_input', safety_context
         assert safety_context['final_is_safety'] is True, safety_context
+
+        output_context = _adjudicate_io_context(
+            page_type='safety_io_table',
+            model_io_type='mixed',
+            model_is_safety=True,
+            verified_page_io_type='safety_output',
+            verified_page_is_safety=True,
+            verified_page_confidence=0.98,
+            verified_region_io_type='safety_output',
+            verified_region_is_safety=True,
+            verified_region_confidence=0.97,
+        )
+        assert output_context['final_io_type'] == 'safety_output', output_context
+        assert output_context['direction_conflict'] is False, output_context
+
+        conflict_context = _adjudicate_io_context(
+            page_type='safety_io_table',
+            model_io_type='safety_input',
+            model_is_safety=True,
+            verified_page_io_type='safety_output',
+            verified_page_is_safety=True,
+            verified_page_confidence=0.98,
+            verified_region_io_type='safety_input',
+            verified_region_is_safety=True,
+            verified_region_confidence=0.97,
+        )
+        assert conflict_context['direction_conflict'] is True, conflict_context
+
+        marker_accounting = _text_row_accounting(
+            signal_name='***',
+            description='***',
+            expected_normal_state='',
+        )
+        assert marker_accounting['requires_text_review'] is False, marker_accounting
+        assert set(marker_accounting['marker_only_text_fields']) == {
+            'signal_name', 'description'
+        }, marker_accounting
+
+        substantive_accounting = _text_row_accounting(
+            signal_name='SPARE 1',
+            description='SPARE 1',
+            expected_normal_state='',
+        )
+        assert substantive_accounting['requires_text_review'] is True, substantive_accounting
 
         placeholder_semantics = _adjudicate_row_semantics(
             model_row_role='other_data',
@@ -285,7 +330,7 @@ steps:
           --revision-suffix="$${REV_SUFFIX}" \
           --timeout="600s" \
           --remove-env-vars="MM_ELECTRICAL_STRUCTURED_MODEL,MM_ELECTRICAL_STRUCTURED_PROMPT_VERSION,MM_ELECTRICAL_STRUCTURED_MIN_CONFIDENCE,MM_ELECTRICAL_STRUCTURED_MAX_WORDS_PER_PAGE" \
-          --update-env-vars="COMMIT_SHA=$COMMIT_SHA,MM_ELECTRICAL_STRUCTURED_ENABLED=1,MM_ELECTRICAL_STRUCTURED_DETECTOR_MODEL=gpt-5.4,MM_ELECTRICAL_STRUCTURED_EXTRACTOR_MODEL=gpt-5.4,MM_ELECTRICAL_STRUCTURED_VERIFIER_MODEL=gpt-5.4,MM_ELECTRICAL_STRUCTURED_DETECTOR_PROMPT_VERSION=mm-electrical-region-detector-v2,MM_ELECTRICAL_STRUCTURED_EXTRACTOR_PROMPT_VERSION=mm-electrical-table-extractor-v2.2,MM_ELECTRICAL_STRUCTURED_VERIFIER_PROMPT_VERSION=mm-electrical-page-verifier-v2.6,MM_ELECTRICAL_STRUCTURED_MATERIALIZER_VERSION=mm-electrical-structured-materializer-v2.6,MM_ELECTRICAL_STRUCTURED_ROW_MIN_CONFIDENCE=0.80,MM_ELECTRICAL_STRUCTURED_PAGE_PASS_MIN_CONFIDENCE=0.90,MM_ELECTRICAL_STRUCTURED_TEXT_RECONSTRUCTION_MIN_CONFIDENCE=0.90,MM_ELECTRICAL_STRUCTURED_RENDER_DPI=220,MM_ELECTRICAL_STRUCTURED_MAX_COMPLETION_TOKENS=16000,MM_ELECTRICAL_STRUCTURED_FETCH_TIMEOUT_SECONDS=60,MM_ELECTRICAL_STRUCTURED_TIMEOUT_SECONDS=240,MM_ELECTRICAL_STRUCTURED_MAX_SOURCE_BYTES=100000000,MM_ELECTRICAL_STRUCTURED_INPUT_USD_PER_MILLION=0,MM_ELECTRICAL_STRUCTURED_OUTPUT_USD_PER_MILLION=0,MM_ELECTRICAL_SOURCE_SNAPSHOT_ENABLED=1,MM_ELECTRICAL_SOURCE_BUCKET=mm-ai-electrical-sources-443517556116,MM_ELECTRICAL_SOURCE_PREFIX=electrical-source-v1,MM_ELECTRICAL_SOURCE_TIMEOUT_SECONDS=90,MM_ELECTRICAL_SOURCE_MAX_BYTES=100000000" \
+          --update-env-vars="COMMIT_SHA=$COMMIT_SHA,MM_ELECTRICAL_STRUCTURED_ENABLED=1,MM_ELECTRICAL_STRUCTURED_DETECTOR_MODEL=gpt-5.4,MM_ELECTRICAL_STRUCTURED_EXTRACTOR_MODEL=gpt-5.4,MM_ELECTRICAL_STRUCTURED_VERIFIER_MODEL=gpt-5.4,MM_ELECTRICAL_STRUCTURED_DETECTOR_PROMPT_VERSION=mm-electrical-region-detector-v2,MM_ELECTRICAL_STRUCTURED_EXTRACTOR_PROMPT_VERSION=mm-electrical-table-extractor-v2.2,MM_ELECTRICAL_STRUCTURED_VERIFIER_PROMPT_VERSION=mm-electrical-page-verifier-v2.7,MM_ELECTRICAL_STRUCTURED_MATERIALIZER_VERSION=mm-electrical-structured-materializer-v2.7,MM_ELECTRICAL_STRUCTURED_ROW_MIN_CONFIDENCE=0.80,MM_ELECTRICAL_STRUCTURED_PAGE_PASS_MIN_CONFIDENCE=0.90,MM_ELECTRICAL_STRUCTURED_TEXT_RECONSTRUCTION_MIN_CONFIDENCE=0.90,MM_ELECTRICAL_STRUCTURED_RENDER_DPI=220,MM_ELECTRICAL_STRUCTURED_MAX_COMPLETION_TOKENS=16000,MM_ELECTRICAL_STRUCTURED_FETCH_TIMEOUT_SECONDS=60,MM_ELECTRICAL_STRUCTURED_TIMEOUT_SECONDS=240,MM_ELECTRICAL_STRUCTURED_MAX_SOURCE_BYTES=100000000,MM_ELECTRICAL_STRUCTURED_INPUT_USD_PER_MILLION=0,MM_ELECTRICAL_STRUCTURED_OUTPUT_USD_PER_MILLION=0,MM_ELECTRICAL_SOURCE_SNAPSHOT_ENABLED=1,MM_ELECTRICAL_SOURCE_BUCKET=mm-ai-electrical-sources-443517556116,MM_ELECTRICAL_SOURCE_PREFIX=electrical-source-v1,MM_ELECTRICAL_SOURCE_TIMEOUT_SECONDS=90,MM_ELECTRICAL_SOURCE_MAX_BYTES=100000000" \
           --quiet
 
         gcloud run services describe "${_SERVICE}" \

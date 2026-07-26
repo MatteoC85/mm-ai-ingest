@@ -76,11 +76,11 @@ EXTRACTOR_PROMPT_VERSION = (
 ).strip()
 VERIFIER_PROMPT_VERSION = (
     os.environ.get("MM_ELECTRICAL_STRUCTURED_VERIFIER_PROMPT_VERSION")
-    or "mm-electrical-page-verifier-v2.6"
+    or "mm-electrical-page-verifier-v2.7"
 ).strip()
 MATERIALIZER_VERSION = (
     os.environ.get("MM_ELECTRICAL_STRUCTURED_MATERIALIZER_VERSION")
-    or "mm-electrical-structured-materializer-v2.6"
+    or "mm-electrical-structured-materializer-v2.7"
 ).strip()
 
 OPENAI_TIMEOUT_SECONDS = _env_int(
@@ -115,11 +115,13 @@ MAX_SOURCE_BYTES = _env_int(
     "MM_ELECTRICAL_STRUCTURED_MAX_SOURCE_BYTES", 100_000_000, 1_000_000, 500_000_000
 )
 
-PIPELINE_MARKER = "phase2-vision-v2.6-source-snapshot"
+PIPELINE_MARKER = "phase2-vision-v2.7-source-snapshot"
 COLUMN_BINDING_ADJUDICATOR_VERSION = ("peer-equivalent-column-consensus-v1")
 ROW_SEMANTICS_VERSION = "canonical-row-semantics-v1"
 IO_CONTEXT_ADJUDICATOR_VERSION = "canonical-page-io-context-v1"
 TEXT_READABILITY_POLICY_VERSION = "semantic-readable-text-v1"
+TEXT_ROW_ACCOUNTING_VERSION = "exact-visual-text-row-id-accounting-v1"
+IO_DIRECTION_ADJUDICATOR_VERSION = "visual-page-direction-v1"
 EXTRACTION_METHOD = "openai_vision_structured_v2"
 PHASE_NAME = "structured_vision_v2"
 IO_PAGE_TYPES = {"plc_io_table", "safety_io_table"}
@@ -243,6 +245,47 @@ def _meaningful_row_value(value: Any) -> bool:
     return bool(value_text) and not _is_explicit_placeholder_value(value_text)
 
 
+def _text_row_accounting(
+    *,
+    signal_name: Any,
+    description: Any,
+    expected_normal_state: Any,
+) -> dict:
+    """Classify free-text evidence without relying on language keywords.
+
+    A row requires visual text review whenever at least one free-text field
+    contains substantive alphanumeric content. Marker-only values such as
+    ``**``/``***`` are accounted for separately and never inflate the reviewed
+    text-row count. This remains true even when the physical row is also a
+    power/reference row (for example a 0VDC row whose free-text cells contain
+    only placeholder marks).
+    """
+    values = {
+        "signal_name": _clean_text(signal_name, 700),
+        "description": _clean_text(description, 1600),
+        "expected_normal_state": _clean_text(
+            expected_normal_state, 500
+        ),
+    }
+    substantive_fields = sorted(
+        field_name
+        for field_name, value in values.items()
+        if _meaningful_row_value(value)
+    )
+    marker_only_fields = sorted(
+        field_name
+        for field_name, value in values.items()
+        if _is_explicit_placeholder_value(value)
+    )
+    return {
+        "version": TEXT_ROW_ACCOUNTING_VERSION,
+        "requires_text_review": bool(substantive_fields),
+        "substantive_text_fields": substantive_fields,
+        "marker_only_text_fields": marker_only_fields,
+        "values": values,
+    }
+
+
 def _looks_like_auxiliary_channel(value: Any) -> bool:
     token = _clean_text(value, 40)
     if not token:
@@ -347,39 +390,114 @@ def _adjudicate_io_context(
     page_type: Any,
     model_io_type: Any,
     model_is_safety: Any,
+    verified_page_io_type: Any = "",
+    verified_page_is_safety: Any = None,
+    verified_page_confidence: Any = 0.0,
+    verified_region_io_type: Any = "",
+    verified_region_is_safety: Any = None,
+    verified_region_confidence: Any = 0.0,
 ) -> dict:
-    """Normalize safety context from the canonical page classification.
+    """Adjudicate I/O direction from independent visual evidence.
 
-    `safety_io_table` is already a language-independent semantic page type.
-    Therefore a digital/analog input or output on such a page must retain its
-    direction while becoming safety_input/safety_output. The original model
-    decision remains in audit metadata.
+    The canonical page type establishes safety context. Direction is selected
+    from a high-confidence full-page decision and a high-confidence per-region
+    decision. When both provide an explicit input/output direction they must
+    agree; otherwise the caller blocks publication. A page-level direction is
+    allowed to resolve extractor values such as ``mixed`` because it describes
+    the electrical role of the whole table page, not the natural-language
+    meaning of individual signal descriptions.
     """
-    canonical_page_type = _clean_text(page_type, 80)
-    raw_io_type = _clean_text(model_io_type, 80)
-    if raw_io_type not in IO_TYPES:
-        raw_io_type = "other"
-    raw_is_safety = bool(model_is_safety)
 
-    final_io_type = raw_io_type
-    final_is_safety = raw_is_safety or raw_io_type.startswith("safety_")
+    def normalize(raw_value: Any, raw_safety: Any) -> tuple[str, bool]:
+        value = _clean_text(raw_value, 80)
+        if value not in IO_TYPES:
+            value = "other"
+        safety = bool(raw_safety) or value.startswith("safety_")
+        if value == "digital_input" and safety:
+            value = "safety_input"
+        elif value == "digital_output" and safety:
+            value = "safety_output"
+        return value, safety
+
+    def explicit_direction(value: str) -> str:
+        if value.endswith("_input"):
+            return "input"
+        if value.endswith("_output"):
+            return "output"
+        return ""
+
+    canonical_page_type = _clean_text(page_type, 80)
+    model_type, model_safety = normalize(model_io_type, model_is_safety)
+    page_type_value, page_safety = normalize(
+        verified_page_io_type, verified_page_is_safety
+    )
+    region_type_value, region_safety = normalize(
+        verified_region_io_type, verified_region_is_safety
+    )
+    page_conf = _clamp_conf(verified_page_confidence)
+    region_conf = _clamp_conf(verified_region_confidence)
+
+    page_direction = (
+        explicit_direction(page_type_value)
+        if page_conf >= PAGE_PASS_MIN_CONFIDENCE
+        else ""
+    )
+    region_direction = (
+        explicit_direction(region_type_value)
+        if region_conf >= PAGE_PASS_MIN_CONFIDENCE
+        else ""
+    )
+    conflict = bool(
+        page_direction
+        and region_direction
+        and page_direction != region_direction
+    )
+
+    final_type = model_type
+    final_safety = model_safety
     source = "extractor"
 
+    if not conflict:
+        if page_direction:
+            final_type = page_type_value
+            final_safety = page_safety
+            source = IO_DIRECTION_ADJUDICATOR_VERSION + ":page"
+        elif region_direction:
+            final_type = region_type_value
+            final_safety = region_safety
+            source = IO_DIRECTION_ADJUDICATOR_VERSION + ":region"
+        elif region_conf >= PAGE_PASS_MIN_CONFIDENCE and region_type_value in IO_TYPES:
+            final_type = region_type_value
+            final_safety = region_safety
+            source = IO_DIRECTION_ADJUDICATOR_VERSION + ":region-nondirectional"
+
     if canonical_page_type == "safety_io_table":
-        final_is_safety = True
-        if raw_io_type.endswith("_input"):
-            final_io_type = "safety_input"
-        elif raw_io_type.endswith("_output"):
-            final_io_type = "safety_output"
-        source = IO_CONTEXT_ADJUDICATOR_VERSION
+        final_safety = True
+        if final_type.endswith("_input"):
+            final_type = "safety_input"
+        elif final_type.endswith("_output"):
+            final_type = "safety_output"
+        elif model_type.endswith("_input") and not page_direction and not region_direction:
+            final_type = "safety_input"
+        elif model_type.endswith("_output") and not page_direction and not region_direction:
+            final_type = "safety_output"
 
     return {
-        "version": IO_CONTEXT_ADJUDICATOR_VERSION,
+        "version": IO_DIRECTION_ADJUDICATOR_VERSION,
         "page_type": canonical_page_type,
-        "model_io_type": raw_io_type,
-        "model_is_safety": raw_is_safety,
-        "final_io_type": final_io_type,
-        "final_is_safety": final_is_safety,
+        "model_io_type": model_type,
+        "model_is_safety": model_safety,
+        "verified_page_io_type": page_type_value,
+        "verified_page_is_safety": page_safety,
+        "verified_page_confidence": page_conf,
+        "verified_region_io_type": region_type_value,
+        "verified_region_is_safety": region_safety,
+        "verified_region_confidence": region_conf,
+        "page_direction": page_direction,
+        "region_direction": region_direction,
+        "direction_conflict": conflict,
+        "final_io_type": final_type,
+        "final_is_safety": final_safety,
         "source": source,
     }
 
@@ -1721,7 +1839,7 @@ def _extractor_schema() -> dict:
 
 def _verifier_schema() -> dict:
     return {
-        "name": "electrical_io_page_verifier_v2_6",
+        "name": "electrical_io_page_verifier_v2_7",
         "strict": True,
         "schema": {
             "type": "object",
@@ -1738,6 +1856,56 @@ def _verifier_schema() -> dict:
                 "all_reference_columns_materialized": {"type": "boolean"},
                 "sheet_code_used_as_module_tag_without_visual_support": {
                     "type": "boolean"
+                },
+                "page_io_context": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "io_type": {
+                            "type": "string",
+                            "enum": sorted(IO_TYPES),
+                        },
+                        "is_safety": {"type": "boolean"},
+                        "applies_to_region_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "maxItems": 24,
+                        },
+                        "confidence": {"type": "number"},
+                        "reason": {"type": "string"},
+                    },
+                    "required": [
+                        "io_type",
+                        "is_safety",
+                        "applies_to_region_ids",
+                        "confidence",
+                        "reason",
+                    ],
+                },
+                "region_io_context_checks": {
+                    "type": "array",
+                    "maxItems": 24,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "region_id": {"type": "string"},
+                            "io_type": {
+                                "type": "string",
+                                "enum": sorted(IO_TYPES),
+                            },
+                            "is_safety": {"type": "boolean"},
+                            "confidence": {"type": "number"},
+                            "reason": {"type": "string"},
+                        },
+                        "required": [
+                            "region_id",
+                            "io_type",
+                            "is_safety",
+                            "confidence",
+                            "reason",
+                        ],
+                    },
                 },
                 "column_binding_decisions": {
                     "type": "array",
@@ -1811,6 +1979,26 @@ def _verifier_schema() -> dict:
                             "accounted_physical_row_count": {"type": "integer"},
                             "visible_text_row_count": {"type": "integer"},
                             "supported_text_row_count": {"type": "integer"},
+                            "review_required_row_ids": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "maxItems": 200,
+                            },
+                            "reviewed_text_row_ids": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "maxItems": 200,
+                            },
+                            "supported_text_row_ids": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "maxItems": 200,
+                            },
+                            "marker_only_text_row_ids": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "maxItems": 200,
+                            },
                             "pass": {"type": "boolean"},
                             "reason": {"type": "string"},
                         },
@@ -1821,6 +2009,10 @@ def _verifier_schema() -> dict:
                             "accounted_physical_row_count",
                             "visible_text_row_count",
                             "supported_text_row_count",
+                            "review_required_row_ids",
+                            "reviewed_text_row_ids",
+                            "supported_text_row_ids",
+                            "marker_only_text_row_ids",
                             "pass",
                             "reason",
                         ],
@@ -1921,6 +2113,8 @@ def _verifier_schema() -> dict:
                 "all_visible_columns_accounted_for",
                 "all_reference_columns_materialized",
                 "sheet_code_used_as_module_tag_without_visual_support",
+                "page_io_context",
+                "region_io_context_checks",
                 "column_binding_decisions",
                 "column_binding_checks",
                 "region_checks",
@@ -2088,73 +2282,109 @@ def _verifier_messages(
             if _clean_text(row.get("word_text_original"), 800)
         )
         rows = extraction.get("row_results") or []
+        included_row_summaries: list[dict] = []
+        expected_text_review_row_ids: list[str] = []
+        expected_marker_only_text_row_ids: list[str] = []
+        for row in rows:
+            if not row.get("include_in_io"):
+                continue
+            accounting = _text_row_accounting(
+                signal_name=(
+                    row.get("signal_name_normalized")
+                    or row.get("signal_name_original")
+                ),
+                description=(
+                    row.get("description_normalized")
+                    or row.get("description_original")
+                ),
+                expected_normal_state=(
+                    row.get("expected_normal_state_normalized")
+                    or row.get("expected_normal_state_original")
+                ),
+            )
+            row_id = _clean_text(row.get("row_id"), 50)
+            if accounting["requires_text_review"] and row_id:
+                expected_text_review_row_ids.append(row_id)
+            if (
+                accounting["marker_only_text_fields"]
+                and not accounting["requires_text_review"]
+                and row_id
+            ):
+                expected_marker_only_text_row_ids.append(row_id)
+            included_row_summaries.append(
+                {
+                    "row_id": row_id,
+                    "row_role": row.get("row_role"),
+                    "channel_ref_original": row.get("channel_ref_original"),
+                    "connector_ref_original": row.get("connector_ref_original"),
+                    "plc_address_original": row.get("plc_address_original"),
+                    "wire_reference_original": row.get("wire_reference_original"),
+                    "terminal_reference_original": row.get("terminal_reference_original"),
+                    "signal_name_original": row.get("signal_name_original"),
+                    "signal_name_candidate": row.get("signal_name_normalized"),
+                    "description_original": row.get("description_original"),
+                    "description_candidate": row.get("description_normalized"),
+                    "expected_normal_state_original": row.get(
+                        "expected_normal_state_original"
+                    ),
+                    "expected_normal_state_candidate": row.get(
+                        "expected_normal_state_normalized"
+                    ),
+                    "text_reconstruction_confidence": row.get(
+                        "text_reconstruction_confidence"
+                    ),
+                    "text_reconstruction_note": row.get(
+                        "text_reconstruction_note"
+                    ),
+                    "fragmentation_risk_fields": [
+                        field_name
+                        for field_name, candidate_value in {
+                            "signal_name": row.get("signal_name_normalized"),
+                            "description": row.get("description_normalized"),
+                            "expected_normal_state": row.get(
+                                "expected_normal_state_normalized"
+                            ),
+                        }.items()
+                        if _looks_artificially_fragmented_text(candidate_value)
+                    ],
+                    "is_placeholder": row.get("is_placeholder"),
+                    "text_row_accounting": accounting,
+                }
+            )
+
         extraction_summary.append(
             {
                 "region_id": rid,
                 "module_header_source_text": header_source_text,
                 "module_tag_original": extraction.get("module_tag_original"),
-                # This is only a hardware-model candidate. It is allowed to be
-                # empty or incomplete and must never be compared with the full
-                # visible header.
                 "module_hardware_model_candidate": extraction.get(
                     "module_model_original"
                 ),
                 "table_label_original": extraction.get("table_label_original"),
                 "io_type": extraction.get("io_type"),
+                "is_safety": extraction.get("is_safety"),
                 "visible_header_row_count": extraction.get(
                     "visible_header_row_count"
                 ),
                 "visible_physical_row_count": extraction.get(
                     "visible_physical_row_count"
                 ),
-                "included_rows": [
-                    {
-                        "row_id": row.get("row_id"),
-                        "row_role": row.get("row_role"),
-                        "channel_ref_original": row.get("channel_ref_original"),
-                        "connector_ref_original": row.get("connector_ref_original"),
-                        "plc_address_original": row.get("plc_address_original"),
-                        "wire_reference_original": row.get("wire_reference_original"),
-                        "terminal_reference_original": row.get("terminal_reference_original"),
-                        "signal_name_original": row.get("signal_name_original"),
-                        "signal_name_candidate": row.get("signal_name_normalized"),
-                        "description_original": row.get("description_original"),
-                        "description_candidate": row.get("description_normalized"),
-                        "expected_normal_state_original": row.get(
-                            "expected_normal_state_original"
-                        ),
-                        "expected_normal_state_candidate": row.get(
-                            "expected_normal_state_normalized"
-                        ),
-                        "text_reconstruction_confidence": row.get(
-                            "text_reconstruction_confidence"
-                        ),
-                        "text_reconstruction_note": row.get(
-                            "text_reconstruction_note"
-                        ),
-                        "fragmentation_risk_fields": [
-                            field_name
-                            for field_name, candidate_value in {
-                                "signal_name": row.get("signal_name_normalized"),
-                                "description": row.get("description_normalized"),
-                                "expected_normal_state": row.get(
-                                    "expected_normal_state_normalized"
-                                ),
-                            }.items()
-                            if _looks_artificially_fragmented_text(
-                                candidate_value
-                            )
-                        ],
-                        "is_placeholder": row.get("is_placeholder"),
-                    }
-                    for row in rows
-                    if row.get("include_in_io")
-                ],
+                "expected_text_review_row_ids": sorted(
+                    set(expected_text_review_row_ids)
+                ),
+                "expected_marker_only_text_row_ids": sorted(
+                    set(expected_marker_only_text_row_ids)
+                ),
+                "text_row_accounting_version": TEXT_ROW_ACCOUNTING_VERSION,
+                "included_rows": included_row_summaries,
                 "excluded_rows": [
-                    row.get("row_id") for row in rows if not row.get("include_in_io")
+                    row.get("row_id")
+                    for row in rows
+                    if not row.get("include_in_io")
                 ],
             }
         )
+
 
     system = (
         "You are the independent visual adjudication stage of an industrial "
@@ -2167,6 +2397,14 @@ def _verifier_messages(
         "fail a region merely because it is blank, contains only a functional label, or "
         "does not repeat words such as a generic device label. A hardware model is valid "
         "only when a distinct model/code is actually visible. "
+        "Determine the electrical I/O direction from the complete page meaning, page "
+        "title, module-table headers, and all region crops. Do this semantically in any "
+        "language, never by a fixed vocabulary. Return one page_io_context and one "
+        "region_io_context_check per region. If the page title clearly defines one "
+        "input/output direction for every table, apply that same direction to all listed "
+        "regions even when individual signal descriptions look like feedbacks or commands; "
+        "direction means the electrical role of the module pins. Preserve repeated module "
+        "tags exactly as printed and distinguish physical tables by region_id. "
         "Semantically bind every physical source column to one or more canonical roles "
         "without relying on a fixed Italian/English vocabulary. Return exactly one "
         "column_binding_decision for every source_column_index in every region. A single "
@@ -2181,10 +2419,17 @@ def _verifier_messages(
         "Every visible column must be assigned at least one role; use other_data only for "
         "a genuinely non-canonical column. Confirm that every visible reference column "
         "is materialized for every row, including placeholders. "
-        "For each non-placeholder row with free text, compare the candidate against the "
-        "high-resolution crop. In region_checks, visible_text_row_count and "
-        "supported_text_row_count count only included non-placeholder rows that have "
-        "at least one non-empty signal, description, or expected-state field. The final "
+        "For every row whose text_row_accounting.requires_text_review is true, compare "
+        "the candidate against the high-resolution crop. The request provides exact "
+        "expected_text_review_row_ids and expected_marker_only_text_row_ids for each "
+        "region. In every region_check, echo expected_text_review_row_ids exactly in "
+        "review_required_row_ids, reviewed_text_row_ids, and supported_text_row_ids when "
+        "the text is visually supported. Echo expected_marker_only_text_row_ids exactly "
+        "in marker_only_text_row_ids. Marker-only values such as **/*** do not count as "
+        "substantive text rows, including when the same physical row is also a power or "
+        "reference row. visible_text_row_count and supported_text_row_count must equal "
+        "the lengths of the corresponding exact row-id arrays. Never substitute aggregate "
+        "count intuition for the supplied physical row IDs. The final "
         "approved_text is the publication-ready, human-readable transcription, while the "
         "request already preserves the exact vector/OCR source separately. Artificial "
         "intra-word spaces from CAD/PDF extraction are not acceptable in approved_text. "
@@ -2205,22 +2450,24 @@ def _verifier_messages(
         "transcription is unchanged; this records independent visual confirmation. Set "
         "all_visible_text_resolved_or_blocked=true only when no artificial intra-word "
         "fragmentation remains in any publishable field. If the crop or a column meaning "
-        "is ambiguous, block rather than guess. Count every reviewed non-placeholder "
-        "text row in each region. Return pass only when all visible content and columns "
+        "is ambiguous, block rather than guess. Account for reviewed text by exact row "
+        "identity, not by inferred counts. Return pass only when all visible content and columns "
         "are complete and every published value is visually supported and readable."
     )
     user_text = (
         "Audit this page, bind every physical column semantically, and adjudicate "
         "exact visible text. The full page is followed by one high-resolution crop "
         "for every region. Return exactly one column-binding decision for each "
-        "physical source column, and return text overrides only where a candidate "
-        "needs correction.\n\n"
+        "physical source column, return exact text-row identity sets, adjudicate page and "
+        "region I/O direction, and return text overrides only where a candidate needs "
+        "correction.\n\n"
         + json.dumps(
             {
                 "page_id": page["id"],
                 "pdf_page_number": page["pdf_page_number"],
                 "sheet_code_original": page.get("sheet_code"),
                 "sheet_title_original": page.get("sheet_title"),
+                "page_type": page.get("page_type"),
                 "detector": detector,
                 "proposal_region_ids": [p["region_id"] for p in proposals],
                 "column_binding_proposals": column_binding_proposals,
@@ -3023,6 +3270,115 @@ def _validate_and_materialize(
             returned=sorted(extraction_by_region),
         )
 
+    region_required_text_row_ids: dict[str, set[str]] = {}
+    region_marker_only_text_row_ids: dict[str, set[str]] = {}
+    for rid, extraction in extraction_by_region.items():
+        for row in extraction.get("row_results") or []:
+            if not bool(row.get("include_in_io")):
+                continue
+            row_id = _clean_text(row.get("row_id"), 50)
+            if not row_id:
+                continue
+            accounting = _text_row_accounting(
+                signal_name=(
+                    row.get("signal_name_normalized")
+                    or row.get("signal_name_original")
+                ),
+                description=(
+                    row.get("description_normalized")
+                    or row.get("description_original")
+                ),
+                expected_normal_state=(
+                    row.get("expected_normal_state_normalized")
+                    or row.get("expected_normal_state_original")
+                ),
+            )
+            if accounting["requires_text_review"]:
+                region_required_text_row_ids.setdefault(rid, set()).add(
+                    row_id
+                )
+            elif accounting["marker_only_text_fields"]:
+                region_marker_only_text_row_ids.setdefault(
+                    rid, set()
+                ).add(row_id)
+
+    raw_page_io_context = verifier.get("page_io_context") or {}
+    page_io_type = _clean_text(raw_page_io_context.get("io_type"), 80)
+    if page_io_type not in IO_TYPES:
+        fail(
+            "verifier_invalid_page_io_type",
+            "Verifier returned an invalid page-level I/O type",
+            verifier_page_io_type=page_io_type,
+        )
+        page_io_type = "other"
+    page_io_confidence = _clamp_conf(
+        raw_page_io_context.get("confidence")
+    )
+    page_io_applies_to = {
+        _clean_text(value, 120)
+        for value in raw_page_io_context.get("applies_to_region_ids") or []
+        if _clean_text(value, 120)
+    }
+    if not page_io_applies_to.issubset(set(proposal_ids)):
+        fail(
+            "verifier_page_io_context_unknown_region",
+            "Page-level I/O context references unknown regions",
+            expected_regions=proposal_ids,
+            returned_regions=sorted(page_io_applies_to),
+        )
+    if page_io_applies_to and page_io_confidence < PAGE_PASS_MIN_CONFIDENCE:
+        fail(
+            "verifier_page_io_context_confidence_below_threshold",
+            "Page-level I/O direction confidence is below the publication threshold",
+            verifier_confidence=page_io_confidence,
+            threshold=PAGE_PASS_MIN_CONFIDENCE,
+        )
+
+    region_io_context_map: dict[str, dict] = {}
+    for raw_check in verifier.get("region_io_context_checks") or []:
+        rid = _clean_text(raw_check.get("region_id"), 120)
+        if not rid:
+            continue
+        if rid in region_io_context_map:
+            fail(
+                "duplicate_verifier_region_io_context",
+                "Verifier returned duplicate region I/O context decisions",
+                region_id=rid,
+            )
+            continue
+        region_type = _clean_text(raw_check.get("io_type"), 80)
+        if region_type not in IO_TYPES:
+            fail(
+                "verifier_invalid_region_io_type",
+                "Verifier returned an invalid region I/O type",
+                region_id=rid,
+                verifier_region_io_type=region_type,
+            )
+            region_type = "other"
+        region_confidence = _clamp_conf(raw_check.get("confidence"))
+        if region_confidence < PAGE_PASS_MIN_CONFIDENCE:
+            fail(
+                "verifier_region_io_context_confidence_below_threshold",
+                "Region I/O direction confidence is below the publication threshold",
+                region_id=rid,
+                verifier_confidence=region_confidence,
+                threshold=PAGE_PASS_MIN_CONFIDENCE,
+            )
+        region_io_context_map[rid] = {
+            "region_id": rid,
+            "io_type": region_type,
+            "is_safety": bool(raw_check.get("is_safety")),
+            "confidence": region_confidence,
+            "reason": _clean_text(raw_check.get("reason"), 1200),
+        }
+    if set(region_io_context_map) != set(proposal_ids):
+        fail(
+            "verifier_region_io_context_accounting_mismatch",
+            "Verifier did not return exactly one I/O context decision per region",
+            expected=proposal_ids,
+            returned=sorted(region_io_context_map),
+        )
+
     binding_proposal_by_region = {
         _clean_text(item.get("region_id"), 120): item
         for item in column_binding_proposals
@@ -3239,7 +3595,6 @@ def _validate_and_materialize(
 
     io_rows: list[dict] = []
     region_stats: list[dict] = []
-    region_text_row_counts: dict[str, int] = {}
     for proposal in proposals:
         rid = proposal["region_id"]
         assessment = assessments.get(rid) or {}
@@ -3380,11 +3735,40 @@ def _validate_and_materialize(
             )
 
         table_conf = _clamp_conf(extraction.get("confidence"))
+        raw_region_io_context = region_io_context_map.get(rid) or {}
+        page_context_applies = rid in page_io_applies_to
         io_context = _adjudicate_io_context(
             page_type=page.get("page_type"),
             model_io_type=extraction.get("io_type"),
             model_is_safety=extraction.get("is_safety"),
+            verified_page_io_type=(
+                page_io_type if page_context_applies else ""
+            ),
+            verified_page_is_safety=(
+                raw_page_io_context.get("is_safety")
+                if page_context_applies
+                else None
+            ),
+            verified_page_confidence=(
+                page_io_confidence if page_context_applies else 0.0
+            ),
+            verified_region_io_type=raw_region_io_context.get("io_type"),
+            verified_region_is_safety=raw_region_io_context.get("is_safety"),
+            verified_region_confidence=raw_region_io_context.get("confidence"),
         )
+        if io_context.get("direction_conflict"):
+            fail(
+                "verifier_io_direction_conflict",
+                "Independent page-level and region-level I/O directions conflict",
+                region_id=rid,
+                io_context=io_context,
+                page_reason=_clean_text(
+                    raw_page_io_context.get("reason"), 1200
+                ),
+                region_reason=_clean_text(
+                    raw_region_io_context.get("reason"), 1200
+                ),
+            )
         if (
             io_context["final_io_type"]
             != io_context["model_io_type"]
@@ -3393,11 +3777,13 @@ def _validate_and_materialize(
         ):
             note(
                 "io_context_adjudicated",
-                "Canonical page context corrected the table I/O safety "
-                "classification while preserving the extractor decision "
-                "for audit",
+                "Independent full-page and region visual context adjudicated "
+                "the electrical I/O direction while preserving the extractor "
+                "decision for audit",
                 region_id=rid,
                 io_context=io_context,
+                page_io_context=raw_page_io_context,
+                region_io_context=raw_region_io_context,
             )
         region_row_role_counts = {
             role_name: 0
@@ -3617,20 +4003,50 @@ def _validate_and_materialize(
                     readability_policy=TEXT_READABILITY_POLICY_VERSION,
                 )
 
-            has_free_text = any(original_text_values.values()) or any(
-                approved_text_values.values()
+            text_accounting = _text_row_accounting(
+                signal_name=approved_text_values["signal_name"],
+                description=approved_text_values["description"],
+                expected_normal_state=approved_text_values[
+                    "expected_normal_state"
+                ],
             )
-            if has_free_text and not is_placeholder:
-                region_text_row_counts[rid] = int(
-                    region_text_row_counts.get(rid, 0)
-                ) + 1
+            expected_requires_text_review = row_id in (
+                region_required_text_row_ids.get(rid, set())
+            )
+            expected_marker_only = row_id in (
+                region_marker_only_text_row_ids.get(rid, set())
+            )
+            if (
+                bool(text_accounting["requires_text_review"])
+                != expected_requires_text_review
+                or bool(text_accounting["marker_only_text_fields"])
+                != expected_marker_only
+            ):
+                fail(
+                    "visual_text_accounting_changed_after_adjudication",
+                    "Visual text adjudication changed whether a physical row "
+                    "contains substantive or marker-only free text",
+                    region_id=rid,
+                    row_ids=[row_id],
+                    accounting_version=TEXT_ROW_ACCOUNTING_VERSION,
+                    expected_requires_text_review=(
+                        expected_requires_text_review
+                    ),
+                    final_requires_text_review=text_accounting[
+                        "requires_text_review"
+                    ],
+                    expected_marker_only=expected_marker_only,
+                    final_marker_only_fields=text_accounting[
+                        "marker_only_text_fields"
+                    ],
+                )
+
+            if text_accounting["requires_text_review"]:
                 nonempty_confidences = [
                     approved_text_confidences[field_name]
-                    for field_name in VISUAL_TEXT_FIELDS
-                    if (
-                        original_text_values[field_name]
-                        or approved_text_values[field_name]
-                    )
+                    for field_name in text_accounting[
+                        "substantive_text_fields"
+                    ]
                 ]
                 final_text_confidence = min(nonempty_confidences or [0.0])
                 if final_text_confidence < TEXT_RECONSTRUCTION_MIN_CONFIDENCE:
@@ -3924,7 +4340,7 @@ def _validate_and_materialize(
                         "io_type_canonical": final_io_type,
                         "is_safety_canonical": final_is_safety,
                         "io_context_adjudicator_version": (
-                            IO_CONTEXT_ADJUDICATOR_VERSION
+                            IO_DIRECTION_ADJUDICATOR_VERSION
                         ),
                         "io_context_adjudication": io_context,
                         "text_readability_policy_version": (
@@ -3959,6 +4375,18 @@ def _validate_and_materialize(
                         "text_reconstruction_note": _clean_text(
                             result.get("text_reconstruction_note"), 800
                         ),
+                        "text_row_accounting_version": (
+                            TEXT_ROW_ACCOUNTING_VERSION
+                        ),
+                        "text_review_required": text_accounting[
+                            "requires_text_review"
+                        ],
+                        "substantive_text_fields": text_accounting[
+                            "substantive_text_fields"
+                        ],
+                        "marker_only_text_fields": text_accounting[
+                            "marker_only_text_fields"
+                        ],
                         "vector_row_text_original": source_text,
                         "extractor_candidate": extractor_candidates,
                         "published_visual_text": approved_text_values,
@@ -4123,22 +4551,120 @@ def _validate_and_materialize(
             assessment.get("visible_physical_row_count") or -2
         ):
             fail("verifier_region_accounted_count_mismatch", f"Verifier accounted row count differs for {rid}", region_id=rid)
-        expected_text_rows = int(region_text_row_counts.get(rid, 0))
-        if int(check.get("visible_text_row_count") or 0) != expected_text_rows:
+        expected_required_ids = set(
+            region_required_text_row_ids.get(rid, set())
+        )
+        expected_marker_only_ids = set(
+            region_marker_only_text_row_ids.get(rid, set())
+        )
+
+        def clean_row_id_list(field_name: str) -> tuple[list[str], set[str]]:
+            raw_values = [
+                _clean_text(value, 50)
+                for value in check.get(field_name) or []
+                if _clean_text(value, 50)
+            ]
+            return raw_values, set(raw_values)
+
+        required_raw, returned_required_ids = clean_row_id_list(
+            "review_required_row_ids"
+        )
+        reviewed_raw, returned_reviewed_ids = clean_row_id_list(
+            "reviewed_text_row_ids"
+        )
+        supported_raw, returned_supported_ids = clean_row_id_list(
+            "supported_text_row_ids"
+        )
+        marker_raw, returned_marker_only_ids = clean_row_id_list(
+            "marker_only_text_row_ids"
+        )
+
+        for field_name, raw_values in [
+            ("review_required_row_ids", required_raw),
+            ("reviewed_text_row_ids", reviewed_raw),
+            ("supported_text_row_ids", supported_raw),
+            ("marker_only_text_row_ids", marker_raw),
+        ]:
+            if len(raw_values) != len(set(raw_values)):
+                fail(
+                    "verifier_duplicate_text_row_id",
+                    f"Verifier returned duplicate row IDs in {field_name} for {rid}",
+                    region_id=rid,
+                    field_name=field_name,
+                    returned_row_ids=raw_values,
+                )
+
+        if returned_required_ids != expected_required_ids:
+            fail(
+                "verifier_required_text_row_set_mismatch",
+                f"Verifier required-text row IDs differ for {rid}",
+                region_id=rid,
+                accounting_version=TEXT_ROW_ACCOUNTING_VERSION,
+                expected_row_ids=sorted(expected_required_ids),
+                returned_row_ids=sorted(returned_required_ids),
+            )
+        if returned_reviewed_ids != expected_required_ids:
+            fail(
+                "verifier_reviewed_text_row_set_mismatch",
+                f"Verifier did not review exactly the required text rows for {rid}",
+                region_id=rid,
+                accounting_version=TEXT_ROW_ACCOUNTING_VERSION,
+                expected_row_ids=sorted(expected_required_ids),
+                returned_row_ids=sorted(returned_reviewed_ids),
+            )
+        if returned_supported_ids != expected_required_ids:
+            fail(
+                "verifier_supported_text_row_set_mismatch",
+                f"Verifier did not visually support exactly the required text rows for {rid}",
+                region_id=rid,
+                accounting_version=TEXT_ROW_ACCOUNTING_VERSION,
+                expected_row_ids=sorted(expected_required_ids),
+                returned_row_ids=sorted(returned_supported_ids),
+            )
+        if returned_marker_only_ids != expected_marker_only_ids:
+            fail(
+                "verifier_marker_only_text_row_set_mismatch",
+                f"Verifier marker-only row IDs differ for {rid}",
+                region_id=rid,
+                accounting_version=TEXT_ROW_ACCOUNTING_VERSION,
+                expected_row_ids=sorted(expected_marker_only_ids),
+                returned_row_ids=sorted(returned_marker_only_ids),
+            )
+        if returned_supported_ids.intersection(returned_marker_only_ids):
+            fail(
+                "verifier_text_row_set_overlap",
+                f"Verifier counted marker-only rows as substantive text rows for {rid}",
+                region_id=rid,
+                overlapping_row_ids=sorted(
+                    returned_supported_ids.intersection(
+                        returned_marker_only_ids
+                    )
+                ),
+            )
+
+        if int(check.get("visible_text_row_count") or 0) != len(
+            returned_reviewed_ids
+        ):
             fail(
                 "verifier_region_text_count_mismatch",
-                f"Verifier visible text-row count differs for {rid}",
+                f"Verifier text-row count does not match its exact reviewed row IDs for {rid}",
                 region_id=rid,
-                expected_text_rows=expected_text_rows,
-                verifier_text_rows=int(check.get("visible_text_row_count") or 0),
+                verifier_text_rows=int(
+                    check.get("visible_text_row_count") or 0
+                ),
+                reviewed_row_ids=sorted(returned_reviewed_ids),
             )
-        if int(check.get("supported_text_row_count") or 0) != expected_text_rows:
+        if int(check.get("supported_text_row_count") or 0) != len(
+            returned_supported_ids
+        ):
             fail(
-                "verifier_region_text_support_incomplete",
-                f"Verifier did not support every visible text row for {rid}",
+                "verifier_region_text_support_count_mismatch",
+                f"Verifier supported-text count does not match its exact supported row IDs for {rid}",
                 region_id=rid,
-                expected_text_rows=expected_text_rows,
-                supported_text_rows=int(check.get("supported_text_row_count") or 0),
+                supported_text_rows=int(
+                    check.get("supported_text_row_count") or 0
+                ),
+                supported_row_ids=sorted(returned_supported_ids),
             )
 
     binding_checks = verifier.get("column_binding_checks") or []
@@ -4772,15 +5298,18 @@ def extract_electrical_structured_version(
             "column_binding_proposals_sha256": _sha256_json(
                 column_binding_proposals
             ),
+            "text_row_accounting_version": (
+                TEXT_ROW_ACCOUNTING_VERSION
+            ),
+            "io_direction_adjudicator_version": (
+                IO_DIRECTION_ADJUDICATOR_VERSION
+            ),
             "region_hashes": [p["region_hash"] for p in proposals],
         }
-        compatible_prior_verifier_prompts = (
-            []
-            if _extractions_need_readability_adjudication(
-                extraction_results
-            )
-            else ["mm-electrical-page-verifier-v2.4"]
-        )
+        # V2.7 introduces an exact row-ID accounting contract and explicit
+        # page/region I/O-direction decisions. Older verifier responses do not
+        # contain these fields and must never be reused as if compatible.
+        compatible_prior_verifier_prompts: list[str] = []
         verifier, usage, reused, verifier_fp = _cached_call(
             context=context,
             page=page,
