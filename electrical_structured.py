@@ -76,11 +76,11 @@ EXTRACTOR_PROMPT_VERSION = (
 ).strip()
 VERIFIER_PROMPT_VERSION = (
     os.environ.get("MM_ELECTRICAL_STRUCTURED_VERIFIER_PROMPT_VERSION")
-    or "mm-electrical-page-verifier-v2.4"
+    or "mm-electrical-page-verifier-v2.6"
 ).strip()
 MATERIALIZER_VERSION = (
     os.environ.get("MM_ELECTRICAL_STRUCTURED_MATERIALIZER_VERSION")
-    or "mm-electrical-structured-materializer-v2.5"
+    or "mm-electrical-structured-materializer-v2.6"
 ).strip()
 
 OPENAI_TIMEOUT_SECONDS = _env_int(
@@ -115,8 +115,11 @@ MAX_SOURCE_BYTES = _env_int(
     "MM_ELECTRICAL_STRUCTURED_MAX_SOURCE_BYTES", 100_000_000, 1_000_000, 500_000_000
 )
 
-PIPELINE_MARKER = "phase2-vision-v2.5-source-snapshot"
+PIPELINE_MARKER = "phase2-vision-v2.6-source-snapshot"
 COLUMN_BINDING_ADJUDICATOR_VERSION = ("peer-equivalent-column-consensus-v1")
+ROW_SEMANTICS_VERSION = "canonical-row-semantics-v1"
+IO_CONTEXT_ADJUDICATOR_VERSION = "canonical-page-io-context-v1"
+TEXT_READABILITY_POLICY_VERSION = "semantic-readable-text-v1"
 EXTRACTION_METHOD = "openai_vision_structured_v2"
 PHASE_NAME = "structured_vision_v2"
 IO_PAGE_TYPES = {"plc_io_table", "safety_io_table"}
@@ -215,6 +218,246 @@ def _clean_text(value: Any, max_len: int = 2000) -> str:
     text = unicodedata.normalize("NFKC", str(value or ""))
     text = re.sub(r"\s+", " ", text).strip()
     return text[:max_len]
+
+
+def _is_explicit_placeholder_value(value: Any) -> bool:
+    """Return True only for a visibly explicit placeholder token.
+
+    This is intentionally language-independent. A blank cell is *not* a
+    placeholder; it is classified separately as blank_unused. Examples that
+    qualify are ``**``, ``***``, ``---`` and similar punctuation-only marks.
+    """
+    value_text = _clean_text(value, 120)
+    if not value_text:
+        return False
+    compact = re.sub(r"\s+", "", value_text)
+    if len(compact) > 24:
+        return False
+    if re.search(r"[^\W_]", compact, flags=re.UNICODE):
+        return False
+    return bool(re.fullmatch(r"[\W_]+", compact, flags=re.UNICODE))
+
+
+def _meaningful_row_value(value: Any) -> bool:
+    value_text = _clean_text(value, 2000)
+    return bool(value_text) and not _is_explicit_placeholder_value(value_text)
+
+
+def _looks_like_auxiliary_channel(value: Any) -> bool:
+    token = _clean_text(value, 40)
+    if not token:
+        return False
+    # A short alphabetic pin such as A/B/T is a common auxiliary-pin shape.
+    # This is only a fallback when the model did not already provide a valid
+    # semantic row role; it is not tied to any particular drawing or language.
+    return bool(re.fullmatch(r"[^\W\d_]{1,3}", token, flags=re.UNICODE))
+
+
+def _adjudicate_row_semantics(
+    *,
+    model_row_role: Any,
+    model_is_placeholder: Any,
+    channel_ref: Any,
+    connector_ref: Any,
+    plc_address: Any,
+    wire_reference: Any,
+    terminal_reference: Any,
+    signal_name: Any,
+    description: Any,
+    expected_normal_state: Any,
+) -> dict:
+    """Derive a stable, canonical semantic role for one physical row.
+
+    The AI output is evidence, not the sole authority. The final role is based
+    on visible cell content and remains independent of Italian/English labels.
+    """
+    raw_role = _clean_text(model_row_role, 80)
+    if raw_role not in ROW_ROLES:
+        raw_role = "other_data"
+
+    payload_values = {
+        "plc_address": _clean_text(plc_address, 200),
+        "wire_reference": _clean_text(wire_reference, 300),
+        "terminal_reference": _clean_text(terminal_reference, 300),
+        "signal_name": _clean_text(signal_name, 700),
+        "description": _clean_text(description, 1600),
+        "expected_normal_state": _clean_text(expected_normal_state, 500),
+    }
+    explicit_placeholder_fields = sorted(
+        key
+        for key, value in payload_values.items()
+        if _is_explicit_placeholder_value(value)
+    )
+    meaningful_fields = sorted(
+        key
+        for key, value in payload_values.items()
+        if _meaningful_row_value(value)
+    )
+    has_meaningful_payload = bool(meaningful_fields)
+
+    if explicit_placeholder_fields and not has_meaningful_payload:
+        final_role = "placeholder"
+        source = "deterministic_explicit_placeholder"
+    elif not has_meaningful_payload:
+        final_role = "blank_unused"
+        source = "deterministic_blank_physical_row"
+    elif raw_role == "power":
+        final_role = "power"
+        source = "extractor_semantic_role"
+    elif raw_role == "connector_aux":
+        final_role = "connector_aux"
+        source = "extractor_semantic_role"
+    elif raw_role == "signal":
+        final_role = "signal"
+        source = "extractor_semantic_role"
+    elif (
+        _looks_like_auxiliary_channel(channel_ref)
+        and _clean_text(connector_ref, 200)
+        and (
+            _meaningful_row_value(wire_reference)
+            or _meaningful_row_value(signal_name)
+            or _meaningful_row_value(description)
+        )
+    ):
+        final_role = "connector_aux"
+        source = "deterministic_auxiliary_pin_shape"
+    else:
+        final_role = "signal"
+        source = "deterministic_meaningful_payload"
+
+    return {
+        "version": ROW_SEMANTICS_VERSION,
+        "model_row_role": raw_role,
+        "model_is_placeholder": bool(model_is_placeholder),
+        "final_row_role": final_role,
+        # `is_placeholder` is reserved for an explicit placeholder marker.
+        # A blank, physically present row is `blank_unused`, not a placeholder.
+        "is_placeholder": final_role == "placeholder",
+        "is_unused": final_role in {"placeholder", "blank_unused"},
+        "source": source,
+        "explicit_placeholder_fields": explicit_placeholder_fields,
+        "meaningful_payload_fields": meaningful_fields,
+        "channel_ref": _clean_text(channel_ref, 160),
+        "connector_ref": _clean_text(connector_ref, 200),
+    }
+
+
+def _adjudicate_io_context(
+    *,
+    page_type: Any,
+    model_io_type: Any,
+    model_is_safety: Any,
+) -> dict:
+    """Normalize safety context from the canonical page classification.
+
+    `safety_io_table` is already a language-independent semantic page type.
+    Therefore a digital/analog input or output on such a page must retain its
+    direction while becoming safety_input/safety_output. The original model
+    decision remains in audit metadata.
+    """
+    canonical_page_type = _clean_text(page_type, 80)
+    raw_io_type = _clean_text(model_io_type, 80)
+    if raw_io_type not in IO_TYPES:
+        raw_io_type = "other"
+    raw_is_safety = bool(model_is_safety)
+
+    final_io_type = raw_io_type
+    final_is_safety = raw_is_safety or raw_io_type.startswith("safety_")
+    source = "extractor"
+
+    if canonical_page_type == "safety_io_table":
+        final_is_safety = True
+        if raw_io_type.endswith("_input"):
+            final_io_type = "safety_input"
+        elif raw_io_type.endswith("_output"):
+            final_io_type = "safety_output"
+        source = IO_CONTEXT_ADJUDICATOR_VERSION
+
+    return {
+        "version": IO_CONTEXT_ADJUDICATOR_VERSION,
+        "page_type": canonical_page_type,
+        "model_io_type": raw_io_type,
+        "model_is_safety": raw_is_safety,
+        "final_io_type": final_io_type,
+        "final_is_safety": final_is_safety,
+        "source": source,
+    }
+
+
+def _looks_artificially_fragmented_text(value: Any) -> bool:
+    """Detect likely intra-word PDF/CAD fragmentation without a dictionary."""
+    value_text = _clean_text(value, 2000)
+    alpha_tokens = re.findall(r"[^\W\d_]+", value_text, flags=re.UNICODE)
+    if len(alpha_tokens) < 5:
+        return False
+    short_count = sum(len(token) <= 3 for token in alpha_tokens)
+    very_short_count = sum(len(token) <= 2 for token in alpha_tokens)
+    longest = max((len(token) for token in alpha_tokens), default=0)
+    return (
+        longest >= 4
+        and very_short_count >= 2
+        and short_count / max(1, len(alpha_tokens)) >= 0.55
+    )
+
+
+def _extractions_need_readability_adjudication(
+    extractions: list[dict],
+) -> bool:
+    """Return True when an older verifier prompt is unsafe to reuse."""
+    for extraction in extractions:
+        for row in extraction.get("row_results") or []:
+            if not bool(row.get("include_in_io")):
+                continue
+            if bool(row.get("is_placeholder")):
+                continue
+            values = [
+                row.get("signal_name_normalized"),
+                row.get("description_normalized"),
+                row.get("expected_normal_state_normalized"),
+            ]
+            if any(
+                _looks_artificially_fragmented_text(value)
+                for value in values
+                if _clean_text(value, 2000)
+            ):
+                return True
+            has_free_text = any(_clean_text(value, 2000) for value in values)
+            if (
+                has_free_text
+                and _clamp_conf(
+                    row.get("text_reconstruction_confidence")
+                )
+                < TEXT_RECONSTRUCTION_MIN_CONFIDENCE
+            ):
+                return True
+    return False
+
+
+def _prior_verifier_response_is_compatible(response: dict) -> bool:
+    if not isinstance(response, dict):
+        return False
+    required_true = [
+        "all_visible_tables_accounted_for",
+        "all_visible_physical_rows_accounted_for",
+        "all_module_tags_supported_by_own_headers",
+        "all_published_text_visually_supported",
+        "all_visible_text_resolved_or_blocked",
+        "all_visible_columns_accounted_for",
+        "all_reference_columns_materialized",
+    ]
+    if str(response.get("verdict") or "") != "pass":
+        return False
+    if not all(bool(response.get(field)) for field in required_true):
+        return False
+    if response.get("blocked_text_rows"):
+        return False
+    for issue in response.get("issues") or []:
+        if str(issue.get("severity") or "").lower() in {
+            "high",
+            "critical",
+        }:
+            return False
+    return True
 
 
 def _semantic_character_signature(value: Any) -> str:
@@ -656,6 +899,8 @@ def _cached_call(
     json_schema: dict,
     force: bool,
     request_metadata: dict,
+    compatible_prompt_versions: Optional[list[str]] = None,
+    compatible_response_validator: Optional[Any] = None,
 ) -> tuple[dict, dict, bool, str]:
     fingerprint, request_sha256 = _fingerprint(
         task_type=task_type,
@@ -672,6 +917,31 @@ def _cached_call(
             prompt_version=prompt_version,
             request_sha256=request_sha256,
         )
+    if (
+        not force
+        and not existing
+        and compatible_prompt_versions
+    ):
+        for compatible_prompt_version in compatible_prompt_versions:
+            candidate = _db_get_artifact_by_request(
+                version_id=int(context["version_id"]),
+                task_type=task_type,
+                model=model,
+                prompt_version=compatible_prompt_version,
+                request_sha256=request_sha256,
+            )
+            if not candidate or not candidate.get("response_json"):
+                continue
+            if (
+                compatible_response_validator is not None
+                and not compatible_response_validator(
+                    candidate["response_json"]
+                )
+            ):
+                continue
+            existing = candidate
+            break
+
     if (
         not force
         and existing
@@ -1451,7 +1721,7 @@ def _extractor_schema() -> dict:
 
 def _verifier_schema() -> dict:
     return {
-        "name": "electrical_io_page_verifier_v2_4",
+        "name": "electrical_io_page_verifier_v2_6",
         "strict": True,
         "schema": {
             "type": "object",
@@ -1862,6 +2132,19 @@ def _verifier_messages(
                         "text_reconstruction_note": row.get(
                             "text_reconstruction_note"
                         ),
+                        "fragmentation_risk_fields": [
+                            field_name
+                            for field_name, candidate_value in {
+                                "signal_name": row.get("signal_name_normalized"),
+                                "description": row.get("description_normalized"),
+                                "expected_normal_state": row.get(
+                                    "expected_normal_state_normalized"
+                                ),
+                            }.items()
+                            if _looks_artificially_fragmented_text(
+                                candidate_value
+                            )
+                        ],
                         "is_placeholder": row.get("is_placeholder"),
                     }
                     for row in rows
@@ -1901,21 +2184,30 @@ def _verifier_messages(
         "For each non-placeholder row with free text, compare the candidate against the "
         "high-resolution crop. In region_checks, visible_text_row_count and "
         "supported_text_row_count count only included non-placeholder rows that have "
-        "at least one non-empty signal, description, or expected-state field. If the "
-        "candidate is already an exact readable visual transcription, leave it unchanged. "
-        "If OCR introduced or split characters and the crop clearly supports the exact "
-        "printed text, return a text_override with the exact visible transcription. "
-        "Return a separate override for every affected field, including both signal_name "
-        "and description when they repeat the same visible text. Such an override may "
-        "correct OCR characters, word boundaries, punctuation, or spacing, but must "
-        "preserve the original language and must not translate, paraphrase, expand "
-        "abbreviations, infer hidden meaning, or invent technical terms. If an extractor "
-        "row has text_reconstruction_confidence below 0.90, return an override for every "
-        "non-empty free-text field even when the approved transcription is unchanged; "
-        "this records independent visual confirmation. If the crop or a column meaning "
+        "at least one non-empty signal, description, or expected-state field. The final "
+        "approved_text is the publication-ready, human-readable transcription, while the "
+        "request already preserves the exact vector/OCR source separately. Artificial "
+        "intra-word spaces from CAD/PDF extraction are not acceptable in approved_text. "
+        "Every field listed in fragmentation_risk_fields must receive a text_override "
+        "unless the candidate is already clearly readable. Reconstruct natural word "
+        "boundaries from the crop, the row context, repeated neighboring rows, and the "
+        "document language without relying on a fixed vocabulary. If PDF glyph order, "
+        "duplication, or segmentation creates an obvious character error and the crop "
+        "plus context supports one unique reading, the override may repair that error. "
+        "Record the exact reason and use confidence >=0.90. Do not translate, paraphrase, "
+        "expand abbreviations, invent hidden technical meaning, or silently correct a "
+        "genuine source spelling when more than one reading is plausible. In an ambiguous "
+        "case preserve the most faithful readable text and return an issue explaining the "
+        "uncertainty rather than guessing. Return a separate override for every affected "
+        "field, including both signal_name and description when they repeat the same "
+        "visible text. If an extractor row has text_reconstruction_confidence below 0.90, "
+        "return an override for every non-empty free-text field even when the approved "
+        "transcription is unchanged; this records independent visual confirmation. Set "
+        "all_visible_text_resolved_or_blocked=true only when no artificial intra-word "
+        "fragmentation remains in any publishable field. If the crop or a column meaning "
         "is ambiguous, block rather than guess. Count every reviewed non-placeholder "
         "text row in each region. Return pass only when all visible content and columns "
-        "are complete and every published value is visually supported."
+        "are complete and every published value is visually supported and readable."
     )
     user_text = (
         "Audit this page, bind every physical column semantically, and adjudicate "
@@ -3088,18 +3380,47 @@ def _validate_and_materialize(
             )
 
         table_conf = _clamp_conf(extraction.get("confidence"))
+        io_context = _adjudicate_io_context(
+            page_type=page.get("page_type"),
+            model_io_type=extraction.get("io_type"),
+            model_is_safety=extraction.get("is_safety"),
+        )
+        if (
+            io_context["final_io_type"]
+            != io_context["model_io_type"]
+            or io_context["final_is_safety"]
+            != io_context["model_is_safety"]
+        ):
+            note(
+                "io_context_adjudicated",
+                "Canonical page context corrected the table I/O safety "
+                "classification while preserving the extractor decision "
+                "for audit",
+                region_id=rid,
+                io_context=io_context,
+            )
+        region_row_role_counts = {
+            role_name: 0
+            for role_name in sorted(
+                ROW_ROLES.difference({"title", "column_header"})
+            )
+        }
+        region_placeholder_rows = 0
+        region_blank_unused_rows = 0
         for result in row_results:
             row_id = _clean_text(result.get("row_id"), 50)
             candidate = candidate_map.get(row_id)
             if not candidate:
                 continue
-            role = str(result.get("row_role") or "other_data")
-            if role not in ROW_ROLES:
-                role = "other_data"
+            model_row_role = str(
+                result.get("row_role") or "other_data"
+            )
+            if model_row_role not in ROW_ROLES:
+                model_row_role = "other_data"
             include = bool(result.get("include_in_io"))
             if not include:
                 continue
-            if role in {"title", "column_header"}:
+            if model_row_role in {"title", "column_header"}:
                 fail(
                     "header_included_as_io",
                     f"Region {rid} row {row_id} is marked as a header but included as I/O",
@@ -3138,7 +3459,35 @@ def _validate_and_materialize(
                     source_word_ids=source_ids,
                     candidate_word_ids=sorted(candidate_ids),
                 )
-            if not source_ids and candidate_ids and role != "blank_unused":
+            row_semantics = _adjudicate_row_semantics(
+                model_row_role=model_row_role,
+                model_is_placeholder=result.get("is_placeholder"),
+                channel_ref=result.get("channel_ref_original"),
+                connector_ref=result.get("connector_ref_original"),
+                plc_address=result.get("plc_address_original"),
+                wire_reference=result.get("wire_reference_original"),
+                terminal_reference=result.get(
+                    "terminal_reference_original"
+                ),
+                signal_name=result.get("signal_name_normalized")
+                or result.get("signal_name_original"),
+                description=result.get("description_normalized")
+                or result.get("description_original"),
+                expected_normal_state=(
+                    result.get("expected_normal_state_normalized")
+                    or result.get("expected_normal_state_original")
+                ),
+            )
+            canonical_row_role = str(
+                row_semantics["final_row_role"]
+            )
+            is_placeholder = bool(row_semantics["is_placeholder"])
+
+            if (
+                not source_ids
+                and candidate_ids
+                and canonical_row_role != "blank_unused"
+            ):
                 fail(
                     "missing_row_evidence",
                     f"Region {rid} row {row_id} has visible words but no source evidence",
@@ -3149,10 +3498,6 @@ def _validate_and_materialize(
             fallback_bbox = _rect_from(candidate["bbox_pt"])
             evidence_bbox = _bbox_for_ids(source_ids, word_map, fallback_bbox)
             source_text = _text_for_ids(source_ids, word_map, 5000)
-            is_placeholder = bool(result.get("is_placeholder")) or role in {
-                "placeholder",
-                "blank_unused",
-            }
 
             extractor_text_confidence = _clamp_conf(
                 result.get("text_reconstruction_confidence")
@@ -3245,6 +3590,32 @@ def _validate_and_materialize(
                     approved_text_confidences[field_name] = (
                         extractor_text_confidence
                     )
+
+            unresolved_fragmented_fields = sorted(
+                field_name
+                for field_name, approved_value
+                in approved_text_values.items()
+                if (
+                    approved_value
+                    and _looks_artificially_fragmented_text(
+                        approved_value
+                    )
+                )
+            )
+            if unresolved_fragmented_fields and not is_placeholder:
+                fail(
+                    "unresolved_artificial_word_fragmentation",
+                    f"Region {rid} row {row_id} still contains artificial "
+                    "intra-word fragmentation after visual adjudication",
+                    region_id=rid,
+                    row_ids=[row_id],
+                    fields=unresolved_fragmented_fields,
+                    approved_values={
+                        field_name: approved_text_values[field_name]
+                        for field_name in unresolved_fragmented_fields
+                    },
+                    readability_policy=TEXT_READABILITY_POLICY_VERSION,
+                )
 
             has_free_text = any(original_text_values.values()) or any(
                 approved_text_values.values()
@@ -3473,9 +3844,15 @@ def _validate_and_materialize(
                 reference_value_column_indexes[role] = [column_index]
                 region_reference_fill_count += 1
 
-            io_type = str(extraction.get("io_type") or "other")
-            if io_type not in IO_TYPES:
-                io_type = "other"
+            final_io_type = str(io_context["final_io_type"])
+            final_is_safety = bool(io_context["final_is_safety"])
+            region_row_role_counts[canonical_row_role] = int(
+                region_row_role_counts.get(canonical_row_role, 0)
+            ) + 1
+            region_placeholder_rows += 1 if is_placeholder else 0
+            region_blank_unused_rows += (
+                1 if canonical_row_role == "blank_unused" else 0
+            )
             io_rows.append(
                 {
                     "io_key": (
@@ -3490,9 +3867,8 @@ def _validate_and_materialize(
                     "plc_address": published_reference_values[
                         "plc_address"
                     ],
-                    "io_type": io_type,
-                    "is_safety": bool(extraction.get("is_safety"))
-                    or io_type.startswith("safety_"),
+                    "io_type": final_io_type,
+                    "is_safety": final_is_safety,
                     "signal_name": normalized_signal_name,
                     "description": normalized_description,
                     "expected_normal_state": (
@@ -3522,8 +3898,13 @@ def _validate_and_materialize(
                         "region_hash": proposal["region_hash"],
                         "row_id": row_id,
                         "row_index": candidate["row_index"],
-                        "row_role": role,
+                        "row_role": canonical_row_role,
+                        "row_role_model": model_row_role,
+                        "row_semantics_version": ROW_SEMANTICS_VERSION,
+                        "row_semantics_source": row_semantics["source"],
+                        "row_semantics_evidence": row_semantics,
                         "is_placeholder": is_placeholder,
+                        "is_unused": bool(row_semantics["is_unused"]),
                         "connector_ref_original": _clean_text(
                             result.get("connector_ref_original"), 200
                         ),
@@ -3537,6 +3918,17 @@ def _validate_and_materialize(
                         "module_model_canonical": module_model,
                         "module_model_evidence_quality": (
                             module_model_evidence_quality
+                        ),
+                        "io_type_model": io_context["model_io_type"],
+                        "is_safety_model": io_context["model_is_safety"],
+                        "io_type_canonical": final_io_type,
+                        "is_safety_canonical": final_is_safety,
+                        "io_context_adjudicator_version": (
+                            IO_CONTEXT_ADJUDICATOR_VERSION
+                        ),
+                        "io_context_adjudication": io_context,
+                        "text_readability_policy_version": (
+                            TEXT_READABILITY_POLICY_VERSION
                         ),
                         "column_binding_version": "semantic-column-binding-v2",
                         "column_binding_adjudicator_version": (
@@ -3618,6 +4010,16 @@ def _validate_and_materialize(
                 "physical_rows": physical_count,
                 "materialized_rows": len(included_rows),
                 "reference_values_filled": region_reference_fill_count,
+                "io_type": io_context["final_io_type"],
+                "is_safety": io_context["final_is_safety"],
+                "io_context_adjudication": io_context,
+                "row_role_counts": {
+                    key: value
+                    for key, value in region_row_role_counts.items()
+                    if value
+                },
+                "placeholder_rows": region_placeholder_rows,
+                "blank_unused_rows": region_blank_unused_rows,
                 "column_bindings": [
                     region_column_bindings[index]
                     for index in sorted(region_column_bindings)
@@ -4372,6 +4774,13 @@ def extract_electrical_structured_version(
             ),
             "region_hashes": [p["region_hash"] for p in proposals],
         }
+        compatible_prior_verifier_prompts = (
+            []
+            if _extractions_need_readability_adjudication(
+                extraction_results
+            )
+            else ["mm-electrical-page-verifier-v2.4"]
+        )
         verifier, usage, reused, verifier_fp = _cached_call(
             context=context,
             page=page,
@@ -4392,6 +4801,12 @@ def extract_electrical_structured_version(
             json_schema=_verifier_schema(),
             force=bool(force),
             request_metadata={"proposal_count": len(proposals)},
+            compatible_prompt_versions=(
+                compatible_prior_verifier_prompts
+            ),
+            compatible_response_validator=(
+                _prior_verifier_response_is_compatible
+            ),
         )
         fingerprints["verifier"] = verifier_fp
         _add_usage(totals, "verifier", usage, reused)
