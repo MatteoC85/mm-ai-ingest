@@ -80,7 +80,7 @@ VERIFIER_PROMPT_VERSION = (
 ).strip()
 MATERIALIZER_VERSION = (
     os.environ.get("MM_ELECTRICAL_STRUCTURED_MATERIALIZER_VERSION")
-    or "mm-electrical-structured-materializer-v2.4"
+    or "mm-electrical-structured-materializer-v2.5"
 ).strip()
 
 OPENAI_TIMEOUT_SECONDS = _env_int(
@@ -115,7 +115,8 @@ MAX_SOURCE_BYTES = _env_int(
     "MM_ELECTRICAL_STRUCTURED_MAX_SOURCE_BYTES", 100_000_000, 1_000_000, 500_000_000
 )
 
-PIPELINE_MARKER = "phase2-vision-v2.4-source-snapshot"
+PIPELINE_MARKER = "phase2-vision-v2.5-source-snapshot"
+COLUMN_BINDING_ADJUDICATOR_VERSION = ("peer-equivalent-column-consensus-v1")
 EXTRACTION_METHOD = "openai_vision_structured_v2"
 PHASE_NAME = "structured_vision_v2"
 IO_PAGE_TYPES = {"plc_io_table", "safety_io_table"}
@@ -2388,6 +2389,207 @@ def _build_column_binding_proposals(
     return output
 
 
+
+def _column_body_signature_sequence(column: dict) -> list[str]:
+    """Return exact normalized body-cell signatures in physical row order."""
+    return [
+        _reference_signature(item.get("cell_text_original"))
+        for item in (column.get("body_cell_values") or [])
+        if _reference_signature(item.get("cell_text_original"))
+    ]
+
+
+def _adjudicate_omitted_consensus_reference_role(
+    *,
+    region_id: str,
+    source_column_index: int,
+    role: str,
+    local_decision: dict,
+    proposal_column: dict,
+    binding_proposal_by_region: dict[str, dict],
+    raw_decision_by_key: dict[tuple[str, int], dict],
+) -> Optional[dict]:
+    """Safely complete a verifier-omitted reference role from page consensus.
+
+    This adjudicator is language-independent and never inspects fixed header
+    words. It activates only when all of the following independently agree:
+
+      * the local verifier approved the physical column for missing values;
+      * the omitted role is present in deterministic page consensus;
+      * the local role is actually missing from the extractor;
+      * the column contains atomic short references for essentially every row;
+      * one or more geometrically equivalent peer columns have the same role
+        approved by the visual verifier at page-level confidence;
+      * no equivalent peer or other local column contradicts that role.
+
+    The function does not copy values from a peer table. It only authorizes the
+    local physical cells already present in the current region to populate the
+    omitted canonical field.
+    """
+    if role not in REFERENCE_COLUMN_ROLES:
+        return None
+    if not bool(local_decision.get("use_for_missing_values")):
+        return None
+
+    local_confidence = _clamp_conf(local_decision.get("confidence"))
+    if local_confidence < PAGE_PASS_MIN_CONFIDENCE:
+        return None
+
+    consensus_roles = set(
+        proposal_column.get("page_consensus_suggested_roles") or []
+    )
+    if role not in consensus_roles:
+        return None
+
+    local_role_evidence = (
+        proposal_column.get("local_reference_role_evidence") or {}
+    ).get(role) or {}
+    if int(local_role_evidence.get("extractor_nonempty_count") or 0) != 0:
+        return None
+
+    body_nonempty_count = int(proposal_column.get("body_nonempty_count") or 0)
+    atomic_ratio = float(
+        proposal_column.get("atomic_reference_value_ratio") or 0.0
+    )
+    if body_nonempty_count <= 0 or atomic_ratio < 0.95:
+        return None
+
+    # A role already assigned to another physical column in the same region is
+    # a real ambiguity and must never be duplicated by consensus.
+    for (other_region_id, other_column_index), other_decision in (
+        raw_decision_by_key.items()
+    ):
+        if other_region_id != region_id:
+            continue
+        if int(other_column_index) == int(source_column_index):
+            continue
+        if role in set(other_decision.get("canonical_roles") or []):
+            return None
+
+    local_sequence = _column_body_signature_sequence(proposal_column)
+    supportive_peers: list[dict] = []
+    contradictory_peers: list[dict] = []
+
+    for peer in proposal_column.get("peer_equivalent_column_evidence") or []:
+        similarity = float(peer.get("header_similarity") or 0.0)
+        if similarity < 0.90 or not bool(peer.get("comparable_value_shape")):
+            continue
+        if role not in set(peer.get("peer_locally_suggested_roles") or []):
+            continue
+
+        peer_region_id = _clean_text(peer.get("peer_region_id"), 120)
+        try:
+            peer_column_index = int(peer.get("peer_source_column_index"))
+        except Exception:
+            continue
+
+        peer_decision = raw_decision_by_key.get(
+            (peer_region_id, peer_column_index)
+        )
+        if not peer_decision:
+            continue
+
+        peer_roles = set(peer_decision.get("canonical_roles") or [])
+        peer_confidence = _clamp_conf(peer_decision.get("confidence"))
+        peer_use_for_missing = bool(
+            peer_decision.get("use_for_missing_values")
+        )
+
+        peer_region = binding_proposal_by_region.get(peer_region_id) or {}
+        peer_column = next(
+            (
+                item
+                for item in (peer_region.get("columns") or [])
+                if int(item.get("source_column_index", -1))
+                == peer_column_index
+            ),
+            None,
+        )
+        if not peer_column:
+            continue
+
+        peer_atomic_ratio = float(
+            peer_column.get("atomic_reference_value_ratio") or 0.0
+        )
+        peer_body_nonempty_count = int(
+            peer_column.get("body_nonempty_count") or 0
+        )
+        peer_sequence = _column_body_signature_sequence(peer_column)
+        same_exact_sequence = bool(local_sequence) and (
+            local_sequence == peer_sequence
+        )
+        same_monotonic_shape = (
+            bool(proposal_column.get("is_monotonic_integer_sequence"))
+            and bool(peer_column.get("is_monotonic_integer_sequence"))
+            and body_nonempty_count == peer_body_nonempty_count
+            and abs(atomic_ratio - peer_atomic_ratio) <= 0.05
+        )
+        strong_value_shape = same_exact_sequence or same_monotonic_shape
+
+        evidence = {
+            "peer_region_id": peer_region_id,
+            "peer_source_column_index": peer_column_index,
+            "header_similarity": round(similarity, 4),
+            "peer_binding_confidence": peer_confidence,
+            "same_exact_value_sequence": same_exact_sequence,
+            "same_monotonic_value_shape": same_monotonic_shape,
+            "peer_roles": sorted(peer_roles),
+        }
+
+        if (
+            role in peer_roles
+            and peer_use_for_missing
+            and peer_confidence >= PAGE_PASS_MIN_CONFIDENCE
+            and peer_atomic_ratio >= 0.95
+            and strong_value_shape
+        ):
+            supportive_peers.append(evidence)
+        else:
+            contradictory_peers.append(evidence)
+
+    if not supportive_peers or contradictory_peers:
+        return None
+
+    adjudication_confidence = min(
+        [local_confidence]
+        + [
+            float(item.get("peer_binding_confidence") or 0.0)
+            for item in supportive_peers
+        ]
+        + [
+            float(item.get("header_similarity") or 0.0)
+            for item in supportive_peers
+        ]
+    )
+    if adjudication_confidence < PAGE_PASS_MIN_CONFIDENCE:
+        return None
+
+    return {
+        "version": COLUMN_BINDING_ADJUDICATOR_VERSION,
+        "canonical_role": role,
+        "region_id": region_id,
+        "source_column_index": int(source_column_index),
+        "confidence": round(adjudication_confidence, 4),
+        "local_verifier_roles": sorted(
+            set(local_decision.get("canonical_roles") or [])
+        ),
+        "local_verifier_confidence": local_confidence,
+        "local_body_nonempty_count": body_nonempty_count,
+        "local_atomic_reference_value_ratio": round(atomic_ratio, 4),
+        "local_extractor_nonempty_count": int(
+            local_role_evidence.get("extractor_nonempty_count") or 0
+        ),
+        "supporting_peers": supportive_peers,
+        "contradictory_peers": contradictory_peers,
+        "reason": (
+            "The local physical column is independently supported by exact "
+            "geometry, atomic row values, a page-consensus role, and one or "
+            "more verifier-approved equivalent peer columns. Values remain "
+            "local to this region; no peer value is copied."
+        ),
+    }
+
+
 def _validate_and_materialize(
     *,
     page: dict,
@@ -2427,6 +2629,22 @@ def _validate_and_materialize(
                 severity="high",
                 region_id=region_id,
                 row_ids=row_ids,
+                sequence=sequence,
+                properties=props,
+            )
+        )
+
+    def note(code: str, message: str, region_id: str = "", row_ids: Optional[list[str]] = None, **props: Any) -> None:
+        nonlocal sequence
+        sequence += 1
+        issues.append(
+            _local_issue(
+                page=page,
+                code=code,
+                message=message,
+                severity="info",
+                region_id=region_id,
+                row_ids=row_ids or [],
                 sequence=sequence,
                 properties=props,
             )
@@ -2534,6 +2752,15 @@ def _validate_and_materialize(
         ):
             expected_column_keys.add((rid, column_index))
 
+    raw_decision_by_key: dict[tuple[str, int], dict] = {}
+    for raw_decision in verifier.get("column_binding_decisions") or []:
+        raw_region_id = _clean_text(raw_decision.get("region_id"), 120)
+        try:
+            raw_column_index = int(raw_decision.get("source_column_index"))
+        except Exception:
+            raw_column_index = -1
+        raw_decision_by_key[(raw_region_id, raw_column_index)] = raw_decision
+
     column_binding_map: dict[str, dict[int, dict]] = {}
     decision_keys: set[tuple[str, int]] = set()
     for decision in verifier.get("column_binding_decisions") or []:
@@ -2588,6 +2815,7 @@ def _validate_and_materialize(
             ),
             None,
         )
+        verifier_returned_roles = list(roles)
         consensus_reference_roles = set(
             (proposal_column or {}).get(
                 "page_consensus_suggested_roles"
@@ -2597,19 +2825,44 @@ def _validate_and_materialize(
         omitted_consensus_roles = sorted(
             consensus_reference_roles.difference(roles)
         )
-        if omitted_consensus_roles:
-            fail(
-                "verifier_omitted_consensus_reference_role",
-                "Verifier omitted a strongly corroborated reference-column role",
+        consensus_added_roles: list[str] = []
+        consensus_adjudication_evidence: dict[str, dict] = {}
+        for omitted_role in omitted_consensus_roles:
+            adjudication = _adjudicate_omitted_consensus_reference_role(
                 region_id=rid,
                 source_column_index=column_index,
-                omitted_roles=omitted_consensus_roles,
-                returned_roles=roles,
-                peer_evidence=(proposal_column or {}).get(
-                    "peer_equivalent_column_evidence"
-                )
-                or [],
+                role=omitted_role,
+                local_decision=decision,
+                proposal_column=proposal_column or {},
+                binding_proposal_by_region=binding_proposal_by_region,
+                raw_decision_by_key=raw_decision_by_key,
             )
+            if adjudication:
+                roles.append(omitted_role)
+                consensus_added_roles.append(omitted_role)
+                consensus_adjudication_evidence[omitted_role] = adjudication
+                note(
+                    "consensus_reference_role_adjudicated",
+                    "A verifier-omitted reference role was safely completed "
+                    "from independent peer-equivalent column consensus",
+                    region_id=rid,
+                    source_column_index=column_index,
+                    canonical_role=omitted_role,
+                    adjudication=adjudication,
+                )
+            else:
+                fail(
+                    "verifier_omitted_consensus_reference_role",
+                    "Verifier omitted a strongly corroborated reference-column role",
+                    region_id=rid,
+                    source_column_index=column_index,
+                    omitted_roles=[omitted_role],
+                    returned_roles=roles,
+                    peer_evidence=(proposal_column or {}).get(
+                        "peer_equivalent_column_evidence"
+                    )
+                    or [],
+                )
 
         if "other_data" in roles and len(roles) > 1:
             fail(
@@ -2650,6 +2903,14 @@ def _validate_and_materialize(
                 threshold=PAGE_PASS_MIN_CONFIDENCE,
             )
 
+        role_sources = {
+            role: (
+                "deterministic_peer_consensus"
+                if role in consensus_added_roles
+                else "visual_verifier"
+            )
+            for role in roles
+        }
         normalized_decision = {
             "region_id": rid,
             "source_column_index": column_index,
@@ -2657,6 +2918,17 @@ def _validate_and_materialize(
                 decision.get("header_text_original"), 1000
             ),
             "canonical_roles": roles,
+            "verifier_returned_roles": verifier_returned_roles,
+            "consensus_added_roles": consensus_added_roles,
+            "role_sources": role_sources,
+            "consensus_adjudicator_version": (
+                COLUMN_BINDING_ADJUDICATOR_VERSION
+                if consensus_added_roles
+                else ""
+            ),
+            "consensus_adjudication_evidence": (
+                consensus_adjudication_evidence
+            ),
             "use_for_missing_values": use_for_missing,
             "confidence": confidence,
             "reason": _clean_text(decision.get("reason"), 1200),
@@ -3039,7 +3311,7 @@ def _validate_and_materialize(
             reference_value_column_indexes: dict[str, list[int]] = {
                 role: [] for role in REFERENCE_COLUMN_ROLES
             }
-            bound_reference_candidates: dict[str, list[tuple[int, str]]] = {
+            bound_reference_candidates: dict[str, list[tuple[int, str, str]]] = {
                 role: [] for role in REFERENCE_COLUMN_ROLES
             }
             deterministic_cells = (
@@ -3079,19 +3351,27 @@ def _validate_and_materialize(
                                 cell_text_original=cell_text,
                             )
                         continue
+                    role_source = (
+                        (binding.get("role_sources") or {}).get(role)
+                        or "visual_verifier"
+                    )
                     bound_reference_candidates[role].append(
-                        (column_index, safe_value)
+                        (column_index, safe_value, role_source)
                     )
 
             for role in sorted(REFERENCE_COLUMN_ROLES):
                 candidates_for_role = bound_reference_candidates.get(role) or []
-                distinct_by_signature: dict[str, tuple[int, str]] = {}
-                for column_index, value in candidates_for_role:
+                distinct_by_signature: dict[
+                    str,
+                    tuple[int, str, str],
+                ] = {}
+                for column_index, value, role_source in candidates_for_role:
                     signature = _reference_signature(value)
                     if signature and signature not in distinct_by_signature:
                         distinct_by_signature[signature] = (
                             column_index,
                             value,
+                            role_source,
                         )
                 existing = published_reference_values.get(role) or ""
 
@@ -3099,32 +3379,45 @@ def _validate_and_materialize(
                     if distinct_by_signature:
                         existing_signature = _reference_signature(existing)
                         if existing_signature in distinct_by_signature:
-                            reference_value_sources[role] = (
-                                "extractor_verified_by_column_binding"
-                            )
+                            matching_sources = {
+                                role_source
+                                for column_index, value, role_source
+                                in candidates_for_role
+                                if _reference_signature(value)
+                                == existing_signature
+                            }
+                            if "deterministic_peer_consensus" in matching_sources:
+                                reference_value_sources[role] = (
+                                    "extractor_verified_by_peer_consensus_column_binding"
+                                )
+                            else:
+                                reference_value_sources[role] = (
+                                    "extractor_verified_by_column_binding"
+                                )
                             reference_value_column_indexes[role] = sorted(
                                 {
                                     column_index
-                                    for column_index, value
+                                    for column_index, value, role_source
                                     in candidates_for_role
                                     if _reference_signature(value)
                                     == existing_signature
                                 }
                             )
                         elif len(distinct_by_signature) == 1:
-                            column_index, bound_value = next(
+                            column_index, bound_value, role_source = next(
                                 iter(distinct_by_signature.values())
                             )
                             fail(
                                 "extractor_reference_conflicts_with_bound_column",
                                 f"Region {rid} row {row_id} extractor {role} "
-                                "conflicts with the verifier-approved source column",
+                                "conflicts with the approved source column",
                                 region_id=rid,
                                 row_ids=[row_id],
                                 canonical_role=role,
                                 extractor_value=existing,
                                 bound_cell_value=bound_value,
                                 source_column_index=column_index,
+                                binding_role_source=role_source,
                             )
                         else:
                             fail(
@@ -3138,8 +3431,9 @@ def _validate_and_materialize(
                                     {
                                         "source_column_index": column_index,
                                         "value": value,
+                                        "role_source": role_source,
                                     }
-                                    for column_index, value
+                                    for column_index, value, role_source
                                     in candidates_for_role
                                 ],
                             )
@@ -3159,18 +3453,22 @@ def _validate_and_materialize(
                             {
                                 "source_column_index": column_index,
                                 "value": value,
+                                "role_source": role_source,
                             }
-                            for column_index, value in candidates_for_role
+                            for column_index, value, role_source
+                            in candidates_for_role
                         ],
                     )
                     continue
 
-                column_index, bound_value = next(
+                column_index, bound_value, role_source = next(
                     iter(distinct_by_signature.values())
                 )
                 published_reference_values[role] = bound_value
                 reference_value_sources[role] = (
-                    "verifier_approved_column_binding"
+                    "deterministic_peer_consensus_column_binding"
+                    if role_source == "deterministic_peer_consensus"
+                    else "verifier_approved_column_binding"
                 )
                 reference_value_column_indexes[role] = [column_index]
                 region_reference_fill_count += 1
@@ -3240,7 +3538,10 @@ def _validate_and_materialize(
                         "module_model_evidence_quality": (
                             module_model_evidence_quality
                         ),
-                        "column_binding_version": "semantic-column-binding-v1",
+                        "column_binding_version": "semantic-column-binding-v2",
+                        "column_binding_adjudicator_version": (
+                            COLUMN_BINDING_ADJUDICATOR_VERSION
+                        ),
                         "column_binding_fingerprint": (
                             region_binding_fingerprint
                         ),
