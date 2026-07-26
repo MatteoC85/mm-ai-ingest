@@ -71,15 +71,15 @@ DETECTOR_PROMPT_VERSION = (
 ).strip()
 EXTRACTOR_PROMPT_VERSION = (
     os.environ.get("MM_ELECTRICAL_STRUCTURED_EXTRACTOR_PROMPT_VERSION")
-    or "mm-electrical-table-extractor-v2"
+    or "mm-electrical-table-extractor-v2.2"
 ).strip()
 VERIFIER_PROMPT_VERSION = (
     os.environ.get("MM_ELECTRICAL_STRUCTURED_VERIFIER_PROMPT_VERSION")
-    or "mm-electrical-page-verifier-v2"
+    or "mm-electrical-page-verifier-v2.2"
 ).strip()
 MATERIALIZER_VERSION = (
     os.environ.get("MM_ELECTRICAL_STRUCTURED_MATERIALIZER_VERSION")
-    or "mm-electrical-structured-materializer-v2.1"
+    or "mm-electrical-structured-materializer-v2.2"
 ).strip()
 
 OPENAI_TIMEOUT_SECONDS = _env_int(
@@ -98,6 +98,12 @@ ROW_MIN_CONFIDENCE = _env_float(
 PAGE_PASS_MIN_CONFIDENCE = _env_float(
     "MM_ELECTRICAL_STRUCTURED_PAGE_PASS_MIN_CONFIDENCE", 0.90, 0.0, 1.0
 )
+TEXT_RECONSTRUCTION_MIN_CONFIDENCE = _env_float(
+    "MM_ELECTRICAL_STRUCTURED_TEXT_RECONSTRUCTION_MIN_CONFIDENCE",
+    0.90,
+    0.0,
+    1.0,
+)
 INPUT_USD_PER_MILLION = _env_float(
     "MM_ELECTRICAL_STRUCTURED_INPUT_USD_PER_MILLION", 0.0
 )
@@ -108,7 +114,7 @@ MAX_SOURCE_BYTES = _env_int(
     "MM_ELECTRICAL_STRUCTURED_MAX_SOURCE_BYTES", 100_000_000, 1_000_000, 500_000_000
 )
 
-PIPELINE_MARKER = "phase2-vision-v2-source-snapshot"
+PIPELINE_MARKER = "phase2-vision-v2.2-source-snapshot"
 EXTRACTION_METHOD = "openai_vision_structured_v2"
 PHASE_NAME = "structured_vision_v2"
 IO_PAGE_TYPES = {"plc_io_table", "safety_io_table"}
@@ -162,6 +168,9 @@ def get_electrical_structured_runtime_config() -> dict:
         "extractor_prompt_version": EXTRACTOR_PROMPT_VERSION,
         "verifier_prompt_version": VERIFIER_PROMPT_VERSION,
         "page_pass_min_confidence": PAGE_PASS_MIN_CONFIDENCE,
+        "text_reconstruction_min_confidence": (
+            TEXT_RECONSTRUCTION_MIN_CONFIDENCE
+        ),
         "render_dpi": RENDER_DPI,
     }
 
@@ -170,6 +179,81 @@ def _clean_text(value: Any, max_len: int = 2000) -> str:
     text = unicodedata.normalize("NFKC", str(value or ""))
     text = re.sub(r"\s+", " ", text).strip()
     return text[:max_len]
+
+
+def _semantic_character_signature(value: Any) -> str:
+    """Return a language-independent character signature for safe re-spacing.
+
+    The normalized display text may repair word boundaries and punctuation spacing,
+    but it must preserve the original alphanumeric content and order. This blocks
+    paraphrases, translations, spelling guesses, and invented technical terms.
+    """
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    text = (
+        text.replace("–", "-")
+        .replace("—", "-")
+        .replace("‐", "-")
+        .replace("−", "-")
+        .upper()
+    )
+    return "".join(ch for ch in text if ch.isalnum())
+
+
+def _safe_normalized_display_text(
+    *,
+    original: Any,
+    normalized: Any,
+    max_len: int,
+    field_name: str,
+    region_id: str,
+    row_id: str,
+    fail,
+) -> str:
+    original_text = _clean_text(original, max_len)
+    normalized_text = _clean_text(normalized, max_len)
+
+    if not original_text:
+        if normalized_text:
+            fail(
+                "normalized_text_without_source",
+                f"Region {region_id} row {row_id} has normalized {field_name} "
+                "without source text",
+                region_id=region_id,
+                row_ids=[row_id],
+                field_name=field_name,
+                normalized_text=normalized_text,
+            )
+        return ""
+
+    if not normalized_text:
+        fail(
+            "missing_normalized_text",
+            f"Region {region_id} row {row_id} is missing normalized "
+            f"{field_name}",
+            region_id=region_id,
+            row_ids=[row_id],
+            field_name=field_name,
+            original_text=original_text,
+        )
+        return original_text
+
+    original_sig = _semantic_character_signature(original_text)
+    normalized_sig = _semantic_character_signature(normalized_text)
+    if original_sig != normalized_sig:
+        fail(
+            "normalized_text_not_character_equivalent",
+            f"Region {region_id} row {row_id} normalized {field_name} "
+            "changes source alphanumeric content",
+            region_id=region_id,
+            row_ids=[row_id],
+            field_name=field_name,
+            original_text=original_text,
+            normalized_text=normalized_text,
+            original_signature=original_sig,
+            normalized_signature=normalized_sig,
+        )
+
+    return normalized_text
 
 
 def _canonical_key(value: Any, max_len: int = 120) -> str:
@@ -1250,8 +1334,13 @@ def _extractor_schema() -> dict:
                             "wire_reference_original": {"type": "string"},
                             "terminal_reference_original": {"type": "string"},
                             "signal_name_original": {"type": "string"},
+                            "signal_name_normalized": {"type": "string"},
                             "description_original": {"type": "string"},
+                            "description_normalized": {"type": "string"},
                             "expected_normal_state_original": {"type": "string"},
+                            "expected_normal_state_normalized": {"type": "string"},
+                            "text_reconstruction_confidence": {"type": "number"},
+                            "text_reconstruction_note": {"type": "string"},
                             "is_placeholder": {"type": "boolean"},
                             "source_word_ids": {
                                 "type": "array",
@@ -1271,8 +1360,13 @@ def _extractor_schema() -> dict:
                             "wire_reference_original",
                             "terminal_reference_original",
                             "signal_name_original",
+                            "signal_name_normalized",
                             "description_original",
+                            "description_normalized",
                             "expected_normal_state_original",
+                            "expected_normal_state_normalized",
+                            "text_reconstruction_confidence",
+                            "text_reconstruction_note",
                             "is_placeholder",
                             "source_word_ids",
                             "confidence",
@@ -1332,6 +1426,17 @@ def _verifier_schema() -> dict:
                 "all_visible_tables_accounted_for": {"type": "boolean"},
                 "all_visible_physical_rows_accounted_for": {"type": "boolean"},
                 "module_headers_consistent": {"type": "boolean"},
+                "all_published_text_character_equivalent_to_source": {
+                    "type": "boolean"
+                },
+                "all_visible_fragmented_text_safely_reconstructed": {
+                    "type": "boolean"
+                },
+                "unsupported_text_row_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 200,
+                },
                 "sheet_code_used_as_module_tag_without_visual_support": {
                     "type": "boolean"
                 },
@@ -1397,6 +1502,9 @@ def _verifier_schema() -> dict:
                 "all_visible_tables_accounted_for",
                 "all_visible_physical_rows_accounted_for",
                 "module_headers_consistent",
+                "all_published_text_character_equivalent_to_source",
+                "all_visible_fragmented_text_safely_reconstructed",
+                "unsupported_text_row_ids",
                 "sheet_code_used_as_module_tag_without_visual_support",
                 "region_checks",
                 "missing_region_ids",
@@ -1486,7 +1594,15 @@ def _extractor_messages(
         "and column-header rows have include_in_io=false. Do not omit a row because its "
         "meaning is unclear. Use source_word_ids from that row; a truly blank bordered "
         "row may have an empty source list and must still be accounted for by row_id. "
-        "Do not invent addresses, wires, tags, or descriptions."
+        "For signal_name, description, and expected_normal_state return two versions: "
+        "the *_original field preserves the exact source characters and order, including "
+        "artificial PDF spacing; the *_normalized field repairs only word boundaries and "
+        "spacing visible in the crop. Normalized text must stay in the original language, "
+        "must not translate or paraphrase, and must not add, remove, reorder, or correct "
+        "any alphanumeric character. Preserve numbers, codes, abbreviations, punctuation, "
+        "and symbols. If the source is already readable, normalized equals original. If "
+        "safe reconstruction is impossible, keep normalized equal to original and lower "
+        "text_reconstruction_confidence. Do not invent addresses, wires, tags, or descriptions."
     )
     compact_rows = [
         {
@@ -1558,8 +1674,13 @@ def _verifier_messages(
                         "wire_reference_original": row.get("wire_reference_original"),
                         "terminal_reference_original": row.get("terminal_reference_original"),
                         "signal_name_original": row.get("signal_name_original"),
+                        "signal_name_normalized": row.get("signal_name_normalized"),
                         "description_original": row.get("description_original"),
+                        "description_normalized": row.get("description_normalized"),
                         "expected_normal_state_original": row.get("expected_normal_state_original"),
+                        "expected_normal_state_normalized": row.get("expected_normal_state_normalized"),
+                        "text_reconstruction_confidence": row.get("text_reconstruction_confidence"),
+                        "text_reconstruction_note": row.get("text_reconstruction_note"),
                         "is_placeholder": row.get("is_placeholder"),
                     }
                     for row in rows
@@ -1575,11 +1696,18 @@ def _verifier_messages(
         "Re-read the full page image; do not trust the prior detector or extractor. "
         "Verify that every visible I/O table is represented separately, every physical "
         "body row is accounted for, module tags come from their own visible headers, "
-        "and the page sheet code has not been mistaken for a module tag. Placeholder, "
-        "unused, power, and connector rows count as physical rows. Repeated source "
-        "module tags are allowed when the drawing visibly repeats them; report them but "
-        "do not auto-correct them. Return pass only when the page is complete. The source "
-        "may be in any language; reason semantically and preserve original evidence."
+        "and the page sheet code has not been mistaken for a module tag. Independently "
+        "compare every *_normalized free-text value with the crop and its *_original "
+        "value. Normalized text may repair only artificial word-boundary/spacing "
+        "fragmentation; it must preserve the original language and the same alphanumeric "
+        "characters in the same order, with no translation, paraphrase, spelling guess, "
+        "or invented technical term. Mark unsupported_text_row_ids and block the page if "
+        "a normalized value changes meaning or if visually readable fragmented text "
+        "remains unreconstructed. Placeholder, unused, power, and connector rows count "
+        "as physical rows. Repeated source module tags are allowed when the drawing "
+        "visibly repeats them; report them but do not auto-correct them. Return pass only "
+        "when the page is complete and all published text is safe. The source may be in "
+        "any language; reason semantically and preserve original evidence."
     )
     user_text = (
         "Audit this complete page against the proposed regions and extracted rows.\n\n"
@@ -1958,13 +2086,78 @@ def _validate_and_materialize(
             fallback_bbox = _rect_from(candidate["bbox_pt"])
             evidence_bbox = _bbox_for_ids(source_ids, word_map, fallback_bbox)
             source_text = _text_for_ids(source_ids, word_map, 5000)
-            io_type = str(extraction.get("io_type") or "other")
-            if io_type not in IO_TYPES:
-                io_type = "other"
             is_placeholder = bool(result.get("is_placeholder")) or role in {
                 "placeholder",
                 "blank_unused",
             }
+
+            text_reconstruction_confidence = _clamp_conf(
+                result.get("text_reconstruction_confidence")
+            )
+            original_signal_name = _clean_text(
+                result.get("signal_name_original"), 700
+            )
+            original_description = _clean_text(
+                result.get("description_original"), 1600
+            )
+            original_expected_normal_state = _clean_text(
+                result.get("expected_normal_state_original"), 500
+            )
+
+            normalized_signal_name = _safe_normalized_display_text(
+                original=original_signal_name,
+                normalized=result.get("signal_name_normalized"),
+                max_len=700,
+                field_name="signal_name",
+                region_id=rid,
+                row_id=row_id,
+                fail=fail,
+            )
+            normalized_description = _safe_normalized_display_text(
+                original=original_description,
+                normalized=result.get("description_normalized"),
+                max_len=1600,
+                field_name="description",
+                region_id=rid,
+                row_id=row_id,
+                fail=fail,
+            )
+            normalized_expected_normal_state = _safe_normalized_display_text(
+                original=original_expected_normal_state,
+                normalized=result.get("expected_normal_state_normalized"),
+                max_len=500,
+                field_name="expected_normal_state",
+                region_id=rid,
+                row_id=row_id,
+                fail=fail,
+            )
+
+            has_free_text = bool(
+                original_signal_name
+                or original_description
+                or original_expected_normal_state
+            )
+            if (
+                has_free_text
+                and not is_placeholder
+                and text_reconstruction_confidence
+                < TEXT_RECONSTRUCTION_MIN_CONFIDENCE
+            ):
+                fail(
+                    "text_reconstruction_confidence_below_threshold",
+                    f"Region {rid} row {row_id} text reconstruction confidence "
+                    "is below the publication threshold",
+                    region_id=rid,
+                    row_ids=[row_id],
+                    text_reconstruction_confidence=(
+                        text_reconstruction_confidence
+                    ),
+                    threshold=TEXT_RECONSTRUCTION_MIN_CONFIDENCE,
+                )
+
+            io_type = str(extraction.get("io_type") or "other")
+            if io_type not in IO_TYPES:
+                io_type = "other"
             io_rows.append(
                 {
                     "io_key": (
@@ -1982,14 +2175,10 @@ def _validate_and_materialize(
                     "io_type": io_type,
                     "is_safety": bool(extraction.get("is_safety"))
                     or io_type.startswith("safety_"),
-                    "signal_name": _clean_text(
-                        result.get("signal_name_original"), 700
-                    ),
-                    "description": _clean_text(
-                        result.get("description_original"), 1600
-                    ),
-                    "expected_normal_state": _clean_text(
-                        result.get("expected_normal_state_original"), 500
+                    "signal_name": normalized_signal_name,
+                    "description": normalized_description,
+                    "expected_normal_state": (
+                        normalized_expected_normal_state
                     ),
                     "wire_reference": _clean_text(
                         result.get("wire_reference_original"), 300
@@ -2031,6 +2220,19 @@ def _validate_and_materialize(
                         "module_model_evidence_quality": (
                             module_model_evidence_quality
                         ),
+                        "text_reconstruction_confidence": (
+                            text_reconstruction_confidence
+                        ),
+                        "text_reconstruction_note": _clean_text(
+                            result.get("text_reconstruction_note"), 800
+                        ),
+                        "normalized": {
+                            "signal_name": normalized_signal_name,
+                            "description": normalized_description,
+                            "expected_normal_state": (
+                                normalized_expected_normal_state
+                            ),
+                        },
                         "detector_fingerprint": fingerprints.get("detector"),
                         "extractor_fingerprint": fingerprints.get(rid),
                         "verifier_fingerprint": fingerprints.get("verifier"),
@@ -2047,11 +2249,10 @@ def _validate_and_materialize(
                             "terminal_reference": _clean_text(
                                 result.get("terminal_reference_original"), 300
                             ),
-                            "signal_name": _clean_text(
-                                result.get("signal_name_original"), 700
-                            ),
-                            "description": _clean_text(
-                                result.get("description_original"), 1600
+                            "signal_name": original_signal_name,
+                            "description": original_description,
+                            "expected_normal_state": (
+                                original_expected_normal_state
                             ),
                         },
                     },
@@ -2077,9 +2278,29 @@ def _validate_and_materialize(
         ("all_visible_tables_accounted_for", "verifier_missing_table"),
         ("all_visible_physical_rows_accounted_for", "verifier_missing_rows"),
         ("module_headers_consistent", "verifier_module_header_inconsistency"),
+        (
+            "all_published_text_character_equivalent_to_source",
+            "verifier_text_not_character_equivalent",
+        ),
+        (
+            "all_visible_fragmented_text_safely_reconstructed",
+            "verifier_text_fragmentation_not_resolved",
+        ),
     ]:
         if not bool(verifier.get(field)):
             fail(code, f"Independent verifier returned {field}=false")
+    unsupported_text_row_ids = [
+        _clean_text(x, 80)
+        for x in (verifier.get("unsupported_text_row_ids") or [])
+        if _clean_text(x, 80)
+    ]
+    if unsupported_text_row_ids:
+        fail(
+            "verifier_unsupported_normalized_text",
+            "Verifier found normalized text that is unsupported or still fragmented",
+            row_ids=unsupported_text_row_ids,
+        )
+
     if bool(verifier.get("sheet_code_used_as_module_tag_without_visual_support")):
         fail("sheet_code_confused_with_module_tag", "Verifier detected a page sheet code used as a module tag")
     if verifier.get("missing_region_ids") or verifier.get("missing_row_ids"):
