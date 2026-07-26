@@ -80,11 +80,11 @@ EXTRACTOR_PROMPT_VERSION = (
 ).strip()
 VERIFIER_PROMPT_VERSION = (
     os.environ.get("MM_ELECTRICAL_TERMINALS_VERIFIER_PROMPT_VERSION")
-    or "mm-electrical-terminal-page-verifier-v1"
+    or "mm-electrical-terminal-page-verifier-v1.1"
 ).strip()
 MATERIALIZER_VERSION = (
     os.environ.get("MM_ELECTRICAL_TERMINALS_MATERIALIZER_VERSION")
-    or "mm-electrical-terminal-materializer-v1"
+    or "mm-electrical-terminal-materializer-v1.1"
 ).strip()
 
 OPENAI_TIMEOUT_SECONDS = _env_int(
@@ -118,7 +118,7 @@ MAX_SOURCE_BYTES = _env_int(
     500_000_000,
 )
 
-PIPELINE_MARKER = "phase2-terminals-v1-source-snapshot"
+PIPELINE_MARKER = "phase2-terminals-v1.1-source-snapshot"
 EXTRACTION_METHOD = "openai_vision_terminals_v1"
 PHASE_NAME = "terminal_vision_v1"
 PAGE_TYPE = "terminal_table"
@@ -145,6 +145,32 @@ OVERRIDABLE_FIELDS = {
     "side_a_description_original",
     "side_b_description_original",
 }
+
+FIELD_ASSIGNMENT_DECISION_VERSION = (
+    "single-visual-evidence-field-arbitration-v1"
+)
+
+# These groups contain canonical fields that may accidentally receive the
+# same visible token from one physical cell. A repeated value is allowed only
+# when an independent visual verifier explicitly supports the shared meaning
+# or when separate visible occurrences exist.
+FIELD_COLLISION_GROUPS = (
+    (
+        "wire_number_original",
+        "cable_reference_original",
+        "potential_original",
+        "conductor_color_original",
+        "conductor_cross_section_original",
+    ),
+    (
+        "side_a_origin_original",
+        "side_b_destination_original",
+    ),
+    (
+        "side_a_description_original",
+        "side_b_description_original",
+    ),
+)
 
 
 def get_electrical_terminal_runtime_config() -> dict:
@@ -1366,7 +1392,7 @@ def _extractor_schema() -> dict:
 
 def _verifier_schema() -> dict:
     return {
-        "name": "electrical_terminal_page_verifier_v1",
+        "name": "electrical_terminal_page_verifier_v1_1",
         "strict": True,
         "schema": {
             "type": "object",
@@ -1427,6 +1453,62 @@ def _verifier_schema() -> dict:
                             "pass",
                             "confidence",
                             "notes",
+                        ],
+                    },
+                },
+                "field_support_decisions": {
+                    "type": "array",
+                    "maxItems": 300,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "region_id": {"type": "string"},
+                            "row_id": {"type": "string"},
+                            "source_text_original": {"type": "string"},
+                            "source_slot_ids": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "maxItems": 12,
+                            },
+                            "visual_occurrence_count": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": 20,
+                            },
+                            "supported_fields": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string",
+                                    "enum": sorted(OVERRIDABLE_FIELDS),
+                                },
+                                "maxItems": 12,
+                            },
+                            "unsupported_fields": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string",
+                                    "enum": sorted(OVERRIDABLE_FIELDS),
+                                },
+                                "maxItems": 12,
+                            },
+                            "shared_semantics_explicitly_supported": {
+                                "type": "boolean"
+                            },
+                            "confidence": {"type": "number"},
+                            "reason": {"type": "string"},
+                        },
+                        "required": [
+                            "region_id",
+                            "row_id",
+                            "source_text_original",
+                            "source_slot_ids",
+                            "visual_occurrence_count",
+                            "supported_fields",
+                            "unsupported_fields",
+                            "shared_semantics_explicitly_supported",
+                            "confidence",
+                            "reason",
                         ],
                     },
                 },
@@ -1493,6 +1575,7 @@ def _verifier_schema() -> dict:
                 "all_terminal_numbers_visually_supported",
                 "all_published_fields_visually_supported",
                 "region_checks",
+                "field_support_decisions",
                 "field_overrides",
                 "missing_region_ids",
                 "missing_terminal_row_ids",
@@ -1679,7 +1762,20 @@ def _verifier_messages(
         "are visible. Provide a field override only when the image supports one "
         "unambiguous exact transcription; otherwise block. Return pass only when "
         "all rows and published fields are visually supported and every region "
-        "meets the requested minimum confidence."
+        "meets the requested minimum confidence. Treat physical column or "
+        "lane semantics as stronger evidence than the lexical shape of a "
+        "value. A token that resembles a potential, cable, color, or wire "
+        "code must not be assigned to that canonical field unless its "
+        "physical location supports the role. For every row where the same "
+        "non-empty visible text is assigned to more than one canonical "
+        "field, return a field_support_decision. Count distinct visible "
+        "occurrences, list supported and unsupported fields, and state "
+        "whether one physical cell explicitly carries multiple meanings. "
+        "When one occurrence has one unambiguous role, emit a field_override "
+        "with approved_text empty for every unsupported duplicate field and "
+        "then allow the page to pass. Block only when the visual role remains "
+        "ambiguous. Never duplicate a value into multiple fields merely "
+        "because its syntax could fit more than one role."
     )
     request = {
         "page_id": page["id"],
@@ -1689,6 +1785,12 @@ def _verifier_messages(
         "detector": detector,
         "proposal_region_ids": [p["region_id"] for p in proposals],
         "extractions": extractions,
+        "same_text_multi_field_candidates": (
+            _same_text_multi_field_candidates(extractions)
+        ),
+        "field_assignment_decision_version": (
+            FIELD_ASSIGNMENT_DECISION_VERSION
+        ),
         "row_min_confidence": ROW_MIN_CONFIDENCE,
         "page_pass_min_confidence": PAGE_PASS_MIN_CONFIDENCE,
     }
@@ -1697,7 +1799,10 @@ def _verifier_messages(
             "type": "text",
             "text": (
                 "Audit this page and all extracted terminal rows. Return exact "
-                "per-region sequences and only image-supported overrides.\n\n"
+                "per-region sequences, a field_support_decision for every "
+                "same-text multi-field assignment, and only image-supported "
+                "overrides. Clear unsupported duplicate fields rather than "
+                "blocking when the physical role is unambiguous.\n\n"
                 + json.dumps(request, ensure_ascii=False)
             ),
         },
@@ -1859,6 +1964,250 @@ def _apply_overrides(
         terminal[field] = approved
 
 
+
+def _normalized_field_value(value: Any) -> str:
+    return _clean_text(value, 1000).casefold()
+
+
+def _field_collisions(terminal: dict) -> list[dict]:
+    collisions: list[dict] = []
+    for group in FIELD_COLLISION_GROUPS:
+        by_value: dict[str, list[str]] = {}
+        original_by_value: dict[str, str] = {}
+        for field in group:
+            original = _clean_text(terminal.get(field), 1000)
+            normalized = _normalized_field_value(original)
+            if not normalized:
+                continue
+            by_value.setdefault(normalized, []).append(field)
+            original_by_value.setdefault(normalized, original)
+        for normalized, fields in by_value.items():
+            if len(fields) < 2:
+                continue
+            collisions.append(
+                {
+                    "normalized_value": normalized,
+                    "source_text_original": original_by_value[normalized],
+                    "fields": sorted(fields),
+                }
+            )
+    return collisions
+
+
+def _same_text_multi_field_candidates(
+    extractions: list[dict],
+) -> list[dict]:
+    candidates: list[dict] = []
+    for extraction in extractions:
+        rid = _clean_text(extraction.get("region_id"), 120)
+        for terminal in extraction.get("terminals") or []:
+            row_id = _clean_text(terminal.get("row_id"), 120)
+            for collision in _field_collisions(terminal):
+                candidates.append(
+                    {
+                        "region_id": rid,
+                        "row_id": row_id,
+                        "source_text_original": collision[
+                            "source_text_original"
+                        ],
+                        "assigned_fields": collision["fields"],
+                        "source_slot_ids": [
+                            str(x)
+                            for x in (
+                                terminal.get("source_slot_ids") or []
+                            )
+                            if str(x)
+                        ],
+                    }
+                )
+    return candidates
+
+
+def _decision_lookup(verifier: dict) -> dict[tuple[str, str, str], dict]:
+    lookup: dict[tuple[str, str, str], dict] = {}
+    for raw in verifier.get("field_support_decisions") or []:
+        if not isinstance(raw, dict):
+            continue
+        rid = _clean_text(raw.get("region_id"), 120)
+        row_id = _clean_text(raw.get("row_id"), 120)
+        value = _normalized_field_value(raw.get("source_text_original"))
+        if not rid or not row_id or not value:
+            continue
+        lookup[(rid, row_id, value)] = raw
+    return lookup
+
+
+def _apply_field_support_decisions(
+    extractions: list[dict],
+    decisions: list[dict],
+) -> None:
+    lookup: dict[tuple[str, str], dict] = {}
+    for extraction in extractions:
+        rid = _clean_text(extraction.get("region_id"), 120)
+        for terminal in extraction.get("terminals") or []:
+            row_id = _clean_text(terminal.get("row_id"), 120)
+            if rid and row_id:
+                lookup[(rid, row_id)] = terminal
+
+    for raw in decisions or []:
+        if not isinstance(raw, dict):
+            continue
+        rid = _clean_text(raw.get("region_id"), 120)
+        row_id = _clean_text(raw.get("row_id"), 120)
+        terminal = lookup.get((rid, row_id))
+        if not terminal:
+            continue
+
+        confidence = max(
+            0.0,
+            min(1.0, float(raw.get("confidence") or 0.0)),
+        )
+        source_text = _clean_text(raw.get("source_text_original"), 1000)
+        normalized = _normalized_field_value(source_text)
+        supported = {
+            str(x)
+            for x in (raw.get("supported_fields") or [])
+            if str(x) in OVERRIDABLE_FIELDS
+        }
+        unsupported = {
+            str(x)
+            for x in (raw.get("unsupported_fields") or [])
+            if str(x) in OVERRIDABLE_FIELDS
+        }
+        row_slots = {
+            str(x)
+            for x in (terminal.get("source_slot_ids") or [])
+            if str(x)
+        }
+        decision_slots = {
+            str(x)
+            for x in (raw.get("source_slot_ids") or [])
+            if str(x)
+        }
+
+        audit = {
+            "version": FIELD_ASSIGNMENT_DECISION_VERSION,
+            "source_text_original": source_text,
+            "source_slot_ids": sorted(decision_slots),
+            "visual_occurrence_count": int(
+                raw.get("visual_occurrence_count") or 0
+            ),
+            "supported_fields": sorted(supported),
+            "unsupported_fields": sorted(unsupported),
+            "shared_semantics_explicitly_supported": bool(
+                raw.get("shared_semantics_explicitly_supported")
+            ),
+            "confidence": confidence,
+            "reason": _clean_text(raw.get("reason"), 1200),
+            "applied": False,
+        }
+
+        terminal.setdefault(
+            "verifier_field_support_decisions",
+            [],
+        ).append(audit)
+
+        if confidence < PAGE_PASS_MIN_CONFIDENCE:
+            continue
+        if not normalized or not supported:
+            continue
+        if supported & unsupported:
+            continue
+        if decision_slots and not decision_slots.issubset(row_slots):
+            continue
+
+        matching_fields = {
+            field
+            for field in supported | unsupported
+            if _normalized_field_value(terminal.get(field)) == normalized
+        }
+        if not supported.issubset(matching_fields):
+            continue
+
+        changed = False
+        for field in unsupported:
+            if _normalized_field_value(terminal.get(field)) != normalized:
+                continue
+            before = _clean_text(terminal.get(field), 1000)
+            terminal.setdefault("verifier_overrides", {})[field] = {
+                "before": before,
+                "after": "",
+                "confidence": confidence,
+                "reason": (
+                    "Cleared by "
+                    f"{FIELD_ASSIGNMENT_DECISION_VERSION}: "
+                    + _clean_text(raw.get("reason"), 900)
+                ),
+            }
+            terminal[field] = ""
+            changed = True
+
+        audit["applied"] = bool(changed or not unsupported)
+
+
+def _field_collision_issues(
+    *,
+    terminal: dict,
+    region_id: str,
+    row_id: str,
+    verifier_decisions: dict[tuple[str, str, str], dict],
+) -> list[dict]:
+    issues: list[dict] = []
+    for collision in _field_collisions(terminal):
+        value = collision["normalized_value"]
+        fields = set(collision["fields"])
+        decision = verifier_decisions.get((region_id, row_id, value))
+        approved = False
+        if isinstance(decision, dict):
+            confidence = float(decision.get("confidence") or 0.0)
+            supported = {
+                str(x)
+                for x in (decision.get("supported_fields") or [])
+                if str(x) in OVERRIDABLE_FIELDS
+            }
+            unsupported = {
+                str(x)
+                for x in (decision.get("unsupported_fields") or [])
+                if str(x) in OVERRIDABLE_FIELDS
+            }
+            occurrence_count = int(
+                decision.get("visual_occurrence_count") or 0
+            )
+            shared = bool(
+                decision.get("shared_semantics_explicitly_supported")
+            )
+            approved = (
+                confidence >= PAGE_PASS_MIN_CONFIDENCE
+                and not unsupported
+                and fields.issubset(supported)
+                and (
+                    occurrence_count >= len(fields)
+                    or shared
+                )
+            )
+        if approved:
+            continue
+        issues.append(
+            {
+                "issue_type": (
+                    "terminal-single-visual-evidence-multi-field-unresolved"
+                ),
+                "severity": "high",
+                "message": (
+                    f"Row {region_id}/{row_id} publishes one visible value "
+                    f"{collision['source_text_original']!r} in multiple "
+                    f"canonical fields {sorted(fields)} without a verified "
+                    "multi-role field decision."
+                ),
+                "region_id": region_id,
+                "row_ids": [row_id],
+                "confidence": float(terminal.get("confidence") or 0.0),
+                "source_stage": "deterministic_validator",
+            }
+        )
+    return issues
+
+
 def _validate_page(
     *,
     page: dict,
@@ -1882,6 +2231,7 @@ def _validate_page(
         for x in extractions
         if isinstance(x, dict)
     }
+    verifier_decisions = _decision_lookup(verifier)
 
     if not detector.get("all_visible_strips_accounted_for"):
         issues.append(
@@ -2191,6 +2541,15 @@ def _validate_page(
                     }
                 )
             seen_physical_keys.add(physical_key)
+
+            issues.extend(
+                _field_collision_issues(
+                    terminal=item,
+                    region_id=rid,
+                    row_id=row_id,
+                    verifier_decisions=verifier_decisions,
+                )
+            )
 
             item["region_id"] = rid
             item["strip_tag_original"] = extraction_tag or detector_tag
@@ -2554,6 +2913,13 @@ def _db_publish_page_rows(
                     "source_slot_ids": item.get("source_slot_ids") or [],
                     "source_word_ids": source_word_ids,
                     "verifier_overrides": item.get("verifier_overrides") or {},
+                    "verifier_field_support_decisions": item.get(
+                        "verifier_field_support_decisions"
+                    )
+                    or [],
+                    "field_assignment_decision_version": (
+                        FIELD_ASSIGNMENT_DECISION_VERSION
+                    ),
                     "evidence_notes": item.get("evidence_notes") or "",
                     "detector_fingerprint": detector_fingerprint,
                     "extractor_fingerprint": extractor_fingerprints.get(
@@ -3003,6 +3369,12 @@ def extract_electrical_terminal_page(
             "extractor_fingerprints": extractor_fingerprints,
             "detector": detector,
             "extractions": extractions,
+            "same_text_multi_field_candidates": (
+                _same_text_multi_field_candidates(extractions)
+            ),
+            "field_assignment_decision_version": (
+                FIELD_ASSIGNMENT_DECISION_VERSION
+            ),
             "render_dpi": RENDER_DPI,
         }
         verifier, verifier_usage, verifier_reused, verifier_fp = _cached_call(
@@ -3037,6 +3409,10 @@ def extract_electrical_terminal_page(
             verifier_reused,
         )
 
+        _apply_field_support_decisions(
+            extractions,
+            verifier.get("field_support_decisions") or [],
+        )
         _apply_overrides(
             extractions,
             verifier.get("field_overrides") or [],

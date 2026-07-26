@@ -12,12 +12,12 @@ substitutions:
   _EXPECTED_EXTRACTOR_PROMPT: "mm-electrical-table-extractor-v2.2"
   _EXPECTED_VERIFIER_PROMPT: "mm-electrical-page-verifier-v2.7"
   _EXPECTED_MATERIALIZER_VERSION: "mm-electrical-structured-materializer-v2.7"
-  _EXPECTED_TERMINAL_MARKER: "phase2-terminals-v1-source-snapshot"
+  _EXPECTED_TERMINAL_MARKER: "phase2-terminals-v1.1-source-snapshot"
   _EXPECTED_TERMINAL_MODEL: "gpt-5.4"
   _EXPECTED_TERMINAL_DETECTOR_PROMPT: "mm-electrical-terminal-detector-v1"
   _EXPECTED_TERMINAL_EXTRACTOR_PROMPT: "mm-electrical-terminal-strip-extractor-v1"
-  _EXPECTED_TERMINAL_VERIFIER_PROMPT: "mm-electrical-terminal-page-verifier-v1"
-  _EXPECTED_TERMINAL_MATERIALIZER: "mm-electrical-terminal-materializer-v1"
+  _EXPECTED_TERMINAL_VERIFIER_PROMPT: "mm-electrical-terminal-page-verifier-v1.1"
+  _EXPECTED_TERMINAL_MATERIALIZER: "mm-electrical-terminal-materializer-v1.1"
 
 steps:
   - id: "01-source-preflight"
@@ -301,6 +301,76 @@ steps:
             'MICRO SERIE PROTEZIONE MACCHINA'
         ) is False
 
+        from electrical_terminals import (
+            _apply_field_support_decisions,
+            _decision_lookup,
+            _field_collision_issues,
+        )
+
+        ambiguous_terminal = {
+            'row_id': 'r8',
+            'source_slot_ids': ['S008'],
+            'confidence': 0.95,
+            'wire_number_original': '3L+',
+            'potential_original': '3L+',
+            'cable_reference_original': '',
+            'conductor_color_original': '',
+            'conductor_cross_section_original': '',
+            'side_a_origin_original': '',
+            'side_b_destination_original': '',
+            'side_a_description_original': '',
+            'side_b_description_original': '',
+        }
+        field_decision = {
+            'region_id': 'R1',
+            'row_id': 'r8',
+            'source_text_original': '3L+',
+            'source_slot_ids': ['S008'],
+            'visual_occurrence_count': 1,
+            'supported_fields': ['wire_number_original'],
+            'unsupported_fields': ['potential_original'],
+            'shared_semantics_explicitly_supported': False,
+            'confidence': 0.98,
+            'reason': 'Single visible cell belongs to one physical field lane.',
+        }
+        terminal_extractions = [{
+            'region_id': 'R1',
+            'terminals': [ambiguous_terminal],
+        }]
+        _apply_field_support_decisions(
+            terminal_extractions,
+            [field_decision],
+        )
+        assert ambiguous_terminal['wire_number_original'] == '3L+', ambiguous_terminal
+        assert ambiguous_terminal['potential_original'] == '', ambiguous_terminal
+        assert (
+            ambiguous_terminal['verifier_field_support_decisions'][0]['applied']
+            is True
+        ), ambiguous_terminal
+
+        decision_lookup = _decision_lookup({
+            'field_support_decisions': [field_decision],
+        })
+        assert _field_collision_issues(
+            terminal=ambiguous_terminal,
+            region_id='R1',
+            row_id='r8',
+            verifier_decisions=decision_lookup,
+        ) == []
+
+        unresolved_terminal = dict(ambiguous_terminal)
+        unresolved_terminal['potential_original'] = '3L+'
+        unresolved_terminal.pop('verifier_field_support_decisions', None)
+        unresolved_terminal.pop('verifier_overrides', None)
+        unresolved_issues = _field_collision_issues(
+            terminal=unresolved_terminal,
+            region_id='R1',
+            row_id='r8',
+            verifier_decisions={},
+        )
+        assert len(unresolved_issues) == 1, unresolved_issues
+        assert unresolved_issues[0]['severity'] == 'high', unresolved_issues
+
         required = {
             '/v1/ai/electrical/normalize',
             '/v1/ai/electrical/extract-structured',
@@ -389,7 +459,7 @@ steps:
           --revision-suffix="$${REV_SUFFIX}" \
           --timeout="600s" \
           --remove-env-vars="MM_ELECTRICAL_STRUCTURED_MODEL,MM_ELECTRICAL_STRUCTURED_PROMPT_VERSION,MM_ELECTRICAL_STRUCTURED_MIN_CONFIDENCE,MM_ELECTRICAL_STRUCTURED_MAX_WORDS_PER_PAGE" \
-          --update-env-vars="COMMIT_SHA=$COMMIT_SHA,MM_ELECTRICAL_STRUCTURED_ENABLED=1,MM_ELECTRICAL_STRUCTURED_DETECTOR_MODEL=gpt-5.4,MM_ELECTRICAL_STRUCTURED_EXTRACTOR_MODEL=gpt-5.4,MM_ELECTRICAL_STRUCTURED_VERIFIER_MODEL=gpt-5.4,MM_ELECTRICAL_STRUCTURED_DETECTOR_PROMPT_VERSION=mm-electrical-region-detector-v2,MM_ELECTRICAL_STRUCTURED_EXTRACTOR_PROMPT_VERSION=mm-electrical-table-extractor-v2.2,MM_ELECTRICAL_STRUCTURED_VERIFIER_PROMPT_VERSION=mm-electrical-page-verifier-v2.7,MM_ELECTRICAL_STRUCTURED_MATERIALIZER_VERSION=mm-electrical-structured-materializer-v2.7,MM_ELECTRICAL_STRUCTURED_ROW_MIN_CONFIDENCE=0.80,MM_ELECTRICAL_STRUCTURED_PAGE_PASS_MIN_CONFIDENCE=0.90,MM_ELECTRICAL_STRUCTURED_TEXT_RECONSTRUCTION_MIN_CONFIDENCE=0.90,MM_ELECTRICAL_STRUCTURED_RENDER_DPI=220,MM_ELECTRICAL_STRUCTURED_MAX_COMPLETION_TOKENS=16000,MM_ELECTRICAL_STRUCTURED_FETCH_TIMEOUT_SECONDS=60,MM_ELECTRICAL_STRUCTURED_TIMEOUT_SECONDS=240,MM_ELECTRICAL_STRUCTURED_MAX_SOURCE_BYTES=100000000,MM_ELECTRICAL_STRUCTURED_INPUT_USD_PER_MILLION=0,MM_ELECTRICAL_STRUCTURED_OUTPUT_USD_PER_MILLION=0,MM_ELECTRICAL_TERMINALS_ENABLED=1,MM_ELECTRICAL_TERMINALS_DETECTOR_MODEL=gpt-5.4,MM_ELECTRICAL_TERMINALS_EXTRACTOR_MODEL=gpt-5.4,MM_ELECTRICAL_TERMINALS_VERIFIER_MODEL=gpt-5.4,MM_ELECTRICAL_TERMINALS_DETECTOR_PROMPT_VERSION=mm-electrical-terminal-detector-v1,MM_ELECTRICAL_TERMINALS_EXTRACTOR_PROMPT_VERSION=mm-electrical-terminal-strip-extractor-v1,MM_ELECTRICAL_TERMINALS_VERIFIER_PROMPT_VERSION=mm-electrical-terminal-page-verifier-v1,MM_ELECTRICAL_TERMINALS_MATERIALIZER_VERSION=mm-electrical-terminal-materializer-v1,MM_ELECTRICAL_TERMINALS_ROW_MIN_CONFIDENCE=0.82,MM_ELECTRICAL_TERMINALS_PAGE_PASS_MIN_CONFIDENCE=0.90,MM_ELECTRICAL_TERMINALS_RENDER_DPI=220,MM_ELECTRICAL_TERMINALS_MAX_COMPLETION_TOKENS=16000,MM_ELECTRICAL_TERMINALS_FETCH_TIMEOUT_SECONDS=60,MM_ELECTRICAL_TERMINALS_TIMEOUT_SECONDS=240,MM_ELECTRICAL_TERMINALS_MAX_SOURCE_BYTES=100000000,MM_ELECTRICAL_TERMINALS_INPUT_USD_PER_MILLION=0,MM_ELECTRICAL_TERMINALS_OUTPUT_USD_PER_MILLION=0,MM_ELECTRICAL_SOURCE_SNAPSHOT_ENABLED=1,MM_ELECTRICAL_SOURCE_BUCKET=mm-ai-electrical-sources-443517556116,MM_ELECTRICAL_SOURCE_PREFIX=electrical-source-v1,MM_ELECTRICAL_SOURCE_TIMEOUT_SECONDS=90,MM_ELECTRICAL_SOURCE_MAX_BYTES=100000000" \
+          --update-env-vars="COMMIT_SHA=$COMMIT_SHA,MM_ELECTRICAL_STRUCTURED_ENABLED=1,MM_ELECTRICAL_STRUCTURED_DETECTOR_MODEL=gpt-5.4,MM_ELECTRICAL_STRUCTURED_EXTRACTOR_MODEL=gpt-5.4,MM_ELECTRICAL_STRUCTURED_VERIFIER_MODEL=gpt-5.4,MM_ELECTRICAL_STRUCTURED_DETECTOR_PROMPT_VERSION=mm-electrical-region-detector-v2,MM_ELECTRICAL_STRUCTURED_EXTRACTOR_PROMPT_VERSION=mm-electrical-table-extractor-v2.2,MM_ELECTRICAL_STRUCTURED_VERIFIER_PROMPT_VERSION=mm-electrical-page-verifier-v2.7,MM_ELECTRICAL_STRUCTURED_MATERIALIZER_VERSION=mm-electrical-structured-materializer-v2.7,MM_ELECTRICAL_STRUCTURED_ROW_MIN_CONFIDENCE=0.80,MM_ELECTRICAL_STRUCTURED_PAGE_PASS_MIN_CONFIDENCE=0.90,MM_ELECTRICAL_STRUCTURED_TEXT_RECONSTRUCTION_MIN_CONFIDENCE=0.90,MM_ELECTRICAL_STRUCTURED_RENDER_DPI=220,MM_ELECTRICAL_STRUCTURED_MAX_COMPLETION_TOKENS=16000,MM_ELECTRICAL_STRUCTURED_FETCH_TIMEOUT_SECONDS=60,MM_ELECTRICAL_STRUCTURED_TIMEOUT_SECONDS=240,MM_ELECTRICAL_STRUCTURED_MAX_SOURCE_BYTES=100000000,MM_ELECTRICAL_STRUCTURED_INPUT_USD_PER_MILLION=0,MM_ELECTRICAL_STRUCTURED_OUTPUT_USD_PER_MILLION=0,MM_ELECTRICAL_TERMINALS_ENABLED=1,MM_ELECTRICAL_TERMINALS_DETECTOR_MODEL=gpt-5.4,MM_ELECTRICAL_TERMINALS_EXTRACTOR_MODEL=gpt-5.4,MM_ELECTRICAL_TERMINALS_VERIFIER_MODEL=gpt-5.4,MM_ELECTRICAL_TERMINALS_DETECTOR_PROMPT_VERSION=mm-electrical-terminal-detector-v1,MM_ELECTRICAL_TERMINALS_EXTRACTOR_PROMPT_VERSION=mm-electrical-terminal-strip-extractor-v1,MM_ELECTRICAL_TERMINALS_VERIFIER_PROMPT_VERSION=mm-electrical-terminal-page-verifier-v1.1,MM_ELECTRICAL_TERMINALS_MATERIALIZER_VERSION=mm-electrical-terminal-materializer-v1.1,MM_ELECTRICAL_TERMINALS_ROW_MIN_CONFIDENCE=0.82,MM_ELECTRICAL_TERMINALS_PAGE_PASS_MIN_CONFIDENCE=0.90,MM_ELECTRICAL_TERMINALS_RENDER_DPI=220,MM_ELECTRICAL_TERMINALS_MAX_COMPLETION_TOKENS=16000,MM_ELECTRICAL_TERMINALS_FETCH_TIMEOUT_SECONDS=60,MM_ELECTRICAL_TERMINALS_TIMEOUT_SECONDS=240,MM_ELECTRICAL_TERMINALS_MAX_SOURCE_BYTES=100000000,MM_ELECTRICAL_TERMINALS_INPUT_USD_PER_MILLION=0,MM_ELECTRICAL_TERMINALS_OUTPUT_USD_PER_MILLION=0,MM_ELECTRICAL_SOURCE_SNAPSHOT_ENABLED=1,MM_ELECTRICAL_SOURCE_BUCKET=mm-ai-electrical-sources-443517556116,MM_ELECTRICAL_SOURCE_PREFIX=electrical-source-v1,MM_ELECTRICAL_SOURCE_TIMEOUT_SECONDS=90,MM_ELECTRICAL_SOURCE_MAX_BYTES=100000000" \
           --quiet
 
         gcloud run services describe "${_SERVICE}" \
