@@ -79,7 +79,7 @@ VERIFIER_PROMPT_VERSION = (
 ).strip()
 MATERIALIZER_VERSION = (
     os.environ.get("MM_ELECTRICAL_STRUCTURED_MATERIALIZER_VERSION")
-    or "mm-electrical-structured-materializer-v2"
+    or "mm-electrical-structured-materializer-v2.1"
 ).strip()
 
 OPENAI_TIMEOUT_SECONDS = _env_int(
@@ -301,10 +301,10 @@ def _fingerprint(
     model: str,
     request_payload: dict,
 ) -> tuple[str, str]:
+    # AI artifacts depend on the model, prompt and exact request only.
+    # Local publication/materializer changes must never force paid AI reruns.
     request_sha256 = _sha256_json(request_payload)
-    raw = "|".join(
-        [task_type, prompt_version, model, MATERIALIZER_VERSION, request_sha256]
-    )
+    raw = "|".join([task_type, prompt_version, model, request_sha256])
     return hashlib.sha256(raw.encode("utf-8")).hexdigest(), request_sha256
 
 
@@ -315,7 +315,7 @@ def _db_get_artifact(version_id: int, fingerprint: str) -> Optional[dict]:
             cur.execute(
                 """
                 SELECT id, status, response_json, input_tokens, output_tokens,
-                       reasoning_tokens, cost_usd, model, prompt_version
+                       reasoning_tokens, cost_usd, model, prompt_version, fingerprint
                 FROM public.electrical_ai_artifacts
                 WHERE version_id=%s AND fingerprint=%s
                 LIMIT 1;
@@ -335,6 +335,65 @@ def _db_get_artifact(version_id: int, fingerprint: str) -> Optional[dict]:
                 "cost_usd": float(row[6] or 0.0),
                 "model": str(row[7] or ""),
                 "prompt_version": str(row[8] or ""),
+                "fingerprint": str(row[9] or ""),
+            }
+    finally:
+        conn.close()
+
+def _db_get_artifact_by_request(
+    *,
+    version_id: int,
+    task_type: str,
+    model: str,
+    prompt_version: str,
+    request_sha256: str,
+) -> Optional[dict]:
+    """Backward-compatible cache lookup.
+
+    Earlier Phase 2 V2 fingerprints included MATERIALIZER_VERSION. Reuse the
+    already-paid AI response when task, model, prompt and exact request are the
+    same, even if only local publication logic changed.
+    """
+    conn = _db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, status, response_json, input_tokens, output_tokens,
+                       reasoning_tokens, cost_usd, model, prompt_version, fingerprint
+                FROM public.electrical_ai_artifacts
+                WHERE version_id=%s
+                  AND task_type=%s
+                  AND model=%s
+                  AND prompt_version=%s
+                  AND request_sha256=%s
+                  AND status IN ('completed','reused')
+                  AND response_json IS NOT NULL
+                ORDER BY completed_at DESC NULLS LAST, id DESC
+                LIMIT 1;
+                """,
+                (
+                    int(version_id),
+                    str(task_type),
+                    str(model),
+                    str(prompt_version),
+                    str(request_sha256),
+                ),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            return {
+                "id": int(row[0]),
+                "status": str(row[1] or ""),
+                "response_json": _json_obj(row[2], None),
+                "input_tokens": int(row[3] or 0),
+                "output_tokens": int(row[4] or 0),
+                "reasoning_tokens": int(row[5] or 0),
+                "cost_usd": float(row[6] or 0.0),
+                "model": str(row[7] or ""),
+                "prompt_version": str(row[8] or ""),
+                "fingerprint": str(row[9] or ""),
             }
     finally:
         conn.close()
@@ -485,6 +544,14 @@ def _cached_call(
         request_payload=request_payload,
     )
     existing = _db_get_artifact(int(context["version_id"]), fingerprint)
+    if not force and not existing:
+        existing = _db_get_artifact_by_request(
+            version_id=int(context["version_id"]),
+            task_type=task_type,
+            model=model,
+            prompt_version=prompt_version,
+            request_sha256=request_sha256,
+        )
     if (
         not force
         and existing
@@ -504,7 +571,12 @@ def _cached_call(
             usage=usage,
             reused=True,
         )
-        return existing["response_json"], usage, True, fingerprint
+        return (
+            existing["response_json"],
+            usage,
+            True,
+            str(existing.get("fingerprint") or fingerprint),
+        )
 
     artifact_id = _db_start_artifact(
         context=context,
@@ -768,6 +840,52 @@ def _word_map(page: dict) -> dict[int, dict]:
             "word_no": int(word[7] or 0) if len(word) > 7 else 0,
         }
     return out
+
+
+def _canonical_hardware_model_code(
+    value: Any,
+    *,
+    module_tag: str,
+    sheet_code: str,
+) -> tuple[str, str]:
+    """Return only a strongly code-like hardware model identifier.
+
+    Table headers often contain the module tag plus a functional description
+    (for example a channel count and I/O function). Those descriptions are not
+    hardware model numbers and must not be written into module_model. The raw
+    candidate and full header remain preserved in properties for audit.
+    """
+    raw = _clean_text(value, 240)
+    if not raw:
+        return "", "absent"
+
+    excluded = {
+        re.sub(r"[^a-z0-9]", "", str(module_tag or "").lower()),
+        re.sub(r"[^a-z0-9]", "", str(sheet_code or "").lower()),
+    }
+    excluded.discard("")
+
+    accepted: list[str] = []
+    seen: set[str] = set()
+    for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9._/\-]{3,}", raw):
+        normalized = re.sub(r"[^a-z0-9]", "", token.lower())
+        if not normalized or normalized in excluded:
+            continue
+        letters = sum(ch.isalpha() for ch in normalized)
+        digits = sum(ch.isdigit() for ch in normalized)
+        # Require a sufficiently distinctive mixed alphanumeric code. This
+        # rejects channel counts and prose while accepting identifiers such as
+        # SDI101, STO081 and 6ES7131-6BF01-0BA0.
+        if len(normalized) < 5 or letters < 2 or digits < 2:
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        accepted.append(token)
+
+    if not accepted:
+        return "", "not_visually_explicit"
+    return " ".join(accepted)[:200], "strong_code"
 
 
 def _rect_list(rect: fitz.Rect, digits: int = 2) -> list[float]:
@@ -1726,7 +1844,19 @@ def _validate_and_materialize(
             )
 
         module_tag = _clean_text(extraction.get("module_tag_original"), 200)
-        module_model = _clean_text(extraction.get("module_model_original"), 200)
+        module_model_candidate = _clean_text(
+            extraction.get("module_model_original"), 240
+        )
+        module_model, module_model_evidence_quality = (
+            _canonical_hardware_model_code(
+                module_model_candidate,
+                module_tag=module_tag,
+                sheet_code=str(page.get("sheet_code") or ""),
+            )
+        )
+        table_label_original = _clean_text(
+            extraction.get("table_label_original"), 500
+        )
         if not module_tag:
             fail("missing_module_tag", f"Region {rid} has no visually supported module tag", region_id=rid)
         header_ids = [
@@ -1895,6 +2025,12 @@ def _validate_and_materialize(
                         "region_bbox_pt": proposal["crop_bbox_pt"],
                         "module_header_source_word_ids": header_ids,
                         "module_header_source_text": header_text,
+                        "table_label_original": table_label_original,
+                        "module_model_original_candidate": module_model_candidate,
+                        "module_model_canonical": module_model,
+                        "module_model_evidence_quality": (
+                            module_model_evidence_quality
+                        ),
                         "detector_fingerprint": fingerprints.get("detector"),
                         "extractor_fingerprint": fingerprints.get(rid),
                         "verifier_fingerprint": fingerprints.get("verifier"),
