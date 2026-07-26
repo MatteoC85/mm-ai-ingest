@@ -12,6 +12,12 @@ substitutions:
   _EXPECTED_EXTRACTOR_PROMPT: "mm-electrical-table-extractor-v2.2"
   _EXPECTED_VERIFIER_PROMPT: "mm-electrical-page-verifier-v2.7"
   _EXPECTED_MATERIALIZER_VERSION: "mm-electrical-structured-materializer-v2.7"
+  _EXPECTED_TERMINAL_MARKER: "phase2-terminals-v1-source-snapshot"
+  _EXPECTED_TERMINAL_MODEL: "gpt-5.4"
+  _EXPECTED_TERMINAL_DETECTOR_PROMPT: "mm-electrical-terminal-detector-v1"
+  _EXPECTED_TERMINAL_EXTRACTOR_PROMPT: "mm-electrical-terminal-strip-extractor-v1"
+  _EXPECTED_TERMINAL_VERIFIER_PROMPT: "mm-electrical-terminal-page-verifier-v1"
+  _EXPECTED_TERMINAL_MATERIALIZER: "mm-electrical-terminal-materializer-v1"
 
 steps:
   - id: "01-source-preflight"
@@ -27,6 +33,7 @@ steps:
           main.py \
           electrical_semantic.py \
           electrical_structured.py \
+          electrical_terminals.py \
           electrical_source_store.py \
           requirements.txt
         do
@@ -40,6 +47,7 @@ steps:
           main.py \
           electrical_semantic.py \
           electrical_structured.py \
+          electrical_terminals.py \
           electrical_source_store.py
 
         echo "SOURCE PREFLIGHT: OK"
@@ -76,6 +84,14 @@ steps:
           -e PORT=8080 \
           -e MM_ELECTRICAL_SOURCE_SNAPSHOT_ENABLED=1 \
           -e MM_ELECTRICAL_SOURCE_BUCKET=mm-ai-electrical-sources-443517556116 \
+          -e MM_ELECTRICAL_TERMINALS_ENABLED=1 \
+          -e MM_ELECTRICAL_TERMINALS_DETECTOR_MODEL=${_EXPECTED_TERMINAL_MODEL} \
+          -e MM_ELECTRICAL_TERMINALS_EXTRACTOR_MODEL=${_EXPECTED_TERMINAL_MODEL} \
+          -e MM_ELECTRICAL_TERMINALS_VERIFIER_MODEL=${_EXPECTED_TERMINAL_MODEL} \
+          -e MM_ELECTRICAL_TERMINALS_DETECTOR_PROMPT_VERSION=${_EXPECTED_TERMINAL_DETECTOR_PROMPT} \
+          -e MM_ELECTRICAL_TERMINALS_EXTRACTOR_PROMPT_VERSION=${_EXPECTED_TERMINAL_EXTRACTOR_PROMPT} \
+          -e MM_ELECTRICAL_TERMINALS_VERIFIER_PROMPT_VERSION=${_EXPECTED_TERMINAL_VERIFIER_PROMPT} \
+          -e MM_ELECTRICAL_TERMINALS_MATERIALIZER_VERSION=${_EXPECTED_TERMINAL_MATERIALIZER} \
           "$${IMAGE}" >/dev/null
 
         READY=0
@@ -140,6 +156,48 @@ steps:
             version.get('electrical_structured_materializer_version')
             == '${_EXPECTED_MATERIALIZER_VERSION}'
         ), version
+
+        assert version.get('electrical_terminals_enabled') is True, version
+        assert (
+            version.get('electrical_terminals_pipeline_marker')
+            == '${_EXPECTED_TERMINAL_MARKER}'
+        ), version
+        assert (
+            version.get('electrical_terminals_detector_model')
+            == '${_EXPECTED_TERMINAL_MODEL}'
+        ), version
+        assert (
+            version.get('electrical_terminals_extractor_model')
+            == '${_EXPECTED_TERMINAL_MODEL}'
+        ), version
+        assert (
+            version.get('electrical_terminals_verifier_model')
+            == '${_EXPECTED_TERMINAL_MODEL}'
+        ), version
+        assert (
+            version.get('electrical_terminals_detector_prompt_version')
+            == '${_EXPECTED_TERMINAL_DETECTOR_PROMPT}'
+        ), version
+        assert (
+            version.get('electrical_terminals_extractor_prompt_version')
+            == '${_EXPECTED_TERMINAL_EXTRACTOR_PROMPT}'
+        ), version
+        assert (
+            version.get('electrical_terminals_verifier_prompt_version')
+            == '${_EXPECTED_TERMINAL_VERIFIER_PROMPT}'
+        ), version
+        assert (
+            version.get('electrical_terminals_materializer_version')
+            == '${_EXPECTED_TERMINAL_MATERIALIZER}'
+        ), version
+
+        from electrical_terminals import get_electrical_terminal_runtime_config
+        terminal_config = get_electrical_terminal_runtime_config()
+        assert terminal_config['enabled'] is True, terminal_config
+        assert (
+            terminal_config['pipeline_marker']
+            == '${_EXPECTED_TERMINAL_MARKER}'
+        ), terminal_config
 
         assert version.get('electrical_source_snapshot_enabled') is True, version
         assert (
@@ -246,6 +304,7 @@ steps:
         required = {
             '/v1/ai/electrical/normalize',
             '/v1/ai/electrical/extract-structured',
+            '/v1/ai/electrical/extract-terminals',
             '/v1/ai/electrical/source/snapshot',
         }
         missing = required - set(openapi.get('paths', {}))
@@ -330,7 +389,7 @@ steps:
           --revision-suffix="$${REV_SUFFIX}" \
           --timeout="600s" \
           --remove-env-vars="MM_ELECTRICAL_STRUCTURED_MODEL,MM_ELECTRICAL_STRUCTURED_PROMPT_VERSION,MM_ELECTRICAL_STRUCTURED_MIN_CONFIDENCE,MM_ELECTRICAL_STRUCTURED_MAX_WORDS_PER_PAGE" \
-          --update-env-vars="COMMIT_SHA=$COMMIT_SHA,MM_ELECTRICAL_STRUCTURED_ENABLED=1,MM_ELECTRICAL_STRUCTURED_DETECTOR_MODEL=gpt-5.4,MM_ELECTRICAL_STRUCTURED_EXTRACTOR_MODEL=gpt-5.4,MM_ELECTRICAL_STRUCTURED_VERIFIER_MODEL=gpt-5.4,MM_ELECTRICAL_STRUCTURED_DETECTOR_PROMPT_VERSION=mm-electrical-region-detector-v2,MM_ELECTRICAL_STRUCTURED_EXTRACTOR_PROMPT_VERSION=mm-electrical-table-extractor-v2.2,MM_ELECTRICAL_STRUCTURED_VERIFIER_PROMPT_VERSION=mm-electrical-page-verifier-v2.7,MM_ELECTRICAL_STRUCTURED_MATERIALIZER_VERSION=mm-electrical-structured-materializer-v2.7,MM_ELECTRICAL_STRUCTURED_ROW_MIN_CONFIDENCE=0.80,MM_ELECTRICAL_STRUCTURED_PAGE_PASS_MIN_CONFIDENCE=0.90,MM_ELECTRICAL_STRUCTURED_TEXT_RECONSTRUCTION_MIN_CONFIDENCE=0.90,MM_ELECTRICAL_STRUCTURED_RENDER_DPI=220,MM_ELECTRICAL_STRUCTURED_MAX_COMPLETION_TOKENS=16000,MM_ELECTRICAL_STRUCTURED_FETCH_TIMEOUT_SECONDS=60,MM_ELECTRICAL_STRUCTURED_TIMEOUT_SECONDS=240,MM_ELECTRICAL_STRUCTURED_MAX_SOURCE_BYTES=100000000,MM_ELECTRICAL_STRUCTURED_INPUT_USD_PER_MILLION=0,MM_ELECTRICAL_STRUCTURED_OUTPUT_USD_PER_MILLION=0,MM_ELECTRICAL_SOURCE_SNAPSHOT_ENABLED=1,MM_ELECTRICAL_SOURCE_BUCKET=mm-ai-electrical-sources-443517556116,MM_ELECTRICAL_SOURCE_PREFIX=electrical-source-v1,MM_ELECTRICAL_SOURCE_TIMEOUT_SECONDS=90,MM_ELECTRICAL_SOURCE_MAX_BYTES=100000000" \
+          --update-env-vars="COMMIT_SHA=$COMMIT_SHA,MM_ELECTRICAL_STRUCTURED_ENABLED=1,MM_ELECTRICAL_STRUCTURED_DETECTOR_MODEL=gpt-5.4,MM_ELECTRICAL_STRUCTURED_EXTRACTOR_MODEL=gpt-5.4,MM_ELECTRICAL_STRUCTURED_VERIFIER_MODEL=gpt-5.4,MM_ELECTRICAL_STRUCTURED_DETECTOR_PROMPT_VERSION=mm-electrical-region-detector-v2,MM_ELECTRICAL_STRUCTURED_EXTRACTOR_PROMPT_VERSION=mm-electrical-table-extractor-v2.2,MM_ELECTRICAL_STRUCTURED_VERIFIER_PROMPT_VERSION=mm-electrical-page-verifier-v2.7,MM_ELECTRICAL_STRUCTURED_MATERIALIZER_VERSION=mm-electrical-structured-materializer-v2.7,MM_ELECTRICAL_STRUCTURED_ROW_MIN_CONFIDENCE=0.80,MM_ELECTRICAL_STRUCTURED_PAGE_PASS_MIN_CONFIDENCE=0.90,MM_ELECTRICAL_STRUCTURED_TEXT_RECONSTRUCTION_MIN_CONFIDENCE=0.90,MM_ELECTRICAL_STRUCTURED_RENDER_DPI=220,MM_ELECTRICAL_STRUCTURED_MAX_COMPLETION_TOKENS=16000,MM_ELECTRICAL_STRUCTURED_FETCH_TIMEOUT_SECONDS=60,MM_ELECTRICAL_STRUCTURED_TIMEOUT_SECONDS=240,MM_ELECTRICAL_STRUCTURED_MAX_SOURCE_BYTES=100000000,MM_ELECTRICAL_STRUCTURED_INPUT_USD_PER_MILLION=0,MM_ELECTRICAL_STRUCTURED_OUTPUT_USD_PER_MILLION=0,MM_ELECTRICAL_TERMINALS_ENABLED=1,MM_ELECTRICAL_TERMINALS_DETECTOR_MODEL=gpt-5.4,MM_ELECTRICAL_TERMINALS_EXTRACTOR_MODEL=gpt-5.4,MM_ELECTRICAL_TERMINALS_VERIFIER_MODEL=gpt-5.4,MM_ELECTRICAL_TERMINALS_DETECTOR_PROMPT_VERSION=mm-electrical-terminal-detector-v1,MM_ELECTRICAL_TERMINALS_EXTRACTOR_PROMPT_VERSION=mm-electrical-terminal-strip-extractor-v1,MM_ELECTRICAL_TERMINALS_VERIFIER_PROMPT_VERSION=mm-electrical-terminal-page-verifier-v1,MM_ELECTRICAL_TERMINALS_MATERIALIZER_VERSION=mm-electrical-terminal-materializer-v1,MM_ELECTRICAL_TERMINALS_ROW_MIN_CONFIDENCE=0.82,MM_ELECTRICAL_TERMINALS_PAGE_PASS_MIN_CONFIDENCE=0.90,MM_ELECTRICAL_TERMINALS_RENDER_DPI=220,MM_ELECTRICAL_TERMINALS_MAX_COMPLETION_TOKENS=16000,MM_ELECTRICAL_TERMINALS_FETCH_TIMEOUT_SECONDS=60,MM_ELECTRICAL_TERMINALS_TIMEOUT_SECONDS=240,MM_ELECTRICAL_TERMINALS_MAX_SOURCE_BYTES=100000000,MM_ELECTRICAL_TERMINALS_INPUT_USD_PER_MILLION=0,MM_ELECTRICAL_TERMINALS_OUTPUT_USD_PER_MILLION=0,MM_ELECTRICAL_SOURCE_SNAPSHOT_ENABLED=1,MM_ELECTRICAL_SOURCE_BUCKET=mm-ai-electrical-sources-443517556116,MM_ELECTRICAL_SOURCE_PREFIX=electrical-source-v1,MM_ELECTRICAL_SOURCE_TIMEOUT_SECONDS=90,MM_ELECTRICAL_SOURCE_MAX_BYTES=100000000" \
           --quiet
 
         gcloud run services describe "${_SERVICE}" \
@@ -407,6 +466,12 @@ steps:
         EXPECTED_EXTRACTOR_PROMPT="${_EXPECTED_EXTRACTOR_PROMPT}" \
         EXPECTED_VERIFIER_PROMPT="${_EXPECTED_VERIFIER_PROMPT}" \
         EXPECTED_MATERIALIZER_VERSION="${_EXPECTED_MATERIALIZER_VERSION}" \
+        EXPECTED_TERMINAL_MARKER="${_EXPECTED_TERMINAL_MARKER}" \
+        EXPECTED_TERMINAL_MODEL="${_EXPECTED_TERMINAL_MODEL}" \
+        EXPECTED_TERMINAL_DETECTOR_PROMPT="${_EXPECTED_TERMINAL_DETECTOR_PROMPT}" \
+        EXPECTED_TERMINAL_EXTRACTOR_PROMPT="${_EXPECTED_TERMINAL_EXTRACTOR_PROMPT}" \
+        EXPECTED_TERMINAL_VERIFIER_PROMPT="${_EXPECTED_TERMINAL_VERIFIER_PROMPT}" \
+        EXPECTED_TERMINAL_MATERIALIZER="${_EXPECTED_TERMINAL_MATERIALIZER}" \
         python3 - <<'PY'
         import json
         import os
@@ -487,10 +552,44 @@ steps:
             version.get('electrical_structured_materializer_version')
             == os.environ['EXPECTED_MATERIALIZER_VERSION']
         ), version
+        assert version.get('electrical_terminals_enabled') is True, version
+        assert (
+            version.get('electrical_terminals_pipeline_marker')
+            == os.environ['EXPECTED_TERMINAL_MARKER']
+        ), version
+        assert (
+            version.get('electrical_terminals_detector_model')
+            == os.environ['EXPECTED_TERMINAL_MODEL']
+        ), version
+        assert (
+            version.get('electrical_terminals_extractor_model')
+            == os.environ['EXPECTED_TERMINAL_MODEL']
+        ), version
+        assert (
+            version.get('electrical_terminals_verifier_model')
+            == os.environ['EXPECTED_TERMINAL_MODEL']
+        ), version
+        assert (
+            version.get('electrical_terminals_detector_prompt_version')
+            == os.environ['EXPECTED_TERMINAL_DETECTOR_PROMPT']
+        ), version
+        assert (
+            version.get('electrical_terminals_extractor_prompt_version')
+            == os.environ['EXPECTED_TERMINAL_EXTRACTOR_PROMPT']
+        ), version
+        assert (
+            version.get('electrical_terminals_verifier_prompt_version')
+            == os.environ['EXPECTED_TERMINAL_VERIFIER_PROMPT']
+        ), version
+        assert (
+            version.get('electrical_terminals_materializer_version')
+            == os.environ['EXPECTED_TERMINAL_MATERIALIZER']
+        ), version
 
         required = {
             '/v1/ai/electrical/normalize',
             '/v1/ai/electrical/extract-structured',
+            '/v1/ai/electrical/extract-terminals',
             '/v1/ai/electrical/source/snapshot',
         }
         missing = required - set(openapi.get('paths', {}))
@@ -563,6 +662,12 @@ steps:
           EXPECTED_EXTRACTOR_PROMPT="${_EXPECTED_EXTRACTOR_PROMPT}" \
           EXPECTED_VERIFIER_PROMPT="${_EXPECTED_VERIFIER_PROMPT}" \
           EXPECTED_MATERIALIZER_VERSION="${_EXPECTED_MATERIALIZER_VERSION}" \
+          EXPECTED_TERMINAL_MARKER="${_EXPECTED_TERMINAL_MARKER}" \
+          EXPECTED_TERMINAL_MODEL="${_EXPECTED_TERMINAL_MODEL}" \
+          EXPECTED_TERMINAL_DETECTOR_PROMPT="${_EXPECTED_TERMINAL_DETECTOR_PROMPT}" \
+          EXPECTED_TERMINAL_EXTRACTOR_PROMPT="${_EXPECTED_TERMINAL_EXTRACTOR_PROMPT}" \
+          EXPECTED_TERMINAL_VERIFIER_PROMPT="${_EXPECTED_TERMINAL_VERIFIER_PROMPT}" \
+          EXPECTED_TERMINAL_MATERIALIZER="${_EXPECTED_TERMINAL_MATERIALIZER}" \
           python3 - <<'PY'
         import json
         import os
@@ -649,6 +754,39 @@ steps:
         assert (
             version.get('electrical_structured_materializer_version')
             == os.environ['EXPECTED_MATERIALIZER_VERSION']
+        ), version
+        assert version.get('electrical_terminals_enabled') is True, version
+        assert (
+            version.get('electrical_terminals_pipeline_marker')
+            == os.environ['EXPECTED_TERMINAL_MARKER']
+        ), version
+        assert (
+            version.get('electrical_terminals_detector_model')
+            == os.environ['EXPECTED_TERMINAL_MODEL']
+        ), version
+        assert (
+            version.get('electrical_terminals_extractor_model')
+            == os.environ['EXPECTED_TERMINAL_MODEL']
+        ), version
+        assert (
+            version.get('electrical_terminals_verifier_model')
+            == os.environ['EXPECTED_TERMINAL_MODEL']
+        ), version
+        assert (
+            version.get('electrical_terminals_detector_prompt_version')
+            == os.environ['EXPECTED_TERMINAL_DETECTOR_PROMPT']
+        ), version
+        assert (
+            version.get('electrical_terminals_extractor_prompt_version')
+            == os.environ['EXPECTED_TERMINAL_EXTRACTOR_PROMPT']
+        ), version
+        assert (
+            version.get('electrical_terminals_verifier_prompt_version')
+            == os.environ['EXPECTED_TERMINAL_VERIFIER_PROMPT']
+        ), version
+        assert (
+            version.get('electrical_terminals_materializer_version')
+            == os.environ['EXPECTED_TERMINAL_MATERIALIZER']
         ), version
 
         print('PROMOZIONE VERIFICATA: OK')

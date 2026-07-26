@@ -35,6 +35,11 @@ from electrical_structured import (
     extract_electrical_structured_version,
 )
 
+from electrical_terminals import (
+    get_electrical_terminal_runtime_config,
+    extract_electrical_terminal_page,
+)
+
 from electrical_source_store import (
     get_electrical_source_runtime_config,
     snapshot_electrical_source_pdf,
@@ -303,6 +308,13 @@ class ElectricalStructuredExtractRequest(BaseModel):
     pdf_page_numbers: Optional[List[int]] = None
     force: Optional[bool] = False
 
+class ElectricalTerminalExtractRequest(BaseModel):
+    company_id: str
+    machine_id: str
+    bubble_document_id: str
+    version_id: Optional[int] = None
+    pdf_page_numbers: Optional[List[int]] = None
+    force: Optional[bool] = False
 
 class ElectricalSourceSnapshotRequest(BaseModel):
     company_id: str
@@ -13100,6 +13112,7 @@ def ping():
 def version():
     semantic_config = get_electrical_semantic_runtime_config()
     structured_config = get_electrical_structured_runtime_config()
+    terminal_config = get_electrical_terminal_runtime_config()
     source_config = get_electrical_source_runtime_config()
 
     return {
@@ -13133,6 +13146,19 @@ def version():
         "electrical_structured_min_confidence": structured_config["min_confidence"],
         "electrical_structured_page_pass_min_confidence": structured_config["page_pass_min_confidence"],
         "electrical_structured_render_dpi": structured_config["render_dpi"],
+        
+        "electrical_terminals_enabled": terminal_config["enabled"],
+        "electrical_terminals_pipeline_marker": terminal_config["pipeline_marker"],
+        "electrical_terminals_detector_model": terminal_config["detector_model"],
+        "electrical_terminals_extractor_model": terminal_config["extractor_model"],
+        "electrical_terminals_verifier_model": terminal_config["verifier_model"],
+        "electrical_terminals_detector_prompt_version": terminal_config["detector_prompt_version"],
+        "electrical_terminals_extractor_prompt_version": terminal_config["extractor_prompt_version"],
+        "electrical_terminals_verifier_prompt_version": terminal_config["verifier_prompt_version"],
+        "electrical_terminals_materializer_version": terminal_config["materializer_version"],
+        "electrical_terminals_row_min_confidence": terminal_config["row_min_confidence"],
+        "electrical_terminals_page_pass_min_confidence": terminal_config["page_pass_min_confidence"],
+        "electrical_terminals_render_dpi": terminal_config["render_dpi"],
 
         "electrical_source_snapshot_enabled": source_config["enabled"],
         "electrical_source_snapshot_backend": source_config["backend"],
@@ -13335,6 +13361,65 @@ def extract_electrical_structured_document(
         raise HTTPException(
             status_code=500,
             detail=f"Electrical structured extraction failed: {str(e)[:1000]}",
+        )
+
+@app.post("/v1/ai/electrical/extract-terminals")
+def extract_electrical_terminals_document(
+    payload: ElectricalTerminalExtractRequest,
+    x_ai_internal_secret: Optional[str] = Header(default=None),
+):
+    if not AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=500, detail="AI_INTERNAL_SECRET missing")
+    if (x_ai_internal_secret or "").strip() != AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    company_id = str(payload.company_id or "").strip()
+    machine_id = str(payload.machine_id or "").strip()
+    bubble_document_id = str(payload.bubble_document_id or "").strip()
+    if not (company_id and machine_id and bubble_document_id):
+        raise HTTPException(
+            status_code=400,
+            detail="company_id, machine_id and bubble_document_id are required",
+        )
+
+    try:
+        result = extract_electrical_terminal_page(
+            company_id=company_id,
+            machine_id=machine_id,
+            bubble_document_id=bubble_document_id,
+            version_id=payload.version_id,
+            pdf_page_numbers=payload.pdf_page_numbers,
+            force=bool(payload.force),
+        )
+        print(
+            "ELECTRICAL_TERMINALS_READY",
+            json.dumps({
+                "company_id": company_id,
+                "machine_id": machine_id,
+                "bubble_document_id": bubble_document_id,
+                **result,
+            }, ensure_ascii=False),
+        )
+        return {"ok": True, **result}
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(
+            "ELECTRICAL_TERMINALS_FAIL",
+            json.dumps({
+                "company_id": company_id,
+                "machine_id": machine_id,
+                "bubble_document_id": bubble_document_id,
+                "version_id": payload.version_id,
+                "pdf_page_numbers": payload.pdf_page_numbers,
+                "error": str(e)[:2000],
+            }, ensure_ascii=False),
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Electrical terminal extraction failed: {str(e)[:1000]}",
         )
 
 def _strip_data_url_prefix(value: str) -> str:
