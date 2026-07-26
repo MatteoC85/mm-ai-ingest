@@ -75,11 +75,11 @@ EXTRACTOR_PROMPT_VERSION = (
 ).strip()
 VERIFIER_PROMPT_VERSION = (
     os.environ.get("MM_ELECTRICAL_STRUCTURED_VERIFIER_PROMPT_VERSION")
-    or "mm-electrical-page-verifier-v2.2"
+    or "mm-electrical-page-verifier-v2.3"
 ).strip()
 MATERIALIZER_VERSION = (
     os.environ.get("MM_ELECTRICAL_STRUCTURED_MATERIALIZER_VERSION")
-    or "mm-electrical-structured-materializer-v2.2"
+    or "mm-electrical-structured-materializer-v2.3"
 ).strip()
 
 OPENAI_TIMEOUT_SECONDS = _env_int(
@@ -114,7 +114,7 @@ MAX_SOURCE_BYTES = _env_int(
     "MM_ELECTRICAL_STRUCTURED_MAX_SOURCE_BYTES", 100_000_000, 1_000_000, 500_000_000
 )
 
-PIPELINE_MARKER = "phase2-vision-v2.2-source-snapshot"
+PIPELINE_MARKER = "phase2-vision-v2.3-source-snapshot"
 EXTRACTION_METHOD = "openai_vision_structured_v2"
 PHASE_NAME = "structured_vision_v2"
 IO_PAGE_TYPES = {"plc_io_table", "safety_io_table"}
@@ -139,6 +139,7 @@ ROW_ROLES = {
     "other_data",
 }
 SEVERITIES = {"info", "warning", "high", "critical"}
+VISUAL_TEXT_FIELDS = {"signal_name", "description", "expected_normal_state"}
 
 
 def _db_conn():
@@ -1415,7 +1416,7 @@ def _extractor_schema() -> dict:
 
 def _verifier_schema() -> dict:
     return {
-        "name": "electrical_io_page_verifier_v2",
+        "name": "electrical_io_page_verifier_v2_3",
         "strict": True,
         "schema": {
             "type": "object",
@@ -1425,18 +1426,9 @@ def _verifier_schema() -> dict:
                 "verdict": {"type": "string", "enum": ["pass", "block"]},
                 "all_visible_tables_accounted_for": {"type": "boolean"},
                 "all_visible_physical_rows_accounted_for": {"type": "boolean"},
-                "module_headers_consistent": {"type": "boolean"},
-                "all_published_text_character_equivalent_to_source": {
-                    "type": "boolean"
-                },
-                "all_visible_fragmented_text_safely_reconstructed": {
-                    "type": "boolean"
-                },
-                "unsupported_text_row_ids": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "maxItems": 200,
-                },
+                "all_module_tags_supported_by_own_headers": {"type": "boolean"},
+                "all_published_text_visually_supported": {"type": "boolean"},
+                "all_visible_text_resolved_or_blocked": {"type": "boolean"},
                 "sheet_code_used_as_module_tag_without_visual_support": {
                     "type": "boolean"
                 },
@@ -1451,6 +1443,8 @@ def _verifier_schema() -> dict:
                             "module_tag_original": {"type": "string"},
                             "visible_physical_row_count": {"type": "integer"},
                             "accounted_physical_row_count": {"type": "integer"},
+                            "visible_text_row_count": {"type": "integer"},
+                            "supported_text_row_count": {"type": "integer"},
                             "pass": {"type": "boolean"},
                             "reason": {"type": "string"},
                         },
@@ -1459,8 +1453,62 @@ def _verifier_schema() -> dict:
                             "module_tag_original",
                             "visible_physical_row_count",
                             "accounted_physical_row_count",
+                            "visible_text_row_count",
+                            "supported_text_row_count",
                             "pass",
                             "reason",
+                        ],
+                    },
+                },
+                "text_overrides": {
+                    "type": "array",
+                    "maxItems": 240,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "region_id": {"type": "string"},
+                            "row_id": {"type": "string"},
+                            "field_name": {
+                                "type": "string",
+                                "enum": sorted(VISUAL_TEXT_FIELDS),
+                            },
+                            "approved_text": {"type": "string"},
+                            "confidence": {"type": "number"},
+                            "reason": {"type": "string"},
+                        },
+                        "required": [
+                            "region_id",
+                            "row_id",
+                            "field_name",
+                            "approved_text",
+                            "confidence",
+                            "reason",
+                        ],
+                    },
+                },
+                "blocked_text_rows": {
+                    "type": "array",
+                    "maxItems": 240,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "region_id": {"type": "string"},
+                            "row_id": {"type": "string"},
+                            "field_name": {
+                                "type": "string",
+                                "enum": sorted(VISUAL_TEXT_FIELDS | {"all_free_text"}),
+                            },
+                            "reason": {"type": "string"},
+                            "confidence": {"type": "number"},
+                        },
+                        "required": [
+                            "region_id",
+                            "row_id",
+                            "field_name",
+                            "reason",
+                            "confidence",
                         ],
                     },
                 },
@@ -1501,12 +1549,13 @@ def _verifier_schema() -> dict:
                 "verdict",
                 "all_visible_tables_accounted_for",
                 "all_visible_physical_rows_accounted_for",
-                "module_headers_consistent",
-                "all_published_text_character_equivalent_to_source",
-                "all_visible_fragmented_text_safely_reconstructed",
-                "unsupported_text_row_ids",
+                "all_module_tags_supported_by_own_headers",
+                "all_published_text_visually_supported",
+                "all_visible_text_resolved_or_blocked",
                 "sheet_code_used_as_module_tag_without_visual_support",
                 "region_checks",
+                "text_overrides",
+                "blocked_text_rows",
                 "missing_region_ids",
                 "missing_row_ids",
                 "duplicate_row_keys",
@@ -1647,16 +1696,39 @@ def _verifier_messages(
     detector: dict,
     proposals: list[dict],
     extractions: list[dict],
-    image: bytes,
+    page_image: bytes,
+    region_images: dict[str, bytes],
 ) -> list[dict]:
+    proposal_by_id = {p["region_id"]: p for p in proposals}
     extraction_summary = []
     for extraction in extractions:
+        rid = _clean_text(extraction.get("region_id"), 120)
+        proposal = proposal_by_id.get(rid) or {}
+        header_count = max(
+            0,
+            min(
+                int(extraction.get("visible_header_row_count") or 0),
+                len(proposal.get("row_candidates") or []),
+            ),
+        )
+        header_source_text = " | ".join(
+            _clean_text(row.get("word_text_original"), 800)
+            for row in (proposal.get("row_candidates") or [])[:header_count]
+            if _clean_text(row.get("word_text_original"), 800)
+        )
         rows = extraction.get("row_results") or []
         extraction_summary.append(
             {
-                "region_id": extraction.get("region_id"),
+                "region_id": rid,
+                "module_header_source_text": header_source_text,
                 "module_tag_original": extraction.get("module_tag_original"),
-                "module_model_original": extraction.get("module_model_original"),
+                # This is only a hardware-model candidate. It is allowed to be
+                # empty or incomplete and must never be compared with the full
+                # visible header.
+                "module_hardware_model_candidate": extraction.get(
+                    "module_model_original"
+                ),
+                "table_label_original": extraction.get("table_label_original"),
                 "io_type": extraction.get("io_type"),
                 "visible_header_row_count": extraction.get(
                     "visible_header_row_count"
@@ -1674,13 +1746,21 @@ def _verifier_messages(
                         "wire_reference_original": row.get("wire_reference_original"),
                         "terminal_reference_original": row.get("terminal_reference_original"),
                         "signal_name_original": row.get("signal_name_original"),
-                        "signal_name_normalized": row.get("signal_name_normalized"),
+                        "signal_name_candidate": row.get("signal_name_normalized"),
                         "description_original": row.get("description_original"),
-                        "description_normalized": row.get("description_normalized"),
-                        "expected_normal_state_original": row.get("expected_normal_state_original"),
-                        "expected_normal_state_normalized": row.get("expected_normal_state_normalized"),
-                        "text_reconstruction_confidence": row.get("text_reconstruction_confidence"),
-                        "text_reconstruction_note": row.get("text_reconstruction_note"),
+                        "description_candidate": row.get("description_normalized"),
+                        "expected_normal_state_original": row.get(
+                            "expected_normal_state_original"
+                        ),
+                        "expected_normal_state_candidate": row.get(
+                            "expected_normal_state_normalized"
+                        ),
+                        "text_reconstruction_confidence": row.get(
+                            "text_reconstruction_confidence"
+                        ),
+                        "text_reconstruction_note": row.get(
+                            "text_reconstruction_note"
+                        ),
                         "is_placeholder": row.get("is_placeholder"),
                     }
                     for row in rows
@@ -1691,26 +1771,43 @@ def _verifier_messages(
                 ],
             }
         )
+
     system = (
-        "You are an independent senior reviewer of an electrical-schematic extraction. "
-        "Re-read the full page image; do not trust the prior detector or extractor. "
-        "Verify that every visible I/O table is represented separately, every physical "
-        "body row is accounted for, module tags come from their own visible headers, "
-        "and the page sheet code has not been mistaken for a module tag. Independently "
-        "compare every *_normalized free-text value with the crop and its *_original "
-        "value. Normalized text may repair only artificial word-boundary/spacing "
-        "fragmentation; it must preserve the original language and the same alphanumeric "
-        "characters in the same order, with no translation, paraphrase, spelling guess, "
-        "or invented technical term. Mark unsupported_text_row_ids and block the page if "
-        "a normalized value changes meaning or if visually readable fragmented text "
-        "remains unreconstructed. Placeholder, unused, power, and connector rows count "
-        "as physical rows. Repeated source module tags are allowed when the drawing "
-        "visibly repeats them; report them but do not auto-correct them. Return pass only "
-        "when the page is complete and all published text is safe. The source may be in "
-        "any language; reason semantically and preserve original evidence."
+        "You are the independent visual adjudication stage of an industrial "
+        "electrical-schematic reader. Re-read the complete page and every supplied "
+        "high-resolution table crop. The source may be in any language. Do not trust "
+        "OCR spacing or the previous extraction when the image contradicts it. Verify "
+        "that every visible table and physical body row is accounted for and that each "
+        "module tag comes from its own header. The field "
+        "module_hardware_model_candidate is optional and is NOT the full header; do not "
+        "fail a region merely because it is blank, contains only a functional label, or "
+        "does not repeat words such as a generic device label. A hardware model is valid "
+        "only when a distinct model/code is actually visible. "
+        "For each non-placeholder row with free text, compare the candidate against the "
+        "high-resolution crop. In region_checks, visible_text_row_count and "
+        "supported_text_row_count count only included non-placeholder rows that have "
+        "at least one non-empty signal, description, or expected-state field. If the "
+        "candidate is already an exact readable visual "
+        "transcription, leave it unchanged. If OCR introduced or split characters and "
+        "the crop clearly supports the exact printed text, return a text_override with "
+        "the exact visible transcription. Return a separate override for every affected "
+        "field, including both signal_name and description when they repeat the same "
+        "visible text. Such an override may correct OCR characters, word boundaries, "
+        "punctuation, or spacing, but must preserve the original "
+        "language and must not translate, paraphrase, expand abbreviations, infer hidden "
+        "meaning, or invent technical terms. If an extractor row has "
+        "text_reconstruction_confidence below 0.90, return an override for every "
+        "non-empty free-text field even when the approved transcription is unchanged; "
+        "this records independent visual confirmation. If the crop is ambiguous, add "
+        "the field to blocked_text_rows instead of guessing. Count every reviewed "
+        "non-placeholder "
+        "text row in each region. Return pass only when all visible content is complete "
+        "and every published text value is either visually confirmed or safely corrected."
     )
     user_text = (
-        "Audit this complete page against the proposed regions and extracted rows.\n\n"
+        "Audit this page and adjudicate exact visible text. The full page is followed "
+        "by one high-resolution crop for every region. Return overrides only where the "
+        "candidate needs correction.\n\n"
         + json.dumps(
             {
                 "page_id": page["id"],
@@ -1724,9 +1821,43 @@ def _verifier_messages(
             ensure_ascii=False,
         )
     )
+    content: list[dict] = [
+        {"type": "text", "text": user_text},
+        {"type": "text", "text": "FULL PAGE IMAGE"},
+        {
+            "type": "image_url",
+            "image_url": {
+                "url": _data_url_png(page_image),
+                "detail": "original",
+            },
+        },
+    ]
+    for proposal in proposals:
+        rid = proposal["region_id"]
+        crop = region_images.get(rid)
+        if not crop:
+            continue
+        content.extend(
+            [
+                {
+                    "type": "text",
+                    "text": (
+                        f"HIGH-RESOLUTION REGION CROP {rid}; red labels identify "
+                        "deterministic row IDs."
+                    ),
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": _data_url_png(crop),
+                        "detail": "original",
+                    },
+                },
+            ]
+        )
     return [
         {"role": "system", "content": system},
-        {"role": "user", "content": _image_message(user_text, image)},
+        {"role": "user", "content": content},
     ]
 
 
@@ -1872,6 +2003,51 @@ def _validate_and_materialize(
             )
         )
 
+    text_override_map: dict[tuple[str, str, str], dict] = {}
+    used_text_override_keys: set[tuple[str, str, str]] = set()
+    for item in verifier.get("text_overrides") or []:
+        rid = _clean_text(item.get("region_id"), 120)
+        row_id = _clean_text(item.get("row_id"), 50)
+        field_name = _clean_text(item.get("field_name"), 80)
+        key = (rid, row_id, field_name)
+        if not rid or not row_id or field_name not in VISUAL_TEXT_FIELDS:
+            fail(
+                "invalid_verifier_text_override",
+                "Verifier returned an invalid text override key",
+                region_id=rid,
+                row_ids=[row_id] if row_id else [],
+                field_name=field_name,
+            )
+            continue
+        if key in text_override_map:
+            fail(
+                "duplicate_verifier_text_override",
+                "Verifier returned the same text override more than once",
+                region_id=rid,
+                row_ids=[row_id],
+                field_name=field_name,
+            )
+            continue
+        text_override_map[key] = item
+
+    blocked_text_keys: set[tuple[str, str, str]] = set()
+    for item in verifier.get("blocked_text_rows") or []:
+        rid = _clean_text(item.get("region_id"), 120)
+        row_id = _clean_text(item.get("row_id"), 50)
+        field_name = _clean_text(item.get("field_name"), 80)
+        if field_name not in VISUAL_TEXT_FIELDS | {"all_free_text"}:
+            field_name = "all_free_text"
+        blocked_text_keys.add((rid, row_id, field_name))
+        fail(
+            "verifier_blocked_text_row",
+            f"Verifier could not safely transcribe {field_name} for region {rid} row {row_id}",
+            region_id=rid,
+            row_ids=[row_id] if row_id else [],
+            field_name=field_name,
+            verifier_reason=_clean_text(item.get("reason"), 1000),
+            verifier_confidence=_clamp_conf(item.get("confidence")),
+        )
+
     if int(detector.get("page_id") or 0) != int(page["id"]):
         fail("detector_page_id_mismatch", "Detector returned a different page_id")
     if not bool(detector.get("all_visible_io_tables_accounted_for")):
@@ -1910,6 +2086,7 @@ def _validate_and_materialize(
 
     io_rows: list[dict] = []
     region_stats: list[dict] = []
+    region_text_row_counts: dict[str, int] = {}
     for proposal in proposals:
         rid = proposal["region_id"]
         assessment = assessments.get(rid) or {}
@@ -1975,13 +2152,6 @@ def _validate_and_materialize(
         module_model_candidate = _clean_text(
             extraction.get("module_model_original"), 240
         )
-        module_model, module_model_evidence_quality = (
-            _canonical_hardware_model_code(
-                module_model_candidate,
-                module_tag=module_tag,
-                sheet_code=str(page.get("sheet_code") or ""),
-            )
-        )
         table_label_original = _clean_text(
             extraction.get("table_label_original"), 500
         )
@@ -2013,6 +2183,18 @@ def _validate_and_materialize(
                 module_tag=module_tag,
                 header_text=header_text,
             )
+
+        # Publish a hardware model only when the extractor explicitly selected
+        # a strong code-like candidate from the header. The full header remains
+        # audit evidence, but generic labels, electrical ratings, and functional
+        # descriptions are never promoted to module_model.
+        module_model, module_model_evidence_quality = (
+            _canonical_hardware_model_code(
+                module_model_candidate,
+                module_tag=module_tag,
+                sheet_code=str(page.get("sheet_code") or ""),
+            )
+        )
 
         included_rows = [row for row in row_results if bool(row.get("include_in_io"))]
         if len(included_rows) != physical_count:
@@ -2091,69 +2273,137 @@ def _validate_and_materialize(
                 "blank_unused",
             }
 
-            text_reconstruction_confidence = _clamp_conf(
+            extractor_text_confidence = _clamp_conf(
                 result.get("text_reconstruction_confidence")
             )
-            original_signal_name = _clean_text(
-                result.get("signal_name_original"), 700
-            )
-            original_description = _clean_text(
-                result.get("description_original"), 1600
-            )
-            original_expected_normal_state = _clean_text(
-                result.get("expected_normal_state_original"), 500
-            )
+            original_text_values = {
+                "signal_name": _clean_text(
+                    result.get("signal_name_original"), 700
+                ),
+                "description": _clean_text(
+                    result.get("description_original"), 1600
+                ),
+                "expected_normal_state": _clean_text(
+                    result.get("expected_normal_state_original"), 500
+                ),
+            }
+            extractor_candidates = {
+                "signal_name": _clean_text(
+                    result.get("signal_name_normalized"), 700
+                ) or original_text_values["signal_name"],
+                "description": _clean_text(
+                    result.get("description_normalized"), 1600
+                ) or original_text_values["description"],
+                "expected_normal_state": _clean_text(
+                    result.get("expected_normal_state_normalized"), 500
+                ) or original_text_values["expected_normal_state"],
+            }
+            max_lengths = {
+                "signal_name": 700,
+                "description": 1600,
+                "expected_normal_state": 500,
+            }
+            approved_text_values: dict[str, str] = {}
+            approved_text_sources: dict[str, str] = {}
+            approved_text_confidences: dict[str, float] = {}
+            verifier_override_properties: dict[str, dict] = {}
 
-            normalized_signal_name = _safe_normalized_display_text(
-                original=original_signal_name,
-                normalized=result.get("signal_name_normalized"),
-                max_len=700,
-                field_name="signal_name",
-                region_id=rid,
-                row_id=row_id,
-                fail=fail,
-            )
-            normalized_description = _safe_normalized_display_text(
-                original=original_description,
-                normalized=result.get("description_normalized"),
-                max_len=1600,
-                field_name="description",
-                region_id=rid,
-                row_id=row_id,
-                fail=fail,
-            )
-            normalized_expected_normal_state = _safe_normalized_display_text(
-                original=original_expected_normal_state,
-                normalized=result.get("expected_normal_state_normalized"),
-                max_len=500,
-                field_name="expected_normal_state",
-                region_id=rid,
-                row_id=row_id,
-                fail=fail,
-            )
+            for field_name in sorted(VISUAL_TEXT_FIELDS):
+                if (
+                    (rid, row_id, "all_free_text") in blocked_text_keys
+                    or (rid, row_id, field_name) in blocked_text_keys
+                ):
+                    approved_text_values[field_name] = ""
+                    approved_text_sources[field_name] = "blocked"
+                    approved_text_confidences[field_name] = 0.0
+                    continue
 
-            has_free_text = bool(
-                original_signal_name
-                or original_description
-                or original_expected_normal_state
+                key = (rid, row_id, field_name)
+                override = text_override_map.get(key)
+                if override is not None:
+                    approved = _clean_text(
+                        override.get("approved_text"),
+                        max_lengths[field_name],
+                    )
+                    confidence = _clamp_conf(override.get("confidence"))
+                    if not approved and (
+                        original_text_values[field_name]
+                        or extractor_candidates[field_name]
+                    ):
+                        fail(
+                            "empty_verifier_text_override",
+                            f"Verifier returned an empty approved {field_name}",
+                            region_id=rid,
+                            row_ids=[row_id],
+                            field_name=field_name,
+                        )
+                    if confidence < TEXT_RECONSTRUCTION_MIN_CONFIDENCE:
+                        fail(
+                            "verifier_text_override_confidence_below_threshold",
+                            f"Verifier override confidence is too low for {field_name}",
+                            region_id=rid,
+                            row_ids=[row_id],
+                            field_name=field_name,
+                            verifier_confidence=confidence,
+                            threshold=TEXT_RECONSTRUCTION_MIN_CONFIDENCE,
+                        )
+                    approved_text_values[field_name] = approved
+                    approved_text_sources[field_name] = "visual_verifier_override"
+                    approved_text_confidences[field_name] = confidence
+                    verifier_override_properties[field_name] = {
+                        "approved_text": approved,
+                        "confidence": confidence,
+                        "reason": _clean_text(override.get("reason"), 1000),
+                    }
+                    used_text_override_keys.add(key)
+                else:
+                    approved_text_values[field_name] = extractor_candidates[
+                        field_name
+                    ]
+                    approved_text_sources[field_name] = "extractor_visual_candidate"
+                    approved_text_confidences[field_name] = (
+                        extractor_text_confidence
+                    )
+
+            has_free_text = any(original_text_values.values()) or any(
+                approved_text_values.values()
             )
-            if (
-                has_free_text
-                and not is_placeholder
-                and text_reconstruction_confidence
-                < TEXT_RECONSTRUCTION_MIN_CONFIDENCE
-            ):
-                fail(
-                    "text_reconstruction_confidence_below_threshold",
-                    f"Region {rid} row {row_id} text reconstruction confidence "
-                    "is below the publication threshold",
-                    region_id=rid,
-                    row_ids=[row_id],
-                    text_reconstruction_confidence=(
-                        text_reconstruction_confidence
-                    ),
-                    threshold=TEXT_RECONSTRUCTION_MIN_CONFIDENCE,
-                )
+            if has_free_text and not is_placeholder:
+                region_text_row_counts[rid] = int(
+                    region_text_row_counts.get(rid, 0)
+                ) + 1
+                nonempty_confidences = [
+                    approved_text_confidences[field_name]
+                    for field_name in VISUAL_TEXT_FIELDS
+                    if (
+                        original_text_values[field_name]
+                        or approved_text_values[field_name]
+                    )
+                ]
+                final_text_confidence = min(nonempty_confidences or [0.0])
+                if final_text_confidence < TEXT_RECONSTRUCTION_MIN_CONFIDENCE:
+                    fail(
+                        "visual_text_confidence_below_threshold",
+                        f"Region {rid} row {row_id} exact visual text confidence "
+                        "is below the publication threshold",
+                        region_id=rid,
+                        row_ids=[row_id],
+                        text_confidence=final_text_confidence,
+                        threshold=TEXT_RECONSTRUCTION_MIN_CONFIDENCE,
+                    )
+            else:
+                final_text_confidence = extractor_text_confidence
+
+            normalized_signal_name = approved_text_values["signal_name"]
+            normalized_description = approved_text_values["description"]
+            normalized_expected_normal_state = approved_text_values[
+                "expected_normal_state"
+            ]
+            original_signal_name = original_text_values["signal_name"]
+            original_description = original_text_values["description"]
+            original_expected_normal_state = original_text_values[
+                "expected_normal_state"
+            ]
 
             io_type = str(extraction.get("io_type") or "other")
             if io_type not in IO_TYPES:
@@ -2221,11 +2471,20 @@ def _validate_and_materialize(
                             module_model_evidence_quality
                         ),
                         "text_reconstruction_confidence": (
-                            text_reconstruction_confidence
+                            final_text_confidence
                         ),
                         "text_reconstruction_note": _clean_text(
                             result.get("text_reconstruction_note"), 800
                         ),
+                        "vector_row_text_original": source_text,
+                        "extractor_candidate": extractor_candidates,
+                        "published_visual_text": approved_text_values,
+                        "visual_text_source": approved_text_sources,
+                        "visual_text_confidence": approved_text_confidences,
+                        "verifier_text_overrides": (
+                            verifier_override_properties
+                        ),
+                        # Backward-compatible alias used by existing SQL/UI.
                         "normalized": {
                             "signal_name": normalized_signal_name,
                             "description": normalized_description,
@@ -2277,32 +2536,27 @@ def _validate_and_materialize(
     for field, code in [
         ("all_visible_tables_accounted_for", "verifier_missing_table"),
         ("all_visible_physical_rows_accounted_for", "verifier_missing_rows"),
-        ("module_headers_consistent", "verifier_module_header_inconsistency"),
         (
-            "all_published_text_character_equivalent_to_source",
-            "verifier_text_not_character_equivalent",
+            "all_module_tags_supported_by_own_headers",
+            "verifier_module_tag_header_inconsistency",
         ),
         (
-            "all_visible_fragmented_text_safely_reconstructed",
-            "verifier_text_fragmentation_not_resolved",
+            "all_published_text_visually_supported",
+            "verifier_text_not_visually_supported",
+        ),
+        (
+            "all_visible_text_resolved_or_blocked",
+            "verifier_text_review_incomplete",
         ),
     ]:
         if not bool(verifier.get(field)):
             fail(code, f"Independent verifier returned {field}=false")
-    unsupported_text_row_ids = [
-        _clean_text(x, 80)
-        for x in (verifier.get("unsupported_text_row_ids") or [])
-        if _clean_text(x, 80)
-    ]
-    if unsupported_text_row_ids:
-        fail(
-            "verifier_unsupported_normalized_text",
-            "Verifier found normalized text that is unsupported or still fragmented",
-            row_ids=unsupported_text_row_ids,
-        )
 
     if bool(verifier.get("sheet_code_used_as_module_tag_without_visual_support")):
-        fail("sheet_code_confused_with_module_tag", "Verifier detected a page sheet code used as a module tag")
+        fail(
+            "sheet_code_confused_with_module_tag",
+            "Verifier detected a page sheet code used as a module tag",
+        )
     if verifier.get("missing_region_ids") or verifier.get("missing_row_ids"):
         fail(
             "verifier_declared_missing_content",
@@ -2330,6 +2584,14 @@ def _validate_and_materialize(
             threshold=PAGE_PASS_MIN_CONFIDENCE,
         )
 
+    unused_override_keys = sorted(set(text_override_map) - used_text_override_keys)
+    if unused_override_keys:
+        fail(
+            "verifier_override_not_applied",
+            "Verifier returned text overrides that do not match published rows",
+            override_keys=[list(x) for x in unused_override_keys],
+        )
+
     checks = verifier.get("region_checks") or []
     check_map = {
         _clean_text(check.get("region_id"), 120): check
@@ -2355,6 +2617,23 @@ def _validate_and_materialize(
             assessment.get("visible_physical_row_count") or -2
         ):
             fail("verifier_region_accounted_count_mismatch", f"Verifier accounted row count differs for {rid}", region_id=rid)
+        expected_text_rows = int(region_text_row_counts.get(rid, 0))
+        if int(check.get("visible_text_row_count") or 0) != expected_text_rows:
+            fail(
+                "verifier_region_text_count_mismatch",
+                f"Verifier visible text-row count differs for {rid}",
+                region_id=rid,
+                expected_text_rows=expected_text_rows,
+                verifier_text_rows=int(check.get("visible_text_row_count") or 0),
+            )
+        if int(check.get("supported_text_row_count") or 0) != expected_text_rows:
+            fail(
+                "verifier_region_text_support_incomplete",
+                f"Verifier did not support every visible text row for {rid}",
+                region_id=rid,
+                expected_text_rows=expected_text_rows,
+                supported_text_rows=int(check.get("supported_text_row_count") or 0),
+            )
 
     blocking = [i for i in issues if i["severity"] in {"high", "critical"}]
     passed = len(blocking) == 0
@@ -2539,13 +2818,16 @@ def _publish_page(
             all_issue_count = int(cur.fetchone()[0] or 0)
             cur.execute(
                 """
-                SELECT COUNT(DISTINCT page_id)
+                SELECT COUNT(DISTINCT page_id), COUNT(*)
                 FROM public.electrical_io
-                WHERE version_id=%s AND extraction_method=%s;
+                WHERE version_id=%s AND extraction_method=%s
+                  AND properties ->> 'pipeline_marker' = %s;
                 """,
-                (version_id, EXTRACTION_METHOD),
+                (version_id, EXTRACTION_METHOD, PIPELINE_MARKER),
             )
-            passed_pages = int(cur.fetchone()[0] or 0)
+            current_row = cur.fetchone()
+            passed_pages = int(current_row[0] or 0)
+            current_pipeline_io_count = int(current_row[1] or 0)
             cur.execute(
                 "SELECT COUNT(*) FROM public.electrical_io WHERE version_id=%s;",
                 (version_id,),
@@ -2599,6 +2881,7 @@ def _publish_page(
                 "structured_v2_verifier_prompt_version": VERIFIER_PROMPT_VERSION,
                 "structured_v2_page_statuses": page_statuses,
                 "structured_v2_passed_pages": passed_pages,
+                "structured_v2_current_pipeline_io_count": current_pipeline_io_count,
                 "structured_v2_total_io_pages": int(context.get("all_io_pages_total") or 0),
                 "structured_v2_last_language": language,
                 "structured_v2_last_run_at": datetime.now().astimezone().isoformat(),
@@ -2647,6 +2930,7 @@ def _publish_page(
             "status": version_status,
             "structured_status": structured_status,
             "io_count": io_count,
+            "current_pipeline_io_count": current_pipeline_io_count,
             "review_issue_count": all_issue_count,
             "blocking_review_issue_count": blocking_count,
             "structured_v2_passed_pages": passed_pages,
@@ -2914,10 +3198,14 @@ def extract_electrical_structured_version(
 
         verifier_request = {
             "phase": PHASE_NAME,
-            "task": "independent_full_page_verification",
+            "task": "independent_full_page_visual_adjudication",
             "page_sha256": page.get("page_sha256"),
             "source_sha256": context.get("source_sha256"),
             "page_image_sha256": _sha256_bytes(page_image),
+            "region_image_sha256": {
+                rid: _sha256_bytes(image)
+                for rid, image in sorted(crop_images.items())
+            },
             "detector_response_sha256": _sha256_json(detector),
             "extraction_response_sha256": _sha256_json(extraction_results),
             "region_hashes": [p["region_hash"] for p in proposals],
@@ -2936,6 +3224,7 @@ def extract_electrical_structured_version(
                 proposals,
                 extraction_results,
                 page_image,
+                crop_images,
             ),
             json_schema=_verifier_schema(),
             force=bool(force),
