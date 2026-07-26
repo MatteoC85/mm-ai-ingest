@@ -7,6 +7,11 @@ substitutions:
   _AR_REPOSITORY: "mm-ai-ingest"
   _IMAGE_NAME: "mm-ai-ingest"
   _EXPECTED_CODE_MARKER: "phase2-vision-v2.2-source-snapshot"
+  _EXPECTED_STRUCTURED_MODEL: "gpt-5.4"
+  _EXPECTED_DETECTOR_PROMPT: "mm-electrical-region-detector-v2"
+  _EXPECTED_EXTRACTOR_PROMPT: "mm-electrical-table-extractor-v2.2"
+  _EXPECTED_VERIFIER_PROMPT: "mm-electrical-page-verifier-v2.2"
+  _EXPECTED_MATERIALIZER_VERSION: "mm-electrical-structured-materializer-v2.2"
 
 steps:
   - id: "01-source-preflight"
@@ -116,9 +121,24 @@ steps:
             version.get('electrical_structured_pipeline_marker')
             == '${_EXPECTED_CODE_MARKER}'
         ), version
+        assert version.get('electrical_structured_detector_model') == '${_EXPECTED_STRUCTURED_MODEL}', version
+        assert version.get('electrical_structured_extractor_model') == '${_EXPECTED_STRUCTURED_MODEL}', version
+        assert version.get('electrical_structured_verifier_model') == '${_EXPECTED_STRUCTURED_MODEL}', version
+        assert (
+            version.get('electrical_structured_detector_prompt_version')
+            == '${_EXPECTED_DETECTOR_PROMPT}'
+        ), version
+        assert (
+            version.get('electrical_structured_extractor_prompt_version')
+            == '${_EXPECTED_EXTRACTOR_PROMPT}'
+        ), version
+        assert (
+            version.get('electrical_structured_verifier_prompt_version')
+            == '${_EXPECTED_VERIFIER_PROMPT}'
+        ), version
         assert (
             version.get('electrical_structured_materializer_version')
-            == 'mm-electrical-structured-materializer-v2.2'
+            == '${_EXPECTED_MATERIALIZER_VERSION}'
         ), version
 
         assert version.get('electrical_source_snapshot_enabled') is True, version
@@ -286,6 +306,11 @@ steps:
         EXPECTED_REVISION="$${REVISION}" \
         EXPECTED_COMMIT="$COMMIT_SHA" \
         EXPECTED_MARKER="${_EXPECTED_CODE_MARKER}" \
+        EXPECTED_STRUCTURED_MODEL="${_EXPECTED_STRUCTURED_MODEL}" \
+        EXPECTED_DETECTOR_PROMPT="${_EXPECTED_DETECTOR_PROMPT}" \
+        EXPECTED_EXTRACTOR_PROMPT="${_EXPECTED_EXTRACTOR_PROMPT}" \
+        EXPECTED_VERIFIER_PROMPT="${_EXPECTED_VERIFIER_PROMPT}" \
+        EXPECTED_MATERIALIZER_VERSION="${_EXPECTED_MATERIALIZER_VERSION}" \
         python3 - <<'PY'
         import json
         import os
@@ -338,24 +363,33 @@ steps:
             version.get('electrical_structured_pipeline_marker')
             == os.environ['EXPECTED_MARKER']
         ), version
-        assert version.get('electrical_structured_detector_model') == 'gpt-5.4', version
-        assert version.get('electrical_structured_extractor_model') == 'gpt-5.4', version
-        assert version.get('electrical_structured_verifier_model') == 'gpt-5.4', version
+        assert (
+            version.get('electrical_structured_detector_model')
+            == os.environ['EXPECTED_STRUCTURED_MODEL']
+        ), version
+        assert (
+            version.get('electrical_structured_extractor_model')
+            == os.environ['EXPECTED_STRUCTURED_MODEL']
+        ), version
+        assert (
+            version.get('electrical_structured_verifier_model')
+            == os.environ['EXPECTED_STRUCTURED_MODEL']
+        ), version
         assert (
             version.get('electrical_structured_detector_prompt_version')
-            == 'mm-electrical-region-detector-v2'
+            == os.environ['EXPECTED_DETECTOR_PROMPT']
         ), version
         assert (
             version.get('electrical_structured_extractor_prompt_version')
-            == 'mm-electrical-table-extractor-v2'
+            == os.environ['EXPECTED_EXTRACTOR_PROMPT']
         ), version
         assert (
             version.get('electrical_structured_verifier_prompt_version')
-            == 'mm-electrical-page-verifier-v2'
+            == os.environ['EXPECTED_VERIFIER_PROMPT']
         ), version
         assert (
             version.get('electrical_structured_materializer_version')
-            == 'mm-electrical-structured-materializer-v2.2'
+            == os.environ['EXPECTED_MATERIALIZER_VERSION']
         ), version
 
         required = {
@@ -428,6 +462,11 @@ steps:
           EXPECTED_REVISION="$${REVISION}" \
           EXPECTED_COMMIT="$COMMIT_SHA" \
           EXPECTED_MARKER="${_EXPECTED_CODE_MARKER}" \
+          EXPECTED_STRUCTURED_MODEL="${_EXPECTED_STRUCTURED_MODEL}" \
+          EXPECTED_DETECTOR_PROMPT="${_EXPECTED_DETECTOR_PROMPT}" \
+          EXPECTED_EXTRACTOR_PROMPT="${_EXPECTED_EXTRACTOR_PROMPT}" \
+          EXPECTED_VERIFIER_PROMPT="${_EXPECTED_VERIFIER_PROMPT}" \
+          EXPECTED_MATERIALIZER_VERSION="${_EXPECTED_MATERIALIZER_VERSION}" \
           python3 - <<'PY'
         import json
         import os
@@ -487,12 +526,33 @@ steps:
             version.get('electrical_structured_pipeline_marker')
             == os.environ['EXPECTED_MARKER']
         ), version
-        assert version.get('electrical_structured_detector_model') == 'gpt-5.4', version
-        assert version.get('electrical_structured_extractor_model') == 'gpt-5.4', version
-        assert version.get('electrical_structured_verifier_model') == 'gpt-5.4', version
+        assert (
+            version.get('electrical_structured_detector_model')
+            == os.environ['EXPECTED_STRUCTURED_MODEL']
+        ), version
+        assert (
+            version.get('electrical_structured_extractor_model')
+            == os.environ['EXPECTED_STRUCTURED_MODEL']
+        ), version
+        assert (
+            version.get('electrical_structured_verifier_model')
+            == os.environ['EXPECTED_STRUCTURED_MODEL']
+        ), version
+        assert (
+            version.get('electrical_structured_detector_prompt_version')
+            == os.environ['EXPECTED_DETECTOR_PROMPT']
+        ), version
+        assert (
+            version.get('electrical_structured_extractor_prompt_version')
+            == os.environ['EXPECTED_EXTRACTOR_PROMPT']
+        ), version
+        assert (
+            version.get('electrical_structured_verifier_prompt_version')
+            == os.environ['EXPECTED_VERIFIER_PROMPT']
+        ), version
         assert (
             version.get('electrical_structured_materializer_version')
-            == 'mm-electrical-structured-materializer-v2.2'
+            == os.environ['EXPECTED_MATERIALIZER_VERSION']
         ), version
 
         print('PROMOZIONE VERIFICATA: OK')
