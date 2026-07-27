@@ -83,6 +83,48 @@ assert (
     == os.environ['EXPECTED_TERMINAL_MATERIALIZER']
 ), version
 
+assert version.get('electrical_bom_enabled') is True, version
+assert (
+    version.get('electrical_bom_pipeline_marker')
+    == os.environ['EXPECTED_BOM_MARKER']
+), version
+assert (
+    version.get('electrical_bom_detector_model')
+    == os.environ['EXPECTED_BOM_MODEL']
+), version
+assert (
+    version.get('electrical_bom_extractor_model')
+    == os.environ['EXPECTED_BOM_MODEL']
+), version
+assert (
+    version.get('electrical_bom_verifier_model')
+    == os.environ['EXPECTED_BOM_MODEL']
+), version
+assert (
+    version.get('electrical_bom_detector_prompt_version')
+    == os.environ['EXPECTED_BOM_DETECTOR_PROMPT']
+), version
+assert (
+    version.get('electrical_bom_extractor_prompt_version')
+    == os.environ['EXPECTED_BOM_EXTRACTOR_PROMPT']
+), version
+assert (
+    version.get('electrical_bom_verifier_prompt_version')
+    == os.environ['EXPECTED_BOM_VERIFIER_PROMPT']
+), version
+assert (
+    version.get('electrical_bom_materializer_version')
+    == os.environ['EXPECTED_BOM_MATERIALIZER']
+), version
+
+from electrical_bom import get_electrical_bom_runtime_config
+bom_config = get_electrical_bom_runtime_config()
+assert bom_config['enabled'] is True, bom_config
+assert (
+    bom_config['pipeline_marker']
+    == os.environ['EXPECTED_BOM_MARKER']
+), bom_config
+
 from electrical_terminals import get_electrical_terminal_runtime_config
 terminal_config = get_electrical_terminal_runtime_config()
 assert terminal_config['enabled'] is True, terminal_config
@@ -579,10 +621,506 @@ assert any(
     for issue in missing_positive_issues
 ), missing_positive_issues
 
+# Phase 2B V1: deterministic BOM publication tests.
+import copy
+from electrical_bom import (
+    _apply_overrides as _apply_bom_overrides,
+    _field_evidence_audit as _bom_field_evidence_audit,
+    _fallback_page_proposal as _bom_fallback_page_proposal,
+    _parse_quantity as _parse_bom_quantity,
+    _physical_bom_key as _bom_physical_key,
+    _semantic_character_signature as _bom_character_signature,
+    _validate_page as _validate_bom_page,
+)
+
+assert str(_parse_bom_quantity('2')) == '2'
+assert str(_parse_bom_quantity('2,500')) == '2.500'
+assert _parse_bom_quantity('K1') is None
+assert _parse_bom_quantity('3VA5180-4EC31-0AA0') is None
+assert _bom_character_signature('PN-1') != _bom_character_signature('PN1')
+assert _bom_character_signature('PN – 1') == _bom_character_signature('PN-1')
+
+# Full-page fallback must expose exact vector-word IDs, text and geometry to
+# the extractor; a bare list of opaque IDs would be unverifiable.
+import fitz as _bom_fitz
+_bom_doc = _bom_fitz.open()
+try:
+    _bom_page_obj = _bom_doc.new_page(width=100, height=100)
+    _bom_fallback = _bom_fallback_page_proposal(
+        source_page=_bom_page_obj,
+        inventory_page={'pdf_page_number': 66, 'page_sha256': 'fixture'},
+        word_map={
+            1: {
+                'id': 1, 'text': 'PN-1',
+                'x0': 10, 'y0': 20, 'x1': 30, 'y1': 25,
+            },
+        },
+    )
+    assert _bom_fallback['fallback_page_word_ids'] == [1]
+    assert _bom_fallback['fallback_page_words'] == [{
+        'word_id': 1,
+        'bbox_pt': [10.0, 20.0, 30.0, 25.0],
+        'text_original': 'PN-1',
+    }]
+finally:
+    _bom_doc.close()
+
+bom_page = {
+    'id': 900,
+    'pdf_page_number': 66,
+    'page_width_pt': 80,
+    'page_height_pt': 40,
+}
+bom_word_map = {
+    1: {'id': 1, 'text': 'K1', 'x0': 0, 'y0': 10, 'x1': 5, 'y1': 15},
+    2: {'id': 2, 'text': '1', 'x0': 10, 'y0': 10, 'x1': 12, 'y1': 15},
+    3: {'id': 3, 'text': 'ACME', 'x0': 20, 'y0': 10, 'x1': 30, 'y1': 15},
+    4: {'id': 4, 'text': 'PN-1', 'x0': 40, 'y0': 10, 'x1': 50, 'y1': 15},
+    5: {'id': 5, 'text': 'Relay', 'x0': 60, 'y0': 10, 'x1': 70, 'y1': 15},
+    6: {'id': 6, 'text': 'K1', 'x0': 0, 'y0': 20, 'x1': 5, 'y1': 25},
+    7: {'id': 7, 'text': '1', 'x0': 10, 'y0': 20, 'x1': 12, 'y1': 25},
+    8: {'id': 8, 'text': 'ACME', 'x0': 20, 'y0': 20, 'x1': 30, 'y1': 25},
+    9: {'id': 9, 'text': 'PN-1', 'x0': 40, 'y0': 20, 'x1': 50, 'y1': 25},
+    10: {'id': 10, 'text': 'Coil', 'x0': 60, 'y0': 20, 'x1': 70, 'y1': 25},
+    11: {'id': 11, 'text': 'Tag', 'x0': 0, 'y0': 0, 'x1': 5, 'y1': 5},
+    12: {'id': 12, 'text': 'Qty', 'x0': 10, 'y0': 0, 'x1': 15, 'y1': 5},
+    13: {'id': 13, 'text': 'Maker', 'x0': 20, 'y0': 0, 'x1': 30, 'y1': 5},
+    14: {'id': 14, 'text': 'Code', 'x0': 40, 'y0': 0, 'x1': 50, 'y1': 5},
+    15: {'id': 15, 'text': 'Description', 'x0': 60, 'y0': 0, 'x1': 75, 'y1': 5},
+}
+bom_proposals = [{
+    'region_id': 'P66-BOM01',
+    'row_candidates': [
+        {'source_row_candidate_id': 'R001', 'word_ids': [11, 12, 13, 14, 15]},
+        {'source_row_candidate_id': 'R002', 'word_ids': [1, 2, 3, 4, 5]},
+        {'source_row_candidate_id': 'R003', 'word_ids': [6, 7, 8, 9, 10]},
+    ],
+}]
+bom_detector = {
+    'page_id': 900,
+    'all_visible_bom_tables_accounted_for': True,
+    'proposal_assessments': [{
+        'region_id': 'P66-BOM01',
+        'visible': True,
+        'distinct_table': True,
+        'kind': 'bom_table',
+        'expected_header_rows': 1,
+        'expected_item_rows': 2,
+        'expected_column_count': 5,
+        'confidence': 0.99,
+        'notes': 'fixture',
+    }],
+    'missing_visible_bom_tables': [],
+    'confidence': 0.99,
+    'issues': [],
+}
+
+
+def _bom_item(
+    *,
+    row_id,
+    source_row_candidate_id,
+    visual_order,
+    ids,
+    tag,
+    quantity,
+    manufacturer,
+    part_number,
+    description,
+):
+    values = {
+        'item_position': '',
+        'component_tag': tag,
+        'quantity_text': quantity,
+        'unit': '',
+        'description': description,
+        'part_number': part_number,
+        'manufacturer': manufacturer,
+    }
+    row = {
+        'row_id': row_id,
+        'source_row_candidate_id': source_row_candidate_id,
+        'visual_order': visual_order,
+        'row_role': 'item',
+        'field_evidence': [
+            {'field_name': 'component_tag_original', 'source_column_index': 0, 'source_word_ids': [ids[0]]},
+            {'field_name': 'quantity_text_original', 'source_column_index': 1, 'source_word_ids': [ids[1]]},
+            {'field_name': 'manufacturer_original', 'source_column_index': 2, 'source_word_ids': [ids[2]]},
+            {'field_name': 'part_number_original', 'source_column_index': 3, 'source_word_ids': [ids[3]]},
+            {'field_name': 'description_original', 'source_column_index': 4, 'source_word_ids': [ids[4]]},
+        ],
+        'source_word_ids': ids,
+        'bbox_pt': [0, visual_order * 10, 80, visual_order * 10 + 8],
+        'confidence': 0.98,
+        'evidence_notes': 'fixture',
+    }
+    for field_name, value in values.items():
+        row[field_name + '_original'] = value
+        row[field_name + '_normalized'] = value
+    return row
+
+
+def _bom_fixture_extractions():
+    return [{
+        'page_id': 900,
+        'region_id': 'P66-BOM01',
+        'header_row_candidate_ids': ['R001'],
+        'non_item_rows': [],
+        'source_column_roles': [
+            {'source_column_index': 0, 'canonical_roles': ['component_tag'], 'confidence': 0.99, 'reason': 'fixture'},
+            {'source_column_index': 1, 'canonical_roles': ['quantity'], 'confidence': 0.99, 'reason': 'fixture'},
+            {'source_column_index': 2, 'canonical_roles': ['manufacturer'], 'confidence': 0.99, 'reason': 'fixture'},
+            {'source_column_index': 3, 'canonical_roles': ['part_number'], 'confidence': 0.99, 'reason': 'fixture'},
+            {'source_column_index': 4, 'canonical_roles': ['description'], 'confidence': 0.99, 'reason': 'fixture'},
+        ],
+        'rows': [
+            _bom_item(
+                row_id='r1',
+                source_row_candidate_id='R002',
+                visual_order=1,
+                ids=[1, 2, 3, 4, 5],
+                tag='K1',
+                quantity='1',
+                manufacturer='ACME',
+                part_number='PN-1',
+                description='Relay',
+            ),
+            _bom_item(
+                row_id='r2',
+                source_row_candidate_id='R003',
+                visual_order=2,
+                ids=[6, 7, 8, 9, 10],
+                tag='K1',
+                quantity='1',
+                manufacturer='ACME',
+                part_number='PN-1',
+                description='Coil',
+            ),
+        ],
+        'unaccounted_row_candidate_ids': [],
+        'duplicate_row_ids': [],
+        'confidence': 0.99,
+        'issues': [],
+    }]
+
+
+bom_verifier = {
+    'page_id': 900,
+    'verdict': 'pass',
+    'all_visible_bom_tables_accounted_for': True,
+    'all_visible_item_rows_accounted_for': True,
+    'all_visible_columns_accounted_for': True,
+    'all_published_fields_visually_supported': True,
+    'all_source_evidence_represented': True,
+    'duplicates_preserved': True,
+    'region_checks': [{
+        'region_id': 'P66-BOM01',
+        'expected_item_rows': 2,
+        'verified_item_rows': 2,
+        'verified_row_ids': ['r1', 'r2'],
+        'verified_component_tag_sequence': ['K1', 'K1'],
+        'pass': True,
+        'confidence': 0.99,
+        'notes': 'Repeated content belongs to two distinct physical rows.',
+    }],
+    'field_overrides': [],
+    'missing_region_ids': [],
+    'missing_row_ids': [],
+    'duplicate_physical_keys': [],
+    'unaccounted_visual_evidence': [],
+    'confidence': 0.99,
+    'issues': [],
+}
+
+bom_extractions = _bom_fixture_extractions()
+bom_passed, bom_rows, bom_issues = _validate_bom_page(
+    page=bom_page,
+    proposals=bom_proposals,
+    detector=bom_detector,
+    extractions=bom_extractions,
+    verifier=bom_verifier,
+    word_map=bom_word_map,
+)
+assert bom_passed is True, bom_issues
+assert len(bom_rows) == 2, bom_rows
+assert [row['component_tag_original'] for row in bom_rows] == ['K1', 'K1']
+assert [row['part_number_original'] for row in bom_rows] == ['PN-1', 'PN-1']
+assert all(row['source_evidence_coverage']['complete'] for row in bom_rows)
+
+# An exact positive override restores a field without losing source evidence.
+bom_override_extractions = _bom_fixture_extractions()
+bom_override_extractions[0]['rows'][0]['manufacturer_original'] = ''
+_apply_bom_overrides(
+    bom_override_extractions,
+    [{
+        'region_id': 'P66-BOM01',
+        'row_id': 'r1',
+        'field_name': 'manufacturer_original',
+        'approved_text': 'ACME',
+        'confidence': 0.99,
+        'reason': 'Exact visible manufacturer cell.',
+    }],
+)
+assert bom_override_extractions[0]['rows'][0]['manufacturer_original'] == 'ACME'
+assert _bom_field_evidence_audit(
+    row=bom_override_extractions[0]['rows'][0],
+    expected_word_ids=[1, 2, 3, 4, 5],
+    word_map=bom_word_map,
+)['complete'] is True
+
+# Silent source-text loss must block publication.
+bom_loss_extractions = _bom_fixture_extractions()
+bom_loss_extractions[0]['rows'][0]['description_original'] = ''
+bom_loss_extractions[0]['rows'][0]['description_normalized'] = ''
+bom_loss_passed, _, bom_loss_issues = _validate_bom_page(
+    page=bom_page,
+    proposals=bom_proposals,
+    detector=bom_detector,
+    extractions=bom_loss_extractions,
+    verifier=bom_verifier,
+    word_map=bom_word_map,
+)
+assert bom_loss_passed is False, bom_loss_issues
+assert any(
+    issue.get('issue_type') == 'bom-visible-source-evidence-unrepresented'
+    for issue in bom_loss_issues
+), bom_loss_issues
+
+# Technical-code punctuation cannot disappear during normalization.
+bom_code_change_extractions = _bom_fixture_extractions()
+bom_code_change_extractions[0]['rows'][0]['part_number_normalized'] = 'PN1'
+bom_code_change_passed, _, bom_code_change_issues = _validate_bom_page(
+    page=bom_page,
+    proposals=bom_proposals,
+    detector=bom_detector,
+    extractions=bom_code_change_extractions,
+    verifier=bom_verifier,
+    word_map=bom_word_map,
+)
+assert bom_code_change_passed is False, bom_code_change_issues
+assert any(
+    issue.get('issue_type') == 'bom-normalized-text-changed-source-content'
+    for issue in bom_code_change_issues
+), bom_code_change_issues
+
+# One visible word cannot populate two canonical fields.
+bom_collision_extractions = _bom_fixture_extractions()
+bom_collision_row = bom_collision_extractions[0]['rows'][0]
+bom_collision_row['part_number_original'] = 'K1'
+bom_collision_row['part_number_normalized'] = 'K1'
+bom_collision_row['field_evidence'][3]['source_word_ids'] = [1]
+bom_collision_passed, _, bom_collision_issues = _validate_bom_page(
+    page=bom_page,
+    proposals=bom_proposals,
+    detector=bom_detector,
+    extractions=bom_collision_extractions,
+    verifier=bom_verifier,
+    word_map=bom_word_map,
+)
+assert bom_collision_passed is False, bom_collision_issues
+assert any(
+    issue.get('issue_type') == 'bom-visible-source-evidence-unrepresented'
+    for issue in bom_collision_issues
+), bom_collision_issues
+
+# Duplicate physical order blocks; repeated tag/part values do not.
+bom_duplicate_extractions = _bom_fixture_extractions()
+bom_duplicate_extractions[0]['rows'][1]['visual_order'] = 1
+bom_duplicate_passed, _, bom_duplicate_issues = _validate_bom_page(
+    page=bom_page,
+    proposals=bom_proposals,
+    detector=bom_detector,
+    extractions=bom_duplicate_extractions,
+    verifier=bom_verifier,
+    word_map=bom_word_map,
+)
+assert bom_duplicate_passed is False, bom_duplicate_issues
+assert any(
+    issue.get('issue_type') == 'bom-visual-order-invalid'
+    for issue in bom_duplicate_issues
+), bom_duplicate_issues
+
+# Missing semantic column accounting blocks publication.
+bom_column_loss_extractions = _bom_fixture_extractions()
+bom_column_loss_extractions[0]['source_column_roles'].pop()
+bom_column_loss_passed, _, bom_column_loss_issues = _validate_bom_page(
+    page=bom_page,
+    proposals=bom_proposals,
+    detector=bom_detector,
+    extractions=bom_column_loss_extractions,
+    verifier=bom_verifier,
+    word_map=bom_word_map,
+)
+assert bom_column_loss_passed is False, bom_column_loss_issues
+assert any(
+    issue.get('issue_type') == 'bom-source-column-accounting-mismatch'
+    for issue in bom_column_loss_issues
+), bom_column_loss_issues
+
+# A field cannot be published from a physical column bound to another role.
+bom_wrong_lane_extractions = _bom_fixture_extractions()
+bom_wrong_lane_extractions[0]['source_column_roles'][4][
+    'canonical_roles'
+] = ['manufacturer']
+bom_wrong_lane_passed, _, bom_wrong_lane_issues = _validate_bom_page(
+    page=bom_page,
+    proposals=bom_proposals,
+    detector=bom_detector,
+    extractions=bom_wrong_lane_extractions,
+    verifier=bom_verifier,
+    word_map=bom_word_map,
+)
+assert bom_wrong_lane_passed is False, bom_wrong_lane_issues
+assert any(
+    issue.get('issue_type') == 'bom-field-column-binding-mismatch'
+    for issue in bom_wrong_lane_issues
+), bom_wrong_lane_issues
+
+# Two materialized rows cannot claim the same deterministic physical row.
+bom_source_row_duplicate_extractions = _bom_fixture_extractions()
+bom_source_row_duplicate_extractions[0]['rows'][1][
+    'source_row_candidate_id'
+] = 'R002'
+bom_source_row_duplicate_passed, _, bom_source_row_duplicate_issues = (
+    _validate_bom_page(
+        page=bom_page,
+        proposals=bom_proposals,
+        detector=bom_detector,
+        extractions=bom_source_row_duplicate_extractions,
+        verifier=bom_verifier,
+        word_map=bom_word_map,
+    )
+)
+assert bom_source_row_duplicate_passed is False, bom_source_row_duplicate_issues
+assert any(
+    issue.get('issue_type') == 'bom-source-row-candidate-duplicate'
+    for issue in bom_source_row_duplicate_issues
+), bom_source_row_duplicate_issues
+
+# Masked source values remain real evidence even without alphanumeric text.
+mask_word_map = {
+    1: {'id': 1, 'text': '********', 'x0': 0, 'y0': 0, 'x1': 20, 'y1': 5},
+}
+mask_row = {
+    'part_number_original': '********',
+    'field_evidence': [{
+        'field_name': 'part_number_original',
+        'source_column_index': 0,
+        'source_word_ids': [1],
+    }],
+}
+assert _bom_field_evidence_audit(
+    row=mask_row,
+    expected_word_ids=[1],
+    word_map=mask_word_map,
+)['complete'] is True
+mask_row['part_number_original'] = '*******'
+assert _bom_field_evidence_audit(
+    row=mask_row,
+    expected_word_ids=[1],
+    word_map=mask_word_map,
+)['complete'] is False
+
+# A verifier issue is downgraded only when every linked exact override was
+# actually applied before deterministic publication validation.
+bom_resolved_extractions = _bom_fixture_extractions()
+bom_resolved_extractions[0]['rows'][0]['manufacturer_original'] = ''
+resolved_override = {
+    'region_id': 'P66-BOM01',
+    'row_id': 'r1',
+    'field_name': 'manufacturer_original',
+    'approved_text': 'ACME',
+    'confidence': 0.99,
+    'reason': 'Exact visible manufacturer cell.',
+}
+_apply_bom_overrides(bom_resolved_extractions, [resolved_override])
+bom_resolved_verifier = copy.deepcopy(bom_verifier)
+bom_resolved_verifier['field_overrides'] = [resolved_override]
+bom_resolved_verifier['issues'] = [{
+    'issue_type': 'wrong_field_assignment',
+    'severity': 'high',
+    'message': 'Manufacturer was missing before the exact correction.',
+    'region_id': 'P66-BOM01',
+    'row_ids': ['r1'],
+    'confidence': 0.99,
+    'resolution_status': 'resolved_by_exact_overrides',
+    'related_overrides': [{
+        'region_id': 'P66-BOM01',
+        'row_id': 'r1',
+        'field_name': 'manufacturer_original',
+    }],
+}]
+bom_resolved_passed, _, bom_resolved_issues = _validate_bom_page(
+    page=bom_page,
+    proposals=bom_proposals,
+    detector=bom_detector,
+    extractions=bom_resolved_extractions,
+    verifier=bom_resolved_verifier,
+    word_map=bom_word_map,
+)
+assert bom_resolved_passed is True, bom_resolved_issues
+assert any(
+    issue.get('source_stage') == 'verifier_post_override_resolved'
+    and issue.get('severity') == 'info'
+    for issue in bom_resolved_issues
+), bom_resolved_issues
+
+bom_false_resolution_verifier = copy.deepcopy(bom_resolved_verifier)
+bom_false_resolution_passed, _, bom_false_resolution_issues = (
+    _validate_bom_page(
+        page=bom_page,
+        proposals=bom_proposals,
+        detector=bom_detector,
+        extractions=_bom_fixture_extractions(),
+        verifier=bom_false_resolution_verifier,
+        word_map=bom_word_map,
+    )
+)
+assert bom_false_resolution_passed is False, bom_false_resolution_issues
+assert any(
+    issue.get('source_stage') == 'deterministic_validator'
+    and issue.get('severity') == 'high'
+    and issue.get('post_override_resolution', {}).get('validated') is False
+    for issue in bom_false_resolution_issues
+), bom_false_resolution_issues
+
+# Invalid row geometry must fail closed.
+bom_bad_bbox_extractions = _bom_fixture_extractions()
+bom_bad_bbox_extractions[0]['rows'][0]['bbox_pt'] = [20, 10, 10, 15]
+bom_bad_bbox_passed, _, bom_bad_bbox_issues = _validate_bom_page(
+    page=bom_page,
+    proposals=bom_proposals,
+    detector=bom_detector,
+    extractions=bom_bad_bbox_extractions,
+    verifier=bom_verifier,
+    word_map=bom_word_map,
+)
+assert bom_bad_bbox_passed is False, bom_bad_bbox_issues
+assert any(
+    issue.get('issue_type') == 'bom-row-bbox-invalid'
+    for issue in bom_bad_bbox_issues
+), bom_bad_bbox_issues
+
+# Identical content on two physical rows receives different immutable keys.
+key1 = _bom_physical_key(
+    version_id=2,
+    page_id=68,
+    region_id='P66-BOM01',
+    visual_order=1,
+)
+key2 = _bom_physical_key(
+    version_id=2,
+    page_id=68,
+    region_id='P66-BOM01',
+    visual_order=2,
+)
+assert key1 != key2
+
 required = {
     '/v1/ai/electrical/normalize',
     '/v1/ai/electrical/extract-structured',
     '/v1/ai/electrical/extract-terminals',
+    '/v1/ai/electrical/extract-bom',
     '/v1/ai/electrical/source/snapshot',
 }
 missing = required - set(openapi.get('paths', {}))
