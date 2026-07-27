@@ -2076,6 +2076,165 @@ assert any(
     for issue in _bom_v14_invented_issues
 ), _bom_v14_invented_issues
 
+
+# Phase 2B V1.5: when the verifier correctly removes one whole edge word
+# from a donor field but omits the matching positive receiver override, exact
+# adjacent-column geometry can complete the transfer. This reproduces the
+# real failure mode generically without any page, language, code or word rule.
+_bom_v15_extractions = _bom_v13_fixture_extractions()
+_bom_v15_part_original_override = {
+    'region_id': 'R-V13',
+    'row_id': 'ROW-X',
+    'field_name': 'part_number_original',
+    'approved_text': '3SU1400-1AA10-1BA0',
+    'confidence': 0.99,
+    'reason': 'One whole edge word visibly belongs outside the code cell.',
+}
+_bom_v15_part_normalized_override = {
+    'region_id': 'R-V13',
+    'row_id': 'ROW-X',
+    'field_name': 'part_number_normalized',
+    'approved_text': '3SU1400-1AA10-1BA0',
+    'confidence': 0.99,
+    'reason': 'Readable code after the exact edge-word removal.',
+}
+_bom_v15_verifier = {
+    'page_id': 902,
+    'verdict': 'review_required',
+    'all_visible_bom_tables_accounted_for': True,
+    'all_visible_item_rows_accounted_for': True,
+    'all_visible_columns_accounted_for': True,
+    'all_published_fields_visually_supported': False,
+    'all_source_evidence_represented': False,
+    'duplicates_preserved': True,
+    'region_checks': [{
+        'region_id': 'R-V13',
+        'expected_item_rows': 1,
+        'verified_item_rows': 1,
+        'verified_row_ids': ['ROW-X'],
+        'verified_component_tag_sequence': ['30S1'],
+        'pass': False,
+        'confidence': 0.99,
+        'notes': 'Pre-correction candidate contains one edge-word spill.',
+    }],
+    'field_overrides': [
+        _bom_v15_part_original_override,
+        _bom_v15_part_normalized_override,
+    ],
+    'missing_region_ids': [],
+    'missing_row_ids': [],
+    'duplicate_physical_keys': [],
+    'unaccounted_visual_evidence': [],
+    'confidence': 0.99,
+    'issues': [{
+        'issue_type': 'column_overflow',
+        'severity': 'high',
+        'message': 'One source edge word leaked into the code field.',
+        'region_id': 'R-V13',
+        'row_ids': ['ROW-X'],
+        'confidence': 0.99,
+        'resolution_status': 'resolved_by_exact_overrides',
+        'related_overrides': [
+            {'region_id': 'R-V13', 'row_id': 'ROW-X', 'field_name': 'part_number_original'},
+            {'region_id': 'R-V13', 'row_id': 'ROW-X', 'field_name': 'part_number_normalized'},
+        ],
+    }],
+}
+_apply_bom_overrides(
+    _bom_v15_extractions,
+    [
+        _bom_v15_part_original_override,
+        _bom_v15_part_normalized_override,
+    ],
+)
+_bom_v15_passed, _bom_v15_rows, _bom_v15_issues = _validate_bom_page(
+    page=_bom_v13_page,
+    proposals=_bom_v13_proposals,
+    detector=_bom_v13_detector,
+    extractions=_bom_v15_extractions,
+    verifier=_bom_v15_verifier,
+    word_map=_bom_v13_word_map,
+)
+assert _bom_v15_passed is True, _bom_v15_issues
+assert _bom_v15_rows[0]['part_number_original'] == '3SU1400-1AA10-1BA0'
+assert _bom_v15_rows[0]['part_number_normalized'] == '3SU1400-1AA10-1BA0'
+assert _bom_v15_rows[0]['description_original'].endswith('FRONTAL E')
+assert _bom_v15_rows[0]['description_normalized'].endswith('FRONTALE')
+assert 11 in _bom_v15_rows[0]['field_evidence'][1]['source_word_ids']
+assert 11 not in _bom_v15_rows[0]['field_evidence'][2]['source_word_ids']
+assert _bom_v15_rows[0]['source_evidence_coverage']['complete'] is True
+assert _bom_v15_rows[0]['cross_field_evidence_transfers'][0][
+    'version'
+] == 'one-sided-boundary-spill-transfer-v1'
+assert not [
+    issue
+    for issue in _bom_v15_issues
+    if issue.get('severity') in {'high', 'critical'}
+], _bom_v15_issues
+
+# If the removed word is not contiguous with the adjacent receiver, no
+# transfer is allowed and source x-order must not silently reintroduce it.
+_bom_v15_far_word_map = copy.deepcopy(_bom_v13_word_map)
+_bom_v15_far_word_map[11] = {
+    **_bom_v15_far_word_map[11],
+    'x0': 150.0,
+    'x1': 151.0,
+}
+_bom_v15_far_extractions = _bom_v13_fixture_extractions()
+_apply_bom_overrides(
+    _bom_v15_far_extractions,
+    [
+        _bom_v15_part_original_override,
+        _bom_v15_part_normalized_override,
+    ],
+)
+_bom_v15_far_reconciliation = _bom_reconcile_post_override_rows(
+    extractions=_bom_v15_far_extractions,
+    word_map=_bom_v15_far_word_map,
+)
+assert _bom_v15_far_reconciliation[
+    'cross_field_transfer_row_ids'
+] == [], _bom_v15_far_reconciliation
+assert _bom_v15_far_extractions[0]['rows'][0][
+    'part_number_original'
+] == '3SU1400-1AA10-1BA0'
+assert 'part_number_original' not in (
+    _bom_v15_far_extractions[0]['rows'][0].get('deterministic_overrides') or {}
+), _bom_v15_far_extractions
+_bom_v15_far_audit = _bom_field_evidence_audit(
+    row=_bom_v15_far_extractions[0]['rows'][0],
+    expected_word_ids=list(range(1, 17)),
+    word_map=_bom_v15_far_word_map,
+)
+assert _bom_v15_far_audit['complete'] is False, _bom_v15_far_audit
+
+# Two eligible adjacent receiver fields are ambiguous. No arbitrary receiver
+# may be selected, and the row must remain fail-closed.
+_bom_v15_ambiguous_extractions = _bom_v13_fixture_extractions()
+_bom_v15_ambiguous_row = _bom_v15_ambiguous_extractions[0]['rows'][0]
+_bom_v15_ambiguous_row['item_position_original'] = 'MODULO DI CONTATTO, 1NO, MORSETTO A VITE, PIASTRA FRONTAL'
+_bom_v15_ambiguous_row['item_position_normalized'] = _bom_v15_ambiguous_row['item_position_original']
+_bom_v15_ambiguous_row['field_evidence'].append({
+    'field_name': 'item_position_original',
+    'source_column_index': 1,
+    'source_word_ids': list(range(2, 11)),
+})
+# Duplicate assignment itself must prevent transfer before any arbitrary choice.
+_apply_bom_overrides(
+    _bom_v15_ambiguous_extractions,
+    [
+        _bom_v15_part_original_override,
+        _bom_v15_part_normalized_override,
+    ],
+)
+_bom_v15_ambiguous_reconciliation = _bom_reconcile_post_override_rows(
+    extractions=_bom_v15_ambiguous_extractions,
+    word_map=_bom_v13_word_map,
+)
+assert _bom_v15_ambiguous_reconciliation[
+    'cross_field_transfer_row_ids'
+] == [], _bom_v15_ambiguous_reconciliation
+
 required = {
     '/v1/ai/electrical/normalize',
     '/v1/ai/electrical/extract-structured',

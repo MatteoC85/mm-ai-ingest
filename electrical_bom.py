@@ -16,7 +16,7 @@ import requests
 
 from electrical_source_store import download_electrical_source_pdf
 
-# MachineMind Phase 2B V1.3
+# MachineMind Phase 2B V1.5
 # Isolated multimodal bill-of-material extraction.
 # Publication is geometry-first, multilingual and fail-closed. No deterministic
 # rule depends on Italian/English labels, a specific PDF, fixed coordinates,
@@ -88,7 +88,7 @@ VERIFIER_PROMPT_VERSION = (
 ).strip()
 MATERIALIZER_VERSION = (
     os.environ.get("MM_ELECTRICAL_BOM_MATERIALIZER_VERSION")
-    or "mm-electrical-bom-materializer-v1.4"
+    or "mm-electrical-bom-materializer-v1.5"
 ).strip()
 
 OPENAI_TIMEOUT_SECONDS = _env_int(
@@ -122,7 +122,7 @@ MAX_SOURCE_BYTES = _env_int(
     500_000_000,
 )
 
-PIPELINE_MARKER = "phase2-bom-v1.4-source-snapshot"
+PIPELINE_MARKER = "phase2-bom-v1.5-source-snapshot"
 EXTRACTION_METHOD = "openai_vision_bom_v1"
 PHASE_NAME = "bom_vision_v1"
 PAGE_TYPE = "bom_table"
@@ -2837,6 +2837,455 @@ def _reconcile_cross_field_evidence_transfers(
     return transfers
 
 
+def _word_ids_boundary_gap(
+    *,
+    receiver_word_ids: list[int],
+    moved_word_ids: list[int],
+    receiver_column_index: int,
+    donor_column_index: int,
+    word_map: dict[int, dict],
+) -> Optional[dict]:
+    """Return strict visual-contiguity evidence at one shared column edge.
+
+    The function is geometry-only. It never inspects language, page numbers,
+    component codes, manufacturers or expected words. A transfer is eligible
+    only when the moved whole-word group and the receiver's edge word are on
+    the same visual line and separated by at most one normal glyph gap.
+    """
+    if abs(int(receiver_column_index) - int(donor_column_index)) != 1:
+        return None
+    if not receiver_word_ids or not moved_word_ids:
+        return None
+    all_ids = list(receiver_word_ids) + list(moved_word_ids)
+    if any(word_id not in word_map for word_id in all_ids):
+        return None
+
+    receiver_words = [word_map[word_id] for word_id in receiver_word_ids]
+    moved_words = [word_map[word_id] for word_id in moved_word_ids]
+    if donor_column_index > receiver_column_index:
+        receiver_edge = max(
+            receiver_words,
+            key=lambda word: (float(word.get("x1") or 0.0), int(word.get("id") or 0)),
+        )
+        moved_edge = min(
+            moved_words,
+            key=lambda word: (float(word.get("x0") or 0.0), int(word.get("id") or 0)),
+        )
+        gap = float(moved_edge.get("x0") or 0.0) - float(
+            receiver_edge.get("x1") or 0.0
+        )
+        receiver_side = "right"
+    else:
+        receiver_edge = min(
+            receiver_words,
+            key=lambda word: (float(word.get("x0") or 0.0), int(word.get("id") or 0)),
+        )
+        moved_edge = max(
+            moved_words,
+            key=lambda word: (float(word.get("x1") or 0.0), int(word.get("id") or 0)),
+        )
+        gap = float(receiver_edge.get("x0") or 0.0) - float(
+            moved_edge.get("x1") or 0.0
+        )
+        receiver_side = "left"
+
+    receiver_center_y = (
+        float(receiver_edge.get("y0") or 0.0)
+        + float(receiver_edge.get("y1") or 0.0)
+    ) / 2.0
+    moved_center_y = (
+        float(moved_edge.get("y0") or 0.0)
+        + float(moved_edge.get("y1") or 0.0)
+    ) / 2.0
+    receiver_height = max(
+        0.1,
+        float(receiver_edge.get("y1") or 0.0)
+        - float(receiver_edge.get("y0") or 0.0),
+    )
+    moved_height = max(
+        0.1,
+        float(moved_edge.get("y1") or 0.0)
+        - float(moved_edge.get("y0") or 0.0),
+    )
+    line_tolerance = max(2.0, max(receiver_height, moved_height) * 0.70)
+    if abs(receiver_center_y - moved_center_y) > line_tolerance:
+        return None
+
+    maximum_gap = max(2.5, max(receiver_height, moved_height) * 0.85)
+    minimum_gap = -max(receiver_height, moved_height) * 0.40
+    if gap < minimum_gap or gap > maximum_gap:
+        return None
+
+    join_without_space = gap <= max(
+        1.25,
+        min(receiver_height, moved_height) * 0.38,
+    )
+    return {
+        "receiver_side": receiver_side,
+        "gap_pt": round(gap, 3),
+        "line_delta_pt": round(abs(receiver_center_y - moved_center_y), 3),
+        "join_without_space": bool(join_without_space),
+        "receiver_edge_word_id": int(receiver_edge.get("id") or 0),
+        "moved_edge_word_id": int(moved_edge.get("id") or 0),
+    }
+
+
+def _boundary_normalized_candidate(
+    *,
+    current_normalized: Any,
+    moved_word_ids: list[int],
+    receiver_side: str,
+    join_without_space: bool,
+    word_map: dict[int, dict],
+) -> str:
+    """Add exact moved source words to a readable normalized transcription."""
+    current = _clean_text(current_normalized, 5000)
+    moved = _text_for_ids(moved_word_ids, word_map, 1000)
+    if not current or not moved:
+        return ""
+    separator = "" if join_without_space else " "
+    if receiver_side == "right":
+        return _clean_text(current + separator + moved, 5000)
+    if receiver_side == "left":
+        return _clean_text(moved + separator + current, 5000)
+    return ""
+
+
+def _reconcile_one_sided_boundary_spills(
+    *,
+    row: dict,
+    word_map: dict[int, dict],
+) -> list[dict]:
+    """Recover a whole source word removed from one column by the verifier.
+
+    Some verifier responses correctly remove a leaked edge word from a donor
+    field but omit the matching positive override for the adjacent receiver.
+    This fallback remains fail-closed. It activates only when:
+
+    * the donor has one exact high-confidence removal-only override;
+    * one unique whole source-word subset realizes the removed characters;
+    * those words are on the donor edge facing an adjacent column;
+    * exactly one non-empty original field in that adjacent column is visually
+      contiguous with the moved words;
+    * moving the word IDs preserves the complete one-to-one row assignment;
+    * donor and receiver final values exactly match their resulting source
+      evidence; and
+    * the readable normalized receiver preserves the exact source characters.
+
+    No dictionary, expected code, page number or language-specific rule is used.
+    """
+    override_map = row.get("verifier_overrides") or {}
+    if not isinstance(override_map, dict):
+        return []
+
+    all_assigned_before: list[int] = []
+    for evidence in row.get("field_evidence") or []:
+        if not isinstance(evidence, dict):
+            continue
+        for raw_id in evidence.get("source_word_ids") or []:
+            try:
+                all_assigned_before.append(int(raw_id))
+            except Exception:
+                continue
+    if len(all_assigned_before) != len(set(all_assigned_before)):
+        return []
+
+    transfer_candidates: list[dict] = []
+    for donor_field in ORIGINAL_FIELDS:
+        donor_audit = override_map.get(donor_field)
+        donor_entry = _field_evidence_entry(row, donor_field)
+        if not isinstance(donor_audit, dict) or not isinstance(donor_entry, dict):
+            continue
+        confidence = float(donor_audit.get("confidence") or 0.0)
+        if confidence < PAGE_PASS_MIN_CONFIDENCE:
+            continue
+        if donor_audit.get("cross_field_transfer_validated") is True:
+            continue
+
+        before_counter = _signature_counter(donor_audit.get("before"))
+        after_counter = _signature_counter(donor_audit.get("after"))
+        removed = before_counter - after_counter
+        added = after_counter - before_counter
+        if not removed or added:
+            continue
+        try:
+            donor_column_index = int(donor_entry.get("source_column_index"))
+        except Exception:
+            continue
+
+        donor_ids = _source_word_ids_for_field(row, donor_field)
+        moved_ids = _unique_source_word_subset_for_counter(
+            source_word_ids=donor_ids,
+            target_counter=removed,
+            word_map=word_map,
+        )
+        if not moved_ids:
+            continue
+
+        receiver_candidates: list[dict] = []
+        for receiver_field in ORIGINAL_FIELDS:
+            if receiver_field == donor_field:
+                continue
+            receiver_entry = _field_evidence_entry(row, receiver_field)
+            if not isinstance(receiver_entry, dict):
+                continue
+            if isinstance(override_map.get(receiver_field), dict):
+                # Paired corrections are handled by the stricter adjudicator.
+                continue
+            try:
+                receiver_column_index = int(
+                    receiver_entry.get("source_column_index")
+                )
+            except Exception:
+                continue
+            if abs(receiver_column_index - donor_column_index) != 1:
+                continue
+
+            receiver_ids = _source_word_ids_for_field(row, receiver_field)
+            if not receiver_ids:
+                continue
+            receiver_current = _clean_text(row.get(receiver_field), 5000)
+            if not receiver_current:
+                continue
+            receiver_source_before = _text_for_ids(
+                receiver_ids,
+                word_map,
+                5000,
+            )
+            if _source_evidence_signature(receiver_current) != (
+                _source_evidence_signature(receiver_source_before)
+            ):
+                continue
+            if not _word_ids_are_at_shared_column_edge(
+                moved_word_ids=moved_ids,
+                donor_word_ids=donor_ids,
+                donor_column_index=donor_column_index,
+                receiver_column_index=receiver_column_index,
+                word_map=word_map,
+            ):
+                continue
+            boundary = _word_ids_boundary_gap(
+                receiver_word_ids=receiver_ids,
+                moved_word_ids=moved_ids,
+                receiver_column_index=receiver_column_index,
+                donor_column_index=donor_column_index,
+                word_map=word_map,
+            )
+            if not boundary:
+                continue
+
+            donor_after_ids = [
+                word_id for word_id in donor_ids if word_id not in set(moved_ids)
+            ]
+            receiver_after_ids = sorted(
+                set(receiver_ids + moved_ids),
+                key=lambda word_id: (
+                    float(word_map.get(word_id, {}).get("y0") or 0.0),
+                    float(word_map.get(word_id, {}).get("x0") or 0.0),
+                    word_id,
+                ),
+            )
+            donor_source_after = _text_for_ids(
+                donor_after_ids,
+                word_map,
+                5000,
+            )
+            receiver_source_after = _text_for_ids(
+                receiver_after_ids,
+                word_map,
+                5000,
+            )
+            if _source_evidence_signature(donor_source_after) != (
+                _source_evidence_signature(row.get(donor_field))
+            ):
+                continue
+
+            receiver_normalized_field = receiver_field.replace(
+                "_original",
+                "_normalized",
+            )
+            normalized_after = _boundary_normalized_candidate(
+                current_normalized=(
+                    row.get(receiver_normalized_field)
+                    or row.get(receiver_field)
+                ),
+                moved_word_ids=moved_ids,
+                receiver_side=str(boundary["receiver_side"]),
+                join_without_space=bool(boundary["join_without_space"]),
+                word_map=word_map,
+            )
+            if not normalized_after:
+                continue
+            if _semantic_character_signature(normalized_after) != (
+                _semantic_character_signature(receiver_source_after)
+            ):
+                continue
+
+            receiver_candidates.append(
+                {
+                    "receiver_field": receiver_field,
+                    "receiver_normalized_field": receiver_normalized_field,
+                    "receiver_entry": receiver_entry,
+                    "receiver_column_index": receiver_column_index,
+                    "receiver_before_ids": list(receiver_ids),
+                    "receiver_after_ids": receiver_after_ids,
+                    "receiver_source_after": receiver_source_after,
+                    "receiver_normalized_after": normalized_after,
+                    "donor_after_ids": donor_after_ids,
+                    "donor_source_after": donor_source_after,
+                    "boundary": boundary,
+                }
+            )
+
+        if len(receiver_candidates) != 1:
+            continue
+        transfer_candidates.append(
+            {
+                "donor_field": donor_field,
+                "donor_entry": donor_entry,
+                "donor_audit": donor_audit,
+                "donor_column_index": donor_column_index,
+                "donor_before_ids": list(donor_ids),
+                "moved_ids": list(moved_ids),
+                "confidence": confidence,
+                **receiver_candidates[0],
+            }
+        )
+
+    # More than one plausible transfer in one row is deliberately ambiguous.
+    if len(transfer_candidates) != 1:
+        return []
+    candidate = transfer_candidates[0]
+
+    donor_entry = candidate["donor_entry"]
+    receiver_entry = candidate["receiver_entry"]
+    donor_entry["source_word_ids"] = candidate["donor_after_ids"]
+    receiver_entry["source_word_ids"] = candidate["receiver_after_ids"]
+
+    receiver_field = str(candidate["receiver_field"])
+    receiver_normalized_field = str(candidate["receiver_normalized_field"])
+    receiver_before = _clean_text(row.get(receiver_field), 5000)
+    receiver_normalized_before = _clean_text(
+        row.get(receiver_normalized_field),
+        5000,
+    )
+    row[receiver_field] = candidate["receiver_source_after"]
+    row[receiver_normalized_field] = candidate["receiver_normalized_after"]
+
+    all_assigned_after: list[int] = []
+    for evidence in row.get("field_evidence") or []:
+        if not isinstance(evidence, dict):
+            continue
+        for raw_id in evidence.get("source_word_ids") or []:
+            try:
+                all_assigned_after.append(int(raw_id))
+            except Exception:
+                continue
+
+    donor_signature = _source_evidence_signature(
+        candidate["donor_source_after"]
+    )
+    receiver_signature = _source_evidence_signature(
+        candidate["receiver_source_after"]
+    )
+    assignment_is_exact = bool(
+        sorted(all_assigned_after) == sorted(all_assigned_before)
+        and len(all_assigned_after) == len(set(all_assigned_after))
+        and donor_signature
+        == _source_evidence_signature(row.get(candidate["donor_field"]))
+        and receiver_signature
+        == _source_evidence_signature(row.get(receiver_field))
+        and _semantic_character_signature(row.get(receiver_normalized_field))
+        == _semantic_character_signature(row.get(receiver_field))
+    )
+    if not assignment_is_exact:
+        donor_entry["source_word_ids"] = candidate["donor_before_ids"]
+        receiver_entry["source_word_ids"] = candidate["receiver_before_ids"]
+        row[receiver_field] = receiver_before
+        row[receiver_normalized_field] = receiver_normalized_before
+        return []
+
+    moved_tokens = [
+        _clean_text(word_map[word_id].get("text"), 500)
+        for word_id in candidate["moved_ids"]
+    ]
+    transfer_signature = _source_evidence_signature(
+        " ".join(moved_tokens)
+    )
+    transfer_id = hashlib.sha256(
+        "|".join(
+            [
+                _clean_text(row.get("row_id"), 120),
+                str(candidate["donor_field"]),
+                receiver_field,
+                ",".join(str(word_id) for word_id in candidate["moved_ids"]),
+                transfer_signature,
+            ]
+        ).encode("utf-8")
+    ).hexdigest()[:20]
+    confidence = float(candidate["confidence"])
+    audit = {
+        "version": "one-sided-boundary-spill-transfer-v1",
+        "transfer_id": transfer_id,
+        "donor_field": str(candidate["donor_field"]),
+        "receiver_field": receiver_field,
+        "donor_column_index": int(candidate["donor_column_index"]),
+        "receiver_column_index": int(candidate["receiver_column_index"]),
+        "moved_source_word_ids": list(candidate["moved_ids"]),
+        "moved_source_tokens": moved_tokens,
+        "transferred_source_signature": transfer_signature,
+        "boundary_geometry": candidate["boundary"],
+        "confidence": confidence,
+        "validated": True,
+    }
+    row.setdefault("cross_field_evidence_transfers", []).append(audit)
+
+    for field_name, field_ids, source_text in [
+        (
+            str(candidate["donor_field"]),
+            candidate["donor_after_ids"],
+            candidate["donor_source_after"],
+        ),
+        (
+            receiver_field,
+            candidate["receiver_after_ids"],
+            candidate["receiver_source_after"],
+        ),
+    ]:
+        row.setdefault("deterministic_overrides", {})[field_name] = {
+            "before": (
+                _clean_text(candidate["donor_audit"].get("before"), 5000)
+                if field_name == candidate["donor_field"]
+                else receiver_before
+            ),
+            "after": _clean_text(row.get(field_name), 5000),
+            "confidence": confidence,
+            "reason": (
+                "A high-confidence removal-only verifier correction and exact "
+                "shared-edge source geometry proved one whole source-word "
+                "spill into the adjacent physical column."
+            ),
+            "method": "one_sided_boundary_spill_transfer_v1",
+            "source_word_ids": list(field_ids),
+            "source_signature": _source_evidence_signature(source_text),
+            "cross_field_transfer_id": transfer_id,
+            "validated": True,
+        }
+
+    candidate["donor_audit"]["cross_field_transfer_validated"] = True
+    candidate["donor_audit"]["cross_field_transfer_id"] = transfer_id
+    row.setdefault("post_override_normalization", {})[
+        receiver_normalized_field
+    ] = {
+        "before": receiver_normalized_before,
+        "after": candidate["receiver_normalized_after"],
+        "authority": "one_sided_boundary_spill_transfer_v1",
+        "source_original_field": receiver_field,
+        "validated": True,
+    }
+    return [audit]
+
+
 def _single_line_source_code_candidate(
     *,
     row: dict,
@@ -2891,6 +3340,19 @@ def _single_line_source_code_candidate(
         return None
 
     visual_audit = (row.get("verifier_overrides") or {}).get(field_name)
+    if isinstance(visual_audit, dict):
+        before_counter = _signature_counter(visual_audit.get("before"))
+        after_counter = _signature_counter(visual_audit.get("after"))
+        removed = before_counter - after_counter
+        added = after_counter - before_counter
+        # A removal-only or addition-only visual correction can indicate a
+        # cross-column spill. Source x-order is not allowed to reintroduce the
+        # changed characters unless a strict evidence transfer has already
+        # validated their new physical field. Substitutions/reorderings remain
+        # eligible for exact source-geometry adjudication.
+        if (removed and not added) or (added and not removed):
+            if visual_audit.get("cross_field_transfer_validated") is not True:
+                return None
     source_before = (
         _clean_text(visual_audit.get("before"), 5000)
         if isinstance(visual_audit, dict)
@@ -2952,6 +3414,22 @@ def _reconcile_post_override_rows(
                     ]
                 )
 
+            one_sided_transfers = _reconcile_one_sided_boundary_spills(
+                row=row,
+                word_map=word_map,
+            )
+            if one_sided_transfers:
+                cross_field_rows.append(row_id)
+                cross_field_transfers.extend(
+                    [
+                        {
+                            "row_id": row_id,
+                            **transfer,
+                        }
+                        for transfer in one_sided_transfers
+                    ]
+                )
+
             # Part numbers are technical codes. If the extractor emitted their
             # fragments in non-physical order, exact source x geometry is a
             # stronger authority than model token order.
@@ -3003,6 +3481,15 @@ def _reconcile_post_override_rows(
                 normalized = _clean_text(row.get(normalized_field), 5000)
                 if normalized == original:
                     continue
+                if (
+                    normalized
+                    and _semantic_character_signature(normalized)
+                    == _semantic_character_signature(original)
+                ):
+                    # Readable spacing is already faithful to the exact final
+                    # original transcription; do not regress it to vector
+                    # fragmentation merely because the strings differ.
+                    continue
                 row.setdefault(
                     "post_override_normalization",
                     {},
@@ -3017,7 +3504,7 @@ def _reconcile_post_override_rows(
                 normalized_rows.append(row_id)
 
     return {
-        "version": "bom-post-override-reconciliation-v2",
+        "version": "bom-post-override-reconciliation-v3",
         "source_order_row_ids": sorted(set(source_order_rows)),
         "normalized_row_ids": sorted(set(normalized_rows)),
         "cross_field_transfer_row_ids": sorted(set(cross_field_rows)),
@@ -3656,8 +4143,9 @@ def _validate_page(
                 ),
                 "severity": "info",
                 "message": (
-                    "Exact paired verifier corrections moved unambiguous whole "
-                    "source words across adjacent physical column boundaries "
+                    "Exact verifier corrections and shared-edge geometry moved "
+                    "unambiguous whole source words across adjacent physical "
+                    "column boundaries "
                     "before publication."
                 ),
                 "region_id": "",
