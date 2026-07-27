@@ -1653,6 +1653,309 @@ assert any(
     for issue in _bom_v12_unresolved_issues
 ), _bom_v12_unresolved_issues
 
+
+# Phase 2B V1.3: a whole source word can be segmented into the adjacent
+# physical column. Publication may repair this only when two exact verifier
+# overrides form one closed character transfer and one unique edge word proves
+# the evidence movement. The final source coverage, normalized values, region
+# decision, field-support flag, source-evidence flag and page verdict must all
+# be revalidated after the transfer.
+_bom_v13_page = {
+    'id': 902,
+    'pdf_page_number': 67,
+    'page_width_pt': 200,
+    'page_height_pt': 50,
+}
+_bom_v13_word_map = {
+    1: {'id': 1, 'text': '30S1', 'x0': 1, 'y0': 10, 'x1': 8, 'y1': 15},
+    2: {'id': 2, 'text': 'MODULO', 'x0': 10, 'y0': 10, 'x1': 20, 'y1': 15},
+    3: {'id': 3, 'text': 'DI', 'x0': 21, 'y0': 10, 'x1': 24, 'y1': 15},
+    4: {'id': 4, 'text': 'CONTATTO,', 'x0': 25, 'y0': 10, 'x1': 40, 'y1': 15},
+    5: {'id': 5, 'text': '1NO,', 'x0': 41, 'y0': 10, 'x1': 47, 'y1': 15},
+    6: {'id': 6, 'text': 'MORSETTO', 'x0': 48, 'y0': 10, 'x1': 60, 'y1': 15},
+    7: {'id': 7, 'text': 'A', 'x0': 61, 'y0': 10, 'x1': 63, 'y1': 15},
+    8: {'id': 8, 'text': 'VITE,', 'x0': 64, 'y0': 10, 'x1': 70, 'y1': 15},
+    9: {'id': 9, 'text': 'PIASTRA', 'x0': 71, 'y0': 10, 'x1': 81, 'y1': 15},
+    10: {'id': 10, 'text': 'FRONTAL', 'x0': 82, 'y0': 10, 'x1': 92, 'y1': 15},
+    11: {'id': 11, 'text': 'E', 'x0': 93, 'y0': 10, 'x1': 94, 'y1': 15},
+    12: {'id': 12, 'text': '3SU', 'x0': 95, 'y0': 10, 'x1': 100, 'y1': 15},
+    13: {'id': 13, 'text': '1400', 'x0': 101, 'y0': 10, 'x1': 106, 'y1': 15},
+    14: {'id': 14, 'text': '-1AA10', 'x0': 107, 'y0': 10, 'x1': 116, 'y1': 15},
+    15: {'id': 15, 'text': '-1BA0', 'x0': 117, 'y0': 10, 'x1': 125, 'y1': 15},
+    16: {'id': 16, 'text': 'SIEMENS', 'x0': 130, 'y0': 10, 'x1': 145, 'y1': 15},
+    17: {'id': 17, 'text': 'Sigla', 'x0': 1, 'y0': 0, 'x1': 8, 'y1': 5},
+    18: {'id': 18, 'text': 'Descrizione', 'x0': 10, 'y0': 0, 'x1': 30, 'y1': 5},
+    19: {'id': 19, 'text': 'Codice', 'x0': 95, 'y0': 0, 'x1': 105, 'y1': 5},
+    20: {'id': 20, 'text': 'Costruttore', 'x0': 130, 'y0': 0, 'x1': 150, 'y1': 5},
+}
+_bom_v13_proposals = [{
+    'region_id': 'R-V13',
+    'row_candidates': [
+        {'source_row_candidate_id': 'H1', 'word_ids': [17, 18, 19, 20]},
+        {'source_row_candidate_id': 'S1', 'word_ids': list(range(1, 17))},
+    ],
+}]
+_bom_v13_detector = {
+    'page_id': 902,
+    'all_visible_bom_tables_accounted_for': True,
+    'missing_visible_bom_tables': [],
+    'confidence': 0.99,
+    'issues': [],
+    'proposal_assessments': [{
+        'region_id': 'R-V13',
+        'visible': True,
+        'distinct_table': True,
+        'kind': 'bom_table',
+        'expected_header_rows': 1,
+        'expected_item_rows': 1,
+        'expected_column_count': 4,
+        'confidence': 0.99,
+        'notes': 'fixture',
+    }],
+}
+
+
+def _bom_v13_fixture_extractions():
+    return [{
+        'page_id': 902,
+        'region_id': 'R-V13',
+        'header_row_candidate_ids': ['H1'],
+        'non_item_rows': [],
+        'source_column_roles': [
+            {'source_column_index': 0, 'canonical_roles': ['component_tag'], 'confidence': 0.99, 'reason': 'fixture'},
+            {'source_column_index': 1, 'canonical_roles': ['description'], 'confidence': 0.99, 'reason': 'fixture'},
+            {'source_column_index': 2, 'canonical_roles': ['part_number'], 'confidence': 0.99, 'reason': 'fixture'},
+            {'source_column_index': 3, 'canonical_roles': ['manufacturer'], 'confidence': 0.99, 'reason': 'fixture'},
+        ],
+        'rows': [{
+            'row_id': 'ROW-X',
+            'source_row_candidate_id': 'S1',
+            'visual_order': 1,
+            'row_role': 'item',
+            'confidence': 0.99,
+            'bbox_pt': [0, 9, 160, 16],
+            'source_word_ids': list(range(1, 17)),
+            'evidence_notes': 'fixture cross-column vector split',
+            'field_evidence': [
+                {'field_name': 'component_tag_original', 'source_column_index': 0, 'source_word_ids': [1]},
+                {'field_name': 'description_original', 'source_column_index': 1, 'source_word_ids': list(range(2, 11))},
+                {'field_name': 'part_number_original', 'source_column_index': 2, 'source_word_ids': [11, 12, 13, 14, 15]},
+                {'field_name': 'manufacturer_original', 'source_column_index': 3, 'source_word_ids': [16]},
+            ],
+            'item_position_original': '',
+            'item_position_normalized': '',
+            'component_tag_original': '30S1',
+            'component_tag_normalized': '30S1',
+            'quantity_text_original': '',
+            'quantity_text_normalized': '',
+            'unit_original': '',
+            'unit_normalized': '',
+            'description_original': 'MODULO DI CONTATTO, 1NO, MORSETTO A VITE, PIASTRA FRONTAL',
+            'description_normalized': 'MODULO DI CONTATTO, 1NO, MORSETTO A VITE, PIASTRA FRONTAL',
+            'part_number_original': 'E 3SU 1400 -1AA10 -1BA0',
+            'part_number_normalized': 'E3SU1400-1AA10-1BA0',
+            'manufacturer_original': 'SIEMENS',
+            'manufacturer_normalized': 'SIEMENS',
+        }],
+        'unaccounted_row_candidate_ids': [],
+        'duplicate_row_ids': [],
+        'confidence': 0.99,
+        'issues': [],
+    }]
+
+
+_bom_v13_description_override = {
+    'region_id': 'R-V13',
+    'row_id': 'ROW-X',
+    'field_name': 'description_original',
+    'approved_text': (
+        'MODULO DI CONTATTO, 1NO, MORSETTO A VITE, PIASTRA FRONTALE'
+    ),
+    'confidence': 0.99,
+    'reason': 'The final whole source word belongs to the description cell.',
+}
+_bom_v13_part_override = {
+    'region_id': 'R-V13',
+    'row_id': 'ROW-X',
+    'field_name': 'part_number_original',
+    'approved_text': '3SU1400-1AA10-1BA0',
+    'confidence': 0.99,
+    'reason': 'The code cell begins with 3SU, not the leaked final letter.',
+}
+_bom_v13_verifier = {
+    'page_id': 902,
+    'verdict': 'review_required',
+    'all_visible_bom_tables_accounted_for': True,
+    'all_visible_item_rows_accounted_for': True,
+    'all_visible_columns_accounted_for': True,
+    'all_published_fields_visually_supported': False,
+    'all_source_evidence_represented': False,
+    'duplicates_preserved': True,
+    'region_checks': [{
+        'region_id': 'R-V13',
+        'expected_item_rows': 1,
+        'verified_item_rows': 1,
+        'verified_row_ids': ['ROW-X'],
+        'verified_component_tag_sequence': ['30S1'],
+        'pass': False,
+        'confidence': 0.99,
+        'notes': 'Pre-correction candidate contains one cross-column split.',
+    }],
+    'field_overrides': [
+        _bom_v13_description_override,
+        _bom_v13_part_override,
+    ],
+    'missing_region_ids': [],
+    'missing_row_ids': [],
+    'duplicate_physical_keys': [],
+    'unaccounted_visual_evidence': [],
+    'confidence': 0.99,
+    'issues': [
+        {
+            'issue_type': 'original_field_transcription_errors',
+            'severity': 'high',
+            'message': 'One source word crossed the visible column boundary.',
+            'region_id': 'R-V13',
+            'row_ids': ['ROW-X'],
+            'confidence': 0.99,
+            'resolution_status': 'resolved_by_exact_overrides',
+            'related_overrides': [
+                {'region_id': 'R-V13', 'row_id': 'ROW-X', 'field_name': 'description_original'},
+                {'region_id': 'R-V13', 'row_id': 'ROW-X', 'field_name': 'part_number_original'},
+            ],
+        },
+        {
+            'issue_type': 'normalized_fields_not_faithful_to_source',
+            'severity': 'high',
+            'message': 'Pre-correction normalized fields were stale.',
+            'region_id': 'R-V13',
+            'row_ids': ['ROW-X'],
+            'confidence': 0.99,
+            'resolution_status': 'open',
+            'related_overrides': [],
+        },
+    ],
+}
+_bom_v13_extractions = _bom_v13_fixture_extractions()
+_apply_bom_overrides(
+    _bom_v13_extractions,
+    [_bom_v13_description_override, _bom_v13_part_override],
+)
+_bom_v13_passed, _bom_v13_rows, _bom_v13_issues = _validate_bom_page(
+    page=_bom_v13_page,
+    proposals=_bom_v13_proposals,
+    detector=_bom_v13_detector,
+    extractions=_bom_v13_extractions,
+    verifier=_bom_v13_verifier,
+    word_map=_bom_v13_word_map,
+)
+assert _bom_v13_passed is True, _bom_v13_issues
+assert _bom_v13_rows[0]['description_original'].endswith('FRONTALE')
+assert _bom_v13_rows[0]['description_normalized'].endswith('FRONTALE')
+assert _bom_v13_rows[0]['part_number_original'] == '3SU1400-1AA10-1BA0'
+assert _bom_v13_rows[0]['part_number_normalized'] == '3SU1400-1AA10-1BA0'
+assert _bom_v13_rows[0]['source_evidence_coverage']['complete'] is True
+assert _bom_v13_rows[0]['field_evidence'][1]['source_word_ids'][-1] == 11
+assert 11 not in _bom_v13_rows[0]['field_evidence'][2]['source_word_ids']
+assert _bom_v13_rows[0]['cross_field_evidence_transfers'][0][
+    'moved_source_word_ids'
+] == [11]
+assert not [
+    issue
+    for issue in _bom_v13_issues
+    if issue.get('severity') in {'high', 'critical'}
+], _bom_v13_issues
+assert any(
+    issue.get('issue_type')
+    == 'bom-cross-field-source-evidence-reconciled-post-override'
+    for issue in _bom_v13_issues
+), _bom_v13_issues
+assert any(
+    issue.get('issue_type')
+    == 'bom-verifier-source-evidence-flag-superseded-post-override'
+    for issue in _bom_v13_issues
+), _bom_v13_issues
+
+# An unmatched transfer must remain blocking: a receiver cannot gain X while
+# the adjacent donor loses E.
+_bom_v13_unmatched_extractions = _bom_v13_fixture_extractions()
+_bom_v13_unmatched_description = {
+    **_bom_v13_description_override,
+    'approved_text': (
+        'MODULO DI CONTATTO, 1NO, MORSETTO A VITE, PIASTRA FRONTALX'
+    ),
+}
+_bom_v13_unmatched_verifier = copy.deepcopy(_bom_v13_verifier)
+_bom_v13_unmatched_verifier['field_overrides'] = [
+    _bom_v13_unmatched_description,
+    _bom_v13_part_override,
+]
+_apply_bom_overrides(
+    _bom_v13_unmatched_extractions,
+    [_bom_v13_unmatched_description, _bom_v13_part_override],
+)
+_bom_v13_unmatched_passed, _, _bom_v13_unmatched_issues = (
+    _validate_bom_page(
+        page=_bom_v13_page,
+        proposals=_bom_v13_proposals,
+        detector=_bom_v13_detector,
+        extractions=_bom_v13_unmatched_extractions,
+        verifier=_bom_v13_unmatched_verifier,
+        word_map=_bom_v13_word_map,
+    )
+)
+assert _bom_v13_unmatched_passed is False, _bom_v13_unmatched_issues
+assert any(
+    issue.get('issue_type')
+    == 'bom-visible-source-evidence-unrepresented'
+    and issue.get('severity') == 'high'
+    for issue in _bom_v13_unmatched_issues
+), _bom_v13_unmatched_issues
+
+# Two identical edge words are ambiguous evidence. No arbitrary word ID may be
+# moved even when the character multiset would fit.
+_bom_v13_ambiguous_extractions = _bom_v13_fixture_extractions()
+_bom_v13_ambiguous_row = _bom_v13_ambiguous_extractions[0]['rows'][0]
+_bom_v13_ambiguous_word_map = copy.deepcopy(_bom_v13_word_map)
+_bom_v13_ambiguous_word_map[21] = {
+    'id': 21,
+    'text': 'E',
+    'x0': 92.0,
+    'y0': 10,
+    'x1': 92.8,
+    'y1': 15,
+}
+_bom_v13_ambiguous_row['source_word_ids'].append(21)
+_bom_v13_ambiguous_row['field_evidence'][2]['source_word_ids'] = [
+    21, 11, 12, 13, 14, 15
+]
+_bom_v13_ambiguous_row['part_number_original'] = (
+    'E E 3SU 1400 -1AA10 -1BA0'
+)
+_bom_v13_ambiguous_row['part_number_normalized'] = (
+    'EE3SU1400-1AA10-1BA0'
+)
+_bom_v13_ambiguous_part_override = {
+    **_bom_v13_part_override,
+    'approved_text': 'E3SU1400-1AA10-1BA0',
+}
+_bom_v13_ambiguous_verifier = copy.deepcopy(_bom_v13_verifier)
+_bom_v13_ambiguous_verifier['field_overrides'] = [
+    _bom_v13_description_override,
+    _bom_v13_ambiguous_part_override,
+]
+_apply_bom_overrides(
+    _bom_v13_ambiguous_extractions,
+    [_bom_v13_description_override, _bom_v13_ambiguous_part_override],
+)
+_bom_v13_ambiguous_reconciliation = _bom_reconcile_post_override_rows(
+    extractions=_bom_v13_ambiguous_extractions,
+    word_map=_bom_v13_ambiguous_word_map,
+)
+assert _bom_v13_ambiguous_reconciliation[
+    'cross_field_transfer_row_ids'
+] == [], _bom_v13_ambiguous_reconciliation
+
 required = {
     '/v1/ai/electrical/normalize',
     '/v1/ai/electrical/extract-structured',
