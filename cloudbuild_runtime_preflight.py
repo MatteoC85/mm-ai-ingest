@@ -632,6 +632,9 @@ from electrical_bom import (
     _detect_sidecar_column_specs as _bom_detect_sidecar_columns,
     _field_evidence_audit as _bom_field_evidence_audit,
     _fallback_page_proposal as _bom_fallback_page_proposal,
+    _glyph_map as _bom_glyph_map,
+    _reconcile_exact_cell_glyph_evidence as _bom_reconcile_glyph_cell_evidence,
+    _canonicalize_verifier_row_references as _bom_canonicalize_verifier_rows,
     _parse_quantity as _parse_bom_quantity,
     _physical_bom_key as _bom_physical_key,
     _reconcile_post_override_rows as _bom_reconcile_post_override_rows,
@@ -1400,6 +1403,7 @@ _bom_source_order_word_map = {
     },
 }
 _bom_source_order_audit = _bom_reconcile_post_override_rows(
+    proposals=[],
     extractions=[{'rows': [_bom_source_order_row]}],
     word_map=_bom_source_order_word_map,
 )
@@ -1950,6 +1954,7 @@ _apply_bom_overrides(
     [_bom_v13_description_override, _bom_v13_ambiguous_part_override],
 )
 _bom_v13_ambiguous_reconciliation = _bom_reconcile_post_override_rows(
+    proposals=[],
     extractions=_bom_v13_ambiguous_extractions,
     word_map=_bom_v13_ambiguous_word_map,
 )
@@ -2189,6 +2194,7 @@ _apply_bom_overrides(
     ],
 )
 _bom_v15_far_reconciliation = _bom_reconcile_post_override_rows(
+    proposals=[],
     extractions=_bom_v15_far_extractions,
     word_map=_bom_v15_far_word_map,
 )
@@ -2228,12 +2234,307 @@ _apply_bom_overrides(
     ],
 )
 _bom_v15_ambiguous_reconciliation = _bom_reconcile_post_override_rows(
+    proposals=[],
     extractions=_bom_v15_ambiguous_extractions,
     word_map=_bom_v13_word_map,
 )
 assert _bom_v15_ambiguous_reconciliation[
     'cross_field_transfer_row_ids'
 ] == [], _bom_v15_ambiguous_reconciliation
+
+
+# Phase 2B V2: glyph/cell evidence is exact-character authority and is
+# independent of PDF word grouping, content-stream order and font name.
+def _v2_ids_in_rect(word_map, rect):
+    out = []
+    for wid, word in word_map.items():
+        cx = (float(word['x0']) + float(word['x1'])) / 2.0
+        cy = (float(word['y0']) + float(word['y1'])) / 2.0
+        if rect.x0 <= cx <= rect.x1 and rect.y0 <= cy <= rect.y1:
+            out.append(int(wid))
+    return sorted(out)
+
+for _font_name in ['helv', 'Times-Roman', 'Courier']:
+    _v2_doc = _bom_fitz.open()
+    try:
+        _v2_page = _v2_doc.new_page(width=520, height=120)
+        _v2_y0, _v2_y1 = 30.0, 70.0
+        _v2_edges = [10.0, 105.0, 345.0, 430.0, 510.0]
+        for _edge in _v2_edges:
+            _v2_page.draw_line((_edge, _v2_y0), (_edge, _v2_y1), width=0.5)
+        _v2_page.draw_line((_v2_edges[0], _v2_y0), (_v2_edges[-1], _v2_y0), width=0.5)
+        _v2_page.draw_line((_v2_edges[0], _v2_y1), (_v2_edges[-1], _v2_y1), width=0.5)
+        _baseline = 55.0
+        # Deliberately scramble content-stream insertion order. Physical x
+        # geometry must still yield the same source text for every font.
+        _v2_page.insert_text((292, _baseline), '********', fontsize=8, fontname=_font_name)
+        _v2_page.insert_text((360, _baseline), '************', fontsize=8, fontname=_font_name)
+        _v2_page.insert_text((112, _baseline), 'Alimentatore azionamenti', fontsize=8, fontname=_font_name)
+        _v2_page.insert_text((445, _baseline), 'SIGMATEK', fontsize=8, fontname=_font_name)
+        _v2_page.insert_text((18, _baseline), '200A1', fontsize=8, fontname=_font_name)
+        _v2_words_raw = list(_v2_page.get_text('words', sort=True) or [])
+        _v2_inventory = {'words': [list(word) for word in _v2_words_raw]}
+        _v2_word_map = _bom_word_map_from_page(_v2_inventory)
+        _v2_cells = []
+        for _column in range(4):
+            _rect = _bom_fitz.Rect(
+                _v2_edges[_column], _v2_y0,
+                _v2_edges[_column + 1], _v2_y1,
+            )
+            _ids = _v2_ids_in_rect(_v2_word_map, _rect)
+            _v2_cells.append({
+                'source_column_index': _column,
+                'bbox_pt': [float(_rect.x0), float(_rect.y0), float(_rect.x1), float(_rect.y1)],
+                'word_ids': _ids,
+                'word_text_original': ' '.join(_v2_word_map[i]['text'] for i in _ids),
+                'deterministic_cell_text_original': '',
+                'geometry_source': 'fixture',
+            })
+        _v2_row_word_ids = sorted({
+            wid for cell in _v2_cells for wid in cell['word_ids']
+        })
+        _v2_proposals = [{
+            'region_id': 'V2-R1',
+            'row_candidates': [{
+                'source_row_candidate_id': 'R002',
+                'source_row_index': 1,
+                'bbox_pt': [_v2_edges[0], _v2_y0, _v2_edges[-1], _v2_y1],
+                'word_ids': _v2_row_word_ids,
+                'cells': _v2_cells,
+            }],
+        }]
+        _v2_row = {
+            'row_id': 'ROW_R002',
+            'source_row_candidate_id': 'R002',
+            'visual_order': 1,
+            'component_tag_original': '200A1',
+            'component_tag_normalized': '200A1',
+            'description_original': 'Alimentatore azionamenti *******',
+            'description_normalized': 'Alimentatore azionamenti *******',
+            'part_number_original': '***********',
+            'part_number_normalized': '***********',
+            'manufacturer_original': 'ATEK SIGM',
+            'manufacturer_normalized': 'SIGMATEK',
+            'item_position_original': '', 'item_position_normalized': '',
+            'quantity_text_original': '', 'quantity_text_normalized': '',
+            'unit_original': '', 'unit_normalized': '',
+            'field_evidence': [
+                {'field_name': 'component_tag_original', 'source_column_index': 0, 'source_word_ids': _v2_cells[0]['word_ids']},
+                {'field_name': 'description_original', 'source_column_index': 1, 'source_word_ids': _v2_cells[1]['word_ids']},
+                {'field_name': 'part_number_original', 'source_column_index': 2, 'source_word_ids': _v2_cells[2]['word_ids']},
+                {'field_name': 'manufacturer_original', 'source_column_index': 3, 'source_word_ids': _v2_cells[3]['word_ids']},
+            ],
+            'source_word_ids': _v2_row_word_ids,
+            'bbox_pt': [_v2_edges[0], _v2_y0, _v2_edges[-1], _v2_y1],
+            'confidence': 0.99,
+        }
+        _v2_extractions = [{
+            'region_id': 'V2-R1',
+            'source_column_roles': [
+                {'source_column_index': 0, 'canonical_roles': ['component_tag'], 'confidence': 0.99, 'reason': 'fixture'},
+                {'source_column_index': 1, 'canonical_roles': ['description'], 'confidence': 0.99, 'reason': 'fixture'},
+                {'source_column_index': 2, 'canonical_roles': ['part_number'], 'confidence': 0.99, 'reason': 'fixture'},
+                {'source_column_index': 3, 'canonical_roles': ['manufacturer'], 'confidence': 0.99, 'reason': 'fixture'},
+            ],
+            'rows': [_v2_row],
+        }]
+        _v2_glyphs = _bom_glyph_map(_v2_page)
+        _v2_audit = _bom_reconcile_glyph_cell_evidence(
+            extractions=_v2_extractions,
+            proposals=_v2_proposals,
+            glyph_map=_v2_glyphs,
+            word_map=_v2_word_map,
+        )
+        assert _v2_audit['field_count'] == 4, (_font_name, _v2_audit)
+        assert _v2_row['description_original'] == 'Alimentatore azionamenti ********', (_font_name, _v2_row)
+        assert _v2_row['part_number_original'] == '************', (_font_name, _v2_row)
+        assert _v2_row['manufacturer_original'] == 'SIGMATEK', (_font_name, _v2_row)
+        assert _v2_row['description_normalized'] == _v2_row['description_original']
+        assert _v2_row['part_number_normalized'] == _v2_row['part_number_original']
+        assert _v2_row['manufacturer_normalized'] == _v2_row['manufacturer_original']
+        assert _bom_field_evidence_audit(
+            row=_v2_row,
+            expected_word_ids=_v2_row_word_ids,
+            word_map=_v2_word_map,
+        )['complete'] is True
+    finally:
+        _v2_doc.close()
+
+
+# Full V2 gate: a verifier may return review_required for its own wrong mask
+# count; exact glyph-cell evidence must correct the row and supersede only the
+# stale pre-correction flags, without weakening any structural gate.
+# Reuse the last synthetic font fixture objects still in scope.
+_v2_gate_page = {'id': 902, 'pdf_page_number': 69, 'page_width_pt': 520, 'page_height_pt': 120}
+_v2_gate_extractions = copy.deepcopy(_v2_extractions)
+_v2_gate_extractions[0].update({
+    'page_id': 902,
+    'header_row_candidate_ids': [],
+    'non_item_rows': [],
+    'unaccounted_row_candidate_ids': [],
+    'duplicate_row_ids': [],
+    'confidence': 0.99,
+    'issues': [],
+})
+_v2_gate_row = _v2_gate_extractions[0]['rows'][0]
+_v2_gate_row.update({
+    'row_role': 'item',
+    'description_original': 'Alimentatore azionamenti *******',
+    'description_normalized': 'Alimentatore azionamenti *******',
+    'part_number_original': '***********',
+    'part_number_normalized': '***********',
+    'manufacturer_original': 'ATEK SIGM',
+    'manufacturer_normalized': 'SIGMATEK',
+    'evidence_notes': 'fixture',
+})
+_v2_gate_detector = {
+    'page_id': 902,
+    'all_visible_bom_tables_accounted_for': True,
+    'missing_visible_bom_tables': [],
+    'confidence': 0.99,
+    'issues': [],
+    'proposal_assessments': [{
+        'region_id': 'V2-R1', 'visible': True, 'distinct_table': True,
+        'kind': 'bom_table', 'expected_header_rows': 0,
+        'expected_item_rows': 1, 'expected_column_count': 4,
+        'confidence': 0.99, 'notes': 'fixture',
+    }],
+}
+_v2_gate_verifier = {
+    'page_id': 902,
+    'verdict': 'review_required',
+    'all_visible_bom_tables_accounted_for': True,
+    'all_visible_item_rows_accounted_for': True,
+    'all_visible_columns_accounted_for': True,
+    'all_published_fields_visually_supported': False,
+    'all_source_evidence_represented': False,
+    'duplicates_preserved': True,
+    'region_checks': [{
+        'region_id': 'V2-R1', 'expected_item_rows': 1,
+        'verified_item_rows': 1, 'verified_row_ids': ['ROW001'],
+        'verified_component_tag_sequence': ['200A1'], 'pass': False,
+        'confidence': 0.99, 'notes': 'Wrong visual mask count before source-exact reconciliation.',
+    }],
+    'field_overrides': [
+        {'region_id': 'V2-R1', 'row_id': 'ROW001', 'field_name': 'description_original',
+         'approved_text': 'Alimentatore azionamenti *******', 'confidence': 0.99, 'reason': 'visual estimate'},
+        {'region_id': 'V2-R1', 'row_id': 'ROW001', 'field_name': 'part_number_original',
+         'approved_text': '***********', 'confidence': 0.99, 'reason': 'visual estimate'},
+        {'region_id': 'V2-R1', 'row_id': 'ROW001', 'field_name': 'manufacturer_original',
+         'approved_text': 'SIGMATEK', 'confidence': 0.99, 'reason': 'visual reading'},
+    ],
+    'missing_region_ids': [], 'missing_row_ids': [],
+    'duplicate_physical_keys': [], 'unaccounted_visual_evidence': [],
+    'confidence': 0.99,
+    'issues': [{
+        'issue_type': 'masked_code_star_count_uncertain', 'severity': 'warning',
+        'message': 'Visual mask count uncertain.', 'region_id': 'V2-R1',
+        'row_ids': ['ROW001'], 'confidence': 0.75,
+        'resolution_status': 'open', 'related_overrides': [],
+    }],
+}
+_v2_gate_alias = _bom_canonicalize_verifier_rows(
+    extractions=_v2_gate_extractions,
+    verifier=_v2_gate_verifier,
+)
+assert _v2_gate_alias['mappings'], _v2_gate_alias
+_apply_bom_overrides(
+    _v2_gate_extractions,
+    _v2_gate_verifier['field_overrides'],
+)
+_v2_gate_passed, _v2_gate_rows, _v2_gate_issues = _validate_bom_page(
+    page=_v2_gate_page,
+    proposals=_v2_proposals,
+    detector=_v2_gate_detector,
+    extractions=_v2_gate_extractions,
+    verifier=_v2_gate_verifier,
+    word_map=_v2_word_map,
+    glyph_map=_v2_glyphs,
+)
+assert _v2_gate_passed is True, _v2_gate_issues
+assert _v2_gate_rows[0]['description_original'] == 'Alimentatore azionamenti ********'
+assert _v2_gate_rows[0]['part_number_original'] == '************'
+assert _v2_gate_rows[0]['manufacturer_original'] == 'SIGMATEK'
+assert not [
+    issue for issue in _v2_gate_issues
+    if issue.get('severity') in {'high', 'critical'}
+], _v2_gate_issues
+assert any(
+    issue.get('issue_type') == 'bom-verifier-verdict-superseded-post-override'
+    for issue in _v2_gate_issues
+), _v2_gate_issues
+
+# Raster/outlined sources without extractable characters remain fail-closed:
+# V2 never invents exact mask counts when no glyph ledger exists.
+_v2_no_glyph_row = copy.deepcopy(_v2_row)
+_v2_no_glyph_row['description_original'] = 'Alimentatore azionamenti *******'
+_v2_no_glyph_row['description_normalized'] = 'Alimentatore azionamenti *******'
+_v2_no_glyph_extractions = copy.deepcopy(_v2_extractions)
+_v2_no_glyph_extractions[0]['rows'] = [_v2_no_glyph_row]
+_v2_no_glyph_audit = _bom_reconcile_glyph_cell_evidence(
+    extractions=_v2_no_glyph_extractions,
+    proposals=_v2_proposals,
+    glyph_map={},
+    word_map=_v2_word_map,
+)
+assert _v2_no_glyph_audit['field_count'] == 0, _v2_no_glyph_audit
+assert _v2_no_glyph_row['description_original'].endswith('*******')
+
+# More than one populated canonical owner in one physical cell is ambiguous.
+_v2_ambiguous_extractions = copy.deepcopy(_v2_extractions)
+_v2_ambiguous_row = _v2_ambiguous_extractions[0]['rows'][0]
+_v2_ambiguous_row['item_position_original'] = 'EXTRA'
+_v2_ambiguous_row['item_position_normalized'] = 'EXTRA'
+_v2_ambiguous_row['field_evidence'].append({
+    'field_name': 'item_position_original',
+    'source_column_index': 1,
+    'source_word_ids': _v2_cells[1]['word_ids'],
+})
+_v2_ambiguous_extractions[0]['source_column_roles'][1]['canonical_roles'] = [
+    'description', 'item_position'
+]
+_v2_ambiguous_audit = _bom_reconcile_glyph_cell_evidence(
+    extractions=_v2_ambiguous_extractions,
+    proposals=_v2_proposals,
+    glyph_map=_v2_glyphs,
+    word_map=_v2_word_map,
+)
+assert not any(
+    item.get('field_name') in {'description_original', 'item_position_original'}
+    for item in _v2_ambiguous_audit['audits']
+), _v2_ambiguous_audit
+
+# Verifier-local row labels are mapped only when complete physical order and
+# tag sequence agree.
+_v2_alias_extractions = [{
+    'region_id': 'V2-R1',
+    'rows': [
+        {'row_id': 'ROW_R002', 'visual_order': 1, 'component_tag_original': 'K1'},
+        {'row_id': 'ROW_R003', 'visual_order': 2, 'component_tag_original': 'K2'},
+    ],
+}]
+_v2_alias_verifier = {
+    'region_checks': [{
+        'region_id': 'V2-R1',
+        'verified_row_ids': ['ROW001', 'ROW002'],
+        'verified_component_tag_sequence': ['K1', 'K2'],
+    }],
+    'field_overrides': [{
+        'region_id': 'V2-R1', 'row_id': 'ROW002',
+        'field_name': 'description_original', 'approved_text': 'X',
+        'confidence': 0.99, 'reason': 'fixture',
+    }],
+    'issues': [], 'missing_row_ids': [],
+}
+_v2_alias_audit = _bom_canonicalize_verifier_rows(
+    extractions=_v2_alias_extractions,
+    verifier=_v2_alias_verifier,
+)
+assert _v2_alias_audit['mappings'], _v2_alias_audit
+assert _v2_alias_verifier['region_checks'][0]['verified_row_ids'] == [
+    'ROW_R002', 'ROW_R003'
+]
+assert _v2_alias_verifier['field_overrides'][0]['row_id'] == 'ROW_R003'
 
 required = {
     '/v1/ai/electrical/normalize',

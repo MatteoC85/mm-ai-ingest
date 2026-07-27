@@ -16,7 +16,7 @@ import requests
 
 from electrical_source_store import download_electrical_source_pdf
 
-# MachineMind Phase 2B V1.5
+# MachineMind Phase 2B V2
 # Isolated multimodal bill-of-material extraction.
 # Publication is geometry-first, multilingual and fail-closed. No deterministic
 # rule depends on Italian/English labels, a specific PDF, fixed coordinates,
@@ -88,7 +88,7 @@ VERIFIER_PROMPT_VERSION = (
 ).strip()
 MATERIALIZER_VERSION = (
     os.environ.get("MM_ELECTRICAL_BOM_MATERIALIZER_VERSION")
-    or "mm-electrical-bom-materializer-v1.5"
+    or "mm-electrical-bom-materializer-v2"
 ).strip()
 
 OPENAI_TIMEOUT_SECONDS = _env_int(
@@ -122,7 +122,7 @@ MAX_SOURCE_BYTES = _env_int(
     500_000_000,
 )
 
-PIPELINE_MARKER = "phase2-bom-v1.5-source-snapshot"
+PIPELINE_MARKER = "phase2-bom-v2-glyph-cell-evidence-source-snapshot"
 EXTRACTION_METHOD = "openai_vision_bom_v1"
 PHASE_NAME = "bom_vision_v1"
 PAGE_TYPE = "bom_table"
@@ -177,6 +177,14 @@ ORIGINAL_FIELD_TO_COLUMN_ROLE = {
     "manufacturer_original": "manufacturer",
 }
 
+# Phase 2B V2: exact character/cell evidence. Font names and sizes are retained
+# only for audit; no decision branches on a specific font, language, page,
+# manufacturer, part number, coordinate or component tag.
+GLYPH_CELL_EVIDENCE_VERSION = "glyph-cell-evidence-v1"
+GLYPH_PHYSICAL_ORDER_VERSION = "glyph-cell-physical-order-v1"
+VERIFIER_ROW_ALIAS_VERSION = "verifier-row-alias-by-physical-order-v1"
+MASKING_CHARACTERS = {"*", "#"}
+
 
 def get_electrical_bom_runtime_config() -> dict:
     return {
@@ -189,6 +197,8 @@ def get_electrical_bom_runtime_config() -> dict:
         "extractor_prompt_version": EXTRACTOR_PROMPT_VERSION,
         "verifier_prompt_version": VERIFIER_PROMPT_VERSION,
         "materializer_version": MATERIALIZER_VERSION,
+        "glyph_cell_evidence_version": GLYPH_CELL_EVIDENCE_VERSION,
+        "verifier_row_alias_version": VERIFIER_ROW_ALIAS_VERSION,
         "row_min_confidence": ROW_MIN_CONFIDENCE,
         "page_pass_min_confidence": PAGE_PASS_MIN_CONFIDENCE,
         "render_dpi": RENDER_DPI,
@@ -908,6 +918,310 @@ def _word_map(page: dict) -> dict[int, dict]:
         }
     return out
 
+
+
+def _glyph_map(source_page: fitz.Page) -> dict[int, dict]:
+    """Return individual vector characters with physical geometry.
+
+    CAD/PDF word segmentation can change with a font, exporter or text engine.
+    Character origins and bboxes are a lower-level source: they let the local
+    publication layer rebuild one physical cell without trusting word grouping
+    or content-stream order. Font metadata is audit-only.
+    """
+    try:
+        raw = source_page.get_text("rawdict") or {}
+    except Exception:
+        return {}
+
+    out: dict[int, dict] = {}
+    glyph_id = 1
+    for block_index, block in enumerate(raw.get("blocks") or []):
+        if not isinstance(block, dict) or int(block.get("type") or 0) != 0:
+            continue
+        for line_index, line in enumerate(block.get("lines") or []):
+            if not isinstance(line, dict):
+                continue
+            direction = line.get("dir") or (1.0, 0.0)
+            try:
+                dir_x, dir_y = float(direction[0]), float(direction[1])
+            except Exception:
+                dir_x, dir_y = 1.0, 0.0
+            for span_index, span in enumerate(line.get("spans") or []):
+                if not isinstance(span, dict):
+                    continue
+                font_name = _clean_text(span.get("font"), 240)
+                try:
+                    font_size = float(span.get("size") or 0.0)
+                except Exception:
+                    font_size = 0.0
+                for char_index, char in enumerate(span.get("chars") or []):
+                    if not isinstance(char, dict):
+                        continue
+                    text = unicodedata.normalize(
+                        "NFKC", str(char.get("c") or "")
+                    ).replace("\x00", "")
+                    if not text or text in {"\n", "\r"}:
+                        continue
+                    bbox = char.get("bbox") or []
+                    if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+                        continue
+                    try:
+                        x0, y0, x1, y1 = [float(value) for value in bbox]
+                    except Exception:
+                        continue
+                    if x1 < x0 or y1 < y0:
+                        continue
+                    origin = char.get("origin") or (x0, y1)
+                    try:
+                        origin_x, origin_y = float(origin[0]), float(origin[1])
+                    except Exception:
+                        origin_x, origin_y = x0, y1
+                    out[glyph_id] = {
+                        "id": glyph_id,
+                        "text": text,
+                        "x0": x0,
+                        "y0": y0,
+                        "x1": x1,
+                        "y1": y1,
+                        "origin_x": origin_x,
+                        "origin_y": origin_y,
+                        "block_no": block_index,
+                        "line_no": line_index,
+                        "span_no": span_index,
+                        "char_no": char_index,
+                        "dir_x": dir_x,
+                        "dir_y": dir_y,
+                        "font_audit": font_name,
+                        "size_audit": font_size,
+                    }
+                    glyph_id += 1
+    return out
+
+
+def _glyph_line_groups(
+    glyph_ids: list[int],
+    glyph_map: dict[int, dict],
+) -> list[list[dict]]:
+    glyphs = [glyph_map[glyph_id] for glyph_id in glyph_ids if glyph_id in glyph_map]
+    glyphs = [glyph for glyph in glyphs if str(glyph.get("text") or "")]
+    if not glyphs:
+        return []
+
+    heights = [
+        max(0.1, float(glyph.get("y1") or 0.0) - float(glyph.get("y0") or 0.0))
+        for glyph in glyphs
+        if not str(glyph.get("text") or "").isspace()
+    ]
+    median_height = sorted(heights)[len(heights) // 2] if heights else 4.0
+    baseline_tolerance = max(0.75, median_height * 0.45)
+
+    ordered = sorted(
+        glyphs,
+        key=lambda glyph: (
+            float(glyph.get("origin_y") or glyph.get("y1") or 0.0),
+            float(glyph.get("origin_x") or glyph.get("x0") or 0.0),
+            int(glyph.get("id") or 0),
+        ),
+    )
+    groups: list[list[dict]] = []
+    baselines: list[float] = []
+    for glyph in ordered:
+        baseline = float(glyph.get("origin_y") or glyph.get("y1") or 0.0)
+        candidates = [
+            index
+            for index, current in enumerate(baselines)
+            if abs(current - baseline) <= baseline_tolerance
+        ]
+        if candidates:
+            index = min(candidates, key=lambda idx: abs(baselines[idx] - baseline))
+            groups[index].append(glyph)
+            baselines[index] = sum(
+                float(item.get("origin_y") or item.get("y1") or 0.0)
+                for item in groups[index]
+            ) / len(groups[index])
+        else:
+            groups.append([glyph])
+            baselines.append(baseline)
+
+    result: list[list[dict]] = []
+    for _baseline, group in sorted(zip(baselines, groups), key=lambda item: item[0]):
+        horizontal = abs(float(group[0].get("dir_x") or 1.0)) >= abs(
+            float(group[0].get("dir_y") or 0.0)
+        )
+        if horizontal:
+            group.sort(
+                key=lambda glyph: (
+                    float(glyph.get("origin_x") or glyph.get("x0") or 0.0),
+                    int(glyph.get("id") or 0),
+                )
+            )
+        else:
+            group.sort(
+                key=lambda glyph: (
+                    float(glyph.get("origin_y") or glyph.get("y0") or 0.0),
+                    int(glyph.get("id") or 0),
+                )
+            )
+        result.append(group)
+    return result
+
+
+def _glyph_text_for_ids(
+    glyph_ids: list[int],
+    glyph_map: dict[int, dict],
+    max_len: int = 5000,
+) -> str:
+    """Rebuild visible text in physical order from individual characters."""
+    lines: list[str] = []
+    for group in _glyph_line_groups(glyph_ids, glyph_map):
+        widths = [
+            max(0.1, float(glyph.get("x1") or 0.0) - float(glyph.get("x0") or 0.0))
+            for glyph in group
+            if not str(glyph.get("text") or "").isspace()
+        ]
+        median_width = sorted(widths)[len(widths) // 2] if widths else 2.0
+        pieces: list[str] = []
+        previous: Optional[dict] = None
+        for glyph in group:
+            text = str(glyph.get("text") or "")
+            if not text:
+                continue
+            if previous is not None and not text.isspace():
+                previous_text = str(previous.get("text") or "")
+                if previous_text and not previous_text.isspace():
+                    gap = float(glyph.get("x0") or 0.0) - float(
+                        previous.get("x1") or 0.0
+                    )
+                    if gap > max(0.9, median_width * 0.72):
+                        pieces.append(" ")
+            pieces.append(text)
+            previous = glyph
+        line_text = _clean_text("".join(pieces), max_len)
+        if line_text:
+            lines.append(line_text)
+    return _clean_text(" ".join(lines), max_len)
+
+
+def _assign_row_glyphs_to_cells(
+    *,
+    row_candidate: dict,
+    glyph_map: dict[int, dict],
+) -> dict:
+    """Assign every row character to exactly one physical cell by its origin."""
+    cells = [cell for cell in (row_candidate.get("cells") or []) if isinstance(cell, dict)]
+    prepared: list[tuple[int, fitz.Rect, dict]] = []
+    for cell in cells:
+        try:
+            column_index = int(cell.get("source_column_index"))
+            rect = _rect_from(cell.get("bbox_pt"))
+        except Exception:
+            continue
+        prepared.append((column_index, rect, cell))
+    prepared.sort(key=lambda item: (item[1].x0, item[1].x1, item[0]))
+    if not prepared:
+        return {"cells": {}, "row_glyph_ids": [], "unassigned_glyph_ids": []}
+
+    try:
+        row_rect = _rect_from(row_candidate.get("bbox_pt"))
+    except Exception:
+        row_rect = fitz.Rect(
+            min(item[1].x0 for item in prepared),
+            min(item[1].y0 for item in prepared),
+            max(item[1].x1 for item in prepared),
+            max(item[1].y1 for item in prepared),
+        )
+
+    assignments: dict[int, list[int]] = {item[0]: [] for item in prepared}
+    row_glyph_ids: list[int] = []
+    unassigned: list[int] = []
+    y_tolerance = 0.45
+    for glyph_id, glyph in glyph_map.items():
+        ox = float(glyph.get("origin_x") or glyph.get("x0") or 0.0)
+        oy = float(glyph.get("origin_y") or glyph.get("y1") or 0.0)
+        if not (row_rect.y0 - y_tolerance <= oy <= row_rect.y1 + y_tolerance):
+            continue
+        if not (prepared[0][1].x0 - 0.6 <= ox <= prepared[-1][1].x1 + 0.6):
+            continue
+        row_glyph_ids.append(int(glyph_id))
+        chosen: Optional[int] = None
+        for pos, (column_index, rect, _cell) in enumerate(prepared):
+            is_last = pos == len(prepared) - 1
+            if rect.x0 - 0.2 <= ox < rect.x1 - 0.02 or (
+                is_last and rect.x0 - 0.2 <= ox <= rect.x1 + 0.2
+            ):
+                chosen = column_index
+                break
+        if chosen is None:
+            # Very small exporter rounding errors are resolved by the nearest
+            # cell edge; larger gaps remain unassigned and therefore blocking.
+            distances = [
+                (
+                    min(abs(ox - rect.x0), abs(ox - rect.x1)),
+                    column_index,
+                )
+                for column_index, rect, _cell in prepared
+            ]
+            distance, nearest = min(distances)
+            if distance <= 0.6:
+                chosen = nearest
+        if chosen is None:
+            unassigned.append(int(glyph_id))
+        else:
+            assignments[chosen].append(int(glyph_id))
+
+    return {
+        "version": GLYPH_CELL_EVIDENCE_VERSION,
+        "cells": {
+            str(column_index): {
+                "source_column_index": column_index,
+                "cell_bbox_pt": _rect_list(rect),
+                "source_glyph_ids": sorted(set(assignments[column_index])),
+                "source_text_physical_order": _glyph_text_for_ids(
+                    assignments[column_index], glyph_map, 5000
+                ),
+            }
+            for column_index, rect, _cell in prepared
+        },
+        "row_glyph_ids": sorted(set(row_glyph_ids)),
+        "unassigned_glyph_ids": sorted(set(unassigned)),
+    }
+
+
+def _mask_runs(value: Any) -> list[str]:
+    return re.findall(r"[*#]+", str(value or ""))
+
+
+def _non_mask_character_signature(value: Any) -> str:
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    return "".join(
+        char.upper()
+        for char in text
+        if not char.isspace() and char not in MASKING_CHARACTERS
+    )
+
+
+def _project_readable_spacing_onto_exact_glyphs(
+    *,
+    exact_text: Any,
+    readable_candidate: Any,
+) -> str:
+    exact = _clean_text(exact_text, 5000)
+    candidate = _clean_text(readable_candidate, 5000)
+    if not exact or not candidate:
+        return ""
+    if _semantic_character_signature(exact) == _semantic_character_signature(candidate):
+        return candidate
+    if _non_mask_character_signature(exact) != _non_mask_character_signature(candidate):
+        return ""
+    exact_runs = _mask_runs(exact)
+    candidate_runs = _mask_runs(candidate)
+    if not exact_runs or len(exact_runs) != len(candidate_runs):
+        return ""
+    run_iter = iter(exact_runs)
+    projected = re.sub(r"[*#]+", lambda _match: next(run_iter), candidate)
+    if _semantic_character_signature(projected) != _semantic_character_signature(exact):
+        return ""
+    return _clean_text(projected, 5000)
 
 def _word_center(word: dict) -> tuple[float, float]:
     return (
@@ -2401,6 +2715,128 @@ def _normalize_verifier_issue_after_overrides(
     return normalized
 
 
+
+def _canonicalize_verifier_row_references(
+    *,
+    extractions: list[dict],
+    verifier: dict,
+) -> dict:
+    """Map verifier-local row labels to extractor row identities by order.
+
+    Some visual responses label the first item ROW001 while the extractor keeps
+    the deterministic source candidate label (for example ROW_R002 because R001
+    is the header). Mapping is permitted only when region, row count, physical
+    order and complete component-tag sequence all agree.
+    """
+    mappings: dict[str, dict[str, str]] = {}
+    audits: list[dict] = []
+    extraction_by_region = {
+        _clean_text(extraction.get("region_id"), 120): extraction
+        for extraction in extractions
+        if isinstance(extraction, dict)
+        and _clean_text(extraction.get("region_id"), 120)
+    }
+    for check in verifier.get("region_checks") or []:
+        if not isinstance(check, dict):
+            continue
+        region_id = _clean_text(check.get("region_id"), 120)
+        extraction = extraction_by_region.get(region_id)
+        if not extraction:
+            continue
+        actual_rows = sorted(
+            [row for row in (extraction.get("rows") or []) if isinstance(row, dict)],
+            key=lambda row: int(row.get("visual_order") or 0),
+        )
+        actual_ids = [_clean_text(row.get("row_id"), 120) for row in actual_rows]
+        verified_ids = [
+            _clean_text(value, 120)
+            for value in (check.get("verified_row_ids") or [])
+        ]
+        actual_tags = [
+            _clean_text(
+                row.get("component_tag_normalized")
+                or row.get("component_tag_original"),
+                1000,
+            )
+            for row in actual_rows
+        ]
+        verified_tags = [
+            _clean_text(value, 1000)
+            for value in (check.get("verified_component_tag_sequence") or [])
+        ]
+        if actual_ids == verified_ids:
+            continue
+        if not actual_ids or len(actual_ids) != len(verified_ids):
+            continue
+        if len(set(verified_ids)) != len(verified_ids):
+            continue
+        if not _sequence_matches_source_characters(actual_tags, verified_tags):
+            continue
+        mapping = dict(zip(verified_ids, actual_ids))
+        if len(set(mapping.values())) != len(mapping):
+            continue
+        mappings[region_id] = mapping
+        check["verified_row_ids"] = [mapping.get(value, value) for value in verified_ids]
+        for actual_row, verifier_id in zip(actual_rows, verified_ids):
+            actual_row.setdefault("verifier_row_aliases", []).append(
+                {
+                    "version": VERIFIER_ROW_ALIAS_VERSION,
+                    "verifier_row_id": verifier_id,
+                    "extractor_row_id": _clean_text(actual_row.get("row_id"), 120),
+                    "visual_order": int(actual_row.get("visual_order") or 0),
+                    "validated": True,
+                }
+            )
+        audits.append(
+            {
+                "version": VERIFIER_ROW_ALIAS_VERSION,
+                "region_id": region_id,
+                "mapping": mapping,
+                "validated": True,
+            }
+        )
+
+    if not mappings:
+        return {"version": VERIFIER_ROW_ALIAS_VERSION, "mappings": [], "validated": True}
+
+    def map_row(region_id: str, value: Any) -> str:
+        cleaned = _clean_text(value, 120)
+        return mappings.get(region_id, {}).get(cleaned, cleaned)
+
+    for override in verifier.get("field_overrides") or []:
+        if not isinstance(override, dict):
+            continue
+        region_id = _clean_text(override.get("region_id"), 120)
+        override["row_id"] = map_row(region_id, override.get("row_id"))
+    for issue in verifier.get("issues") or []:
+        if not isinstance(issue, dict):
+            continue
+        region_id = _clean_text(issue.get("region_id"), 120)
+        issue["row_ids"] = [
+            map_row(region_id, value) for value in (issue.get("row_ids") or [])
+        ]
+        for ref in issue.get("related_overrides") or []:
+            if not isinstance(ref, dict):
+                continue
+            ref_region = _clean_text(ref.get("region_id") or region_id, 120)
+            ref["row_id"] = map_row(ref_region, ref.get("row_id"))
+    verifier["missing_row_ids"] = [
+        next(
+            (
+                mapping[value]
+                for mapping in mappings.values()
+                if _clean_text(value, 120) in mapping
+            ),
+            _clean_text(value, 120),
+        )
+        for value in (verifier.get("missing_row_ids") or [])
+    ]
+    return {
+        "version": VERIFIER_ROW_ALIAS_VERSION,
+        "mappings": audits,
+        "validated": True,
+    }
+
 def _apply_overrides(
     extractions: list[dict],
     overrides: list[dict],
@@ -2457,7 +2893,10 @@ def _valid_transcription_override(
             after == current
             and confidence >= PAGE_PASS_MIN_CONFIDENCE
             and deterministic.get("validated") is True
-            and deterministic.get("source_word_ids")
+            and (
+                deterministic.get("source_word_ids")
+                or deterministic.get("source_glyph_ids")
+            )
         ):
             return {
                 "authority": "deterministic_source_geometry",
@@ -3383,12 +3822,272 @@ def _single_line_source_code_candidate(
     }
 
 
+
+def _reconcile_exact_cell_glyph_evidence(
+    *,
+    extractions: list[dict],
+    proposals: list[dict],
+    glyph_map: dict[int, dict],
+    word_map: dict[int, dict],
+) -> dict:
+    """Use physical cell characters as exact local publication evidence.
+
+    AI remains authoritative for table/column semantics. Character content and
+    order are reconstructed from glyph origins within the already-adjudicated
+    physical cell. This is independent of font name, PDF word grouping and
+    content-stream order. Ambiguous shared cells are deliberately skipped.
+    """
+    if not glyph_map:
+        return {
+            "version": GLYPH_CELL_EVIDENCE_VERSION,
+            "glyphs_available": False,
+            "validated": True,
+            "row_ids": [],
+            "field_count": 0,
+            "audits": [],
+        }
+
+    proposal_by_region = {
+        _clean_text(proposal.get("region_id"), 120): proposal
+        for proposal in proposals
+        if isinstance(proposal, dict)
+        and _clean_text(proposal.get("region_id"), 120)
+    }
+    audits: list[dict] = []
+    row_ids: set[str] = set()
+
+    for extraction in extractions:
+        if not isinstance(extraction, dict):
+            continue
+        region_id = _clean_text(extraction.get("region_id"), 120)
+        proposal = proposal_by_region.get(region_id)
+        if not proposal:
+            continue
+        candidate_by_id = {
+            _clean_text(candidate.get("source_row_candidate_id"), 120): candidate
+            for candidate in (proposal.get("row_candidates") or [])
+            if isinstance(candidate, dict)
+            and _clean_text(candidate.get("source_row_candidate_id"), 120)
+        }
+        roles_by_column: dict[int, set[str]] = {}
+        for decision in extraction.get("source_column_roles") or []:
+            if not isinstance(decision, dict):
+                continue
+            try:
+                column_index = int(decision.get("source_column_index"))
+            except Exception:
+                continue
+            roles_by_column[column_index] = {
+                _clean_text(role, 120)
+                for role in (decision.get("canonical_roles") or [])
+                if _clean_text(role, 120)
+            }
+
+        for row in extraction.get("rows") or []:
+            if not isinstance(row, dict):
+                continue
+            row_id = _clean_text(row.get("row_id"), 120)
+            source_candidate_id = _clean_text(
+                row.get("source_row_candidate_id"), 120
+            )
+            candidate = candidate_by_id.get(source_candidate_id)
+            if not candidate:
+                continue
+            row_glyph_assignment = _assign_row_glyphs_to_cells(
+                row_candidate=candidate,
+                glyph_map=glyph_map,
+            )
+            cell_glyphs = row_glyph_assignment.get("cells") or {}
+            row_word_ids = [
+                int(value)
+                for value in (candidate.get("word_ids") or [])
+                if str(value).isdigit() and int(value) in word_map
+            ]
+            row_word_text = _text_for_ids(row_word_ids, word_map, 12000)
+            all_cell_glyph_text = _clean_text(
+                " ".join(
+                    str(cell_glyphs[key].get("source_text_physical_order") or "")
+                    for key in sorted(cell_glyphs, key=lambda value: int(value))
+                    if str(cell_glyphs[key].get("source_text_physical_order") or "").strip()
+                ),
+                12000,
+            )
+            aggregate_word_signature = _source_evidence_signature(row_word_text)
+            aggregate_glyph_signature = _source_evidence_signature(all_cell_glyph_text)
+            aggregate_matches = bool(
+                aggregate_glyph_signature
+                and (
+                    not aggregate_word_signature
+                    or Counter(aggregate_word_signature)
+                    == Counter(aggregate_glyph_signature)
+                )
+                and not row_glyph_assignment.get("unassigned_glyph_ids")
+            )
+            row["glyph_row_evidence"] = {
+                **row_glyph_assignment,
+                "row_word_ids": sorted(set(row_word_ids)),
+                "row_word_text": row_word_text,
+                "all_cell_glyph_text": all_cell_glyph_text,
+                "aggregate_word_character_multiset_matches_glyphs": aggregate_matches,
+                "validated": aggregate_matches,
+            }
+            if not aggregate_matches:
+                continue
+
+            evidence_entries = [
+                item
+                for item in (row.get("field_evidence") or [])
+                if isinstance(item, dict)
+                and _clean_text(item.get("field_name"), 120) in ORIGINAL_FIELDS
+            ]
+            entries_by_column: dict[int, list[dict]] = {}
+            for evidence in evidence_entries:
+                try:
+                    column_index = int(evidence.get("source_column_index"))
+                except Exception:
+                    continue
+                entries_by_column.setdefault(column_index, []).append(evidence)
+
+            for column_index, entries in entries_by_column.items():
+                cell_audit = cell_glyphs.get(str(column_index)) or {}
+                exact_text = _clean_text(
+                    cell_audit.get("source_text_physical_order"), 5000
+                )
+                if not exact_text or not cell_audit.get("source_glyph_ids"):
+                    continue
+                owners = []
+                for evidence in entries:
+                    field_name = _clean_text(evidence.get("field_name"), 120)
+                    expected_role = ORIGINAL_FIELD_TO_COLUMN_ROLE.get(field_name)
+                    if not expected_role or expected_role not in roles_by_column.get(column_index, set()):
+                        continue
+                    if _clean_text(row.get(field_name), 5000):
+                        owners.append((field_name, evidence))
+                # One physical cell must have one unambiguous canonical owner.
+                if len(owners) != 1:
+                    continue
+                field_name, evidence = owners[0]
+                normalized_field = field_name.replace("_original", "_normalized")
+                visual_audit = (row.get("verifier_overrides") or {}).get(field_name)
+                visual_after = (
+                    _clean_text(visual_audit.get("after"), 5000)
+                    if isinstance(visual_audit, dict)
+                    else ""
+                )
+                candidates = [
+                    visual_after,
+                    _clean_text(row.get(normalized_field), 5000),
+                    _clean_text(row.get(field_name), 5000),
+                ]
+                final_text = ""
+                final_source = ""
+                for readable in candidates:
+                    projected = _project_readable_spacing_onto_exact_glyphs(
+                        exact_text=exact_text,
+                        readable_candidate=readable,
+                    )
+                    if projected:
+                        final_text = projected
+                        final_source = "readable_spacing_plus_source_exact_characters"
+                        break
+                if not final_text:
+                    final_text = exact_text
+                    final_source = "source_glyph_physical_order"
+                if _semantic_character_signature(final_text) != _semantic_character_signature(exact_text):
+                    continue
+
+                before_original = _clean_text(row.get(field_name), 5000)
+                before_normalized = _clean_text(row.get(normalized_field), 5000)
+                field_word_ids = []
+                for raw_id in evidence.get("source_word_ids") or []:
+                    try:
+                        field_word_ids.append(int(raw_id))
+                    except Exception:
+                        continue
+                audit = {
+                    "version": GLYPH_CELL_EVIDENCE_VERSION,
+                    "method": GLYPH_PHYSICAL_ORDER_VERSION,
+                    "region_id": region_id,
+                    "row_id": row_id,
+                    "source_row_candidate_id": source_candidate_id,
+                    "field_name": field_name,
+                    "source_column_index": column_index,
+                    "cell_bbox_pt": cell_audit.get("cell_bbox_pt") or [],
+                    "source_word_ids": sorted(set(field_word_ids)),
+                    "source_glyph_ids": cell_audit.get("source_glyph_ids") or [],
+                    "glyph_text_physical_order": exact_text,
+                    "before_original": before_original,
+                    "before_normalized": before_normalized,
+                    "final_text": final_text,
+                    "final_text_source": final_source,
+                    "font_names_audit": sorted(
+                        {
+                            _clean_text(glyph_map[glyph_id].get("font_audit"), 240)
+                            for glyph_id in (cell_audit.get("source_glyph_ids") or [])
+                            if glyph_id in glyph_map
+                            and _clean_text(glyph_map[glyph_id].get("font_audit"), 240)
+                        }
+                    ),
+                    "confidence": 1.0,
+                    "validated": True,
+                }
+                row[field_name] = final_text
+                row[normalized_field] = final_text
+                row.setdefault("glyph_cell_evidence", {})[field_name] = audit
+                row.setdefault("deterministic_overrides", {})[field_name] = {
+                    "before": before_original,
+                    "after": final_text,
+                    "confidence": 1.0,
+                    "reason": (
+                        "Individual source glyph origins inside the semantic cell "
+                        "established exact characters and physical order without "
+                        "using PDF word grouping or font-specific rules."
+                    ),
+                    "method": GLYPH_PHYSICAL_ORDER_VERSION,
+                    "source_word_ids": sorted(set(field_word_ids)),
+                    "source_glyph_ids": cell_audit.get("source_glyph_ids") or [],
+                    "source_signature": _source_evidence_signature(exact_text),
+                    "validated": True,
+                }
+                if isinstance(visual_audit, dict):
+                    visual_audit["superseded_by"] = GLYPH_PHYSICAL_ORDER_VERSION
+                    visual_audit["glyph_cell_authority_validated"] = True
+                if before_normalized != final_text:
+                    row.setdefault("post_override_normalization", {})[
+                        normalized_field
+                    ] = {
+                        "before": before_normalized,
+                        "after": final_text,
+                        "authority": GLYPH_PHYSICAL_ORDER_VERSION,
+                        "source_original_field": field_name,
+                        "validated": True,
+                    }
+                audits.append(audit)
+                row_ids.add(row_id)
+
+    return {
+        "version": GLYPH_CELL_EVIDENCE_VERSION,
+        "glyphs_available": True,
+        "validated": True,
+        "row_ids": sorted(row_ids),
+        "field_count": len(audits),
+        "audits": audits,
+    }
+
 def _reconcile_post_override_rows(
     *,
     extractions: list[dict],
+    proposals: list[dict],
     word_map: dict[int, dict],
+    glyph_map: Optional[dict[int, dict]] = None,
 ) -> dict:
     """Finalize rows after exact verifier overrides, before publication gates."""
+    glyph_reconciliation = _reconcile_exact_cell_glyph_evidence(
+        extractions=extractions,
+        proposals=proposals,
+        glyph_map=glyph_map or {},
+        word_map=word_map,
+    )
     source_order_rows: list[str] = []
     normalized_rows: list[str] = []
     cross_field_rows: list[str] = []
@@ -3504,7 +4203,10 @@ def _reconcile_post_override_rows(
                 normalized_rows.append(row_id)
 
     return {
-        "version": "bom-post-override-reconciliation-v3",
+        "version": "bom-post-override-reconciliation-v4-glyph-cells",
+        "glyph_cell_row_ids": glyph_reconciliation.get("row_ids") or [],
+        "glyph_cell_field_count": int(glyph_reconciliation.get("field_count") or 0),
+        "glyph_cell_evidence": glyph_reconciliation,
         "source_order_row_ids": sorted(set(source_order_rows)),
         "normalized_row_ids": sorted(set(normalized_rows)),
         "cross_field_transfer_row_ids": sorted(set(cross_field_rows)),
@@ -3681,11 +4383,17 @@ def _field_evidence_audit(
     )
     assigned_set = set(assignments)
     missing_ids = sorted(expected_set - assigned_set)
+    glyph_cell_evidence = row.get("glyph_cell_evidence") or {}
     missing_field_evidence = sorted(
         field_name
         for field_name in ORIGINAL_FIELDS
         if _clean_text(row.get(field_name), 5000)
         and not evidence_by_field.get(field_name)
+        and not (
+            isinstance(glyph_cell_evidence.get(field_name), dict)
+            and glyph_cell_evidence[field_name].get("validated") is True
+            and glyph_cell_evidence[field_name].get("source_glyph_ids")
+        )
     )
 
     unresolved_field_text_mismatches: list[dict] = []
@@ -3703,6 +4411,22 @@ def _field_evidence_audit(
             "source_signature": source_signature,
             "field_signature": field_signature,
         }
+        glyph_authority = glyph_cell_evidence.get(field_name) or {}
+        glyph_signature = _source_evidence_signature(
+            glyph_authority.get("glyph_text_physical_order")
+        )
+        if (
+            isinstance(glyph_authority, dict)
+            and glyph_authority.get("validated") is True
+            and glyph_authority.get("source_glyph_ids")
+            and glyph_signature == field_signature
+        ):
+            mismatch["post_override_authority"] = {
+                "authority": GLYPH_PHYSICAL_ORDER_VERSION,
+                **glyph_authority,
+            }
+            adjudicated_field_text_mismatches.append(mismatch)
+            continue
         authority = _valid_transcription_override(row, field_name)
         if authority:
             mismatch["post_override_authority"] = authority
@@ -3720,6 +4444,14 @@ def _field_evidence_audit(
         "field_text_mismatches": unresolved_field_text_mismatches,
         "adjudicated_field_text_mismatches": (
             adjudicated_field_text_mismatches
+        ),
+        "glyph_cell_evidence_version": GLYPH_CELL_EVIDENCE_VERSION,
+        "glyph_supported_fields": sorted(
+            field_name
+            for field_name, evidence in glyph_cell_evidence.items()
+            if isinstance(evidence, dict)
+            and evidence.get("validated") is True
+            and evidence.get("source_glyph_ids")
         ),
         "complete": not any(
             [
@@ -4127,14 +4859,34 @@ def _validate_page(
     extractions: list[dict],
     verifier: dict,
     word_map: dict[int, dict],
+    glyph_map: Optional[dict[int, dict]] = None,
 ) -> tuple[bool, list[dict], list[dict]]:
     issues: list[dict] = []
     rows: list[dict] = []
 
     reconciliation = _reconcile_post_override_rows(
         extractions=extractions,
+        proposals=proposals,
         word_map=word_map,
+        glyph_map=glyph_map or {},
     )
+    if reconciliation["glyph_cell_row_ids"]:
+        issues.append(
+            {
+                "issue_type": "bom-glyph-cell-evidence-reconciled",
+                "severity": "info",
+                "message": (
+                    "Individual source glyph geometry established exact cell "
+                    "characters and physical order independently of PDF word "
+                    "segmentation and font metrics."
+                ),
+                "region_id": "",
+                "row_ids": reconciliation["glyph_cell_row_ids"],
+                "confidence": 1.0,
+                "source_stage": "deterministic_glyph_cell_adjudicator",
+                "post_override_resolution": reconciliation,
+            }
+        )
     if reconciliation["cross_field_transfer_row_ids"]:
         issues.append(
             {
@@ -5673,6 +6425,9 @@ def _db_publish_page_rows(
                     "source_column_roles": item.get("source_column_roles") or [],
                     "field_evidence": item.get("field_evidence") or [],
                     "source_word_ids": item.get("source_word_ids") or [],
+                    "glyph_cell_evidence": item.get("glyph_cell_evidence") or {},
+                    "glyph_row_evidence": item.get("glyph_row_evidence") or {},
+                    "verifier_row_aliases": item.get("verifier_row_aliases") or [],
                     "source_evidence_coverage": item.get(
                         "source_evidence_coverage"
                     )
@@ -5935,6 +6690,7 @@ def extract_electrical_bom_page(
     try:
         page_index = int(page["pdf_page_number"]) - 1
         source_page = source_doc[page_index]
+        glyph_map = _glyph_map(source_page)
         proposals = _detect_geometry_proposals(
             source_page=source_page,
             inventory_page=page,
@@ -6136,6 +6892,10 @@ def extract_electrical_bom_page(
             verifier_reused,
         )
 
+        verifier_row_alias_audit = _canonicalize_verifier_row_references(
+            extractions=extractions,
+            verifier=verifier,
+        )
         _apply_overrides(
             extractions,
             verifier.get("field_overrides") or [],
@@ -6147,6 +6907,7 @@ def extract_electrical_bom_page(
             extractions=extractions,
             verifier=verifier,
             word_map=word_map,
+            glyph_map=glyph_map,
         )
 
         _db_replace_page_issues(
@@ -6280,6 +7041,21 @@ def extract_electrical_bom_page(
                 page_passed and not unresolved_duplicate_keys
             ),
             "duplicate_value_adjudication": resolved_duplicate_values,
+            "verifier_row_alias_adjudication": verifier_row_alias_audit,
+            "glyph_cell_evidence": {
+                "version": GLYPH_CELL_EVIDENCE_VERSION,
+                "glyph_count": len(glyph_map),
+                "reconciled_row_count": len(
+                    {
+                        _clean_text(row.get("row_id"), 120)
+                        for row in rows
+                        if row.get("glyph_cell_evidence")
+                    }
+                ),
+                "reconciled_field_count": sum(
+                    len(row.get("glyph_cell_evidence") or {}) for row in rows
+                ),
+            },
             "region_stats": region_stats,
             "severity_counts": _severity_counts(issues),
             **state,
