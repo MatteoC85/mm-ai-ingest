@@ -16,7 +16,7 @@ import requests
 
 from electrical_source_store import download_electrical_source_pdf
 
-# MachineMind Phase 2B V2
+# MachineMind Phase 2B V2.1
 # Isolated multimodal bill-of-material extraction.
 # Publication is geometry-first, multilingual and fail-closed. No deterministic
 # rule depends on Italian/English labels, a specific PDF, fixed coordinates,
@@ -88,7 +88,7 @@ VERIFIER_PROMPT_VERSION = (
 ).strip()
 MATERIALIZER_VERSION = (
     os.environ.get("MM_ELECTRICAL_BOM_MATERIALIZER_VERSION")
-    or "mm-electrical-bom-materializer-v2"
+    or "mm-electrical-bom-materializer-v2.1"
 ).strip()
 
 OPENAI_TIMEOUT_SECONDS = _env_int(
@@ -122,7 +122,7 @@ MAX_SOURCE_BYTES = _env_int(
     500_000_000,
 )
 
-PIPELINE_MARKER = "phase2-bom-v2-glyph-cell-evidence-source-snapshot"
+PIPELINE_MARKER = "phase2-bom-v2.1-glyph-cell-evidence-source-snapshot"
 EXTRACTION_METHOD = "openai_vision_bom_v1"
 PHASE_NAME = "bom_vision_v1"
 PAGE_TYPE = "bom_table"
@@ -182,6 +182,7 @@ ORIGINAL_FIELD_TO_COLUMN_ROLE = {
 # manufacturer, part number, coordinate or component tag.
 GLYPH_CELL_EVIDENCE_VERSION = "glyph-cell-evidence-v1"
 GLYPH_PHYSICAL_ORDER_VERSION = "glyph-cell-physical-order-v1"
+GLYPH_ROW_OWNERSHIP_VERSION = "glyph-row-center-exclusive-v1"
 VERIFIER_ROW_ALIAS_VERSION = "verifier-row-alias-by-physical-order-v1"
 MASKING_CHARACTERS = {"*", "#"}
 
@@ -1107,8 +1108,21 @@ def _assign_row_glyphs_to_cells(
     row_candidate: dict,
     glyph_map: dict[int, dict],
 ) -> dict:
-    """Assign every row character to exactly one physical cell by its origin."""
-    cells = [cell for cell in (row_candidate.get("cells") or []) if isinstance(cell, dict)]
+    """Assign every source glyph to one row and one physical cell.
+
+    Horizontal cell ownership remains based on the glyph origin because that
+    is the PDF text-placement anchor. Vertical row ownership is intentionally
+    based on the glyph bbox centre and a half-open row interval. CAD exporters
+    commonly place a text baseline exactly on the lower row border; using the
+    baseline for both adjacent rows duplicated the complete text of the upper
+    row inside the lower row. Bbox-centre ownership is independent of font,
+    font metrics and content-stream order and makes adjacent rows exclusive.
+    """
+    cells = [
+        cell
+        for cell in (row_candidate.get("cells") or [])
+        if isinstance(cell, dict)
+    ]
     prepared: list[tuple[int, fitz.Rect, dict]] = []
     for cell in cells:
         try:
@@ -1119,7 +1133,13 @@ def _assign_row_glyphs_to_cells(
         prepared.append((column_index, rect, cell))
     prepared.sort(key=lambda item: (item[1].x0, item[1].x1, item[0]))
     if not prepared:
-        return {"cells": {}, "row_glyph_ids": [], "unassigned_glyph_ids": []}
+        return {
+            "version": GLYPH_CELL_EVIDENCE_VERSION,
+            "row_ownership_version": GLYPH_ROW_OWNERSHIP_VERSION,
+            "cells": {},
+            "row_glyph_ids": [],
+            "unassigned_glyph_ids": [],
+        }
 
     try:
         row_rect = _rect_from(row_candidate.get("bbox_pt"))
@@ -1134,14 +1154,22 @@ def _assign_row_glyphs_to_cells(
     assignments: dict[int, list[int]] = {item[0]: [] for item in prepared}
     row_glyph_ids: list[int] = []
     unassigned: list[int] = []
-    y_tolerance = 0.45
     for glyph_id, glyph in glyph_map.items():
-        ox = float(glyph.get("origin_x") or glyph.get("x0") or 0.0)
-        oy = float(glyph.get("origin_y") or glyph.get("y1") or 0.0)
-        if not (row_rect.y0 - y_tolerance <= oy <= row_rect.y1 + y_tolerance):
+        gx0 = float(glyph.get("x0") or 0.0)
+        gy0 = float(glyph.get("y0") or 0.0)
+        gx1 = float(glyph.get("x1") or gx0)
+        gy1 = float(glyph.get("y1") or gy0)
+        ox = float(glyph.get("origin_x") or gx0)
+        centre_y = (gy0 + gy1) / 2.0
+
+        # Half-open vertical ownership prevents the same baseline from being
+        # claimed by two adjacent rows. Character centres remain inside their
+        # visual row even when ascenders/descenders cross a border slightly.
+        if not (row_rect.y0 <= centre_y < row_rect.y1):
             continue
         if not (prepared[0][1].x0 - 0.6 <= ox <= prepared[-1][1].x1 + 0.6):
             continue
+
         row_glyph_ids.append(int(glyph_id))
         chosen: Optional[int] = None
         for pos, (column_index, rect, _cell) in enumerate(prepared):
@@ -1171,6 +1199,7 @@ def _assign_row_glyphs_to_cells(
 
     return {
         "version": GLYPH_CELL_EVIDENCE_VERSION,
+        "row_ownership_version": GLYPH_ROW_OWNERSHIP_VERSION,
         "cells": {
             str(column_index): {
                 "source_column_index": column_index,
@@ -1185,7 +1214,6 @@ def _assign_row_glyphs_to_cells(
         "row_glyph_ids": sorted(set(row_glyph_ids)),
         "unassigned_glyph_ids": sorted(set(unassigned)),
     }
-
 
 def _mask_runs(value: Any) -> list[str]:
     return re.findall(r"[*#]+", str(value or ""))
@@ -3840,8 +3868,14 @@ def _reconcile_exact_cell_glyph_evidence(
     if not glyph_map:
         return {
             "version": GLYPH_CELL_EVIDENCE_VERSION,
+            "row_ownership_version": GLYPH_ROW_OWNERSHIP_VERSION,
             "glyphs_available": False,
             "validated": True,
+            "candidate_row_ids": [],
+            "validated_row_ids": [],
+            "unvalidated_row_ids": [],
+            "candidate_row_count": 0,
+            "validated_row_count": 0,
             "row_ids": [],
             "field_count": 0,
             "audits": [],
@@ -3855,6 +3889,9 @@ def _reconcile_exact_cell_glyph_evidence(
     }
     audits: list[dict] = []
     row_ids: set[str] = set()
+    candidate_row_ids: set[str] = set()
+    validated_row_ids: set[str] = set()
+    unvalidated_row_ids: set[str] = set()
 
     for extraction in extractions:
         if not isinstance(extraction, dict):
@@ -3893,6 +3930,7 @@ def _reconcile_exact_cell_glyph_evidence(
             candidate = candidate_by_id.get(source_candidate_id)
             if not candidate:
                 continue
+            candidate_row_ids.add(row_id)
             row_glyph_assignment = _assign_row_glyphs_to_cells(
                 row_candidate=candidate,
                 glyph_map=glyph_map,
@@ -3932,7 +3970,9 @@ def _reconcile_exact_cell_glyph_evidence(
                 "validated": aggregate_matches,
             }
             if not aggregate_matches:
+                unvalidated_row_ids.add(row_id)
                 continue
+            validated_row_ids.add(row_id)
 
             evidence_entries = [
                 item
@@ -4067,8 +4107,14 @@ def _reconcile_exact_cell_glyph_evidence(
 
     return {
         "version": GLYPH_CELL_EVIDENCE_VERSION,
+        "row_ownership_version": GLYPH_ROW_OWNERSHIP_VERSION,
         "glyphs_available": True,
-        "validated": True,
+        "validated": not bool(unvalidated_row_ids),
+        "candidate_row_ids": sorted(candidate_row_ids),
+        "validated_row_ids": sorted(validated_row_ids),
+        "unvalidated_row_ids": sorted(unvalidated_row_ids),
+        "candidate_row_count": len(candidate_row_ids),
+        "validated_row_count": len(validated_row_ids),
         "row_ids": sorted(row_ids),
         "field_count": len(audits),
         "audits": audits,
@@ -4887,6 +4933,28 @@ def _validate_page(
                 "post_override_resolution": reconciliation,
             }
         )
+    glyph_reconciliation = reconciliation.get("glyph_cell_evidence") or {}
+    if (
+        glyph_reconciliation.get("glyphs_available") is True
+        and glyph_reconciliation.get("unvalidated_row_ids")
+    ):
+        issues.append(
+            {
+                "issue_type": "bom-glyph-row-evidence-incomplete",
+                "severity": "high",
+                "message": (
+                    "One or more vector BOM rows could not be assigned an "
+                    "exclusive, source-exact glyph ledger. Publication remains "
+                    "blocked instead of falling back to font-sensitive word order."
+                ),
+                "region_id": "",
+                "row_ids": glyph_reconciliation.get("unvalidated_row_ids") or [],
+                "confidence": 0.0,
+                "source_stage": "deterministic_glyph_cell_validator",
+                "post_override_resolution": reconciliation,
+            }
+        )
+
     if reconciliation["cross_field_transfer_row_ids"]:
         issues.append(
             {
@@ -7044,6 +7112,7 @@ def extract_electrical_bom_page(
             "verifier_row_alias_adjudication": verifier_row_alias_audit,
             "glyph_cell_evidence": {
                 "version": GLYPH_CELL_EVIDENCE_VERSION,
+                "row_ownership_version": GLYPH_ROW_OWNERSHIP_VERSION,
                 "glyph_count": len(glyph_map),
                 "reconciled_row_count": len(
                     {
@@ -7052,6 +7121,16 @@ def extract_electrical_bom_page(
                         if row.get("glyph_cell_evidence")
                     }
                 ),
+                "validated_row_count": sum(
+                    1
+                    for row in rows
+                    if (row.get("glyph_row_evidence") or {}).get("validated") is True
+                ),
+                "unvalidated_row_ids": [
+                    _clean_text(row.get("row_id"), 120)
+                    for row in rows
+                    if (row.get("glyph_row_evidence") or {}).get("validated") is not True
+                ],
                 "reconciled_field_count": sum(
                     len(row.get("glyph_cell_evidence") or {}) for row in rows
                 ),

@@ -625,6 +625,7 @@ assert any(
 import copy
 from electrical_bom import (
     _apply_overrides as _apply_bom_overrides,
+    _assign_row_glyphs_to_cells as _bom_assign_row_glyphs,
     _build_table_proposal as _bom_build_table_proposal,
     _candidate_tables as _bom_candidate_tables,
     _canonical_row_candidate_accounting as _bom_row_candidate_accounting,
@@ -2361,6 +2362,152 @@ for _font_name in ['helv', 'Times-Roman', 'Courier']:
         _v2_doc.close()
 
 
+
+# Phase 2B V2.1: adjacent rows own glyphs exclusively. Many CAD PDFs place
+# each text baseline exactly on the lower row border. Baseline-inclusive row
+# tests duplicated the upper-row text into the next row. Bbox-centre,
+# half-open row ownership must work identically across common font metrics.
+for _font_name in ['helv', 'Times-Roman', 'Courier']:
+    _adj_doc = _bom_fitz.open()
+    try:
+        _adj_page = _adj_doc.new_page(width=360, height=100)
+        _adj_edges = [10.0, 90.0, 220.0, 280.0, 350.0]
+        _adj_y = [30.0, 50.0, 70.0]
+        for _edge in _adj_edges:
+            _adj_page.draw_line((_edge, _adj_y[0]), (_edge, _adj_y[-1]), width=0.5)
+        for _y in _adj_y:
+            _adj_page.draw_line((_adj_edges[0], _y), (_adj_edges[-1], _y), width=0.5)
+        # The baseline equals each row's lower border, reproducing the real
+        # shared-boundary failure without any page/tag/manufacturer special case.
+        _adj_page.insert_text((18, 50.0), 'A1', fontsize=8, fontname=_font_name)
+        _adj_page.insert_text((292, 50.0), 'BOSCH', fontsize=8, fontname=_font_name)
+        _adj_page.insert_text((18, 70.0), 'A2', fontsize=8, fontname=_font_name)
+        _adj_page.insert_text((292, 70.0), 'SIGMATEK', fontsize=8, fontname=_font_name)
+
+        _adj_glyphs = _bom_glyph_map(_adj_page)
+        _adj_words_raw = list(_adj_page.get_text('words', sort=True) or [])
+        _adj_word_map = _bom_word_map_from_page({
+            'words': [list(word) for word in _adj_words_raw],
+        })
+
+        def _adj_candidate(candidate_id, y0, y1):
+            cells = []
+            for column in range(4):
+                rect = _bom_fitz.Rect(
+                    _adj_edges[column], y0,
+                    _adj_edges[column + 1], y1,
+                )
+                ids = _v2_ids_in_rect(_adj_word_map, rect)
+                cells.append({
+                    'source_column_index': column,
+                    'bbox_pt': [float(rect.x0), float(rect.y0), float(rect.x1), float(rect.y1)],
+                    'word_ids': ids,
+                    'word_text_original': ' '.join(_adj_word_map[i]['text'] for i in ids),
+                    'deterministic_cell_text_original': '',
+                    'geometry_source': 'shared-boundary-fixture',
+                })
+            return {
+                'source_row_candidate_id': candidate_id,
+                'bbox_pt': [_adj_edges[0], y0, _adj_edges[-1], y1],
+                'word_ids': sorted({wid for cell in cells for wid in cell['word_ids']}),
+                'cells': cells,
+            }
+
+        _adj_candidate_1 = _adj_candidate('R002', 30.0, 50.0)
+        _adj_candidate_2 = _adj_candidate('R003', 50.0, 70.0)
+        _adj_assignment_1 = _bom_assign_row_glyphs(
+            row_candidate=_adj_candidate_1,
+            glyph_map=_adj_glyphs,
+        )
+        _adj_assignment_2 = _bom_assign_row_glyphs(
+            row_candidate=_adj_candidate_2,
+            glyph_map=_adj_glyphs,
+        )
+        assert _adj_assignment_1['row_ownership_version'] == 'glyph-row-center-exclusive-v1'
+        assert _adj_assignment_2['row_ownership_version'] == 'glyph-row-center-exclusive-v1'
+        assert _adj_assignment_1['cells']['3']['source_text_physical_order'] == 'BOSCH', (
+            _font_name, _adj_assignment_1
+        )
+        assert _adj_assignment_2['cells']['3']['source_text_physical_order'] == 'SIGMATEK', (
+            _font_name, _adj_assignment_2
+        )
+        assert not (
+            set(_adj_assignment_1['row_glyph_ids'])
+            & set(_adj_assignment_2['row_glyph_ids'])
+        ), (_font_name, _adj_assignment_1, _adj_assignment_2)
+
+        _adj_rows = [
+            {
+                'row_id': 'ROW_R002',
+                'source_row_candidate_id': 'R002',
+                'visual_order': 1,
+                'component_tag_original': 'A1',
+                'component_tag_normalized': 'A1',
+                'description_original': '', 'description_normalized': '',
+                'part_number_original': '', 'part_number_normalized': '',
+                'manufacturer_original': 'BOSCH',
+                'manufacturer_normalized': 'BOSCH',
+                'item_position_original': '', 'item_position_normalized': '',
+                'quantity_text_original': '', 'quantity_text_normalized': '',
+                'unit_original': '', 'unit_normalized': '',
+                'field_evidence': [
+                    {'field_name': 'component_tag_original', 'source_column_index': 0, 'source_word_ids': _adj_candidate_1['cells'][0]['word_ids']},
+                    {'field_name': 'manufacturer_original', 'source_column_index': 3, 'source_word_ids': _adj_candidate_1['cells'][3]['word_ids']},
+                ],
+                'source_word_ids': _adj_candidate_1['word_ids'],
+                'bbox_pt': _adj_candidate_1['bbox_pt'],
+                'confidence': 0.99,
+            },
+            {
+                'row_id': 'ROW_R003',
+                'source_row_candidate_id': 'R003',
+                'visual_order': 2,
+                'component_tag_original': 'A2',
+                'component_tag_normalized': 'A2',
+                'description_original': '', 'description_normalized': '',
+                'part_number_original': '', 'part_number_normalized': '',
+                'manufacturer_original': 'ATEK SIGM',
+                'manufacturer_normalized': 'ATEKSIGM',
+                'item_position_original': '', 'item_position_normalized': '',
+                'quantity_text_original': '', 'quantity_text_normalized': '',
+                'unit_original': '', 'unit_normalized': '',
+                'field_evidence': [
+                    {'field_name': 'component_tag_original', 'source_column_index': 0, 'source_word_ids': _adj_candidate_2['cells'][0]['word_ids']},
+                    {'field_name': 'manufacturer_original', 'source_column_index': 3, 'source_word_ids': _adj_candidate_2['cells'][3]['word_ids']},
+                ],
+                'source_word_ids': _adj_candidate_2['word_ids'],
+                'bbox_pt': _adj_candidate_2['bbox_pt'],
+                'confidence': 0.99,
+            },
+        ]
+        _adj_extractions = [{
+            'region_id': 'ADJ-R1',
+            'source_column_roles': [
+                {'source_column_index': 0, 'canonical_roles': ['component_tag'], 'confidence': 0.99, 'reason': 'fixture'},
+                {'source_column_index': 1, 'canonical_roles': ['description'], 'confidence': 0.99, 'reason': 'fixture'},
+                {'source_column_index': 2, 'canonical_roles': ['part_number'], 'confidence': 0.99, 'reason': 'fixture'},
+                {'source_column_index': 3, 'canonical_roles': ['manufacturer'], 'confidence': 0.99, 'reason': 'fixture'},
+            ],
+            'rows': _adj_rows,
+        }]
+        _adj_audit = _bom_reconcile_glyph_cell_evidence(
+            extractions=_adj_extractions,
+            proposals=[{
+                'region_id': 'ADJ-R1',
+                'row_candidates': [_adj_candidate_1, _adj_candidate_2],
+            }],
+            glyph_map=_adj_glyphs,
+            word_map=_adj_word_map,
+        )
+        assert _adj_audit['validated'] is True, (_font_name, _adj_audit)
+        assert _adj_audit['validated_row_count'] == 2, (_font_name, _adj_audit)
+        assert _adj_audit['unvalidated_row_ids'] == [], (_font_name, _adj_audit)
+        assert _adj_rows[1]['manufacturer_original'] == 'SIGMATEK', (
+            _font_name, _adj_rows[1]
+        )
+    finally:
+        _adj_doc.close()
+
 # Full V2 gate: a verifier may return review_required for its own wrong mask
 # count; exact glyph-cell evidence must correct the row and supersede only the
 # stale pre-correction flags, without weakening any structural gate.
@@ -2463,6 +2610,34 @@ assert any(
     issue.get('issue_type') == 'bom-verifier-verdict-superseded-post-override'
     for issue in _v2_gate_issues
 ), _v2_gate_issues
+
+# A vector row with a non-exclusive or incomplete glyph ledger must now block
+# at the endpoint gate instead of passing and being caught only by SQL later.
+_v21_bad_glyphs = copy.deepcopy(_v2_glyphs)
+_v21_bad_id = max(_v21_bad_glyphs) + 1
+_v21_bad_glyphs[_v21_bad_id] = {
+    'id': _v21_bad_id, 'text': 'Z',
+    'x0': 470.0, 'y0': 45.0, 'x1': 475.0, 'y1': 55.0,
+    'origin_x': 470.0, 'origin_y': 55.0,
+    'block_no': 999, 'line_no': 999, 'span_no': 0, 'char_no': 0,
+    'dir_x': 1.0, 'dir_y': 0.0, 'font_audit': '', 'size_audit': 8.0,
+}
+_v21_bad_extractions = copy.deepcopy(_v2_gate_extractions)
+_v21_bad_passed, _, _v21_bad_issues = _validate_bom_page(
+    page=_v2_gate_page,
+    proposals=_v2_proposals,
+    detector=_v2_gate_detector,
+    extractions=_v21_bad_extractions,
+    verifier=copy.deepcopy(_v2_gate_verifier),
+    word_map=_v2_word_map,
+    glyph_map=_v21_bad_glyphs,
+)
+assert _v21_bad_passed is False, _v21_bad_issues
+assert any(
+    issue.get('issue_type') == 'bom-glyph-row-evidence-incomplete'
+    and issue.get('severity') == 'high'
+    for issue in _v21_bad_issues
+), _v21_bad_issues
 
 # Raster/outlined sources without extractable characters remain fail-closed:
 # V2 never invents exact mask counts when no glyph ledger exists.
