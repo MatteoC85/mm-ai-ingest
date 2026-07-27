@@ -80,11 +80,11 @@ EXTRACTOR_PROMPT_VERSION = (
 ).strip()
 VERIFIER_PROMPT_VERSION = (
     os.environ.get("MM_ELECTRICAL_TERMINALS_VERIFIER_PROMPT_VERSION")
-    or "mm-electrical-terminal-page-verifier-v1.1"
+    or "mm-electrical-terminal-page-verifier-v1.2"
 ).strip()
 MATERIALIZER_VERSION = (
     os.environ.get("MM_ELECTRICAL_TERMINALS_MATERIALIZER_VERSION")
-    or "mm-electrical-terminal-materializer-v1.1"
+    or "mm-electrical-terminal-materializer-v1.2"
 ).strip()
 
 OPENAI_TIMEOUT_SECONDS = _env_int(
@@ -118,7 +118,7 @@ MAX_SOURCE_BYTES = _env_int(
     500_000_000,
 )
 
-PIPELINE_MARKER = "phase2-terminals-v1.1-source-snapshot"
+PIPELINE_MARKER = "phase2-terminals-v1.2-source-snapshot"
 EXTRACTION_METHOD = "openai_vision_terminals_v1"
 PHASE_NAME = "terminal_vision_v1"
 PAGE_TYPE = "terminal_table"
@@ -148,6 +148,34 @@ OVERRIDABLE_FIELDS = {
 
 FIELD_ASSIGNMENT_DECISION_VERSION = (
     "single-visual-evidence-field-arbitration-v1"
+)
+
+REGION_ADJUDICATION_VERSION = "visual-terminal-region-eligibility-v1"
+VISUAL_REGION_KINDS = {
+    "terminal_strip",
+    "auxiliary_description_grid",
+    "boundary_plate_row",
+    "annotation_grid",
+    "title_block",
+    "other_non_terminal",
+}
+NON_DATA_REGION_KINDS = VISUAL_REGION_KINDS - {"terminal_strip"}
+
+# Every visible word associated with a numbered terminal row must remain
+# represented after verifier overrides. This prevents a positive source value
+# from disappearing when an unsupported field assignment is cleared.
+SOURCE_EVIDENCE_FIELDS = (
+    "terminal_number_original",
+    "level_ref_original",
+    "side_a_origin_original",
+    "side_b_destination_original",
+    "wire_number_original",
+    "cable_reference_original",
+    "potential_original",
+    "conductor_color_original",
+    "conductor_cross_section_original",
+    "side_a_description_original",
+    "side_b_description_original",
 )
 
 # These groups contain canonical fields that may accidentally receive the
@@ -1390,9 +1418,41 @@ def _extractor_schema() -> dict:
     }
 
 
+
 def _verifier_schema() -> dict:
+    region_adjudication_schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "region_ref": {"type": "string"},
+            "visual_region_kind": {
+                "type": "string",
+                "enum": sorted(VISUAL_REGION_KINDS),
+            },
+            "is_data_terminal_strip": {"type": "boolean"},
+            "has_strip_tag": {"type": "boolean"},
+            "has_terminal_number_axis": {"type": "boolean"},
+            "has_numbered_terminal_rows": {"type": "boolean"},
+            "has_connection_semantics": {"type": "boolean"},
+            "accounted": {"type": "boolean"},
+            "confidence": {"type": "number"},
+            "reason": {"type": "string"},
+        },
+        "required": [
+            "region_ref",
+            "visual_region_kind",
+            "is_data_terminal_strip",
+            "has_strip_tag",
+            "has_terminal_number_axis",
+            "has_numbered_terminal_rows",
+            "has_connection_semantics",
+            "accounted",
+            "confidence",
+            "reason",
+        ],
+    }
     return {
-        "name": "electrical_terminal_page_verifier_v1_1",
+        "name": "electrical_terminal_page_verifier_v1_2",
         "strict": True,
         "schema": {
             "type": "object",
@@ -1403,7 +1463,14 @@ def _verifier_schema() -> dict:
                     "type": "string",
                     "enum": ["pass", "review_required"],
                 },
+                # Kept for backward-compatible audit. In V1.2 it means that
+                # every actual data-bearing strip is accounted for after the
+                # strip-like regions have been classified.
                 "all_visible_strips_accounted_for": {"type": "boolean"},
+                "all_strip_like_regions_classified": {"type": "boolean"},
+                "all_data_terminal_strips_accounted_for": {
+                    "type": "boolean"
+                },
                 "all_visible_terminal_rows_accounted_for": {
                     "type": "boolean"
                 },
@@ -1413,6 +1480,16 @@ def _verifier_schema() -> dict:
                 },
                 "all_published_fields_visually_supported": {
                     "type": "boolean"
+                },
+                "uncovered_region_adjudications": {
+                    "type": "array",
+                    "maxItems": 40,
+                    "items": region_adjudication_schema,
+                },
+                "unaccounted_data_terminal_strip_regions": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 20,
                 },
                 "region_checks": {
                     "type": "array",
@@ -1570,10 +1647,14 @@ def _verifier_schema() -> dict:
                 "page_id",
                 "verdict",
                 "all_visible_strips_accounted_for",
+                "all_strip_like_regions_classified",
+                "all_data_terminal_strips_accounted_for",
                 "all_visible_terminal_rows_accounted_for",
                 "all_strip_tags_supported_by_headers",
                 "all_terminal_numbers_visually_supported",
                 "all_published_fields_visually_supported",
+                "uncovered_region_adjudications",
+                "unaccounted_data_terminal_strip_regions",
                 "region_checks",
                 "field_support_decisions",
                 "field_overrides",
@@ -1740,6 +1821,7 @@ def _extractor_messages(
     ]
 
 
+
 def _verifier_messages(
     page: dict,
     proposals: list[dict],
@@ -1748,43 +1830,59 @@ def _verifier_messages(
     page_original: bytes,
     page_rotated: bytes,
     region_images: dict[str, tuple[bytes, bytes]],
+    word_map: dict[int, dict],
 ) -> list[dict]:
     system = (
         "You are the independent visual verifier of an industrial electrical "
         "terminal-strip reader. Re-read the full page and every high-resolution "
         "strip crop. The source may use any language, font, orientation, or CAD "
-        "system. Verify that every visible strip, numbered terminal, boundary "
-        "row, side value, and description is accounted for. Compare exact "
-        "terminal-number sequences, not just counts. Preserve source errors, "
-        "gaps, non-monotonic ordering, and repeated tags. Do not infer missing "
-        "values. A plate-terminal/boundary row is not a numbered terminal. "
-        "A repeated strip tag is allowed only when two distinct physical regions "
-        "are visible. Provide a field override only when the image supports one "
-        "unambiguous exact transcription; otherwise block. Return pass only when "
-        "all rows and published fields are visually supported and every region "
-        "meets the requested minimum confidence. Treat physical column or "
-        "lane semantics as stronger evidence than the lexical shape of a "
-        "value. A token that resembles a potential, cable, color, or wire "
-        "code must not be assigned to that canonical field unless its "
-        "physical location supports the role. For every row where the same "
-        "non-empty visible text is assigned to more than one canonical "
-        "field, return a field_support_decision. Count distinct visible "
-        "occurrences, list supported and unsupported fields, and state "
-        "whether one physical cell explicitly carries multiple meanings. "
-        "When one occurrence has one unambiguous role, emit a field_override "
-        "with approved_text empty for every unsupported duplicate field and "
-        "then allow the page to pass. Block only when the visual role remains "
-        "ambiguous. Never duplicate a value into multiple fields merely "
-        "because its syntax could fit more than one role."
+        "system. Verify that every actual data-bearing terminal strip, numbered "
+        "terminal, boundary row, side value, and visible row text is accounted "
+        "for. A grid is not automatically a terminal strip. For every uncovered "
+        "strip-like region reported by the preliminary detector, copy its "
+        "description exactly into region_ref and classify it as one of: "
+        "terminal_strip, auxiliary_description_grid, boundary_plate_row, "
+        "annotation_grid, title_block, or other_non_terminal. A data-bearing "
+        "terminal strip requires numbered terminal rows plus connection "
+        "semantics and either a strip identity or a terminal-number axis. Empty "
+        "layout/template grids without numbered terminal rows or electrical "
+        "connection semantics are non-data regions: account for them in the "
+        "audit, but do not require extraction or publication. Never dismiss a "
+        "true data-bearing strip merely because it is empty in some columns. "
+        "Compare exact terminal-number sequences, not just counts. Preserve "
+        "source errors, gaps, non-monotonic ordering, and repeated tags. Do not "
+        "infer missing values. A plate-terminal/boundary row is not a numbered "
+        "terminal. A repeated strip tag is allowed only when two distinct "
+        "physical regions are visible. Provide a field override only when the "
+        "image supports one unambiguous exact transcription; otherwise block. "
+        "Physical column/lane semantics are stronger evidence than the lexical "
+        "shape of a value. For every row where one non-empty visible text is "
+        "assigned to more than one canonical field, return a "
+        "field_support_decision. When a visible text is absent from its correct "
+        "physical field or is assigned to a wrong field, emit both sides of the "
+        "reassignment: set the correct field to the exact visible text and clear "
+        "the unsupported field. This also applies to spare/unused terminal rows: "
+        "a textual label printed in a physical wire lane remains wire text even "
+        "when it is not code-like. Do not translate, paraphrase, normalize, or "
+        "drop visible text. Return pass only when every actual data strip and "
+        "terminal row is covered, every strip-like region is classified, every "
+        "visible row word is represented in an approved field, and every "
+        "published field is visually supported."
     )
+    source_evidence = _row_source_evidence(extractions, word_map)
     request = {
         "page_id": page["id"],
         "pdf_page_number": page["pdf_page_number"],
         "sheet_code_original": page.get("sheet_code"),
         "sheet_title_original": page.get("sheet_title"),
         "detector": detector,
+        "detector_missing_visible_strips": (
+            detector.get("missing_visible_strips") or []
+        ),
+        "region_adjudication_version": REGION_ADJUDICATION_VERSION,
         "proposal_region_ids": [p["region_id"] for p in proposals],
         "extractions": extractions,
+        "row_source_evidence": source_evidence,
         "same_text_multi_field_candidates": (
             _same_text_multi_field_candidates(extractions)
         ),
@@ -1798,11 +1896,17 @@ def _verifier_messages(
         {
             "type": "text",
             "text": (
-                "Audit this page and all extracted terminal rows. Return exact "
-                "per-region sequences, a field_support_decision for every "
-                "same-text multi-field assignment, and only image-supported "
-                "overrides. Clear unsupported duplicate fields rather than "
-                "blocking when the physical role is unambiguous.\n\n"
+                "Audit this page and all extracted terminal rows. First "
+                "classify every detector-reported uncovered strip-like region "
+                "using its exact detector text as region_ref. Distinguish "
+                "data-bearing terminal strips from empty auxiliary/layout "
+                "grids by visual structure and electrical content, not by "
+                "language or font. Then verify exact per-region sequences. "
+                "Return a field_support_decision for every same-text "
+                "multi-field assignment. For any visible row text assigned "
+                "to a wrong field or missing from the physically supported "
+                "field, return positive and negative field_overrides so no "
+                "source evidence disappears.\n\n"
                 + json.dumps(request, ensure_ascii=False)
             ),
         },
@@ -1855,6 +1959,299 @@ def _verifier_messages(
         {"role": "system", "content": system},
         {"role": "user", "content": content},
     ]
+
+
+def _row_source_evidence(
+    extractions: list[dict],
+    word_map: dict[int, dict],
+) -> list[dict]:
+    evidence: list[dict] = []
+    for extraction in extractions:
+        region_id = _clean_text(extraction.get("region_id"), 120)
+        for terminal in extraction.get("terminals") or []:
+            word_ids = [
+                int(x)
+                for x in (terminal.get("source_word_ids") or [])
+                if isinstance(x, int) or str(x).isdigit()
+            ]
+            evidence.append(
+                {
+                    "region_id": region_id,
+                    "row_id": _clean_text(terminal.get("row_id"), 120),
+                    "row_role": _clean_text(terminal.get("row_role"), 120),
+                    "source_slot_ids": [
+                        str(x)
+                        for x in (terminal.get("source_slot_ids") or [])
+                        if str(x)
+                    ],
+                    "source_word_ids": word_ids,
+                    "source_text_original": _text_for_ids(
+                        word_ids,
+                        word_map,
+                        4000,
+                    ),
+                    "current_fields": {
+                        field: _clean_text(terminal.get(field), 1000)
+                        for field in SOURCE_EVIDENCE_FIELDS
+                    },
+                }
+            )
+    return evidence
+
+
+def _normalized_evidence_atom(value: Any) -> str:
+    text = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    return re.sub(r"[^0-9a-z]+", "", text)
+
+
+def _unrepresented_source_evidence(
+    terminal: dict,
+    word_map: dict[int, dict],
+) -> list[dict]:
+    published_values = [
+        _normalized_evidence_atom(terminal.get(field))
+        for field in SOURCE_EVIDENCE_FIELDS
+        if _normalized_evidence_atom(terminal.get(field))
+    ]
+    missing: list[dict] = []
+    for raw_id in terminal.get("source_word_ids") or []:
+        try:
+            word_id = int(raw_id)
+        except Exception:
+            continue
+        word = word_map.get(word_id)
+        if not word:
+            continue
+        original = _clean_text(word.get("text"), 500)
+        atom = _normalized_evidence_atom(original)
+        if not atom:
+            continue
+        if any(atom in value for value in published_values):
+            continue
+        missing.append(
+            {
+                "word_id": word_id,
+                "text_original": original,
+                "normalized_atom": atom,
+            }
+        )
+    return missing
+
+
+def _adjudicate_uncovered_regions(
+    *,
+    detector: dict,
+    verifier: dict,
+) -> tuple[list[dict], list[dict]]:
+    missing_refs = [
+        _clean_text(x, 500)
+        for x in (detector.get("missing_visible_strips") or [])
+        if _clean_text(x, 500)
+    ]
+    adjudications = [
+        x
+        for x in (verifier.get("uncovered_region_adjudications") or [])
+        if isinstance(x, dict)
+    ]
+    by_ref = {
+        _clean_text(x.get("region_ref"), 500).casefold(): x
+        for x in adjudications
+        if _clean_text(x.get("region_ref"), 500)
+    }
+
+    audit: list[dict] = []
+    issues: list[dict] = []
+
+    if missing_refs and not verifier.get("all_strip_like_regions_classified"):
+        issues.append(
+            {
+                "issue_type": "terminal-strip-like-regions-not-classified",
+                "severity": "high",
+                "message": (
+                    "The verifier did not classify every uncovered "
+                    "strip-like visual region."
+                ),
+                "region_id": "",
+                "row_ids": [],
+                "confidence": float(verifier.get("confidence") or 0.0),
+                "source_stage": "deterministic_validator",
+            }
+        )
+
+    for ref in missing_refs:
+        adjudication = by_ref.get(ref.casefold())
+        if not adjudication:
+            issues.append(
+                {
+                    "issue_type": "terminal-uncovered-region-not-adjudicated",
+                    "severity": "high",
+                    "message": (
+                        "Detector-reported uncovered visual region was not "
+                        f"adjudicated by the verifier: {ref}"
+                    ),
+                    "region_id": "",
+                    "row_ids": [],
+                    "confidence": 0.0,
+                    "source_stage": "deterministic_validator",
+                }
+            )
+            continue
+
+        kind = _clean_text(
+            adjudication.get("visual_region_kind"),
+            120,
+        )
+        confidence = max(
+            0.0,
+            min(1.0, float(adjudication.get("confidence") or 0.0)),
+        )
+        accounted = bool(adjudication.get("accounted"))
+        has_strip_tag = bool(adjudication.get("has_strip_tag"))
+        has_axis = bool(adjudication.get("has_terminal_number_axis"))
+        has_rows = bool(adjudication.get("has_numbered_terminal_rows"))
+        has_connections = bool(
+            adjudication.get("has_connection_semantics")
+        )
+        declared_data = bool(adjudication.get("is_data_terminal_strip"))
+        # Numbered physical rows plus either a strip identity or a
+        # terminal-number axis are sufficient to make a region data-bearing.
+        # Connection semantics strengthen the decision but are not mandatory:
+        # a valid strip can consist entirely of spare/reserved terminals.
+        computed_data = bool(
+            has_rows
+            and (has_strip_tag or has_axis)
+        )
+
+        audit_item = {
+            "version": REGION_ADJUDICATION_VERSION,
+            "region_ref": ref,
+            "visual_region_kind": kind,
+            "is_data_terminal_strip": declared_data,
+            "computed_is_data_terminal_strip": computed_data,
+            "has_strip_tag": has_strip_tag,
+            "has_terminal_number_axis": has_axis,
+            "has_numbered_terminal_rows": has_rows,
+            "has_connection_semantics": has_connections,
+            "accounted": accounted,
+            "confidence": confidence,
+            "reason": _clean_text(adjudication.get("reason"), 1600),
+        }
+        audit.append(audit_item)
+
+        if kind not in VISUAL_REGION_KINDS:
+            issues.append(
+                {
+                    "issue_type": "terminal-visual-region-kind-invalid",
+                    "severity": "high",
+                    "message": f"Invalid visual region kind for {ref}: {kind!r}",
+                    "region_id": "",
+                    "row_ids": [],
+                    "confidence": confidence,
+                    "source_stage": "deterministic_validator",
+                }
+            )
+            continue
+        if confidence < PAGE_PASS_MIN_CONFIDENCE or not accounted:
+            issues.append(
+                {
+                    "issue_type": "terminal-uncovered-region-low-confidence",
+                    "severity": "high",
+                    "message": (
+                        "Uncovered visual region was not confidently "
+                        f"accounted for: {ref}"
+                    ),
+                    "region_id": "",
+                    "row_ids": [],
+                    "confidence": confidence,
+                    "source_stage": "deterministic_validator",
+                }
+            )
+            continue
+        if declared_data != computed_data:
+            issues.append(
+                {
+                    "issue_type": "terminal-region-eligibility-inconsistent",
+                    "severity": "high",
+                    "message": (
+                        "Verifier region eligibility is internally "
+                        f"inconsistent for {ref}"
+                    ),
+                    "region_id": "",
+                    "row_ids": [],
+                    "confidence": confidence,
+                    "source_stage": "deterministic_validator",
+                }
+            )
+            continue
+        if computed_data or kind == "terminal_strip":
+            issues.append(
+                {
+                    "issue_type": "terminal-uncovered-data-strip",
+                    "severity": "high",
+                    "message": (
+                        "A data-bearing terminal strip is visible but has no "
+                        f"geometry/extraction region: {ref}"
+                    ),
+                    "region_id": "",
+                    "row_ids": [],
+                    "confidence": confidence,
+                    "source_stage": "deterministic_validator",
+                }
+            )
+            continue
+
+        issues.append(
+            {
+                "issue_type": "terminal-non-data-region-adjudicated",
+                "severity": "info",
+                "message": (
+                    f"Uncovered strip-like region classified as {kind}: {ref}"
+                ),
+                "region_id": "",
+                "row_ids": [],
+                "confidence": confidence,
+                "source_stage": "deterministic_validator",
+            }
+        )
+
+    unaccounted_data = [
+        _clean_text(x, 500)
+        for x in (
+            verifier.get("unaccounted_data_terminal_strip_regions") or []
+        )
+        if _clean_text(x, 500)
+    ]
+    if unaccounted_data:
+        issues.append(
+            {
+                "issue_type": "terminal-unaccounted-data-strips",
+                "severity": "high",
+                "message": (
+                    "Verifier found unaccounted data-bearing terminal strips: "
+                    + "; ".join(unaccounted_data)
+                ),
+                "region_id": "",
+                "row_ids": [],
+                "confidence": float(verifier.get("confidence") or 0.0),
+                "source_stage": "deterministic_validator",
+            }
+        )
+    if not verifier.get("all_data_terminal_strips_accounted_for"):
+        issues.append(
+            {
+                "issue_type": "terminal-data-strip-coverage-failed",
+                "severity": "high",
+                "message": (
+                    "Verifier returned "
+                    "all_data_terminal_strips_accounted_for=false"
+                ),
+                "region_id": "",
+                "row_ids": [],
+                "confidence": float(verifier.get("confidence") or 0.0),
+                "source_stage": "deterministic_validator",
+            }
+        )
+    return audit, issues
 
 
 def _usage_accumulator() -> dict:
@@ -2233,34 +2630,13 @@ def _validate_page(
     }
     verifier_decisions = _decision_lookup(verifier)
 
-    if not detector.get("all_visible_strips_accounted_for"):
-        issues.append(
-            {
-                "issue_type": "terminal-detector-unaccounted-strip",
-                "severity": "high",
-                "message": "Detector found an unaccounted visible terminal strip",
-                "region_id": "",
-                "row_ids": [],
-                "confidence": float(detector.get("confidence") or 0.0),
-                "source_stage": "detector",
-            }
+    region_audit, region_coverage_issues = (
+        _adjudicate_uncovered_regions(
+            detector=detector,
+            verifier=verifier,
         )
-    if detector.get("missing_visible_strips"):
-        issues.append(
-            {
-                "issue_type": "terminal-detector-missing-region",
-                "severity": "high",
-                "message": "Visible strip is not covered by geometry proposals: "
-                + "; ".join(
-                    _clean_text(x, 300)
-                    for x in detector.get("missing_visible_strips") or []
-                ),
-                "region_id": "",
-                "row_ids": [],
-                "confidence": float(detector.get("confidence") or 0.0),
-                "source_stage": "detector",
-            }
-        )
+    )
+    issues.extend(region_coverage_issues)
 
     for raw in detector.get("issues") or []:
         issues.append(
@@ -2551,6 +2927,37 @@ def _validate_page(
                 )
             )
 
+            missing_evidence = _unrepresented_source_evidence(
+                item,
+                word_map,
+            )
+            item["source_evidence_coverage"] = {
+                "version": "terminal-row-source-evidence-v1",
+                "missing": missing_evidence,
+                "complete": not bool(missing_evidence),
+            }
+            if missing_evidence:
+                issues.append(
+                    {
+                        "issue_type": (
+                            "terminal-visible-source-evidence-unrepresented"
+                        ),
+                        "severity": "high",
+                        "message": (
+                            f"Visible source evidence is not represented after "
+                            f"field adjudication for {rid}/{row_id}: "
+                            + ", ".join(
+                                repr(x["text_original"])
+                                for x in missing_evidence
+                            )
+                        ),
+                        "region_id": rid,
+                        "row_ids": [row_id],
+                        "confidence": confidence,
+                        "source_stage": "deterministic_validator",
+                    }
+                )
+
             item["region_id"] = rid
             item["strip_tag_original"] = extraction_tag or detector_tag
             item["source_side_label_original"] = _clean_text(
@@ -2662,7 +3069,8 @@ def _validate_page(
             )
 
     verifier_flags = [
-        "all_visible_strips_accounted_for",
+        "all_strip_like_regions_classified",
+        "all_data_terminal_strips_accounted_for",
         "all_visible_terminal_rows_accounted_for",
         "all_strip_tags_supported_by_headers",
         "all_terminal_numbers_visually_supported",
@@ -2917,6 +3325,10 @@ def _db_publish_page_rows(
                         "verifier_field_support_decisions"
                     )
                     or [],
+                    "source_evidence_coverage": item.get(
+                        "source_evidence_coverage"
+                    )
+                    or {},
                     "field_assignment_decision_version": (
                         FIELD_ASSIGNMENT_DECISION_VERSION
                     ),
@@ -3369,9 +3781,14 @@ def extract_electrical_terminal_page(
             "extractor_fingerprints": extractor_fingerprints,
             "detector": detector,
             "extractions": extractions,
+            "row_source_evidence": _row_source_evidence(
+                extractions,
+                word_map,
+            ),
             "same_text_multi_field_candidates": (
                 _same_text_multi_field_candidates(extractions)
             ),
+            "region_adjudication_version": REGION_ADJUDICATION_VERSION,
             "field_assignment_decision_version": (
                 FIELD_ASSIGNMENT_DECISION_VERSION
             ),
@@ -3393,6 +3810,7 @@ def extract_electrical_terminal_page(
                 page_original,
                 page_rotated,
                 region_images,
+                word_map,
             ),
             json_schema=_verifier_schema(),
             force=force,
@@ -3407,6 +3825,11 @@ def extract_electrical_terminal_page(
             "verifier",
             verifier_usage,
             verifier_reused,
+        )
+
+        region_audit, _ = _adjudicate_uncovered_regions(
+            detector=detector,
+            verifier=verifier,
         )
 
         _apply_field_support_decisions(
@@ -3521,6 +3944,15 @@ def extract_electrical_terminal_page(
             "published_terminal_rows": len(rows) if page_passed else 0,
             "blocking_issue_count_this_page": blocking,
             "warning_issue_count_this_page": warning,
+            "ignored_non_data_regions": [
+                item
+                for item in region_audit
+                if not item.get("is_data_terminal_strip")
+            ],
+            "unaccounted_data_terminal_strip_regions": (
+                verifier.get("unaccounted_data_terminal_strip_regions")
+                or []
+            ),
             "duplicate_source_strip_tags": sorted(
                 {
                     tag

@@ -12,12 +12,12 @@ substitutions:
   _EXPECTED_EXTRACTOR_PROMPT: "mm-electrical-table-extractor-v2.2"
   _EXPECTED_VERIFIER_PROMPT: "mm-electrical-page-verifier-v2.7"
   _EXPECTED_MATERIALIZER_VERSION: "mm-electrical-structured-materializer-v2.7"
-  _EXPECTED_TERMINAL_MARKER: "phase2-terminals-v1.1-source-snapshot"
+  _EXPECTED_TERMINAL_MARKER: "phase2-terminals-v1.2-source-snapshot"
   _EXPECTED_TERMINAL_MODEL: "gpt-5.4"
   _EXPECTED_TERMINAL_DETECTOR_PROMPT: "mm-electrical-terminal-detector-v1"
   _EXPECTED_TERMINAL_EXTRACTOR_PROMPT: "mm-electrical-terminal-strip-extractor-v1"
-  _EXPECTED_TERMINAL_VERIFIER_PROMPT: "mm-electrical-terminal-page-verifier-v1.1"
-  _EXPECTED_TERMINAL_MATERIALIZER: "mm-electrical-terminal-materializer-v1.1"
+  _EXPECTED_TERMINAL_VERIFIER_PROMPT: "mm-electrical-terminal-page-verifier-v1.2"
+  _EXPECTED_TERMINAL_MATERIALIZER: "mm-electrical-terminal-materializer-v1.2"
 
 steps:
   - id: "01-source-preflight"
@@ -302,9 +302,12 @@ steps:
         ) is False
 
         from electrical_terminals import (
+            _adjudicate_uncovered_regions,
             _apply_field_support_decisions,
+            _apply_overrides,
             _decision_lookup,
             _field_collision_issues,
+            _unrepresented_source_evidence,
         )
 
         ambiguous_terminal = {
@@ -370,6 +373,146 @@ steps:
         )
         assert len(unresolved_issues) == 1, unresolved_issues
         assert unresolved_issues[0]['severity'] == 'high', unresolved_issues
+
+        # Phase 2T V1.2: strip-like empty layout grids are classified and
+        # audited, but they do not become missing data-bearing strips.
+        coverage_detector = {
+            'missing_visible_strips': [
+                'upper strip-like empty grid',
+                'lower strip-like empty grid',
+            ],
+        }
+        coverage_verifier = {
+            'all_strip_like_regions_classified': True,
+            'all_data_terminal_strips_accounted_for': True,
+            'unaccounted_data_terminal_strip_regions': [],
+            'confidence': 0.98,
+            'uncovered_region_adjudications': [
+                {
+                    'region_ref': 'upper strip-like empty grid',
+                    'visual_region_kind': 'auxiliary_description_grid',
+                    'is_data_terminal_strip': False,
+                    'has_strip_tag': False,
+                    'has_terminal_number_axis': False,
+                    'has_numbered_terminal_rows': False,
+                    'has_connection_semantics': False,
+                    'accounted': True,
+                    'confidence': 0.98,
+                    'reason': 'Empty auxiliary layout without terminal data.',
+                },
+                {
+                    'region_ref': 'lower strip-like empty grid',
+                    'visual_region_kind': 'auxiliary_description_grid',
+                    'is_data_terminal_strip': False,
+                    'has_strip_tag': False,
+                    'has_terminal_number_axis': False,
+                    'has_numbered_terminal_rows': False,
+                    'has_connection_semantics': False,
+                    'accounted': True,
+                    'confidence': 0.97,
+                    'reason': 'Empty auxiliary layout without terminal data.',
+                },
+            ],
+        }
+        region_audit, coverage_issues = _adjudicate_uncovered_regions(
+            detector=coverage_detector,
+            verifier=coverage_verifier,
+        )
+        assert len(region_audit) == 2, region_audit
+        assert not [
+            issue
+            for issue in coverage_issues
+            if issue.get('severity') in {'high', 'critical'}
+        ], coverage_issues
+
+        # A real uncovered strip must still block.
+        blocking_verifier = {
+            **coverage_verifier,
+            'all_data_terminal_strips_accounted_for': False,
+            'unaccounted_data_terminal_strip_regions': ['uncovered data strip'],
+            'uncovered_region_adjudications': [
+                {
+                    'region_ref': 'upper strip-like empty grid',
+                    'visual_region_kind': 'terminal_strip',
+                    'is_data_terminal_strip': True,
+                    'has_strip_tag': True,
+                    'has_terminal_number_axis': True,
+                    'has_numbered_terminal_rows': True,
+                    'has_connection_semantics': True,
+                    'accounted': True,
+                    'confidence': 0.98,
+                    'reason': 'Actual numbered terminal strip.',
+                },
+                coverage_verifier['uncovered_region_adjudications'][1],
+            ],
+        }
+        _, blocking_coverage_issues = _adjudicate_uncovered_regions(
+            detector=coverage_detector,
+            verifier=blocking_verifier,
+        )
+        assert [
+            issue
+            for issue in blocking_coverage_issues
+            if issue.get('severity') in {'high', 'critical'}
+        ], blocking_coverage_issues
+
+        # Positive and negative overrides must move exact visible text to its
+        # physically supported field without losing it.
+        spare_row = {
+            'row_id': 'r24',
+            'wire_number_original': '',
+            'side_b_description_original': 'RESERVE',
+        }
+        spare_extractions = [{
+            'region_id': 'R1',
+            'terminals': [spare_row],
+        }]
+        _apply_overrides(
+            spare_extractions,
+            [
+                {
+                    'region_id': 'R1',
+                    'row_id': 'r24',
+                    'field_name': 'wire_number_original',
+                    'approved_text': 'RESERVE',
+                    'confidence': 0.98,
+                    'reason': 'Visible text is printed in the wire lane.',
+                },
+                {
+                    'region_id': 'R1',
+                    'row_id': 'r24',
+                    'field_name': 'side_b_description_original',
+                    'approved_text': '',
+                    'confidence': 0.98,
+                    'reason': 'No text is printed in the destination lane.',
+                },
+            ],
+        )
+        assert spare_row['wire_number_original'] == 'RESERVE', spare_row
+        assert spare_row['side_b_description_original'] == '', spare_row
+
+        # Deterministic source-evidence coverage blocks silent text loss.
+        word_map = {
+            1: {'id': 1, 'text': '24'},
+            2: {'id': 2, 'text': 'RESERVE'},
+        }
+        evidence_row = {
+            'source_word_ids': [1, 2],
+            'terminal_number_original': '24',
+            'wire_number_original': '',
+        }
+        missing_evidence = _unrepresented_source_evidence(
+            evidence_row,
+            word_map,
+        )
+        assert [
+            item['text_original'] for item in missing_evidence
+        ] == ['RESERVE'], missing_evidence
+        evidence_row['wire_number_original'] = 'RESERVE'
+        assert _unrepresented_source_evidence(
+            evidence_row,
+            word_map,
+        ) == []
 
         required = {
             '/v1/ai/electrical/normalize',
@@ -459,7 +602,7 @@ steps:
           --revision-suffix="$${REV_SUFFIX}" \
           --timeout="600s" \
           --remove-env-vars="MM_ELECTRICAL_STRUCTURED_MODEL,MM_ELECTRICAL_STRUCTURED_PROMPT_VERSION,MM_ELECTRICAL_STRUCTURED_MIN_CONFIDENCE,MM_ELECTRICAL_STRUCTURED_MAX_WORDS_PER_PAGE" \
-          --update-env-vars="COMMIT_SHA=$COMMIT_SHA,MM_ELECTRICAL_STRUCTURED_ENABLED=1,MM_ELECTRICAL_STRUCTURED_DETECTOR_MODEL=gpt-5.4,MM_ELECTRICAL_STRUCTURED_EXTRACTOR_MODEL=gpt-5.4,MM_ELECTRICAL_STRUCTURED_VERIFIER_MODEL=gpt-5.4,MM_ELECTRICAL_STRUCTURED_DETECTOR_PROMPT_VERSION=mm-electrical-region-detector-v2,MM_ELECTRICAL_STRUCTURED_EXTRACTOR_PROMPT_VERSION=mm-electrical-table-extractor-v2.2,MM_ELECTRICAL_STRUCTURED_VERIFIER_PROMPT_VERSION=mm-electrical-page-verifier-v2.7,MM_ELECTRICAL_STRUCTURED_MATERIALIZER_VERSION=mm-electrical-structured-materializer-v2.7,MM_ELECTRICAL_STRUCTURED_ROW_MIN_CONFIDENCE=0.80,MM_ELECTRICAL_STRUCTURED_PAGE_PASS_MIN_CONFIDENCE=0.90,MM_ELECTRICAL_STRUCTURED_TEXT_RECONSTRUCTION_MIN_CONFIDENCE=0.90,MM_ELECTRICAL_STRUCTURED_RENDER_DPI=220,MM_ELECTRICAL_STRUCTURED_MAX_COMPLETION_TOKENS=16000,MM_ELECTRICAL_STRUCTURED_FETCH_TIMEOUT_SECONDS=60,MM_ELECTRICAL_STRUCTURED_TIMEOUT_SECONDS=240,MM_ELECTRICAL_STRUCTURED_MAX_SOURCE_BYTES=100000000,MM_ELECTRICAL_STRUCTURED_INPUT_USD_PER_MILLION=0,MM_ELECTRICAL_STRUCTURED_OUTPUT_USD_PER_MILLION=0,MM_ELECTRICAL_TERMINALS_ENABLED=1,MM_ELECTRICAL_TERMINALS_DETECTOR_MODEL=gpt-5.4,MM_ELECTRICAL_TERMINALS_EXTRACTOR_MODEL=gpt-5.4,MM_ELECTRICAL_TERMINALS_VERIFIER_MODEL=gpt-5.4,MM_ELECTRICAL_TERMINALS_DETECTOR_PROMPT_VERSION=mm-electrical-terminal-detector-v1,MM_ELECTRICAL_TERMINALS_EXTRACTOR_PROMPT_VERSION=mm-electrical-terminal-strip-extractor-v1,MM_ELECTRICAL_TERMINALS_VERIFIER_PROMPT_VERSION=mm-electrical-terminal-page-verifier-v1.1,MM_ELECTRICAL_TERMINALS_MATERIALIZER_VERSION=mm-electrical-terminal-materializer-v1.1,MM_ELECTRICAL_TERMINALS_ROW_MIN_CONFIDENCE=0.82,MM_ELECTRICAL_TERMINALS_PAGE_PASS_MIN_CONFIDENCE=0.90,MM_ELECTRICAL_TERMINALS_RENDER_DPI=220,MM_ELECTRICAL_TERMINALS_MAX_COMPLETION_TOKENS=16000,MM_ELECTRICAL_TERMINALS_FETCH_TIMEOUT_SECONDS=60,MM_ELECTRICAL_TERMINALS_TIMEOUT_SECONDS=240,MM_ELECTRICAL_TERMINALS_MAX_SOURCE_BYTES=100000000,MM_ELECTRICAL_TERMINALS_INPUT_USD_PER_MILLION=0,MM_ELECTRICAL_TERMINALS_OUTPUT_USD_PER_MILLION=0,MM_ELECTRICAL_SOURCE_SNAPSHOT_ENABLED=1,MM_ELECTRICAL_SOURCE_BUCKET=mm-ai-electrical-sources-443517556116,MM_ELECTRICAL_SOURCE_PREFIX=electrical-source-v1,MM_ELECTRICAL_SOURCE_TIMEOUT_SECONDS=90,MM_ELECTRICAL_SOURCE_MAX_BYTES=100000000" \
+          --update-env-vars="COMMIT_SHA=$COMMIT_SHA,MM_ELECTRICAL_STRUCTURED_ENABLED=1,MM_ELECTRICAL_STRUCTURED_DETECTOR_MODEL=gpt-5.4,MM_ELECTRICAL_STRUCTURED_EXTRACTOR_MODEL=gpt-5.4,MM_ELECTRICAL_STRUCTURED_VERIFIER_MODEL=gpt-5.4,MM_ELECTRICAL_STRUCTURED_DETECTOR_PROMPT_VERSION=mm-electrical-region-detector-v2,MM_ELECTRICAL_STRUCTURED_EXTRACTOR_PROMPT_VERSION=mm-electrical-table-extractor-v2.2,MM_ELECTRICAL_STRUCTURED_VERIFIER_PROMPT_VERSION=mm-electrical-page-verifier-v2.7,MM_ELECTRICAL_STRUCTURED_MATERIALIZER_VERSION=mm-electrical-structured-materializer-v2.7,MM_ELECTRICAL_STRUCTURED_ROW_MIN_CONFIDENCE=0.80,MM_ELECTRICAL_STRUCTURED_PAGE_PASS_MIN_CONFIDENCE=0.90,MM_ELECTRICAL_STRUCTURED_TEXT_RECONSTRUCTION_MIN_CONFIDENCE=0.90,MM_ELECTRICAL_STRUCTURED_RENDER_DPI=220,MM_ELECTRICAL_STRUCTURED_MAX_COMPLETION_TOKENS=16000,MM_ELECTRICAL_STRUCTURED_FETCH_TIMEOUT_SECONDS=60,MM_ELECTRICAL_STRUCTURED_TIMEOUT_SECONDS=240,MM_ELECTRICAL_STRUCTURED_MAX_SOURCE_BYTES=100000000,MM_ELECTRICAL_STRUCTURED_INPUT_USD_PER_MILLION=0,MM_ELECTRICAL_STRUCTURED_OUTPUT_USD_PER_MILLION=0,MM_ELECTRICAL_TERMINALS_ENABLED=1,MM_ELECTRICAL_TERMINALS_DETECTOR_MODEL=gpt-5.4,MM_ELECTRICAL_TERMINALS_EXTRACTOR_MODEL=gpt-5.4,MM_ELECTRICAL_TERMINALS_VERIFIER_MODEL=gpt-5.4,MM_ELECTRICAL_TERMINALS_DETECTOR_PROMPT_VERSION=mm-electrical-terminal-detector-v1,MM_ELECTRICAL_TERMINALS_EXTRACTOR_PROMPT_VERSION=mm-electrical-terminal-strip-extractor-v1,MM_ELECTRICAL_TERMINALS_VERIFIER_PROMPT_VERSION=mm-electrical-terminal-page-verifier-v1.2,MM_ELECTRICAL_TERMINALS_MATERIALIZER_VERSION=mm-electrical-terminal-materializer-v1.2,MM_ELECTRICAL_TERMINALS_ROW_MIN_CONFIDENCE=0.82,MM_ELECTRICAL_TERMINALS_PAGE_PASS_MIN_CONFIDENCE=0.90,MM_ELECTRICAL_TERMINALS_RENDER_DPI=220,MM_ELECTRICAL_TERMINALS_MAX_COMPLETION_TOKENS=16000,MM_ELECTRICAL_TERMINALS_FETCH_TIMEOUT_SECONDS=60,MM_ELECTRICAL_TERMINALS_TIMEOUT_SECONDS=240,MM_ELECTRICAL_TERMINALS_MAX_SOURCE_BYTES=100000000,MM_ELECTRICAL_TERMINALS_INPUT_USD_PER_MILLION=0,MM_ELECTRICAL_TERMINALS_OUTPUT_USD_PER_MILLION=0,MM_ELECTRICAL_SOURCE_SNAPSHOT_ENABLED=1,MM_ELECTRICAL_SOURCE_BUCKET=mm-ai-electrical-sources-443517556116,MM_ELECTRICAL_SOURCE_PREFIX=electrical-source-v1,MM_ELECTRICAL_SOURCE_TIMEOUT_SECONDS=90,MM_ELECTRICAL_SOURCE_MAX_BYTES=100000000" \
           --quiet
 
         gcloud run services describe "${_SERVICE}" \
