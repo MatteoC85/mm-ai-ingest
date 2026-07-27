@@ -88,7 +88,7 @@ VERIFIER_PROMPT_VERSION = (
 ).strip()
 MATERIALIZER_VERSION = (
     os.environ.get("MM_ELECTRICAL_BOM_MATERIALIZER_VERSION")
-    or "mm-electrical-bom-materializer-v1.3"
+    or "mm-electrical-bom-materializer-v1.4"
 ).strip()
 
 OPENAI_TIMEOUT_SECONDS = _env_int(
@@ -122,7 +122,7 @@ MAX_SOURCE_BYTES = _env_int(
     500_000_000,
 )
 
-PIPELINE_MARKER = "phase2-bom-v1.3-source-snapshot"
+PIPELINE_MARKER = "phase2-bom-v1.4-source-snapshot"
 EXTRACTION_METHOD = "openai_vision_bom_v1"
 PHASE_NAME = "bom_vision_v1"
 PAGE_TYPE = "bom_table"
@@ -3346,6 +3346,203 @@ def _sequence_matches_source_characters(
     )
 
 
+def _component_tag_sequence_source_exact_adjudication(
+    *,
+    actual_rows: list[dict],
+    verified_row_ids: list[str],
+    verified_tags: list[str],
+    word_map: dict[int, dict],
+) -> dict:
+    """Adjudicate verifier tag punctuation only from exact source evidence.
+
+    The verifier can occasionally compact a source identifier for display and
+    omit punctuation that is genuinely printed in the BOM tag column. The
+    source value must never be rewritten merely to match that compact sequence.
+
+    Adjudication is allowed only when row count and row identity already match,
+    every differing tag has the same alphanumeric/masking content, and the
+    published tag (including punctuation) is independently identical to the
+    exact vector words assigned to ``component_tag_original``. Any missing,
+    duplicated, invalid or non-exact field evidence keeps the mismatch blocking.
+    """
+    actual_row_ids = [
+        _clean_text(row.get("row_id"), 120)
+        for row in actual_rows
+    ]
+    result = {
+        "version": "source-exact-component-tag-sequence-v1",
+        "validated": False,
+        "row_identity_matches": False,
+        "exact_match_count": 0,
+        "source_authoritative_difference_count": 0,
+        "source_authoritative_row_ids": [],
+        "differences": [],
+        "failure_reason": "",
+    }
+
+    if (
+        len(actual_rows) != len(verified_tags)
+        or len(actual_rows) != len(verified_row_ids)
+    ):
+        result["failure_reason"] = "row_count_mismatch"
+        return result
+    if actual_row_ids != verified_row_ids:
+        result["failure_reason"] = "row_identity_or_order_mismatch"
+        return result
+    result["row_identity_matches"] = True
+
+    differences: list[dict] = []
+    exact_match_count = 0
+    for row, verified_tag in zip(actual_rows, verified_tags):
+        row_id = _clean_text(row.get("row_id"), 120)
+        original_tag = _clean_text(
+            row.get("component_tag_original"),
+            1000,
+        )
+        published_tag = _clean_text(
+            row.get("component_tag_normalized") or original_tag,
+            1000,
+        )
+        verified_tag = _clean_text(verified_tag, 1000)
+
+        published_signature = _semantic_character_signature(published_tag)
+        verified_signature = _semantic_character_signature(verified_tag)
+        if published_signature == verified_signature:
+            exact_match_count += 1
+            continue
+
+        if not original_tag or not published_tag or not verified_tag:
+            result["failure_reason"] = (
+                f"empty_differing_component_tag:{row_id}"
+            )
+            return result
+        if (
+            _semantic_character_signature(original_tag)
+            != published_signature
+        ):
+            result["failure_reason"] = (
+                f"published_tag_not_source_character_equivalent:{row_id}"
+            )
+            return result
+
+        # The disagreement may contain punctuation/spacing only. Any
+        # alphanumeric or masking-symbol difference remains blocking.
+        source_atom = _source_evidence_signature(original_tag)
+        verifier_atom = _source_evidence_signature(verified_tag)
+        if not source_atom or source_atom != verifier_atom:
+            result["failure_reason"] = (
+                f"non_punctuation_component_tag_difference:{row_id}"
+            )
+            return result
+
+        evidence_entries = [
+            item
+            for item in (row.get("field_evidence") or [])
+            if isinstance(item, dict)
+            and _clean_text(item.get("field_name"), 120)
+            == "component_tag_original"
+        ]
+        if len(evidence_entries) != 1:
+            result["failure_reason"] = (
+                f"component_tag_evidence_not_unique:{row_id}"
+            )
+            return result
+        evidence = evidence_entries[0]
+        try:
+            source_column_index = int(evidence.get("source_column_index"))
+        except Exception:
+            result["failure_reason"] = (
+                f"component_tag_source_column_invalid:{row_id}"
+            )
+            return result
+
+        source_word_ids: list[int] = []
+        for raw_id in evidence.get("source_word_ids") or []:
+            try:
+                source_word_ids.append(int(raw_id))
+            except Exception:
+                result["failure_reason"] = (
+                    f"component_tag_word_id_invalid:{row_id}"
+                )
+                return result
+        if (
+            not source_word_ids
+            or len(source_word_ids) != len(set(source_word_ids))
+            or any(word_id not in word_map for word_id in source_word_ids)
+        ):
+            result["failure_reason"] = (
+                f"component_tag_word_evidence_invalid:{row_id}"
+            )
+            return result
+
+        declared_row_word_ids = {
+            int(raw_id)
+            for raw_id in (row.get("source_word_ids") or [])
+            if isinstance(raw_id, int) or str(raw_id).isdigit()
+        }
+        if not set(source_word_ids).issubset(declared_row_word_ids):
+            result["failure_reason"] = (
+                f"component_tag_word_evidence_outside_row:{row_id}"
+            )
+            return result
+
+        source_text = _text_for_ids(
+            source_word_ids,
+            word_map,
+            1000,
+        )
+        if (
+            _semantic_character_signature(source_text)
+            != _semantic_character_signature(original_tag)
+        ):
+            result["failure_reason"] = (
+                f"component_tag_not_exact_vector_source:{row_id}"
+            )
+            return result
+
+        coverage = row.get("source_evidence_coverage") or {}
+        if coverage and coverage.get("complete") is not True:
+            result["failure_reason"] = (
+                f"row_source_evidence_not_complete:{row_id}"
+            )
+            return result
+        if float(row.get("confidence") or 0.0) < ROW_MIN_CONFIDENCE:
+            result["failure_reason"] = (
+                f"component_tag_row_confidence_below_threshold:{row_id}"
+            )
+            return result
+
+        audit = {
+            "row_id": row_id,
+            "source_column_index": source_column_index,
+            "source_word_ids": source_word_ids,
+            "source_text_original": source_text,
+            "published_component_tag": published_tag,
+            "verifier_component_tag": verified_tag,
+            "source_exact_signature": (
+                _semantic_character_signature(source_text)
+            ),
+            "shared_alphanumeric_signature": source_atom,
+            "difference_kind": "verifier_punctuation_or_spacing_omission",
+            "source_authority": "exact_component_tag_vector_evidence",
+            "validated": True,
+        }
+        row["component_tag_sequence_adjudication"] = {
+            "version": result["version"],
+            **audit,
+        }
+        differences.append(audit)
+
+    result["exact_match_count"] = exact_match_count
+    result["source_authoritative_difference_count"] = len(differences)
+    result["source_authoritative_row_ids"] = [
+        item["row_id"] for item in differences
+    ]
+    result["differences"] = differences
+    result["validated"] = True
+    return result
+
+
 def _adjudicate_verifier_duplicate_physical_keys(
     *,
     reported_keys: list[Any],
@@ -4420,15 +4617,63 @@ def _validate_page(
             _clean_text(x, 1000)
             for x in (check.get("verified_component_tag_sequence") or [])
         ]
-        sequence_matches = bool(
+        count_and_identity_match = bool(
             int(check.get("expected_item_rows") or 0) == len(actual_rows)
             and int(check.get("verified_item_rows") or 0) == len(actual_rows)
             and verified_row_ids == actual_row_ids
+        )
+        exact_sequence_matches = bool(
+            count_and_identity_match
             and _sequence_matches_source_characters(
                 actual_tags,
                 verified_tags,
             )
         )
+        component_tag_sequence_adjudication: dict = {}
+        if count_and_identity_match and not exact_sequence_matches:
+            component_tag_sequence_adjudication = (
+                _component_tag_sequence_source_exact_adjudication(
+                    actual_rows=actual_rows,
+                    verified_row_ids=verified_row_ids,
+                    verified_tags=verified_tags,
+                    word_map=word_map,
+                )
+            )
+        sequence_matches = bool(
+            exact_sequence_matches
+            or component_tag_sequence_adjudication.get("validated") is True
+        )
+        if (
+            component_tag_sequence_adjudication.get("validated") is True
+            and component_tag_sequence_adjudication.get(
+                "source_authoritative_difference_count"
+            )
+        ):
+            issues.append(
+                {
+                    "issue_type": (
+                        "bom-verifier-component-tag-sequence-"
+                        "source-exact-adjudicated"
+                    ),
+                    "severity": "info",
+                    "message": (
+                        "Verifier component-tag sequence omitted source "
+                        "punctuation or spacing; exact vector field evidence "
+                        "preserved the printed identifiers."
+                    ),
+                    "region_id": rid,
+                    "row_ids": component_tag_sequence_adjudication[
+                        "source_authoritative_row_ids"
+                    ],
+                    "confidence": check_confidence,
+                    "source_stage": (
+                        "deterministic_source_evidence_adjudicator"
+                    ),
+                    "component_tag_sequence_adjudication": (
+                        component_tag_sequence_adjudication
+                    ),
+                }
+            )
         if not sequence_matches:
             issues.append(
                 {
@@ -4442,6 +4687,9 @@ def _validate_page(
                     "row_ids": actual_row_ids,
                     "confidence": check_confidence,
                     "source_stage": "deterministic_validator",
+                    "component_tag_sequence_adjudication": (
+                        component_tag_sequence_adjudication
+                    ),
                 }
             )
         elif not check.get("pass"):
@@ -4819,6 +5067,10 @@ def _db_replace_page_issues(
                         "duplicate_value_adjudication"
                     )
                     or [],
+                    "component_tag_sequence_adjudication": issue.get(
+                        "component_tag_sequence_adjudication"
+                    )
+                    or {},
                 }
                 cur.execute(
                     """
@@ -4947,6 +5199,9 @@ def _db_publish_page_rows(
                     "cross_field_evidence_transfers": item.get(
                         "cross_field_evidence_transfers"
                     ) or [],
+                    "component_tag_sequence_adjudication": item.get(
+                        "component_tag_sequence_adjudication"
+                    ) or {},
                     "evidence_notes": item.get("evidence_notes") or "",
                     "detector_fingerprint": detector_fingerprint,
                     "extractor_fingerprint": extractor_fingerprints.get(

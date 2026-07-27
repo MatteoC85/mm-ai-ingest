@@ -628,6 +628,7 @@ from electrical_bom import (
     _build_table_proposal as _bom_build_table_proposal,
     _candidate_tables as _bom_candidate_tables,
     _canonical_row_candidate_accounting as _bom_row_candidate_accounting,
+    _component_tag_sequence_source_exact_adjudication as _bom_tag_sequence_adjudication,
     _detect_sidecar_column_specs as _bom_detect_sidecar_columns,
     _field_evidence_audit as _bom_field_evidence_audit,
     _fallback_page_proposal as _bom_fallback_page_proposal,
@@ -1955,6 +1956,125 @@ _bom_v13_ambiguous_reconciliation = _bom_reconcile_post_override_rows(
 assert _bom_v13_ambiguous_reconciliation[
     'cross_field_transfer_row_ids'
 ] == [], _bom_v13_ambiguous_reconciliation
+
+# Phase 2B V1.4: exact source punctuation in a component tag is
+# authoritative when the verifier emits only a compact alphanumeric sequence.
+# The printed dot must be preserved; this is not permission to ignore arbitrary
+# punctuation or any alphanumeric disagreement.
+_bom_v14_word_map = copy.deepcopy(bom_word_map)
+_bom_v14_word_map[1] = {
+    **_bom_v14_word_map[1],
+    'text': '35.AP1',
+}
+_bom_v14_extractions = _bom_fixture_extractions()
+_bom_v14_row = _bom_v14_extractions[0]['rows'][0]
+_bom_v14_row['component_tag_original'] = '35.AP1'
+_bom_v14_row['component_tag_normalized'] = '35.AP1'
+_bom_v14_verifier = copy.deepcopy(bom_verifier)
+_bom_v14_verifier['verdict'] = 'review_required'
+_bom_v14_verifier['all_published_fields_visually_supported'] = False
+_bom_v14_verifier['all_source_evidence_represented'] = False
+_bom_v14_verifier['region_checks'][0]['pass'] = False
+_bom_v14_verifier['region_checks'][0][
+    'verified_component_tag_sequence'
+] = ['35AP1', 'K1']
+_bom_v14_verifier['region_checks'][0]['notes'] = (
+    'The verifier compacted source punctuation in one tag.'
+)
+_bom_v14_adjudication = _bom_tag_sequence_adjudication(
+    actual_rows=_bom_v14_extractions[0]['rows'],
+    verified_row_ids=['r1', 'r2'],
+    verified_tags=['35AP1', 'K1'],
+    word_map=_bom_v14_word_map,
+)
+assert _bom_v14_adjudication['validated'] is True, (
+    _bom_v14_adjudication
+)
+assert _bom_v14_adjudication[
+    'source_authoritative_row_ids'
+] == ['r1'], _bom_v14_adjudication
+_bom_v14_passed, _bom_v14_rows, _bom_v14_issues = _validate_bom_page(
+    page=bom_page,
+    proposals=bom_proposals,
+    detector=bom_detector,
+    extractions=_bom_v14_extractions,
+    verifier=_bom_v14_verifier,
+    word_map=_bom_v14_word_map,
+)
+assert _bom_v14_passed is True, _bom_v14_issues
+assert _bom_v14_rows[0]['component_tag_original'] == '35.AP1'
+assert _bom_v14_rows[0]['component_tag_normalized'] == '35.AP1'
+assert _bom_v14_rows[0]['component_tag_sequence_adjudication'][
+    'validated'
+] is True
+assert any(
+    issue.get('issue_type')
+    == 'bom-verifier-component-tag-sequence-source-exact-adjudicated'
+    and issue.get('severity') == 'info'
+    for issue in _bom_v14_issues
+), _bom_v14_issues
+assert not [
+    issue
+    for issue in _bom_v14_issues
+    if issue.get('severity') in {'high', 'critical'}
+], _bom_v14_issues
+
+# Any alphanumeric disagreement remains blocking even when punctuation also
+# differs. Source authority cannot turn 35.AP1 into 35BP1.
+_bom_v14_wrong_tag_verifier = copy.deepcopy(_bom_v14_verifier)
+_bom_v14_wrong_tag_verifier['verdict'] = 'pass'
+_bom_v14_wrong_tag_verifier['all_published_fields_visually_supported'] = True
+_bom_v14_wrong_tag_verifier['all_source_evidence_represented'] = True
+_bom_v14_wrong_tag_verifier['region_checks'][0]['pass'] = True
+_bom_v14_wrong_tag_verifier['region_checks'][0][
+    'verified_component_tag_sequence'
+] = ['35BP1', 'K1']
+_bom_v14_wrong_passed, _, _bom_v14_wrong_issues = _validate_bom_page(
+    page=bom_page,
+    proposals=bom_proposals,
+    detector=bom_detector,
+    extractions=copy.deepcopy(_bom_v14_extractions),
+    verifier=_bom_v14_wrong_tag_verifier,
+    word_map=_bom_v14_word_map,
+)
+assert _bom_v14_wrong_passed is False, _bom_v14_wrong_issues
+assert any(
+    issue.get('issue_type') == 'bom-verifier-row-sequence-mismatch'
+    and issue.get('severity') == 'high'
+    and issue.get('component_tag_sequence_adjudication', {}).get(
+        'failure_reason'
+    ).startswith('non_punctuation_component_tag_difference:')
+    for issue in _bom_v14_wrong_issues
+), _bom_v14_wrong_issues
+
+# Punctuation cannot be invented by the materializer. If exact vector evidence
+# says 35AP1 while the candidate says 35.AP1, source-evidence validation blocks.
+_bom_v14_invented_word_map = copy.deepcopy(_bom_v14_word_map)
+_bom_v14_invented_word_map[1]['text'] = '35AP1'
+_bom_v14_invented_extractions = copy.deepcopy(_bom_v14_extractions)
+_bom_v14_invented_verifier = copy.deepcopy(_bom_v14_wrong_tag_verifier)
+_bom_v14_invented_verifier['region_checks'][0][
+    'verified_component_tag_sequence'
+] = ['35AP1', 'K1']
+_bom_v14_invented_passed, _, _bom_v14_invented_issues = (
+    _validate_bom_page(
+        page=bom_page,
+        proposals=bom_proposals,
+        detector=bom_detector,
+        extractions=_bom_v14_invented_extractions,
+        verifier=_bom_v14_invented_verifier,
+        word_map=_bom_v14_invented_word_map,
+    )
+)
+assert _bom_v14_invented_passed is False, _bom_v14_invented_issues
+assert any(
+    issue.get('issue_type') == 'bom-verifier-row-sequence-mismatch'
+    and issue.get('severity') == 'high'
+    and issue.get('component_tag_sequence_adjudication', {}).get(
+        'failure_reason'
+    ).startswith('component_tag_not_exact_vector_source:')
+    for issue in _bom_v14_invented_issues
+), _bom_v14_invented_issues
 
 required = {
     '/v1/ai/electrical/normalize',
