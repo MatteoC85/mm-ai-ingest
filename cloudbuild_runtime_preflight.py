@@ -633,6 +633,7 @@ from electrical_bom import (
     _fallback_page_proposal as _bom_fallback_page_proposal,
     _parse_quantity as _parse_bom_quantity,
     _physical_bom_key as _bom_physical_key,
+    _reconcile_post_override_rows as _bom_reconcile_post_override_rows,
     _semantic_character_signature as _bom_character_signature,
     _validate_page as _validate_bom_page,
     _word_map as _bom_word_map_from_page,
@@ -1360,6 +1361,297 @@ key2 = _bom_physical_key(
     visual_order=2,
 )
 assert key1 != key2
+
+
+# Phase 2B V1.2: exact source x geometry must repair a technical code whose
+# vector fragments were returned in non-physical order. The deterministic
+# source characters win over a visually plausible O/0 substitution.
+_bom_source_order_row = {
+    'row_id': 'ROW-CODE-ORDER',
+    'part_number_original': '3VA9137OFK31',
+    'part_number_normalized': '0FK33VA91371',
+    'field_evidence': [{
+        'field_name': 'part_number_original',
+        'source_column_index': 2,
+        'source_word_ids': [2, 1, 3],
+    }],
+    'verifier_overrides': {
+        'part_number_original': {
+            'before': '0FK3 3VA9137 1',
+            'after': '3VA9137OFK31',
+            'confidence': 0.99,
+            'reason': 'Visual candidate contained an O/0 ambiguity.',
+        },
+    },
+}
+_bom_source_order_word_map = {
+    1: {
+        'id': 1, 'text': '3VA9137',
+        'x0': 10, 'y0': 10, 'x1': 30, 'y1': 15,
+    },
+    2: {
+        'id': 2, 'text': '0FK3',
+        'x0': 31, 'y0': 10, 'x1': 42, 'y1': 15,
+    },
+    3: {
+        'id': 3, 'text': '1',
+        'x0': 43, 'y0': 10, 'x1': 45, 'y1': 15,
+    },
+}
+_bom_source_order_audit = _bom_reconcile_post_override_rows(
+    extractions=[{'rows': [_bom_source_order_row]}],
+    word_map=_bom_source_order_word_map,
+)
+assert _bom_source_order_row['part_number_original'] == '3VA91370FK31', (
+    _bom_source_order_row
+)
+assert _bom_source_order_row['part_number_normalized'] == '3VA91370FK31', (
+    _bom_source_order_row
+)
+assert _bom_source_order_audit['source_order_row_ids'] == [
+    'ROW-CODE-ORDER'
+], _bom_source_order_audit
+
+# Exact visual word-order repair may adjudicate a source-string mismatch only
+# when it preserves the complete source character multiset. A substitution
+# without deterministic source authority must still fail closed.
+_bom_reordered_description = {
+    'description_original': 'interruttore automatico 3va5 ul frame 125',
+    'field_evidence': [{
+        'field_name': 'description_original',
+        'source_column_index': 1,
+        'source_word_ids': [1, 2, 3, 4, 5, 6],
+    }],
+    'verifier_overrides': {
+        'description_original': {
+            'before': 'frame interruttore automatico 3va5 ul 125',
+            'after': 'interruttore automatico 3va5 ul frame 125',
+            'confidence': 0.99,
+            'reason': 'Exact visible reading order.',
+        },
+    },
+}
+_bom_reordered_words = {
+    1: {'id': 1, 'text': 'frame', 'x0': 1, 'y0': 1, 'x1': 2, 'y1': 2},
+    2: {'id': 2, 'text': 'interruttore', 'x0': 3, 'y0': 1, 'x1': 4, 'y1': 2},
+    3: {'id': 3, 'text': 'automatico', 'x0': 5, 'y0': 1, 'x1': 6, 'y1': 2},
+    4: {'id': 4, 'text': '3va5', 'x0': 7, 'y0': 1, 'x1': 8, 'y1': 2},
+    5: {'id': 5, 'text': 'ul', 'x0': 9, 'y0': 1, 'x1': 10, 'y1': 2},
+    6: {'id': 6, 'text': '125', 'x0': 11, 'y0': 1, 'x1': 12, 'y1': 2},
+}
+_bom_reordered_audit = _bom_field_evidence_audit(
+    row=_bom_reordered_description,
+    expected_word_ids=[1, 2, 3, 4, 5, 6],
+    word_map=_bom_reordered_words,
+)
+assert _bom_reordered_audit['complete'] is True, _bom_reordered_audit
+assert len(
+    _bom_reordered_audit['adjudicated_field_text_mismatches']
+) == 1, _bom_reordered_audit
+
+_bom_substitution = copy.deepcopy(_bom_reordered_description)
+_bom_substitution['description_original'] = (
+    'interruttore automatico 3va5 uI frame 125'
+)
+_bom_substitution['verifier_overrides']['description_original']['after'] = (
+    _bom_substitution['description_original']
+)
+_bom_substitution_audit = _bom_field_evidence_audit(
+    row=_bom_substitution,
+    expected_word_ids=[1, 2, 3, 4, 5, 6],
+    word_map=_bom_reordered_words,
+)
+assert _bom_substitution_audit['complete'] is False, (
+    _bom_substitution_audit
+)
+
+# A pre-correction verifier review_required may be superseded only after the
+# exact override is applied, the normalized display value is synchronized,
+# and every deterministic publication check is clean.
+_bom_v12_page = {
+    'id': 901,
+    'pdf_page_number': 66,
+    'page_width_pt': 100,
+    'page_height_pt': 50,
+}
+_bom_v12_word_map = {
+    1: {'id': 1, 'text': 'K1', 'x0': 1, 'y0': 10, 'x1': 5, 'y1': 15},
+    2: {'id': 2, 'text': 'Relay', 'x0': 10, 'y0': 10, 'x1': 25, 'y1': 15},
+    3: {'id': 3, 'text': 'PN-1', 'x0': 30, 'y0': 10, 'x1': 45, 'y1': 15},
+    4: {'id': 4, 'text': 'ACME', 'x0': 50, 'y0': 10, 'x1': 65, 'y1': 15},
+    5: {'id': 5, 'text': 'Tag', 'x0': 1, 'y0': 0, 'x1': 5, 'y1': 5},
+    6: {'id': 6, 'text': 'Desc', 'x0': 10, 'y0': 0, 'x1': 25, 'y1': 5},
+    7: {'id': 7, 'text': 'Code', 'x0': 30, 'y0': 0, 'x1': 45, 'y1': 5},
+    8: {'id': 8, 'text': 'Maker', 'x0': 50, 'y0': 0, 'x1': 65, 'y1': 5},
+}
+_bom_v12_proposals = [{
+    'region_id': 'R-V12',
+    'row_candidates': [
+        {'source_row_candidate_id': 'H1', 'word_ids': [5, 6, 7, 8]},
+        {'source_row_candidate_id': 'S1', 'word_ids': [1, 2, 3, 4]},
+    ],
+}]
+_bom_v12_detector = {
+    'page_id': 901,
+    'all_visible_bom_tables_accounted_for': True,
+    'missing_visible_bom_tables': [],
+    'confidence': 0.99,
+    'issues': [],
+    'proposal_assessments': [{
+        'region_id': 'R-V12',
+        'visible': True,
+        'distinct_table': True,
+        'kind': 'bom_table',
+        'expected_header_rows': 1,
+        'expected_item_rows': 1,
+        'expected_column_count': 4,
+        'confidence': 0.99,
+        'notes': 'fixture',
+    }],
+}
+_bom_v12_row = {
+    'row_id': 'r-v12',
+    'source_row_candidate_id': 'S1',
+    'visual_order': 1,
+    'row_role': 'item',
+    'confidence': 0.99,
+    'bbox_pt': [0, 9, 70, 16],
+    'source_word_ids': [1, 2, 3, 4],
+    'evidence_notes': 'fixture',
+    'field_evidence': [
+        {'field_name': 'component_tag_original', 'source_column_index': 0, 'source_word_ids': [1]},
+        {'field_name': 'description_original', 'source_column_index': 1, 'source_word_ids': [2]},
+        {'field_name': 'part_number_original', 'source_column_index': 2, 'source_word_ids': [3]},
+        {'field_name': 'manufacturer_original', 'source_column_index': 3, 'source_word_ids': [4]},
+    ],
+    'item_position_original': '',
+    'item_position_normalized': '',
+    'component_tag_original': 'K1',
+    'component_tag_normalized': 'K1',
+    'quantity_text_original': '',
+    'quantity_text_normalized': '',
+    'unit_original': '',
+    'unit_normalized': '',
+    'description_original': 'y Rela',
+    'description_normalized': 'yRela',
+    'part_number_original': 'PN-1',
+    'part_number_normalized': 'PN-1',
+    'manufacturer_original': 'ACME',
+    'manufacturer_normalized': 'ACME',
+}
+_bom_v12_extractions = [{
+    'page_id': 901,
+    'region_id': 'R-V12',
+    'header_row_candidate_ids': ['H1'],
+    'non_item_rows': [],
+    'source_column_roles': [
+        {'source_column_index': 0, 'canonical_roles': ['component_tag'], 'confidence': 0.99, 'reason': 'fixture'},
+        {'source_column_index': 1, 'canonical_roles': ['description'], 'confidence': 0.99, 'reason': 'fixture'},
+        {'source_column_index': 2, 'canonical_roles': ['part_number'], 'confidence': 0.99, 'reason': 'fixture'},
+        {'source_column_index': 3, 'canonical_roles': ['manufacturer'], 'confidence': 0.99, 'reason': 'fixture'},
+    ],
+    'rows': [_bom_v12_row],
+    'unaccounted_row_candidate_ids': [],
+    'duplicate_row_ids': [],
+    'confidence': 0.99,
+    'issues': [],
+}]
+_bom_v12_override = {
+    'region_id': 'R-V12',
+    'row_id': 'r-v12',
+    'field_name': 'description_original',
+    'approved_text': 'Relay',
+    'confidence': 0.99,
+    'reason': 'Exact visible transcription.',
+}
+_bom_v12_verifier = {
+    'page_id': 901,
+    'verdict': 'review_required',
+    'all_visible_bom_tables_accounted_for': True,
+    'all_visible_item_rows_accounted_for': True,
+    'all_visible_columns_accounted_for': True,
+    'all_published_fields_visually_supported': False,
+    'all_source_evidence_represented': True,
+    'duplicates_preserved': True,
+    'region_checks': [{
+        'region_id': 'R-V12',
+        'expected_item_rows': 1,
+        'verified_item_rows': 1,
+        'verified_row_ids': ['r-v12'],
+        'verified_component_tag_sequence': ['K1'],
+        'pass': False,
+        'confidence': 0.99,
+        'notes': 'Pre-correction normalized text was stale.',
+    }],
+    'field_overrides': [_bom_v12_override],
+    'missing_region_ids': [],
+    'missing_row_ids': [],
+    'duplicate_physical_keys': [],
+    'unaccounted_visual_evidence': [],
+    'confidence': 0.99,
+    'issues': [{
+        'issue_type': 'normalized_text_not_spacing_only',
+        'severity': 'high',
+        'message': 'Pre-correction normalized text was stale.',
+        'region_id': 'R-V12',
+        'row_ids': ['r-v12'],
+        'confidence': 0.99,
+        'resolution_status': 'open',
+        'related_overrides': [],
+    }],
+}
+_apply_bom_overrides(
+    _bom_v12_extractions,
+    [_bom_v12_override],
+)
+_bom_v12_passed, _bom_v12_rows, _bom_v12_issues = _validate_bom_page(
+    page=_bom_v12_page,
+    proposals=_bom_v12_proposals,
+    detector=_bom_v12_detector,
+    extractions=_bom_v12_extractions,
+    verifier=_bom_v12_verifier,
+    word_map=_bom_v12_word_map,
+)
+assert _bom_v12_passed is True, _bom_v12_issues
+assert _bom_v12_rows[0]['description_original'] == 'Relay'
+assert _bom_v12_rows[0]['description_normalized'] == 'Relay'
+assert not [
+    issue for issue in _bom_v12_issues
+    if issue.get('severity') in {'high', 'critical'}
+], _bom_v12_issues
+assert any(
+    issue.get('issue_type')
+    == 'bom-verifier-verdict-superseded-post-override'
+    for issue in _bom_v12_issues
+), _bom_v12_issues
+
+_bom_v12_unresolved_verifier = copy.deepcopy(_bom_v12_verifier)
+_bom_v12_unresolved_verifier['issues'].append({
+    'issue_type': 'unresolved_visual_ambiguity',
+    'severity': 'high',
+    'message': 'No exact correction is available.',
+    'region_id': 'R-V12',
+    'row_ids': ['r-v12'],
+    'confidence': 0.99,
+    'resolution_status': 'open',
+    'related_overrides': [],
+})
+_bom_v12_unresolved_passed, _, _bom_v12_unresolved_issues = (
+    _validate_bom_page(
+        page=_bom_v12_page,
+        proposals=_bom_v12_proposals,
+        detector=_bom_v12_detector,
+        extractions=copy.deepcopy(_bom_v12_extractions),
+        verifier=_bom_v12_unresolved_verifier,
+        word_map=_bom_v12_word_map,
+    )
+)
+assert _bom_v12_unresolved_passed is False, _bom_v12_unresolved_issues
+assert any(
+    issue.get('issue_type') == 'unresolved_visual_ambiguity'
+    and issue.get('severity') == 'high'
+    for issue in _bom_v12_unresolved_issues
+), _bom_v12_unresolved_issues
 
 required = {
     '/v1/ai/electrical/normalize',

@@ -14,7 +14,7 @@ import requests
 
 from electrical_source_store import download_electrical_source_pdf
 
-# MachineMind Phase 2B V1.1
+# MachineMind Phase 2B V1.2
 # Isolated multimodal bill-of-material extraction.
 # Publication is geometry-first, multilingual and fail-closed. No deterministic
 # rule depends on Italian/English labels, a specific PDF, fixed coordinates,
@@ -86,7 +86,7 @@ VERIFIER_PROMPT_VERSION = (
 ).strip()
 MATERIALIZER_VERSION = (
     os.environ.get("MM_ELECTRICAL_BOM_MATERIALIZER_VERSION")
-    or "mm-electrical-bom-materializer-v1.1"
+    or "mm-electrical-bom-materializer-v1.2"
 ).strip()
 
 OPENAI_TIMEOUT_SECONDS = _env_int(
@@ -120,7 +120,7 @@ MAX_SOURCE_BYTES = _env_int(
     500_000_000,
 )
 
-PIPELINE_MARKER = "phase2-bom-v1.1-source-snapshot"
+PIPELINE_MARKER = "phase2-bom-v1.2-source-snapshot"
 EXTRACTION_METHOD = "openai_vision_bom_v1"
 PHASE_NAME = "bom_vision_v1"
 PAGE_TYPE = "bom_table"
@@ -2428,6 +2428,386 @@ def _apply_overrides(
         row[field_name] = approved
 
 
+def _valid_transcription_override(
+    row: dict,
+    field_name: str,
+) -> Optional[dict]:
+    """Return a validated post-override transcription authority.
+
+    Two authorities are accepted, both fail-closed:
+
+    * deterministic source-word geometry, which may restore the physical
+      left-to-right order of fragments from one source cell;
+    * an exact high-confidence visual verifier override, but only when it
+      preserves the complete multiset of source alphanumeric/masking
+      characters. This permits CAD/PDF word-order repair without silently
+      accepting substitutions, additions or deletions.
+    """
+    current = _clean_text(row.get(field_name), 5000)
+
+    deterministic = (
+        row.get("deterministic_overrides") or {}
+    ).get(field_name)
+    if isinstance(deterministic, dict):
+        after = _clean_text(deterministic.get("after"), 5000)
+        confidence = float(deterministic.get("confidence") or 0.0)
+        if (
+            after == current
+            and confidence >= PAGE_PASS_MIN_CONFIDENCE
+            and deterministic.get("validated") is True
+            and deterministic.get("source_word_ids")
+        ):
+            return {
+                "authority": "deterministic_source_geometry",
+                **deterministic,
+            }
+
+    visual = (row.get("verifier_overrides") or {}).get(field_name)
+    if not isinstance(visual, dict):
+        return None
+    before = _clean_text(visual.get("before"), 5000)
+    after = _clean_text(visual.get("after"), 5000)
+    confidence = float(visual.get("confidence") or 0.0)
+    before_signature = _source_evidence_signature(before)
+    after_signature = _source_evidence_signature(after)
+    same_source_character_multiset = bool(
+        before_signature
+        and after_signature
+        and sorted(before_signature) == sorted(after_signature)
+    )
+    if (
+        after == current
+        and confidence >= PAGE_PASS_MIN_CONFIDENCE
+        and same_source_character_multiset
+    ):
+        return {
+            "authority": "exact_visual_override_same_source_characters",
+            **visual,
+            "same_source_character_multiset": True,
+        }
+    return None
+
+
+def _source_word_ids_for_field(
+    row: dict,
+    field_name: str,
+) -> list[int]:
+    matches = [
+        item
+        for item in (row.get("field_evidence") or [])
+        if isinstance(item, dict)
+        and _clean_text(item.get("field_name"), 120) == field_name
+    ]
+    if len(matches) != 1:
+        return []
+    out: list[int] = []
+    seen: set[int] = set()
+    for raw_id in matches[0].get("source_word_ids") or []:
+        try:
+            word_id = int(raw_id)
+        except Exception:
+            continue
+        if word_id in seen:
+            return []
+        seen.add(word_id)
+        out.append(word_id)
+    return out
+
+
+def _single_line_source_code_candidate(
+    *,
+    row: dict,
+    field_name: str,
+    word_map: dict[int, dict],
+) -> Optional[dict]:
+    """Reconstruct a fragmented technical code from exact source geometry.
+
+    This does not use page numbers, language, manufacturers, known codes or
+    fixed coordinates. It operates only on the word IDs already bound to one
+    canonical code field and requires a single horizontal visual line. The
+    candidate must contain exactly the same source characters as the original
+    vector transcription; only their physical left-to-right order may change.
+    """
+    ids = _source_word_ids_for_field(row, field_name)
+    if len(ids) < 2 or any(word_id not in word_map for word_id in ids):
+        return None
+
+    words = [word_map[word_id] for word_id in ids]
+    centers_y = [
+        (float(word["y0"]) + float(word["y1"])) / 2.0
+        for word in words
+    ]
+    heights = [
+        max(0.1, float(word["y1"]) - float(word["y0"]))
+        for word in words
+    ]
+    line_tolerance = max(3.0, max(heights) * 1.25)
+    if max(centers_y) - min(centers_y) > line_tolerance:
+        return None
+
+    ordered = sorted(
+        words,
+        key=lambda word: (
+            float(word["x0"]),
+            float(word["y0"]),
+            int(word.get("id") or 0),
+        ),
+    )
+    tokens = [
+        re.sub(r"\s+", "", _clean_text(word.get("text"), 500))
+        for word in ordered
+    ]
+    if any(not token for token in tokens):
+        return None
+    candidate = "".join(tokens)
+    if not candidate or len(candidate) > 300:
+        return None
+
+    candidate_signature = _source_evidence_signature(candidate)
+    if not candidate_signature:
+        return None
+
+    visual_audit = (row.get("verifier_overrides") or {}).get(field_name)
+    source_before = (
+        _clean_text(visual_audit.get("before"), 5000)
+        if isinstance(visual_audit, dict)
+        else _clean_text(row.get(field_name), 5000)
+    )
+    source_before_signature = _source_evidence_signature(source_before)
+    current_signature = _source_evidence_signature(row.get(field_name))
+
+    # The exact vector characters must be preserved. Only their sequence may
+    # be repaired from physical x geometry.
+    if (
+        not source_before_signature
+        or sorted(source_before_signature) != sorted(candidate_signature)
+        or current_signature == candidate_signature
+    ):
+        return None
+
+    return {
+        "candidate": candidate,
+        "source_word_ids": [int(word.get("id") or 0) for word in ordered],
+        "source_tokens": tokens,
+        "source_before": source_before,
+        "source_before_signature": source_before_signature,
+        "candidate_signature": candidate_signature,
+        "method": "single_line_source_x_order_v1",
+        "confidence": 1.0,
+        "validated": True,
+    }
+
+
+def _reconcile_post_override_rows(
+    *,
+    extractions: list[dict],
+    word_map: dict[int, dict],
+) -> dict:
+    """Finalize rows after exact verifier overrides, before publication gates."""
+    source_order_rows: list[str] = []
+    normalized_rows: list[str] = []
+
+    for extraction in extractions:
+        for row in extraction.get("rows") or []:
+            row_id = _clean_text(row.get("row_id"), 120)
+
+            # Part numbers are technical codes. If the extractor emitted their
+            # fragments in non-physical order, exact source x geometry is a
+            # stronger authority than model token order.
+            field_name = "part_number_original"
+            candidate = _single_line_source_code_candidate(
+                row=row,
+                field_name=field_name,
+                word_map=word_map,
+            )
+            if candidate:
+                before = _clean_text(row.get(field_name), 5000)
+                row.setdefault("deterministic_overrides", {})[field_name] = {
+                    "before": before,
+                    "after": candidate["candidate"],
+                    "confidence": candidate["confidence"],
+                    "reason": (
+                        "Exact source-word x geometry restored the physical "
+                        "left-to-right order of one technical-code cell."
+                    ),
+                    "method": candidate["method"],
+                    "source_word_ids": candidate["source_word_ids"],
+                    "source_tokens": candidate["source_tokens"],
+                    "source_before_signature": candidate[
+                        "source_before_signature"
+                    ],
+                    "candidate_signature": candidate[
+                        "candidate_signature"
+                    ],
+                    "validated": True,
+                }
+                visual = (row.get("verifier_overrides") or {}).get(field_name)
+                if isinstance(visual, dict):
+                    visual["superseded_by"] = candidate["method"]
+                row[field_name] = candidate["candidate"]
+                source_order_rows.append(row_id)
+
+            # Once an original field has a validated exact authority, a stale
+            # pre-correction normalized field must not survive publication.
+            for base_name in BASE_FIELDS:
+                original_field = f"{base_name}_original"
+                normalized_field = f"{base_name}_normalized"
+                authority = _valid_transcription_override(
+                    row,
+                    original_field,
+                )
+                if not authority:
+                    continue
+                original = _clean_text(row.get(original_field), 5000)
+                normalized = _clean_text(row.get(normalized_field), 5000)
+                if normalized == original:
+                    continue
+                row.setdefault(
+                    "post_override_normalization",
+                    {},
+                )[normalized_field] = {
+                    "before": normalized,
+                    "after": original,
+                    "authority": authority.get("authority"),
+                    "source_original_field": original_field,
+                    "validated": True,
+                }
+                row[normalized_field] = original
+                normalized_rows.append(row_id)
+
+    return {
+        "version": "bom-post-override-reconciliation-v1",
+        "source_order_row_ids": sorted(set(source_order_rows)),
+        "normalized_row_ids": sorted(set(normalized_rows)),
+    }
+
+
+def _post_override_text_issue_resolution(
+    *,
+    raw_issue: dict,
+    normalized_issue: dict,
+    extractions: list[dict],
+) -> dict:
+    """Resolve only specifically provable post-override text findings."""
+    if normalized_issue.get("severity") not in {"high", "critical"}:
+        return normalized_issue
+
+    issue_type = _clean_text(raw_issue.get("issue_type"), 180)
+    row_ids = [
+        _clean_text(value, 120)
+        for value in (raw_issue.get("row_ids") or [])
+        if _clean_text(value, 120)
+    ]
+    row_lookup = {
+        _clean_text(row.get("row_id"), 120): row
+        for extraction in extractions
+        for row in (extraction.get("rows") or [])
+        if _clean_text(row.get("row_id"), 120)
+    }
+
+    resolved = False
+    evidence: list[dict] = []
+
+    if issue_type == "normalized_text_not_spacing_only" and row_ids:
+        resolved = True
+        for row_id in row_ids:
+            row = row_lookup.get(row_id)
+            if not row:
+                resolved = False
+                break
+            row_evidence: list[dict] = []
+            for base_name in BASE_FIELDS:
+                original = _clean_text(
+                    row.get(f"{base_name}_original"),
+                    5000,
+                )
+                normalized = _clean_text(
+                    row.get(f"{base_name}_normalized"),
+                    5000,
+                )
+                if bool(original) != bool(normalized):
+                    resolved = False
+                    break
+                if (
+                    original
+                    and _semantic_character_signature(original)
+                    != _semantic_character_signature(normalized)
+                ):
+                    resolved = False
+                    break
+                authority = _valid_transcription_override(
+                    row,
+                    f"{base_name}_original",
+                )
+                if authority and normalized != original:
+                    resolved = False
+                    break
+                if authority:
+                    row_evidence.append(
+                        {
+                            "field": base_name,
+                            "authority": authority.get("authority"),
+                        }
+                    )
+            if not resolved:
+                break
+            evidence.append({"row_id": row_id, "fields": row_evidence})
+
+    elif issue_type == "reading_order_error_in_part_number" and row_ids:
+        resolved = True
+        for row_id in row_ids:
+            row = row_lookup.get(row_id)
+            if not row:
+                resolved = False
+                break
+            audit = (
+                row.get("deterministic_overrides") or {}
+            ).get("part_number_original")
+            original = _clean_text(
+                row.get("part_number_original"),
+                5000,
+            )
+            normalized = _clean_text(
+                row.get("part_number_normalized"),
+                5000,
+            )
+            if not (
+                isinstance(audit, dict)
+                and audit.get("validated") is True
+                and float(audit.get("confidence") or 0.0)
+                >= PAGE_PASS_MIN_CONFIDENCE
+                and _clean_text(audit.get("after"), 5000) == original
+                and normalized == original
+                and audit.get("source_word_ids")
+            ):
+                resolved = False
+                break
+            evidence.append(
+                {
+                    "row_id": row_id,
+                    "method": audit.get("method"),
+                    "source_word_ids": audit.get("source_word_ids"),
+                    "final_value": original,
+                }
+            )
+
+    if not resolved:
+        return normalized_issue
+
+    normalized_issue = dict(normalized_issue)
+    normalized_issue["severity"] = "info"
+    normalized_issue["source_stage"] = (
+        "deterministic_post_override_adjudicator"
+    )
+    normalized_issue["post_override_resolution"] = {
+        "status": "resolved_by_post_override_revalidation",
+        "validated": True,
+        "issue_type": issue_type,
+        "evidence": evidence,
+    }
+    return normalized_issue
+
+
 def _field_evidence_audit(
     *,
     row: dict,
@@ -2471,21 +2851,27 @@ def _field_evidence_audit(
         and not evidence_by_field.get(field_name)
     )
 
-    field_text_mismatches: list[dict] = []
+    unresolved_field_text_mismatches: list[dict] = []
+    adjudicated_field_text_mismatches: list[dict] = []
     for field_name, ids in evidence_by_field.items():
         source_text = _text_for_ids(sorted(set(ids)), word_map, 5000)
         source_signature = _source_evidence_signature(source_text)
         field_signature = _source_evidence_signature(row.get(field_name))
-        if source_signature != field_signature:
-            field_text_mismatches.append(
-                {
-                    "field_name": field_name,
-                    "source_text": source_text,
-                    "field_text": _clean_text(row.get(field_name), 5000),
-                    "source_signature": source_signature,
-                    "field_signature": field_signature,
-                }
-            )
+        if source_signature == field_signature:
+            continue
+        mismatch = {
+            "field_name": field_name,
+            "source_text": source_text,
+            "field_text": _clean_text(row.get(field_name), 5000),
+            "source_signature": source_signature,
+            "field_signature": field_signature,
+        }
+        authority = _valid_transcription_override(row, field_name)
+        if authority:
+            mismatch["post_override_authority"] = authority
+            adjudicated_field_text_mismatches.append(mismatch)
+        else:
+            unresolved_field_text_mismatches.append(mismatch)
 
     return {
         "expected_word_ids": sorted(expected_set),
@@ -2494,18 +2880,20 @@ def _field_evidence_audit(
         "duplicated_word_ids": duplicated_ids,
         "invalid_word_ids": sorted(set(invalid_ids)),
         "missing_field_evidence": missing_field_evidence,
-        "field_text_mismatches": field_text_mismatches,
+        "field_text_mismatches": unresolved_field_text_mismatches,
+        "adjudicated_field_text_mismatches": (
+            adjudicated_field_text_mismatches
+        ),
         "complete": not any(
             [
                 missing_ids,
                 duplicated_ids,
                 invalid_ids,
                 missing_field_evidence,
-                field_text_mismatches,
+                unresolved_field_text_mismatches,
             ]
         ),
     }
-
 
 def _parse_quantity(value: Any) -> Optional[Decimal]:
     text = _clean_text(value, 120)
@@ -2708,6 +3096,43 @@ def _validate_page(
 ) -> tuple[bool, list[dict], list[dict]]:
     issues: list[dict] = []
     rows: list[dict] = []
+
+    reconciliation = _reconcile_post_override_rows(
+        extractions=extractions,
+        word_map=word_map,
+    )
+    if reconciliation["source_order_row_ids"]:
+        issues.append(
+            {
+                "issue_type": "bom-source-order-reconciled-post-override",
+                "severity": "info",
+                "message": (
+                    "Exact source-word geometry restored one or more "
+                    "technical-code fragment sequences before publication."
+                ),
+                "region_id": "",
+                "row_ids": reconciliation["source_order_row_ids"],
+                "confidence": 1.0,
+                "source_stage": "deterministic_post_override_adjudicator",
+                "post_override_resolution": reconciliation,
+            }
+        )
+    if reconciliation["normalized_row_ids"]:
+        issues.append(
+            {
+                "issue_type": "bom-normalized-fields-synchronized-post-override",
+                "severity": "info",
+                "message": (
+                    "Normalized display values were synchronized from their "
+                    "validated final original transcriptions."
+                ),
+                "region_id": "",
+                "row_ids": reconciliation["normalized_row_ids"],
+                "confidence": 1.0,
+                "source_stage": "deterministic_post_override_adjudicator",
+                "post_override_resolution": reconciliation,
+            }
+        )
 
     proposal_by_id = {p["region_id"]: p for p in proposals}
     proposal_ids = [str(p["region_id"]) for p in proposals]
@@ -3389,7 +3814,7 @@ def _validate_page(
                 and not invalid_field_column_bindings
             )
             item["source_evidence_coverage"] = {
-                "version": "bom-row-source-evidence-v1",
+                "version": "bom-row-source-evidence-v1.2",
                 **evidence_audit,
             }
             if not evidence_audit["complete"]:
@@ -3517,12 +3942,20 @@ def _validate_page(
         )
 
     for raw in verifier.get("issues") or []:
-        issues.append(
+        normalized_verifier_issue = (
             _normalize_verifier_issue_after_overrides(
                 raw,
                 extractions=extractions,
             )
         )
+        normalized_verifier_issue = (
+            _post_override_text_issue_resolution(
+                raw_issue=raw if isinstance(raw, dict) else {},
+                normalized_issue=normalized_verifier_issue,
+                extractions=extractions,
+            )
+        )
+        issues.append(normalized_verifier_issue)
 
     raw_verifier_checks = [
         x
@@ -3579,22 +4012,19 @@ def _validate_page(
                 }
             )
             continue
-        if (
-            not check.get("pass")
-            or float(check.get("confidence") or 0.0)
-            < PAGE_PASS_MIN_CONFIDENCE
-        ):
+        check_confidence = float(check.get("confidence") or 0.0)
+        if check_confidence < PAGE_PASS_MIN_CONFIDENCE:
             issues.append(
                 {
-                    "issue_type": "bom-verifier-region-failed",
+                    "issue_type": "bom-verifier-region-confidence-below-threshold",
                     "severity": "high",
                     "message": _clean_text(
-                        check.get("notes") or f"Verifier failed {rid}",
+                        check.get("notes") or f"Verifier confidence failed {rid}",
                         1600,
                     ),
                     "region_id": rid,
                     "row_ids": [],
-                    "confidence": float(check.get("confidence") or 0.0),
+                    "confidence": check_confidence,
                     "source_stage": "deterministic_validator",
                 }
             )
@@ -3617,15 +4047,16 @@ def _validate_page(
             _clean_text(x, 1000)
             for x in (check.get("verified_component_tag_sequence") or [])
         ]
-        if (
-            int(check.get("expected_item_rows") or 0) != len(actual_rows)
-            or int(check.get("verified_item_rows") or 0) != len(actual_rows)
-            or verified_row_ids != actual_row_ids
-            or not _sequence_matches_source_characters(
+        sequence_matches = bool(
+            int(check.get("expected_item_rows") or 0) == len(actual_rows)
+            and int(check.get("verified_item_rows") or 0) == len(actual_rows)
+            and verified_row_ids == actual_row_ids
+            and _sequence_matches_source_characters(
                 actual_tags,
                 verified_tags,
             )
-        ):
+        )
+        if not sequence_matches:
             issues.append(
                 {
                     "issue_type": "bom-verifier-row-sequence-mismatch",
@@ -3636,25 +4067,120 @@ def _validate_page(
                     ),
                     "region_id": rid,
                     "row_ids": actual_row_ids,
-                    "confidence": float(check.get("confidence") or 0.0),
+                    "confidence": check_confidence,
                     "source_stage": "deterministic_validator",
                 }
             )
+        elif not check.get("pass"):
+            prior_blocking = [
+                issue
+                for issue in issues
+                if issue.get("severity") in {"high", "critical"}
+            ]
+            if not prior_blocking and check_confidence >= PAGE_PASS_MIN_CONFIDENCE:
+                issues.append(
+                    {
+                        "issue_type": (
+                            "bom-verifier-region-verdict-superseded-post-override"
+                        ),
+                        "severity": "info",
+                        "message": (
+                            "The verifier region decision described the "
+                            "pre-correction candidate; exact post-override "
+                            "row and field validation is now clean."
+                        ),
+                        "region_id": rid,
+                        "row_ids": actual_row_ids,
+                        "confidence": check_confidence,
+                        "source_stage": (
+                            "deterministic_post_override_adjudicator"
+                        ),
+                        "post_override_resolution": {
+                            "status": "superseded_after_exact_revalidation",
+                            "validated": True,
+                            "verifier_notes": _clean_text(
+                                check.get("notes"), 1600
+                            ),
+                        },
+                    }
+                )
+            else:
+                issues.append(
+                    {
+                        "issue_type": "bom-verifier-region-failed",
+                        "severity": "high",
+                        "message": _clean_text(
+                            check.get("notes") or f"Verifier failed {rid}",
+                            1600,
+                        ),
+                        "region_id": rid,
+                        "row_ids": [],
+                        "confidence": check_confidence,
+                        "source_stage": "deterministic_validator",
+                    }
+                )
 
-    required_flags = [
+    structural_required_flags = [
         "all_visible_bom_tables_accounted_for",
         "all_visible_item_rows_accounted_for",
         "all_visible_columns_accounted_for",
-        "all_published_fields_visually_supported",
         "all_source_evidence_represented",
     ]
-    for flag in required_flags:
+    for flag in structural_required_flags:
         if not verifier.get(flag):
             issues.append(
                 {
                     "issue_type": f"bom-verifier-{flag}",
                     "severity": "high",
                     "message": f"Verifier returned {flag}=false",
+                    "region_id": "",
+                    "row_ids": [],
+                    "confidence": float(verifier.get("confidence") or 0.0),
+                    "source_stage": "deterministic_validator",
+                }
+            )
+
+    if not verifier.get("all_published_fields_visually_supported"):
+        prior_blocking = [
+            issue
+            for issue in issues
+            if issue.get("severity") in {"high", "critical"}
+        ]
+        if not prior_blocking:
+            issues.append(
+                {
+                    "issue_type": (
+                        "bom-verifier-fields-flag-superseded-post-override"
+                    ),
+                    "severity": "info",
+                    "message": (
+                        "The verifier field-support flag described the "
+                        "pre-correction candidate; every final field passed "
+                        "exact post-override evidence validation."
+                    ),
+                    "region_id": "",
+                    "row_ids": [],
+                    "confidence": float(verifier.get("confidence") or 0.0),
+                    "source_stage": (
+                        "deterministic_post_override_adjudicator"
+                    ),
+                    "post_override_resolution": {
+                        "status": "superseded_after_exact_revalidation",
+                        "validated": True,
+                    },
+                }
+            )
+        else:
+            issues.append(
+                {
+                    "issue_type": (
+                        "bom-verifier-all_published_fields_visually_supported"
+                    ),
+                    "severity": "high",
+                    "message": (
+                        "Verifier returned "
+                        "all_published_fields_visually_supported=false"
+                    ),
                     "region_id": "",
                     "row_ids": [],
                     "confidence": float(verifier.get("confidence") or 0.0),
@@ -3750,17 +4276,51 @@ def _validate_page(
                 }
             )
     if str(verifier.get("verdict") or "") != "pass":
-        issues.append(
-            {
-                "issue_type": "bom-verifier-blocked-page",
-                "severity": "high",
-                "message": "Independent verifier did not pass BOM page",
-                "region_id": "",
-                "row_ids": [],
-                "confidence": float(verifier.get("confidence") or 0.0),
-                "source_stage": "deterministic_validator",
-            }
-        )
+        prior_blocking = [
+            issue
+            for issue in issues
+            if issue.get("severity") in {"high", "critical"}
+        ]
+        if (
+            not prior_blocking
+            and float(verifier.get("confidence") or 0.0)
+            >= PAGE_PASS_MIN_CONFIDENCE
+        ):
+            issues.append(
+                {
+                    "issue_type": (
+                        "bom-verifier-verdict-superseded-post-override"
+                    ),
+                    "severity": "info",
+                    "message": (
+                        "Independent verifier review_required was based on the "
+                        "pre-correction candidate; exact post-override "
+                        "revalidation completed without blocking findings."
+                    ),
+                    "region_id": "",
+                    "row_ids": [],
+                    "confidence": float(verifier.get("confidence") or 0.0),
+                    "source_stage": (
+                        "deterministic_post_override_adjudicator"
+                    ),
+                    "post_override_resolution": {
+                        "status": "superseded_after_exact_revalidation",
+                        "validated": True,
+                    },
+                }
+            )
+        else:
+            issues.append(
+                {
+                    "issue_type": "bom-verifier-blocked-page",
+                    "severity": "high",
+                    "message": "Independent verifier did not pass BOM page",
+                    "region_id": "",
+                    "row_ids": [],
+                    "confidence": float(verifier.get("confidence") or 0.0),
+                    "source_stage": "deterministic_validator",
+                }
+            )
     if float(verifier.get("confidence") or 0.0) < PAGE_PASS_MIN_CONFIDENCE:
         issues.append(
             {
@@ -3950,6 +4510,12 @@ def _db_publish_page_rows(
                     )
                     or {},
                     "verifier_overrides": item.get("verifier_overrides") or {},
+                    "deterministic_overrides": item.get(
+                        "deterministic_overrides"
+                    ) or {},
+                    "post_override_normalization": item.get(
+                        "post_override_normalization"
+                    ) or {},
                     "evidence_notes": item.get("evidence_notes") or "",
                     "detector_fingerprint": detector_fingerprint,
                     "extractor_fingerprint": extractor_fingerprints.get(
