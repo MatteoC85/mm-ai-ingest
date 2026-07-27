@@ -84,7 +84,7 @@ VERIFIER_PROMPT_VERSION = (
 ).strip()
 MATERIALIZER_VERSION = (
     os.environ.get("MM_ELECTRICAL_TERMINALS_MATERIALIZER_VERSION")
-    or "mm-electrical-terminal-materializer-v1.2"
+    or "mm-electrical-terminal-materializer-v1.2.1"
 ).strip()
 
 OPENAI_TIMEOUT_SECONDS = _env_int(
@@ -118,7 +118,7 @@ MAX_SOURCE_BYTES = _env_int(
     500_000_000,
 )
 
-PIPELINE_MARKER = "phase2-terminals-v1.2-source-snapshot"
+PIPELINE_MARKER = "phase2-terminals-v1.2.1-source-snapshot"
 EXTRACTION_METHOD = "openai_vision_terminals_v1"
 PHASE_NAME = "terminal_vision_v1"
 PAGE_TYPE = "terminal_table"
@@ -151,6 +151,9 @@ FIELD_ASSIGNMENT_DECISION_VERSION = (
 )
 
 REGION_ADJUDICATION_VERSION = "visual-terminal-region-eligibility-v1"
+POST_OVERRIDE_ADJUDICATION_VERSION = (
+    "terminal-post-override-final-adjudication-v1"
+)
 VISUAL_REGION_KINDS = {
     "terminal_strip",
     "auxiliary_description_grid",
@@ -2605,6 +2608,316 @@ def _field_collision_issues(
     return issues
 
 
+
+def _post_override_row_lookup(
+    extractions: list[dict],
+) -> dict[tuple[str, str], dict]:
+    lookup: dict[tuple[str, str], dict] = {}
+    for extraction in extractions:
+        region_id = _clean_text(extraction.get("region_id"), 120)
+        if not region_id:
+            continue
+        for terminal in extraction.get("terminals") or []:
+            row_id = _clean_text(terminal.get("row_id"), 120)
+            if row_id:
+                lookup[(region_id, row_id)] = terminal
+    return lookup
+
+
+def _verifier_issue_is_field_assignment_related(issue: dict) -> bool:
+    """Return True only for verifier findings correctable by field overrides.
+
+    This classification uses protocol issue identifiers, never source-language
+    words or document-specific values. Structural, coverage, sequence, row-count,
+    and confidence findings remain non-resolvable and continue to block.
+    """
+    issue_type = re.sub(
+        r"[^a-z0-9]+",
+        "_",
+        str(issue.get("issue_type") or "").strip().lower(),
+    ).strip("_")
+    tokens = {token for token in issue_type.split("_") if token}
+    if "field" not in tokens:
+        return False
+    return bool(
+        tokens.intersection(
+            {
+                "assignment",
+                "support",
+                "supported",
+                "unsupported",
+                "wrong",
+                "duplicate",
+                "collision",
+                "multi",
+            }
+        )
+    )
+
+
+def _post_override_row_audit(terminal: dict) -> dict:
+    applied_decisions: list[dict] = []
+    for decision in terminal.get("verifier_field_support_decisions") or []:
+        if not isinstance(decision, dict):
+            continue
+        confidence = max(
+            0.0,
+            min(1.0, float(decision.get("confidence") or 0.0)),
+        )
+        if not decision.get("applied"):
+            continue
+        if confidence < PAGE_PASS_MIN_CONFIDENCE:
+            continue
+        applied_decisions.append(
+            {
+                "source_text_original": _clean_text(
+                    decision.get("source_text_original"),
+                    1000,
+                ),
+                "supported_fields": sorted(
+                    str(x)
+                    for x in (decision.get("supported_fields") or [])
+                    if str(x) in OVERRIDABLE_FIELDS
+                ),
+                "unsupported_fields": sorted(
+                    str(x)
+                    for x in (decision.get("unsupported_fields") or [])
+                    if str(x) in OVERRIDABLE_FIELDS
+                ),
+                "confidence": confidence,
+            }
+        )
+
+    applied_overrides: dict[str, dict] = {}
+    changed_fields: list[str] = []
+    for field, raw_audit in (
+        terminal.get("verifier_overrides") or {}
+    ).items():
+        if field not in OVERRIDABLE_FIELDS or not isinstance(raw_audit, dict):
+            continue
+        confidence = max(
+            0.0,
+            min(1.0, float(raw_audit.get("confidence") or 0.0)),
+        )
+        before = _clean_text(raw_audit.get("before"), 1000)
+        after = _clean_text(raw_audit.get("after"), 1000)
+        current = _clean_text(terminal.get(field), 1000)
+        if confidence < PAGE_PASS_MIN_CONFIDENCE or current != after:
+            continue
+        applied_overrides[field] = {
+            "before": before,
+            "after": after,
+            "confidence": confidence,
+        }
+        if before != after:
+            changed_fields.append(field)
+
+    coverage = terminal.get("source_evidence_coverage") or {}
+    source_evidence_complete = bool(coverage.get("complete"))
+    collision_free = not bool(_field_collisions(terminal))
+    has_correction = bool(applied_decisions or changed_fields)
+
+    return {
+        "version": POST_OVERRIDE_ADJUDICATION_VERSION,
+        "has_correction": has_correction,
+        "source_evidence_complete": source_evidence_complete,
+        "collision_free": collision_free,
+        "applied_decision_count": len(applied_decisions),
+        "applied_override_fields": sorted(applied_overrides),
+        "changed_fields": sorted(changed_fields),
+        "applied_decisions": applied_decisions,
+    }
+
+
+def _blocking_issue_targets_row(
+    *,
+    issues: list[dict],
+    region_id: str,
+    row_id: str,
+) -> bool:
+    for issue in issues:
+        if issue.get("severity") not in {"high", "critical"}:
+            continue
+        issue_region = _clean_text(issue.get("region_id"), 120)
+        if issue_region and issue_region != region_id:
+            continue
+        issue_rows = {
+            _clean_text(value, 120)
+            for value in (issue.get("row_ids") or [])
+            if _clean_text(value, 120)
+        }
+        if row_id in issue_rows:
+            return True
+    return False
+
+
+def _adjudicate_verifier_issues_after_overrides(
+    *,
+    verifier: dict,
+    extractions: list[dict],
+    existing_issues: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    """Reclassify only verifier field issues proven resolved post-override.
+
+    A pre-correction verifier issue becomes informational only when every
+    referenced row received a high-confidence verifier correction, the final
+    row has no field collision, all visible source evidence remains represented,
+    and no independent blocking issue still targets that row.
+    """
+    row_lookup = _post_override_row_lookup(extractions)
+    output: list[dict] = []
+    resolved: list[dict] = []
+
+    for raw in verifier.get("issues") or []:
+        normalized = _normalize_issue(
+            raw,
+            default_type="terminal-verifier-issue",
+            source_stage="verifier",
+        )
+        original_severity = normalized.get("severity")
+        region_id = _clean_text(normalized.get("region_id"), 120)
+        row_ids = [
+            _clean_text(value, 120)
+            for value in (normalized.get("row_ids") or [])
+            if _clean_text(value, 120)
+        ]
+
+        eligible = bool(
+            original_severity in {"high", "critical"}
+            and normalized.get("confidence", 0.0)
+            >= PAGE_PASS_MIN_CONFIDENCE
+            and _verifier_issue_is_field_assignment_related(normalized)
+            and region_id
+            and row_ids
+        )
+        row_audits: list[dict] = []
+        if eligible:
+            for row_id in row_ids:
+                terminal = row_lookup.get((region_id, row_id))
+                if terminal is None:
+                    eligible = False
+                    break
+                audit = _post_override_row_audit(terminal)
+                row_audits.append(
+                    {
+                        "row_id": row_id,
+                        "has_correction": audit["has_correction"],
+                        "source_evidence_complete": audit[
+                            "source_evidence_complete"
+                        ],
+                        "collision_free": audit["collision_free"],
+                        "applied_decision_count": audit[
+                            "applied_decision_count"
+                        ],
+                        "applied_override_fields": audit[
+                            "applied_override_fields"
+                        ],
+                        "changed_fields": audit["changed_fields"],
+                    }
+                )
+                if not (
+                    audit["has_correction"]
+                    and audit["source_evidence_complete"]
+                    and audit["collision_free"]
+                ):
+                    eligible = False
+                    break
+                if _blocking_issue_targets_row(
+                    issues=existing_issues,
+                    region_id=region_id,
+                    row_id=row_id,
+                ):
+                    eligible = False
+                    break
+
+        if eligible:
+            resolution = {
+                "version": POST_OVERRIDE_ADJUDICATION_VERSION,
+                "resolved": True,
+                "original_severity": original_severity,
+                "region_id": region_id,
+                "row_ids": row_ids,
+                "row_audits": row_audits,
+            }
+            normalized["severity"] = "info"
+            normalized["source_stage"] = "post_override_adjudicator"
+            normalized["message"] = (
+                "Resolved after high-confidence verifier corrections and "
+                "deterministic post-override validation: "
+                + normalized["message"]
+            )
+            normalized["post_override_adjudication"] = resolution
+            resolved.append(
+                {
+                    "issue_type": normalized.get("issue_type"),
+                    "region_id": region_id,
+                    "row_ids": row_ids,
+                    "original_severity": original_severity,
+                }
+            )
+
+        output.append(normalized)
+
+    return output, resolved
+
+
+def _post_override_field_support_audit(
+    *,
+    rows: list[dict],
+    issues: list[dict],
+    resolved_verifier_issues: list[dict],
+) -> dict:
+    row_audits: list[dict] = []
+    all_rows_clean = bool(rows)
+    corrected_rows = 0
+    for row in rows:
+        audit = _post_override_row_audit(row)
+        region_id = _clean_text(row.get("region_id"), 120)
+        row_id = _clean_text(row.get("row_id"), 120)
+        if audit["has_correction"]:
+            corrected_rows += 1
+        clean = bool(
+            audit["source_evidence_complete"]
+            and audit["collision_free"]
+        )
+        all_rows_clean = all_rows_clean and clean
+        row_audits.append(
+            {
+                "region_id": region_id,
+                "row_id": row_id,
+                "clean": clean,
+                "has_correction": audit["has_correction"],
+                "applied_decision_count": audit[
+                    "applied_decision_count"
+                ],
+                "applied_override_fields": audit[
+                    "applied_override_fields"
+                ],
+                "changed_fields": audit["changed_fields"],
+            }
+        )
+
+    blocking_issue_count = sum(
+        1
+        for issue in issues
+        if issue.get("severity") in {"high", "critical"}
+    )
+    complete = bool(
+        all_rows_clean
+        and corrected_rows > 0
+        and resolved_verifier_issues
+        and blocking_issue_count == 0
+    )
+    return {
+        "version": POST_OVERRIDE_ADJUDICATION_VERSION,
+        "complete": complete,
+        "row_count": len(rows),
+        "corrected_row_count": corrected_rows,
+        "resolved_verifier_issue_count": len(resolved_verifier_issues),
+        "blocking_issue_count_before_verdict": blocking_issue_count,
+        "row_audits": row_audits,
+    }
+
 def _validate_page(
     *,
     page: dict,
@@ -2980,15 +3293,6 @@ def _validate_page(
                 )
             )
 
-    for raw in verifier.get("issues") or []:
-        issues.append(
-            _normalize_issue(
-                raw,
-                default_type="terminal-verifier-issue",
-                source_stage="verifier",
-            )
-        )
-
     verifier_checks = {
         str(x.get("region_id") or ""): x
         for x in (verifier.get("region_checks") or [])
@@ -3068,15 +3372,14 @@ def _validate_page(
                 }
             )
 
-    verifier_flags = [
+    strict_verifier_flags = [
         "all_strip_like_regions_classified",
         "all_data_terminal_strips_accounted_for",
         "all_visible_terminal_rows_accounted_for",
         "all_strip_tags_supported_by_headers",
         "all_terminal_numbers_visually_supported",
-        "all_published_fields_visually_supported",
     ]
-    for flag in verifier_flags:
+    for flag in strict_verifier_flags:
         if not verifier.get(flag):
             issues.append(
                 {
@@ -3089,19 +3392,66 @@ def _validate_page(
                     "source_stage": "deterministic_validator",
                 }
             )
-    if str(verifier.get("verdict") or "") != "pass":
-        issues.append(
-            {
-                "issue_type": "terminal-verifier-blocked-page",
-                "severity": "high",
-                "message": "Independent verifier did not pass terminal page",
-                "region_id": "",
-                "row_ids": [],
-                "confidence": float(verifier.get("confidence") or 0.0),
-                "source_stage": "deterministic_validator",
-            }
+
+    adjudicated_verifier_issues, resolved_verifier_issues = (
+        _adjudicate_verifier_issues_after_overrides(
+            verifier=verifier,
+            extractions=extractions,
+            existing_issues=issues,
         )
-    if float(verifier.get("confidence") or 0.0) < PAGE_PASS_MIN_CONFIDENCE:
+    )
+    issues.extend(adjudicated_verifier_issues)
+
+    field_support_audit = _post_override_field_support_audit(
+        rows=rows,
+        issues=issues,
+        resolved_verifier_issues=resolved_verifier_issues,
+    )
+    if not verifier.get("all_published_fields_visually_supported"):
+        if field_support_audit["complete"]:
+            issues.append(
+                {
+                    "issue_type": (
+                        "terminal-post-override-published-fields-supported"
+                    ),
+                    "severity": "info",
+                    "message": (
+                        "The verifier's pre-correction field-support flag was "
+                        "superseded after all high-confidence corrections were "
+                        "applied and deterministic source-evidence validation "
+                        "passed."
+                    ),
+                    "region_id": "",
+                    "row_ids": [],
+                    "confidence": float(verifier.get("confidence") or 0.0),
+                    "source_stage": "post_override_adjudicator",
+                    "post_override_adjudication": field_support_audit,
+                }
+            )
+        else:
+            issues.append(
+                {
+                    "issue_type": (
+                        "terminal-verifier-"
+                        "all_published_fields_visually_supported"
+                    ),
+                    "severity": "high",
+                    "message": (
+                        "Verifier returned "
+                        "all_published_fields_visually_supported=false and "
+                        "post-override validation could not prove the field "
+                        "corrections complete."
+                    ),
+                    "region_id": "",
+                    "row_ids": [],
+                    "confidence": float(verifier.get("confidence") or 0.0),
+                    "source_stage": "deterministic_validator",
+                    "post_override_adjudication": field_support_audit,
+                }
+            )
+
+    verifier_confidence = float(verifier.get("confidence") or 0.0)
+    if verifier_confidence < PAGE_PASS_MIN_CONFIDENCE:
         issues.append(
             {
                 "issue_type": "terminal-page-confidence-below-threshold",
@@ -3109,10 +3459,74 @@ def _validate_page(
                 "message": "Terminal page confidence below threshold",
                 "region_id": "",
                 "row_ids": [],
-                "confidence": float(verifier.get("confidence") or 0.0),
+                "confidence": verifier_confidence,
                 "source_stage": "deterministic_validator",
             }
         )
+
+    verifier_verdict = str(verifier.get("verdict") or "")
+    if verifier_verdict != "pass":
+        blocking_before_verdict = [
+            issue
+            for issue in issues
+            if issue.get("severity") in {"high", "critical"}
+        ]
+        can_supersede_review = bool(
+            verifier_verdict == "review_required"
+            and verifier_confidence >= PAGE_PASS_MIN_CONFIDENCE
+            and field_support_audit["complete"]
+            and resolved_verifier_issues
+            and not blocking_before_verdict
+        )
+        if can_supersede_review:
+            issues.append(
+                {
+                    "issue_type": (
+                        "terminal-verifier-verdict-superseded-post-override"
+                    ),
+                    "severity": "info",
+                    "message": (
+                        "The verifier reviewed the pre-correction rows. Its "
+                        "review_required verdict was superseded only after the "
+                        "returned corrections were applied and every final "
+                        "deterministic publication check passed."
+                    ),
+                    "region_id": "",
+                    "row_ids": [],
+                    "confidence": verifier_confidence,
+                    "source_stage": "post_override_adjudicator",
+                    "post_override_adjudication": {
+                        **field_support_audit,
+                        "original_verdict": verifier_verdict,
+                        "resolved_verifier_issues": (
+                            resolved_verifier_issues
+                        ),
+                    },
+                }
+            )
+        else:
+            issues.append(
+                {
+                    "issue_type": "terminal-verifier-blocked-page",
+                    "severity": "high",
+                    "message": (
+                        "Independent verifier did not pass terminal page and "
+                        "the post-override fail-safe conditions were not all "
+                        "satisfied."
+                    ),
+                    "region_id": "",
+                    "row_ids": [],
+                    "confidence": verifier_confidence,
+                    "source_stage": "deterministic_validator",
+                    "post_override_adjudication": {
+                        **field_support_audit,
+                        "original_verdict": verifier_verdict,
+                        "resolved_verifier_issues": (
+                            resolved_verifier_issues
+                        ),
+                    },
+                }
+            )
 
     blocking = [
         issue
@@ -3164,6 +3578,9 @@ def _db_replace_page_issues(
                     "confidence": float(issue.get("confidence") or 0.0),
                     "source_stage": issue.get("source_stage") or "",
                 }
+                post_override = issue.get("post_override_adjudication")
+                if isinstance(post_override, dict):
+                    props["post_override_adjudication"] = post_override
                 cur.execute(
                     """
                     INSERT INTO public.electrical_review_issues(
@@ -3331,6 +3748,9 @@ def _db_publish_page_rows(
                     or {},
                     "field_assignment_decision_version": (
                         FIELD_ASSIGNMENT_DECISION_VERSION
+                    ),
+                    "post_override_adjudication_version": (
+                        POST_OVERRIDE_ADJUDICATION_VERSION
                     ),
                     "evidence_notes": item.get("evidence_notes") or "",
                     "detector_fingerprint": detector_fingerprint,

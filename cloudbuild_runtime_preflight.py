@@ -200,6 +200,8 @@ from electrical_terminals import (
     _decision_lookup,
     _field_collision_issues,
     _unrepresented_source_evidence,
+    _validate_page,
+    _verifier_issue_is_field_assignment_related,
 )
 
 ambiguous_terminal = {
@@ -265,6 +267,12 @@ unresolved_issues = _field_collision_issues(
 )
 assert len(unresolved_issues) == 1, unresolved_issues
 assert unresolved_issues[0]['severity'] == 'high', unresolved_issues
+assert _verifier_issue_is_field_assignment_related({
+    'issue_type': 'wrong_field_assignment',
+}) is True
+assert _verifier_issue_is_field_assignment_related({
+    'issue_type': 'terminal_number_not_visually_supported',
+}) is False
 
 # Phase 2T V1.2: strip-like empty layout grids are classified and
 # audited, but they do not become missing data-bearing strips.
@@ -405,6 +413,171 @@ assert _unrepresented_source_evidence(
     evidence_row,
     word_map,
 ) == []
+
+# Phase 2T V1.2.1: a verifier can correctly return review_required for the
+# pre-correction row and also return the exact positive/negative corrections.
+# The final gate must revalidate the corrected row, not blindly reuse the
+# pre-correction verdict. A missing positive reassignment must still block.
+def _post_override_fixture_extractions():
+    return [{
+        'region_id': 'R1',
+        'strip_tag_original': 'X1',
+        'source_side_label_original': '',
+        'destination_side_label_original': '',
+        'boundary_rows': [],
+        'confidence': 0.99,
+        'issues': [],
+        'terminals': [{
+            'row_id': 'r1',
+            'visual_order': 1,
+            'row_role': 'spare_terminal',
+            'terminal_number_original': '1',
+            'level_ref_original': '',
+            'side_a_origin_original': '',
+            'side_b_destination_original': '',
+            'wire_number_original': '',
+            'cable_reference_original': '',
+            'potential_original': '',
+            'conductor_color_original': '',
+            'conductor_cross_section_original': '',
+            'side_a_description_original': '',
+            'side_b_description_original': 'RESERVE',
+            'source_slot_ids': ['S001'],
+            'source_word_ids': [1, 2],
+            'bbox_pt': [0, 0, 1, 1],
+            'confidence': 0.99,
+            'evidence_notes': '',
+        }],
+    }]
+
+post_override_proposals = [{
+    'region_id': 'R1',
+    'slot_candidates': [{'slot_id': 'S001'}],
+}]
+post_override_detector = {
+    'missing_visible_strips': [],
+    'issues': [],
+    'regions': [{
+        'region_id': 'R1',
+        'is_terminal_strip': True,
+        'strip_tag_original': 'X1',
+        'expected_terminal_rows': 1,
+        'expected_boundary_rows': 0,
+        'visible_number_sequence': ['1'],
+        'confidence': 0.99,
+    }],
+}
+post_override_word_map = {
+    1: {'id': 1, 'text': '1'},
+    2: {'id': 2, 'text': 'RESERVE'},
+}
+post_override_corrections = [
+    {
+        'region_id': 'R1',
+        'row_id': 'r1',
+        'field_name': 'wire_number_original',
+        'approved_text': 'RESERVE',
+        'confidence': 0.99,
+        'reason': 'Visible text belongs to the wire lane.',
+    },
+    {
+        'region_id': 'R1',
+        'row_id': 'r1',
+        'field_name': 'side_b_description_original',
+        'approved_text': '',
+        'confidence': 0.99,
+        'reason': 'No text is visible in the description lane.',
+    },
+]
+post_override_verifier = {
+    'verdict': 'review_required',
+    'all_visible_strips_accounted_for': True,
+    'all_strip_like_regions_classified': True,
+    'all_data_terminal_strips_accounted_for': True,
+    'all_visible_terminal_rows_accounted_for': True,
+    'all_strip_tags_supported_by_headers': True,
+    'all_terminal_numbers_visually_supported': True,
+    'all_published_fields_visually_supported': False,
+    'uncovered_region_adjudications': [],
+    'unaccounted_data_terminal_strip_regions': [],
+    'field_support_decisions': [],
+    'field_overrides': post_override_corrections,
+    'region_checks': [{
+        'region_id': 'R1',
+        'strip_tag_original': 'X1',
+        'expected_terminal_rows': 1,
+        'extracted_terminal_rows': 1,
+        'expected_terminal_number_sequence': ['1'],
+        'verified_terminal_number_sequence': ['1'],
+        'boundary_rows_accounted_for': True,
+        'pass': True,
+        'confidence': 0.99,
+        'notes': 'The row is complete after the returned corrections.',
+    }],
+    'issues': [{
+        'issue_type': 'wrong_field_assignment',
+        'severity': 'high',
+        'message': 'Visible text was assigned to the wrong field.',
+        'region_id': 'R1',
+        'row_ids': ['r1'],
+        'confidence': 0.99,
+    }],
+    'confidence': 0.99,
+}
+
+post_override_extractions = _post_override_fixture_extractions()
+_apply_overrides(
+    post_override_extractions,
+    post_override_corrections,
+)
+post_override_passed, post_override_rows, post_override_issues = (
+    _validate_page(
+        page={'id': 1},
+        proposals=post_override_proposals,
+        detector=post_override_detector,
+        extractions=post_override_extractions,
+        verifier=post_override_verifier,
+        word_map=post_override_word_map,
+    )
+)
+assert post_override_passed is True, post_override_issues
+assert post_override_rows[0]['wire_number_original'] == 'RESERVE'
+assert post_override_rows[0]['side_b_description_original'] == ''
+assert not [
+    issue
+    for issue in post_override_issues
+    if issue.get('severity') in {'high', 'critical'}
+], post_override_issues
+assert any(
+    issue.get('issue_type')
+    == 'terminal-verifier-verdict-superseded-post-override'
+    for issue in post_override_issues
+), post_override_issues
+
+missing_positive_extractions = _post_override_fixture_extractions()
+missing_positive_corrections = [post_override_corrections[1]]
+_apply_overrides(
+    missing_positive_extractions,
+    missing_positive_corrections,
+)
+missing_positive_verifier = {
+    **post_override_verifier,
+    'field_overrides': missing_positive_corrections,
+}
+missing_positive_passed, _, missing_positive_issues = _validate_page(
+    page={'id': 1},
+    proposals=post_override_proposals,
+    detector=post_override_detector,
+    extractions=missing_positive_extractions,
+    verifier=missing_positive_verifier,
+    word_map=post_override_word_map,
+)
+assert missing_positive_passed is False, missing_positive_issues
+assert any(
+    issue.get('issue_type')
+    == 'terminal-visible-source-evidence-unrepresented'
+    for issue in missing_positive_issues
+), missing_positive_issues
 
 required = {
     '/v1/ai/electrical/normalize',
