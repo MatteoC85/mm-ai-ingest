@@ -14,7 +14,7 @@ import requests
 
 from electrical_source_store import download_electrical_source_pdf
 
-# MachineMind Phase 2B V1
+# MachineMind Phase 2B V1.1
 # Isolated multimodal bill-of-material extraction.
 # Publication is geometry-first, multilingual and fail-closed. No deterministic
 # rule depends on Italian/English labels, a specific PDF, fixed coordinates,
@@ -78,15 +78,15 @@ DETECTOR_PROMPT_VERSION = (
 ).strip()
 EXTRACTOR_PROMPT_VERSION = (
     os.environ.get("MM_ELECTRICAL_BOM_EXTRACTOR_PROMPT_VERSION")
-    or "mm-electrical-bom-table-extractor-v1"
+    or "mm-electrical-bom-table-extractor-v1.1"
 ).strip()
 VERIFIER_PROMPT_VERSION = (
     os.environ.get("MM_ELECTRICAL_BOM_VERIFIER_PROMPT_VERSION")
-    or "mm-electrical-bom-page-verifier-v1"
+    or "mm-electrical-bom-page-verifier-v1.1"
 ).strip()
 MATERIALIZER_VERSION = (
     os.environ.get("MM_ELECTRICAL_BOM_MATERIALIZER_VERSION")
-    or "mm-electrical-bom-materializer-v1"
+    or "mm-electrical-bom-materializer-v1.1"
 ).strip()
 
 OPENAI_TIMEOUT_SECONDS = _env_int(
@@ -120,7 +120,7 @@ MAX_SOURCE_BYTES = _env_int(
     500_000_000,
 )
 
-PIPELINE_MARKER = "phase2-bom-v1-source-snapshot"
+PIPELINE_MARKER = "phase2-bom-v1.1-source-snapshot"
 EXTRACTION_METHOD = "openai_vision_bom_v1"
 PHASE_NAME = "bom_vision_v1"
 PAGE_TYPE = "bom_table"
@@ -1033,6 +1033,109 @@ def _table_row_cells(
     return list(rows[row_index].cells or [])
 
 
+def _detect_sidecar_column_specs(
+    *,
+    source_page: fitz.Page,
+    table_bbox: fitz.Rect,
+    row_rects: list[fitz.Rect],
+    word_map: dict[int, dict],
+) -> list[dict]:
+    """Recover visually populated columns adjacent to a detected table.
+
+    Some CAD PDFs omit one vertical ruling line. ``PyMuPDF.find_tables`` can
+    then stop at the last fully bordered column even though a further column is
+    visibly populated on nearly every physical row. This geometry-only rescue
+    looks for a compact word band immediately to the left or right of the
+    detected table and accepts it only when it is aligned with a substantial
+    fraction of the table rows. No header vocabulary, manufacturer name, page
+    number or fixed coordinate is used.
+    """
+    if len(row_rects) < 4 or not word_map:
+        return []
+
+    page_rect = source_page.rect
+    page_width = max(1.0, float(page_rect.width))
+    max_search_gap = max(10.0, min(72.0, page_width * 0.10))
+    max_band_width = max(36.0, min(190.0, page_width * 0.25))
+    minimum_support = max(3, int(len(row_rects) * 0.30 + 0.999))
+
+    specs: list[dict] = []
+    for side in ("left", "right"):
+        support_rows: list[int] = []
+        supported_word_ids: set[int] = set()
+        nearest_gap: Optional[float] = None
+
+        for row_index, row_rect in enumerate(row_rects):
+            row_ids: list[int] = []
+            for word_id, word in word_map.items():
+                cx, cy = _word_center(word)
+                if not (row_rect.y0 <= cy <= row_rect.y1):
+                    continue
+
+                if side == "right":
+                    gap = float(word["x0"]) - float(table_bbox.x1)
+                    outside = cx > float(table_bbox.x1) + 0.25
+                    within = gap <= max_search_gap
+                else:
+                    gap = float(table_bbox.x0) - float(word["x1"])
+                    outside = cx < float(table_bbox.x0) - 0.25
+                    within = gap <= max_search_gap
+
+                if outside and 0.0 <= gap <= max_search_gap and within:
+                    row_ids.append(int(word_id))
+                    nearest_gap = gap if nearest_gap is None else min(
+                        nearest_gap,
+                        gap,
+                    )
+
+            if row_ids:
+                support_rows.append(row_index)
+                supported_word_ids.update(row_ids)
+
+        if len(support_rows) < minimum_support or not supported_word_ids:
+            continue
+
+        words = [word_map[word_id] for word_id in sorted(supported_word_ids)]
+        word_x0 = min(float(word["x0"]) for word in words)
+        word_x1 = max(float(word["x1"]) for word in words)
+        band_width = word_x1 - word_x0
+        if band_width <= 0.0 or band_width > max_band_width:
+            continue
+
+        support_ratio = len(support_rows) / max(1, len(row_rects))
+        if support_ratio < 0.30:
+            continue
+
+        margin = 3.0
+        if side == "right":
+            x0 = max(float(table_bbox.x1), word_x0 - margin)
+            x1 = min(float(page_rect.x1), word_x1 + margin)
+        else:
+            x0 = max(float(page_rect.x0), word_x0 - margin)
+            x1 = min(float(table_bbox.x0), word_x1 + margin)
+        if x1 - x0 < 4.0:
+            continue
+
+        specs.append(
+            {
+                "side": side,
+                "bbox_pt": _rect_list(
+                    fitz.Rect(x0, table_bbox.y0, x1, table_bbox.y1)
+                ),
+                "support_row_indexes": support_rows,
+                "support_row_count": len(support_rows),
+                "support_ratio": round(support_ratio, 4),
+                "source_word_ids": sorted(supported_word_ids),
+                "nearest_gap_pt": round(float(nearest_gap or 0.0), 2),
+                "band_width_pt": round(float(band_width), 2),
+            }
+        )
+
+    # At most one adjacent recovered column per side. Both sides are supported
+    # for generality; the final physical order is assigned from x coordinates.
+    return sorted(specs, key=lambda item: item["bbox_pt"][0])
+
+
 def _build_table_proposal(
     *,
     table: Any,
@@ -1041,22 +1144,52 @@ def _build_table_proposal(
     inventory_page: dict,
     word_map: dict[int, dict],
 ) -> dict:
-    bbox = _rect_from(table.bbox)
-    crop = fitz.Rect(
-        max(source_page.rect.x0, bbox.x0 - 8.0),
-        max(source_page.rect.y0, bbox.y0 - 12.0),
-        min(source_page.rect.x1, bbox.x1 + 8.0),
-        min(source_page.rect.y1, bbox.y1 + 12.0),
-    )
+    original_bbox = _rect_from(table.bbox)
     extracted = table.extract() or []
-    row_candidates: list[dict] = []
     rows = list(table.rows or [])
+    row_rects = [
+        fitz.Rect(
+            original_bbox.x0,
+            _rect_from(table_row.bbox).y0,
+            original_bbox.x1,
+            _rect_from(table_row.bbox).y1,
+        )
+        for table_row in rows
+    ]
+
+    sidecar_specs = _detect_sidecar_column_specs(
+        source_page=source_page,
+        table_bbox=original_bbox,
+        row_rects=row_rects,
+        word_map=word_map,
+    )
+    sidecar_rects = [_rect_from(item["bbox_pt"]) for item in sidecar_specs]
+
+    extended_bbox = fitz.Rect(original_bbox)
+    for sidecar_rect in sidecar_rects:
+        extended_bbox.include_rect(sidecar_rect)
+
+    crop = fitz.Rect(
+        max(source_page.rect.x0, extended_bbox.x0 - 8.0),
+        max(source_page.rect.y0, extended_bbox.y0 - 12.0),
+        min(source_page.rect.x1, extended_bbox.x1 + 8.0),
+        min(source_page.rect.y1, extended_bbox.y1 + 12.0),
+    )
+
+    row_candidates: list[dict] = []
+    base_column_count = int(table.col_count or 0)
     for row_index, table_row in enumerate(rows):
-        row_bbox = _rect_from(table_row.bbox)
-        row_rect = fitz.Rect(bbox.x0, row_bbox.y0, bbox.x1, row_bbox.y1)
-        cells: list[dict] = []
+        original_row_bbox = _rect_from(table_row.bbox)
+        row_rect = fitz.Rect(
+            extended_bbox.x0,
+            original_row_bbox.y0,
+            extended_bbox.x1,
+            original_row_bbox.y1,
+        )
+        raw_cells: list[dict] = []
         cell_rects = _table_row_cells(table, row_index)
-        for column_index in range(int(table.col_count or 0)):
+
+        for column_index in range(base_column_count):
             raw_cell = (
                 cell_rects[column_index]
                 if column_index < len(cell_rects)
@@ -1065,22 +1198,58 @@ def _build_table_proposal(
             if raw_cell:
                 cell_rect = _rect_from(raw_cell)
             else:
-                width = bbox.width / max(1, int(table.col_count or 1))
+                width = original_bbox.width / max(1, base_column_count)
                 cell_rect = fitz.Rect(
-                    bbox.x0 + column_index * width,
-                    row_rect.y0,
-                    bbox.x0 + (column_index + 1) * width,
-                    row_rect.y1,
+                    original_bbox.x0 + column_index * width,
+                    original_row_bbox.y0,
+                    original_bbox.x0 + (column_index + 1) * width,
+                    original_row_bbox.y1,
                 )
-            word_ids = _ids_in_rect(word_map, cell_rect)
             deterministic_text = ""
             if row_index < len(extracted):
                 values = extracted[row_index] or []
                 if column_index < len(values):
-                    deterministic_text = _clean_text(values[column_index], 1600)
+                    deterministic_text = _clean_text(
+                        values[column_index],
+                        1600,
+                    )
+            raw_cells.append(
+                {
+                    "bbox": cell_rect,
+                    "deterministic_text": deterministic_text,
+                    "geometry_source": "pymupdf_find_tables",
+                }
+            )
+
+        for sidecar_spec, sidecar_rect in zip(sidecar_specs, sidecar_rects):
+            cell_rect = fitz.Rect(
+                sidecar_rect.x0,
+                original_row_bbox.y0,
+                sidecar_rect.x1,
+                original_row_bbox.y1,
+            )
+            word_ids = _ids_in_rect(word_map, cell_rect)
+            raw_cells.append(
+                {
+                    "bbox": cell_rect,
+                    "deterministic_text": _text_for_ids(
+                        word_ids,
+                        word_map,
+                        1600,
+                    ),
+                    "geometry_source": "row_aligned_sidecar_recovery_v1",
+                    "side": sidecar_spec["side"],
+                }
+            )
+
+        raw_cells.sort(key=lambda item: (item["bbox"].x0, item["bbox"].x1))
+        cells: list[dict] = []
+        for source_column_index, raw_cell in enumerate(raw_cells):
+            cell_rect = raw_cell["bbox"]
+            word_ids = _ids_in_rect(word_map, cell_rect)
             cells.append(
                 {
-                    "source_column_index": column_index,
+                    "source_column_index": source_column_index,
                     "bbox_pt": _rect_list(cell_rect),
                     "word_ids": word_ids,
                     "word_text_original": _text_for_ids(
@@ -1088,9 +1257,13 @@ def _build_table_proposal(
                         word_map,
                         2000,
                     ),
-                    "deterministic_cell_text_original": deterministic_text,
+                    "deterministic_cell_text_original": raw_cell[
+                        "deterministic_text"
+                    ],
+                    "geometry_source": raw_cell["geometry_source"],
                 }
             )
+
         row_word_ids = sorted(
             {
                 wid
@@ -1123,11 +1296,24 @@ def _build_table_proposal(
     )
     proposal = {
         "region_id": region_id,
-        "geometry_method": "pymupdf_find_tables_v1",
-        "table_bbox_pt": _rect_list(bbox),
+        "geometry_method": (
+            "pymupdf_find_tables_plus_sidecar_columns_v1"
+            if sidecar_specs
+            else "pymupdf_find_tables_v1"
+        ),
+        "table_bbox_pt": _rect_list(extended_bbox),
+        "original_table_bbox_pt": _rect_list(original_bbox),
         "crop_bbox_pt": _rect_list(crop),
         "deterministic_row_count": int(table.row_count or 0),
-        "deterministic_column_count": int(table.col_count or 0),
+        "deterministic_column_count": (
+            base_column_count + len(sidecar_specs)
+        ),
+        "geometry_recovery": {
+            "version": "row-aligned-sidecar-column-recovery-v1",
+            "base_column_count": base_column_count,
+            "recovered_column_count": len(sidecar_specs),
+            "recovered_columns": sidecar_specs,
+        },
         "row_candidates": row_candidates,
     }
     proposal["region_hash"] = _sha256_json(
@@ -1137,7 +1323,6 @@ def _build_table_proposal(
         }
     )
     return proposal
-
 
 def _fallback_page_proposal(
     *,
@@ -1552,7 +1737,7 @@ def _bom_row_schema() -> dict:
 
 def _extractor_schema() -> dict:
     return {
-        "name": "electrical_bom_table_extractor_v1",
+        "name": "electrical_bom_table_extractor_v1_1",
         "strict": True,
         "schema": {
             "type": "object",
@@ -1660,7 +1845,7 @@ def _extractor_schema() -> dict:
 
 def _verifier_schema() -> dict:
     return {
-        "name": "electrical_bom_page_verifier_v1",
+        "name": "electrical_bom_page_verifier_v1_1",
         "strict": True,
         "schema": {
             "type": "object",
@@ -1803,6 +1988,7 @@ def _detector_messages(
             "crop_bbox_pt": p["crop_bbox_pt"],
             "deterministic_row_count": p["deterministic_row_count"],
             "deterministic_column_count": p["deterministic_column_count"],
+            "geometry_recovery": p.get("geometry_recovery") or {},
         }
         for p in proposals
     ]
@@ -1883,9 +2069,12 @@ def _extractor_messages(
         "same alphanumeric characters, masking symbols and order. Never translate, paraphrase, "
         "expand abbreviations, repair a source typo or alter a technical code. "
         "Every source word in an item row must belong to exactly one field_evidence "
-        "entry. Use only supplied source word IDs. Every deterministic row "
-        "candidate must be classified as header, item or another explicit "
-        "non-item kind."
+        "entry. Use only supplied source word IDs. Return exactly one semantic "
+        "source_column_roles decision for every supplied source column index, "
+        "including geometry-recovered adjacent columns. Every deterministic row "
+        "candidate must be classified exactly once: header rows belong only in "
+        "header_row_candidate_ids, item rows belong only in rows, and all other "
+        "rows belong only in non_item_rows."
     )
     request = {
         "page_id": page["id"],
@@ -1894,8 +2083,10 @@ def _extractor_messages(
         "sheet_title_original": page.get("sheet_title"),
         "region_id": proposal["region_id"],
         "geometry_method": proposal["geometry_method"],
+        "geometry_recovery": proposal.get("geometry_recovery") or {},
         "detector_assessment": detector_assessment,
         "table_bbox_pt": proposal["table_bbox_pt"],
+        "original_table_bbox_pt": proposal.get("original_table_bbox_pt"),
         "crop_bbox_pt": proposal["crop_bbox_pt"],
         "row_candidates": proposal.get("row_candidates") or [],
         "fallback_page_word_ids": proposal.get("fallback_page_word_ids") or [],
@@ -1948,8 +2139,11 @@ def _verifier_messages(
         "reader. Re-read the full page and every high-resolution table crop. The "
         "source may use any language or drawing standard. Verify every BOM table, "
         "physical item row, column, field and source token. Physical row identity "
-        "is authoritative: identical tags, descriptions, part numbers and "
-        "manufacturers on different rows are separate items and must be preserved. "
+        "is authoritative and consists of region plus source_row_candidate_id and "
+        "visual_order. duplicate_physical_keys must contain only duplicated physical "
+        "row identities, never repeated component tags, descriptions, part numbers "
+        "or manufacturers. Identical field values on different physical rows are "
+        "valid separate items and must be preserved. "
         "Do not merge accessory rows sharing one component tag. Verify that wrapped "
         "description text remains in its own row and no text leaks to adjacent rows. "
         "No visible token may disappear or be assigned to two fields. Original text "
@@ -1971,6 +2165,20 @@ def _verifier_messages(
         "sheet_code_original": page.get("sheet_code"),
         "sheet_title_original": page.get("sheet_title"),
         "detector": detector,
+        "geometry_proposals": [
+            {
+                "region_id": proposal["region_id"],
+                "geometry_method": proposal.get("geometry_method"),
+                "deterministic_row_count": int(
+                    proposal.get("deterministic_row_count") or 0
+                ),
+                "deterministic_column_count": int(
+                    proposal.get("deterministic_column_count") or 0
+                ),
+                "geometry_recovery": proposal.get("geometry_recovery") or {},
+            }
+            for proposal in proposals
+        ],
         "proposal_region_ids": [p["region_id"] for p in proposals],
         "extractions": extractions,
         "row_min_confidence": ROW_MIN_CONFIDENCE,
@@ -2340,6 +2548,154 @@ def _physical_bom_key(
         ).encode("utf-8")
     ).hexdigest()
 
+
+
+def _canonical_row_candidate_accounting(
+    extraction: dict,
+) -> tuple[set[str], set[str], set[str]]:
+    """Return mutually exclusive header, non-item and item candidate IDs.
+
+    Older/less precise model responses can echo a header in both the dedicated
+    ``header_row_candidate_ids`` list and ``non_item_rows`` with kind=header.
+    That is one semantic classification, not two physical rows. Header aliases
+    are therefore canonicalized before the exact-once accounting check. Any
+    overlap with an item row or with a genuine non-header non-item row remains
+    blocking.
+    """
+    explicit_headers = {
+        _clean_text(value, 120)
+        for value in (extraction.get("header_row_candidate_ids") or [])
+        if _clean_text(value, 120)
+    }
+    non_item_rows = [
+        item
+        for item in (extraction.get("non_item_rows") or [])
+        if isinstance(item, dict)
+    ]
+    header_aliases = {
+        _clean_text(item.get("source_row_candidate_id"), 120)
+        for item in non_item_rows
+        if _clean_text(item.get("kind"), 120) == "header"
+        and _clean_text(item.get("source_row_candidate_id"), 120)
+    }
+    headers = explicit_headers | header_aliases
+    non_items = {
+        _clean_text(item.get("source_row_candidate_id"), 120)
+        for item in non_item_rows
+        if _clean_text(item.get("kind"), 120) != "header"
+        and _clean_text(item.get("source_row_candidate_id"), 120)
+    }
+    items = {
+        _clean_text(item.get("source_row_candidate_id"), 120)
+        for item in (extraction.get("rows") or [])
+        if isinstance(item, dict)
+        and _clean_text(item.get("source_row_candidate_id"), 120)
+    }
+    return headers, non_items, items
+
+
+def _sequence_matches_source_characters(
+    actual_values: list[Any],
+    verified_values: list[Any],
+) -> bool:
+    """Compare visual sequences while tolerating artificial PDF whitespace."""
+    if len(actual_values) != len(verified_values):
+        return False
+    return all(
+        _semantic_character_signature(actual)
+        == _semantic_character_signature(verified)
+        for actual, verified in zip(actual_values, verified_values)
+    )
+
+
+def _adjudicate_verifier_duplicate_physical_keys(
+    *,
+    reported_keys: list[Any],
+    rows: list[dict],
+) -> tuple[list[str], list[dict]]:
+    """Separate real duplicate row identities from repeated BOM values.
+
+    The deterministic physical key intentionally excludes component values. A
+    verifier occasionally reports repeated component tags in the field named
+    ``duplicate_physical_keys``. When every row identity is unique and the
+    reported token is demonstrably a value repeated on distinct rows, preserve
+    it as audit information rather than blocking publication. Unknown tokens or
+    actual duplicate row identities remain unresolved.
+    """
+    cleaned = [
+        _clean_text(value, 500)
+        for value in (reported_keys or [])
+        if _clean_text(value, 500)
+    ]
+    if not cleaned:
+        return [], []
+
+    physical_identities = [
+        (
+            _clean_text(row.get("region_id"), 120),
+            _clean_text(row.get("source_row_candidate_id"), 120),
+            int(row.get("visual_order") or 0),
+        )
+        for row in rows
+    ]
+    identities_unique = len(physical_identities) == len(
+        set(physical_identities)
+    )
+
+    repeated_values: dict[str, dict] = {}
+    for field_name in ORIGINAL_FIELDS:
+        occurrences: dict[str, list[dict]] = {}
+        for row in rows:
+            value = _clean_text(row.get(field_name), 4000)
+            atom = _evidence_atom(value)
+            if not atom:
+                continue
+            occurrences.setdefault(atom, []).append(
+                {
+                    "region_id": _clean_text(row.get("region_id"), 120),
+                    "row_id": _clean_text(row.get("row_id"), 120),
+                    "source_row_candidate_id": _clean_text(
+                        row.get("source_row_candidate_id"), 120
+                    ),
+                    "visual_order": int(row.get("visual_order") or 0),
+                    "value": value,
+                }
+            )
+        for atom, matches in occurrences.items():
+            if len(matches) >= 2:
+                repeated_values.setdefault(
+                    atom,
+                    {"fields": set(), "rows": []},
+                )
+                repeated_values[atom]["fields"].add(field_name)
+                repeated_values[atom]["rows"].extend(matches)
+
+    unresolved: list[str] = []
+    resolved: list[dict] = []
+    for reported in cleaned:
+        atom = _evidence_atom(reported)
+        evidence = repeated_values.get(atom)
+        if identities_unique and evidence:
+            unique_rows = {
+                (
+                    item["region_id"],
+                    item["source_row_candidate_id"],
+                    item["visual_order"],
+                )
+                for item in evidence["rows"]
+            }
+            if len(unique_rows) >= 2:
+                resolved.append(
+                    {
+                        "reported_value": reported,
+                        "matched_fields": sorted(evidence["fields"]),
+                        "distinct_physical_rows": len(unique_rows),
+                        "row_examples": evidence["rows"][:12],
+                    }
+                )
+                continue
+        unresolved.append(reported)
+    return unresolved, resolved
 
 def _validate_page(
     *,
@@ -2734,22 +3090,11 @@ def _validate_page(
             if isinstance(x, dict)
         }
         if candidate_rows:
-            header_ids = {
-                _clean_text(x, 120)
-                for x in (extraction.get("header_row_candidate_ids") or [])
-                if _clean_text(x, 120)
-            }
-            non_item_ids = {
-                _clean_text(x.get("source_row_candidate_id"), 120)
-                for x in (extraction.get("non_item_rows") or [])
-                if isinstance(x, dict)
-                and _clean_text(x.get("source_row_candidate_id"), 120)
-            }
-            item_candidate_ids = {
-                _clean_text(x.get("source_row_candidate_id"), 120)
-                for x in extracted_rows
-                if _clean_text(x.get("source_row_candidate_id"), 120)
-            }
+            (
+                header_ids,
+                non_item_ids,
+                item_candidate_ids,
+            ) = _canonical_row_candidate_accounting(extraction)
             all_candidate_ids = set(candidate_by_id)
             accounted = header_ids | non_item_ids | item_candidate_ids
             overlaps = (
@@ -3261,7 +3606,11 @@ def _validate_page(
             for x in (check.get("verified_row_ids") or [])
         ]
         actual_tags = [
-            _clean_text(row.get("component_tag_original"), 1000)
+            _clean_text(
+                row.get("component_tag_normalized")
+                or row.get("component_tag_original"),
+                1000,
+            )
             for row in actual_rows
         ]
         verified_tags = [
@@ -3272,7 +3621,10 @@ def _validate_page(
             int(check.get("expected_item_rows") or 0) != len(actual_rows)
             or int(check.get("verified_item_rows") or 0) != len(actual_rows)
             or verified_row_ids != actual_row_ids
-            or verified_tags != actual_tags
+            or not _sequence_matches_source_characters(
+                actual_tags,
+                verified_tags,
+            )
         ):
             issues.append(
                 {
@@ -3295,7 +3647,6 @@ def _validate_page(
         "all_visible_columns_accounted_for",
         "all_published_fields_visually_supported",
         "all_source_evidence_represented",
-        "duplicates_preserved",
     ]
     for flag in required_flags:
         if not verifier.get(flag):
@@ -3310,10 +3661,77 @@ def _validate_page(
                     "source_stage": "deterministic_validator",
                 }
             )
+
+    unresolved_duplicate_keys, resolved_repeated_values = (
+        _adjudicate_verifier_duplicate_physical_keys(
+            reported_keys=verifier.get("duplicate_physical_keys") or [],
+            rows=rows,
+        )
+    )
+    if resolved_repeated_values:
+        issues.append(
+            {
+                "issue_type": "bom-repeated-values-preserved-as-distinct-rows",
+                "severity": "info",
+                "message": (
+                    "Verifier-reported duplicate values were confirmed as "
+                    "separate physical BOM rows by deterministic row identity"
+                ),
+                "region_id": "",
+                "row_ids": [],
+                "confidence": float(verifier.get("confidence") or 0.0),
+                "source_stage": "deterministic_duplicate_adjudicator",
+                "duplicate_value_adjudication": resolved_repeated_values,
+            }
+        )
+    if unresolved_duplicate_keys:
+        issues.append(
+            {
+                "issue_type": "bom-verifier-duplicate-physical-keys",
+                "severity": "high",
+                "message": (
+                    "Verifier returned unresolved duplicate physical row keys"
+                ),
+                "region_id": "",
+                "row_ids": unresolved_duplicate_keys,
+                "confidence": float(verifier.get("confidence") or 0.0),
+                "source_stage": "deterministic_validator",
+            }
+        )
+
+    if not verifier.get("duplicates_preserved"):
+        if resolved_repeated_values and not unresolved_duplicate_keys:
+            issues.append(
+                {
+                    "issue_type": "bom-verifier-duplicates-preserved-adjudicated",
+                    "severity": "info",
+                    "message": (
+                        "The verifier flag was conservative, but deterministic "
+                        "physical row identities prove repeated values were preserved"
+                    ),
+                    "region_id": "",
+                    "row_ids": [],
+                    "confidence": float(verifier.get("confidence") or 0.0),
+                    "source_stage": "deterministic_duplicate_adjudicator",
+                    "duplicate_value_adjudication": resolved_repeated_values,
+                }
+            )
+        else:
+            issues.append(
+                {
+                    "issue_type": "bom-verifier-duplicates_preserved",
+                    "severity": "high",
+                    "message": "Verifier returned duplicates_preserved=false",
+                    "region_id": "",
+                    "row_ids": [],
+                    "confidence": float(verifier.get("confidence") or 0.0),
+                    "source_stage": "deterministic_validator",
+                }
+            )
+
     for field_name, issue_type in [
         ("missing_region_ids", "bom-verifier-missing-regions"),
         ("missing_row_ids", "bom-verifier-missing-rows"),
-        ("duplicate_physical_keys", "bom-verifier-duplicate-physical-keys"),
         ("unaccounted_visual_evidence", "bom-verifier-unaccounted-evidence"),
     ]:
         if verifier.get(field_name):
@@ -3409,6 +3827,10 @@ def _db_replace_page_issues(
                         "post_override_resolution"
                     )
                     or {},
+                    "duplicate_value_adjudication": issue.get(
+                        "duplicate_value_adjudication"
+                    )
+                    or [],
                 }
                 cur.execute(
                     """
@@ -3809,6 +4231,7 @@ def extract_electrical_bom_page(
                     "deterministic_column_count": p[
                         "deterministic_column_count"
                     ],
+                    "geometry_recovery": p.get("geometry_recovery") or {},
                 }
                 for p in proposals
             ],
@@ -3878,6 +4301,7 @@ def extract_electrical_bom_page(
                 "region_hash": proposal["region_hash"],
                 "detector_assessment": assessment,
                 "geometry_method": proposal["geometry_method"],
+                "geometry_recovery": proposal.get("geometry_recovery") or {},
                 "row_candidates": proposal.get("row_candidates") or [],
                 "fallback_page_word_ids": proposal.get(
                     "fallback_page_word_ids"
@@ -3923,6 +4347,20 @@ def extract_electrical_bom_page(
             "detector_fingerprint": detector_fp,
             "extractor_fingerprints": extractor_fingerprints,
             "detector": detector,
+            "geometry_proposals": [
+                {
+                    "region_id": proposal["region_id"],
+                    "geometry_method": proposal.get("geometry_method"),
+                    "deterministic_row_count": int(
+                        proposal.get("deterministic_row_count") or 0
+                    ),
+                    "deterministic_column_count": int(
+                        proposal.get("deterministic_column_count") or 0
+                    ),
+                    "geometry_recovery": proposal.get("geometry_recovery") or {},
+                }
+                for proposal in proposals
+            ],
             "extractions": extractions,
             "render_dpi": RENDER_DPI,
         }
@@ -4037,6 +4475,7 @@ def extract_electrical_bom_page(
                     "deterministic_columns": int(
                         proposal.get("deterministic_column_count") or 0
                     ),
+                    "geometry_recovery": proposal.get("geometry_recovery") or {},
                     "expected_header_rows": int(
                         assessment.get("expected_header_rows") or 0
                     ),
@@ -4044,6 +4483,24 @@ def extract_electrical_bom_page(
                         assessment.get("expected_item_rows") or 0
                     ),
                     "materialized_item_rows": len(ordered_rows),
+                    "rows_with_manufacturer": sum(
+                        1
+                        for row in ordered_rows
+                        if _clean_text(
+                            row.get("manufacturer_normalized")
+                            or row.get("manufacturer_original"),
+                            1000,
+                        )
+                    ),
+                    "blank_manufacturer_rows": sum(
+                        1
+                        for row in ordered_rows
+                        if not _clean_text(
+                            row.get("manufacturer_normalized")
+                            or row.get("manufacturer_original"),
+                            1000,
+                        )
+                    ),
                     "component_tag_sequence": [
                         _clean_text(
                             row.get("component_tag_original"),
@@ -4053,6 +4510,13 @@ def extract_electrical_bom_page(
                     ],
                 }
             )
+
+        unresolved_duplicate_keys, resolved_duplicate_values = (
+            _adjudicate_verifier_duplicate_physical_keys(
+                reported_keys=verifier.get("duplicate_physical_keys") or [],
+                rows=rows,
+            )
+        )
 
         return {
             "electrical_document_id": context["electrical_document_id"],
@@ -4073,8 +4537,9 @@ def extract_electrical_bom_page(
             "blocking_issue_count_this_page": blocking,
             "warning_issue_count_this_page": warning,
             "duplicate_value_rows_preserved": bool(
-                page_passed and verifier.get("duplicates_preserved")
+                page_passed and not unresolved_duplicate_keys
             ),
+            "duplicate_value_adjudication": resolved_duplicate_values,
             "region_stats": region_stats,
             "severity_counts": _severity_counts(issues),
             **state,

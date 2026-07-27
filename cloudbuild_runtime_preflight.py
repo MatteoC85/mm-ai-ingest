@@ -621,16 +621,21 @@ assert any(
     for issue in missing_positive_issues
 ), missing_positive_issues
 
-# Phase 2B V1: deterministic BOM publication tests.
+# Phase 2B V1.1: deterministic BOM publication tests.
 import copy
 from electrical_bom import (
     _apply_overrides as _apply_bom_overrides,
+    _build_table_proposal as _bom_build_table_proposal,
+    _candidate_tables as _bom_candidate_tables,
+    _canonical_row_candidate_accounting as _bom_row_candidate_accounting,
+    _detect_sidecar_column_specs as _bom_detect_sidecar_columns,
     _field_evidence_audit as _bom_field_evidence_audit,
     _fallback_page_proposal as _bom_fallback_page_proposal,
     _parse_quantity as _parse_bom_quantity,
     _physical_bom_key as _bom_physical_key,
     _semantic_character_signature as _bom_character_signature,
     _validate_page as _validate_bom_page,
+    _word_map as _bom_word_map_from_page,
 )
 
 assert str(_parse_bom_quantity('2')) == '2'
@@ -664,6 +669,162 @@ try:
     }]
 finally:
     _bom_doc.close()
+
+# A visually populated adjacent column must be recovered when find_tables
+# stops at the last fully bordered lane. The rule is row-alignment based and
+# does not know any language, header word or manufacturer name.
+_sidecar_doc = _bom_fitz.open()
+try:
+    _sidecar_page = _sidecar_doc.new_page(width=120, height=60)
+    _sidecar_rows = [
+        _bom_fitz.Rect(5, index * 10, 60, (index + 1) * 10)
+        for index in range(5)
+    ]
+    _sidecar_word_map = {}
+    _wid = 1
+    for index in range(5):
+        y0 = index * 10 + 2
+        _sidecar_word_map[_wid] = {
+            'id': _wid, 'text': f'BASE{index}',
+            'x0': 10, 'y0': y0, 'x1': 25, 'y1': y0 + 5,
+        }
+        _wid += 1
+        _sidecar_word_map[_wid] = {
+            'id': _wid, 'text': f'MAKER{index}',
+            'x0': 67, 'y0': y0, 'x1': 86, 'y1': y0 + 5,
+        }
+        _wid += 1
+    _sidecar_specs = _bom_detect_sidecar_columns(
+        source_page=_sidecar_page,
+        table_bbox=_bom_fitz.Rect(5, 0, 60, 50),
+        row_rects=_sidecar_rows,
+        word_map=_sidecar_word_map,
+    )
+    assert len(_sidecar_specs) == 1, _sidecar_specs
+    assert _sidecar_specs[0]['side'] == 'right', _sidecar_specs
+    assert _sidecar_specs[0]['support_row_count'] == 5, _sidecar_specs
+    assert _sidecar_specs[0]['bbox_pt'][0] >= 60, _sidecar_specs
+
+    _sparse_sidecar_specs = _bom_detect_sidecar_columns(
+        source_page=_sidecar_page,
+        table_bbox=_bom_fitz.Rect(5, 0, 60, 50),
+        row_rects=_sidecar_rows,
+        word_map={
+            1: {
+                'id': 1,
+                'text': 'UNRELATED',
+                'x0': 65,
+                'y0': 2,
+                'x1': 90,
+                'y1': 7,
+            },
+        },
+    )
+    assert _sparse_sidecar_specs == [], _sparse_sidecar_specs
+finally:
+    _sidecar_doc.close()
+
+# Integration fixture: PyMuPDF detects only the three fully ruled columns,
+# while the fourth adjacent populated lane is recovered and included in every
+# row candidate. This reproduces the failure mode found on the first real BOM
+# page without using any page number, language or manufacturer name in logic.
+_integration_doc = _bom_fitz.open()
+try:
+    _integration_page = _integration_doc.new_page(width=400, height=250)
+    _x0 = 40.0
+    _widths = [55.0, 150.0, 80.0]
+    _x_edges = [_x0]
+    for _width in _widths:
+        _x_edges.append(_x_edges[-1] + _width)
+    _y0 = 30.0
+    _row_height = 28.0
+    _row_count = 6
+    for _x in _x_edges:
+        _integration_page.draw_line(
+            (_x, _y0),
+            (_x, _y0 + _row_count * _row_height),
+            color=(0, 0, 0),
+            width=0.8,
+        )
+    for _row_index in range(_row_count + 1):
+        _y = _y0 + _row_index * _row_height
+        _integration_page.draw_line(
+            (_x0, _y),
+            (_x_edges[-1], _y),
+            color=(0, 0, 0),
+            width=0.8,
+        )
+    for _column_index, _header in enumerate(
+        ['FIELD-A', 'FIELD-B', 'FIELD-C']
+    ):
+        _integration_page.insert_text(
+            (_x_edges[_column_index] + 3, _y0 + 18),
+            _header,
+            fontsize=8,
+        )
+    _integration_page.insert_text(
+        (_x_edges[-1] + 8, _y0 + 18),
+        'FIELD-D',
+        fontsize=8,
+    )
+    for _row_index in range(1, _row_count):
+        _y = _y0 + _row_index * _row_height + 18
+        for _column_index, _value in enumerate(
+            [
+                f'A{_row_index}',
+                f'B{_row_index}',
+                f'C{_row_index}',
+            ]
+        ):
+            _integration_page.insert_text(
+                (_x_edges[_column_index] + 3, _y),
+                _value,
+                fontsize=8,
+            )
+        _integration_page.insert_text(
+            (_x_edges[-1] + 8, _y),
+            f'D{_row_index}',
+            fontsize=8,
+        )
+
+    _integration_words = list(
+        _integration_page.get_text('words', sort=True) or []
+    )
+    _integration_inventory_page = {
+        'pdf_page_number': 1,
+        'page_sha256': 'sidecar-integration-fixture',
+        'words': [list(word) for word in _integration_words],
+    }
+    _integration_word_map = _bom_word_map_from_page(
+        _integration_inventory_page
+    )
+    _integration_tables = _bom_candidate_tables(_integration_page)
+    assert len(_integration_tables) == 1, _integration_tables
+    assert int(_integration_tables[0].col_count or 0) == 3
+    _integration_proposal = _bom_build_table_proposal(
+        table=_integration_tables[0],
+        proposal_index=1,
+        source_page=_integration_page,
+        inventory_page=_integration_inventory_page,
+        word_map=_integration_word_map,
+    )
+    assert _integration_proposal['deterministic_column_count'] == 4, (
+        _integration_proposal
+    )
+    assert _integration_proposal['geometry_recovery'][
+        'recovered_column_count'
+    ] == 1, _integration_proposal
+    assert all(
+        len(row.get('cells') or []) == 4
+        for row in _integration_proposal['row_candidates']
+    ), _integration_proposal
+    assert all(
+        (row.get('cells') or [])[-1].get('geometry_source')
+        == 'row_aligned_sidecar_recovery_v1'
+        for row in _integration_proposal['row_candidates']
+    ), _integration_proposal
+finally:
+    _integration_doc.close()
 
 bom_page = {
     'id': 900,
@@ -846,6 +1007,90 @@ assert len(bom_rows) == 2, bom_rows
 assert [row['component_tag_original'] for row in bom_rows] == ['K1', 'K1']
 assert [row['part_number_original'] for row in bom_rows] == ['PN-1', 'PN-1']
 assert all(row['source_evidence_coverage']['complete'] for row in bom_rows)
+
+# A header echoed in both legacy header containers is one physical
+# classification and must not create a false row-accounting failure.
+bom_header_alias_extractions = _bom_fixture_extractions()
+bom_header_alias_extractions[0]['non_item_rows'] = [{
+    'source_row_candidate_id': 'R001',
+    'kind': 'header',
+    'reason': 'legacy duplicate header classification',
+    'confidence': 0.99,
+}]
+header_ids, non_item_ids, item_ids = _bom_row_candidate_accounting(
+    bom_header_alias_extractions[0]
+)
+assert header_ids == {'R001'}
+assert non_item_ids == set()
+assert item_ids == {'R002', 'R003'}
+bom_header_alias_passed, _, bom_header_alias_issues = _validate_bom_page(
+    page=bom_page,
+    proposals=bom_proposals,
+    detector=bom_detector,
+    extractions=bom_header_alias_extractions,
+    verifier=bom_verifier,
+    word_map=bom_word_map,
+)
+assert bom_header_alias_passed is True, bom_header_alias_issues
+
+# Artificial spacing differences in verifier tag sequences do not alter the
+# source characters and therefore do not create a false row mismatch.
+bom_spacing_verifier = copy.deepcopy(bom_verifier)
+bom_spacing_verifier['region_checks'][0][
+    'verified_component_tag_sequence'
+] = ['K 1', 'K1']
+bom_spacing_passed, _, bom_spacing_issues = _validate_bom_page(
+    page=bom_page,
+    proposals=bom_proposals,
+    detector=bom_detector,
+    extractions=_bom_fixture_extractions(),
+    verifier=bom_spacing_verifier,
+    word_map=bom_word_map,
+)
+assert bom_spacing_passed is True, bom_spacing_issues
+
+# Repeated field values are not duplicate physical rows. A conservative
+# verifier report is locally adjudicated only because row candidate IDs and
+# visual orders are independently unique.
+bom_repeated_value_verifier = copy.deepcopy(bom_verifier)
+bom_repeated_value_verifier['duplicates_preserved'] = False
+bom_repeated_value_verifier['duplicate_physical_keys'] = ['K1', 'PN-1']
+bom_repeated_value_passed, _, bom_repeated_value_issues = _validate_bom_page(
+    page=bom_page,
+    proposals=bom_proposals,
+    detector=bom_detector,
+    extractions=_bom_fixture_extractions(),
+    verifier=bom_repeated_value_verifier,
+    word_map=bom_word_map,
+)
+assert bom_repeated_value_passed is True, bom_repeated_value_issues
+assert any(
+    issue.get('issue_type')
+    == 'bom-repeated-values-preserved-as-distinct-rows'
+    and issue.get('severity') == 'info'
+    for issue in bom_repeated_value_issues
+), bom_repeated_value_issues
+
+bom_unknown_duplicate_verifier = copy.deepcopy(bom_verifier)
+bom_unknown_duplicate_verifier['duplicate_physical_keys'] = [
+    'UNKNOWN-PHYSICAL-KEY'
+]
+bom_unknown_duplicate_passed, _, bom_unknown_duplicate_issues = (
+    _validate_bom_page(
+        page=bom_page,
+        proposals=bom_proposals,
+        detector=bom_detector,
+        extractions=_bom_fixture_extractions(),
+        verifier=bom_unknown_duplicate_verifier,
+        word_map=bom_word_map,
+    )
+)
+assert bom_unknown_duplicate_passed is False, bom_unknown_duplicate_issues
+assert any(
+    issue.get('issue_type') == 'bom-verifier-duplicate-physical-keys'
+    and issue.get('severity') == 'high'
+    for issue in bom_unknown_duplicate_issues
+), bom_unknown_duplicate_issues
 
 # An exact positive override restores a field without losing source evidence.
 bom_override_extractions = _bom_fixture_extractions()
