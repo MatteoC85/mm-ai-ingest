@@ -3062,6 +3062,22 @@ _graph_ref_verifier = {
     'verified_edge_ids': ['E-KEEP'],
     'rejected_entity_ids': ['IO-MISSING'],
     'rejected_edge_ids': ['E-REMOVE'],
+    'recovery_entities': [],
+    'recovery_edges': [],
+    'visual_evidence_adjudications': [{
+        'evidence_index': 0,
+        'evidence_text_original': (
+            'Reference is printed but absent from certified registry.'
+        ),
+        'status': 'accounted_existing_graph',
+        'related_entity_ids': ['IO-MISSING'],
+        'related_edge_ids': ['E-KEEP'],
+        'confidence': 0.98,
+        'reason': (
+            'The visible reference occurrence and its surviving conductor are '
+            'already represented; only the external registry match is absent.'
+        ),
+    }],
     'confidence': 0.96,
     'issues': [
         {
@@ -3183,6 +3199,159 @@ assert any(
     issue.get('issue_type') == 'graph-unresolved-visual-evidence'
     for issue in _graph_unaccounted_issues
 ), _graph_unaccounted_issues
+
+# Phase 2G V1.2: a verifier can recover a genuinely omitted graphic entity
+# with exact PDF-point drawing evidence. Detector region bboxes reported in a
+# rendered-image coordinate frame are reconciled from final entity geometry.
+_graph_recovery_extraction = copy.deepcopy(_graph_extraction)
+_graph_recovery_note = 'Visible protective-earth symbol and one-ended stub omitted.'
+_graph_recovery_extraction['unresolved_visual_evidence'] = [
+    _graph_recovery_note
+]
+_graph_recovery_detector = copy.deepcopy(_graph_detector)
+_graph_recovery_detector['regions'][0]['bbox_pt'] = [20, 200, 80, 300]
+_graph_recovery_verifier = copy.deepcopy(_graph_verifier)
+_graph_recovery_verifier.update({
+    'verdict': 'review_required',
+    'all_visible_entities_accounted_for': False,
+    'all_visible_connections_accounted_for': False,
+    'all_entity_text_visually_supported': False,
+    'all_connection_geometry_supported': False,
+    'recovery_entities': [{
+        'occurrence_id': 'VR-GROUND-1',
+        'region_id': 'R1',
+        'entity_type': 'potential',
+        'subtype': 'protective_earth_symbol',
+        'tag_original': '',
+        'label_original': '',
+        'description_original': '',
+        'function_text_original': '',
+        'symbol_code': 'protective_earth',
+        'location_code': '',
+        'reference_value_original': '',
+        'reference_context_original': '',
+        'bbox_pt': [10, 60, 20, 72],
+        'source_glyph_ids': [],
+        'source_word_ids': [],
+        'source_drawing_ids': [2],
+        'confidence': 0.98,
+        'evidence_notes': (
+            'Visible ground symbol; the short stub has no second endpoint.'
+        ),
+    }],
+    'recovery_edges': [],
+    'visual_evidence_adjudications': [{
+        'evidence_index': 0,
+        'evidence_text_original': _graph_recovery_note,
+        'status': 'recovered_entity',
+        'related_entity_ids': ['VR-GROUND-1'],
+        'related_edge_ids': [],
+        'confidence': 0.98,
+        'reason': (
+            'The graphic entity is recovered from exact drawing evidence; the '
+            'one-ended stub is not promoted to a two-endpoint connection.'
+        ),
+    }],
+    'issues': [
+        {
+            'issue_type': 'missing_visible_entity',
+            'severity': 'warning',
+            'message': 'Visible ground symbol was absent from raw candidates.',
+            'entity_ids': [],
+            'edge_ids': [],
+            'confidence': 0.98,
+        },
+        {
+            'issue_type': 'missing_visible_connections',
+            'severity': 'warning',
+            'message': 'One-ended ground stub was absent from raw candidates.',
+            'entity_ids': [],
+            'edge_ids': [],
+            'confidence': 0.96,
+        },
+    ],
+})
+_graph_recovery_drawings = _graph_drawings + [
+    {'drawing_id': 2, 'bbox_pt': [10, 60, 20, 72]}
+]
+_graph_recovery_passed, _graph_recovery_entities, _graph_recovery_edges, (
+    _graph_recovery_issues
+) = _graph_validate_candidate(
+    page=_graph_page,
+    detector=_graph_recovery_detector,
+    extraction=_graph_recovery_extraction,
+    verifier=_graph_recovery_verifier,
+    resolution=copy.deepcopy(_graph_resolution),
+    glyphs=_graph_glyphs,
+    words=_graph_words,
+    drawings=_graph_recovery_drawings,
+    links=[],
+)
+assert _graph_recovery_passed is True, _graph_recovery_issues
+assert len(_graph_recovery_entities) == len(_graph_entities) + 1
+assert len(_graph_recovery_edges) == len(_graph_edges)
+assert _graph_recovery_extraction['verifier_evidence_recovery'][
+    'recovered_entity_ids'
+] == ['VR-GROUND-1']
+assert _graph_recovery_extraction['region_bbox_adjudication'][
+    'adjudicated_region_count'
+] == 1
+assert not [
+    issue for issue in _graph_recovery_issues
+    if issue.get('severity') in {'high', 'critical'}
+], _graph_recovery_issues
+
+# Unknown drawing evidence must fail closed.
+_graph_bad_recovery_verifier = copy.deepcopy(_graph_recovery_verifier)
+_graph_bad_recovery_verifier['recovery_entities'][0][
+    'source_drawing_ids'
+] = [999]
+_graph_bad_recovery_passed, _, _, _graph_bad_recovery_issues = (
+    _graph_validate_candidate(
+        page=_graph_page,
+        detector=copy.deepcopy(_graph_recovery_detector),
+        extraction=copy.deepcopy(_graph_recovery_extraction),
+        verifier=_graph_bad_recovery_verifier,
+        resolution=copy.deepcopy(_graph_resolution),
+        glyphs=_graph_glyphs,
+        words=_graph_words,
+        drawings=_graph_recovery_drawings,
+        links=[],
+    )
+)
+assert _graph_bad_recovery_passed is False, _graph_bad_recovery_issues
+assert any(
+    issue.get('issue_type') == 'graph-recovery-entity-evidence-id-invalid'
+    for issue in _graph_bad_recovery_issues
+), _graph_bad_recovery_issues
+
+# A recovery ledger that still declares visible evidence unresolved must block.
+_graph_still_unresolved_verifier = copy.deepcopy(_graph_recovery_verifier)
+_graph_still_unresolved_verifier['recovery_entities'] = []
+_graph_still_unresolved_verifier['visual_evidence_adjudications'][0].update({
+    'status': 'still_unresolved',
+    'related_entity_ids': [],
+})
+_graph_still_unresolved_passed, _, _, _graph_still_unresolved_issues = (
+    _graph_validate_candidate(
+        page=_graph_page,
+        detector=copy.deepcopy(_graph_recovery_detector),
+        extraction=copy.deepcopy(_graph_recovery_extraction),
+        verifier=_graph_still_unresolved_verifier,
+        resolution=copy.deepcopy(_graph_resolution),
+        glyphs=_graph_glyphs,
+        words=_graph_words,
+        drawings=_graph_recovery_drawings,
+        links=[],
+    )
+)
+assert _graph_still_unresolved_passed is False, (
+    _graph_still_unresolved_issues
+)
+assert any(
+    issue.get('issue_type') == 'graph-visual-evidence-still-unresolved'
+    for issue in _graph_still_unresolved_issues
+), _graph_still_unresolved_issues
 
 required = {
     '/v1/ai/electrical/normalize',

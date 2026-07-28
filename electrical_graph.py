@@ -14,7 +14,7 @@ import requests
 
 from electrical_source_store import download_electrical_source_pdf
 
-# MachineMind Phase 2G V1.1
+# MachineMind Phase 2G V1.2
 # Page-atomic, multimodal electrical graph extraction.
 # The deterministic layer is geometry/evidence based and contains no page,
 # language, font, manufacturer, component-tag or drawing-template dictionary.
@@ -76,15 +76,15 @@ EXTRACTOR_PROMPT_VERSION = (
 ).strip()
 VERIFIER_PROMPT_VERSION = (
     os.environ.get("MM_ELECTRICAL_GRAPH_VERIFIER_PROMPT_VERSION")
-    or "mm-electrical-graph-page-verifier-v1"
+    or "mm-electrical-graph-page-verifier-v1.2"
 ).strip()
 MATERIALIZER_VERSION = (
     os.environ.get("MM_ELECTRICAL_GRAPH_MATERIALIZER_VERSION")
-    or "mm-electrical-graph-materializer-v1.1"
+    or "mm-electrical-graph-materializer-v1.2"
 ).strip()
 
 OPENAI_TIMEOUT_SECONDS = _env_int(
-    "MM_ELECTRICAL_GRAPH_TIMEOUT_SECONDS", 300, 30, 600
+    "MM_ELECTRICAL_GRAPH_TIMEOUT_SECONDS", 600, 30, 600
 )
 FETCH_TIMEOUT_SECONDS = _env_int(
     "MM_ELECTRICAL_GRAPH_FETCH_TIMEOUT_SECONDS", 60, 10, 300
@@ -123,7 +123,7 @@ MAX_DRAWINGS_IN_PROMPT = _env_int(
     "MM_ELECTRICAL_GRAPH_MAX_DRAWINGS_IN_PROMPT", 3000, 100, 10000
 )
 
-PIPELINE_MARKER = "phase2-graph-v1.1-post-verifier-source-snapshot"
+PIPELINE_MARKER = "phase2-graph-v1.2-evidence-recovery-source-snapshot"
 MATERIALIZATION_PHASE = "graph_vision_v1"
 EXTRACTION_METHOD = "openai_vision_graph_v1"
 PAGE_TYPE = "schematic"
@@ -201,6 +201,17 @@ PAGE_REFERENCE_RESOLUTION_VERSION = (
     "graph-page-reference-sheet-and-link-v1"
 )
 EDGE_GEOMETRY_POLICY_VERSION = "graph-line-or-area-edge-geometry-v1"
+REGION_BBOX_ADJUDICATION_VERSION = "graph-region-bbox-from-final-evidence-v1"
+VERIFIER_EVIDENCE_RECOVERY_VERSION = "graph-verifier-evidence-recovery-v1"
+VISUAL_EVIDENCE_ADJUDICATION_VERSION = "graph-visual-evidence-adjudication-v1"
+RECOVERABLE_ENTITY_TYPES = ENTITY_TYPES - REFERENCE_ENTITY_TYPES
+VISUAL_EVIDENCE_STATUSES = {
+    "accounted_existing_graph",
+    "accounted_non_materializable",
+    "recovered_entity",
+    "recovered_edge",
+    "still_unresolved",
+}
 
 
 def get_electrical_graph_runtime_config() -> dict:
@@ -1478,9 +1489,107 @@ def _extractor_schema() -> dict:
     }
 
 
+def _recovery_entity_schema() -> dict:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "occurrence_id": {"type": "string"},
+            "region_id": {"type": "string"},
+            "entity_type": {
+                "type": "string",
+                "enum": sorted(RECOVERABLE_ENTITY_TYPES),
+            },
+            "subtype": {"type": "string"},
+            "tag_original": {"type": "string"},
+            "label_original": {"type": "string"},
+            "description_original": {"type": "string"},
+            "function_text_original": {"type": "string"},
+            "symbol_code": {"type": "string"},
+            "location_code": {"type": "string"},
+            "reference_value_original": {"type": "string"},
+            "reference_context_original": {"type": "string"},
+            "bbox_pt": _bbox_schema(),
+            "source_glyph_ids": {
+                "type": "array",
+                "items": {"type": "integer"},
+                "maxItems": 1000,
+            },
+            "source_word_ids": {
+                "type": "array",
+                "items": {"type": "integer"},
+                "maxItems": 500,
+            },
+            "source_drawing_ids": {
+                "type": "array",
+                "items": {"type": "integer"},
+                "maxItems": 1000,
+            },
+            "confidence": {"type": "number"},
+            "evidence_notes": {"type": "string"},
+        },
+        "required": [
+            "occurrence_id",
+            "region_id",
+            "entity_type",
+            "subtype",
+            "tag_original",
+            "label_original",
+            "description_original",
+            "function_text_original",
+            "symbol_code",
+            "location_code",
+            "reference_value_original",
+            "reference_context_original",
+            "bbox_pt",
+            "source_glyph_ids",
+            "source_word_ids",
+            "source_drawing_ids",
+            "confidence",
+            "evidence_notes",
+        ],
+    }
+
+
+def _visual_evidence_adjudication_schema() -> dict:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "evidence_index": {"type": "integer", "minimum": 0},
+            "evidence_text_original": {"type": "string"},
+            "status": {
+                "type": "string",
+                "enum": sorted(VISUAL_EVIDENCE_STATUSES),
+            },
+            "related_entity_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 100,
+            },
+            "related_edge_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 100,
+            },
+            "confidence": {"type": "number"},
+            "reason": {"type": "string"},
+        },
+        "required": [
+            "evidence_index",
+            "evidence_text_original",
+            "status",
+            "related_entity_ids",
+            "related_edge_ids",
+            "confidence",
+            "reason",
+        ],
+    }
+
+
 def _verifier_schema() -> dict:
     return {
-        "name": "electrical_graph_page_verifier_v1",
+        "name": "electrical_graph_page_verifier_v1_2",
         "strict": True,
         "schema": {
             "type": "object",
@@ -1519,11 +1628,26 @@ def _verifier_schema() -> dict:
                     "items": {"type": "string"},
                     "maxItems": 1000,
                 },
+                "recovery_entities": {
+                    "type": "array",
+                    "items": _recovery_entity_schema(),
+                    "maxItems": 300,
+                },
+                "recovery_edges": {
+                    "type": "array",
+                    "items": _edge_schema(),
+                    "maxItems": 800,
+                },
+                "visual_evidence_adjudications": {
+                    "type": "array",
+                    "items": _visual_evidence_adjudication_schema(),
+                    "maxItems": 300,
+                },
                 "confidence": {"type": "number"},
                 "issues": {
                     "type": "array",
                     "items": _issue_schema(),
-                    "maxItems": 100,
+                    "maxItems": 150,
                 },
             },
             "required": [
@@ -1539,6 +1663,9 @@ def _verifier_schema() -> dict:
                 "verified_edge_ids",
                 "rejected_entity_ids",
                 "rejected_edge_ids",
+                "recovery_entities",
+                "recovery_edges",
+                "visual_evidence_adjudications",
                 "confidence",
                 "issues",
             ],
@@ -1736,43 +1863,94 @@ def _verifier_messages(
     detector: dict,
     extraction: dict,
     resolution: dict,
-    drawing_count: int,
-    link_count: int,
+    words: list[dict],
+    glyphs: list[dict],
+    drawings: list[dict],
+    links: list[dict],
     image_original: bytes,
     image_rotated: bytes,
 ) -> list[dict]:
     system = (
-        "You are the independent visual verifier of an industrial electrical "
-        "page graph. Re-read the full page without trusting the extractor. "
-        "Verify exact physical occurrence identity, printed tags, symbol roles, "
-        "connection topology, wire/potential labels and off-page references. "
-        "Repeated component tags must remain separate occurrences. A visible "
-        "wire crossing is not a junction unless the drawing visibly supports a "
-        "junction. Every geometry-dependent connection must be supported by a "
-        "drawing or PDF-link evidence ID. Certified BOM, I/O, terminal and page "
-        "matches must be exact and grounded in both the visible page and the "
-        "provided certified registry resolution. Return pass only when the full "
-        "post-resolution graph is safe to publish atomically."
+        "You are the independent visual verifier and evidence-recovery stage "
+        "of an industrial electrical page graph. Re-read the full page without "
+        "trusting the extractor. Verify exact physical occurrence identity, "
+        "printed tags, symbol roles, connection topology, wire/potential labels "
+        "and off-page references. Repeated component tags must remain separate "
+        "occurrences. A visible wire crossing is not a junction unless the "
+        "drawing visibly supports a junction. Every geometry-dependent connection "
+        "must cite local drawing evidence IDs. Certified BOM, I/O, terminal and "
+        "page matches must be exact and grounded in both the visible page and the "
+        "provided certified registry resolution. "
+        "If the extractor omitted a real visible symbol or local conductor, return "
+        "it only in recovery_entities or recovery_edges. Recovery IDs must be new "
+        "and unique. Recovery entities may not be external reference entities; "
+        "unmatched printed references must remain explicit unresolved references. "
+        "A graphic-only recovery entity must cite exact source_drawing_ids. A text "
+        "entity must cite exact source glyph or word IDs. A recovery edge must have "
+        "two visible endpoints and exact local source_drawing_ids; never turn a "
+        "one-ended graphical stub into an electrical connection. A short stub that "
+        "belongs visually to a recovered symbol may be accounted for by that "
+        "entity's bbox and drawing evidence. "
+        "All recovery bbox_pt values MUST be in the original PDF point coordinate "
+        "space shown by page_width_pt/page_height_pt, never rendered-image pixels "
+        "and never rotated-image coordinates. Use the supplied glyph/drawing bbox "
+        "registries to choose exact PDF-point evidence. "
+        "Return exactly one visual_evidence_adjudication for every numbered "
+        "extractor unresolved_visual_evidence item. Use still_unresolved whenever "
+        "the page does not support one safe disposition. Return pass only when the "
+        "post-pruning, post-recovery graph is safe to publish atomically."
     )
+    compact_glyphs = [
+        {
+            "glyph_id": item["glyph_id"],
+            "text_original": item["text_original"],
+            "bbox_pt": item["bbox_pt"],
+            "origin_pt": item["origin_pt"],
+            "direction": item["direction"],
+        }
+        for item in glyphs[:MAX_GLYPHS_IN_PROMPT]
+    ]
+    unresolved_items = [
+        {
+            "evidence_index": index,
+            "evidence_text_original": _clean_text(value, 4000),
+        }
+        for index, value in enumerate(
+            extraction.get("unresolved_visual_evidence") or []
+        )
+    ]
     request = {
         "page_id": page["id"],
         "pdf_page_number": page["pdf_page_number"],
         "sheet_code_original": page.get("sheet_code"),
         "sheet_title_original": page.get("sheet_title"),
+        "page_width_pt": page.get("page_width_pt"),
+        "page_height_pt": page.get("page_height_pt"),
         "detector": detector,
         "candidate_graph": extraction,
         "deterministic_reference_resolution": resolution,
-        "available_drawing_count": drawing_count,
-        "available_link_count": link_count,
+        "numbered_unresolved_visual_evidence": unresolved_items,
+        "vector_words": words,
+        "source_glyphs": compact_glyphs,
+        "glyph_registry_complete": len(glyphs) <= MAX_GLYPHS_IN_PROMPT,
+        "drawing_registry": drawings[:MAX_DRAWINGS_IN_PROMPT],
+        "drawing_registry_complete": len(drawings) <= MAX_DRAWINGS_IN_PROMPT,
+        "pdf_link_registry": links,
         "page_pass_min_confidence": PAGE_PASS_MIN_CONFIDENCE,
+        "recovery_version": VERIFIER_EVIDENCE_RECOVERY_VERSION,
+        "visual_evidence_adjudication_version": (
+            VISUAL_EVIDENCE_ADJUDICATION_VERSION
+        ),
     }
     content = [
         {
             "type": "text",
             "text": (
-                "Audit every entity and edge ID. Echo exactly the IDs that are "
-                "visually and deterministically supported. Reject rather than "
-                "repair ambiguous topology.\n\n"
+                "Audit every raw entity and edge ID, prune false candidates, "
+                "recover only directly visible omitted evidence, and adjudicate "
+                "every numbered unresolved evidence item exactly once. Echo raw "
+                "IDs only in verified/rejected lists; put new IDs only in recovery "
+                "arrays. Judge the resulting post-recovery graph.\n\n"
                 + json.dumps(request, ensure_ascii=False)
             ),
         },
@@ -2585,11 +2763,765 @@ def _post_verifier_candidate_adjudication(
     return final_entities, final_edges, audit, issues
 
 
+def _augment_resolution_for_recovered_entities(
+    resolution: dict,
+    recovered_entities: list[dict],
+) -> None:
+    existing = {
+        str(item.get("occurrence_id") or "")
+        for item in (resolution.get("entity_resolutions") or [])
+    }
+    added = 0
+    for entity in recovered_entities:
+        occurrence_id = _clean_text(entity.get("occurrence_id"), 160)
+        if not occurrence_id or occurrence_id in existing:
+            continue
+        resolution.setdefault("entity_resolutions", []).append({
+            "occurrence_id": occurrence_id,
+            "entity_type": _clean_text(entity.get("entity_type"), 120),
+            "tag_original": _clean_text(entity.get("tag_original"), 500),
+            "reference_value_original": _clean_text(
+                entity.get("reference_value_original"), 500
+            ),
+            "bom_matches": [],
+            "io_matches": [],
+            "terminal_matches": [],
+            "page_matches": [],
+            "candidate_count": 0,
+            "resolved": True,
+            "explicitly_unresolved": False,
+            "accounted": True,
+            "resolution_status": "not_applicable",
+            "resolution_source": "verifier_evidence_recovery",
+            "reason": "Recovered local visual entity; no external registry resolution applies",
+        })
+        existing.add(occurrence_id)
+        added += 1
+    if added:
+        counts = resolution.setdefault("resolution_status_counts", {})
+        counts["not_applicable"] = int(counts.get("not_applicable") or 0) + added
+
+
+def _apply_verifier_evidence_recovery(
+    *,
+    page: dict,
+    detector: dict,
+    extraction: dict,
+    verifier: dict,
+    resolution: dict,
+    base_entities: list[dict],
+    base_edges: list[dict],
+    glyphs: list[dict],
+    words: list[dict],
+    drawings: list[dict],
+    links: list[dict],
+) -> tuple[list[dict], list[dict], dict, list[dict]]:
+    """Validate and merge verifier-proposed omitted visual evidence.
+
+    Recovery is intentionally narrower than extraction. It may add only local,
+    directly visible entities or edges with exact PDF-point geometry and source
+    evidence. It can never add external reference entities or registry mappings.
+    Every extractor unresolved-evidence note must be adjudicated exactly once.
+    """
+    issues: list[dict] = []
+    region_ids = {
+        _clean_text(item.get("region_id"), 160)
+        for item in (detector.get("regions") or [])
+        if isinstance(item, dict) and _clean_text(item.get("region_id"), 160)
+    }
+    valid_glyph_ids = {int(item["glyph_id"]) for item in glyphs}
+    valid_word_ids = {int(item["word_id"]) for item in words}
+    valid_drawing_ids = {int(item["drawing_id"]) for item in drawings}
+    valid_link_ids = {int(item["id"]) for item in links}
+
+    entities = [dict(item) for item in base_entities]
+    edges = [dict(item) for item in base_edges]
+    existing_entity_ids = {
+        _clean_text(item.get("occurrence_id"), 160) for item in entities
+    }
+    existing_edge_ids = {
+        _clean_text(item.get("edge_id"), 160) for item in edges
+    }
+    recovered_entities: list[dict] = []
+    recovered_edges: list[dict] = []
+    claimed_recovery_drawing_ids: dict[int, str] = {}
+
+    for raw in verifier.get("recovery_entities") or []:
+        if not isinstance(raw, dict):
+            issues.append(_local_issue(
+                issue_type="graph-recovery-entity-invalid",
+                message="Verifier returned a non-object recovery entity",
+            ))
+            continue
+        entity = dict(raw)
+        occurrence_id = _clean_text(entity.get("occurrence_id"), 160)
+        entity_type = _clean_text(entity.get("entity_type"), 120)
+        region_id = _clean_text(entity.get("region_id"), 160)
+        confidence = _clamp_conf(entity.get("confidence"))
+        entity_problem = False
+        if not occurrence_id or occurrence_id in existing_entity_ids:
+            issues.append(_local_issue(
+                issue_type="graph-recovery-entity-id-invalid",
+                message="Recovery entity ID is missing or collides with an existing entity",
+                entity_ids=[occurrence_id] if occurrence_id else [],
+                confidence=confidence,
+            ))
+            entity_problem = True
+        if entity_type not in RECOVERABLE_ENTITY_TYPES:
+            issues.append(_local_issue(
+                issue_type="graph-recovery-entity-type-invalid",
+                message="Recovery entity type is not permitted for local evidence recovery",
+                entity_ids=[occurrence_id] if occurrence_id else [],
+                confidence=confidence,
+            ))
+            entity_problem = True
+        if region_id not in region_ids:
+            issues.append(_local_issue(
+                issue_type="graph-recovery-entity-region-invalid",
+                message="Recovery entity references an unknown detector region",
+                entity_ids=[occurrence_id] if occurrence_id else [],
+                confidence=confidence,
+            ))
+            entity_problem = True
+        if not _bbox_valid(entity.get("bbox_pt"), page):
+            issues.append(_local_issue(
+                issue_type="graph-recovery-entity-bbox-invalid",
+                message="Recovery entity bbox is not valid original-PDF point geometry",
+                entity_ids=[occurrence_id] if occurrence_id else [],
+                confidence=confidence,
+            ))
+            entity_problem = True
+        if confidence + 1e-9 < PAGE_PASS_MIN_CONFIDENCE:
+            issues.append(_local_issue(
+                issue_type="graph-recovery-entity-confidence-below-threshold",
+                message="Recovery entity confidence is below the page threshold",
+                entity_ids=[occurrence_id] if occurrence_id else [],
+                confidence=confidence,
+            ))
+            entity_problem = True
+
+        glyph_ids = {
+            int(value)
+            for value in (entity.get("source_glyph_ids") or [])
+            if isinstance(value, int) or str(value).isdigit()
+        }
+        word_ids = {
+            int(value)
+            for value in (entity.get("source_word_ids") or [])
+            if isinstance(value, int) or str(value).isdigit()
+        }
+        drawing_ids = {
+            int(value)
+            for value in (entity.get("source_drawing_ids") or [])
+            if isinstance(value, int) or str(value).isdigit()
+        }
+        if (
+            glyph_ids - valid_glyph_ids
+            or word_ids - valid_word_ids
+            or drawing_ids - valid_drawing_ids
+        ):
+            issues.append(_local_issue(
+                issue_type="graph-recovery-entity-evidence-id-invalid",
+                message="Recovery entity cites evidence IDs absent from the source registries",
+                entity_ids=[occurrence_id] if occurrence_id else [],
+                confidence=confidence,
+            ))
+            entity_problem = True
+        substantive_text = any(
+            _clean_text(entity.get(field), 1000)
+            for field in (
+                "tag_original",
+                "label_original",
+                "description_original",
+                "function_text_original",
+                "reference_value_original",
+            )
+        )
+        if substantive_text and not (glyph_ids or word_ids):
+            issues.append(_local_issue(
+                issue_type="graph-recovery-entity-text-evidence-missing",
+                message="Recovery entity has visible text without glyph or word evidence",
+                entity_ids=[occurrence_id] if occurrence_id else [],
+                confidence=confidence,
+            ))
+            entity_problem = True
+        if not substantive_text and not drawing_ids:
+            issues.append(_local_issue(
+                issue_type="graph-recovery-graphic-evidence-missing",
+                message="Graphic-only recovery entity has no exact source drawing evidence",
+                entity_ids=[occurrence_id] if occurrence_id else [],
+                confidence=confidence,
+            ))
+            entity_problem = True
+        if entity_type in COMPONENT_ENTITY_TYPES and not _clean_text(
+            entity.get("tag_original"), 500
+        ):
+            issues.append(_local_issue(
+                issue_type="graph-recovery-component-tag-missing",
+                message="Recovered component-like entity has no visible component tag",
+                entity_ids=[occurrence_id] if occurrence_id else [],
+                confidence=confidence,
+            ))
+            entity_problem = True
+        for drawing_id in drawing_ids:
+            owner = claimed_recovery_drawing_ids.get(drawing_id)
+            if owner and owner != occurrence_id:
+                issues.append(_local_issue(
+                    issue_type="graph-recovery-drawing-evidence-ambiguous",
+                    message="One drawing ID was claimed by multiple recovered entities",
+                    entity_ids=sorted({owner, occurrence_id}),
+                    confidence=confidence,
+                ))
+                entity_problem = True
+            else:
+                claimed_recovery_drawing_ids[drawing_id] = occurrence_id
+        if entity_problem:
+            continue
+        entity["source_glyph_ids"] = sorted(glyph_ids)
+        entity["source_word_ids"] = sorted(word_ids)
+        entity["source_drawing_ids"] = sorted(drawing_ids)
+        entity["recovery_evidence"] = {
+            "version": VERIFIER_EVIDENCE_RECOVERY_VERSION,
+            "source": "independent_verifier",
+            "validated": True,
+        }
+        recovered_entities.append(entity)
+        existing_entity_ids.add(occurrence_id)
+
+    merged_entity_ids = existing_entity_ids
+    for raw in verifier.get("recovery_edges") or []:
+        if not isinstance(raw, dict):
+            issues.append(_local_issue(
+                issue_type="graph-recovery-edge-invalid",
+                message="Verifier returned a non-object recovery edge",
+            ))
+            continue
+        edge = dict(raw)
+        edge_id = _clean_text(edge.get("edge_id"), 160)
+        source_id = _clean_text(edge.get("source_occurrence_id"), 160)
+        target_id = _clean_text(edge.get("target_occurrence_id"), 160)
+        relation_type = _clean_text(edge.get("relation_type"), 120)
+        confidence = _clamp_conf(edge.get("confidence"))
+        edge_problem = False
+        if not edge_id or edge_id in existing_edge_ids:
+            issues.append(_local_issue(
+                issue_type="graph-recovery-edge-id-invalid",
+                message="Recovery edge ID is missing or collides with an existing edge",
+                edge_ids=[edge_id] if edge_id else [],
+                confidence=confidence,
+            ))
+            edge_problem = True
+        if relation_type not in RELATION_TYPES:
+            issues.append(_local_issue(
+                issue_type="graph-recovery-edge-relation-invalid",
+                message="Recovery edge relation type is invalid",
+                edge_ids=[edge_id] if edge_id else [],
+                confidence=confidence,
+            ))
+            edge_problem = True
+        if source_id not in merged_entity_ids or target_id not in merged_entity_ids:
+            issues.append(_local_issue(
+                issue_type="graph-recovery-edge-endpoint-missing",
+                message="Recovery edge does not have two existing visible endpoints",
+                edge_ids=[edge_id] if edge_id else [],
+                confidence=confidence,
+            ))
+            edge_problem = True
+        if source_id and source_id == target_id:
+            issues.append(_local_issue(
+                issue_type="graph-recovery-edge-self-reference",
+                message="Recovery edge connects an entity to itself",
+                edge_ids=[edge_id] if edge_id else [],
+                confidence=confidence,
+            ))
+            edge_problem = True
+        if not _edge_bbox_valid(edge.get("bbox_pt"), page):
+            issues.append(_local_issue(
+                issue_type="graph-recovery-edge-bbox-invalid",
+                message="Recovery edge bbox is not valid original-PDF point geometry",
+                edge_ids=[edge_id] if edge_id else [],
+                confidence=confidence,
+            ))
+            edge_problem = True
+        if confidence + 1e-9 < PAGE_PASS_MIN_CONFIDENCE:
+            issues.append(_local_issue(
+                issue_type="graph-recovery-edge-confidence-below-threshold",
+                message="Recovery edge confidence is below the page threshold",
+                edge_ids=[edge_id] if edge_id else [],
+                confidence=confidence,
+            ))
+            edge_problem = True
+        drawing_ids = {
+            int(value)
+            for value in (edge.get("source_drawing_ids") or [])
+            if isinstance(value, int) or str(value).isdigit()
+        }
+        glyph_ids = {
+            int(value)
+            for value in (edge.get("source_glyph_ids") or [])
+            if isinstance(value, int) or str(value).isdigit()
+        }
+        link_ids = {
+            int(value)
+            for value in (edge.get("source_link_ids") or [])
+            if isinstance(value, int) or str(value).isdigit()
+        }
+        if (
+            drawing_ids - valid_drawing_ids
+            or glyph_ids - valid_glyph_ids
+            or link_ids - valid_link_ids
+        ):
+            issues.append(_local_issue(
+                issue_type="graph-recovery-edge-evidence-id-invalid",
+                message="Recovery edge cites evidence IDs absent from the source registries",
+                edge_ids=[edge_id] if edge_id else [],
+                confidence=confidence,
+            ))
+            edge_problem = True
+        if relation_type in GEOMETRY_REQUIRED_RELATIONS and not drawing_ids:
+            issues.append(_local_issue(
+                issue_type="graph-recovery-edge-geometry-evidence-missing",
+                message="Recovery edge has no exact local drawing evidence",
+                edge_ids=[edge_id] if edge_id else [],
+                confidence=confidence,
+            ))
+            edge_problem = True
+        if edge_problem:
+            continue
+        edge["source_drawing_ids"] = sorted(drawing_ids)
+        edge["source_glyph_ids"] = sorted(glyph_ids)
+        edge["source_link_ids"] = sorted(link_ids)
+        edge["recovery_evidence"] = {
+            "version": VERIFIER_EVIDENCE_RECOVERY_VERSION,
+            "source": "independent_verifier",
+            "validated": True,
+        }
+        recovered_edges.append(edge)
+        existing_edge_ids.add(edge_id)
+
+    recovered_entity_ids = {
+        _clean_text(item.get("occurrence_id"), 160)
+        for item in recovered_entities
+    }
+    recovered_edge_ids = {
+        _clean_text(item.get("edge_id"), 160) for item in recovered_edges
+    }
+    unresolved_items = [
+        _clean_text(value, 4000)
+        for value in (extraction.get("unresolved_visual_evidence") or [])
+    ]
+    adjudication_rows = [
+        item for item in (verifier.get("visual_evidence_adjudications") or [])
+        if isinstance(item, dict)
+    ]
+    seen_indexes: set[int] = set()
+    referenced_recovery_entities: set[str] = set()
+    referenced_recovery_edges: set[str] = set()
+    normalized_adjudications: list[dict] = []
+    for item in adjudication_rows:
+        try:
+            index = int(item.get("evidence_index"))
+        except Exception:
+            index = -1
+        text = _clean_text(item.get("evidence_text_original"), 4000)
+        status = _clean_text(item.get("status"), 120)
+        confidence = _clamp_conf(item.get("confidence"))
+        entity_ids = {
+            _clean_text(value, 160)
+            for value in (item.get("related_entity_ids") or [])
+            if _clean_text(value, 160)
+        }
+        edge_ids = {
+            _clean_text(value, 160)
+            for value in (item.get("related_edge_ids") or [])
+            if _clean_text(value, 160)
+        }
+        row_problem = False
+        if index < 0 or index >= len(unresolved_items) or index in seen_indexes:
+            issues.append(_local_issue(
+                issue_type="graph-visual-evidence-adjudication-index-invalid",
+                message="Visual evidence adjudication index is missing, duplicate or out of range",
+                confidence=confidence,
+            ))
+            row_problem = True
+        else:
+            seen_indexes.add(index)
+            if text != unresolved_items[index]:
+                issues.append(_local_issue(
+                    issue_type="graph-visual-evidence-adjudication-text-canonicalized",
+                    message=(
+                        "The evidence index was valid; the audit text was "
+                        "canonicalized from the extractor ledger"
+                    ),
+                    confidence=confidence,
+                    severity="info",
+                    source_stage="verifier_evidence_recovery",
+                ))
+                text = unresolved_items[index]
+        if status not in VISUAL_EVIDENCE_STATUSES:
+            issues.append(_local_issue(
+                issue_type="graph-visual-evidence-adjudication-status-invalid",
+                message="Visual evidence adjudication returned an invalid status",
+                confidence=confidence,
+            ))
+            row_problem = True
+        if confidence + 1e-9 < PAGE_PASS_MIN_CONFIDENCE:
+            issues.append(_local_issue(
+                issue_type="graph-visual-evidence-adjudication-confidence-low",
+                message="Visual evidence adjudication confidence is below threshold",
+                confidence=confidence,
+            ))
+            row_problem = True
+        if status == "accounted_existing_graph":
+            if not (entity_ids or edge_ids):
+                issues.append(_local_issue(
+                    issue_type="graph-visual-evidence-existing-link-missing",
+                    message="Existing-graph adjudication must identify at least one supporting entity or edge",
+                    confidence=confidence,
+                ))
+                row_problem = True
+            if not entity_ids.issubset(merged_entity_ids):
+                issues.append(_local_issue(
+                    issue_type="graph-visual-evidence-existing-entity-link-invalid",
+                    message="Evidence adjudication cites an entity absent from the final graph",
+                    entity_ids=sorted(entity_ids),
+                    confidence=confidence,
+                ))
+                row_problem = True
+            if not edge_ids.issubset(existing_edge_ids):
+                issues.append(_local_issue(
+                    issue_type="graph-visual-evidence-existing-edge-link-invalid",
+                    message="Evidence adjudication cites an edge absent from the final graph",
+                    edge_ids=sorted(edge_ids),
+                    confidence=confidence,
+                ))
+                row_problem = True
+            referenced_recovery_entities.update(entity_ids & recovered_entity_ids)
+            referenced_recovery_edges.update(edge_ids & recovered_edge_ids)
+        elif status == "recovered_entity":
+            if not entity_ids or not entity_ids.issubset(recovered_entity_ids):
+                issues.append(_local_issue(
+                    issue_type="graph-visual-evidence-recovery-entity-link-invalid",
+                    message="Evidence adjudication does not point to valid recovered entities",
+                    entity_ids=sorted(entity_ids),
+                    confidence=confidence,
+                ))
+                row_problem = True
+            referenced_recovery_entities.update(entity_ids)
+        elif status == "recovered_edge":
+            if not edge_ids or not edge_ids.issubset(recovered_edge_ids):
+                issues.append(_local_issue(
+                    issue_type="graph-visual-evidence-recovery-edge-link-invalid",
+                    message="Evidence adjudication does not point to valid recovered edges",
+                    edge_ids=sorted(edge_ids),
+                    confidence=confidence,
+                ))
+                row_problem = True
+            referenced_recovery_edges.update(edge_ids)
+        elif status == "accounted_non_materializable":
+            if entity_ids or edge_ids:
+                issues.append(_local_issue(
+                    issue_type="graph-visual-evidence-nonmaterializable-link-invalid",
+                    message="Non-materializable evidence must not fabricate entity or edge links",
+                    entity_ids=sorted(entity_ids),
+                    edge_ids=sorted(edge_ids),
+                    confidence=confidence,
+                ))
+                row_problem = True
+        elif status == "still_unresolved":
+            issues.append(_local_issue(
+                issue_type="graph-visual-evidence-still-unresolved",
+                message="A visible evidence item remains unresolved after independent recovery",
+                entity_ids=sorted(entity_ids),
+                edge_ids=sorted(edge_ids),
+                confidence=confidence,
+            ))
+            row_problem = True
+        normalized_adjudications.append({
+            "evidence_index": index,
+            "evidence_text_original": text,
+            "status": status,
+            "related_entity_ids": sorted(entity_ids),
+            "related_edge_ids": sorted(edge_ids),
+            "confidence": confidence,
+            "reason": _clean_text(item.get("reason"), 1600),
+            "validated": not row_problem,
+        })
+
+    expected_indexes = set(range(len(unresolved_items)))
+    if seen_indexes != expected_indexes:
+        issues.append(_local_issue(
+            issue_type="graph-visual-evidence-adjudication-accounting-mismatch",
+            message="Verifier did not adjudicate every extractor unresolved-evidence item exactly once",
+            confidence=verifier.get("confidence") or 0.0,
+        ))
+    unlinked_entities = recovered_entity_ids - referenced_recovery_entities
+    unlinked_edges = recovered_edge_ids - referenced_recovery_edges
+    if unlinked_entities:
+        issues.append(_local_issue(
+            issue_type="graph-recovery-entities-not-linked-to-gap",
+            message="Recovered entities are not linked to any numbered visual evidence gap",
+            entity_ids=sorted(unlinked_entities),
+            confidence=verifier.get("confidence") or 0.0,
+        ))
+    if unlinked_edges:
+        issues.append(_local_issue(
+            issue_type="graph-recovery-edges-not-linked-to-gap",
+            message="Recovered edges are not linked to any numbered visual evidence gap",
+            edge_ids=sorted(unlinked_edges),
+            confidence=verifier.get("confidence") or 0.0,
+        ))
+
+    entities.extend(recovered_entities)
+    edges.extend(recovered_edges)
+    _augment_resolution_for_recovered_entities(resolution, recovered_entities)
+    blocking = [
+        issue for issue in issues
+        if issue.get("severity") in {"high", "critical"}
+    ]
+    audit = {
+        "version": VERIFIER_EVIDENCE_RECOVERY_VERSION,
+        "raw_unresolved_visual_evidence_count": len(unresolved_items),
+        "recovered_entity_ids": sorted(recovered_entity_ids),
+        "recovered_edge_ids": sorted(recovered_edge_ids),
+        "recovered_entity_count": len(recovered_entities),
+        "recovered_edge_count": len(recovered_edges),
+        "visual_evidence_adjudications": normalized_adjudications,
+        "all_visual_evidence_adjudicated": seen_indexes == expected_indexes,
+        "all_recovery_candidates_linked": not (
+            unlinked_entities or unlinked_edges
+        ),
+        "validated": not blocking,
+    }
+    if recovered_entities or recovered_edges:
+        issues.append(_local_issue(
+            issue_type="graph-verifier-evidence-recovery-applied",
+            message="Independent verifier recovery candidates were validated and merged",
+            entity_ids=sorted(recovered_entity_ids),
+            edge_ids=sorted(recovered_edge_ids),
+            confidence=verifier.get("confidence") or 0.0,
+            severity="info",
+            source_stage="verifier_evidence_recovery",
+        ))
+    if unresolved_items and audit["validated"]:
+        issues.append(_local_issue(
+            issue_type="graph-extractor-evidence-fully-adjudicated",
+            message="Every extractor unresolved-evidence note was independently and deterministically adjudicated",
+            confidence=verifier.get("confidence") or 0.0,
+            severity="info",
+            source_stage="verifier_evidence_recovery",
+        ))
+    return entities, edges, audit, issues
+
+
+def _adjudicate_detector_region_bboxes(
+    *,
+    page: dict,
+    detector: dict,
+    entities: list[dict],
+    edges: list[dict],
+) -> tuple[dict, list[dict]]:
+    """Reconcile detector coordinate frames against final PDF-point evidence.
+
+    Detector models can occasionally report rendered-image pixel coordinates
+    even though the schema requests PDF points. A region is accepted as-is only
+    when its bbox is in page bounds and covers the majority of final entity
+    centers assigned to that region. Otherwise a conservative bbox is derived
+    from the union of final entity geometry (or incident edge geometry when the
+    region contains no entity). No semantic classification depends on this box.
+    """
+    issues: list[dict] = []
+    audits: list[dict] = []
+    entity_by_id = {
+        _clean_text(item.get("occurrence_id"), 160): item
+        for item in entities
+        if _clean_text(item.get("occurrence_id"), 160)
+    }
+    page_width = float(page.get("page_width_pt") or 0.0)
+    page_height = float(page.get("page_height_pt") or 0.0)
+
+    def rect_for_edge(edge: dict) -> Optional[fitz.Rect]:
+        if not _edge_bbox_valid(edge.get("bbox_pt"), page):
+            return None
+        x0, y0, x1, y1 = [float(x) for x in edge.get("bbox_pt")]
+        pad = 1.5
+        if x0 == x1:
+            x0 -= pad
+            x1 += pad
+        if y0 == y1:
+            y0 -= pad
+            y1 += pad
+        return fitz.Rect(x0, y0, x1, y1)
+
+    for region in detector.get("regions") or []:
+        if not isinstance(region, dict):
+            continue
+        region_id = _clean_text(region.get("region_id"), 160)
+        original = list(region.get("bbox_pt") or [])
+        entity_rects: list[fitz.Rect] = []
+        entity_centers: list[tuple[float, float]] = []
+        region_entity_ids: list[str] = []
+        for entity in entities:
+            if _clean_text(entity.get("region_id"), 160) != region_id:
+                continue
+            if not _bbox_valid(entity.get("bbox_pt"), page):
+                continue
+            rect = _rect_from(entity.get("bbox_pt"))
+            entity_rects.append(rect)
+            entity_centers.append(
+                ((rect.x0 + rect.x1) / 2.0, (rect.y0 + rect.y1) / 2.0)
+            )
+            region_entity_ids.append(
+                _clean_text(entity.get("occurrence_id"), 160)
+            )
+        edge_rects: list[fitz.Rect] = []
+        region_edge_ids: list[str] = []
+        for edge in edges:
+            source = entity_by_id.get(
+                _clean_text(edge.get("source_occurrence_id"), 160)
+            ) or {}
+            target = entity_by_id.get(
+                _clean_text(edge.get("target_occurrence_id"), 160)
+            ) or {}
+            if region_id not in {
+                _clean_text(source.get("region_id"), 160),
+                _clean_text(target.get("region_id"), 160),
+            }:
+                continue
+            edge_rect = rect_for_edge(edge)
+            if edge_rect is not None:
+                edge_rects.append(edge_rect)
+                region_edge_ids.append(_clean_text(edge.get("edge_id"), 160))
+
+        original_valid = _bbox_valid(original, page)
+        coverage_ratio = 1.0
+        if original_valid and entity_centers:
+            raw_rect = _rect_from(original)
+            covered = sum(
+                1 for x, y in entity_centers
+                if raw_rect.x0 <= x <= raw_rect.x1
+                and raw_rect.y0 <= y <= raw_rect.y1
+            )
+            coverage_ratio = covered / max(1, len(entity_centers))
+        needs_recovery = bool(
+            not original_valid
+            or (entity_centers and coverage_ratio < 0.60)
+        )
+        if not needs_recovery:
+            audits.append({
+                "region_id": region_id,
+                "original_bbox_pt": original,
+                "final_bbox_pt": original,
+                "reason": "original_pdf_point_bbox_valid",
+                "entity_center_coverage_ratio": round(coverage_ratio, 4),
+                "source_entity_ids": region_entity_ids,
+                "source_edge_ids": region_edge_ids,
+                "validated": True,
+            })
+            continue
+
+        source_rects = entity_rects or edge_rects
+        if not source_rects:
+            issues.append(_local_issue(
+                issue_type="graph-region-bbox-unrecoverable",
+                message=(
+                    "Detector region bbox is invalid or inconsistent and no "
+                    "final PDF-point entity/edge evidence can recover it"
+                ),
+                confidence=region.get("confidence") or 0.0,
+            ))
+            audits.append({
+                "region_id": region_id,
+                "original_bbox_pt": original,
+                "final_bbox_pt": [],
+                "reason": "no_final_geometry_evidence",
+                "entity_center_coverage_ratio": round(coverage_ratio, 4),
+                "source_entity_ids": region_entity_ids,
+                "source_edge_ids": region_edge_ids,
+                "validated": False,
+            })
+            continue
+        union = fitz.Rect(source_rects[0])
+        for rect in source_rects[1:]:
+            union.include_rect(rect)
+        margin = 6.0
+        union = fitz.Rect(
+            max(0.0, union.x0 - margin),
+            max(0.0, union.y0 - margin),
+            min(page_width, union.x1 + margin) if page_width > 0 else union.x1 + margin,
+            min(page_height, union.y1 + margin) if page_height > 0 else union.y1 + margin,
+        )
+        final_bbox = _rect_list(union)
+        if not _bbox_valid(final_bbox, page):
+            issues.append(_local_issue(
+                issue_type="graph-region-bbox-recovery-invalid",
+                message="Derived detector region bbox is not valid PDF-point geometry",
+                confidence=region.get("confidence") or 0.0,
+            ))
+            validated = False
+        else:
+            region["bbox_pt"] = final_bbox
+            region["bbox_adjudication"] = {
+                "version": REGION_BBOX_ADJUDICATION_VERSION,
+                "original_bbox_pt": original,
+                "final_bbox_pt": final_bbox,
+                "original_bbox_valid": original_valid,
+                "original_entity_center_coverage_ratio": round(
+                    coverage_ratio, 4
+                ),
+                "source_entity_ids": region_entity_ids,
+                "source_edge_ids": region_edge_ids,
+                "validated": True,
+            }
+            issues.append(_local_issue(
+                issue_type="graph-region-bbox-adjudicated",
+                message=(
+                    "Detector region coordinates were reconciled to the final "
+                    "original-PDF point evidence frame"
+                ),
+                entity_ids=region_entity_ids,
+                edge_ids=region_edge_ids,
+                confidence=region.get("confidence") or 0.0,
+                severity="info",
+                source_stage="region_bbox_adjudicator",
+            ))
+            validated = True
+        audits.append({
+            "region_id": region_id,
+            "original_bbox_pt": original,
+            "final_bbox_pt": final_bbox,
+            "reason": (
+                "original_out_of_page"
+                if not original_valid
+                else "original_bbox_did_not_cover_final_region_entities"
+            ),
+            "entity_center_coverage_ratio": round(coverage_ratio, 4),
+            "source_entity_ids": region_entity_ids,
+            "source_edge_ids": region_edge_ids,
+            "validated": validated,
+        })
+
+    return {
+        "version": REGION_BBOX_ADJUDICATION_VERSION,
+        "regions": audits,
+        "adjudicated_region_count": sum(
+            1 for item in audits
+            if item.get("reason") != "original_pdf_point_bbox_valid"
+            and item.get("validated")
+        ),
+        "validated": not any(
+            issue.get("severity") in {"high", "critical"}
+            for issue in issues
+        ),
+    }, issues
+
+
 def _normalize_verifier_issue_after_adjudication(
     raw: Any,
     *,
     adjudication: dict,
     resolution: dict,
+    recovery_audit: Optional[dict] = None,
 ) -> dict:
     issue = _normalize_issue(
         raw,
@@ -2603,6 +3535,9 @@ def _normalize_verifier_issue_after_adjudication(
     preserved_unresolved = set(
         adjudication.get("preserved_unresolved_reference_ids") or []
     )
+    recovery_audit = recovery_audit or {}
+    recovered_entities = set(recovery_audit.get("recovered_entity_ids") or [])
+    recovered_edges = set(recovery_audit.get("recovered_edge_ids") or [])
     resolution_by_id = {
         str(item.get("occurrence_id") or ""): item
         for item in (resolution.get("entity_resolutions") or [])
@@ -2618,6 +3553,59 @@ def _normalize_verifier_issue_after_adjudication(
         issue["adjudication"] = {
             "validated": True,
             "action": "removed_rejected_edges",
+        }
+        return issue
+
+    if entity_ids and entity_ids.issubset(recovered_entities):
+        issue["severity"] = "info"
+        issue["source_stage"] = "verifier_evidence_recovery"
+        issue["message"] = (
+            issue["message"]
+            + " [Resolved by a validated verifier recovery entity.]"
+        )[:1600]
+        issue["adjudication"] = {
+            "validated": True,
+            "action": "added_recovery_entities",
+        }
+        return issue
+    if edge_ids and edge_ids.issubset(recovered_edges):
+        issue["severity"] = "info"
+        issue["source_stage"] = "verifier_evidence_recovery"
+        issue["message"] = (
+            issue["message"]
+            + " [Resolved by a validated verifier recovery edge.]"
+        )[:1600]
+        issue["adjudication"] = {
+            "validated": True,
+            "action": "added_recovery_edges",
+        }
+        return issue
+    missing_issue_recovered = bool(
+        (
+            issue_type == "missing_visible_entity"
+            and int(recovery_audit.get("recovered_entity_count") or 0) > 0
+        )
+        or (
+            issue_type == "missing_visible_connections"
+            and recovery_audit.get("all_visual_evidence_adjudicated")
+        )
+    )
+    if (
+        not entity_ids
+        and not edge_ids
+        and issue_type in {"missing_visible_entity", "missing_visible_connections"}
+        and recovery_audit.get("validated")
+        and missing_issue_recovered
+    ):
+        issue["severity"] = "info"
+        issue["source_stage"] = "verifier_evidence_recovery"
+        issue["message"] = (
+            issue["message"]
+            + " [Resolved by complete structured visual-evidence adjudication.]"
+        )[:1600]
+        issue["adjudication"] = {
+            "validated": True,
+            "action": "structured_visual_evidence_recovery",
         }
         return issue
 
@@ -2684,8 +3672,58 @@ def _validate_candidate_graph(
             resolution=resolution,
         )
     )
-    extraction["post_verifier_adjudication"] = adjudication
     issues.extend(adjudication_issues)
+    pre_recovery_entity_count = len(entities)
+    pre_recovery_edge_count = len(edges)
+    entities, edges, recovery_audit, recovery_issues = (
+        _apply_verifier_evidence_recovery(
+            page=page,
+            detector=detector,
+            extraction=extraction,
+            verifier=verifier,
+            resolution=resolution,
+            base_entities=entities,
+            base_edges=edges,
+            glyphs=glyphs,
+            words=words,
+            drawings=drawings,
+            links=links,
+        )
+    )
+    issues.extend(recovery_issues)
+    adjudication["pre_recovery_final_entity_count"] = (
+        pre_recovery_entity_count
+    )
+    adjudication["pre_recovery_final_edge_count"] = pre_recovery_edge_count
+    adjudication["final_entity_count"] = len(entities)
+    adjudication["final_edge_count"] = len(edges)
+    adjudication["recovered_entity_ids"] = recovery_audit.get(
+        "recovered_entity_ids"
+    ) or []
+    adjudication["recovered_edge_ids"] = recovery_audit.get(
+        "recovered_edge_ids"
+    ) or []
+    adjudication["evidence_recovery_validated"] = bool(
+        recovery_audit.get("validated")
+    )
+    adjudication["validated"] = bool(
+        adjudication.get("validated") and recovery_audit.get("validated")
+    )
+    adjudication["verifier_evidence_recovery"] = recovery_audit
+    extraction["verifier_evidence_recovery"] = recovery_audit
+    extraction["post_verifier_adjudication"] = adjudication
+
+    region_bbox_audit, region_bbox_issues = (
+        _adjudicate_detector_region_bboxes(
+            page=page,
+            detector=detector,
+            entities=entities,
+            edges=edges,
+        )
+    )
+    adjudication["region_bbox_adjudication"] = region_bbox_audit
+    extraction["region_bbox_adjudication"] = region_bbox_audit
+    issues.extend(region_bbox_issues)
 
     for raw in detector.get("issues") or []:
         issues.append(_normalize_issue(
@@ -2704,6 +3742,7 @@ def _validate_candidate_graph(
             raw,
             adjudication=adjudication,
             resolution=resolution,
+            recovery_audit=recovery_audit,
         ))
 
     if int(detector.get("page_id") or 0) != int(page["id"]):
@@ -2778,27 +3817,24 @@ def _validate_candidate_graph(
         ))
     if extraction.get("unresolved_visual_evidence"):
         if (
-            verifier.get("all_visible_entities_accounted_for")
-            and verifier.get("all_visible_connections_accounted_for")
-            and verifier.get(
-                "all_references_resolved_or_explicitly_unresolved"
-            )
-            and adjudication.get("validated")
+            recovery_audit.get("validated")
+            and recovery_audit.get("all_visual_evidence_adjudicated")
+            and recovery_audit.get("all_recovery_candidates_linked")
         ):
             issues.append(_local_issue(
                 issue_type="graph-extractor-evidence-explicitly-accounted",
                 message=(
-                    "Extractor audit notes were explicitly accounted for by "
-                    "the independent verifier and final candidate adjudication"
+                    "Every extractor evidence note is accounted for by the "
+                    "structured verifier recovery/adjudication ledger"
                 ),
                 confidence=extraction.get("confidence") or 0.0,
                 severity="info",
-                source_stage="post_verifier_adjudication",
+                source_stage="verifier_evidence_recovery",
             ))
         else:
             issues.append(_local_issue(
                 issue_type="graph-unresolved-visual-evidence",
-                message="Extractor returned unresolved circuit evidence",
+                message="Extractor returned visual evidence that remains unresolved",
                 confidence=extraction.get("confidence") or 0.0,
             ))
 
@@ -2881,10 +3917,19 @@ def _validate_candidate_graph(
             for value in (entity.get("source_word_ids") or [])
             if isinstance(value, int) or str(value).isdigit()
         }
-        if source_glyph_ids - valid_glyph_ids or source_word_ids - valid_word_ids:
+        source_drawing_ids = {
+            int(value)
+            for value in (entity.get("source_drawing_ids") or [])
+            if isinstance(value, int) or str(value).isdigit()
+        }
+        if (
+            source_glyph_ids - valid_glyph_ids
+            or source_word_ids - valid_word_ids
+            or source_drawing_ids - valid_drawing_ids
+        ):
             entity_fail(
                 "graph-entity-evidence-id-invalid",
-                f"Entity {occurrence_id} cites invalid glyph/word IDs",
+                f"Entity {occurrence_id} cites invalid glyph/word/drawing IDs",
                 occurrence_id,
                 confidence,
             )
@@ -3083,10 +4128,19 @@ def _validate_candidate_graph(
     preserved_unresolved = set(
         adjudication.get("preserved_unresolved_reference_ids") or []
     )
+    recovered_entity_ids = set(
+        recovery_audit.get("recovered_entity_ids") or []
+    )
+    recovered_edge_ids = set(
+        recovery_audit.get("recovered_edge_ids") or []
+    )
     final_entity_ids = set(occurrence_ids)
     final_edge_ids = set(edge_ids)
     unaccounted_entities = (
-        final_entity_ids - verified_entity_ids - preserved_unresolved
+        final_entity_ids
+        - verified_entity_ids
+        - preserved_unresolved
+        - recovered_entity_ids
     )
     if unaccounted_entities:
         issues.append(_local_issue(
@@ -3098,7 +4152,7 @@ def _validate_candidate_graph(
             entity_ids=sorted(unaccounted_entities),
             confidence=verifier.get("confidence") or 0.0,
         ))
-    unaccounted_edges = final_edge_ids - verified_edge_ids
+    unaccounted_edges = final_edge_ids - verified_edge_ids - recovered_edge_ids
     if unaccounted_edges:
         issues.append(_local_issue(
             issue_type="graph-verifier-edge-accounting-mismatch",
@@ -3107,9 +4161,82 @@ def _validate_candidate_graph(
             confidence=verifier.get("confidence") or 0.0,
         ))
 
+    verifier_issue_types = {
+        _clean_text(item.get("issue_type"), 180)
+        for item in (verifier.get("issues") or [])
+        if isinstance(item, dict)
+    }
+    missing_entity_recovery_required = bool(
+        "missing_visible_entity" in verifier_issue_types
+    )
+    entity_coverage_recovered = bool(
+        recovery_audit.get("validated")
+        and recovery_audit.get("all_visual_evidence_adjudicated")
+        and (
+            not missing_entity_recovery_required
+            or int(recovery_audit.get("recovered_entity_count") or 0) > 0
+        )
+    )
+    if not verifier.get("all_visible_entities_accounted_for"):
+        if (
+            entity_coverage_recovered
+            and not entity_validation_failed
+        ):
+            issues.append(_local_issue(
+                issue_type=(
+                    "graph-verifier-visible-entity-flag-"
+                    "superseded-post-recovery"
+                ),
+                message=(
+                    "The verifier raw-candidate entity coverage flag was false, "
+                    "but all missing visual entity evidence was recovered or "
+                    "explicitly adjudicated and every final entity is valid"
+                ),
+                confidence=verifier.get("confidence") or 0.0,
+                severity="info",
+                source_stage="verifier_evidence_recovery",
+            ))
+        else:
+            issues.append(_local_issue(
+                issue_type="graph-verifier-all_visible_entities_accounted_for",
+                message=(
+                    "Verifier returned all_visible_entities_accounted_for=false"
+                ),
+                confidence=verifier.get("confidence") or 0.0,
+            ))
+
+    if not verifier.get("all_visible_connections_accounted_for"):
+        if (
+            recovery_audit.get("validated")
+            and recovery_audit.get("all_visual_evidence_adjudicated")
+            and not edge_validation_failed
+        ):
+            issues.append(_local_issue(
+                issue_type=(
+                    "graph-verifier-visible-connection-flag-"
+                    "superseded-post-recovery"
+                ),
+                message=(
+                    "The verifier raw-candidate connection coverage flag was "
+                    "false, but every visual gap was recovered or explicitly "
+                    "adjudicated and every final edge is valid"
+                ),
+                confidence=verifier.get("confidence") or 0.0,
+                severity="info",
+                source_stage="verifier_evidence_recovery",
+            ))
+        else:
+            issues.append(_local_issue(
+                issue_type=(
+                    "graph-verifier-all_visible_connections_accounted_for"
+                ),
+                message=(
+                    "Verifier returned all_visible_connections_accounted_for=false"
+                ),
+                confidence=verifier.get("confidence") or 0.0,
+            ))
+
     for flag in (
-        "all_visible_entities_accounted_for",
-        "all_visible_connections_accounted_for",
         "all_references_resolved_or_explicitly_unresolved",
         "duplicates_preserved",
     ):
@@ -3327,6 +4454,8 @@ def _build_materialization_plan(
                 ) or "",
                 "source_glyph_ids": entity.get("source_glyph_ids") or [],
                 "source_word_ids": entity.get("source_word_ids") or [],
+                "source_drawing_ids": entity.get("source_drawing_ids") or [],
+                "recovery_evidence": entity.get("recovery_evidence") or {},
                 "evidence_notes": entity.get("evidence_notes") or "",
                 "reference_resolution": {
                     key: (resolution_by_id.get(occurrence_id) or {}).get(key)
@@ -3625,6 +4754,7 @@ def _build_materialization_plan(
                 "source_glyph_ids": edge.get("source_glyph_ids") or [],
                 "source_drawing_ids": edge.get("source_drawing_ids") or [],
                 "source_link_ids": edge.get("source_link_ids") or [],
+                "recovery_evidence": edge.get("recovery_evidence") or {},
                 "evidence_notes": edge.get("evidence_notes") or "",
                 "detector_fingerprint": detector_fingerprint,
                 "extractor_fingerprint": extractor_fingerprint,
@@ -4007,6 +5137,29 @@ def _db_update_version_state(
                 "preserved_unresolved_reference_ids": adjudication.get(
                     "preserved_unresolved_reference_ids"
                 ) or [],
+                "recovered_entity_ids": adjudication.get(
+                    "recovered_entity_ids"
+                ) or [],
+                "recovered_edge_ids": adjudication.get(
+                    "recovered_edge_ids"
+                ) or [],
+                "evidence_recovery_validated": bool(
+                    adjudication.get("evidence_recovery_validated")
+                ),
+                "visual_evidence_adjudication_count": len(
+                    (
+                        adjudication.get("verifier_evidence_recovery")
+                        or {}
+                    ).get("visual_evidence_adjudications")
+                    or []
+                ),
+                "adjudicated_region_bbox_count": int(
+                    (
+                        adjudication.get("region_bbox_adjudication")
+                        or {}
+                    ).get("adjudicated_region_count")
+                    or 0
+                ),
                 "unresolved_reference_entity_ids": resolution.get(
                     "unresolved_reference_entity_ids"
                 ) or [],
@@ -4345,9 +5498,9 @@ def extract_electrical_graph_page(
             extractor_reused,
         )
 
-        # Preserve the exact V1 verifier request projection so detector,
-        # extractor and verifier artifacts remain reusable when only local
-        # resolution/materialization logic changes.
+        # Detector and extractor requests remain byte-for-byte compatible with
+        # V1.1. The V1.2 verifier receives complete PDF-point evidence so it can
+        # recover omitted visible symbols without re-running extraction.
         verifier_resolution = _resolve_references_for_verifier_v1(
             extraction,
             registry,
@@ -4360,8 +5513,23 @@ def extract_electrical_graph_page(
             "detector": detector,
             "extraction": extraction,
             "deterministic_reference_resolution": verifier_resolution,
-            "drawing_count": len(drawings),
-            "link_count": len(links),
+            "vector_words": words,
+            "source_glyphs": [
+                {
+                    "glyph_id": x["glyph_id"],
+                    "text_original": x["text_original"],
+                    "bbox_pt": x["bbox_pt"],
+                    "origin_pt": x["origin_pt"],
+                    "direction": x["direction"],
+                }
+                for x in glyphs
+            ],
+            "drawing_registry": drawings,
+            "pdf_link_registry": links,
+            "recovery_version": VERIFIER_EVIDENCE_RECOVERY_VERSION,
+            "visual_evidence_adjudication_version": (
+                VISUAL_EVIDENCE_ADJUDICATION_VERSION
+            ),
             "render_dpi": RENDER_DPI,
         }
         verifier, verifier_usage, verifier_reused, verifier_fp = _cached_call(
@@ -4377,8 +5545,10 @@ def extract_electrical_graph_page(
                 detector=detector,
                 extraction=extraction,
                 resolution=verifier_resolution,
-                drawing_count=len(drawings),
-                link_count=len(links),
+                words=words,
+                glyphs=glyphs,
+                drawings=drawings,
+                links=links,
                 image_original=page_original,
                 image_rotated=page_rotated,
             ),
@@ -4399,7 +5569,7 @@ def extract_electrical_graph_page(
         )
 
         # Final deterministic reference resolution is intentionally local and
-        # runs after the cached V1 verifier response.
+        # runs after the verifier response.
         resolution = _resolve_references(extraction, registry)
 
         page_passed, entities, edges, issues = _validate_candidate_graph(
@@ -4519,6 +5689,12 @@ def extract_electrical_graph_page(
             },
             "post_verifier_adjudication": extraction.get(
                 "post_verifier_adjudication"
+            ) or {},
+            "verifier_evidence_recovery": extraction.get(
+                "verifier_evidence_recovery"
+            ) or {},
+            "region_bbox_adjudication": extraction.get(
+                "region_bbox_adjudication"
             ) or {},
             "raw_extracted_entity_count": len(
                 extraction.get("entities") or []
