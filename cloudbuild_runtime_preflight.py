@@ -3865,6 +3865,211 @@ assert any(
     for issue in _graph_v3_final_issues
 ), _graph_v3_final_issues
 
+# Graph V3.1: strict-schema models may echo result objects for KEEP/REMOVE
+# and may include a redundant raw-source echo beside REPLACE/REWIRE results.
+# These forms are normalized only when identity/topology proves them safe.
+_graph_v31_echo_verifier = _graph_v3_make_verifier(
+    [
+        _graph_v3_entity_op(
+            'echo-keep-e1', 'KEEP_ENTITY', 'e1', [
+                _graph_v3_entity(
+                    'e1', 'component_occurrence', 'K1',
+                    [10, 10, 20, 20], 1,
+                )
+            ]
+        ),
+        _graph_v3_entity_op(
+            'echo-keep-e2', 'KEEP_ENTITY', 'e2', [
+                _graph_v3_entity(
+                    'e2', 'potential', '24V',
+                    [40, 10, 50, 20], 2,
+                )
+            ]
+        ),
+        _graph_v3_entity_op(
+            'echo-remove-e3', 'REMOVE_ENTITY', 'e3', [
+                _graph_v3_entity(
+                    'e3', 'component_occurrence', 'X',
+                    [60, 10, 65, 20], 3,
+                )
+            ]
+        ),
+    ],
+    [
+        _graph_v3_edge_op(
+            'echo-keep-ed1', 'KEEP_EDGE', 'ed1', [
+                copy.deepcopy(_graph_v3_raw_edge)
+            ]
+        )
+    ],
+)
+(
+    _graph_v31_echo_entities,
+    _graph_v31_echo_edges,
+    _graph_v31_echo_audit,
+    _graph_v31_echo_issues,
+) = _graph_apply_patch_plan(
+    page=_graph_v3_page,
+    extraction=_graph_v3_extraction,
+    verifier=_graph_v31_echo_verifier,
+)
+assert _graph_v31_echo_audit['validated'] is True, _graph_v31_echo_issues
+assert [row['occurrence_id'] for row in _graph_v31_echo_entities] == [
+    'e1', 'e2'
+]
+assert [row['edge_id'] for row in _graph_v31_echo_edges] == ['ed1']
+assert _graph_v31_echo_audit['patch_result_compatibility'][
+    'normalized_operation_count'
+] == 4, _graph_v31_echo_audit
+assert _graph_v31_echo_audit['patch_result_compatibility'][
+    'mode_counts'
+] == {
+    'echoed_keep_projection': 3,
+    'echoed_remove_projection_discarded': 1,
+}, _graph_v31_echo_audit
+_graph_v31_echo_resolution = _graph_resolve_references(
+    {'entities': _graph_v31_echo_entities}, _graph_v3_registry
+)
+_graph_v31_echo_passed, _, _, _graph_v31_echo_final_issues = (
+    _graph_validate_patched(
+        page=_graph_v3_page,
+        detector=copy.deepcopy(_graph_v3_detector),
+        extraction=_graph_v3_extraction,
+        verifier=_graph_v31_echo_verifier,
+        resolution=_graph_v31_echo_resolution,
+        entities=_graph_v31_echo_entities,
+        edges=_graph_v31_echo_edges,
+        patch_audit=_graph_v31_echo_audit,
+        patch_issues=_graph_v31_echo_issues,
+        glyphs=_graph_v3_glyphs,
+        words=_graph_v3_words,
+        drawings=_graph_v3_drawings,
+        links=[],
+    )
+)
+assert _graph_v31_echo_passed is True, _graph_v31_echo_final_issues
+
+# A redundant exact source echo can accompany the effective replacement and
+# rewire result; it is discarded deterministically before cardinality checks.
+_graph_v31_replace_echo_verifier = _graph_v3_make_verifier(
+    [
+        _graph_v3_entity_op(
+            'replace-with-source-echo', 'REPLACE_ENTITY', 'e1', [
+                _graph_v3_entity(
+                    'e1', 'component_occurrence', 'K1',
+                    [10, 10, 20, 20], 1,
+                ),
+                copy.deepcopy(_graph_v3_replacement),
+            ]
+        ),
+        _graph_v3_entity_op(
+            'keep-e2-echo', 'KEEP_ENTITY', 'e2', [
+                _graph_v3_entity(
+                    'e2', 'potential', '24V',
+                    [40, 10, 50, 20], 2,
+                )
+            ]
+        ),
+        _graph_v3_entity_op(
+            'remove-e3-echo', 'REMOVE_ENTITY', 'e3', [
+                _graph_v3_entity(
+                    'e3', 'component_occurrence', 'X',
+                    [60, 10, 65, 20], 3,
+                )
+            ]
+        ),
+    ],
+    [
+        _graph_v3_edge_op(
+            'rewire-with-source-echo', 'REWIRE_EDGE', 'ed1', [
+                copy.deepcopy(_graph_v3_raw_edge),
+                _graph_v3_edge(
+                    'fed1-v31', 'f1', 'e2', drawing_ids=[1]
+                ),
+            ]
+        )
+    ],
+)
+(
+    _graph_v31_replace_entities,
+    _graph_v31_replace_edges,
+    _graph_v31_replace_audit,
+    _graph_v31_replace_issues,
+) = _graph_apply_patch_plan(
+    page=_graph_v3_page,
+    extraction=_graph_v3_extraction,
+    verifier=_graph_v31_replace_echo_verifier,
+)
+assert _graph_v31_replace_audit['validated'] is True, (
+    _graph_v31_replace_issues
+)
+assert [row['occurrence_id'] for row in _graph_v31_replace_entities] == [
+    'f1', 'e2'
+]
+assert [row['edge_id'] for row in _graph_v31_replace_edges] == [
+    'fed1-v31'
+]
+assert _graph_v31_replace_audit['patch_result_compatibility'][
+    'mode_counts'
+]['redundant_source_echo_discarded'] == 2
+
+# Echo tolerance never permits a KEEP operation to change canonical entity
+# type or edge topology. Those changes require REPLACE/REWIRE and fail closed.
+_graph_v31_bad_entity_echo = _graph_v3_make_verifier(
+    [
+        _graph_v3_entity_op(
+            'bad-keep-e1', 'KEEP_ENTITY', 'e1', [
+                _graph_v3_entity(
+                    'e1', 'coil', 'K1', [10, 10, 20, 20], 1
+                )
+            ]
+        ),
+        _graph_v3_entity_op('keep-e2', 'KEEP_ENTITY', 'e2'),
+        _graph_v3_entity_op('remove-e3', 'REMOVE_ENTITY', 'e3'),
+    ],
+    [_graph_v3_edge_op('keep-ed1', 'KEEP_EDGE', 'ed1')],
+)
+_, _, _graph_v31_bad_entity_audit, _graph_v31_bad_entity_issues = (
+    _graph_apply_patch_plan(
+        page=_graph_v3_page,
+        extraction=_graph_v3_extraction,
+        verifier=_graph_v31_bad_entity_echo,
+    )
+)
+assert _graph_v31_bad_entity_audit['validated'] is False
+assert any(
+    issue.get('issue_type') == 'graph-entity-patch-cardinality-invalid'
+    for issue in _graph_v31_bad_entity_issues
+), _graph_v31_bad_entity_issues
+
+_graph_v31_changed_edge = copy.deepcopy(_graph_v3_raw_edge)
+_graph_v31_changed_edge['target_occurrence_id'] = 'e1'
+_graph_v31_bad_edge_echo = _graph_v3_make_verifier(
+    [
+        _graph_v3_entity_op('keep-e1', 'KEEP_ENTITY', 'e1'),
+        _graph_v3_entity_op('keep-e2', 'KEEP_ENTITY', 'e2'),
+        _graph_v3_entity_op('remove-e3', 'REMOVE_ENTITY', 'e3'),
+    ],
+    [
+        _graph_v3_edge_op(
+            'bad-keep-ed1', 'KEEP_EDGE', 'ed1',
+            [_graph_v31_changed_edge]
+        )
+    ],
+)
+_, _, _graph_v31_bad_edge_audit, _graph_v31_bad_edge_issues = (
+    _graph_apply_patch_plan(
+        page=_graph_v3_page,
+        extraction=_graph_v3_extraction,
+        verifier=_graph_v31_bad_edge_echo,
+    )
+)
+assert _graph_v31_bad_edge_audit['validated'] is False
+assert any(
+    issue.get('issue_type') == 'graph-edge-patch-cardinality-invalid'
+    for issue in _graph_v31_bad_edge_issues
+), _graph_v31_bad_edge_issues
+
 # Merged repeated occurrences can be split and every incident edge rewired.
 _graph_v3_split_extraction = {
     'page_id': 1,

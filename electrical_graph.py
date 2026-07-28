@@ -82,7 +82,7 @@ VERIFIER_PROMPT_VERSION = (
 ).strip()
 MATERIALIZER_VERSION = (
     os.environ.get("MM_ELECTRICAL_GRAPH_MATERIALIZER_VERSION")
-    or "mm-electrical-graph-materializer-v3"
+    or "mm-electrical-graph-materializer-v3.1"
 ).strip()
 
 OPENAI_TIMEOUT_SECONDS = _env_int(
@@ -125,7 +125,7 @@ MAX_DRAWINGS_IN_PROMPT = _env_int(
     "MM_ELECTRICAL_GRAPH_MAX_DRAWINGS_IN_PROMPT", 3000, 100, 10000
 )
 
-PIPELINE_MARKER = "phase2-graph-v3-atomic-patch-plan-source-snapshot"
+PIPELINE_MARKER = "phase2-graph-v3.1-echo-tolerant-patch-plan-source-snapshot"
 MATERIALIZATION_PHASE = "graph_vision_v1"
 EXTRACTION_METHOD = "openai_vision_graph_v1"
 PAGE_TYPE = "schematic"
@@ -242,7 +242,10 @@ NONMATERIALIZABLE_CONTEXT_VERSION = (
 )
 REVIEW_GROUPING_VERSION = "graph-review-signature-v3-causal-family"
 GRAPH_PATCH_PLAN_VERSION = "graph-atomic-patch-plan-v1"
-GRAPH_PATCH_APPLICATION_VERSION = "graph-atomic-patch-application-v1"
+GRAPH_PATCH_APPLICATION_VERSION = "graph-atomic-patch-application-v1.1"
+PATCH_RESULT_COMPATIBILITY_VERSION = (
+    "graph-patch-result-echo-normalization-v1"
+)
 GRAPH_FINAL_VALIDATION_VERSION = "graph-final-projection-validation-v1"
 ENTITY_PATCH_ACTIONS = {
     "KEEP_ENTITY",
@@ -5172,6 +5175,243 @@ def _patch_edge_result_normalized(raw: Any) -> dict:
     return edge
 
 
+def _patch_bbox_signature(value: Any) -> tuple[float, ...]:
+    values = list(value or [])
+    if len(values) != 4:
+        return ()
+    try:
+        return tuple(round(float(item), 3) for item in values)
+    except Exception:
+        return ()
+
+
+def _patch_int_signature(value: Any) -> tuple[int, ...]:
+    return tuple(sorted({
+        int(item)
+        for item in (value or [])
+        if isinstance(item, int) or str(item).isdigit()
+    }))
+
+
+def _entity_strict_echo_signature(value: Any) -> tuple[Any, ...]:
+    """Signature for recognizing a redundant copy of the raw entity.
+
+    Confidence, notes and source_drawing_ids are intentionally excluded. The
+    extractor V1 entity contract has no drawing-id field, while the canonical
+    verifier entity contract does. All identity, literal source text, geometry
+    and extractor-owned source evidence must otherwise be unchanged.
+    """
+    entity = _patch_entity_result_normalized(value)
+    text_fields = (
+        "occurrence_id",
+        "region_id",
+        "entity_type",
+        "subtype",
+        "tag_original",
+        "label_original",
+        "description_original",
+        "function_text_original",
+        "symbol_code",
+        "location_code",
+        "reference_value_original",
+        "reference_context_original",
+    )
+    return (
+        *(_clean_text(entity.get(field), 4000) for field in text_fields),
+        _patch_bbox_signature(entity.get("bbox_pt")),
+        _patch_int_signature(entity.get("source_glyph_ids")),
+        _patch_int_signature(entity.get("source_word_ids")),
+    )
+
+
+def _edge_strict_echo_signature(value: Any) -> tuple[Any, ...]:
+    """Signature for recognizing a redundant copy of the raw edge."""
+    edge = _patch_edge_result_normalized(value)
+    return (
+        _clean_text(edge.get("edge_id"), 160),
+        _clean_text(edge.get("source_occurrence_id"), 160),
+        _clean_text(edge.get("target_occurrence_id"), 160),
+        _clean_text(edge.get("relation_type"), 120),
+        bool(edge.get("is_directed")),
+        _clean_text(edge.get("potential_original"), 2000),
+        _clean_text(edge.get("wire_reference_original"), 2000),
+        _patch_bbox_signature(edge.get("bbox_pt")),
+        _patch_int_signature(edge.get("source_glyph_ids")),
+        _patch_int_signature(edge.get("source_drawing_ids")),
+        _patch_int_signature(edge.get("source_link_ids")),
+    )
+
+
+def _entity_keep_projection_compatible(source: dict, result: dict) -> bool:
+    """Allow a verifier to echo the final KEEP projection safely.
+
+    The identity, canonical type and region must remain the same. All other
+    fields are still validated later against the complete source registries,
+    so this does not bypass text, geometry or evidence ownership checks.
+    """
+    return bool(
+        _clean_text(result.get("occurrence_id"), 160)
+        == _clean_text(source.get("occurrence_id"), 160)
+        and _clean_text(result.get("entity_type"), 120)
+        == _clean_text(source.get("entity_type"), 120)
+        and _clean_text(result.get("region_id"), 120)
+        == _clean_text(source.get("region_id"), 120)
+    )
+
+
+def _edge_keep_projection_compatible(source: dict, result: dict) -> bool:
+    """Allow a verifier to echo a KEEP edge without silently rewiring it."""
+    return bool(
+        _clean_text(result.get("edge_id"), 160)
+        == _clean_text(source.get("edge_id"), 160)
+        and _clean_text(result.get("source_occurrence_id"), 160)
+        == _clean_text(source.get("source_occurrence_id"), 160)
+        and _clean_text(result.get("target_occurrence_id"), 160)
+        == _clean_text(source.get("target_occurrence_id"), 160)
+        and _clean_text(result.get("relation_type"), 120)
+        == _clean_text(source.get("relation_type"), 120)
+        and bool(result.get("is_directed"))
+        == bool(source.get("is_directed"))
+    )
+
+
+def _normalize_entity_patch_results(
+    *,
+    action: str,
+    source_id: str,
+    source: Optional[dict],
+    results: list[dict],
+) -> tuple[list[dict], str, Optional[str]]:
+    """Normalize schema-valid verifier result echoes without weakening safety.
+
+    Strict JSON Schema requires ``result_entities`` on every operation. Models
+    may therefore echo the source object for KEEP/REMOVE, or include that echo
+    alongside REPLACE/SPLIT results. The operation action remains authoritative:
+    redundant echoes are accepted only when their source identity is provable.
+    """
+    normalized = [_patch_entity_result_normalized(item) for item in results]
+    if action == "ADD_ENTITY":
+        if source_id or len(normalized) != 1:
+            return [], "invalid_add_contract", "ADD_ENTITY requires one result and no source ID"
+        return normalized, "direct_add", None
+
+    if source is None:
+        return [], "invalid_source", "Entity operation source does not exist"
+    normalized_source = _patch_entity_result_normalized(source)
+
+    if action == "KEEP_ENTITY":
+        if not normalized:
+            return [normalized_source], "implicit_raw_keep", None
+        if len(normalized) == 1 and _entity_keep_projection_compatible(
+            normalized_source, normalized[0]
+        ):
+            return normalized, "echoed_keep_projection", None
+        return [], "invalid_keep_contract", (
+            "KEEP_ENTITY accepts no result or one same-ID/type/region final projection"
+        )
+
+    if action == "REMOVE_ENTITY":
+        if not normalized:
+            return [], "direct_remove", None
+        if (
+            len(normalized) == 1
+            and _clean_text(normalized[0].get("occurrence_id"), 160)
+            == source_id
+        ):
+            return [], "echoed_remove_projection_discarded", None
+        return [], "invalid_remove_contract", (
+            "REMOVE_ENTITY accepts no result or one redundant same-ID source echo"
+        )
+
+    effective = list(normalized)
+    strict_source_signature = _entity_strict_echo_signature(normalized_source)
+    strict_echo_indexes = [
+        index
+        for index, item in enumerate(effective)
+        if _entity_strict_echo_signature(item) == strict_source_signature
+    ]
+    compatibility_mode = "direct_results"
+    if len(effective) > 1 and len(strict_echo_indexes) == 1:
+        effective.pop(strict_echo_indexes[0])
+        compatibility_mode = "redundant_source_echo_discarded"
+
+    if action == "REPLACE_ENTITY":
+        if len(effective) != 1:
+            return [], "invalid_replace_contract", (
+                "REPLACE_ENTITY requires exactly one effective final entity"
+            )
+        return effective, compatibility_mode, None
+    if action == "SPLIT_ENTITY":
+        if not (2 <= len(effective) <= 12):
+            return [], "invalid_split_contract", (
+                "SPLIT_ENTITY requires two to twelve effective final entities"
+            )
+        return effective, compatibility_mode, None
+    return [], "invalid_action", "Unsupported entity patch action"
+
+
+def _normalize_edge_patch_results(
+    *,
+    action: str,
+    source_id: str,
+    source: Optional[dict],
+    results: list[dict],
+) -> tuple[list[dict], str, Optional[str]]:
+    """Normalize redundant edge result echoes while preserving topology rules."""
+    normalized = [_patch_edge_result_normalized(item) for item in results]
+    if action == "ADD_EDGE":
+        if source_id or len(normalized) != 1:
+            return [], "invalid_add_contract", "ADD_EDGE requires one result and no source ID"
+        return normalized, "direct_add", None
+
+    if source is None:
+        return [], "invalid_source", "Edge operation source does not exist"
+    normalized_source = _patch_edge_result_normalized(source)
+
+    if action == "KEEP_EDGE":
+        if not normalized:
+            return [normalized_source], "implicit_raw_keep", None
+        if len(normalized) == 1 and _edge_keep_projection_compatible(
+            normalized_source, normalized[0]
+        ):
+            return normalized, "echoed_keep_projection", None
+        return [], "invalid_keep_contract", (
+            "KEEP_EDGE cannot change endpoints, relation, direction or edge ID"
+        )
+
+    if action == "REMOVE_EDGE":
+        if not normalized:
+            return [], "direct_remove", None
+        if (
+            len(normalized) == 1
+            and _clean_text(normalized[0].get("edge_id"), 160) == source_id
+        ):
+            return [], "echoed_remove_projection_discarded", None
+        return [], "invalid_remove_contract", (
+            "REMOVE_EDGE accepts no result or one redundant same-ID source echo"
+        )
+
+    effective = list(normalized)
+    strict_source_signature = _edge_strict_echo_signature(normalized_source)
+    strict_echo_indexes = [
+        index
+        for index, item in enumerate(effective)
+        if _edge_strict_echo_signature(item) == strict_source_signature
+    ]
+    compatibility_mode = "direct_results"
+    if len(effective) > 1 and len(strict_echo_indexes) == 1:
+        effective.pop(strict_echo_indexes[0])
+        compatibility_mode = "redundant_source_echo_discarded"
+
+    if action == "REWIRE_EDGE":
+        if not (1 <= len(effective) <= 24):
+            return [], "invalid_rewire_contract", (
+                "REWIRE_EDGE requires one to twenty-four effective final edges"
+            )
+        return effective, compatibility_mode, None
+    return [], "invalid_action", "Unsupported edge patch action"
+
+
 def _apply_graph_patch_plan(
     *,
     page: dict,
@@ -5283,10 +5523,8 @@ def _apply_graph_patch_plan(
             ))
             problem = True
 
-        if action == "ADD_ENTITY":
-            if source_id or len(results) != 1:
-                problem = True
-        else:
+        source_entity = raw_entity_by_id.get(source_id)
+        if action != "ADD_ENTITY":
             if source_id not in raw_entity_ids:
                 issues.append(_local_issue(
                     issue_type="graph-entity-patch-source-invalid",
@@ -5297,20 +5535,25 @@ def _apply_graph_patch_plan(
                 problem = True
             else:
                 raw_entity_claims.setdefault(source_id, []).append(operation_id)
-            expected_counts = {
-                "KEEP_ENTITY": (0, 0),
-                "REMOVE_ENTITY": (0, 0),
-                "REPLACE_ENTITY": (1, 1),
-                "SPLIT_ENTITY": (2, 12),
-            }
-            minimum, maximum = expected_counts.get(action, (0, -1))
-            if not (minimum <= len(results) <= maximum):
-                problem = True
+
+        produced, compatibility_mode, contract_error = (
+            _normalize_entity_patch_results(
+                action=action,
+                source_id=source_id,
+                source=source_entity,
+                results=results,
+            )
+        )
+        if contract_error:
+            problem = True
 
         if problem:
             issues.append(_local_issue(
                 issue_type="graph-entity-patch-cardinality-invalid",
-                message="Entity patch operation violates its source/result contract",
+                message=(
+                    "Entity patch operation violates its source/result contract"
+                    + (f": {contract_error}" if contract_error else "")
+                ),
                 entity_ids=[source_id] if source_id else [],
                 confidence=confidence,
             ))
@@ -5318,19 +5561,21 @@ def _apply_graph_patch_plan(
                 "operation_id": operation_id,
                 "action": action,
                 "source_entity_id": source_id,
-                "result_entity_ids": [
+                "input_result_entity_ids": [
                     _clean_text(item.get("occurrence_id"), 160)
                     for item in results
                 ],
+                "result_entity_ids": [
+                    _clean_text(item.get("occurrence_id"), 160)
+                    for item in produced
+                ],
+                "input_result_count": len(results),
+                "effective_result_count": len(produced),
+                "compatibility_mode": compatibility_mode,
+                "contract_error": contract_error or "",
                 "validated": False,
             })
             continue
-
-        produced: list[dict] = []
-        if action == "KEEP_ENTITY":
-            produced = [_patch_entity_result_normalized(raw_entity_by_id[source_id])]
-        elif action in {"REPLACE_ENTITY", "SPLIT_ENTITY", "ADD_ENTITY"}:
-            produced = results
 
         produced_ids = [
             _clean_text(item.get("occurrence_id"), 160) for item in produced
@@ -5370,7 +5615,14 @@ def _apply_graph_patch_plan(
             "operation_id": operation_id,
             "action": action,
             "source_entity_id": source_id,
+            "input_result_entity_ids": [
+                _clean_text(item.get("occurrence_id"), 160)
+                for item in results
+            ],
             "result_entity_ids": produced_ids,
+            "input_result_count": len(results),
+            "effective_result_count": len(produced),
+            "compatibility_mode": compatibility_mode,
             "evidence_indexes": evidence_indexes,
             "confidence": confidence,
             "validated": True,
@@ -5446,10 +5698,8 @@ def _apply_graph_patch_plan(
             ))
             problem = True
 
-        if action == "ADD_EDGE":
-            if source_id or len(results) != 1:
-                problem = True
-        else:
+        source_edge = raw_edge_by_id.get(source_id)
+        if action != "ADD_EDGE":
             if source_id not in raw_edge_ids:
                 issues.append(_local_issue(
                     issue_type="graph-edge-patch-source-invalid",
@@ -5460,19 +5710,25 @@ def _apply_graph_patch_plan(
                 problem = True
             else:
                 raw_edge_claims.setdefault(source_id, []).append(operation_id)
-            expected_counts = {
-                "KEEP_EDGE": (0, 0),
-                "REMOVE_EDGE": (0, 0),
-                "REWIRE_EDGE": (1, 24),
-            }
-            minimum, maximum = expected_counts.get(action, (0, -1))
-            if not (minimum <= len(results) <= maximum):
-                problem = True
+
+        produced, compatibility_mode, contract_error = (
+            _normalize_edge_patch_results(
+                action=action,
+                source_id=source_id,
+                source=source_edge,
+                results=results,
+            )
+        )
+        if contract_error:
+            problem = True
 
         if problem:
             issues.append(_local_issue(
                 issue_type="graph-edge-patch-cardinality-invalid",
-                message="Edge patch operation violates its source/result contract",
+                message=(
+                    "Edge patch operation violates its source/result contract"
+                    + (f": {contract_error}" if contract_error else "")
+                ),
                 edge_ids=[source_id] if source_id else [],
                 confidence=confidence,
             ))
@@ -5480,18 +5736,19 @@ def _apply_graph_patch_plan(
                 "operation_id": operation_id,
                 "action": action,
                 "source_edge_id": source_id,
-                "result_edge_ids": [
+                "input_result_edge_ids": [
                     _clean_text(item.get("edge_id"), 160) for item in results
                 ],
+                "result_edge_ids": [
+                    _clean_text(item.get("edge_id"), 160) for item in produced
+                ],
+                "input_result_count": len(results),
+                "effective_result_count": len(produced),
+                "compatibility_mode": compatibility_mode,
+                "contract_error": contract_error or "",
                 "validated": False,
             })
             continue
-
-        produced: list[dict] = []
-        if action == "KEEP_EDGE":
-            produced = [_patch_edge_result_normalized(raw_edge_by_id[source_id])]
-        elif action in {"REWIRE_EDGE", "ADD_EDGE"}:
-            produced = results
         produced_ids = [
             _clean_text(item.get("edge_id"), 160) for item in produced
         ]
@@ -5529,7 +5786,13 @@ def _apply_graph_patch_plan(
             "operation_id": operation_id,
             "action": action,
             "source_edge_id": source_id,
+            "input_result_edge_ids": [
+                _clean_text(item.get("edge_id"), 160) for item in results
+            ],
             "result_edge_ids": produced_ids,
+            "input_result_count": len(results),
+            "effective_result_count": len(produced),
+            "compatibility_mode": compatibility_mode,
             "evidence_indexes": evidence_indexes,
             "confidence": confidence,
             "validated": True,
@@ -5718,9 +5981,24 @@ def _apply_graph_patch_plan(
         issue for issue in issues
         if issue.get("severity") in {"high", "critical"}
     ]
+    compatibility_modes: dict[str, int] = {}
+    for row in entity_operation_audit + edge_operation_audit:
+        mode = _clean_text(row.get("compatibility_mode"), 160)
+        if mode:
+            compatibility_modes[mode] = compatibility_modes.get(mode, 0) + 1
+
     audit = {
         "version": GRAPH_PATCH_APPLICATION_VERSION,
         "patch_plan_version": verifier.get("patch_plan_version") or "",
+        "patch_result_compatibility": {
+            "version": PATCH_RESULT_COMPATIBILITY_VERSION,
+            "normalized_operation_count": sum(
+                count
+                for mode, count in compatibility_modes.items()
+                if mode not in {"direct_add", "direct_remove", "direct_results"}
+            ),
+            "mode_counts": dict(sorted(compatibility_modes.items())),
+        },
         "raw_entity_count": len(raw_entities),
         "raw_edge_count": len(raw_edges),
         "final_entity_count": len(final_entities),
@@ -7036,6 +7314,9 @@ def _db_update_version_state(
                     "final_validation_version"
                 ) or GRAPH_FINAL_VALIDATION_VERSION,
                 "patch_plan_validated": bool(adjudication.get("validated")),
+                "patch_result_compatibility": adjudication.get(
+                    "patch_result_compatibility"
+                ) or {},
                 "applied_patch_operation_count": len(
                     adjudication.get("applied_operation_ids") or []
                 ),
