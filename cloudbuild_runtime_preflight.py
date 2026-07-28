@@ -2757,8 +2757,10 @@ assert _v2_alias_verifier['field_overrides'][0]['row_id'] == 'ROW_R003'
 # Phase 2G V1: font-independent character evidence, exact reference
 # resolution and fail-closed electrical topology validation.
 from electrical_graph import (
+    _edge_bbox_valid as _graph_edge_bbox_valid,
     _glyph_registry as _graph_glyph_registry,
     _resolve_references as _graph_resolve_references,
+    _resolve_references_for_verifier_v1 as _graph_resolve_for_verifier_v1,
     _validate_candidate_graph as _graph_validate_candidate,
 )
 
@@ -2916,6 +2918,271 @@ assert any(
     issue.get('issue_type') == 'graph-edge-geometry-evidence-missing'
     for issue in _graph_failed_issues
 ), _graph_failed_issues
+
+# Phase 2G V1.1: conductor paths can be vertical or horizontal line segments.
+assert _graph_edge_bbox_valid([20, 10, 20, 70], _graph_page) is True
+assert _graph_edge_bbox_valid([20, 10, 70, 10], _graph_page) is True
+assert _graph_edge_bbox_valid([20, 10, 20, 10], _graph_page) is False
+assert _graph_edge_bbox_valid([70, 10, 20, 10], _graph_page) is False
+
+# Final materialization resolves printed sheet/grid references locally, while
+# the verifier request keeps the exact V1 projection for artifact reuse.
+_graph_page_ref_entity = {
+    'occurrence_id': 'P-GRID',
+    'region_id': 'R1',
+    'entity_type': 'page_reference',
+    'subtype': 'cross_reference',
+    'tag_original': 'K9',
+    'label_original': '205.3',
+    'description_original': '',
+    'function_text_original': '',
+    'symbol_code': '',
+    'location_code': '',
+    'reference_value_original': '205.3',
+    'reference_context_original': 'a',
+    'bbox_pt': [60, 30, 75, 40],
+    'source_glyph_ids': [5],
+    'source_word_ids': [5],
+    'confidence': 0.98,
+    'evidence_notes': 'fixture',
+}
+_graph_page_ref_registry = {
+    **_graph_registry,
+    'pages': [
+        {'id': 30, 'pdf_page_number': 44, 'sheet_code': '205',
+         'sheet_title': 'Axis', 'page_type': 'schematic'},
+    ],
+    'cross_references': [],
+}
+_graph_final_ref = _graph_resolve_references(
+    {'entities': [_graph_page_ref_entity]},
+    _graph_page_ref_registry,
+)
+assert _graph_final_ref['all_reference_entities_resolved'] is True, (
+    _graph_final_ref
+)
+assert _graph_final_ref['match_counts']['page'] == 1, _graph_final_ref
+_graph_legacy_ref = _graph_resolve_for_verifier_v1(
+    {'entities': [_graph_page_ref_entity]},
+    _graph_page_ref_registry,
+)
+assert _graph_legacy_ref['version'] == 'exact-certified-reference-resolution-v1'
+assert _graph_legacy_ref['all_reference_entities_resolved'] is False, (
+    _graph_legacy_ref
+)
+
+# A visible I/O reference absent from the certified registry is preserved as
+# explicitly unresolved. A false topology edge is pruned, the verified local
+# conductor remains, and the raw review verdict is superseded only after the
+# final projection passes every deterministic check.
+_graph_ref_entities = [
+    copy.deepcopy(_graph_entities[0]),
+    {
+        'occurrence_id': 'IO-MISSING',
+        'region_id': 'R1',
+        'entity_type': 'io_reference',
+        'subtype': 'safety_output',
+        'tag_original': 'MISSING-MODULE',
+        'label_original': 'MISSING-MODULE',
+        'description_original': 'Visible reference',
+        'function_text_original': 'OUTPUT',
+        'symbol_code': '',
+        'location_code': '',
+        'reference_value_original': '1',
+        'reference_context_original': 'sheet/grid',
+        'bbox_pt': [40, 10, 55, 20],
+        'source_glyph_ids': [2],
+        'source_word_ids': [2],
+        'confidence': 0.98,
+        'evidence_notes': 'fixture',
+    },
+]
+_graph_ref_edges = [
+    {
+        'edge_id': 'E-KEEP',
+        'source_occurrence_id': 'C1',
+        'target_occurrence_id': 'IO-MISSING',
+        'relation_type': 'electrically_connected_to',
+        'is_directed': False,
+        'potential_original': '',
+        'wire_reference_original': 'W1',
+        'bbox_pt': [20, 15, 40, 15],
+        'source_glyph_ids': [],
+        'source_drawing_ids': [1],
+        'source_link_ids': [],
+        'confidence': 0.98,
+        'evidence_notes': 'visible conductor',
+    },
+    {
+        'edge_id': 'E-REMOVE',
+        'source_occurrence_id': 'C1',
+        'target_occurrence_id': 'IO-MISSING',
+        'relation_type': 'controls',
+        'is_directed': True,
+        'potential_original': '',
+        'wire_reference_original': '',
+        'bbox_pt': [20, 10, 40, 20],
+        'source_glyph_ids': [],
+        'source_drawing_ids': [],
+        'source_link_ids': [9],
+        'confidence': 0.95,
+        'evidence_notes': 'not local conductor geometry',
+    },
+]
+_graph_ref_extraction = {
+    'page_id': 1,
+    'entities': _graph_ref_entities,
+    'edges': _graph_ref_edges,
+    'unresolved_visual_evidence': [
+        'Reference is printed but absent from certified registry.'
+    ],
+    'confidence': 0.98,
+    'issues': [],
+}
+_graph_ref_resolution = _graph_resolve_references(
+    _graph_ref_extraction,
+    {**_graph_registry, 'io': []},
+)
+assert _graph_ref_resolution[
+    'all_reference_entities_resolved_or_explicitly_unresolved'
+] is True, _graph_ref_resolution
+assert _graph_ref_resolution['unresolved_reference_entity_ids'] == [
+    'IO-MISSING'
+], _graph_ref_resolution
+_graph_ref_verifier = {
+    'page_id': 1,
+    'verdict': 'review_required',
+    'all_visible_entities_accounted_for': True,
+    'all_visible_connections_accounted_for': True,
+    'all_entity_text_visually_supported': False,
+    'all_connection_geometry_supported': False,
+    'all_references_resolved_or_explicitly_unresolved': True,
+    'duplicates_preserved': True,
+    'verified_entity_ids': ['C1'],
+    'verified_edge_ids': ['E-KEEP'],
+    'rejected_entity_ids': ['IO-MISSING'],
+    'rejected_edge_ids': ['E-REMOVE'],
+    'confidence': 0.96,
+    'issues': [
+        {
+            'issue_type': 'certified_registry_mismatch',
+            'severity': 'high',
+            'message': 'Visible reference has no certified registry row.',
+            'entity_ids': ['IO-MISSING'],
+            'edge_ids': ['E-KEEP'],
+            'confidence': 0.96,
+        },
+        {
+            'issue_type': 'topology_ambiguity',
+            'severity': 'high',
+            'message': 'Functional edge is not locally drawn.',
+            'entity_ids': ['C1'],
+            'edge_ids': ['E-REMOVE'],
+            'confidence': 0.96,
+        },
+    ],
+}
+_graph_ref_detector = copy.deepcopy(_graph_detector)
+_graph_ref_detector['regions'][0] = {
+    **_graph_ref_detector['regions'][0],
+    'region_kind': 'off_page_reference',
+    'visible_connection_count': 0,
+    'confidence': 0.86,
+}
+_graph_ref_passed, _graph_ref_final_entities, _graph_ref_final_edges, (
+    _graph_ref_issues
+) = _graph_validate_candidate(
+    page=_graph_page,
+    detector=_graph_ref_detector,
+    extraction=_graph_ref_extraction,
+    verifier=_graph_ref_verifier,
+    resolution=_graph_ref_resolution,
+    glyphs=_graph_glyphs,
+    words=_graph_words,
+    drawings=_graph_drawings,
+    links=[{'id': 9, 'bbox_pt': [20, 10, 40, 20]}],
+)
+assert _graph_ref_passed is True, _graph_ref_issues
+assert [x['occurrence_id'] for x in _graph_ref_final_entities] == [
+    'C1', 'IO-MISSING'
+]
+assert [x['edge_id'] for x in _graph_ref_final_edges] == ['E-KEEP']
+assert _graph_ref_extraction['post_verifier_adjudication'][
+    'preserved_unresolved_reference_ids'
+] == ['IO-MISSING']
+assert _graph_ref_extraction['post_verifier_adjudication'][
+    'removed_edge_ids'
+] == ['E-REMOVE']
+assert not [
+    issue for issue in _graph_ref_issues
+    if issue.get('severity') in {'high', 'critical'}
+], _graph_ref_issues
+
+# A rejected non-reference entity required by a surviving verified edge cannot
+# be silently removed.
+_graph_bad_entity_verifier = copy.deepcopy(_graph_verifier)
+_graph_bad_entity_verifier.update({
+    'verdict': 'review_required',
+    'verified_entity_ids': ['C1', 'IO1', 'T1', 'P1'],
+    'rejected_entity_ids': ['C2'],
+    'verified_edge_ids': ['E1'],
+    'rejected_edge_ids': [],
+    'issues': [{
+        'issue_type': 'entity_not_supported',
+        'severity': 'high',
+        'message': 'Entity is not visually supported.',
+        'entity_ids': ['C2'],
+        'edge_ids': ['E1'],
+        'confidence': 0.98,
+    }],
+})
+_graph_bad_entity_passed, _, _, _graph_bad_entity_issues = (
+    _graph_validate_candidate(
+        page=_graph_page,
+        detector=_graph_detector,
+        extraction=copy.deepcopy(_graph_extraction),
+        verifier=_graph_bad_entity_verifier,
+        resolution=_graph_resolution,
+        glyphs=_graph_glyphs,
+        words=_graph_words,
+        drawings=_graph_drawings,
+        links=[],
+    )
+)
+assert _graph_bad_entity_passed is False, _graph_bad_entity_issues
+assert any(
+    issue.get('issue_type')
+    == 'graph-rejected-entity-required-by-verified-edge'
+    for issue in _graph_bad_entity_issues
+), _graph_bad_entity_issues
+
+# Unresolved visual evidence remains blocking when independent coverage flags
+# are not all true.
+_graph_unaccounted_extraction = copy.deepcopy(_graph_extraction)
+_graph_unaccounted_extraction['unresolved_visual_evidence'] = [
+    'Unaccounted conductor.'
+]
+_graph_unaccounted_verifier = copy.deepcopy(_graph_verifier)
+_graph_unaccounted_verifier['all_visible_connections_accounted_for'] = False
+_graph_unaccounted_verifier['verdict'] = 'review_required'
+_graph_unaccounted_passed, _, _, _graph_unaccounted_issues = (
+    _graph_validate_candidate(
+        page=_graph_page,
+        detector=_graph_detector,
+        extraction=_graph_unaccounted_extraction,
+        verifier=_graph_unaccounted_verifier,
+        resolution=_graph_resolution,
+        glyphs=_graph_glyphs,
+        words=_graph_words,
+        drawings=_graph_drawings,
+        links=[],
+    )
+)
+assert _graph_unaccounted_passed is False, _graph_unaccounted_issues
+assert any(
+    issue.get('issue_type') == 'graph-unresolved-visual-evidence'
+    for issue in _graph_unaccounted_issues
+), _graph_unaccounted_issues
 
 required = {
     '/v1/ai/electrical/normalize',
