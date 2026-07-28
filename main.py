@@ -48,6 +48,7 @@ from electrical_bom import (
 from electrical_graph import (
     get_electrical_graph_runtime_config,
     extract_electrical_graph_page,
+    list_electrical_graph_pages,
 )
 
 from electrical_source_store import (
@@ -341,6 +342,13 @@ class ElectricalGraphExtractRequest(BaseModel):
     version_id: Optional[int] = None
     pdf_page_numbers: Optional[List[int]] = None
     force: Optional[bool] = False
+
+class ElectricalGraphPlanRequest(BaseModel):
+    company_id: str
+    machine_id: str
+    bubble_document_id: str
+    version_id: Optional[int] = None
+    include_passed: Optional[bool] = True
 
 class ElectricalSourceSnapshotRequest(BaseModel):
     company_id: str
@@ -19987,6 +19995,45 @@ def smart_diagnostic_finalize_v1(
         rg_links=rg_links,
         debug=bool(payload.debug),
     )
+
+@app.post("/v1/ai/electrical/graph-plan")
+def electrical_graph_plan(
+    payload: ElectricalGraphPlanRequest,
+    x_ai_internal_secret: Optional[str] = Header(default=None),
+):
+    """Read-only resumable plan for the external graph batch runner."""
+    if not AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=500, detail="AI_INTERNAL_SECRET missing")
+    if (x_ai_internal_secret or "").strip() != AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    company_id = str(payload.company_id or "").strip()
+    machine_id = str(payload.machine_id or "").strip()
+    bubble_document_id = str(payload.bubble_document_id or "").strip()
+    if not (company_id and machine_id and bubble_document_id):
+        raise HTTPException(
+            status_code=400,
+            detail="company_id, machine_id and bubble_document_id are required",
+        )
+    try:
+        result = list_electrical_graph_pages(
+            company_id=company_id,
+            machine_id=machine_id,
+            bubble_document_id=bubble_document_id,
+            version_id=payload.version_id,
+            include_passed=bool(payload.include_passed),
+        )
+        return {"ok": True, **result}
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Electrical graph plan failed: {str(e)[:1000]}",
+        )
+
 
 @app.post("/v1/ai/electrical/extract-graph")
 def extract_electrical_graph_document(

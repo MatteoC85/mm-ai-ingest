@@ -14,10 +14,12 @@ import requests
 
 from electrical_source_store import download_electrical_source_pdf
 
-# MachineMind Phase 2G V1.2
-# Page-atomic, multimodal electrical graph extraction.
+# MachineMind Phase 2G V2
+# Page-atomic, multimodal electrical graph extraction with evidence ownership.
 # The deterministic layer is geometry/evidence based and contains no page,
 # language, font, manufacturer, component-tag or drawing-template dictionary.
+# Batch orchestration remains outside the page transaction so every page is
+# independently resumable and fail-closed.
 
 
 def _env_int(name: str, default: int, minimum: int = 1, maximum: int = 1_000_000) -> int:
@@ -80,7 +82,7 @@ VERIFIER_PROMPT_VERSION = (
 ).strip()
 MATERIALIZER_VERSION = (
     os.environ.get("MM_ELECTRICAL_GRAPH_MATERIALIZER_VERSION")
-    or "mm-electrical-graph-materializer-v1.2"
+    or "mm-electrical-graph-materializer-v2"
 ).strip()
 
 OPENAI_TIMEOUT_SECONDS = _env_int(
@@ -123,7 +125,7 @@ MAX_DRAWINGS_IN_PROMPT = _env_int(
     "MM_ELECTRICAL_GRAPH_MAX_DRAWINGS_IN_PROMPT", 3000, 100, 10000
 )
 
-PIPELINE_MARKER = "phase2-graph-v1.2-evidence-recovery-source-snapshot"
+PIPELINE_MARKER = "phase2-graph-v2-evidence-owned-batch-source-snapshot"
 MATERIALIZATION_PHASE = "graph_vision_v1"
 EXTRACTION_METHOD = "openai_vision_graph_v1"
 PAGE_TYPE = "schematic"
@@ -212,6 +214,33 @@ VISUAL_EVIDENCE_STATUSES = {
     "recovered_edge",
     "still_unresolved",
 }
+
+# Only these fields claim literal printed source text. Description/function
+# fields are semantic annotations produced from the image and may describe a
+# graphic-only symbol without pretending that those words are printed nearby.
+SOURCE_VISIBLE_ENTITY_TEXT_FIELDS = (
+    "tag_original",
+    "label_original",
+    "location_code",
+    "reference_value_original",
+    "reference_context_original",
+)
+SEMANTIC_ENTITY_ANNOTATION_FIELDS = (
+    "description_original",
+    "function_text_original",
+    "subtype",
+    "symbol_code",
+)
+ENTITY_BBOX_RECONCILIATION_VERSION = (
+    "graph-entity-bbox-from-source-evidence-v2"
+)
+EDGE_BBOX_RECONCILIATION_VERSION = (
+    "graph-edge-bbox-from-source-evidence-v2"
+)
+NONMATERIALIZABLE_CONTEXT_VERSION = (
+    "graph-nonmaterializable-context-links-v2"
+)
+REVIEW_GROUPING_VERSION = "graph-review-signature-v1"
 
 
 def get_electrical_graph_runtime_config() -> dict:
@@ -922,6 +951,184 @@ def _load_context(
         conn.close()
 
 
+
+def list_electrical_graph_pages(
+    *,
+    company_id: str,
+    machine_id: str,
+    bubble_document_id: str,
+    version_id: Optional[int] = None,
+    include_passed: bool = True,
+) -> dict:
+    """Return a read-only, resumable page plan for external batch runners."""
+    company_id = _clean_text(company_id, 300)
+    machine_id = _clean_text(machine_id, 300)
+    bubble_document_id = _clean_text(bubble_document_id, 300)
+    if not (company_id and machine_id and bubble_document_id):
+        raise ValueError(
+            "company_id, machine_id and bubble_document_id are required"
+        )
+
+    conn = _db_conn()
+    try:
+        with conn.cursor() as cur:
+            params: list[Any] = [company_id, machine_id, bubble_document_id]
+            version_clause = ""
+            if version_id is not None:
+                version_clause = "AND v.id=%s"
+                params.append(int(version_id))
+            cur.execute(
+                f"""
+                SELECT v.id, v.version_no, v.status, v.metadata
+                FROM public.electrical_versions v
+                WHERE v.company_id=%s
+                  AND v.machine_id=%s
+                  AND v.bubble_document_id=%s
+                  {version_clause}
+                ORDER BY v.version_no DESC
+                LIMIT 1;
+                """,
+                params,
+            )
+            version_row = cur.fetchone()
+            if not version_row:
+                raise ValueError(
+                    "Electrical version not found for supplied scope"
+                )
+            resolved_version_id = int(version_row[0])
+            metadata = _json_obj(version_row[3], {}) or {}
+            page_results = metadata.get("graph_page_results") or {}
+            if not isinstance(page_results, dict):
+                page_results = {}
+
+            cur.execute(
+                """
+                SELECT
+                    p.id,
+                    p.pdf_page_number,
+                    p.sheet_code,
+                    p.sheet_title,
+                    p.group_code,
+                    p.page_width_pt,
+                    p.page_height_pt,
+                    p.classification_language,
+                    p.semantic_confidence,
+                    LENGTH(COALESCE(p.raw_text, '')),
+                    jsonb_array_length(
+                        COALESCE(p.text_spans_json, '[]'::jsonb)
+                    ),
+                    jsonb_array_length(
+                        COALESCE(p.links_json, '[]'::jsonb)
+                    ),
+                    (
+                        SELECT COUNT(*)
+                        FROM public.electrical_entities e
+                        WHERE e.version_id=p.version_id
+                          AND e.page_id=p.id
+                          AND e.properties ->> 'phase'=%s
+                    ) AS published_entity_rows,
+                    (
+                        SELECT COUNT(*)
+                        FROM public.electrical_edges ed
+                        WHERE ed.version_id=p.version_id
+                          AND ed.page_id=p.id
+                          AND ed.properties ->> 'phase'=%s
+                    ) AS published_edge_rows
+                FROM public.electrical_pages p
+                WHERE p.version_id=%s
+                  AND p.page_type=%s
+                ORDER BY p.pdf_page_number;
+                """,
+                (
+                    MATERIALIZATION_PHASE,
+                    MATERIALIZATION_PHASE,
+                    resolved_version_id,
+                    PAGE_TYPE,
+                ),
+            )
+            pages: list[dict] = []
+            for row in cur.fetchall():
+                pdf_page_number = int(row[1])
+                result = page_results.get(str(pdf_page_number)) or {}
+                if not isinstance(result, dict):
+                    result = {}
+                page_passed = bool(result.get("page_passed"))
+                status = (
+                    "passed"
+                    if page_passed
+                    else (
+                        "review_required"
+                        if str(pdf_page_number) in page_results
+                        else "not_started"
+                    )
+                )
+                if status == "passed" and not include_passed:
+                    continue
+                pages.append({
+                    "page_id": int(row[0]),
+                    "pdf_page_number": pdf_page_number,
+                    "sheet_code": str(row[2] or ""),
+                    "sheet_title": str(row[3] or ""),
+                    "group_code": str(row[4] or ""),
+                    "page_width_pt": float(row[5] or 0.0),
+                    "page_height_pt": float(row[6] or 0.0),
+                    "language": str(row[7] or "unknown"),
+                    "semantic_confidence": float(row[8] or 0.0),
+                    "raw_text_chars": int(row[9] or 0),
+                    "vector_word_count": int(row[10] or 0),
+                    "stored_link_count": int(row[11] or 0),
+                    "published_entity_rows": int(row[12] or 0),
+                    "published_edge_rows": int(row[13] or 0),
+                    "status": status,
+                    "page_passed": page_passed,
+                    "result_pipeline_marker": str(
+                        result.get("pipeline_marker") or ""
+                    ),
+                    "result_materializer_version": str(
+                        result.get("materializer_version") or ""
+                    ),
+                    "blocking_issue_count": int(
+                        result.get("blocking_issue_count") or 0
+                    ),
+                    "blocking_issue_type_counts": result.get(
+                        "blocking_issue_type_counts"
+                    ) or {},
+                    "review_signature": str(
+                        result.get("review_signature") or ""
+                    ),
+                    "updated_at": str(result.get("updated_at") or ""),
+                })
+
+            counts = {
+                "total": len(pages) if include_passed else int(
+                    sum(1 for _ in pages)
+                ),
+                "passed": sum(1 for page in pages if page["status"] == "passed"),
+                "review_required": sum(
+                    1 for page in pages
+                    if page["status"] == "review_required"
+                ),
+                "not_started": sum(
+                    1 for page in pages if page["status"] == "not_started"
+                ),
+            }
+            return {
+                "electrical_version_id": resolved_version_id,
+                "electrical_version_no": int(version_row[1]),
+                "version_status": str(version_row[2] or ""),
+                "graph_status": str(
+                    metadata.get("graph_structured_status") or "not_started"
+                ),
+                "graph_pipeline_marker": PIPELINE_MARKER,
+                "graph_materializer_version": MATERIALIZER_VERSION,
+                "include_passed": bool(include_passed),
+                "counts": counts,
+                "pages": pages,
+            }
+    finally:
+        conn.close()
+
+
 def _fetch_source_pdf(context: dict) -> tuple[bytes, fitz.Document]:
     expected_sha = str(context.get("source_sha256") or "").strip().lower()
     snapshot_uri = str(context.get("source_snapshot_uri") or "").strip()
@@ -1209,6 +1416,277 @@ def _drawing_registry(source_page: fitz.Page) -> list[dict]:
             "has_fill": drawing.get("fill") is not None,
         })
     return output
+
+
+
+def _registry_bbox_map(items: list[dict], id_field: str) -> dict[int, list[float]]:
+    output: dict[int, list[float]] = {}
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            item_id = int(item.get(id_field))
+            bbox = [float(value) for value in (item.get("bbox_pt") or [])]
+        except Exception:
+            continue
+        if len(bbox) != 4:
+            continue
+        x0, y0, x1, y1 = bbox
+        if not all(math.isfinite(value) for value in bbox):
+            continue
+        output[item_id] = [x0, y0, x1, y1]
+    return output
+
+
+def _evidence_bbox(
+    *,
+    ids: set[int],
+    bbox_map: dict[int, list[float]],
+    page: dict,
+    minimum_extent: float = 1.0,
+    margin: float = 1.25,
+) -> Optional[list[float]]:
+    rects: list[fitz.Rect] = []
+    for item_id in sorted(ids):
+        bbox = bbox_map.get(int(item_id))
+        if not bbox:
+            continue
+        try:
+            rect = fitz.Rect(*bbox)
+        except Exception:
+            continue
+        # A line drawing can legitimately have zero width or height. Keep it
+        # as evidence and give the final ownership rectangle a tiny extent.
+        if rect.x1 < rect.x0:
+            rect.x0, rect.x1 = rect.x1, rect.x0
+        if rect.y1 < rect.y0:
+            rect.y0, rect.y1 = rect.y1, rect.y0
+        rects.append(rect)
+    if not rects:
+        return None
+
+    union = fitz.Rect(rects[0])
+    for rect in rects[1:]:
+        union.include_rect(rect)
+
+    if union.width < minimum_extent:
+        center = (union.x0 + union.x1) / 2.0
+        union.x0 = center - minimum_extent / 2.0
+        union.x1 = center + minimum_extent / 2.0
+    if union.height < minimum_extent:
+        center = (union.y0 + union.y1) / 2.0
+        union.y0 = center - minimum_extent / 2.0
+        union.y1 = center + minimum_extent / 2.0
+
+    union.x0 -= margin
+    union.y0 -= margin
+    union.x1 += margin
+    union.y1 += margin
+
+    page_width = float(page.get("page_width_pt") or 0.0)
+    page_height = float(page.get("page_height_pt") or 0.0)
+    if page_width > 0.0:
+        union.x0 = max(0.0, min(page_width, union.x0))
+        union.x1 = max(0.0, min(page_width, union.x1))
+    if page_height > 0.0:
+        union.y0 = max(0.0, min(page_height, union.y0))
+        union.y1 = max(0.0, min(page_height, union.y1))
+    if union.x1 <= union.x0 or union.y1 <= union.y0:
+        return None
+    return _rect_list(union, 3)
+
+
+def _reconcile_graph_geometry_from_evidence(
+    *,
+    page: dict,
+    entities: list[dict],
+    edges: list[dict],
+    glyphs: list[dict],
+    words: list[dict],
+    drawings: list[dict],
+) -> tuple[dict, list[dict]]:
+    """Repair only invalid candidate geometry from exact cited source evidence.
+
+    AI bboxes are advisory. Ownership is established by the source registries:
+    glyph/word rectangles for text-bearing occurrences and drawing rectangles
+    for symbols/conductors. Valid original-PDF bboxes are never changed.
+    """
+    issues: list[dict] = []
+    glyph_map = _registry_bbox_map(glyphs, "glyph_id")
+    word_map = _registry_bbox_map(words, "word_id")
+    drawing_map = _registry_bbox_map(drawings, "drawing_id")
+    entity_audit: list[dict] = []
+    edge_audit: list[dict] = []
+
+    for entity in entities:
+        occurrence_id = _clean_text(entity.get("occurrence_id"), 160)
+        original = list(entity.get("bbox_pt") or [])
+        if _bbox_valid(original, page):
+            entity_audit.append({
+                "occurrence_id": occurrence_id,
+                "reason": "original_pdf_point_bbox_valid",
+                "original_bbox_pt": original,
+                "final_bbox_pt": original,
+                "validated": True,
+            })
+            continue
+
+        glyph_ids = {
+            int(value) for value in (entity.get("source_glyph_ids") or [])
+            if isinstance(value, int) or str(value).isdigit()
+        }
+        word_ids = {
+            int(value) for value in (entity.get("source_word_ids") or [])
+            if isinstance(value, int) or str(value).isdigit()
+        }
+        drawing_ids = {
+            int(value) for value in (entity.get("source_drawing_ids") or [])
+            if isinstance(value, int) or str(value).isdigit()
+        }
+        source_rects: list[list[float]] = []
+        for ids, bbox_map in (
+            (glyph_ids, glyph_map),
+            (word_ids, word_map),
+            (drawing_ids, drawing_map),
+        ):
+            candidate = _evidence_bbox(
+                ids=ids,
+                bbox_map=bbox_map,
+                page=page,
+            )
+            if candidate:
+                source_rects.append(candidate)
+        final_bbox = None
+        if source_rects:
+            rect = fitz.Rect(*source_rects[0])
+            for candidate in source_rects[1:]:
+                rect.include_rect(fitz.Rect(*candidate))
+            final_bbox = _rect_list(rect, 3)
+        validated = bool(final_bbox and _bbox_valid(final_bbox, page))
+        if validated:
+            entity["bbox_pt"] = final_bbox
+            entity["bbox_reconciliation"] = {
+                "version": ENTITY_BBOX_RECONCILIATION_VERSION,
+                "original_bbox_pt": original,
+                "final_bbox_pt": final_bbox,
+                "source_glyph_ids": sorted(glyph_ids),
+                "source_word_ids": sorted(word_ids),
+                "source_drawing_ids": sorted(drawing_ids),
+                "validated": True,
+            }
+            issues.append(_local_issue(
+                issue_type="graph-entity-bbox-reconciled-from-evidence",
+                message=(
+                    "Invalid candidate entity geometry was replaced by the "
+                    "union of its exact source evidence in original PDF points"
+                ),
+                entity_ids=[occurrence_id] if occurrence_id else [],
+                confidence=entity.get("confidence") or 0.0,
+                severity="info",
+                source_stage="source_evidence_geometry_adjudicator",
+            ))
+        entity_audit.append({
+            "occurrence_id": occurrence_id,
+            "reason": (
+                "invalid_candidate_rebuilt_from_source_evidence"
+                if validated else "invalid_candidate_without_repairable_evidence"
+            ),
+            "original_bbox_pt": original,
+            "final_bbox_pt": final_bbox or original,
+            "validated": validated,
+        })
+
+    for edge in edges:
+        edge_id = _clean_text(edge.get("edge_id"), 160)
+        original = list(edge.get("bbox_pt") or [])
+        if _edge_bbox_valid(original, page):
+            edge_audit.append({
+                "edge_id": edge_id,
+                "reason": "original_pdf_point_bbox_valid",
+                "original_bbox_pt": original,
+                "final_bbox_pt": original,
+                "validated": True,
+            })
+            continue
+        drawing_ids = {
+            int(value) for value in (edge.get("source_drawing_ids") or [])
+            if isinstance(value, int) or str(value).isdigit()
+        }
+        glyph_ids = {
+            int(value) for value in (edge.get("source_glyph_ids") or [])
+            if isinstance(value, int) or str(value).isdigit()
+        }
+        candidates: list[list[float]] = []
+        for ids, bbox_map in (
+            (drawing_ids, drawing_map),
+            (glyph_ids, glyph_map),
+        ):
+            candidate = _evidence_bbox(
+                ids=ids,
+                bbox_map=bbox_map,
+                page=page,
+                minimum_extent=0.5,
+                margin=0.5,
+            )
+            if candidate:
+                candidates.append(candidate)
+        final_bbox = None
+        if candidates:
+            rect = fitz.Rect(*candidates[0])
+            for candidate in candidates[1:]:
+                rect.include_rect(fitz.Rect(*candidate))
+            final_bbox = _rect_list(rect, 3)
+        validated = bool(final_bbox and _edge_bbox_valid(final_bbox, page))
+        if validated:
+            edge["bbox_pt"] = final_bbox
+            edge["bbox_reconciliation"] = {
+                "version": EDGE_BBOX_RECONCILIATION_VERSION,
+                "original_bbox_pt": original,
+                "final_bbox_pt": final_bbox,
+                "source_glyph_ids": sorted(glyph_ids),
+                "source_drawing_ids": sorted(drawing_ids),
+                "validated": True,
+            }
+            issues.append(_local_issue(
+                issue_type="graph-edge-bbox-reconciled-from-evidence",
+                message=(
+                    "Invalid candidate edge geometry was replaced by the union "
+                    "of exact local drawing evidence"
+                ),
+                edge_ids=[edge_id] if edge_id else [],
+                confidence=edge.get("confidence") or 0.0,
+                severity="info",
+                source_stage="source_evidence_geometry_adjudicator",
+            ))
+        edge_audit.append({
+            "edge_id": edge_id,
+            "reason": (
+                "invalid_candidate_rebuilt_from_source_evidence"
+                if validated else "invalid_candidate_without_repairable_evidence"
+            ),
+            "original_bbox_pt": original,
+            "final_bbox_pt": final_bbox or original,
+            "validated": validated,
+        })
+
+    return {
+        "version": "graph-source-evidence-geometry-reconciliation-v2",
+        "entity_reconciliations": entity_audit,
+        "edge_reconciliations": edge_audit,
+        "reconciled_entity_count": sum(
+            1 for item in entity_audit
+            if item.get("reason") == "invalid_candidate_rebuilt_from_source_evidence"
+            and item.get("validated")
+        ),
+        "reconciled_edge_count": sum(
+            1 for item in edge_audit
+            if item.get("reason") == "invalid_candidate_rebuilt_from_source_evidence"
+            and item.get("validated")
+        ),
+        "validated": all(
+            item.get("validated") for item in entity_audit + edge_audit
+        ),
+    }, issues
 
 
 def _render_page(source_doc: fitz.Document, page_index: int, rotation: int) -> bytes:
@@ -2927,28 +3405,32 @@ def _apply_verifier_evidence_recovery(
                 confidence=confidence,
             ))
             entity_problem = True
-        substantive_text = any(
-            _clean_text(entity.get(field), 1000)
-            for field in (
-                "tag_original",
-                "label_original",
-                "description_original",
-                "function_text_original",
-                "reference_value_original",
-            )
-        )
-        if substantive_text and not (glyph_ids or word_ids):
+        visible_source_text_fields = [
+            field for field in SOURCE_VISIBLE_ENTITY_TEXT_FIELDS
+            if _clean_text(entity.get(field), 1000)
+        ]
+        semantic_annotation_fields = [
+            field for field in SEMANTIC_ENTITY_ANNOTATION_FIELDS
+            if _clean_text(entity.get(field), 1000)
+        ]
+        if visible_source_text_fields and not (glyph_ids or word_ids):
             issues.append(_local_issue(
                 issue_type="graph-recovery-entity-text-evidence-missing",
-                message="Recovery entity has visible text without glyph or word evidence",
+                message=(
+                    "Recovery entity claims literal printed text without exact "
+                    "glyph or word evidence"
+                ),
                 entity_ids=[occurrence_id] if occurrence_id else [],
                 confidence=confidence,
             ))
             entity_problem = True
-        if not substantive_text and not drawing_ids:
+        if not visible_source_text_fields and not drawing_ids:
             issues.append(_local_issue(
                 issue_type="graph-recovery-graphic-evidence-missing",
-                message="Graphic-only recovery entity has no exact source drawing evidence",
+                message=(
+                    "Graphic-only recovery entity has no exact source drawing "
+                    "evidence"
+                ),
                 entity_ids=[occurrence_id] if occurrence_id else [],
                 confidence=confidence,
             ))
@@ -2983,6 +3465,13 @@ def _apply_verifier_evidence_recovery(
         entity["recovery_evidence"] = {
             "version": VERIFIER_EVIDENCE_RECOVERY_VERSION,
             "source": "independent_verifier",
+            "visible_source_text_fields": visible_source_text_fields,
+            "semantic_annotation_fields": semantic_annotation_fields,
+            "text_evidence_mode": (
+                "literal_source_text"
+                if visible_source_text_fields
+                else "graphic_with_semantic_annotation"
+            ),
             "validated": True,
         }
         recovered_entities.append(entity)
@@ -3219,12 +3708,23 @@ def _apply_verifier_evidence_recovery(
                 row_problem = True
             referenced_recovery_edges.update(edge_ids)
         elif status == "accounted_non_materializable":
-            if entity_ids or edge_ids:
+            # Context links are audit pointers only: they explain where an
+            # annotation/boundary belongs without creating a new entity/edge.
+            # They are valid only when every cited ID already exists in the
+            # final graph.
+            invalid_context_entities = entity_ids - merged_entity_ids
+            invalid_context_edges = edge_ids - existing_edge_ids
+            if invalid_context_entities or invalid_context_edges:
                 issues.append(_local_issue(
-                    issue_type="graph-visual-evidence-nonmaterializable-link-invalid",
-                    message="Non-materializable evidence must not fabricate entity or edge links",
-                    entity_ids=sorted(entity_ids),
-                    edge_ids=sorted(edge_ids),
+                    issue_type=(
+                        "graph-visual-evidence-nonmaterializable-context-invalid"
+                    ),
+                    message=(
+                        "Non-materializable evidence cites context IDs absent "
+                        "from the final graph"
+                    ),
+                    entity_ids=sorted(invalid_context_entities),
+                    edge_ids=sorted(invalid_context_edges),
                     confidence=confidence,
                 ))
                 row_problem = True
@@ -3245,6 +3745,15 @@ def _apply_verifier_evidence_recovery(
             "related_edge_ids": sorted(edge_ids),
             "confidence": confidence,
             "reason": _clean_text(item.get("reason"), 1600),
+            "context_link_policy": (
+                {
+                    "version": NONMATERIALIZABLE_CONTEXT_VERSION,
+                    "materializes_new_graph_items": False,
+                    "validated_existing_context_only": not row_problem,
+                }
+                if status == "accounted_non_materializable"
+                else {}
+            ),
             "validated": not row_problem,
         })
 
@@ -3711,6 +4220,18 @@ def _validate_candidate_graph(
     )
     adjudication["verifier_evidence_recovery"] = recovery_audit
     extraction["verifier_evidence_recovery"] = recovery_audit
+
+    geometry_audit, geometry_issues = _reconcile_graph_geometry_from_evidence(
+        page=page,
+        entities=entities,
+        edges=edges,
+        glyphs=glyphs,
+        words=words,
+        drawings=drawings,
+    )
+    issues.extend(geometry_issues)
+    adjudication["source_evidence_geometry_reconciliation"] = geometry_audit
+    extraction["source_evidence_geometry_reconciliation"] = geometry_audit
     extraction["post_verifier_adjudication"] = adjudication
 
     region_bbox_audit, region_bbox_issues = (
@@ -3933,23 +4454,35 @@ def _validate_candidate_graph(
                 occurrence_id,
                 confidence,
             )
-        substantive_text = any(
-            _clean_text(entity.get(field), 1000)
-            for field in (
-                "tag_original",
-                "label_original",
-                "description_original",
-                "function_text_original",
-                "reference_value_original",
-            )
-        )
-        if substantive_text and not (source_glyph_ids or source_word_ids):
+        visible_source_text_fields = [
+            field for field in SOURCE_VISIBLE_ENTITY_TEXT_FIELDS
+            if _clean_text(entity.get(field), 1000)
+        ]
+        if visible_source_text_fields and not (
+            source_glyph_ids or source_word_ids
+        ):
             entity_fail(
                 "graph-entity-text-evidence-missing",
-                f"Entity {occurrence_id} has text without source evidence",
+                (
+                    f"Entity {occurrence_id} claims literal printed text "
+                    "without source glyph/word evidence"
+                ),
                 occurrence_id,
                 confidence,
             )
+        entity["source_text_evidence_policy"] = {
+            "version": "graph-source-visible-text-fields-v2",
+            "visible_source_text_fields": visible_source_text_fields,
+            "semantic_annotation_fields": [
+                field for field in SEMANTIC_ENTITY_ANNOTATION_FIELDS
+                if _clean_text(entity.get(field), 1000)
+            ],
+            "validated": bool(
+                not visible_source_text_fields
+                or source_glyph_ids
+                or source_word_ids
+            ),
+        }
         if entity_type in COMPONENT_ENTITY_TYPES and not _clean_text(
             entity.get("tag_original"), 500
         ):
@@ -4456,6 +4989,10 @@ def _build_materialization_plan(
                 "source_word_ids": entity.get("source_word_ids") or [],
                 "source_drawing_ids": entity.get("source_drawing_ids") or [],
                 "recovery_evidence": entity.get("recovery_evidence") or {},
+                "bbox_reconciliation": entity.get("bbox_reconciliation") or {},
+                "source_text_evidence_policy": entity.get(
+                    "source_text_evidence_policy"
+                ) or {},
                 "evidence_notes": entity.get("evidence_notes") or "",
                 "reference_resolution": {
                     key: (resolution_by_id.get(occurrence_id) or {}).get(key)
@@ -4755,6 +5292,7 @@ def _build_materialization_plan(
                 "source_drawing_ids": edge.get("source_drawing_ids") or [],
                 "source_link_ids": edge.get("source_link_ids") or [],
                 "recovery_evidence": edge.get("recovery_evidence") or {},
+                "bbox_reconciliation": edge.get("bbox_reconciliation") or {},
                 "evidence_notes": edge.get("evidence_notes") or "",
                 "detector_fingerprint": detector_fingerprint,
                 "extractor_fingerprint": extractor_fingerprint,
@@ -5091,6 +5629,9 @@ def _db_update_version_state(
     blocking_count: int,
     post_verifier_adjudication: Optional[dict] = None,
     reference_resolution: Optional[dict] = None,
+    issue_type_counts: Optional[dict] = None,
+    blocking_issue_type_counts: Optional[dict] = None,
+    review_signature: str = "",
 ) -> dict:
     conn = _db_conn()
     try:
@@ -5160,6 +5701,32 @@ def _db_update_version_state(
                     ).get("adjudicated_region_count")
                     or 0
                 ),
+                "source_evidence_geometry_validated": bool(
+                    (
+                        adjudication.get(
+                            "source_evidence_geometry_reconciliation"
+                        )
+                        or {}
+                    ).get("validated")
+                ),
+                "reconciled_entity_bbox_count": int(
+                    (
+                        adjudication.get(
+                            "source_evidence_geometry_reconciliation"
+                        )
+                        or {}
+                    ).get("reconciled_entity_count")
+                    or 0
+                ),
+                "reconciled_edge_bbox_count": int(
+                    (
+                        adjudication.get(
+                            "source_evidence_geometry_reconciliation"
+                        )
+                        or {}
+                    ).get("reconciled_edge_count")
+                    or 0
+                ),
                 "unresolved_reference_entity_ids": resolution.get(
                     "unresolved_reference_entity_ids"
                 ) or [],
@@ -5169,6 +5736,11 @@ def _db_update_version_state(
                 "reference_match_counts": resolution.get(
                     "match_counts"
                 ) or {},
+                "issue_type_counts": issue_type_counts or {},
+                "blocking_issue_type_counts": (
+                    blocking_issue_type_counts or {}
+                ),
+                "review_signature": review_signature or "",
                 "pipeline_marker": PIPELINE_MARKER,
                 "materializer_version": MATERIALIZER_VERSION,
                 "updated_at": datetime.utcnow().isoformat() + "Z",
@@ -5178,14 +5750,20 @@ def _db_update_version_state(
                 for value in page_results.values()
                 if isinstance(value, dict) and value.get("page_passed")
             )
-            total_pages = int(context["all_graph_pages_total"])
-            graph_status = (
-                "graph_ready"
-                if passed_pages == total_pages and total_pages > 0
-                else ("partial" if passed_pages > 0 else "review_required")
+            review_pages = sum(
+                1
+                for value in page_results.values()
+                if isinstance(value, dict) and not value.get("page_passed")
             )
-            if not page_passed:
+            total_pages = int(context["all_graph_pages_total"])
+            if passed_pages == total_pages and total_pages > 0:
+                graph_status = "graph_ready"
+            elif review_pages > 0:
                 graph_status = "review_required"
+            elif passed_pages > 0:
+                graph_status = "partial"
+            else:
+                graph_status = "not_started"
 
             cur.execute(
                 """
@@ -5215,7 +5793,11 @@ def _db_update_version_state(
             metadata["graph_entities"] = entity_count
             metadata["graph_edges"] = edge_count
 
-            version_status = "queued" if page_passed else "review_required"
+            version_status = (
+                "review_required"
+                if graph_status == "review_required"
+                else "queued"
+            )
             cur.execute(
                 """
                 UPDATE public.electrical_versions
@@ -5318,6 +5900,82 @@ def _severity_counts(issues: list[dict]) -> dict:
         )
         for severity in sorted(SEVERITIES)
     }
+
+
+
+def _issue_type_counts(
+    issues: list[dict],
+    *,
+    blocking_only: bool = False,
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for issue in issues or []:
+        if blocking_only and issue.get("severity") not in {"high", "critical"}:
+            continue
+        issue_type = _clean_text(issue.get("issue_type"), 180) or "unknown"
+        counts[issue_type] = counts.get(issue_type, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _blocking_issue_summary(issues: list[dict]) -> list[dict]:
+    grouped: dict[tuple[str, str], dict] = {}
+    for issue in issues or []:
+        if issue.get("severity") not in {"high", "critical"}:
+            continue
+        issue_type = _clean_text(issue.get("issue_type"), 180) or "unknown"
+        source_stage = _clean_text(issue.get("source_stage"), 120) or "unknown"
+        key = (issue_type, source_stage)
+        row = grouped.setdefault(key, {
+            "issue_type": issue_type,
+            "source_stage": source_stage,
+            "severity": issue.get("severity") or "high",
+            "count": 0,
+            "entity_ids": set(),
+            "edge_ids": set(),
+            "sample_message": _clean_text(issue.get("message"), 500),
+        })
+        row["count"] += 1
+        row["entity_ids"].update(issue.get("entity_ids") or [])
+        row["edge_ids"].update(issue.get("edge_ids") or [])
+        if issue.get("severity") == "critical":
+            row["severity"] = "critical"
+    output: list[dict] = []
+    for key in sorted(grouped):
+        row = grouped[key]
+        output.append({
+            **{k: v for k, v in row.items() if k not in {"entity_ids", "edge_ids"}},
+            "entity_ids": sorted(row["entity_ids"])[:60],
+            "edge_ids": sorted(row["edge_ids"])[:60],
+        })
+    return output
+
+
+def _review_signature(issues: list[dict]) -> str:
+    blocking = [
+        {
+            "issue_type": _clean_text(issue.get("issue_type"), 180),
+            "source_stage": _clean_text(issue.get("source_stage"), 120),
+            "severity": _clean_text(issue.get("severity"), 30),
+        }
+        for issue in issues or []
+        if issue.get("severity") in {"high", "critical"}
+    ]
+    if not blocking:
+        return "pass"
+    raw = json.dumps(
+        sorted(
+            blocking,
+            key=lambda item: (
+                item["issue_type"],
+                item["source_stage"],
+                item["severity"],
+            ),
+        ),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
 
 
 def extract_electrical_graph_page(
@@ -5620,6 +6278,13 @@ def extract_electrical_graph_page(
         warning = sum(
             1 for issue in issues if issue.get("severity") == "warning"
         )
+        issue_type_counts = _issue_type_counts(issues)
+        blocking_issue_type_counts = _issue_type_counts(
+            issues,
+            blocking_only=True,
+        )
+        review_signature = _review_signature(issues)
+        blocking_issue_summary = _blocking_issue_summary(issues)
         state = _db_update_version_state(
             context=context,
             page=page,
@@ -5631,6 +6296,9 @@ def extract_electrical_graph_page(
                 "post_verifier_adjudication"
             ) or {},
             reference_resolution=resolution,
+            issue_type_counts=issue_type_counts,
+            blocking_issue_type_counts=blocking_issue_type_counts,
+            review_signature=review_signature,
         )
 
         entity_type_counts: dict[str, int] = {}
@@ -5649,6 +6317,8 @@ def extract_electrical_graph_page(
             "sheet_code": page["sheet_code"],
             "sheet_title": page["sheet_title"],
             "page_type": page["page_type"],
+            "graph_pipeline_marker": PIPELINE_MARKER,
+            "graph_materializer_version": MATERIALIZER_VERSION,
             "language": detector.get("language")
             or page.get("classification_language"),
             "page_passed": bool(page_passed),
@@ -5659,6 +6329,11 @@ def extract_electrical_graph_page(
             "blocking_issue_count_this_page": blocking,
             "warning_issue_count_this_page": warning,
             "severity_counts": _severity_counts(issues),
+            "issue_type_counts": issue_type_counts,
+            "blocking_issue_type_counts": blocking_issue_type_counts,
+            "blocking_issue_summary": blocking_issue_summary,
+            "review_signature_version": REVIEW_GROUPING_VERSION,
+            "review_signature": review_signature,
             "entity_type_counts": entity_type_counts,
             "relation_type_counts": relation_type_counts,
             "reference_resolution": {
@@ -5695,6 +6370,9 @@ def extract_electrical_graph_page(
             ) or {},
             "region_bbox_adjudication": extraction.get(
                 "region_bbox_adjudication"
+            ) or {},
+            "source_evidence_geometry_reconciliation": extraction.get(
+                "source_evidence_geometry_reconciliation"
             ) or {},
             "raw_extracted_entity_count": len(
                 extraction.get("entities") or []

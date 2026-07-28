@@ -2757,8 +2757,10 @@ assert _v2_alias_verifier['field_overrides'][0]['row_id'] == 'ROW_R003'
 # Phase 2G V1: font-independent character evidence, exact reference
 # resolution and fail-closed electrical topology validation.
 from electrical_graph import (
+    _apply_verifier_evidence_recovery as _graph_apply_recovery,
     _edge_bbox_valid as _graph_edge_bbox_valid,
     _glyph_registry as _graph_glyph_registry,
+    _reconcile_graph_geometry_from_evidence as _graph_reconcile_geometry,
     _resolve_references as _graph_resolve_references,
     _resolve_references_for_verifier_v1 as _graph_resolve_for_verifier_v1,
     _validate_candidate_graph as _graph_validate_candidate,
@@ -3353,12 +3355,251 @@ assert any(
     for issue in _graph_still_unresolved_issues
 ), _graph_still_unresolved_issues
 
+
+# Phase 2G V2: semantic annotations on graphic-only recovery entities do not
+# pretend to be printed source text. Exact drawing evidence remains mandatory.
+_graph_v2_note = 'Standalone graphic symbol omitted from the raw candidate.'
+_graph_v2_detector = {
+    'regions': [{
+        'region_id': 'R1',
+        'region_kind': 'other',
+        'bbox_pt': [0, 0, 100, 80],
+        'visible_connection_count': 0,
+        'confidence': 0.99,
+    }],
+}
+_graph_v2_base_entity = {
+    'occurrence_id': 'E1',
+    'region_id': 'R1',
+    'entity_type': 'potential',
+    'subtype': 'supply',
+    'tag_original': '24V',
+    'label_original': '24V',
+    'description_original': '',
+    'function_text_original': '',
+    'symbol_code': '',
+    'location_code': '',
+    'reference_value_original': '',
+    'reference_context_original': '',
+    'bbox_pt': [10, 10, 20, 20],
+    'source_glyph_ids': [1],
+    'source_word_ids': [1],
+    'source_drawing_ids': [1],
+    'confidence': 0.99,
+    'evidence_notes': '',
+}
+_graph_v2_base_edge = {
+    'edge_id': 'ED1',
+    'source_occurrence_id': 'E1',
+    'target_occurrence_id': 'E1-2',
+    'relation_type': 'electrically_connected_to',
+    'is_directed': False,
+    'bbox_pt': [20, 10, 40, 10],
+    'potential_original': '24V',
+    'wire_reference_original': '',
+    'source_glyph_ids': [],
+    'source_drawing_ids': [1],
+    'source_link_ids': [],
+    'confidence': 0.99,
+    'evidence_notes': '',
+}
+_graph_v2_companion = {
+    **_graph_v2_base_entity,
+    'occurrence_id': 'E1-2',
+    'tag_original': '',
+    'label_original': '',
+    'entity_type': 'junction',
+    'bbox_pt': [38, 8, 42, 12],
+}
+_graph_v2_recovery_verifier = {
+    'confidence': 0.99,
+    'recovery_entities': [{
+        'occurrence_id': 'RE-GROUND',
+        'region_id': 'R1',
+        'entity_type': 'potential',
+        'subtype': 'protective_earth_symbol',
+        'tag_original': '',
+        'label_original': '',
+        # These are semantic annotations, not claimed printed words.
+        'description_original': 'Standalone protective-earth graphic symbol',
+        'function_text_original': 'Protective earth',
+        'symbol_code': 'protective_earth',
+        'location_code': '',
+        'reference_value_original': '',
+        'reference_context_original': '',
+        'bbox_pt': [50, 50, 60, 65],
+        'source_glyph_ids': [],
+        'source_word_ids': [],
+        'source_drawing_ids': [2],
+        'confidence': 0.99,
+        'evidence_notes': 'Graphic-only source occurrence.',
+    }],
+    'recovery_edges': [],
+    'visual_evidence_adjudications': [{
+        'evidence_index': 0,
+        'evidence_text_original': _graph_v2_note,
+        'status': 'recovered_entity',
+        'related_entity_ids': ['RE-GROUND'],
+        'related_edge_ids': [],
+        'confidence': 0.99,
+        'reason': 'Recovered from exact drawing evidence.',
+    }],
+}
+_graph_v2_recovery_entities, _, _graph_v2_recovery_audit, (
+    _graph_v2_recovery_issues
+) = _graph_apply_recovery(
+    page={'page_width_pt': 100, 'page_height_pt': 80},
+    detector=_graph_v2_detector,
+    extraction={'unresolved_visual_evidence': [_graph_v2_note]},
+    verifier=_graph_v2_recovery_verifier,
+    resolution={'resolution_status_counts': {}},
+    base_entities=[_graph_v2_base_entity, _graph_v2_companion],
+    base_edges=[_graph_v2_base_edge],
+    glyphs=[{'glyph_id': 1, 'bbox_pt': [10, 10, 20, 20]}],
+    words=[{'word_id': 1, 'bbox_pt': [10, 10, 20, 20]}],
+    drawings=[
+        {'drawing_id': 1, 'bbox_pt': [10, 10, 40, 20]},
+        {'drawing_id': 2, 'bbox_pt': [50, 50, 60, 65]},
+    ],
+    links=[],
+)
+assert _graph_v2_recovery_audit['validated'] is True, (
+    _graph_v2_recovery_issues
+)
+assert any(
+    row['occurrence_id'] == 'RE-GROUND'
+    and row['recovery_evidence']['text_evidence_mode']
+        == 'graphic_with_semantic_annotation'
+    for row in _graph_v2_recovery_entities
+), _graph_v2_recovery_entities
+
+# Literal printed text without glyph/word evidence still blocks.
+_graph_v2_bad_text = copy.deepcopy(_graph_v2_recovery_verifier)
+_graph_v2_bad_text['recovery_entities'][0]['tag_original'] = 'PE'
+_, _, _graph_v2_bad_text_audit, _graph_v2_bad_text_issues = (
+    _graph_apply_recovery(
+        page={'page_width_pt': 100, 'page_height_pt': 80},
+        detector=_graph_v2_detector,
+        extraction={'unresolved_visual_evidence': [_graph_v2_note]},
+        verifier=_graph_v2_bad_text,
+        resolution={'resolution_status_counts': {}},
+        base_entities=[_graph_v2_base_entity, _graph_v2_companion],
+        base_edges=[_graph_v2_base_edge],
+        glyphs=[{'glyph_id': 1, 'bbox_pt': [10, 10, 20, 20]}],
+        words=[{'word_id': 1, 'bbox_pt': [10, 10, 20, 20]}],
+        drawings=[
+            {'drawing_id': 1, 'bbox_pt': [10, 10, 40, 20]},
+            {'drawing_id': 2, 'bbox_pt': [50, 50, 60, 65]},
+        ],
+        links=[],
+    )
+)
+assert _graph_v2_bad_text_audit['validated'] is False
+assert any(
+    issue.get('issue_type') == 'graph-recovery-entity-text-evidence-missing'
+    for issue in _graph_v2_bad_text_issues
+), _graph_v2_bad_text_issues
+
+# Non-materializable evidence may cite existing graph items as context without
+# materializing anything new. Unknown context IDs still block.
+_graph_v2_context_note = 'Conductor annotation belongs to existing branch.'
+_graph_v2_context_verifier = {
+    'confidence': 0.99,
+    'recovery_entities': [],
+    'recovery_edges': [],
+    'visual_evidence_adjudications': [{
+        'evidence_index': 0,
+        'evidence_text_original': _graph_v2_context_note,
+        'status': 'accounted_non_materializable',
+        'related_entity_ids': ['E1'],
+        'related_edge_ids': ['ED1'],
+        'confidence': 0.99,
+        'reason': 'Existing items are context only.',
+    }],
+}
+_, _, _graph_v2_context_audit, _graph_v2_context_issues = (
+    _graph_apply_recovery(
+        page={'page_width_pt': 100, 'page_height_pt': 80},
+        detector=_graph_v2_detector,
+        extraction={'unresolved_visual_evidence': [_graph_v2_context_note]},
+        verifier=_graph_v2_context_verifier,
+        resolution={'resolution_status_counts': {}},
+        base_entities=[_graph_v2_base_entity, _graph_v2_companion],
+        base_edges=[_graph_v2_base_edge],
+        glyphs=[{'glyph_id': 1, 'bbox_pt': [10, 10, 20, 20]}],
+        words=[{'word_id': 1, 'bbox_pt': [10, 10, 20, 20]}],
+        drawings=[{'drawing_id': 1, 'bbox_pt': [10, 10, 40, 20]}],
+        links=[],
+    )
+)
+assert _graph_v2_context_audit['validated'] is True, _graph_v2_context_issues
+assert _graph_v2_context_audit['visual_evidence_adjudications'][0][
+    'context_link_policy'
+]['materializes_new_graph_items'] is False
+_graph_v2_invalid_context = copy.deepcopy(_graph_v2_context_verifier)
+_graph_v2_invalid_context['visual_evidence_adjudications'][0][
+    'related_entity_ids'
+] = ['MISSING']
+_, _, _graph_v2_invalid_context_audit, _graph_v2_invalid_context_issues = (
+    _graph_apply_recovery(
+        page={'page_width_pt': 100, 'page_height_pt': 80},
+        detector=_graph_v2_detector,
+        extraction={'unresolved_visual_evidence': [_graph_v2_context_note]},
+        verifier=_graph_v2_invalid_context,
+        resolution={'resolution_status_counts': {}},
+        base_entities=[_graph_v2_base_entity, _graph_v2_companion],
+        base_edges=[_graph_v2_base_edge],
+        glyphs=[{'glyph_id': 1, 'bbox_pt': [10, 10, 20, 20]}],
+        words=[{'word_id': 1, 'bbox_pt': [10, 10, 20, 20]}],
+        drawings=[{'drawing_id': 1, 'bbox_pt': [10, 10, 40, 20]}],
+        links=[],
+    )
+)
+assert _graph_v2_invalid_context_audit['validated'] is False
+assert any(
+    issue.get('issue_type')
+        == 'graph-visual-evidence-nonmaterializable-context-invalid'
+    for issue in _graph_v2_invalid_context_issues
+), _graph_v2_invalid_context_issues
+
+# Inverted or otherwise invalid AI geometry is repaired only from the exact
+# cited source registries. This reproduces the page-43 branch-potential failure.
+_graph_v2_geometry_entities = [{
+    **_graph_v2_base_entity,
+    'occurrence_id': 'E-INVERTED',
+    'bbox_pt': [60, 50, 20, 10],
+    'source_glyph_ids': [1],
+    'source_word_ids': [1],
+    'source_drawing_ids': [1],
+}]
+_graph_v2_geometry_edges = [{
+    **_graph_v2_base_edge,
+    'edge_id': 'ED-INVERTED',
+    'source_occurrence_id': 'E-INVERTED',
+    'target_occurrence_id': 'E1-2',
+    'bbox_pt': [50, 40, 20, 10],
+}]
+_graph_v2_geometry_audit, _graph_v2_geometry_issues = (
+    _graph_reconcile_geometry(
+        page={'page_width_pt': 100, 'page_height_pt': 80},
+        entities=_graph_v2_geometry_entities,
+        edges=_graph_v2_geometry_edges,
+        glyphs=[{'glyph_id': 1, 'bbox_pt': [10, 10, 20, 20]}],
+        words=[{'word_id': 1, 'bbox_pt': [10, 10, 20, 20]}],
+        drawings=[{'drawing_id': 1, 'bbox_pt': [10, 10, 40, 30]}],
+    )
+)
+assert _graph_v2_geometry_audit['validated'] is True, _graph_v2_geometry_issues
+assert _graph_v2_geometry_audit['reconciled_entity_count'] == 1
+assert _graph_v2_geometry_audit['reconciled_edge_count'] == 1
+
 required = {
     '/v1/ai/electrical/normalize',
     '/v1/ai/electrical/extract-structured',
     '/v1/ai/electrical/extract-terminals',
     '/v1/ai/electrical/extract-bom',
     '/v1/ai/electrical/extract-graph',
+    '/v1/ai/electrical/graph-plan',
     '/v1/ai/electrical/source/snapshot',
 }
 missing = required - set(openapi.get('paths', {}))
