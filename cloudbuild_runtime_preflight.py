@@ -3690,7 +3690,7 @@ def _graph_v3_edge_op(operation_id, action, source_id='', results=None):
     }
 
 
-def _graph_v3_verifier(entity_operations, edge_operations, *, issues=None):
+def _graph_v3_make_verifier(entity_operations, edge_operations, *, issues=None):
     return {
         'page_id': 1,
         'verdict': 'apply_patch',
@@ -3795,7 +3795,7 @@ _graph_v3_replacement = _graph_v3_entity(
     'f1', 'contact', 'K1', [10, 10, 20, 20], 1,
     drawing_ids=[1],
 )
-_graph_v3_verifier = _graph_v3_verifier(
+_graph_v3_verifier = _graph_v3_make_verifier(
     [
         _graph_v3_entity_op(
             'oe1', 'REPLACE_ENTITY', 'e1', [_graph_v3_replacement]
@@ -3889,7 +3889,7 @@ _graph_v3_split_extraction = {
     'confidence': 0.97,
     'issues': [],
 }
-_graph_v3_split_verifier = _graph_v3_verifier(
+_graph_v3_split_verifier = _graph_v3_make_verifier(
     [
         _graph_v3_entity_op('split', 'SPLIT_ENTITY', 'merged', [
             _graph_v3_entity(
@@ -3948,7 +3948,7 @@ _graph_v3_ref_extraction = {
     'confidence': 0.97,
     'issues': [],
 }
-_graph_v3_ref_verifier = _graph_v3_verifier(
+_graph_v3_ref_verifier = _graph_v3_make_verifier(
     [
         _graph_v3_entity_op('keep-ref', 'KEEP_ENTITY', 'ref'),
         _graph_v3_entity_op('keep-e2', 'KEEP_ENTITY', 'e2'),
@@ -3990,7 +3990,7 @@ _graph_v3_ref_passed, _, _, _graph_v3_ref_final_issues = (
 assert _graph_v3_ref_passed is True, _graph_v3_ref_final_issues
 
 # Missing coverage and a PDF-link-only conductor both remain fail-closed.
-_graph_v3_missing_verifier = _graph_v3_verifier(
+_graph_v3_missing_verifier = _graph_v3_make_verifier(
     [_graph_v3_entity_op('keep-e1', 'KEEP_ENTITY', 'e1')],
     [_graph_v3_edge_op('keep-ed1', 'KEEP_EDGE', 'ed1')],
 )
@@ -4014,7 +4014,7 @@ _graph_v3_link_only_extraction = {
     'confidence': 0.97,
     'issues': [],
 }
-_graph_v3_link_only_verifier = _graph_v3_verifier(
+_graph_v3_link_only_verifier = _graph_v3_make_verifier(
     [
         _graph_v3_entity_op('keep-e1', 'KEEP_ENTITY', 'e1'),
         _graph_v3_entity_op('keep-e2', 'KEEP_ENTITY', 'e2'),
