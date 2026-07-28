@@ -45,6 +45,11 @@ from electrical_bom import (
     extract_electrical_bom_page,
 )
 
+from electrical_graph import (
+    get_electrical_graph_runtime_config,
+    extract_electrical_graph_page,
+)
+
 from electrical_source_store import (
     get_electrical_source_runtime_config,
     snapshot_electrical_source_pdf,
@@ -322,6 +327,14 @@ class ElectricalTerminalExtractRequest(BaseModel):
     force: Optional[bool] = False
 
 class ElectricalBomExtractRequest(BaseModel):
+    company_id: str
+    machine_id: str
+    bubble_document_id: str
+    version_id: Optional[int] = None
+    pdf_page_numbers: Optional[List[int]] = None
+    force: Optional[bool] = False
+
+class ElectricalGraphExtractRequest(BaseModel):
     company_id: str
     machine_id: str
     bubble_document_id: str
@@ -13127,6 +13140,7 @@ def version():
     structured_config = get_electrical_structured_runtime_config()
     terminal_config = get_electrical_terminal_runtime_config()
     bom_config = get_electrical_bom_runtime_config()
+    graph_config = get_electrical_graph_runtime_config()
     source_config = get_electrical_source_runtime_config()
 
     return {
@@ -13186,6 +13200,20 @@ def version():
         "electrical_bom_row_min_confidence": bom_config["row_min_confidence"],
         "electrical_bom_page_pass_min_confidence": bom_config["page_pass_min_confidence"],
         "electrical_bom_render_dpi": bom_config["render_dpi"],
+
+        "electrical_graph_enabled": graph_config["enabled"],
+        "electrical_graph_pipeline_marker": graph_config["pipeline_marker"],
+        "electrical_graph_detector_model": graph_config["detector_model"],
+        "electrical_graph_extractor_model": graph_config["extractor_model"],
+        "electrical_graph_verifier_model": graph_config["verifier_model"],
+        "electrical_graph_detector_prompt_version": graph_config["detector_prompt_version"],
+        "electrical_graph_extractor_prompt_version": graph_config["extractor_prompt_version"],
+        "electrical_graph_verifier_prompt_version": graph_config["verifier_prompt_version"],
+        "electrical_graph_materializer_version": graph_config["materializer_version"],
+        "electrical_graph_entity_min_confidence": graph_config["entity_min_confidence"],
+        "electrical_graph_edge_min_confidence": graph_config["edge_min_confidence"],
+        "electrical_graph_page_pass_min_confidence": graph_config["page_pass_min_confidence"],
+        "electrical_graph_render_dpi": graph_config["render_dpi"],
 
         "electrical_source_snapshot_enabled": source_config["enabled"],
         "electrical_source_snapshot_backend": source_config["backend"],
@@ -19959,3 +19987,63 @@ def smart_diagnostic_finalize_v1(
         rg_links=rg_links,
         debug=bool(payload.debug),
     )
+
+@app.post("/v1/ai/electrical/extract-graph")
+def extract_electrical_graph_document(
+    payload: ElectricalGraphExtractRequest,
+    x_ai_internal_secret: Optional[str] = Header(default=None),
+):
+    if not AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=500, detail="AI_INTERNAL_SECRET missing")
+    if (x_ai_internal_secret or "").strip() != AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    company_id = str(payload.company_id or "").strip()
+    machine_id = str(payload.machine_id or "").strip()
+    bubble_document_id = str(payload.bubble_document_id or "").strip()
+    if not (company_id and machine_id and bubble_document_id):
+        raise HTTPException(
+            status_code=400,
+            detail="company_id, machine_id and bubble_document_id are required",
+        )
+
+    try:
+        result = extract_electrical_graph_page(
+            company_id=company_id,
+            machine_id=machine_id,
+            bubble_document_id=bubble_document_id,
+            version_id=payload.version_id,
+            pdf_page_numbers=payload.pdf_page_numbers,
+            force=bool(payload.force),
+        )
+        print(
+            "ELECTRICAL_GRAPH_READY",
+            json.dumps({
+                "company_id": company_id,
+                "machine_id": machine_id,
+                "bubble_document_id": bubble_document_id,
+                **result,
+            }, ensure_ascii=False),
+        )
+        return {"ok": True, **result}
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(
+            "ELECTRICAL_GRAPH_FAIL",
+            json.dumps({
+                "company_id": company_id,
+                "machine_id": machine_id,
+                "bubble_document_id": bubble_document_id,
+                "version_id": payload.version_id,
+                "pdf_page_numbers": payload.pdf_page_numbers,
+                "error": str(e)[:2000],
+            }, ensure_ascii=False),
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Electrical graph extraction failed: {str(e)[:1000]}",
+        )
+

@@ -125,6 +125,48 @@ assert (
     == os.environ['EXPECTED_BOM_MARKER']
 ), bom_config
 
+assert version.get('electrical_graph_enabled') is True, version
+assert (
+    version.get('electrical_graph_pipeline_marker')
+    == os.environ['EXPECTED_GRAPH_MARKER']
+), version
+assert (
+    version.get('electrical_graph_detector_model')
+    == os.environ['EXPECTED_GRAPH_MODEL']
+), version
+assert (
+    version.get('electrical_graph_extractor_model')
+    == os.environ['EXPECTED_GRAPH_MODEL']
+), version
+assert (
+    version.get('electrical_graph_verifier_model')
+    == os.environ['EXPECTED_GRAPH_MODEL']
+), version
+assert (
+    version.get('electrical_graph_detector_prompt_version')
+    == os.environ['EXPECTED_GRAPH_DETECTOR_PROMPT']
+), version
+assert (
+    version.get('electrical_graph_extractor_prompt_version')
+    == os.environ['EXPECTED_GRAPH_EXTRACTOR_PROMPT']
+), version
+assert (
+    version.get('electrical_graph_verifier_prompt_version')
+    == os.environ['EXPECTED_GRAPH_VERIFIER_PROMPT']
+), version
+assert (
+    version.get('electrical_graph_materializer_version')
+    == os.environ['EXPECTED_GRAPH_MATERIALIZER']
+), version
+
+from electrical_graph import get_electrical_graph_runtime_config
+graph_config = get_electrical_graph_runtime_config()
+assert graph_config['enabled'] is True, graph_config
+assert (
+    graph_config['pipeline_marker']
+    == os.environ['EXPECTED_GRAPH_MARKER']
+), graph_config
+
 from electrical_terminals import get_electrical_terminal_runtime_config
 terminal_config = get_electrical_terminal_runtime_config()
 assert terminal_config['enabled'] is True, terminal_config
@@ -2711,11 +2753,176 @@ assert _v2_alias_verifier['region_checks'][0]['verified_row_ids'] == [
 ]
 assert _v2_alias_verifier['field_overrides'][0]['row_id'] == 'ROW_R003'
 
+
+# Phase 2G V1: font-independent character evidence, exact reference
+# resolution and fail-closed electrical topology validation.
+from electrical_graph import (
+    _glyph_registry as _graph_glyph_registry,
+    _resolve_references as _graph_resolve_references,
+    _validate_candidate_graph as _graph_validate_candidate,
+)
+
+_graph_font_texts = []
+for _font_name in ('helv', 'times-roman', 'cour'):
+    _graph_doc = _bom_fitz.open()
+    try:
+        _graph_page_obj = _graph_doc.new_page(width=220, height=80)
+        _graph_page_obj.insert_text(
+            (15, 35),
+            'K1 35.AP1 ********',
+            fontsize=11,
+            fontname=_font_name,
+        )
+        _glyph_rows = _graph_glyph_registry(_graph_page_obj)
+        _glyph_rows.sort(key=lambda item: item['bbox_pt'][0])
+        _graph_font_texts.append(''.join(
+            item['text_original'] for item in _glyph_rows
+        ))
+    finally:
+        _graph_doc.close()
+assert _graph_font_texts == [
+    'K1 35.AP1 ********',
+    'K1 35.AP1 ********',
+    'K1 35.AP1 ********',
+], _graph_font_texts
+
+_graph_registry = {
+    'bom': [
+        {'id': 1, 'page_id': 66, 'component_tag': 'K1', 'manufacturer': 'A', 'part_number': 'P1', 'description': 'Relay', 'confidence': 0.99},
+        {'id': 2, 'page_id': 66, 'component_tag': 'K1', 'manufacturer': 'A', 'part_number': 'P2', 'description': 'Accessory', 'confidence': 0.98},
+    ],
+    'io': [
+        {'id': 10, 'page_id': 51, 'module_tag': 'M1', 'channel_ref': '8', 'plc_address': '', 'io_type': 'safety_input', 'is_safety': True, 'signal_name': 'Reset', 'description': 'Reset', 'wire_reference': '33/1', 'terminal_reference': '', 'confidence': 0.98},
+    ],
+    'terminals': [
+        {'id': 20, 'page_id': 62, 'strip_tag': 'X1', 'terminal_number': '9', 'level_ref': '', 'side_a_origin': '', 'side_b_destination': '', 'wire_number': '33/1', 'cable_reference': '', 'potential': '', 'confidence': 0.98},
+    ],
+    'pages': [
+        {'id': 30, 'pdf_page_number': 44, 'sheet_code': '205', 'sheet_title': 'Axis', 'page_type': 'schematic'},
+    ],
+    'cross_references': [],
+}
+_graph_entities = [
+    {'occurrence_id': 'C1', 'region_id': 'R1', 'entity_type': 'component_occurrence', 'subtype': 'relay', 'tag_original': 'K1', 'label_original': '', 'description_original': '', 'function_text_original': '', 'symbol_code': '', 'location_code': '', 'reference_value_original': '', 'reference_context_original': '', 'bbox_pt': [10, 10, 20, 20], 'source_glyph_ids': [1], 'source_word_ids': [1], 'confidence': 0.98, 'evidence_notes': 'fixture'},
+    {'occurrence_id': 'C2', 'region_id': 'R1', 'entity_type': 'coil', 'subtype': 'coil', 'tag_original': 'K1', 'label_original': '', 'description_original': '', 'function_text_original': '', 'symbol_code': '', 'location_code': '', 'reference_value_original': '', 'reference_context_original': '', 'bbox_pt': [40, 10, 50, 20], 'source_glyph_ids': [2], 'source_word_ids': [2], 'confidence': 0.98, 'evidence_notes': 'fixture'},
+    {'occurrence_id': 'IO1', 'region_id': 'R1', 'entity_type': 'io_reference', 'subtype': '', 'tag_original': 'M1', 'label_original': '', 'description_original': '', 'function_text_original': '', 'symbol_code': '', 'location_code': '', 'reference_value_original': '8', 'reference_context_original': 'M1/8', 'bbox_pt': [10, 30, 20, 40], 'source_glyph_ids': [3], 'source_word_ids': [3], 'confidence': 0.98, 'evidence_notes': 'fixture'},
+    {'occurrence_id': 'T1', 'region_id': 'R1', 'entity_type': 'terminal_reference', 'subtype': '', 'tag_original': 'X1', 'label_original': '', 'description_original': '', 'function_text_original': '', 'symbol_code': '', 'location_code': '', 'reference_value_original': '9', 'reference_context_original': 'X1-9', 'bbox_pt': [30, 30, 40, 40], 'source_glyph_ids': [4], 'source_word_ids': [4], 'confidence': 0.98, 'evidence_notes': 'fixture'},
+    {'occurrence_id': 'P1', 'region_id': 'R1', 'entity_type': 'page_reference', 'subtype': '', 'tag_original': '205', 'label_original': '', 'description_original': '', 'function_text_original': '', 'symbol_code': '', 'location_code': '', 'reference_value_original': '', 'reference_context_original': '205.4', 'bbox_pt': [50, 30, 60, 40], 'source_glyph_ids': [5], 'source_word_ids': [5], 'confidence': 0.98, 'evidence_notes': 'fixture'},
+]
+_graph_resolution = _graph_resolve_references(
+    {'entities': _graph_entities},
+    _graph_registry,
+)
+assert _graph_resolution['all_reference_entities_resolved'] is True, _graph_resolution
+assert _graph_resolution['match_counts'] == {
+    'bom': 4, 'io': 1, 'terminal': 1, 'page': 1
+}, _graph_resolution
+
+_graph_edges = [{
+    'edge_id': 'E1',
+    'source_occurrence_id': 'C1',
+    'target_occurrence_id': 'C2',
+    'relation_type': 'electrically_connected_to',
+    'is_directed': False,
+    'potential_original': '',
+    'wire_reference_original': '33/1',
+    'bbox_pt': [20, 10, 40, 20],
+    'source_glyph_ids': [],
+    'source_drawing_ids': [1],
+    'source_link_ids': [],
+    'confidence': 0.98,
+    'evidence_notes': 'visible conductor',
+}]
+_graph_extraction = {
+    'page_id': 1,
+    'entities': _graph_entities,
+    'edges': _graph_edges,
+    'unresolved_visual_evidence': [],
+    'confidence': 0.98,
+    'issues': [],
+}
+_graph_detector = {
+    'page_id': 1,
+    'all_visible_circuit_regions_accounted_for': True,
+    'regions': [{
+        'region_id': 'R1', 'region_kind': 'mixed_circuit',
+        'bbox_pt': [0, 0, 100, 100],
+        'visible_component_count': 5,
+        'visible_connection_count': 1,
+        'confidence': 0.98, 'notes': 'fixture',
+    }],
+    'uncovered_visual_regions': [],
+    'confidence': 0.98,
+    'issues': [],
+}
+_graph_verifier = {
+    'page_id': 1,
+    'verdict': 'pass',
+    'all_visible_entities_accounted_for': True,
+    'all_visible_connections_accounted_for': True,
+    'all_entity_text_visually_supported': True,
+    'all_connection_geometry_supported': True,
+    'all_references_resolved_or_explicitly_unresolved': True,
+    'duplicates_preserved': True,
+    'verified_entity_ids': ['C1', 'C2', 'IO1', 'T1', 'P1'],
+    'verified_edge_ids': ['E1'],
+    'rejected_entity_ids': [],
+    'rejected_edge_ids': [],
+    'confidence': 0.98,
+    'issues': [],
+}
+_graph_page = {
+    'id': 1,
+    'page_width_pt': 100,
+    'page_height_pt': 100,
+}
+_graph_glyphs = [
+    {'glyph_id': i, 'text_original': str(i), 'bbox_pt': [i, 1, i + 1, 2]}
+    for i in range(1, 6)
+]
+_graph_words = [
+    {'word_id': i, 'text_original': str(i), 'bbox_pt': [i, 1, i + 1, 2]}
+    for i in range(1, 6)
+]
+_graph_drawings = [{'drawing_id': 1, 'bbox_pt': [20, 10, 40, 20]}]
+_graph_passed, _, _, _graph_issues = _graph_validate_candidate(
+    page=_graph_page,
+    detector=_graph_detector,
+    extraction=_graph_extraction,
+    verifier=_graph_verifier,
+    resolution=_graph_resolution,
+    glyphs=_graph_glyphs,
+    words=_graph_words,
+    drawings=_graph_drawings,
+    links=[],
+)
+assert _graph_passed is True, _graph_issues
+
+_graph_no_geometry = copy.deepcopy(_graph_extraction)
+_graph_no_geometry['edges'][0]['source_drawing_ids'] = []
+_graph_failed, _, _, _graph_failed_issues = _graph_validate_candidate(
+    page=_graph_page,
+    detector=_graph_detector,
+    extraction=_graph_no_geometry,
+    verifier=_graph_verifier,
+    resolution=_graph_resolution,
+    glyphs=_graph_glyphs,
+    words=_graph_words,
+    drawings=_graph_drawings,
+    links=[],
+)
+assert _graph_failed is False, _graph_failed_issues
+assert any(
+    issue.get('issue_type') == 'graph-edge-geometry-evidence-missing'
+    for issue in _graph_failed_issues
+), _graph_failed_issues
+
 required = {
     '/v1/ai/electrical/normalize',
     '/v1/ai/electrical/extract-structured',
     '/v1/ai/electrical/extract-terminals',
     '/v1/ai/electrical/extract-bom',
+    '/v1/ai/electrical/extract-graph',
     '/v1/ai/electrical/source/snapshot',
 }
 missing = required - set(openapi.get('paths', {}))
