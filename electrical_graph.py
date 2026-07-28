@@ -14,7 +14,7 @@ import requests
 
 from electrical_source_store import download_electrical_source_pdf
 
-# MachineMind Phase 2G V3
+# MachineMind Phase 2G V3.2
 # Page-atomic, multimodal electrical graph extraction with evidence ownership.
 # The deterministic layer is geometry/evidence based and contains no page,
 # language, font, manufacturer, component-tag or drawing-template dictionary.
@@ -82,7 +82,7 @@ VERIFIER_PROMPT_VERSION = (
 ).strip()
 MATERIALIZER_VERSION = (
     os.environ.get("MM_ELECTRICAL_GRAPH_MATERIALIZER_VERSION")
-    or "mm-electrical-graph-materializer-v3.1"
+    or "mm-electrical-graph-materializer-v3.2"
 ).strip()
 
 OPENAI_TIMEOUT_SECONDS = _env_int(
@@ -125,7 +125,7 @@ MAX_DRAWINGS_IN_PROMPT = _env_int(
     "MM_ELECTRICAL_GRAPH_MAX_DRAWINGS_IN_PROMPT", 3000, 100, 10000
 )
 
-PIPELINE_MARKER = "phase2-graph-v3.1-echo-tolerant-patch-plan-source-snapshot"
+PIPELINE_MARKER = "phase2-graph-v3.2-anonymous-graphic-identity-source-snapshot"
 MATERIALIZATION_PHASE = "graph_vision_v1"
 EXTRACTION_METHOD = "openai_vision_graph_v1"
 PAGE_TYPE = "schematic"
@@ -246,7 +246,10 @@ GRAPH_PATCH_APPLICATION_VERSION = "graph-atomic-patch-application-v1.1"
 PATCH_RESULT_COMPATIBILITY_VERSION = (
     "graph-patch-result-echo-normalization-v1"
 )
-GRAPH_FINAL_VALIDATION_VERSION = "graph-final-projection-validation-v1"
+GRAPH_FINAL_VALIDATION_VERSION = "graph-final-projection-validation-v1.1"
+ANONYMOUS_GRAPHIC_IDENTITY_POLICY_VERSION = (
+    "graph-anonymous-graphic-identity-v1"
+)
 ENTITY_PATCH_ACTIONS = {
     "KEEP_ENTITY",
     "REMOVE_ENTITY",
@@ -353,6 +356,153 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
 
 def _clamp_conf(value: Any) -> float:
     return max(0.0, min(1.0, _safe_float(value, 0.0)))
+
+
+def _explicitly_accounted_final_entity_ids(patch_audit: dict) -> set[str]:
+    """Return final entity IDs explicitly accepted by validated evidence rows.
+
+    This is intentionally based on the normalized patch audit, not directly on
+    free-form model text. The patch application layer has already checked each
+    evidence index, final-graph ID, operation link and confidence before setting
+    ``validated``.
+    """
+    accounted: set[str] = set()
+    for item in patch_audit.get("evidence_adjudications") or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("status") != "accounted_by_final_graph":
+            continue
+        if item.get("validated") is not True:
+            continue
+        if _clamp_conf(item.get("confidence")) + 1e-9 < ENTITY_MIN_CONFIDENCE:
+            continue
+        for value in item.get("final_entity_ids") or []:
+            occurrence_id = _clean_text(value, 160)
+            if occurrence_id:
+                accounted.add(occurrence_id)
+    return accounted
+
+
+def _component_identity_policy(
+    entity: dict,
+    *,
+    explicitly_accounted_entity_ids: set[str],
+) -> dict:
+    """Validate whether a component-like entity needs a printed tag.
+
+    Specific device/symbol classes remain identity-bearing and therefore always
+    require an exact visible tag. A generic ``component_occurrence`` may instead
+    represent an anonymous graphic infrastructure occurrence (for example an
+    untagged distribution bar or grouped symbol) only when all of the following
+    are independently true:
+
+    * the final object is explicitly cited by a validated verifier evidence row;
+    * it has direct source evidence (drawing or exact glyph/word evidence),
+      not merely semantic prose;
+    * it has a visible/semantic classification that explains the occurrence;
+    * it does not claim reference identity that belongs in a reference type.
+
+    No word, language, font, symbol name, page number or coordinate is used.
+    """
+    occurrence_id = _clean_text(entity.get("occurrence_id"), 160)
+    entity_type = _clean_text(entity.get("entity_type"), 120)
+    tag = _clean_text(entity.get("tag_original"), 500)
+    drawing_ids = {
+        int(value)
+        for value in (entity.get("source_drawing_ids") or [])
+        if isinstance(value, int) or str(value).isdigit()
+    }
+    glyph_ids = {
+        int(value)
+        for value in (entity.get("source_glyph_ids") or [])
+        if isinstance(value, int) or str(value).isdigit()
+    }
+    word_ids = {
+        int(value)
+        for value in (entity.get("source_word_ids") or [])
+        if isinstance(value, int) or str(value).isdigit()
+    }
+    semantic_fields = [
+        field
+        for field in (
+            "label_original",
+            "description_original",
+            "function_text_original",
+            "subtype",
+            "symbol_code",
+        )
+        if _clean_text(entity.get(field), 1000)
+    ]
+    reference_identity_fields = [
+        field
+        for field in (
+            "reference_value_original",
+            "reference_context_original",
+        )
+        if _clean_text(entity.get(field), 1000)
+    ]
+
+    if entity_type not in COMPONENT_ENTITY_TYPES:
+        return {
+            "version": ANONYMOUS_GRAPHIC_IDENTITY_POLICY_VERSION,
+            "identity_mode": "not_component_like",
+            "requires_visible_tag": False,
+            "explicitly_accounted_by_verifier": False,
+            "has_drawing_evidence": bool(drawing_ids),
+            "has_literal_text_evidence": bool(glyph_ids or word_ids),
+            "has_direct_source_evidence": bool(
+                drawing_ids or glyph_ids or word_ids
+            ),
+            "semantic_support_fields": semantic_fields,
+            "reference_identity_fields": reference_identity_fields,
+            "validated": True,
+        }
+
+    if tag:
+        return {
+            "version": ANONYMOUS_GRAPHIC_IDENTITY_POLICY_VERSION,
+            "identity_mode": "tagged_component_identity",
+            "requires_visible_tag": True,
+            "explicitly_accounted_by_verifier": (
+                occurrence_id in explicitly_accounted_entity_ids
+            ),
+            "has_drawing_evidence": bool(drawing_ids),
+            "has_literal_text_evidence": bool(glyph_ids or word_ids),
+            "has_direct_source_evidence": bool(
+                drawing_ids or glyph_ids or word_ids
+            ),
+            "semantic_support_fields": semantic_fields,
+            "reference_identity_fields": reference_identity_fields,
+            "validated": True,
+        }
+
+    anonymous_valid = bool(
+        entity_type == "component_occurrence"
+        and occurrence_id in explicitly_accounted_entity_ids
+        and (drawing_ids or glyph_ids or word_ids)
+        and semantic_fields
+        and not reference_identity_fields
+    )
+    return {
+        "version": ANONYMOUS_GRAPHIC_IDENTITY_POLICY_VERSION,
+        "identity_mode": (
+            "anonymous_graphic_occurrence"
+            if anonymous_valid
+            else "missing_required_component_identity"
+        ),
+        "requires_visible_tag": not anonymous_valid,
+        "explicitly_accounted_by_verifier": (
+            occurrence_id in explicitly_accounted_entity_ids
+        ),
+        "has_drawing_evidence": bool(drawing_ids),
+        "has_literal_text_evidence": bool(glyph_ids or word_ids),
+        "has_direct_source_evidence": bool(
+            drawing_ids or glyph_ids or word_ids
+        ),
+        "semantic_support_fields": semantic_fields,
+        "reference_identity_fields": reference_identity_fields,
+        "validated": anonymous_valid,
+    }
 
 
 def _price(input_tokens: int, output_tokens: int) -> float:
@@ -6277,6 +6427,9 @@ def _validate_patched_graph(
         str(item.get("occurrence_id") or ""): item
         for item in (resolution.get("entity_resolutions") or [])
     }
+    explicitly_accounted_entity_ids = (
+        _explicitly_accounted_final_entity_ids(patch_audit)
+    )
     for entity in entities:
         occurrence_id = _clean_text(entity.get("occurrence_id"), 160)
         entity_type = _clean_text(entity.get("entity_type"), 120)
@@ -6323,8 +6476,30 @@ def _validate_patched_graph(
             fail("graph-entity-text-evidence-missing", "Final entity claims literal text without glyph/word evidence")
         if not visible_fields and not drawing_ids:
             fail("graph-entity-graphic-evidence-missing", "Graphic-only final entity lacks drawing evidence")
-        if entity_type in COMPONENT_ENTITY_TYPES and not _clean_text(entity.get("tag_original"), 500):
-            fail("graph-component-tag-missing", "Component-like final entity has no visible tag; it must be retyped or replaced")
+        identity_policy = _component_identity_policy(
+            entity,
+            explicitly_accounted_entity_ids=explicitly_accounted_entity_ids,
+        )
+        entity["component_identity_policy"] = identity_policy
+        if not identity_policy.get("validated"):
+            fail(
+                "graph-component-tag-missing",
+                "Identity-bearing component-like final entity has no visible tag; "
+                "only an explicitly accounted, source-backed generic graphic "
+                "occurrence may remain anonymous",
+            )
+        elif identity_policy.get("identity_mode") == "anonymous_graphic_occurrence":
+            issues.append(_local_issue(
+                issue_type="graph-anonymous-graphic-occurrence-accounted",
+                message=(
+                    "An untagged generic graphic occurrence is preserved without "
+                    "inventing component identity"
+                ),
+                entity_ids=[occurrence_id],
+                confidence=confidence,
+                severity="info",
+                source_stage="component_identity_adjudicator",
+            ))
         entity["source_text_evidence_policy"] = {
             "version": "graph-source-visible-text-fields-v3",
             "visible_source_text_fields": visible_fields,
@@ -6614,6 +6789,9 @@ def _build_materialization_plan(
                 "bbox_reconciliation": entity.get("bbox_reconciliation") or {},
                 "source_text_evidence_policy": entity.get(
                     "source_text_evidence_policy"
+                ) or {},
+                "component_identity_policy": entity.get(
+                    "component_identity_policy"
                 ) or {},
                 "patch_provenance": entity.get("patch_provenance") or {},
                 "evidence_notes": entity.get("evidence_notes") or "",

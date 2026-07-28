@@ -25,11 +25,11 @@ from pathlib import Path
 from contextlib import contextmanager
 from typing import Any, Iterable, Iterator, TextIO
 
-RUNNER_VERSION = "mm-graph-batch-runner-v3.1"
+RUNNER_VERSION = "mm-graph-batch-runner-v3.2"
 EXPECTED_PIPELINE_MARKER = (
-    "phase2-graph-v3.1-echo-tolerant-patch-plan-source-snapshot"
+    "phase2-graph-v3.2-anonymous-graphic-identity-source-snapshot"
 )
-EXPECTED_MATERIALIZER_VERSION = "mm-electrical-graph-materializer-v3.1"
+EXPECTED_MATERIALIZER_VERSION = "mm-electrical-graph-materializer-v3.2"
 DEFAULT_BASE_URL = (
     "https://mm-ai-ingest-fixed-443517556116.europe-west1.run.app"
 )

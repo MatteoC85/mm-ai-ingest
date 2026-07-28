@@ -2760,6 +2760,8 @@ from electrical_graph import (
     GRAPH_PATCH_PLAN_VERSION as _graph_patch_plan_version,
     _apply_graph_patch_plan as _graph_apply_patch_plan,
     _apply_verifier_evidence_recovery as _graph_apply_recovery,
+    _component_identity_policy as _graph_component_identity_policy,
+    _explicitly_accounted_final_entity_ids as _graph_explicitly_accounted_final_entity_ids,
     _edge_bbox_valid as _graph_edge_bbox_valid,
     _glyph_registry as _graph_glyph_registry,
     _reconcile_graph_geometry_from_evidence as _graph_reconcile_geometry,
@@ -4261,6 +4263,186 @@ assert any(
     issue.get('issue_type') == 'graph-edge-geometry-evidence-missing'
     for issue in _graph_v3_link_issues
 ), _graph_v3_link_issues
+
+
+# Graph V3.2: a generic graphic occurrence may be intentionally anonymous,
+# but only when validated patch evidence explicitly accounts for it and direct
+# drawing evidence plus semantic classification prove that it is a real visual
+# occurrence. Specific identity-bearing types remain tag-required.
+_graph_v32_anonymous = _graph_v3_entity(
+    'anon', 'component_occurrence', '', [10, 10, 20, 20], 0,
+    drawing_ids=[1],
+)
+_graph_v32_anonymous['description_original'] = (
+    'Generic untagged graphic infrastructure occurrence'
+)
+_graph_v32_extraction = {
+    'page_id': 1,
+    'entities': [_graph_v32_anonymous, copy.deepcopy(_graph_v3_e2)],
+    'edges': [_graph_v3_edge(
+        'anon-edge', 'anon', 'e2', drawing_ids=[1]
+    )],
+    'unresolved_visual_evidence': [
+        'A visible untagged graphic occurrence is retained without inventing '
+        'a component identity.'
+    ],
+    'confidence': 0.97,
+    'issues': [],
+}
+_graph_v32_verifier = _graph_v3_make_verifier(
+    [
+        _graph_v3_entity_op('keep-anon', 'KEEP_ENTITY', 'anon'),
+        _graph_v3_entity_op('keep-e2-v32', 'KEEP_ENTITY', 'e2'),
+    ],
+    [_graph_v3_edge_op('keep-anon-edge', 'KEEP_EDGE', 'anon-edge')],
+)
+_graph_v32_verifier['evidence_adjudications'] = [{
+    'evidence_index': 0,
+    'evidence_text_original': (
+        'A visible untagged graphic occurrence is retained without inventing '
+        'a component identity.'
+    ),
+    'status': 'accounted_by_final_graph',
+    'raw_context_entity_ids': ['anon'],
+    'raw_context_edge_ids': ['anon-edge'],
+    'final_entity_ids': ['anon'],
+    'final_edge_ids': ['anon-edge'],
+    'related_operation_ids': ['keep-anon', 'keep-anon-edge'],
+    'confidence': 0.97,
+    'reason': (
+        'Direct drawing evidence and semantic classification support the '
+        'visible occurrence, but no printed device identity exists.'
+    ),
+}]
+(
+    _graph_v32_entities,
+    _graph_v32_edges,
+    _graph_v32_audit,
+    _graph_v32_patch_issues,
+) = _graph_apply_patch_plan(
+    page=_graph_v3_page,
+    extraction=_graph_v32_extraction,
+    verifier=_graph_v32_verifier,
+)
+assert _graph_v32_audit['validated'] is True, _graph_v32_patch_issues
+_graph_v32_accounted_ids = _graph_explicitly_accounted_final_entity_ids(
+    _graph_v32_audit
+)
+assert _graph_v32_accounted_ids == {'anon'}, _graph_v32_accounted_ids
+_graph_v32_policy = _graph_component_identity_policy(
+    _graph_v32_entities[0],
+    explicitly_accounted_entity_ids=_graph_v32_accounted_ids,
+)
+assert _graph_v32_policy['identity_mode'] == 'anonymous_graphic_occurrence'
+assert _graph_v32_policy['validated'] is True, _graph_v32_policy
+_graph_v32_resolution = _graph_resolve_references(
+    {'entities': _graph_v32_entities}, _graph_v3_registry
+)
+(
+    _graph_v32_passed,
+    _graph_v32_final_entities,
+    _,
+    _graph_v32_final_issues,
+) = _graph_validate_patched(
+    page=_graph_v3_page,
+    detector=copy.deepcopy(_graph_v3_detector),
+    extraction=_graph_v32_extraction,
+    verifier=_graph_v32_verifier,
+    resolution=_graph_v32_resolution,
+    entities=_graph_v32_entities,
+    edges=_graph_v32_edges,
+    patch_audit=_graph_v32_audit,
+    patch_issues=_graph_v32_patch_issues,
+    glyphs=_graph_v3_glyphs,
+    words=_graph_v3_words,
+    drawings=_graph_v3_drawings,
+    links=[],
+)
+assert _graph_v32_passed is True, _graph_v32_final_issues
+assert _graph_v32_final_entities[0]['component_identity_policy'][
+    'identity_mode'
+] == 'anonymous_graphic_occurrence'
+assert any(
+    issue.get('issue_type')
+    == 'graph-anonymous-graphic-occurrence-accounted'
+    and issue.get('severity') == 'info'
+    for issue in _graph_v32_final_issues
+), _graph_v32_final_issues
+
+# The same anonymous occurrence must fail when it is not explicitly accounted
+# by validated patch evidence.
+_graph_v32_unaccounted_verifier = _graph_v3_make_verifier(
+    [
+        _graph_v3_entity_op('keep-anon-u', 'KEEP_ENTITY', 'anon'),
+        _graph_v3_entity_op('keep-e2-u', 'KEEP_ENTITY', 'e2'),
+    ],
+    [_graph_v3_edge_op('keep-anon-edge-u', 'KEEP_EDGE', 'anon-edge')],
+)
+_graph_v32_unaccounted_extraction = copy.deepcopy(_graph_v32_extraction)
+_graph_v32_unaccounted_extraction['unresolved_visual_evidence'] = []
+(
+    _graph_v32_unaccounted_entities,
+    _graph_v32_unaccounted_edges,
+    _graph_v32_unaccounted_audit,
+    _graph_v32_unaccounted_patch_issues,
+) = _graph_apply_patch_plan(
+    page=_graph_v3_page,
+    extraction=_graph_v32_unaccounted_extraction,
+    verifier=_graph_v32_unaccounted_verifier,
+)
+_graph_v32_unaccounted_resolution = _graph_resolve_references(
+    {'entities': _graph_v32_unaccounted_entities}, _graph_v3_registry
+)
+(
+    _graph_v32_unaccounted_passed,
+    _,
+    _,
+    _graph_v32_unaccounted_issues,
+) = _graph_validate_patched(
+    page=_graph_v3_page,
+    detector=copy.deepcopy(_graph_v3_detector),
+    extraction=_graph_v32_unaccounted_extraction,
+    verifier=_graph_v32_unaccounted_verifier,
+    resolution=_graph_v32_unaccounted_resolution,
+    entities=_graph_v32_unaccounted_entities,
+    edges=_graph_v32_unaccounted_edges,
+    patch_audit=_graph_v32_unaccounted_audit,
+    patch_issues=_graph_v32_unaccounted_patch_issues,
+    glyphs=_graph_v3_glyphs,
+    words=_graph_v3_words,
+    drawings=_graph_v3_drawings,
+    links=[],
+)
+assert _graph_v32_unaccounted_passed is False
+assert any(
+    issue.get('issue_type') == 'graph-component-tag-missing'
+    for issue in _graph_v32_unaccounted_issues
+), _graph_v32_unaccounted_issues
+
+# A specific identity-bearing symbol remains tag-required even with direct
+# drawings and an evidence adjudication.
+_graph_v32_untagged_contact = copy.deepcopy(_graph_v32_anonymous)
+_graph_v32_untagged_contact['occurrence_id'] = 'untagged-contact'
+_graph_v32_untagged_contact['entity_type'] = 'contact'
+_graph_v32_contact_policy = _graph_component_identity_policy(
+    _graph_v32_untagged_contact,
+    explicitly_accounted_entity_ids={'untagged-contact'},
+)
+assert _graph_v32_contact_policy['validated'] is False
+assert _graph_v32_contact_policy[
+    'identity_mode'
+] == 'missing_required_component_identity'
+
+# A generic occurrence carrying external-reference identity must be retyped as
+# a canonical reference rather than bypassing tag validation.
+_graph_v32_reference_claim = copy.deepcopy(_graph_v32_anonymous)
+_graph_v32_reference_claim['occurrence_id'] = 'anon-ref'
+_graph_v32_reference_claim['reference_value_original'] = 'SHEET-X'
+_graph_v32_reference_policy = _graph_component_identity_policy(
+    _graph_v32_reference_claim,
+    explicitly_accounted_entity_ids={'anon-ref'},
+)
+assert _graph_v32_reference_policy['validated'] is False
 
 _graph_v3_cause_counts = _graph_review_cause_family_counts([
     {
