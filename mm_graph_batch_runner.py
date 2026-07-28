@@ -25,11 +25,11 @@ from pathlib import Path
 from contextlib import contextmanager
 from typing import Any, Iterable, Iterator, TextIO
 
-RUNNER_VERSION = "mm-graph-batch-runner-v2"
+RUNNER_VERSION = "mm-graph-batch-runner-v3"
 EXPECTED_PIPELINE_MARKER = (
-    "phase2-graph-v2-evidence-owned-batch-source-snapshot"
+    "phase2-graph-v3-atomic-patch-plan-source-snapshot"
 )
-EXPECTED_MATERIALIZER_VERSION = "mm-electrical-graph-materializer-v2"
+EXPECTED_MATERIALIZER_VERSION = "mm-electrical-graph-materializer-v3"
 DEFAULT_BASE_URL = (
     "https://mm-ai-ingest-fixed-443517556116.europe-west1.run.app"
 )
@@ -219,17 +219,83 @@ def manifest_pages(path: Path) -> list[int]:
     return pages
 
 
+def _fallback_cause_family(issue_type: Any, source_stage: Any = "") -> str:
+    value = str(issue_type or "").strip().casefold()
+    stage = str(source_stage or "").strip().casefold()
+    if any(token in value for token in (
+        "rewire", "edge-endpoint", "edge-geometry", "connection_geometry"
+    )):
+        return "edge_rewire_or_geometry"
+    if any(token in value for token in (
+        "split", "merged", "duplicate", "under_materialized",
+        "false_candidate", "entity-bbox", "component-tag"
+    )):
+        return "entity_identity_or_replacement"
+    if any(token in value for token in (
+        "reference", "registry", "explicitly-unresolved"
+    )):
+        return "reference_resolution"
+    if any(token in value for token in (
+        "evidence", "glyph", "drawing"
+    )):
+        return "source_evidence_accounting"
+    if any(token in value for token in (
+        "patch", "schema", "type-invalid", "operation"
+    )):
+        return "canonical_patch_contract"
+    if "confidence" in value or stage.endswith("preliminary_audit"):
+        return "preliminary_confidence"
+    if (
+        value.startswith("graph-verifier-all_")
+        or any(token in value for token in (
+            "verdict", "publish", "blocked-page", "final-assertions"
+        ))
+    ):
+        return "publish_gate_cascade"
+    return "other"
+
+
+def review_cause_family_counts(response: dict[str, Any]) -> dict[str, int]:
+    existing = response.get("review_cause_family_counts") or {}
+    if isinstance(existing, dict) and existing:
+        return {
+            str(key): int(value or 0)
+            for key, value in sorted(existing.items())
+            if str(key) and int(value or 0) > 0
+        }
+    counts: dict[str, int] = {}
+    for row in response.get("blocking_issue_summary") or []:
+        if not isinstance(row, dict):
+            continue
+        family = _fallback_cause_family(
+            row.get("issue_type"), row.get("source_stage")
+        )
+        counts[family] = counts.get(family, 0) + int(row.get("count") or 1)
+    if counts:
+        return dict(sorted(counts.items()))
+    for issue_type, count in (
+        response.get("blocking_issue_type_counts") or {}
+    ).items():
+        family = _fallback_cause_family(issue_type)
+        counts[family] = counts.get(family, 0) + int(count or 0)
+    return dict(sorted(counts.items()))
+
+
 def review_signature(response: dict[str, Any]) -> str:
     existing = str(response.get("review_signature") or "").strip()
     if existing:
         return existing
-    counts = response.get("blocking_issue_type_counts") or {}
-    raw = json.dumps(counts, sort_keys=True, separators=(",", ":"))
+    families = review_cause_family_counts(response)
+    causal = {
+        key: value for key, value in families.items()
+        if key != "publish_gate_cascade"
+    } or families
+    raw = json.dumps(sorted(causal), separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
 
 
 def compact_result(response: dict[str, Any]) -> dict[str, Any]:
-    return {
+    result = {
         key: response.get(key)
         for key in (
             "ok",
@@ -250,6 +316,7 @@ def compact_result(response: dict[str, Any]) -> dict[str, Any]:
             "severity_counts",
             "blocking_issue_type_counts",
             "blocking_issue_summary",
+            "review_cause_family_counts",
             "review_signature",
             "graph_status",
             "graph_entity_count",
@@ -262,6 +329,32 @@ def compact_result(response: dict[str, Any]) -> dict[str, Any]:
             "new_output_tokens",
         )
     }
+    patch = response.get("graph_patch_plan") or {}
+    if isinstance(patch, dict) and patch:
+        result["graph_patch_plan"] = {
+            "version": patch.get("version"),
+            "patch_plan_version": patch.get("patch_plan_version"),
+            "validated": patch.get("validated"),
+            "raw_entity_count": patch.get("raw_entity_count"),
+            "raw_edge_count": patch.get("raw_edge_count"),
+            "final_entity_count": patch.get("final_entity_count"),
+            "final_edge_count": patch.get("final_edge_count"),
+            "applied_operation_count": len(
+                patch.get("applied_operation_ids") or []
+            ),
+            "removed_entity_ids": patch.get("removed_entity_ids") or [],
+            "removed_edge_ids": patch.get("removed_edge_ids") or [],
+            "added_entity_ids": patch.get("added_entity_ids") or [],
+            "added_edge_ids": patch.get("added_edge_ids") or [],
+            "evidence_adjudication_count": len(
+                patch.get("evidence_adjudications") or []
+            ),
+        }
+    if not result.get("review_cause_family_counts"):
+        result["review_cause_family_counts"] = (
+            review_cause_family_counts(response)
+        )
+    return result
 
 
 def state_template(args: argparse.Namespace) -> dict[str, Any]:
@@ -328,10 +421,32 @@ def choose_pages(
         plan_item = plan_by_page.get(page)
         if plan_item is None:
             raise ValueError(f"page {page} is not a schematic page in the plan")
-        if plan_item.get("status") == "passed" and not args.reprocess_passed:
-            continue
         state_item = (state.get("pages") or {}).get(str(page)) or {}
-        if state_item.get("status") == "passed" and not args.reprocess_passed:
+        persisted_same_generation_pass = bool(
+            plan_item.get("status") == "passed"
+            and str(plan_item.get("result_pipeline_marker") or "")
+                == current_marker
+            and str(plan_item.get("result_materializer_version") or "")
+                == current_materializer
+        )
+        checkpoint_same_generation_pass = bool(
+            state_item.get("status") == "passed"
+            and str(state_item.get("pipeline_marker") or "")
+                == current_marker
+            and str(state_item.get("materializer_version") or "")
+                == current_materializer
+        )
+        # Resume must never repeat a page already passed by the active graph
+        # generation. --reprocess-passed upgrades only older-generation passes.
+        if (
+            persisted_same_generation_pass
+            or checkpoint_same_generation_pass
+        ):
+            continue
+        if (
+            plan_item.get("status") == "passed"
+            or state_item.get("status") == "passed"
+        ) and not args.reprocess_passed:
             continue
         persisted_same_generation_review = bool(
             plan_item.get("status") == "review_required"
@@ -369,11 +484,15 @@ def write_summary(
     selected_pages: Iterable[int],
 ) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
+    # Pages may belong to more than one architectural cause family. This is
+    # intentional: grouping is by shared root cause, not by an exact page-wide
+    # combination of issue counts.
     review_groups: dict[str, dict[str, Any]] = {}
     selected = list(selected_pages)
     for page in selected:
         item = (state.get("pages") or {}).get(str(page)) or {}
         result = item.get("result") or {}
+        family_counts = result.get("review_cause_family_counts") or {}
         row = {
             "pdf_page_number": page,
             "sheet_code": result.get("sheet_code"),
@@ -387,22 +506,58 @@ def write_summary(
                 "blocking_issue_count_this_page"
             ),
             "review_signature": item.get("review_signature") or "",
+            "review_cause_families": ",".join(sorted(family_counts)),
             "response_file": item.get("response_file") or "",
         }
         rows.append(row)
-        if item.get("status") == "review_required":
-            signature = item.get("review_signature") or "unknown"
-            group = review_groups.setdefault(signature, {
-                "review_signature": signature,
+        if item.get("status") != "review_required":
+            continue
+        if not family_counts:
+            family_counts = {"unknown": 1}
+        page_issue_counts = result.get("blocking_issue_type_counts") or {}
+        page_issue_summary = result.get("blocking_issue_summary") or []
+        for family, family_count in sorted(family_counts.items()):
+            group = review_groups.setdefault(family, {
+                "review_signature": family,
+                "cause_family": family,
                 "pages": [],
-                "blocking_issue_type_counts": result.get(
-                    "blocking_issue_type_counts"
-                ) or {},
-                "blocking_issue_summary": result.get(
-                    "blocking_issue_summary"
-                ) or [],
+                "family_issue_count": 0,
+                "blocking_issue_type_counts": {},
+                "blocking_issue_summary": [],
             })
-            group["pages"].append(page)
+            if page not in group["pages"]:
+                group["pages"].append(page)
+            group["family_issue_count"] += int(family_count or 0)
+            for issue_type, count in page_issue_counts.items():
+                if _fallback_cause_family(issue_type) != family:
+                    continue
+                group["blocking_issue_type_counts"][issue_type] = (
+                    int(group["blocking_issue_type_counts"].get(issue_type) or 0)
+                    + int(count or 0)
+                )
+            seen_samples = {
+                (
+                    str(sample.get("issue_type") or ""),
+                    str(sample.get("sample_message") or ""),
+                )
+                for sample in group["blocking_issue_summary"]
+                if isinstance(sample, dict)
+            }
+            for sample in page_issue_summary:
+                if not isinstance(sample, dict):
+                    continue
+                if _fallback_cause_family(
+                    sample.get("issue_type"), sample.get("source_stage")
+                ) != family:
+                    continue
+                key = (
+                    str(sample.get("issue_type") or ""),
+                    str(sample.get("sample_message") or ""),
+                )
+                if key in seen_samples:
+                    continue
+                group["blocking_issue_summary"].append(sample)
+                seen_samples.add(key)
 
     counts: dict[str, int] = {}
     for row in rows:
@@ -430,13 +585,24 @@ def write_summary(
             for page in selected
         ),
     }
+    ordered_groups = [
+        review_groups[key] for key in sorted(
+            review_groups,
+            key=lambda key: (-len(review_groups[key]["pages"]), key),
+        )
+    ]
+    for group in ordered_groups:
+        group["pages"].sort()
+        group["blocking_issue_type_counts"] = dict(sorted(
+            group["blocking_issue_type_counts"].items()
+        ))
     summary = {
         "runner_version": RUNNER_VERSION,
         "generated_at": utc_now(),
         "selected_page_count": len(selected),
         "counts": dict(sorted(counts.items())),
         "usage": usage,
-        "review_groups": list(review_groups.values()),
+        "review_groups": ordered_groups,
         "rows": rows,
     }
     atomic_json_write(output_dir / "summary.json", summary)
@@ -484,7 +650,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--retry-base-seconds", type=float, default=8.0)
     parser.add_argument("--sleep-between", type=float, default=1.0)
     parser.add_argument("--max-pages", type=int, default=0)
-    parser.add_argument("--reprocess-passed", action="store_true")
+    parser.add_argument(
+        "--reprocess-passed",
+        action="store_true",
+        help=(
+            "upgrade pages passed by an older pipeline/materializer generation; "
+            "pages already passed by the active generation remain skipped so "
+            "the same command is safely resumable"
+        ),
+    )
     parser.add_argument(
         "--retry-review-same-generation",
         action="store_true",
@@ -505,40 +679,69 @@ def self_test() -> int:
     assert page_status_from_response(200, {"ok": True, "page_passed": False}) == "review_required"
     assert page_status_from_response(500, {"detail": "Read timed out"}) == "transient_error"
     assert review_signature({"blocking_issue_type_counts": {"x": 2}})
+    grouped = review_cause_family_counts({
+        "blocking_issue_summary": [
+            {"issue_type": "graph-edge-geometry-evidence-missing", "count": 2},
+            {"issue_type": "graph-verifier-blocked-page", "count": 1},
+        ]
+    })
+    assert grouped["edge_rewire_or_geometry"] == 2, grouped
+    assert grouped["publish_gate_cascade"] == 1, grouped
     args = argparse.Namespace(
         base_url="https://example.invalid",
         company_id="c",
         machine_id="m",
         bubble_document_id="d",
         version_id=2,
-        expected_pipeline_marker="marker-v2",
-        expected_materializer_version="materializer-v2",
-        pages="",
+        expected_pipeline_marker="marker-v3",
+        expected_materializer_version="materializer-v3",
+        pages="24,43,44,45",
         manifest="",
-        mode="pending",
+        mode="all",
         reprocess_passed=False,
         retry_review_same_generation=False,
         max_pages=0,
     )
     state = state_template(args)
     plan = {
-        "graph_pipeline_marker": "marker-v2",
-        "graph_materializer_version": "materializer-v2",
+        "graph_pipeline_marker": "marker-v3",
+        "graph_materializer_version": "materializer-v3",
         "pages": [
-            {"pdf_page_number": 24, "status": "passed"},
             {
-                "pdf_page_number": 43,
-                "status": "review_required",
+                "pdf_page_number": 24,
+                "status": "passed",
                 "result_pipeline_marker": "marker-v2",
                 "result_materializer_version": "materializer-v2",
             },
+            {
+                "pdf_page_number": 43,
+                "status": "review_required",
+                "result_pipeline_marker": "marker-v3",
+                "result_materializer_version": "materializer-v3",
+            },
             {"pdf_page_number": 44, "status": "not_started"},
+            {
+                "pdf_page_number": 45,
+                "status": "passed",
+                "result_pipeline_marker": "marker-v3",
+                "result_materializer_version": "materializer-v3",
+            },
         ],
     }
     state["pages"]["43"] = {
         "status": "review_required",
-        "pipeline_marker": "marker-v2",
-        "materializer_version": "materializer-v2",
+        "pipeline_marker": "marker-v3",
+        "materializer_version": "materializer-v3",
+    }
+    assert choose_pages(args=args, plan=plan, state=state) == [44]
+    args.reprocess_passed = True
+    assert choose_pages(args=args, plan=plan, state=state) == [24, 44]
+    # Once page 24 passes V3 in the checkpoint, the exact same command must
+    # skip it on resume even though --reprocess-passed remains enabled.
+    state["pages"]["24"] = {
+        "status": "passed",
+        "pipeline_marker": "marker-v3",
+        "materializer_version": "materializer-v3",
     }
     assert choose_pages(args=args, plan=plan, state=state) == [44]
     args.retry_review_same_generation = True

@@ -2757,13 +2757,18 @@ assert _v2_alias_verifier['field_overrides'][0]['row_id'] == 'ROW_R003'
 # Phase 2G V1: font-independent character evidence, exact reference
 # resolution and fail-closed electrical topology validation.
 from electrical_graph import (
+    GRAPH_PATCH_PLAN_VERSION as _graph_patch_plan_version,
+    _apply_graph_patch_plan as _graph_apply_patch_plan,
     _apply_verifier_evidence_recovery as _graph_apply_recovery,
     _edge_bbox_valid as _graph_edge_bbox_valid,
     _glyph_registry as _graph_glyph_registry,
     _reconcile_graph_geometry_from_evidence as _graph_reconcile_geometry,
     _resolve_references as _graph_resolve_references,
     _resolve_references_for_verifier_v1 as _graph_resolve_for_verifier_v1,
+    _review_cause_family_counts as _graph_review_cause_family_counts,
     _validate_candidate_graph as _graph_validate_candidate,
+    _validate_patched_graph as _graph_validate_patched,
+    _verifier_schema as _graph_v3_verifier_schema,
 )
 
 _graph_font_texts = []
@@ -3592,6 +3597,480 @@ _graph_v2_geometry_audit, _graph_v2_geometry_issues = (
 assert _graph_v2_geometry_audit['validated'] is True, _graph_v2_geometry_issues
 assert _graph_v2_geometry_audit['reconciled_entity_count'] == 1
 assert _graph_v2_geometry_audit['reconciled_edge_count'] == 1
+
+
+# Phase 2G V3: one canonical atomic patch plan covers every raw entity and
+# edge, supports replacement/split/rewire, preserves explicit unresolved
+# references, and validates only the final projection.
+def _graph_v3_entity(
+    occurrence_id,
+    entity_type,
+    tag,
+    bbox,
+    glyph_id,
+    *,
+    drawing_ids=None,
+):
+    return {
+        'occurrence_id': occurrence_id,
+        'region_id': 'R1',
+        'entity_type': entity_type,
+        'subtype': '',
+        'tag_original': tag,
+        'label_original': '',
+        'description_original': '',
+        'function_text_original': '',
+        'symbol_code': '',
+        'location_code': '',
+        'reference_value_original': '',
+        'reference_context_original': '',
+        'bbox_pt': bbox,
+        'source_glyph_ids': [glyph_id] if glyph_id else [],
+        'source_word_ids': [glyph_id] if glyph_id else [],
+        'source_drawing_ids': list(drawing_ids or []),
+        'confidence': 0.98,
+        'evidence_notes': 'V3 fixture',
+    }
+
+
+def _graph_v3_raw_entity(*args, **kwargs):
+    row = _graph_v3_entity(*args, **kwargs)
+    row.pop('source_drawing_ids', None)
+    return row
+
+
+def _graph_v3_edge(
+    edge_id,
+    source_id,
+    target_id,
+    *,
+    relation_type='electrically_connected_to',
+    drawing_ids=None,
+    link_ids=None,
+    bbox=None,
+):
+    return {
+        'edge_id': edge_id,
+        'source_occurrence_id': source_id,
+        'target_occurrence_id': target_id,
+        'relation_type': relation_type,
+        'is_directed': False,
+        'potential_original': '',
+        'wire_reference_original': '',
+        'bbox_pt': bbox or [20, 15, 40, 15],
+        'source_glyph_ids': [],
+        'source_drawing_ids': list(drawing_ids or []),
+        'source_link_ids': list(link_ids or []),
+        'confidence': 0.98,
+        'evidence_notes': 'V3 fixture',
+    }
+
+
+def _graph_v3_entity_op(operation_id, action, source_id='', results=None):
+    return {
+        'operation_id': operation_id,
+        'action': action,
+        'source_entity_id': source_id,
+        'result_entities': results or [],
+        'evidence_indexes': [],
+        'confidence': 0.98,
+        'reason': 'V3 fixture',
+    }
+
+
+def _graph_v3_edge_op(operation_id, action, source_id='', results=None):
+    return {
+        'operation_id': operation_id,
+        'action': action,
+        'source_edge_id': source_id,
+        'result_edges': results or [],
+        'evidence_indexes': [],
+        'confidence': 0.98,
+        'reason': 'V3 fixture',
+    }
+
+
+def _graph_v3_verifier(entity_operations, edge_operations, *, issues=None):
+    return {
+        'page_id': 1,
+        'verdict': 'apply_patch',
+        'patch_plan_version': _graph_patch_plan_version,
+        'entity_operations': entity_operations,
+        'edge_operations': edge_operations,
+        'evidence_adjudications': [],
+        'final_assertions': {
+            'all_raw_entities_decided': True,
+            'all_raw_edges_decided': True,
+            'all_visible_entities_accounted_for': True,
+            'all_visible_connections_accounted_for': True,
+            'all_entity_text_visually_supported': True,
+            'all_connection_geometry_supported': True,
+            'all_references_resolved_or_explicitly_unresolved': True,
+            'duplicates_preserved': True,
+            'patch_plan_safe_to_apply': True,
+        },
+        'confidence': 0.98,
+        'issues': issues or [],
+    }
+
+
+_graph_v3_schema = _graph_v3_verifier_schema()['schema']
+assert _graph_v3_schema['additionalProperties'] is False
+assert _graph_v3_schema['properties']['entity_operations'][
+    'items'
+]['properties']['action']['enum'] == [
+    'ADD_ENTITY', 'KEEP_ENTITY', 'REMOVE_ENTITY',
+    'REPLACE_ENTITY', 'SPLIT_ENTITY'
+]
+assert _graph_v3_schema['properties']['edge_operations'][
+    'items'
+]['properties']['action']['enum'] == [
+    'ADD_EDGE', 'KEEP_EDGE', 'REMOVE_EDGE', 'REWIRE_EDGE'
+]
+assert set(_graph_v3_schema['properties']['entity_operations'][
+    'items'
+]['properties']['result_entities']['items']['properties'][
+    'entity_type'
+]['enum']) >= {'io_reference', 'terminal_reference', 'page_reference'}
+
+_graph_v3_page = {
+    'id': 1,
+    'pdf_page_number': 1,
+    'sheet_code': 'S1',
+    'page_width_pt': 100,
+    'page_height_pt': 100,
+}
+_graph_v3_detector = {
+    'page_id': 1,
+    'all_visible_circuit_regions_accounted_for': True,
+    'regions': [{
+        'region_id': 'R1',
+        'region_kind': 'mixed_circuit',
+        'bbox_pt': [0, 0, 100, 100],
+        'visible_component_count': 2,
+        'visible_connection_count': 1,
+        'confidence': 0.98,
+        'notes': 'V3 fixture',
+    }],
+    'uncovered_visual_regions': [],
+    'confidence': 0.98,
+    'issues': [],
+}
+_graph_v3_words = [
+    {'word_id': 1, 'text_original': 'K1', 'bbox_pt': [10, 10, 20, 20]},
+    {'word_id': 2, 'text_original': '24V', 'bbox_pt': [40, 10, 50, 20]},
+    {'word_id': 3, 'text_original': 'X', 'bbox_pt': [60, 10, 65, 20]},
+]
+_graph_v3_glyphs = [
+    {'glyph_id': 1, 'text_original': 'K', 'bbox_pt': [10, 10, 15, 20]},
+    {'glyph_id': 2, 'text_original': '2', 'bbox_pt': [40, 10, 45, 20]},
+    {'glyph_id': 3, 'text_original': 'X', 'bbox_pt': [60, 10, 65, 20]},
+]
+_graph_v3_drawings = [{'drawing_id': 1, 'bbox_pt': [20, 14, 40, 16]}]
+_graph_v3_registry = {
+    'bom': [], 'io': [], 'terminals': [], 'pages': [],
+    'cross_references': [],
+}
+_graph_v3_e1 = _graph_v3_raw_entity(
+    'e1', 'component_occurrence', 'K1', [10, 10, 20, 20], 1
+)
+_graph_v3_e2 = _graph_v3_raw_entity(
+    'e2', 'potential', '24V', [40, 10, 50, 20], 2
+)
+_graph_v3_false = _graph_v3_raw_entity(
+    'e3', 'component_occurrence', 'X', [60, 10, 65, 20], 3
+)
+_graph_v3_raw_edge = _graph_v3_edge(
+    'ed1', 'e1', 'e2', drawing_ids=[1]
+)
+_graph_v3_extraction = {
+    'page_id': 1,
+    'entities': [_graph_v3_e1, _graph_v3_e2, _graph_v3_false],
+    'edges': [_graph_v3_raw_edge],
+    'unresolved_visual_evidence': [],
+    'confidence': 0.97,
+    'issues': [],
+}
+_graph_v3_replacement = _graph_v3_entity(
+    'f1', 'contact', 'K1', [10, 10, 20, 20], 1,
+    drawing_ids=[1],
+)
+_graph_v3_verifier = _graph_v3_verifier(
+    [
+        _graph_v3_entity_op(
+            'oe1', 'REPLACE_ENTITY', 'e1', [_graph_v3_replacement]
+        ),
+        _graph_v3_entity_op('oe2', 'KEEP_ENTITY', 'e2'),
+        _graph_v3_entity_op('oe3', 'REMOVE_ENTITY', 'e3'),
+    ],
+    [
+        _graph_v3_edge_op(
+            'od1', 'REWIRE_EDGE', 'ed1', [
+                _graph_v3_edge(
+                    'fed1', 'f1', 'e2', drawing_ids=[1]
+                )
+            ]
+        )
+    ],
+    issues=[{
+        'issue_type': 'under_materialized_symbol',
+        'severity': 'high',
+        'message': 'Raw entity must be replaced and its edge rewired.',
+        'entity_ids': ['e1'],
+        'edge_ids': ['ed1'],
+        'confidence': 0.98,
+        'resolution_status': 'resolved_by_patch_plan',
+        'related_operation_ids': ['oe1', 'od1'],
+    }],
+)
+(
+    _graph_v3_entities,
+    _graph_v3_edges,
+    _graph_v3_patch_audit,
+    _graph_v3_patch_issues,
+) = _graph_apply_patch_plan(
+    page=_graph_v3_page,
+    extraction=_graph_v3_extraction,
+    verifier=_graph_v3_verifier,
+)
+assert _graph_v3_patch_audit['validated'] is True, _graph_v3_patch_issues
+assert [row['occurrence_id'] for row in _graph_v3_entities] == ['f1', 'e2']
+assert [row['edge_id'] for row in _graph_v3_edges] == ['fed1']
+_graph_v3_resolution = _graph_resolve_references(
+    {'entities': _graph_v3_entities}, _graph_v3_registry
+)
+(
+    _graph_v3_passed,
+    _,
+    _,
+    _graph_v3_final_issues,
+) = _graph_validate_patched(
+    page=_graph_v3_page,
+    detector=copy.deepcopy(_graph_v3_detector),
+    extraction=_graph_v3_extraction,
+    verifier=_graph_v3_verifier,
+    resolution=_graph_v3_resolution,
+    entities=_graph_v3_entities,
+    edges=_graph_v3_edges,
+    patch_audit=_graph_v3_patch_audit,
+    patch_issues=_graph_v3_patch_issues,
+    glyphs=_graph_v3_glyphs,
+    words=_graph_v3_words,
+    drawings=_graph_v3_drawings,
+    links=[],
+)
+assert _graph_v3_passed is True, _graph_v3_final_issues
+assert any(
+    issue.get('source_stage') == 'verifier_patch_plan_resolved'
+    for issue in _graph_v3_final_issues
+), _graph_v3_final_issues
+
+# Merged repeated occurrences can be split and every incident edge rewired.
+_graph_v3_split_extraction = {
+    'page_id': 1,
+    'entities': [
+        _graph_v3_raw_entity(
+            'merged', 'component_occurrence', 'K1',
+            [10, 10, 30, 20], 1
+        ),
+        _graph_v3_e2,
+    ],
+    'edges': [
+        _graph_v3_edge(
+            'a', 'merged', 'e2', drawing_ids=[1],
+            bbox=[30, 12, 40, 12]
+        ),
+        _graph_v3_edge(
+            'b', 'merged', 'e2', drawing_ids=[1],
+            bbox=[30, 18, 40, 18]
+        ),
+    ],
+    'unresolved_visual_evidence': [],
+    'confidence': 0.97,
+    'issues': [],
+}
+_graph_v3_split_verifier = _graph_v3_verifier(
+    [
+        _graph_v3_entity_op('split', 'SPLIT_ENTITY', 'merged', [
+            _graph_v3_entity(
+                's1', 'contact', 'K1', [10, 10, 18, 20], 1,
+                drawing_ids=[1],
+            ),
+            _graph_v3_entity(
+                's2', 'contact', 'K1', [20, 10, 28, 20], 1,
+                drawing_ids=[1],
+            ),
+        ]),
+        _graph_v3_entity_op('keep-e2', 'KEEP_ENTITY', 'e2'),
+    ],
+    [
+        _graph_v3_edge_op('rewire-a', 'REWIRE_EDGE', 'a', [
+            _graph_v3_edge(
+                'fa', 's1', 'e2', drawing_ids=[1],
+                bbox=[18, 12, 40, 12]
+            )
+        ]),
+        _graph_v3_edge_op('rewire-b', 'REWIRE_EDGE', 'b', [
+            _graph_v3_edge(
+                'fb', 's2', 'e2', drawing_ids=[1],
+                bbox=[28, 18, 40, 18]
+            )
+        ]),
+    ],
+)
+(
+    _graph_v3_split_entities,
+    _graph_v3_split_edges,
+    _graph_v3_split_audit,
+    _graph_v3_split_issues,
+) = _graph_apply_patch_plan(
+    page=_graph_v3_page,
+    extraction=_graph_v3_split_extraction,
+    verifier=_graph_v3_split_verifier,
+)
+assert _graph_v3_split_audit['entity_lineage']['merged'] == ['s1', 's2']
+assert len(_graph_v3_split_edges) == 2
+assert _graph_v3_split_audit['validated'] is True, _graph_v3_split_issues
+
+# Explicit unresolved references are accounted for without a fabricated match.
+_graph_v3_reference = _graph_v3_raw_entity(
+    'ref', 'terminal_reference', 'XP1', [10, 10, 20, 20], 1
+)
+_graph_v3_reference['reference_value_original'] = '99'
+_graph_v3_ref_extraction = {
+    'page_id': 1,
+    'entities': [_graph_v3_reference, _graph_v3_e2],
+    'edges': [_graph_v3_edge(
+        'ref-edge', 'ref', 'e2', relation_type='linked_to_component',
+        drawing_ids=[], bbox=[20, 15, 40, 15]
+    )],
+    'unresolved_visual_evidence': [],
+    'confidence': 0.97,
+    'issues': [],
+}
+_graph_v3_ref_verifier = _graph_v3_verifier(
+    [
+        _graph_v3_entity_op('keep-ref', 'KEEP_ENTITY', 'ref'),
+        _graph_v3_entity_op('keep-e2', 'KEEP_ENTITY', 'e2'),
+    ],
+    [_graph_v3_edge_op('keep-ref-edge', 'KEEP_EDGE', 'ref-edge')],
+)
+(
+    _graph_v3_ref_entities,
+    _graph_v3_ref_edges,
+    _graph_v3_ref_audit,
+    _graph_v3_ref_patch_issues,
+) = _graph_apply_patch_plan(
+    page=_graph_v3_page,
+    extraction=_graph_v3_ref_extraction,
+    verifier=_graph_v3_ref_verifier,
+)
+_graph_v3_ref_resolution = _graph_resolve_references(
+    {'entities': _graph_v3_ref_entities}, _graph_v3_registry
+)
+assert _graph_v3_ref_resolution['unresolved_reference_entity_ids'] == ['ref']
+assert _graph_v3_ref_resolution['all_reference_entities_accounted_for'] is True
+_graph_v3_ref_passed, _, _, _graph_v3_ref_final_issues = (
+    _graph_validate_patched(
+        page=_graph_v3_page,
+        detector=copy.deepcopy(_graph_v3_detector),
+        extraction=_graph_v3_ref_extraction,
+        verifier=_graph_v3_ref_verifier,
+        resolution=_graph_v3_ref_resolution,
+        entities=_graph_v3_ref_entities,
+        edges=_graph_v3_ref_edges,
+        patch_audit=_graph_v3_ref_audit,
+        patch_issues=_graph_v3_ref_patch_issues,
+        glyphs=_graph_v3_glyphs,
+        words=_graph_v3_words,
+        drawings=_graph_v3_drawings,
+        links=[],
+    )
+)
+assert _graph_v3_ref_passed is True, _graph_v3_ref_final_issues
+
+# Missing coverage and a PDF-link-only conductor both remain fail-closed.
+_graph_v3_missing_verifier = _graph_v3_verifier(
+    [_graph_v3_entity_op('keep-e1', 'KEEP_ENTITY', 'e1')],
+    [_graph_v3_edge_op('keep-ed1', 'KEEP_EDGE', 'ed1')],
+)
+_, _, _, _graph_v3_missing_issues = _graph_apply_patch_plan(
+    page=_graph_v3_page,
+    extraction=_graph_v3_extraction,
+    verifier=_graph_v3_missing_verifier,
+)
+assert any(
+    issue.get('issue_type') == 'graph-entity-patch-coverage-failed'
+    for issue in _graph_v3_missing_issues
+), _graph_v3_missing_issues
+
+_graph_v3_link_only_extraction = {
+    'page_id': 1,
+    'entities': [_graph_v3_e1, _graph_v3_e2],
+    'edges': [_graph_v3_edge(
+        'link-edge', 'e1', 'e2', drawing_ids=[], link_ids=[9]
+    )],
+    'unresolved_visual_evidence': [],
+    'confidence': 0.97,
+    'issues': [],
+}
+_graph_v3_link_only_verifier = _graph_v3_verifier(
+    [
+        _graph_v3_entity_op('keep-e1', 'KEEP_ENTITY', 'e1'),
+        _graph_v3_entity_op('keep-e2', 'KEEP_ENTITY', 'e2'),
+    ],
+    [_graph_v3_edge_op('keep-link', 'KEEP_EDGE', 'link-edge')],
+)
+(
+    _graph_v3_link_entities,
+    _graph_v3_link_edges,
+    _graph_v3_link_audit,
+    _graph_v3_link_patch_issues,
+) = _graph_apply_patch_plan(
+    page=_graph_v3_page,
+    extraction=_graph_v3_link_only_extraction,
+    verifier=_graph_v3_link_only_verifier,
+)
+_graph_v3_link_resolution = _graph_resolve_references(
+    {'entities': _graph_v3_link_entities}, _graph_v3_registry
+)
+_graph_v3_link_passed, _, _, _graph_v3_link_issues = (
+    _graph_validate_patched(
+        page=_graph_v3_page,
+        detector=copy.deepcopy(_graph_v3_detector),
+        extraction=_graph_v3_link_only_extraction,
+        verifier=_graph_v3_link_only_verifier,
+        resolution=_graph_v3_link_resolution,
+        entities=_graph_v3_link_entities,
+        edges=_graph_v3_link_edges,
+        patch_audit=_graph_v3_link_audit,
+        patch_issues=_graph_v3_link_patch_issues,
+        glyphs=_graph_v3_glyphs,
+        words=_graph_v3_words,
+        drawings=_graph_v3_drawings,
+        links=[{'id': 9}],
+    )
+)
+assert _graph_v3_link_passed is False
+assert any(
+    issue.get('issue_type') == 'graph-edge-geometry-evidence-missing'
+    for issue in _graph_v3_link_issues
+), _graph_v3_link_issues
+
+_graph_v3_cause_counts = _graph_review_cause_family_counts([
+    {
+        'issue_type': 'graph-edge-geometry-evidence-missing',
+        'severity': 'high',
+        'source_stage': 'deterministic_validator',
+    },
+    {
+        'issue_type': 'graph-verifier-blocked-page',
+        'severity': 'high',
+        'source_stage': 'deterministic_validator',
+    },
+])
+assert _graph_v3_cause_counts['edge_rewire_or_geometry'] == 1
+assert _graph_v3_cause_counts['publish_gate_cascade'] == 1
 
 required = {
     '/v1/ai/electrical/normalize',

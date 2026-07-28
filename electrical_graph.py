@@ -14,7 +14,7 @@ import requests
 
 from electrical_source_store import download_electrical_source_pdf
 
-# MachineMind Phase 2G V2
+# MachineMind Phase 2G V3
 # Page-atomic, multimodal electrical graph extraction with evidence ownership.
 # The deterministic layer is geometry/evidence based and contains no page,
 # language, font, manufacturer, component-tag or drawing-template dictionary.
@@ -78,11 +78,11 @@ EXTRACTOR_PROMPT_VERSION = (
 ).strip()
 VERIFIER_PROMPT_VERSION = (
     os.environ.get("MM_ELECTRICAL_GRAPH_VERIFIER_PROMPT_VERSION")
-    or "mm-electrical-graph-page-verifier-v1.2"
+    or "mm-electrical-graph-page-verifier-v3"
 ).strip()
 MATERIALIZER_VERSION = (
     os.environ.get("MM_ELECTRICAL_GRAPH_MATERIALIZER_VERSION")
-    or "mm-electrical-graph-materializer-v2"
+    or "mm-electrical-graph-materializer-v3"
 ).strip()
 
 OPENAI_TIMEOUT_SECONDS = _env_int(
@@ -95,7 +95,7 @@ RENDER_DPI = _env_int(
     "MM_ELECTRICAL_GRAPH_RENDER_DPI", 240, 120, 360
 )
 MAX_COMPLETION_TOKENS = _env_int(
-    "MM_ELECTRICAL_GRAPH_MAX_COMPLETION_TOKENS", 24000, 1000, 64000
+    "MM_ELECTRICAL_GRAPH_MAX_COMPLETION_TOKENS", 40000, 1000, 64000
 )
 ENTITY_MIN_CONFIDENCE = _env_float(
     "MM_ELECTRICAL_GRAPH_ENTITY_MIN_CONFIDENCE", 0.84, 0.0, 1.0
@@ -125,7 +125,7 @@ MAX_DRAWINGS_IN_PROMPT = _env_int(
     "MM_ELECTRICAL_GRAPH_MAX_DRAWINGS_IN_PROMPT", 3000, 100, 10000
 )
 
-PIPELINE_MARKER = "phase2-graph-v2-evidence-owned-batch-source-snapshot"
+PIPELINE_MARKER = "phase2-graph-v3-atomic-patch-plan-source-snapshot"
 MATERIALIZATION_PHASE = "graph_vision_v1"
 EXTRACTION_METHOD = "openai_vision_graph_v1"
 PAGE_TYPE = "schematic"
@@ -240,7 +240,34 @@ EDGE_BBOX_RECONCILIATION_VERSION = (
 NONMATERIALIZABLE_CONTEXT_VERSION = (
     "graph-nonmaterializable-context-links-v2"
 )
-REVIEW_GROUPING_VERSION = "graph-review-signature-v1"
+REVIEW_GROUPING_VERSION = "graph-review-signature-v3-causal-family"
+GRAPH_PATCH_PLAN_VERSION = "graph-atomic-patch-plan-v1"
+GRAPH_PATCH_APPLICATION_VERSION = "graph-atomic-patch-application-v1"
+GRAPH_FINAL_VALIDATION_VERSION = "graph-final-projection-validation-v1"
+ENTITY_PATCH_ACTIONS = {
+    "KEEP_ENTITY",
+    "REMOVE_ENTITY",
+    "REPLACE_ENTITY",
+    "SPLIT_ENTITY",
+    "ADD_ENTITY",
+}
+EDGE_PATCH_ACTIONS = {
+    "KEEP_EDGE",
+    "REMOVE_EDGE",
+    "REWIRE_EDGE",
+    "ADD_EDGE",
+}
+PATCH_EVIDENCE_STATUSES = {
+    "accounted_by_final_graph",
+    "accounted_non_materializable",
+    "still_unresolved",
+}
+VERIFIER_ISSUE_RESOLUTION_STATUSES = {
+    "open",
+    "resolved_by_patch_plan",
+    "informational",
+}
+
 
 
 def get_electrical_graph_runtime_config() -> dict:
@@ -1093,6 +1120,12 @@ def list_electrical_graph_pages(
                     "blocking_issue_type_counts": result.get(
                         "blocking_issue_type_counts"
                     ) or {},
+                    "review_cause_family_counts": result.get(
+                        "review_cause_family_counts"
+                    ) or {},
+                    "patch_plan_validated": bool(
+                        result.get("patch_plan_validated")
+                    ),
                     "review_signature": str(
                         result.get("review_signature") or ""
                     ),
@@ -2065,9 +2098,195 @@ def _visual_evidence_adjudication_schema() -> dict:
     }
 
 
+
+def _patch_entity_schema() -> dict:
+    """Canonical final-entity schema used by the verifier patch plan.
+
+    Extractor V1 responses remain cache-compatible. The verifier can normalize,
+    replace, split or add entities into this canonical final schema, which adds
+    exact drawing evidence for graphic-only occurrences.
+    """
+    schema = json.loads(json.dumps(_entity_schema()))
+    schema["properties"]["source_drawing_ids"] = {
+        "type": "array",
+        "items": {"type": "integer"},
+        "maxItems": 1000,
+    }
+    schema["required"].append("source_drawing_ids")
+    return schema
+
+
+def _entity_patch_operation_schema() -> dict:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "operation_id": {"type": "string"},
+            "action": {
+                "type": "string",
+                "enum": sorted(ENTITY_PATCH_ACTIONS),
+            },
+            "source_entity_id": {"type": "string"},
+            "result_entities": {
+                "type": "array",
+                "items": _patch_entity_schema(),
+                "maxItems": 12,
+            },
+            "evidence_indexes": {
+                "type": "array",
+                "items": {"type": "integer", "minimum": 0},
+                "maxItems": 200,
+            },
+            "confidence": {"type": "number"},
+            "reason": {"type": "string"},
+        },
+        "required": [
+            "operation_id",
+            "action",
+            "source_entity_id",
+            "result_entities",
+            "evidence_indexes",
+            "confidence",
+            "reason",
+        ],
+    }
+
+
+def _edge_patch_operation_schema() -> dict:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "operation_id": {"type": "string"},
+            "action": {
+                "type": "string",
+                "enum": sorted(EDGE_PATCH_ACTIONS),
+            },
+            "source_edge_id": {"type": "string"},
+            "result_edges": {
+                "type": "array",
+                "items": _edge_schema(),
+                "maxItems": 24,
+            },
+            "evidence_indexes": {
+                "type": "array",
+                "items": {"type": "integer", "minimum": 0},
+                "maxItems": 200,
+            },
+            "confidence": {"type": "number"},
+            "reason": {"type": "string"},
+        },
+        "required": [
+            "operation_id",
+            "action",
+            "source_edge_id",
+            "result_edges",
+            "evidence_indexes",
+            "confidence",
+            "reason",
+        ],
+    }
+
+
+def _patch_evidence_adjudication_schema() -> dict:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "evidence_index": {"type": "integer", "minimum": 0},
+            "evidence_text_original": {"type": "string"},
+            "status": {
+                "type": "string",
+                "enum": sorted(PATCH_EVIDENCE_STATUSES),
+            },
+            "raw_context_entity_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 200,
+            },
+            "raw_context_edge_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 400,
+            },
+            "final_entity_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 200,
+            },
+            "final_edge_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 400,
+            },
+            "related_operation_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 200,
+            },
+            "confidence": {"type": "number"},
+            "reason": {"type": "string"},
+        },
+        "required": [
+            "evidence_index",
+            "evidence_text_original",
+            "status",
+            "raw_context_entity_ids",
+            "raw_context_edge_ids",
+            "final_entity_ids",
+            "final_edge_ids",
+            "related_operation_ids",
+            "confidence",
+            "reason",
+        ],
+    }
+
+
+def _verifier_patch_issue_schema() -> dict:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "issue_type": {"type": "string"},
+            "severity": {"type": "string", "enum": sorted(SEVERITIES)},
+            "message": {"type": "string"},
+            "entity_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 500,
+            },
+            "edge_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 500,
+            },
+            "confidence": {"type": "number"},
+            "resolution_status": {
+                "type": "string",
+                "enum": sorted(VERIFIER_ISSUE_RESOLUTION_STATUSES),
+            },
+            "related_operation_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 300,
+            },
+        },
+        "required": [
+            "issue_type",
+            "severity",
+            "message",
+            "entity_ids",
+            "edge_ids",
+            "confidence",
+            "resolution_status",
+            "related_operation_ids",
+        ],
+    }
+
+
 def _verifier_schema() -> dict:
     return {
-        "name": "electrical_graph_page_verifier_v1_2",
+        "name": "electrical_graph_page_verifier_v3_atomic_patch_plan",
         "strict": True,
         "schema": {
             "type": "object",
@@ -2076,74 +2295,70 @@ def _verifier_schema() -> dict:
                 "page_id": {"type": "integer"},
                 "verdict": {
                     "type": "string",
-                    "enum": ["pass", "review_required"],
+                    "enum": ["apply_patch", "review_required"],
                 },
-                "all_visible_entities_accounted_for": {"type": "boolean"},
-                "all_visible_connections_accounted_for": {"type": "boolean"},
-                "all_entity_text_visually_supported": {"type": "boolean"},
-                "all_connection_geometry_supported": {"type": "boolean"},
-                "all_references_resolved_or_explicitly_unresolved": {
-                    "type": "boolean"
+                "patch_plan_version": {
+                    "type": "string",
+                    "enum": [GRAPH_PATCH_PLAN_VERSION],
                 },
-                "duplicates_preserved": {"type": "boolean"},
-                "verified_entity_ids": {
+                "entity_operations": {
                     "type": "array",
-                    "items": {"type": "string"},
-                    "maxItems": 1500,
+                    "items": _entity_patch_operation_schema(),
+                    "maxItems": 2500,
                 },
-                "verified_edge_ids": {
+                "edge_operations": {
                     "type": "array",
-                    "items": {"type": "string"},
-                    "maxItems": 4000,
+                    "items": _edge_patch_operation_schema(),
+                    "maxItems": 6000,
                 },
-                "rejected_entity_ids": {
+                "evidence_adjudications": {
                     "type": "array",
-                    "items": {"type": "string"},
+                    "items": _patch_evidence_adjudication_schema(),
                     "maxItems": 500,
                 },
-                "rejected_edge_ids": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "maxItems": 1000,
-                },
-                "recovery_entities": {
-                    "type": "array",
-                    "items": _recovery_entity_schema(),
-                    "maxItems": 300,
-                },
-                "recovery_edges": {
-                    "type": "array",
-                    "items": _edge_schema(),
-                    "maxItems": 800,
-                },
-                "visual_evidence_adjudications": {
-                    "type": "array",
-                    "items": _visual_evidence_adjudication_schema(),
-                    "maxItems": 300,
+                "final_assertions": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "all_raw_entities_decided": {"type": "boolean"},
+                        "all_raw_edges_decided": {"type": "boolean"},
+                        "all_visible_entities_accounted_for": {"type": "boolean"},
+                        "all_visible_connections_accounted_for": {"type": "boolean"},
+                        "all_entity_text_visually_supported": {"type": "boolean"},
+                        "all_connection_geometry_supported": {"type": "boolean"},
+                        "all_references_resolved_or_explicitly_unresolved": {
+                            "type": "boolean"
+                        },
+                        "duplicates_preserved": {"type": "boolean"},
+                        "patch_plan_safe_to_apply": {"type": "boolean"},
+                    },
+                    "required": [
+                        "all_raw_entities_decided",
+                        "all_raw_edges_decided",
+                        "all_visible_entities_accounted_for",
+                        "all_visible_connections_accounted_for",
+                        "all_entity_text_visually_supported",
+                        "all_connection_geometry_supported",
+                        "all_references_resolved_or_explicitly_unresolved",
+                        "duplicates_preserved",
+                        "patch_plan_safe_to_apply",
+                    ],
                 },
                 "confidence": {"type": "number"},
                 "issues": {
                     "type": "array",
-                    "items": _issue_schema(),
-                    "maxItems": 150,
+                    "items": _verifier_patch_issue_schema(),
+                    "maxItems": 300,
                 },
             },
             "required": [
                 "page_id",
                 "verdict",
-                "all_visible_entities_accounted_for",
-                "all_visible_connections_accounted_for",
-                "all_entity_text_visually_supported",
-                "all_connection_geometry_supported",
-                "all_references_resolved_or_explicitly_unresolved",
-                "duplicates_preserved",
-                "verified_entity_ids",
-                "verified_edge_ids",
-                "rejected_entity_ids",
-                "rejected_edge_ids",
-                "recovery_entities",
-                "recovery_edges",
-                "visual_evidence_adjudications",
+                "patch_plan_version",
+                "entity_operations",
+                "edge_operations",
+                "evidence_adjudications",
+                "final_assertions",
                 "confidence",
                 "issues",
             ],
@@ -2335,6 +2550,7 @@ def _extractor_messages(
     ]
 
 
+
 def _verifier_messages(
     *,
     page: dict,
@@ -2349,34 +2565,39 @@ def _verifier_messages(
     image_rotated: bytes,
 ) -> list[dict]:
     system = (
-        "You are the independent visual verifier and evidence-recovery stage "
-        "of an industrial electrical page graph. Re-read the full page without "
-        "trusting the extractor. Verify exact physical occurrence identity, "
-        "printed tags, symbol roles, connection topology, wire/potential labels "
-        "and off-page references. Repeated component tags must remain separate "
-        "occurrences. A visible wire crossing is not a junction unless the "
-        "drawing visibly supports a junction. Every geometry-dependent connection "
-        "must cite local drawing evidence IDs. Certified BOM, I/O, terminal and "
-        "page matches must be exact and grounded in both the visible page and the "
-        "provided certified registry resolution. "
-        "If the extractor omitted a real visible symbol or local conductor, return "
-        "it only in recovery_entities or recovery_edges. Recovery IDs must be new "
-        "and unique. Recovery entities may not be external reference entities; "
-        "unmatched printed references must remain explicit unresolved references. "
-        "A graphic-only recovery entity must cite exact source_drawing_ids. A text "
-        "entity must cite exact source glyph or word IDs. A recovery edge must have "
-        "two visible endpoints and exact local source_drawing_ids; never turn a "
-        "one-ended graphical stub into an electrical connection. A short stub that "
-        "belongs visually to a recovered symbol may be accounted for by that "
-        "entity's bbox and drawing evidence. "
-        "All recovery bbox_pt values MUST be in the original PDF point coordinate "
-        "space shown by page_width_pt/page_height_pt, never rendered-image pixels "
-        "and never rotated-image coordinates. Use the supplied glyph/drawing bbox "
-        "registries to choose exact PDF-point evidence. "
-        "Return exactly one visual_evidence_adjudication for every numbered "
-        "extractor unresolved_visual_evidence item. Use still_unresolved whenever "
-        "the page does not support one safe disposition. Return pass only when the "
-        "post-pruning, post-recovery graph is safe to publish atomically."
+        "You are the independent final graph editor for an industrial electrical "
+        "schematic. Re-read the full page and produce an atomic patch plan over "
+        "the extractor graph. The source may use any language, font, CAD system, "
+        "orientation or drawing standard. The canonical entity types listed in "
+        "the request are ALL valid, including io_reference, terminal_reference "
+        "and page_reference. Never reject those types merely because they are "
+        "references. A reference can remain explicitly unresolved when the visible "
+        "page is real but no exact certified registry match exists; never invent a "
+        "mapping. PDF links are navigation evidence only and can never substitute "
+        "for local conductor drawing evidence. "
+        "Return exactly one entity operation for every raw entity and exactly one "
+        "edge operation for every raw edge. KEEP means the raw object is already "
+        "correct. REMOVE deletes a false candidate. REPLACE normalizes or substitutes "
+        "one raw entity. SPLIT separates merged repeated physical occurrences. ADD "
+        "creates one omitted visible occurrence. If an entity is removed, replaced "
+        "with a different ID, or split, every incident raw edge must be removed or "
+        "rewired so no final edge points to a deleted ID. REWIRE may replace one raw "
+        "edge with one or more final edges. "
+        "Every final entity/edge must cite exact glyph, word and/or drawing IDs from "
+        "the supplied registries. Literal printed text requires glyph or word evidence. "
+        "A graphic-only entity requires drawing evidence. Geometry-dependent edges "
+        "require local drawing IDs and two visible final endpoints. Repeated printed "
+        "occurrences must remain separate. A wire crossing is not a junction unless "
+        "the drawing supports it. "
+        "Every numbered extractor unresolved-evidence item must be adjudicated exactly "
+        "once. accounted_non_materializable may cite RAW context IDs even when those "
+        "raw candidates are later removed or replaced; those links are audit context, "
+        "not graph objects. Patch operations do not need an unresolved-evidence index "
+        "when they correct an already extracted candidate. "
+        "Mark a verifier issue resolved_by_patch_plan only when the listed operation "
+        "IDs completely resolve it. Keep resolution_status=open for anything still "
+        "unsafe. Return apply_patch only when the final projection is safe after all "
+        "operations, rewiring and explicit-unresolved reference handling."
     )
     compact_glyphs = [
         {
@@ -2404,9 +2625,14 @@ def _verifier_messages(
         "sheet_title_original": page.get("sheet_title"),
         "page_width_pt": page.get("page_width_pt"),
         "page_height_pt": page.get("page_height_pt"),
+        "canonical_entity_types": sorted(ENTITY_TYPES),
+        "canonical_relation_types": sorted(RELATION_TYPES),
+        "entity_patch_actions": sorted(ENTITY_PATCH_ACTIONS),
+        "edge_patch_actions": sorted(EDGE_PATCH_ACTIONS),
+        "patch_plan_version": GRAPH_PATCH_PLAN_VERSION,
         "detector": detector,
-        "candidate_graph": extraction,
-        "deterministic_reference_resolution": resolution,
+        "raw_candidate_graph": extraction,
+        "raw_reference_resolution": resolution,
         "numbered_unresolved_visual_evidence": unresolved_items,
         "vector_words": words,
         "source_glyphs": compact_glyphs,
@@ -2414,21 +2640,17 @@ def _verifier_messages(
         "drawing_registry": drawings[:MAX_DRAWINGS_IN_PROMPT],
         "drawing_registry_complete": len(drawings) <= MAX_DRAWINGS_IN_PROMPT,
         "pdf_link_registry": links,
+        "entity_min_confidence": ENTITY_MIN_CONFIDENCE,
+        "edge_min_confidence": EDGE_MIN_CONFIDENCE,
         "page_pass_min_confidence": PAGE_PASS_MIN_CONFIDENCE,
-        "recovery_version": VERIFIER_EVIDENCE_RECOVERY_VERSION,
-        "visual_evidence_adjudication_version": (
-            VISUAL_EVIDENCE_ADJUDICATION_VERSION
-        ),
     }
     content = [
         {
             "type": "text",
             "text": (
-                "Audit every raw entity and edge ID, prune false candidates, "
-                "recover only directly visible omitted evidence, and adjudicate "
-                "every numbered unresolved evidence item exactly once. Echo raw "
-                "IDs only in verified/rejected lists; put new IDs only in recovery "
-                "arrays. Judge the resulting post-recovery graph.\n\n"
+                "Produce the complete atomic graph patch plan. Cover every raw "
+                "entity and edge exactly once, reconnect all surviving topology, "
+                "and adjudicate every numbered unresolved evidence item.\n\n"
                 + json.dumps(request, ensure_ascii=False)
             ),
         },
@@ -3829,6 +4051,7 @@ def _adjudicate_detector_region_bboxes(
     detector: dict,
     entities: list[dict],
     edges: list[dict],
+    final_assertions: Optional[dict] = None,
 ) -> tuple[dict, list[dict]]:
     """Reconcile detector coordinate frames against final PDF-point evidence.
 
@@ -3931,6 +4154,52 @@ def _adjudicate_detector_region_bboxes(
 
         source_rects = entity_rects or edge_rects
         if not source_rects:
+            expected_components = int(
+                region.get("visible_component_count") or 0
+            )
+            expected_connections = int(
+                region.get("visible_connection_count") or 0
+            )
+            assertions = final_assertions or {}
+            final_coverage_asserted = bool(
+                assertions.get("all_visible_entities_accounted_for")
+                and assertions.get("all_visible_connections_accounted_for")
+            )
+            detector_low_confidence = bool(
+                _clamp_conf(region.get("confidence")) + 1e-9
+                < PAGE_PASS_MIN_CONFIDENCE
+            )
+            empty_region_is_preliminary_false_positive = bool(
+                (expected_components == 0 and expected_connections == 0)
+                or (final_coverage_asserted and detector_low_confidence)
+            )
+            if empty_region_is_preliminary_false_positive:
+                issues.append(_local_issue(
+                    issue_type="graph-empty-detector-region-superseded",
+                    message=(
+                        "A preliminary detector region has no final graph "
+                        "objects and was superseded by complete final-projection "
+                        "coverage validation"
+                    ),
+                    confidence=region.get("confidence") or 0.0,
+                    severity="warning" if (
+                        expected_components or expected_connections
+                    ) else "info",
+                    source_stage="detector_preliminary_audit",
+                ))
+                audits.append({
+                    "region_id": region_id,
+                    "original_bbox_pt": original,
+                    "final_bbox_pt": [],
+                    "reason": "empty_preliminary_region_superseded",
+                    "entity_center_coverage_ratio": round(coverage_ratio, 4),
+                    "source_entity_ids": [],
+                    "source_edge_ids": [],
+                    "detector_visible_component_count": expected_components,
+                    "detector_visible_connection_count": expected_connections,
+                    "validated": True,
+                })
+                continue
             issues.append(_local_issue(
                 issue_type="graph-region-bbox-unrecoverable",
                 message=(
@@ -3947,6 +4216,8 @@ def _adjudicate_detector_region_bboxes(
                 "entity_center_coverage_ratio": round(coverage_ratio, 4),
                 "source_entity_ids": region_entity_ids,
                 "source_edge_ids": region_edge_ids,
+                "detector_visible_component_count": expected_components,
+                "detector_visible_connection_count": expected_connections,
                 "validated": False,
             })
             continue
@@ -4875,6 +5146,1079 @@ def _validate_candidate_graph(
     return not blocking and bool(entities) and bool(edges), entities, edges, issues
 
 
+
+def _patch_entity_result_normalized(raw: Any) -> dict:
+    entity = dict(raw) if isinstance(raw, dict) else {}
+    entity.setdefault("source_drawing_ids", [])
+    for field in (
+        "source_glyph_ids", "source_word_ids", "source_drawing_ids"
+    ):
+        entity[field] = sorted({
+            int(value) for value in (entity.get(field) or [])
+            if isinstance(value, int) or str(value).isdigit()
+        })
+    return entity
+
+
+def _patch_edge_result_normalized(raw: Any) -> dict:
+    edge = dict(raw) if isinstance(raw, dict) else {}
+    for field in (
+        "source_glyph_ids", "source_drawing_ids", "source_link_ids"
+    ):
+        edge[field] = sorted({
+            int(value) for value in (edge.get(field) or [])
+            if isinstance(value, int) or str(value).isdigit()
+        })
+    return edge
+
+
+def _apply_graph_patch_plan(
+    *,
+    page: dict,
+    extraction: dict,
+    verifier: dict,
+) -> tuple[list[dict], list[dict], dict, list[dict]]:
+    """Apply the verifier patch plan entirely in memory and fail closed.
+
+    Every raw entity and edge must be decided exactly once. Replacement/split
+    lineage is explicit, and any edge that would retain a deleted endpoint must
+    be rewired or removed. This function does not trust verifier global flags;
+    it validates operation cardinality, coverage and final endpoint integrity.
+    """
+    issues: list[dict] = []
+    raw_entities = [
+        dict(item) for item in (extraction.get("entities") or [])
+        if isinstance(item, dict)
+    ]
+    raw_edges = [
+        dict(item) for item in (extraction.get("edges") or [])
+        if isinstance(item, dict)
+    ]
+    raw_entity_by_id = {
+        _clean_text(item.get("occurrence_id"), 160): item
+        for item in raw_entities
+        if _clean_text(item.get("occurrence_id"), 160)
+    }
+    raw_edge_by_id = {
+        _clean_text(item.get("edge_id"), 160): item
+        for item in raw_edges
+        if _clean_text(item.get("edge_id"), 160)
+    }
+    raw_entity_ids = set(raw_entity_by_id)
+    raw_edge_ids = set(raw_edge_by_id)
+    unresolved_items = [
+        _clean_text(value, 4000)
+        for value in (extraction.get("unresolved_visual_evidence") or [])
+    ]
+
+    if verifier.get("patch_plan_version") != GRAPH_PATCH_PLAN_VERSION:
+        issues.append(_local_issue(
+            issue_type="graph-patch-plan-version-mismatch",
+            message="Verifier returned an unsupported graph patch-plan version",
+            confidence=verifier.get("confidence") or 0.0,
+        ))
+
+    operation_ids: set[str] = set()
+    applied_operation_ids: set[str] = set()
+    raw_entity_claims: dict[str, list[str]] = {}
+    raw_edge_claims: dict[str, list[str]] = {}
+    entity_lineage: dict[str, list[str]] = {}
+    edge_lineage: dict[str, list[str]] = {}
+    final_entities: list[dict] = []
+    final_edges: list[dict] = []
+    entity_operation_audit: list[dict] = []
+    edge_operation_audit: list[dict] = []
+
+    def register_operation_id(operation_id: str, *, kind: str) -> bool:
+        if not operation_id or operation_id in operation_ids:
+            issues.append(_local_issue(
+                issue_type="graph-patch-operation-id-invalid",
+                message=(
+                    f"Missing or duplicate {kind} patch operation_id"
+                ),
+                confidence=verifier.get("confidence") or 0.0,
+            ))
+            return False
+        operation_ids.add(operation_id)
+        return True
+
+    for raw in verifier.get("entity_operations") or []:
+        op = raw if isinstance(raw, dict) else {}
+        operation_id = _clean_text(op.get("operation_id"), 160)
+        action = _clean_text(op.get("action"), 80)
+        source_id = _clean_text(op.get("source_entity_id"), 160)
+        confidence = _clamp_conf(op.get("confidence"))
+        results = [
+            _patch_entity_result_normalized(item)
+            for item in (op.get("result_entities") or [])
+            if isinstance(item, dict)
+        ]
+        evidence_indexes = sorted({
+            int(value) for value in (op.get("evidence_indexes") or [])
+            if isinstance(value, int) or str(value).isdigit()
+        })
+        problem = not register_operation_id(operation_id, kind="entity")
+        if action not in ENTITY_PATCH_ACTIONS:
+            issues.append(_local_issue(
+                issue_type="graph-entity-patch-action-invalid",
+                message="Verifier returned an invalid entity patch action",
+                entity_ids=[source_id] if source_id else [],
+                confidence=confidence,
+            ))
+            problem = True
+        if confidence + 1e-9 < ENTITY_MIN_CONFIDENCE:
+            issues.append(_local_issue(
+                issue_type="graph-entity-patch-confidence-below-threshold",
+                message="Entity patch operation confidence is below threshold",
+                entity_ids=[source_id] if source_id else [],
+                confidence=confidence,
+            ))
+            problem = True
+        if any(index < 0 or index >= len(unresolved_items) for index in evidence_indexes):
+            issues.append(_local_issue(
+                issue_type="graph-patch-evidence-index-invalid",
+                message="Entity patch operation cites an invalid evidence index",
+                entity_ids=[source_id] if source_id else [],
+                confidence=confidence,
+            ))
+            problem = True
+
+        if action == "ADD_ENTITY":
+            if source_id or len(results) != 1:
+                problem = True
+        else:
+            if source_id not in raw_entity_ids:
+                issues.append(_local_issue(
+                    issue_type="graph-entity-patch-source-invalid",
+                    message="Entity patch operation references an unknown raw entity",
+                    entity_ids=[source_id] if source_id else [],
+                    confidence=confidence,
+                ))
+                problem = True
+            else:
+                raw_entity_claims.setdefault(source_id, []).append(operation_id)
+            expected_counts = {
+                "KEEP_ENTITY": (0, 0),
+                "REMOVE_ENTITY": (0, 0),
+                "REPLACE_ENTITY": (1, 1),
+                "SPLIT_ENTITY": (2, 12),
+            }
+            minimum, maximum = expected_counts.get(action, (0, -1))
+            if not (minimum <= len(results) <= maximum):
+                problem = True
+
+        if problem:
+            issues.append(_local_issue(
+                issue_type="graph-entity-patch-cardinality-invalid",
+                message="Entity patch operation violates its source/result contract",
+                entity_ids=[source_id] if source_id else [],
+                confidence=confidence,
+            ))
+            entity_operation_audit.append({
+                "operation_id": operation_id,
+                "action": action,
+                "source_entity_id": source_id,
+                "result_entity_ids": [
+                    _clean_text(item.get("occurrence_id"), 160)
+                    for item in results
+                ],
+                "validated": False,
+            })
+            continue
+
+        produced: list[dict] = []
+        if action == "KEEP_ENTITY":
+            produced = [_patch_entity_result_normalized(raw_entity_by_id[source_id])]
+        elif action in {"REPLACE_ENTITY", "SPLIT_ENTITY", "ADD_ENTITY"}:
+            produced = results
+
+        produced_ids = [
+            _clean_text(item.get("occurrence_id"), 160) for item in produced
+        ]
+        if any(not value for value in produced_ids) or len(produced_ids) != len(set(produced_ids)):
+            issues.append(_local_issue(
+                issue_type="graph-entity-patch-result-id-invalid",
+                message="Entity patch operation produced missing or duplicate final IDs",
+                entity_ids=[value for value in produced_ids if value],
+                confidence=confidence,
+            ))
+            entity_operation_audit.append({
+                "operation_id": operation_id,
+                "action": action,
+                "source_entity_id": source_id,
+                "result_entity_ids": produced_ids,
+                "validated": False,
+            })
+            continue
+
+        for entity in produced:
+            entity.setdefault("patch_provenance", {})
+            entity["patch_provenance"] = {
+                "version": GRAPH_PATCH_APPLICATION_VERSION,
+                "operation_id": operation_id,
+                "action": action,
+                "source_entity_id": source_id,
+                "evidence_indexes": evidence_indexes,
+                "confidence": confidence,
+                "reason": _clean_text(op.get("reason"), 1600),
+            }
+            final_entities.append(entity)
+        if source_id:
+            entity_lineage[source_id] = produced_ids
+        applied_operation_ids.add(operation_id)
+        entity_operation_audit.append({
+            "operation_id": operation_id,
+            "action": action,
+            "source_entity_id": source_id,
+            "result_entity_ids": produced_ids,
+            "evidence_indexes": evidence_indexes,
+            "confidence": confidence,
+            "validated": True,
+        })
+
+    missing_entity_decisions = sorted(raw_entity_ids - set(raw_entity_claims))
+    duplicate_entity_decisions = sorted(
+        source_id for source_id, claims in raw_entity_claims.items()
+        if len(claims) != 1
+    )
+    if missing_entity_decisions or duplicate_entity_decisions:
+        issues.append(_local_issue(
+            issue_type="graph-entity-patch-coverage-failed",
+            message="Every raw entity must be decided exactly once",
+            entity_ids=sorted(set(missing_entity_decisions + duplicate_entity_decisions)),
+            confidence=verifier.get("confidence") or 0.0,
+        ))
+
+    final_entity_ids_list = [
+        _clean_text(item.get("occurrence_id"), 160) for item in final_entities
+    ]
+    duplicate_final_entity_ids = sorted({
+        value for value in final_entity_ids_list
+        if value and final_entity_ids_list.count(value) > 1
+    })
+    if duplicate_final_entity_ids:
+        issues.append(_local_issue(
+            issue_type="graph-final-entity-id-collision",
+            message="Multiple patch operations produced the same final entity ID",
+            entity_ids=duplicate_final_entity_ids,
+            confidence=verifier.get("confidence") or 0.0,
+        ))
+    final_entity_ids = set(final_entity_ids_list)
+
+    for raw in verifier.get("edge_operations") or []:
+        op = raw if isinstance(raw, dict) else {}
+        operation_id = _clean_text(op.get("operation_id"), 160)
+        action = _clean_text(op.get("action"), 80)
+        source_id = _clean_text(op.get("source_edge_id"), 160)
+        confidence = _clamp_conf(op.get("confidence"))
+        results = [
+            _patch_edge_result_normalized(item)
+            for item in (op.get("result_edges") or [])
+            if isinstance(item, dict)
+        ]
+        evidence_indexes = sorted({
+            int(value) for value in (op.get("evidence_indexes") or [])
+            if isinstance(value, int) or str(value).isdigit()
+        })
+        problem = not register_operation_id(operation_id, kind="edge")
+        if action not in EDGE_PATCH_ACTIONS:
+            issues.append(_local_issue(
+                issue_type="graph-edge-patch-action-invalid",
+                message="Verifier returned an invalid edge patch action",
+                edge_ids=[source_id] if source_id else [],
+                confidence=confidence,
+            ))
+            problem = True
+        if confidence + 1e-9 < EDGE_MIN_CONFIDENCE:
+            issues.append(_local_issue(
+                issue_type="graph-edge-patch-confidence-below-threshold",
+                message="Edge patch operation confidence is below threshold",
+                edge_ids=[source_id] if source_id else [],
+                confidence=confidence,
+            ))
+            problem = True
+        if any(index < 0 or index >= len(unresolved_items) for index in evidence_indexes):
+            issues.append(_local_issue(
+                issue_type="graph-patch-evidence-index-invalid",
+                message="Edge patch operation cites an invalid evidence index",
+                edge_ids=[source_id] if source_id else [],
+                confidence=confidence,
+            ))
+            problem = True
+
+        if action == "ADD_EDGE":
+            if source_id or len(results) != 1:
+                problem = True
+        else:
+            if source_id not in raw_edge_ids:
+                issues.append(_local_issue(
+                    issue_type="graph-edge-patch-source-invalid",
+                    message="Edge patch operation references an unknown raw edge",
+                    edge_ids=[source_id] if source_id else [],
+                    confidence=confidence,
+                ))
+                problem = True
+            else:
+                raw_edge_claims.setdefault(source_id, []).append(operation_id)
+            expected_counts = {
+                "KEEP_EDGE": (0, 0),
+                "REMOVE_EDGE": (0, 0),
+                "REWIRE_EDGE": (1, 24),
+            }
+            minimum, maximum = expected_counts.get(action, (0, -1))
+            if not (minimum <= len(results) <= maximum):
+                problem = True
+
+        if problem:
+            issues.append(_local_issue(
+                issue_type="graph-edge-patch-cardinality-invalid",
+                message="Edge patch operation violates its source/result contract",
+                edge_ids=[source_id] if source_id else [],
+                confidence=confidence,
+            ))
+            edge_operation_audit.append({
+                "operation_id": operation_id,
+                "action": action,
+                "source_edge_id": source_id,
+                "result_edge_ids": [
+                    _clean_text(item.get("edge_id"), 160) for item in results
+                ],
+                "validated": False,
+            })
+            continue
+
+        produced: list[dict] = []
+        if action == "KEEP_EDGE":
+            produced = [_patch_edge_result_normalized(raw_edge_by_id[source_id])]
+        elif action in {"REWIRE_EDGE", "ADD_EDGE"}:
+            produced = results
+        produced_ids = [
+            _clean_text(item.get("edge_id"), 160) for item in produced
+        ]
+        if any(not value for value in produced_ids) or len(produced_ids) != len(set(produced_ids)):
+            issues.append(_local_issue(
+                issue_type="graph-edge-patch-result-id-invalid",
+                message="Edge patch operation produced missing or duplicate final IDs",
+                edge_ids=[value for value in produced_ids if value],
+                confidence=confidence,
+            ))
+            edge_operation_audit.append({
+                "operation_id": operation_id,
+                "action": action,
+                "source_edge_id": source_id,
+                "result_edge_ids": produced_ids,
+                "validated": False,
+            })
+            continue
+        for edge in produced:
+            edge.setdefault("patch_provenance", {})
+            edge["patch_provenance"] = {
+                "version": GRAPH_PATCH_APPLICATION_VERSION,
+                "operation_id": operation_id,
+                "action": action,
+                "source_edge_id": source_id,
+                "evidence_indexes": evidence_indexes,
+                "confidence": confidence,
+                "reason": _clean_text(op.get("reason"), 1600),
+            }
+            final_edges.append(edge)
+        if source_id:
+            edge_lineage[source_id] = produced_ids
+        applied_operation_ids.add(operation_id)
+        edge_operation_audit.append({
+            "operation_id": operation_id,
+            "action": action,
+            "source_edge_id": source_id,
+            "result_edge_ids": produced_ids,
+            "evidence_indexes": evidence_indexes,
+            "confidence": confidence,
+            "validated": True,
+        })
+
+    missing_edge_decisions = sorted(raw_edge_ids - set(raw_edge_claims))
+    duplicate_edge_decisions = sorted(
+        source_id for source_id, claims in raw_edge_claims.items()
+        if len(claims) != 1
+    )
+    if missing_edge_decisions or duplicate_edge_decisions:
+        issues.append(_local_issue(
+            issue_type="graph-edge-patch-coverage-failed",
+            message="Every raw edge must be decided exactly once",
+            edge_ids=sorted(set(missing_edge_decisions + duplicate_edge_decisions)),
+            confidence=verifier.get("confidence") or 0.0,
+        ))
+
+    final_edge_ids_list = [
+        _clean_text(item.get("edge_id"), 160) for item in final_edges
+    ]
+    duplicate_final_edge_ids = sorted({
+        value for value in final_edge_ids_list
+        if value and final_edge_ids_list.count(value) > 1
+    })
+    if duplicate_final_edge_ids:
+        issues.append(_local_issue(
+            issue_type="graph-final-edge-id-collision",
+            message="Multiple patch operations produced the same final edge ID",
+            edge_ids=duplicate_final_edge_ids,
+            confidence=verifier.get("confidence") or 0.0,
+        ))
+    final_edge_ids = set(final_edge_ids_list)
+
+    invalid_endpoint_edges = []
+    for edge in final_edges:
+        source_id = _clean_text(edge.get("source_occurrence_id"), 160)
+        target_id = _clean_text(edge.get("target_occurrence_id"), 160)
+        if source_id not in final_entity_ids or target_id not in final_entity_ids:
+            invalid_endpoint_edges.append(_clean_text(edge.get("edge_id"), 160))
+    if invalid_endpoint_edges:
+        issues.append(_local_issue(
+            issue_type="graph-patch-final-edge-endpoint-missing",
+            message="Final patched edges reference deleted or absent final entities",
+            edge_ids=sorted(invalid_endpoint_edges),
+            confidence=verifier.get("confidence") or 0.0,
+        ))
+
+    adjudications = [
+        item for item in (verifier.get("evidence_adjudications") or [])
+        if isinstance(item, dict)
+    ]
+    seen_evidence_indexes: set[int] = set()
+    normalized_adjudications: list[dict] = []
+    for item in adjudications:
+        try:
+            evidence_index = int(item.get("evidence_index"))
+        except Exception:
+            evidence_index = -1
+        confidence = _clamp_conf(item.get("confidence"))
+        status = _clean_text(item.get("status"), 120)
+        raw_context_entity_ids = {
+            _clean_text(value, 160)
+            for value in (item.get("raw_context_entity_ids") or [])
+            if _clean_text(value, 160)
+        }
+        raw_context_edge_ids = {
+            _clean_text(value, 160)
+            for value in (item.get("raw_context_edge_ids") or [])
+            if _clean_text(value, 160)
+        }
+        cited_final_entity_ids = {
+            _clean_text(value, 160)
+            for value in (item.get("final_entity_ids") or [])
+            if _clean_text(value, 160)
+        }
+        cited_final_edge_ids = {
+            _clean_text(value, 160)
+            for value in (item.get("final_edge_ids") or [])
+            if _clean_text(value, 160)
+        }
+        related_operation_ids = {
+            _clean_text(value, 160)
+            for value in (item.get("related_operation_ids") or [])
+            if _clean_text(value, 160)
+        }
+        row_problem = False
+        if (
+            evidence_index < 0
+            or evidence_index >= len(unresolved_items)
+            or evidence_index in seen_evidence_indexes
+        ):
+            issues.append(_local_issue(
+                issue_type="graph-patch-evidence-adjudication-index-invalid",
+                message="Evidence adjudication index is missing, duplicate or out of range",
+                confidence=confidence,
+            ))
+            row_problem = True
+        else:
+            seen_evidence_indexes.add(evidence_index)
+        if status not in PATCH_EVIDENCE_STATUSES:
+            issues.append(_local_issue(
+                issue_type="graph-patch-evidence-status-invalid",
+                message="Evidence adjudication returned an invalid status",
+                confidence=confidence,
+            ))
+            row_problem = True
+        if confidence + 1e-9 < ENTITY_MIN_CONFIDENCE:
+            issues.append(_local_issue(
+                issue_type="graph-patch-evidence-confidence-below-threshold",
+                message="Evidence adjudication confidence is below threshold",
+                confidence=confidence,
+            ))
+            row_problem = True
+        if raw_context_entity_ids - raw_entity_ids or raw_context_edge_ids - raw_edge_ids:
+            issues.append(_local_issue(
+                issue_type="graph-patch-evidence-raw-context-invalid",
+                message="Evidence adjudication cites raw context IDs absent from extraction",
+                entity_ids=sorted(raw_context_entity_ids - raw_entity_ids),
+                edge_ids=sorted(raw_context_edge_ids - raw_edge_ids),
+                confidence=confidence,
+            ))
+            row_problem = True
+        if cited_final_entity_ids - final_entity_ids or cited_final_edge_ids - final_edge_ids:
+            issues.append(_local_issue(
+                issue_type="graph-patch-evidence-final-context-invalid",
+                message="Evidence adjudication cites IDs absent from the final graph",
+                entity_ids=sorted(cited_final_entity_ids - final_entity_ids),
+                edge_ids=sorted(cited_final_edge_ids - final_edge_ids),
+                confidence=confidence,
+            ))
+            row_problem = True
+        if related_operation_ids - applied_operation_ids:
+            issues.append(_local_issue(
+                issue_type="graph-patch-evidence-operation-link-invalid",
+                message="Evidence adjudication cites unapplied patch operations",
+                confidence=confidence,
+            ))
+            row_problem = True
+        if status == "accounted_by_final_graph" and not (
+            cited_final_entity_ids or cited_final_edge_ids
+        ):
+            issues.append(_local_issue(
+                issue_type="graph-patch-evidence-final-link-missing",
+                message="Final-graph evidence adjudication must cite a final entity or edge",
+                confidence=confidence,
+            ))
+            row_problem = True
+        if status == "still_unresolved":
+            issues.append(_local_issue(
+                issue_type="graph-patch-evidence-still-unresolved",
+                message="A visible evidence item remains unresolved after patch planning",
+                entity_ids=sorted(cited_final_entity_ids),
+                edge_ids=sorted(cited_final_edge_ids),
+                confidence=confidence,
+            ))
+            row_problem = True
+        canonical_text = (
+            unresolved_items[evidence_index]
+            if 0 <= evidence_index < len(unresolved_items)
+            else _clean_text(item.get("evidence_text_original"), 4000)
+        )
+        normalized_adjudications.append({
+            "evidence_index": evidence_index,
+            "evidence_text_original": canonical_text,
+            "status": status,
+            "raw_context_entity_ids": sorted(raw_context_entity_ids),
+            "raw_context_edge_ids": sorted(raw_context_edge_ids),
+            "final_entity_ids": sorted(cited_final_entity_ids),
+            "final_edge_ids": sorted(cited_final_edge_ids),
+            "related_operation_ids": sorted(related_operation_ids),
+            "confidence": confidence,
+            "reason": _clean_text(item.get("reason"), 1600),
+            "validated": not row_problem,
+        })
+
+    expected_evidence_indexes = set(range(len(unresolved_items)))
+    if seen_evidence_indexes != expected_evidence_indexes:
+        issues.append(_local_issue(
+            issue_type="graph-patch-evidence-accounting-mismatch",
+            message="Every extractor unresolved-evidence item must be adjudicated exactly once",
+            confidence=verifier.get("confidence") or 0.0,
+        ))
+
+    blocking = [
+        issue for issue in issues
+        if issue.get("severity") in {"high", "critical"}
+    ]
+    audit = {
+        "version": GRAPH_PATCH_APPLICATION_VERSION,
+        "patch_plan_version": verifier.get("patch_plan_version") or "",
+        "raw_entity_count": len(raw_entities),
+        "raw_edge_count": len(raw_edges),
+        "final_entity_count": len(final_entities),
+        "final_edge_count": len(final_edges),
+        "entity_operations": entity_operation_audit,
+        "edge_operations": edge_operation_audit,
+        "applied_operation_ids": sorted(applied_operation_ids),
+        "entity_lineage": entity_lineage,
+        "edge_lineage": edge_lineage,
+        "removed_entity_ids": sorted(
+            source_id for source_id, targets in entity_lineage.items()
+            if not targets
+        ),
+        "removed_edge_ids": sorted(
+            source_id for source_id, targets in edge_lineage.items()
+            if not targets
+        ),
+        "added_entity_ids": sorted(
+            _clean_text(item.get("occurrence_id"), 160)
+            for item in final_entities
+            if (item.get("patch_provenance") or {}).get("action") == "ADD_ENTITY"
+        ),
+        "added_edge_ids": sorted(
+            _clean_text(item.get("edge_id"), 160)
+            for item in final_edges
+            if (item.get("patch_provenance") or {}).get("action") == "ADD_EDGE"
+        ),
+        "evidence_adjudications": normalized_adjudications,
+        "all_raw_entities_decided": not (
+            missing_entity_decisions or duplicate_entity_decisions
+        ),
+        "all_raw_edges_decided": not (
+            missing_edge_decisions or duplicate_edge_decisions
+        ),
+        "all_unresolved_evidence_adjudicated": (
+            seen_evidence_indexes == expected_evidence_indexes
+        ),
+        "validated": not blocking,
+    }
+    return final_entities, final_edges, audit, issues
+
+
+def _normalize_verifier_patch_issue(
+    raw: Any,
+    *,
+    patch_audit: dict,
+) -> dict:
+    issue = _normalize_issue(
+        raw,
+        default_type="graph-verifier-patch-issue",
+        source_stage="verifier",
+    )
+    source = raw if isinstance(raw, dict) else {}
+    status = _clean_text(source.get("resolution_status"), 80) or "open"
+    related_operation_ids = {
+        _clean_text(value, 160)
+        for value in (source.get("related_operation_ids") or [])
+        if _clean_text(value, 160)
+    }
+    applied = set(patch_audit.get("applied_operation_ids") or [])
+    resolution_validated = bool(
+        status == "resolved_by_patch_plan"
+        and related_operation_ids
+        and related_operation_ids.issubset(applied)
+    )
+    if status == "informational":
+        issue["severity"] = "info"
+        issue["source_stage"] = "verifier_patch_audit"
+    elif resolution_validated:
+        issue["severity"] = "info"
+        issue["source_stage"] = "verifier_patch_plan_resolved"
+    elif status == "resolved_by_patch_plan":
+        issue["severity"] = "high"
+        issue["source_stage"] = "deterministic_patch_validator"
+        issue["message"] = (
+            issue["message"]
+            + " [Invalid resolution claim: one or more related patch operations were not applied.]"
+        )[:1600]
+    issue["patch_resolution"] = {
+        "status": status,
+        "related_operation_ids": sorted(related_operation_ids),
+        "validated": resolution_validated,
+    }
+    return issue
+
+
+def _normalize_raw_issue_after_patch(
+    raw: Any,
+    *,
+    default_type: str,
+    source_stage: str,
+    patch_audit: dict,
+) -> dict:
+    issue = _normalize_issue(
+        raw,
+        default_type=default_type,
+        source_stage=source_stage,
+    )
+    entity_ids = set(issue.get("entity_ids") or [])
+    edge_ids = set(issue.get("edge_ids") or [])
+    entity_lineage = patch_audit.get("entity_lineage") or {}
+    edge_lineage = patch_audit.get("edge_lineage") or {}
+    transformed_entities = {
+        source_id for source_id, targets in entity_lineage.items()
+        if targets != [source_id]
+    }
+    transformed_edges = {
+        source_id for source_id, targets in edge_lineage.items()
+        if targets != [source_id]
+    }
+    if (
+        issue.get("severity") in {"high", "critical"}
+        and (entity_ids or edge_ids)
+        and entity_ids.issubset(transformed_entities)
+        and edge_ids.issubset(transformed_edges)
+    ):
+        issue["severity"] = "info"
+        issue["source_stage"] = "raw_issue_superseded_by_patch"
+        issue["message"] = (
+            issue["message"]
+            + " [Superseded by validated entity/edge patch operations.]"
+        )[:1600]
+    return issue
+
+
+def _validate_patched_graph(
+    *,
+    page: dict,
+    detector: dict,
+    extraction: dict,
+    verifier: dict,
+    resolution: dict,
+    entities: list[dict],
+    edges: list[dict],
+    patch_audit: dict,
+    patch_issues: list[dict],
+    glyphs: list[dict],
+    words: list[dict],
+    drawings: list[dict],
+    links: list[dict],
+) -> tuple[bool, list[dict], list[dict], list[dict]]:
+    """Validate only the final patched projection, never the pre-patch graph."""
+    issues = list(patch_issues)
+
+    geometry_audit, geometry_issues = _reconcile_graph_geometry_from_evidence(
+        page=page,
+        entities=entities,
+        edges=edges,
+        glyphs=glyphs,
+        words=words,
+        drawings=drawings,
+    )
+    issues.extend(geometry_issues)
+    final_assertions = verifier.get("final_assertions") or {}
+    region_bbox_audit, region_bbox_issues = _adjudicate_detector_region_bboxes(
+        page=page,
+        detector=detector,
+        entities=entities,
+        edges=edges,
+        final_assertions=final_assertions,
+    )
+    issues.extend(region_bbox_issues)
+
+    for raw in detector.get("issues") or []:
+        issue = _normalize_raw_issue_after_patch(
+            raw,
+            default_type="graph-detector-issue",
+            source_stage="detector",
+            patch_audit=patch_audit,
+        )
+        if issue.get("severity") in {"high", "critical"} and region_bbox_audit.get("validated"):
+            issue["severity"] = "warning"
+            issue["source_stage"] = "detector_preliminary_audit"
+        issues.append(issue)
+    for raw in extraction.get("issues") or []:
+        issues.append(_normalize_raw_issue_after_patch(
+            raw,
+            default_type="graph-extractor-issue",
+            source_stage="extractor",
+            patch_audit=patch_audit,
+        ))
+    for raw in verifier.get("issues") or []:
+        issues.append(_normalize_verifier_patch_issue(
+            raw,
+            patch_audit=patch_audit,
+        ))
+
+    if int(detector.get("page_id") or 0) != int(page["id"]):
+        issues.append(_local_issue(
+            issue_type="graph-detector-page-id-mismatch",
+            message="Detector returned a different page_id",
+        ))
+    if int(extraction.get("page_id") or 0) != int(page["id"]):
+        issues.append(_local_issue(
+            issue_type="graph-extractor-page-id-mismatch",
+            message="Extractor returned a different page_id",
+        ))
+    if int(verifier.get("page_id") or 0) != int(page["id"]):
+        issues.append(_local_issue(
+            issue_type="graph-verifier-page-id-mismatch",
+            message="Verifier returned a different page_id",
+        ))
+
+    preliminary_coverage_false = bool(
+        not detector.get("all_visible_circuit_regions_accounted_for")
+        or detector.get("uncovered_visual_regions")
+    )
+    if preliminary_coverage_false:
+        if (
+            patch_audit.get("validated")
+            and patch_audit.get("all_unresolved_evidence_adjudicated")
+            and final_assertions.get("all_visible_entities_accounted_for")
+            and final_assertions.get("all_visible_connections_accounted_for")
+        ):
+            issues.append(_local_issue(
+                issue_type="graph-detector-coverage-superseded-by-final-patch",
+                message="Preliminary detector coverage was superseded by the complete final patch projection",
+                confidence=detector.get("confidence") or 0.0,
+                severity="info",
+                source_stage="final_patch_validation",
+            ))
+        else:
+            issues.append(_local_issue(
+                issue_type="graph-detector-region-coverage-failed",
+                message="Detector coverage remains unresolved by the final patch plan",
+                confidence=detector.get("confidence") or 0.0,
+            ))
+
+    if _clamp_conf(detector.get("confidence")) + 1e-9 < PAGE_PASS_MIN_CONFIDENCE:
+        issues.append(_local_issue(
+            issue_type="graph-detector-confidence-low-audit",
+            message="Detector confidence was low but is not authoritative after final evidence validation",
+            confidence=detector.get("confidence") or 0.0,
+            severity="warning",
+            source_stage="detector_preliminary_audit",
+        ))
+    if _clamp_conf(extraction.get("confidence")) + 1e-9 < PAGE_PASS_MIN_CONFIDENCE:
+        issues.append(_local_issue(
+            issue_type="graph-extractor-confidence-low-audit",
+            message="Extractor confidence was low; final patched objects remain subject to deterministic validation",
+            confidence=extraction.get("confidence") or 0.0,
+            severity="warning",
+            source_stage="extractor_preliminary_audit",
+        ))
+
+    if extraction.get("unresolved_visual_evidence"):
+        if patch_audit.get("all_unresolved_evidence_adjudicated") and patch_audit.get("validated"):
+            issues.append(_local_issue(
+                issue_type="graph-extractor-evidence-fully-adjudicated",
+                message="Every extractor unresolved-evidence item was adjudicated by the atomic patch plan",
+                confidence=verifier.get("confidence") or 0.0,
+                severity="info",
+                source_stage="final_patch_validation",
+            ))
+        else:
+            issues.append(_local_issue(
+                issue_type="graph-unresolved-visual-evidence",
+                message="Extractor visual evidence remains unresolved after patch application",
+                confidence=extraction.get("confidence") or 0.0,
+            ))
+
+    valid_glyph_ids = {int(item["glyph_id"]) for item in glyphs}
+    valid_word_ids = {int(item["word_id"]) for item in words}
+    valid_drawing_ids = {int(item["drawing_id"]) for item in drawings}
+    valid_link_ids = {int(item["id"]) for item in links}
+    region_ids = {
+        _clean_text(item.get("region_id"), 160)
+        for item in (detector.get("regions") or [])
+        if isinstance(item, dict) and _clean_text(item.get("region_id"), 160)
+    }
+
+    occurrence_ids: list[str] = []
+    entity_by_id: dict[str, dict] = {}
+    entity_validation_failed: set[str] = set()
+    resolution_by_id = {
+        str(item.get("occurrence_id") or ""): item
+        for item in (resolution.get("entity_resolutions") or [])
+    }
+    for entity in entities:
+        occurrence_id = _clean_text(entity.get("occurrence_id"), 160)
+        entity_type = _clean_text(entity.get("entity_type"), 120)
+        confidence = _clamp_conf(entity.get("confidence"))
+        def fail(issue_type: str, message: str) -> None:
+            entity_validation_failed.add(occurrence_id)
+            issues.append(_local_issue(
+                issue_type=issue_type,
+                message=message,
+                entity_ids=[occurrence_id] if occurrence_id else [],
+                confidence=confidence,
+            ))
+        if not occurrence_id or occurrence_id in occurrence_ids:
+            fail("graph-entity-id-invalid", "Missing or duplicate final entity occurrence_id")
+        occurrence_ids.append(occurrence_id)
+        entity_by_id[occurrence_id] = entity
+        if entity_type not in ENTITY_TYPES:
+            fail("graph-entity-type-invalid", "Final entity type is outside the canonical schema")
+        if _clean_text(entity.get("region_id"), 160) not in region_ids:
+            fail("graph-entity-region-invalid", "Final entity references an unknown detector region")
+        if not _bbox_valid(entity.get("bbox_pt"), page):
+            fail("graph-entity-bbox-invalid", "Final entity bbox is invalid after evidence reconciliation")
+        if confidence + 1e-9 < ENTITY_MIN_CONFIDENCE:
+            fail("graph-entity-confidence-below-threshold", "Final entity confidence is below threshold")
+        glyph_ids = {
+            int(value) for value in (entity.get("source_glyph_ids") or [])
+            if isinstance(value, int) or str(value).isdigit()
+        }
+        word_ids = {
+            int(value) for value in (entity.get("source_word_ids") or [])
+            if isinstance(value, int) or str(value).isdigit()
+        }
+        drawing_ids = {
+            int(value) for value in (entity.get("source_drawing_ids") or [])
+            if isinstance(value, int) or str(value).isdigit()
+        }
+        if glyph_ids - valid_glyph_ids or word_ids - valid_word_ids or drawing_ids - valid_drawing_ids:
+            fail("graph-entity-evidence-id-invalid", "Final entity cites source evidence IDs absent from registries")
+        visible_fields = [
+            field for field in SOURCE_VISIBLE_ENTITY_TEXT_FIELDS
+            if _clean_text(entity.get(field), 1000)
+        ]
+        if visible_fields and not (glyph_ids or word_ids):
+            fail("graph-entity-text-evidence-missing", "Final entity claims literal text without glyph/word evidence")
+        if not visible_fields and not drawing_ids:
+            fail("graph-entity-graphic-evidence-missing", "Graphic-only final entity lacks drawing evidence")
+        if entity_type in COMPONENT_ENTITY_TYPES and not _clean_text(entity.get("tag_original"), 500):
+            fail("graph-component-tag-missing", "Component-like final entity has no visible tag; it must be retyped or replaced")
+        entity["source_text_evidence_policy"] = {
+            "version": "graph-source-visible-text-fields-v3",
+            "visible_source_text_fields": visible_fields,
+            "semantic_annotation_fields": [
+                field for field in SEMANTIC_ENTITY_ANNOTATION_FIELDS
+                if _clean_text(entity.get(field), 1000)
+            ],
+            "validated": bool((not visible_fields and drawing_ids) or (visible_fields and (glyph_ids or word_ids))),
+        }
+        if entity_type in REFERENCE_ENTITY_TYPES:
+            resolved = resolution_by_id.get(occurrence_id) or {}
+            if not resolved.get("accounted"):
+                fail("graph-reference-entity-not-accounted", "Final reference is neither exactly resolved nor explicitly unresolved")
+            entity["reference_resolution"] = {
+                key: resolved.get(key) for key in (
+                    "resolved", "explicitly_unresolved", "accounted",
+                    "resolution_status", "resolution_source", "reason",
+                )
+            }
+
+    edge_ids: list[str] = []
+    edge_validation_failed: set[str] = set()
+    for edge in edges:
+        edge_id = _clean_text(edge.get("edge_id"), 160)
+        relation_type = _clean_text(edge.get("relation_type"), 120)
+        source_id = _clean_text(edge.get("source_occurrence_id"), 160)
+        target_id = _clean_text(edge.get("target_occurrence_id"), 160)
+        confidence = _clamp_conf(edge.get("confidence"))
+        def fail(issue_type: str, message: str) -> None:
+            edge_validation_failed.add(edge_id)
+            issues.append(_local_issue(
+                issue_type=issue_type,
+                message=message,
+                edge_ids=[edge_id] if edge_id else [],
+                confidence=confidence,
+            ))
+        if not edge_id or edge_id in edge_ids:
+            fail("graph-edge-id-invalid", "Missing or duplicate final edge_id")
+        edge_ids.append(edge_id)
+        if relation_type not in RELATION_TYPES:
+            fail("graph-edge-relation-invalid", "Final edge relation type is outside the canonical schema")
+        if source_id not in entity_by_id or target_id not in entity_by_id:
+            fail("graph-edge-endpoint-missing", "Final edge references a missing final entity")
+        if source_id and source_id == target_id:
+            fail("graph-edge-self-reference", "Final edge connects an entity to itself")
+        if not _edge_bbox_valid(edge.get("bbox_pt"), page):
+            fail("graph-edge-bbox-invalid", "Final edge bbox is invalid after evidence reconciliation")
+        if confidence + 1e-9 < EDGE_MIN_CONFIDENCE:
+            fail("graph-edge-confidence-below-threshold", "Final edge confidence is below threshold")
+        drawing_ids = {
+            int(value) for value in (edge.get("source_drawing_ids") or [])
+            if isinstance(value, int) or str(value).isdigit()
+        }
+        glyph_ids = {
+            int(value) for value in (edge.get("source_glyph_ids") or [])
+            if isinstance(value, int) or str(value).isdigit()
+        }
+        link_ids = {
+            int(value) for value in (edge.get("source_link_ids") or [])
+            if isinstance(value, int) or str(value).isdigit()
+        }
+        if drawing_ids - valid_drawing_ids or glyph_ids - valid_glyph_ids or link_ids - valid_link_ids:
+            fail("graph-edge-evidence-id-invalid", "Final edge cites source evidence IDs absent from registries")
+        if relation_type in GEOMETRY_REQUIRED_RELATIONS and not drawing_ids:
+            fail("graph-edge-geometry-evidence-missing", "Geometry-dependent final edge lacks local drawing evidence; PDF links are not conductors")
+
+    if not resolution.get("all_reference_entities_accounted_for"):
+        issues.append(_local_issue(
+            issue_type="graph-reference-accounting-failed",
+            message="Final external references are neither exactly resolved nor explicitly unresolved",
+            entity_ids=resolution.get("invalid_reference_entity_ids") or [],
+        ))
+    unresolved_ids = resolution.get("unresolved_reference_entity_ids") or []
+    if unresolved_ids:
+        issues.append(_local_issue(
+            issue_type="graph-unresolved-references-preserved",
+            message="Visible unresolved references are preserved without fabricated registry mappings",
+            entity_ids=unresolved_ids,
+            confidence=verifier.get("confidence") or 0.0,
+            severity="warning",
+            source_stage="reference_resolution_adjudicator",
+        ))
+
+    deterministic_blockers = [
+        issue for issue in issues
+        if issue.get("severity") in {"high", "critical"}
+    ]
+    assertions_false = sorted(
+        key for key, value in final_assertions.items() if value is not True
+    )
+    if assertions_false:
+        if not deterministic_blockers:
+            issues.append(_local_issue(
+                issue_type="graph-verifier-final-assertions-superseded",
+                message="Conservative verifier assertions were superseded by complete deterministic final-projection validation",
+                confidence=verifier.get("confidence") or 0.0,
+                severity="info",
+                source_stage="final_patch_validation",
+            ))
+        else:
+            issues.append(_local_issue(
+                issue_type="graph-verifier-final-assertions-failed",
+                message="Verifier final assertions remain false and deterministic blockers remain",
+                confidence=verifier.get("confidence") or 0.0,
+            ))
+
+    if _clamp_conf(verifier.get("confidence")) + 1e-9 < PAGE_PASS_MIN_CONFIDENCE:
+        if deterministic_blockers:
+            issues.append(_local_issue(
+                issue_type="graph-verifier-confidence-below-threshold",
+                message="Verifier confidence is below page threshold and final blockers remain",
+                confidence=verifier.get("confidence") or 0.0,
+            ))
+        else:
+            issues.append(_local_issue(
+                issue_type="graph-verifier-confidence-low-audit",
+                message="Global verifier confidence is conservative; every applied operation and final object passes its own threshold",
+                confidence=verifier.get("confidence") or 0.0,
+                severity="warning",
+                source_stage="final_patch_validation",
+            ))
+
+    if not entities:
+        issues.append(_local_issue(
+            issue_type="graph-no-entities",
+            message="No graph entities remain after patch application",
+        ))
+    if not edges:
+        issues.append(_local_issue(
+            issue_type="graph-no-edges",
+            message="No graph edges remain after patch application",
+        ))
+
+    blockers_before_verdict = [
+        issue for issue in issues
+        if issue.get("severity") in {"high", "critical"}
+    ]
+    if verifier.get("verdict") != "apply_patch":
+        if not blockers_before_verdict:
+            issues.append(_local_issue(
+                issue_type="graph-verifier-verdict-superseded-post-patch",
+                message="Verifier review verdict applied before deterministic patch validation; the final projection is safe",
+                confidence=verifier.get("confidence") or 0.0,
+                severity="info",
+                source_stage="final_patch_validation",
+            ))
+        else:
+            issues.append(_local_issue(
+                issue_type="graph-verifier-blocked-page",
+                message="Verifier requested review and final deterministic blockers remain",
+                confidence=verifier.get("confidence") or 0.0,
+            ))
+
+    patch_audit["source_evidence_geometry_reconciliation"] = geometry_audit
+    patch_audit["region_bbox_adjudication"] = region_bbox_audit
+    patch_audit["final_validation_version"] = GRAPH_FINAL_VALIDATION_VERSION
+    patch_audit["final_entity_count"] = len(entities)
+    patch_audit["final_edge_count"] = len(edges)
+    patch_audit["final_assertions"] = final_assertions
+    patch_audit["final_reference_resolution"] = {
+        "unresolved_reference_entity_ids": resolution.get("unresolved_reference_entity_ids") or [],
+        "resolution_status_counts": resolution.get("resolution_status_counts") or {},
+        "match_counts": resolution.get("match_counts") or {},
+        "all_reference_entities_accounted_for": resolution.get("all_reference_entities_accounted_for"),
+    }
+    blocking = [
+        issue for issue in issues
+        if issue.get("severity") in {"high", "critical"}
+    ]
+    patch_audit["validated"] = not blocking
+    return not blocking and bool(entities) and bool(edges), entities, edges, issues
+
 def _build_materialization_plan(
     *,
     context: dict,
@@ -4993,6 +6337,7 @@ def _build_materialization_plan(
                 "source_text_evidence_policy": entity.get(
                     "source_text_evidence_policy"
                 ) or {},
+                "patch_provenance": entity.get("patch_provenance") or {},
                 "evidence_notes": entity.get("evidence_notes") or "",
                 "reference_resolution": {
                     key: (resolution_by_id.get(occurrence_id) or {}).get(key)
@@ -5293,6 +6638,7 @@ def _build_materialization_plan(
                 "source_link_ids": edge.get("source_link_ids") or [],
                 "recovery_evidence": edge.get("recovery_evidence") or {},
                 "bbox_reconciliation": edge.get("bbox_reconciliation") or {},
+                "patch_provenance": edge.get("patch_provenance") or {},
                 "evidence_notes": edge.get("evidence_notes") or "",
                 "detector_fingerprint": detector_fingerprint,
                 "extractor_fingerprint": extractor_fingerprint,
@@ -5352,6 +6698,10 @@ def _db_replace_page_issues(
                     "confidence": _clamp_conf(issue.get("confidence")),
                     "source_stage": issue.get("source_stage") or "",
                     "adjudication": issue.get("adjudication") or {},
+                    "patch_resolution": issue.get("patch_resolution") or {},
+                    "review_cause_family": _review_cause_family(
+                        issue.get("issue_type"), issue.get("source_stage")
+                    ),
                 }
                 cur.execute(
                     """
@@ -5631,6 +6981,7 @@ def _db_update_version_state(
     reference_resolution: Optional[dict] = None,
     issue_type_counts: Optional[dict] = None,
     blocking_issue_type_counts: Optional[dict] = None,
+    review_cause_family_counts: Optional[dict] = None,
     review_signature: str = "",
 ) -> dict:
     conn = _db_conn()
@@ -5675,24 +7026,39 @@ def _db_update_version_state(
                 "removed_edge_ids": adjudication.get(
                     "removed_edge_ids"
                 ) or [],
-                "preserved_unresolved_reference_ids": adjudication.get(
-                    "preserved_unresolved_reference_ids"
+                "patch_plan_version": adjudication.get(
+                    "patch_plan_version"
+                ) or GRAPH_PATCH_PLAN_VERSION,
+                "patch_application_version": adjudication.get(
+                    "version"
+                ) or GRAPH_PATCH_APPLICATION_VERSION,
+                "final_validation_version": adjudication.get(
+                    "final_validation_version"
+                ) or GRAPH_FINAL_VALIDATION_VERSION,
+                "patch_plan_validated": bool(adjudication.get("validated")),
+                "applied_patch_operation_count": len(
+                    adjudication.get("applied_operation_ids") or []
+                ),
+                "entity_patch_operation_count": len(
+                    adjudication.get("entity_operations") or []
+                ),
+                "edge_patch_operation_count": len(
+                    adjudication.get("edge_operations") or []
+                ),
+                "preserved_unresolved_reference_ids": resolution.get(
+                    "unresolved_reference_entity_ids"
                 ) or [],
                 "recovered_entity_ids": adjudication.get(
-                    "recovered_entity_ids"
+                    "added_entity_ids"
                 ) or [],
                 "recovered_edge_ids": adjudication.get(
-                    "recovered_edge_ids"
+                    "added_edge_ids"
                 ) or [],
                 "evidence_recovery_validated": bool(
-                    adjudication.get("evidence_recovery_validated")
+                    adjudication.get("validated")
                 ),
                 "visual_evidence_adjudication_count": len(
-                    (
-                        adjudication.get("verifier_evidence_recovery")
-                        or {}
-                    ).get("visual_evidence_adjudications")
-                    or []
+                    adjudication.get("evidence_adjudications") or []
                 ),
                 "adjudicated_region_bbox_count": int(
                     (
@@ -5740,6 +7106,10 @@ def _db_update_version_state(
                 "blocking_issue_type_counts": (
                     blocking_issue_type_counts or {}
                 ),
+                "review_cause_family_counts": (
+                    review_cause_family_counts or {}
+                ),
+                "review_signature_version": REVIEW_GROUPING_VERSION,
                 "review_signature": review_signature or "",
                 "pipeline_marker": PIPELINE_MARKER,
                 "materializer_version": MATERIALIZER_VERSION,
@@ -5950,29 +7320,68 @@ def _blocking_issue_summary(issues: list[dict]) -> list[dict]:
     return output
 
 
+
+def _review_cause_family(issue_type: Any, source_stage: Any = "") -> str:
+    value = _clean_text(issue_type, 180).casefold()
+    stage = _clean_text(source_stage, 120).casefold()
+    if any(token in value for token in (
+        "rewire", "edge-endpoint", "edge-geometry", "connection_geometry"
+    )):
+        return "edge_rewire_or_geometry"
+    if any(token in value for token in (
+        "split", "merged", "duplicate", "under_materialized",
+        "false_candidate", "entity-bbox", "component-tag"
+    )):
+        return "entity_identity_or_replacement"
+    if any(token in value for token in (
+        "reference", "registry", "explicitly-unresolved"
+    )):
+        return "reference_resolution"
+    if any(token in value for token in (
+        "evidence", "glyph", "drawing"
+    )):
+        return "source_evidence_accounting"
+    if any(token in value for token in (
+        "patch", "schema", "type-invalid", "operation"
+    )):
+        return "canonical_patch_contract"
+    if "confidence" in value or stage.endswith("preliminary_audit"):
+        return "preliminary_confidence"
+    if (
+        value.startswith("graph-verifier-all_")
+        or any(token in value for token in (
+            "verdict", "publish", "blocked-page", "final-assertions"
+        ))
+    ):
+        return "publish_gate_cascade"
+    return "other"
+
+
+def _review_cause_family_counts(issues: list[dict]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for issue in issues or []:
+        if issue.get("severity") not in {"high", "critical"}:
+            continue
+        family = _review_cause_family(
+            issue.get("issue_type"), issue.get("source_stage")
+        )
+        counts[family] = counts.get(family, 0) + 1
+    return dict(sorted(counts.items()))
+
+
 def _review_signature(issues: list[dict]) -> str:
-    blocking = [
-        {
-            "issue_type": _clean_text(issue.get("issue_type"), 180),
-            "source_stage": _clean_text(issue.get("source_stage"), 120),
-            "severity": _clean_text(issue.get("severity"), 30),
-        }
-        for issue in issues or []
-        if issue.get("severity") in {"high", "critical"}
-    ]
-    if not blocking:
+    families = _review_cause_family_counts(issues)
+    if not families:
         return "pass"
+    # Gate-cascade issues do not create a distinct technical family when a
+    # concrete upstream cause is present.
+    causal = {
+        key: value for key, value in families.items()
+        if key != "publish_gate_cascade"
+    } or families
     raw = json.dumps(
-        sorted(
-            blocking,
-            key=lambda item: (
-                item["issue_type"],
-                item["source_stage"],
-                item["severity"],
-            ),
-        ),
+        sorted(causal),
         ensure_ascii=False,
-        sort_keys=True,
         separators=(",", ":"),
     )
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
@@ -6157,8 +7566,8 @@ def extract_electrical_graph_page(
         )
 
         # Detector and extractor requests remain byte-for-byte compatible with
-        # V1.1. The V1.2 verifier receives complete PDF-point evidence so it can
-        # recover omitted visible symbols without re-running extraction.
+        # the certified V1 stages. The V3 verifier receives complete PDF-point
+        # evidence and returns one canonical atomic patch plan.
         verifier_resolution = _resolve_references_for_verifier_v1(
             extraction,
             registry,
@@ -6184,10 +7593,11 @@ def extract_electrical_graph_page(
             ],
             "drawing_registry": drawings,
             "pdf_link_registry": links,
-            "recovery_version": VERIFIER_EVIDENCE_RECOVERY_VERSION,
-            "visual_evidence_adjudication_version": (
-                VISUAL_EVIDENCE_ADJUDICATION_VERSION
-            ),
+            "patch_plan_version": GRAPH_PATCH_PLAN_VERSION,
+            "entity_patch_actions": sorted(ENTITY_PATCH_ACTIONS),
+            "edge_patch_actions": sorted(EDGE_PATCH_ACTIONS),
+            "canonical_entity_types": sorted(ENTITY_TYPES),
+            "canonical_relation_types": sorted(RELATION_TYPES),
             "render_dpi": RENDER_DPI,
         }
         verifier, verifier_usage, verifier_reused, verifier_fp = _cached_call(
@@ -6217,6 +7627,7 @@ def extract_electrical_graph_page(
                 "extractor_fingerprint": extractor_fp,
                 "entity_count": len(extraction.get("entities") or []),
                 "edge_count": len(extraction.get("edges") or []),
+                "patch_plan_version": GRAPH_PATCH_PLAN_VERSION,
             },
         )
         _add_usage(
@@ -6226,16 +7637,31 @@ def extract_electrical_graph_page(
             verifier_reused,
         )
 
-        # Final deterministic reference resolution is intentionally local and
-        # runs after the verifier response.
-        resolution = _resolve_references(extraction, registry)
+        # Graph V3 applies the complete verifier patch plan in memory, then
+        # resolves references and validates only the final projection. Raw
+        # candidates and pre-patch global flags are audit evidence, never the
+        # publication authority.
+        entities, edges, patch_audit, patch_issues = _apply_graph_patch_plan(
+            page=page,
+            extraction=extraction,
+            verifier=verifier,
+        )
+        patched_extraction = dict(extraction)
+        patched_extraction["entities"] = entities
+        patched_extraction["edges"] = edges
+        patched_extraction["graph_patch_plan"] = patch_audit
+        resolution = _resolve_references(patched_extraction, registry)
 
-        page_passed, entities, edges, issues = _validate_candidate_graph(
+        page_passed, entities, edges, issues = _validate_patched_graph(
             page=page,
             detector=detector,
             extraction=extraction,
             verifier=verifier,
             resolution=resolution,
+            entities=entities,
+            edges=edges,
+            patch_audit=patch_audit,
+            patch_issues=patch_issues,
             glyphs=glyphs,
             words=words,
             drawings=drawings,
@@ -6284,6 +7710,7 @@ def extract_electrical_graph_page(
             blocking_only=True,
         )
         review_signature = _review_signature(issues)
+        review_cause_family_counts = _review_cause_family_counts(issues)
         blocking_issue_summary = _blocking_issue_summary(issues)
         state = _db_update_version_state(
             context=context,
@@ -6292,12 +7719,11 @@ def extract_electrical_graph_page(
             published_entities=publication["published_page_entities"],
             published_edges=publication["published_page_edges"],
             blocking_count=blocking,
-            post_verifier_adjudication=extraction.get(
-                "post_verifier_adjudication"
-            ) or {},
+            post_verifier_adjudication=patch_audit,
             reference_resolution=resolution,
             issue_type_counts=issue_type_counts,
             blocking_issue_type_counts=blocking_issue_type_counts,
+            review_cause_family_counts=review_cause_family_counts,
             review_signature=review_signature,
         )
 
@@ -6334,6 +7760,7 @@ def extract_electrical_graph_page(
             "blocking_issue_summary": blocking_issue_summary,
             "review_signature_version": REVIEW_GROUPING_VERSION,
             "review_signature": review_signature,
+            "review_cause_family_counts": review_cause_family_counts,
             "entity_type_counts": entity_type_counts,
             "relation_type_counts": relation_type_counts,
             "reference_resolution": {
@@ -6362,16 +7789,15 @@ def extract_electrical_graph_page(
                 ) or {},
                 "match_counts": resolution.get("match_counts") or {},
             },
-            "post_verifier_adjudication": extraction.get(
-                "post_verifier_adjudication"
-            ) or {},
-            "verifier_evidence_recovery": extraction.get(
-                "verifier_evidence_recovery"
-            ) or {},
-            "region_bbox_adjudication": extraction.get(
+            "graph_patch_plan": patch_audit,
+            # Compatibility aliases for existing audit consumers. They now
+            # point to the final V3 patch/geometry audits rather than the old
+            # keep/reject/recovery protocol.
+            "post_verifier_adjudication": patch_audit,
+            "region_bbox_adjudication": patch_audit.get(
                 "region_bbox_adjudication"
             ) or {},
-            "source_evidence_geometry_reconciliation": extraction.get(
+            "source_evidence_geometry_reconciliation": patch_audit.get(
                 "source_evidence_geometry_reconciliation"
             ) or {},
             "raw_extracted_entity_count": len(
