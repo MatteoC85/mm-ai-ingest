@@ -2,6 +2,7 @@ import os
 import re
 import asyncio
 import contextvars
+import functools
 import threading
 import base64
 import binascii
@@ -167,7 +168,7 @@ SEMANTIC_QUERY_PLANNER_TIMEOUT = int(os.environ.get("MM_SEMANTIC_QUERY_PLANNER_T
 SEMANTIC_MAX_DENSE_QUERIES = int(os.environ.get("MM_SEMANTIC_MAX_DENSE_QUERIES", "5"))
 SEMANTIC_MAX_LEXICAL_QUERIES = int(os.environ.get("MM_SEMANTIC_MAX_LEXICAL_QUERIES", "5"))
 SEMANTIC_EXACT_MACHINE_BONUS = float(os.environ.get("MM_SEMANTIC_EXACT_MACHINE_BONUS", "0.055"))
-ASK_ROOT_CAUSE_CODE_MARKER = "ask-root-v13-prod-task-aware-source-dominance-assurance-stream-v5"
+ASK_ROOT_CAUSE_CODE_MARKER = "ask-root-v13-prod-task-aware-source-selection-hardened-stream-v5-1"
 
 # Root-cause semantic intent gate
 ROOT_CAUSE_INTENT_MODEL = (os.environ.get("MM_ROOT_CAUSE_INTENT_MODEL") or "gpt-5.4-mini").strip()
@@ -12449,7 +12450,7 @@ def version():
         "v13_enabled": V13_ENABLED,
         "v13_ask_enabled": V13_ASK_ENABLED,
         "v13_root_cause_enabled": V13_ROOT_CAUSE_ENABLED,
-        "v13_architecture": "deterministic_retrieval_task_aware_source_dominance_shared_evidence_gate_bounded_assurance_single_synthesis",
+        "v13_architecture": "deterministic_retrieval_task_aware_source_selection_hardened_shared_evidence_gate_bounded_assurance_single_synthesis",
         "v13_verifier_rewrite_loop_enabled": False,
         "v13_planner_model": V13_PLANNER_MODEL,
         "v13_evidence_gate_model": V13_EVIDENCE_GATE_MODEL,
@@ -12469,14 +12470,24 @@ def version():
         "v13_retrieval_assurance_page_radius": V13_RETRIEVAL_ASSURANCE_PAGE_RADIUS,
         "v13_retrieval_assurance_adoption_policy": "baseline_preserved_replace_only_on_objective_coverage_exact_or_semantic_gain",
         "v13_source_retrieval_enabled": V13_SOURCE_RETRIEVAL_ENABLED,
-        "v13_source_retrieval_policy": "bounded_cross_type_title_probe_forces_semantic_task_gate_then_link_first_dominant_selection",
+        "v13_source_retrieval_policy": "content_relevance_dominates_modality_preference_tie_guard_and_gate_selected_links",
         "v13_source_retrieval_scan_limit": V13_SOURCE_RETRIEVAL_SCAN_LIMIT,
         "v13_source_retrieval_max_candidates": V13_SOURCE_RETRIEVAL_MAX_CANDIDATES,
         "v13_source_retrieval_min_title_score": V13_SOURCE_RETRIEVAL_MIN_TITLE_SCORE,
         "v13_source_retrieval_force_gate_score": V13_SOURCE_RETRIEVAL_FORCE_GATE_SCORE,
         "v13_source_retrieval_min_task_confidence": V13_SOURCE_RETRIEVAL_MIN_TASK_CONFIDENCE,
+        "v13_source_retrieval_require_type_confidence": V13_SOURCE_RETRIEVAL_REQUIRE_TYPE_CONFIDENCE,
+        "v13_source_retrieval_min_semantic_score": V13_SOURCE_RETRIEVAL_MIN_SEMANTIC_SCORE,
+        "v13_source_retrieval_force_semantic_score": V13_SOURCE_RETRIEVAL_FORCE_SEMANTIC_SCORE,
+        "v13_source_retrieval_preference_max_gap": V13_SOURCE_RETRIEVAL_PREFERENCE_MAX_GAP,
+        "v13_source_retrieval_ambiguity_delta": V13_SOURCE_RETRIEVAL_AMBIGUITY_DELTA,
+        "v13_source_retrieval_result_band": V13_SOURCE_RETRIEVAL_RESULT_BAND,
+        "v13_source_retrieval_source_type_policy": "semantic_none_prefer_require_with_relevance_dominance",
         "v13_source_retrieval_max_extra_llm_calls": 0,
-        "v13_source_retrieval_regression_policy": "if_not_confident_keep_v13_4_path_unchanged",
+        "v13_source_retrieval_regression_policy": "direct_route_only_replaces_clear_baseline_otherwise_restore_or_fail_closed_for_confident_link_task",
+        "v13_source_retrieval_baseline_policy": "preserve_clear_v13_4_pack_when_optional_source_task_route_not_valid",
+        "v13_source_retrieval_link_failure_policy": "confident_link_only_request_without_match_returns_no_sources",
+        "v13_source_retrieval_separator_policy": "split_alphabetic_separators_preserve_mixed_alphanumeric_codes",
         "v13_nonprocedural_link_policy": "show_only_model_used_sources_unless_explicit_broad_overview",
         "v13_direct_answer_bypass_enabled": False,
         "v13_identifier_policy": "bare_identifier_deterministic_contextual_identifier_semantic_gate",
@@ -16347,8 +16358,8 @@ def _root_cause_v1_candidate_impl(
 V13_ENABLED = (os.environ.get("MM_V13_ENABLED") or "1").strip() != "0"
 V13_ASK_ENABLED = (os.environ.get("MM_V13_ASK_ENABLED") or "1").strip() != "0"
 V13_ROOT_CAUSE_ENABLED = (os.environ.get("MM_V13_ROOT_CAUSE_ENABLED") or "1").strip() != "0"
-V13_CODE_MARKER = "ask-root-v13-prod-task-aware-source-dominance-assurance-stream-v5"
-V13_RELEASE_ID = (os.environ.get("MM_V13_RELEASE_ID") or "2026-07-29.5").strip()
+V13_CODE_MARKER = "ask-root-v13-prod-task-aware-source-selection-hardened-stream-v5-1"
+V13_RELEASE_ID = (os.environ.get("MM_V13_RELEASE_ID") or "2026-07-29.5.1").strip()
 OPENAI_RESPONSES_URL = (os.environ.get("OPENAI_RESPONSES_URL") or "https://api.openai.com/v1/responses").strip()
 
 # Model policy. Luna is used only for optional retrieval refinement; Terra handles
@@ -16429,9 +16440,20 @@ V13_SOURCE_RETRIEVAL_MAX_CANDIDATES = max(3, min(16, int(os.environ.get("MM_V13_
 V13_SOURCE_RETRIEVAL_MIN_TITLE_SCORE = max(0.50, min(0.95, float(os.environ.get("MM_V13_SOURCE_RETRIEVAL_MIN_TITLE_SCORE", "0.68"))))
 V13_SOURCE_RETRIEVAL_FORCE_GATE_SCORE = max(0.55, min(0.98, float(os.environ.get("MM_V13_SOURCE_RETRIEVAL_FORCE_GATE_SCORE", "0.72"))))
 V13_SOURCE_RETRIEVAL_MIN_TASK_CONFIDENCE = max(0.55, min(0.95, float(os.environ.get("MM_V13_SOURCE_RETRIEVAL_MIN_TASK_CONFIDENCE", "0.72"))))
+V13_SOURCE_RETRIEVAL_REQUIRE_TYPE_CONFIDENCE = max(0.72, min(0.98, float(os.environ.get("MM_V13_SOURCE_RETRIEVAL_REQUIRE_TYPE_CONFIDENCE", "0.85"))))
 V13_SOURCE_RETRIEVAL_MAX_RESULTS_FEW = max(2, min(5, int(os.environ.get("MM_V13_SOURCE_RETRIEVAL_MAX_RESULTS_FEW", "3"))))
 V13_SOURCE_RETRIEVAL_MAX_RESULTS_MANY = max(4, min(12, int(os.environ.get("MM_V13_SOURCE_RETRIEVAL_MAX_RESULTS_MANY", "8"))))
-V13_SOURCE_RETRIEVAL_MAX_QUERY_TOKENS = max(6, min(40, int(os.environ.get("MM_V13_SOURCE_RETRIEVAL_MAX_QUERY_TOKENS", "18"))))
+V13_SOURCE_RETRIEVAL_MAX_QUERY_TOKENS = max(6, min(48, int(os.environ.get("MM_V13_SOURCE_RETRIEVAL_MAX_QUERY_TOKENS", "24"))))
+# Hardening: source modality is never allowed to outrank a materially better content
+# match. A semantic source-type preference may decide only inside a narrow relevance
+# band; an explicit required type is enforced by the task contract and otherwise the
+# direct route falls back rather than returning a nearby-but-wrong item.
+V13_SOURCE_RETRIEVAL_MIN_SEMANTIC_SCORE = max(0.45, min(0.90, float(os.environ.get("MM_V13_SOURCE_RETRIEVAL_MIN_SEMANTIC_SCORE", "0.62"))))
+V13_SOURCE_RETRIEVAL_FORCE_SEMANTIC_SCORE = max(0.55, min(0.95, float(os.environ.get("MM_V13_SOURCE_RETRIEVAL_FORCE_SEMANTIC_SCORE", "0.74"))))
+V13_SOURCE_RETRIEVAL_PREFERENCE_MAX_GAP = max(0.0, min(0.15, float(os.environ.get("MM_V13_SOURCE_RETRIEVAL_PREFERENCE_MAX_GAP", "0.05"))))
+V13_SOURCE_RETRIEVAL_AMBIGUITY_DELTA = max(0.0, min(0.10, float(os.environ.get("MM_V13_SOURCE_RETRIEVAL_AMBIGUITY_DELTA", "0.025"))))
+V13_SOURCE_RETRIEVAL_RESULT_BAND = max(0.04, min(0.25, float(os.environ.get("MM_V13_SOURCE_RETRIEVAL_RESULT_BAND", "0.12"))))
+V13_SOURCE_RETRIEVAL_MIN_FOCUS_SCORE = max(0.35, min(0.90, float(os.environ.get("MM_V13_SOURCE_RETRIEVAL_MIN_FOCUS_SCORE", "0.58"))))
 V13_FAST_TIMEOUT_SECONDS = max(12, min(35, int(os.environ.get("MM_V13_FAST_TIMEOUT_SECONDS", "26"))))
 V13_HEAVY_TIMEOUT_SECONDS = max(20, min(45, int(os.environ.get("MM_V13_HEAVY_TIMEOUT_SECONDS", "40"))))
 V13_PLANNER_MAX_OUTPUT_TOKENS = max(800, min(2000, int(os.environ.get("MM_V13_PLANNER_MAX_OUTPUT_TOKENS", "1200"))))
@@ -16512,8 +16534,16 @@ V13_ENGINE_KEY = hashlib.sha256(
             str(V13_SOURCE_RETRIEVAL_MIN_TITLE_SCORE),
             str(V13_SOURCE_RETRIEVAL_FORCE_GATE_SCORE),
             str(V13_SOURCE_RETRIEVAL_MIN_TASK_CONFIDENCE),
+            str(V13_SOURCE_RETRIEVAL_REQUIRE_TYPE_CONFIDENCE),
             str(V13_SOURCE_RETRIEVAL_MAX_RESULTS_FEW),
             str(V13_SOURCE_RETRIEVAL_MAX_RESULTS_MANY),
+            str(V13_SOURCE_RETRIEVAL_MAX_QUERY_TOKENS),
+            str(V13_SOURCE_RETRIEVAL_MIN_SEMANTIC_SCORE),
+            str(V13_SOURCE_RETRIEVAL_FORCE_SEMANTIC_SCORE),
+            str(V13_SOURCE_RETRIEVAL_PREFERENCE_MAX_GAP),
+            str(V13_SOURCE_RETRIEVAL_AMBIGUITY_DELTA),
+            str(V13_SOURCE_RETRIEVAL_RESULT_BAND),
+            str(V13_SOURCE_RETRIEVAL_MIN_FOCUS_SCORE),
             V13_FAST_MODEL,
             V13_HEAVY_MODEL,
             V13_FAST_EFFORT,
@@ -17804,13 +17834,17 @@ def _v13_evidence_gate_schema(mode: str = "", *, include_task_contract: bool = F
                     },
                     "maxItems": 6,
                 },
+                "source_type_policy": {
+                    "type": "string",
+                    "enum": ["none", "prefer", "require"],
+                },
                 "task_focus": {"type": "string"},
             }
         )
         required.extend(
             [
                 "task_mode", "task_confidence", "result_cardinality",
-                "requires_explanation", "preferred_source_types", "task_focus",
+                "requires_explanation", "preferred_source_types", "source_type_policy", "task_focus",
             ]
         )
 
@@ -18101,6 +18135,7 @@ def _v13_semantic_evidence_gate(
         "result_cardinality": "few",
         "requires_explanation": True,
         "preferred_source_types": [],
+        "source_type_policy": "none",
         "task_focus": "",
     }
     if not evidence_block or not supplied_ids:
@@ -18128,7 +18163,8 @@ def _v13_semantic_evidence_gate(
             "Use list_sources when the user explicitly wants multiple indexed resources. Use answer, procedure, diagnostic, or comparison when the requested output is substantive reasoning or instructions. "
             "result_cardinality is one for a single best item, few for a short set, and many only for an explicitly broad/exhaustive request. "
             "requires_explanation is false only when links/content retrieval itself satisfies the request. preferred_source_types must reflect the semantic request, not merely the source types that happen to be available. "
-            "This task classification must not make irrelevant evidence sufficient."
+            "Set source_type_policy=require only when the user explicitly constrains the result to those source types; set prefer for a genuine but non-exclusive preference; otherwise use none. "
+            "A preferred source type never makes a weak content match relevant, and this task classification must not make irrelevant evidence sufficient."
         )
 
     system_msg = (
@@ -18202,12 +18238,20 @@ def _v13_semantic_evidence_gate(
             ],
             limit=6,
         )
+        source_type_policy = str(out.get("source_type_policy") or "none").strip().lower()
+        if source_type_policy not in {"none", "prefer", "require"}:
+            source_type_policy = "none"
+        if not preferred_source_types:
+            source_type_policy = "none"
+        if source_type_policy == "require" and task_confidence < V13_SOURCE_RETRIEVAL_REQUIRE_TYPE_CONFIDENCE:
+            source_type_policy = "prefer"
         task_meta = {
             "task_mode": task_mode,
             "task_confidence": task_confidence,
             "result_cardinality": cardinality,
             "requires_explanation": bool(out.get("requires_explanation")),
             "preferred_source_types": preferred_source_types,
+            "source_type_policy": source_type_policy,
             "task_focus": _clean_display_text(out.get("task_focus") or "", max_len=240),
         }
 
@@ -20421,8 +20465,14 @@ _V13_SOURCE_TITLE_STOPWORDS = {
 }
 
 
-def _v13_source_title_tokens(value: Any, *, limit: int = 48) -> list[str]:
+@functools.lru_cache(maxsize=8192)
+def _v13_source_title_tokens_cached(value: str, limit: int) -> tuple[str, ...]:
     text = _normalize_unicode_advanced(str(value or "")).lower()
+    # Human titles often use hyphens/slashes as word separators (for example
+    # ``uscita-pezzo`` or ``aspo-macchina``), while technical identifiers use the
+    # same characters inside mixed letter/digit codes (PROC-009, BBX-300/40T). Split
+    # only separators surrounded by alphabetic characters, preserving code tokens.
+    text = re.sub(r"(?<=[a-zà-öø-ÿ])[-_/](?=[a-zà-öø-ÿ])", " ", text)
     out: list[str] = []
     seen: set[str] = set()
     for token in re.findall(r"[a-zà-öø-ÿ0-9][a-zà-öø-ÿ0-9_.\-/]{1,}", text):
@@ -20433,10 +20483,67 @@ def _v13_source_title_tokens(value: Any, *, limit: int = 48) -> list[str]:
         out.append(token)
         if len(out) >= max(1, int(limit or 48)):
             break
-    return out
+    return tuple(out)
 
 
+
+def _v13_source_title_tokens(value: Any, *, limit: int = 48) -> list[str]:
+    return list(_v13_source_title_tokens_cached(str(value or ""), max(1, int(limit or 48))))
+
+
+def _v13_source_token_edit_distance(left: str, right: str, *, max_distance: int = 3) -> int:
+    """Small bounded Levenshtein distance used only for source-title tokens."""
+    a = str(left or "")
+    b = str(right or "")
+    if a == b:
+        return 0
+    if not a:
+        return min(len(b), max_distance + 1)
+    if not b:
+        return min(len(a), max_distance + 1)
+    if abs(len(a) - len(b)) > max_distance:
+        return max_distance + 1
+    previous = list(range(len(b) + 1))
+    for i, ca in enumerate(a, start=1):
+        current = [i]
+        row_min = i
+        for j, cb in enumerate(b, start=1):
+            value = min(
+                current[j - 1] + 1,
+                previous[j] + 1,
+                previous[j - 1] + (0 if ca == cb else 1),
+            )
+            current.append(value)
+            row_min = min(row_min, value)
+        if row_min > max_distance:
+            return max_distance + 1
+        previous = current
+    return previous[-1]
+
+
+def _v13_source_inflection_stems(token: str) -> set[str]:
+    """Return conservative language-generic inflection stems, never semantic roots."""
+    value = _normalize_unicode_advanced(str(token or "")).lower().strip()
+    out = {value} if value else set()
+    if len(value) >= 5 and value[-1:] in {"a", "e", "i", "o"}:
+        out.add(value[:-1])
+    if len(value) >= 5 and value.endswith("s"):
+        out.add(value[:-1])
+    if len(value) >= 6 and value.endswith("es"):
+        out.add(value[:-2])
+    if len(value) >= 6 and value.endswith("ies"):
+        out.add(value[:-3] + "y")
+    return {x for x in out if len(x) >= 4}
+
+
+@functools.lru_cache(maxsize=50000)
 def _v13_source_title_token_similarity(left: str, right: str) -> float:
+    """Conservative fuzzy token match for titles.
+
+    It accepts exact matches, ordinary singular/plural inflections and small typos.
+    Shared prefixes alone never establish a match, avoiding pairs such as
+    pressa/pressione, stampo/stampaggio or ciclo/cicloturismo.
+    """
     a = _normalize_unicode_advanced(str(left or "")).lower().strip()
     b = _normalize_unicode_advanced(str(right or "")).lower().strip()
     if not a or not b:
@@ -20445,18 +20552,37 @@ def _v13_source_title_token_similarity(left: str, right: str) -> float:
         return 1.0
     if any(ch.isdigit() for ch in a + b):
         return 0.0
-    if min(len(a), len(b)) >= 4:
-        common = 0
-        for ca, cb in zip(a, b):
-            if ca != cb:
-                break
-            common += 1
-        if common >= min(len(a), len(b)) - 1 and common >= 4:
-            return 0.96
-        if common >= 5:
-            return max(0.88, SequenceMatcher(None, a, b).ratio())
+
+    stems_a = _v13_source_inflection_stems(a)
+    stems_b = _v13_source_inflection_stems(b)
+    if stems_a & stems_b:
+        return 0.96
+
+    min_len = min(len(a), len(b))
+    max_len = max(len(a), len(b))
+    if min_len < 4:
+        return 0.0
+    allowed_edits = 1 if max_len <= 7 else 2
+    distance = _v13_source_token_edit_distance(a, b, max_distance=allowed_edits)
+    prefix = 0
+    for ca, cb in zip(a, b):
+        if ca != cb:
+            break
+        prefix += 1
+    suffix = 0
+    for ca, cb in zip(reversed(a), reversed(b)):
+        if ca != cb:
+            break
+        suffix += 1
+    boundary_coverage = min(min_len, prefix + suffix)
+    if distance <= allowed_edits and prefix >= 2 and boundary_coverage >= min_len:
+        normalized = 1.0 - (distance / max_len)
+        return max(0.84, min(0.94, normalized))
+
     ratio = SequenceMatcher(None, a, b).ratio()
-    return float(ratio) if ratio >= 0.78 else 0.0
+    if ratio >= 0.92 and prefix >= 3 and boundary_coverage >= min_len - 2:
+        return float(ratio)
+    return 0.0
 
 
 def _v13_source_title_match_metrics(q: str, title: str, description: str = "") -> dict:
@@ -20465,61 +20591,92 @@ def _v13_source_title_match_metrics(q: str, title: str, description: str = "") -
     description_tokens = _v13_source_title_tokens(description, limit=96)
     if not query_tokens or not title_tokens:
         return {
-            "score": 0.0, "title_coverage": 0.0, "strict_coverage": 0.0,
-            "matched_title_terms": 0, "title_term_count": len(title_tokens),
+            "score": 0.0, "title_coverage": 0.0, "query_coverage": 0.0,
+            "strict_coverage": 0.0, "strict_query_coverage": 0.0,
+            "matched_title_terms": 0, "matched_query_terms": 0,
+            "title_term_count": len(title_tokens), "query_term_count": len(query_tokens),
             "description_support": 0.0,
         }
 
-    best_scores: list[float] = []
-    for title_token in title_tokens:
-        best_scores.append(
-            max(
-                (_v13_source_title_token_similarity(title_token, query_token) for query_token in query_tokens),
-                default=0.0,
-            )
-        )
-    matched = sum(1 for score in best_scores if score >= 0.82)
-    title_coverage = sum(best_scores) / max(1, len(best_scores))
-    strict_coverage = matched / max(1, len(title_tokens))
+    title_best = [
+        max((_v13_source_title_token_similarity(title_token, query_token) for query_token in query_tokens), default=0.0)
+        for title_token in title_tokens
+    ]
+    query_best = [
+        max((_v13_source_title_token_similarity(query_token, title_token) for title_token in title_tokens), default=0.0)
+        for query_token in query_tokens
+    ]
+    matched_title = sum(1 for score in title_best if score >= 0.82)
+    matched_query = sum(1 for score in query_best if score >= 0.82)
+    title_coverage = sum(title_best) / max(1, len(title_best))
+    strict_coverage = matched_title / max(1, len(title_tokens))
+
+    # Ignore request framing by measuring the strongest query terms, bounded by the
+    # title size. This remains content-based and is independent of source-type words.
+    query_keep = max(1, min(len(title_tokens) + 1, len(query_best)))
+    query_coverage = sum(sorted(query_best, reverse=True)[:query_keep]) / query_keep
+    strict_query_coverage = min(1.0, matched_query / max(1, min(len(query_tokens), len(title_tokens))))
 
     title_norm = " ".join(title_tokens)
     query_norm = " ".join(query_tokens)
     sequence_score = SequenceMatcher(None, title_norm, query_norm).ratio() if title_norm and query_norm else 0.0
 
     if description_tokens:
-        query_matches = [
-            max(
-                (_v13_source_title_token_similarity(query_token, desc_token) for desc_token in description_tokens),
-                default=0.0,
-            )
+        description_matches = [
+            max((_v13_source_title_token_similarity(query_token, desc_token) for desc_token in description_tokens), default=0.0)
             for query_token in query_tokens
         ]
-        # Use the strongest content-bearing half so request framing cannot dilute a
-        # genuinely matching title/description pair.
-        keep = max(1, min(len(title_tokens) + 1, len(query_matches)))
-        description_support = sum(sorted(query_matches, reverse=True)[:keep]) / keep
+        keep = max(1, min(len(title_tokens) + 1, len(description_matches)))
+        description_support = sum(sorted(description_matches, reverse=True)[:keep]) / keep
     else:
         description_support = 0.0
 
     score = (
-        0.72 * title_coverage
-        + 0.18 * strict_coverage
+        0.52 * title_coverage
+        + 0.16 * strict_coverage
+        + 0.14 * query_coverage
+        + 0.06 * strict_query_coverage
         + 0.06 * sequence_score
-        + 0.04 * description_support
+        + 0.06 * description_support
     )
+
+    # Two or more strongly matching title terms are meaningful evidence even when the
+    # user omits one qualifier from a short title. This is generic partial-title recall,
+    # not a domain-specific phrase rule.
+    if matched_title >= 2:
+        if len(title_tokens) <= 3 and strict_coverage >= (2.0 / 3.0):
+            score = max(score, 0.76 + 0.14 * max(0.0, strict_coverage - (2.0 / 3.0)) / (1.0 / 3.0))
+        elif len(title_tokens) <= 5 and strict_coverage >= 0.60:
+            score = max(score, 0.72)
     if strict_coverage >= 0.999 and len(title_tokens) >= 2:
-        score = max(score, 0.90)
-    if len(title_tokens) == 1 and matched < 1:
-        score *= 0.55
+        score = max(score, 0.92)
+    if len(title_tokens) == 1:
+        score = max(score, 0.90) if matched_title == 1 else score * 0.45
 
     return {
         "score": round(max(0.0, min(1.0, score)), 6),
         "title_coverage": round(max(0.0, min(1.0, title_coverage)), 6),
+        "query_coverage": round(max(0.0, min(1.0, query_coverage)), 6),
         "strict_coverage": round(max(0.0, min(1.0, strict_coverage)), 6),
-        "matched_title_terms": int(matched),
+        "strict_query_coverage": round(max(0.0, min(1.0, strict_query_coverage)), 6),
+        "matched_title_terms": int(matched_title),
+        "matched_query_terms": int(matched_query),
         "title_term_count": int(len(title_tokens)),
+        "query_term_count": int(len(query_tokens)),
         "description_support": round(max(0.0, min(1.0, description_support)), 6),
     }
+
+
+def _v13_source_sql_match_patterns(token: str) -> list[str]:
+    """Bounded SQL patterns for exact and ordinary inflection variants."""
+    value = _normalize_unicode_advanced(str(token or "")).lower().strip()
+    if not value:
+        return []
+    variants = [value]
+    for stem in sorted(_v13_source_inflection_stems(value), key=lambda x: (-len(x), x)):
+        if stem != value and len(stem) >= 4:
+            variants.append(stem)
+    return _dedup_text_values(variants, limit=3)
 
 
 def _v13_fetch_structured_title_candidates(
@@ -20549,16 +20706,33 @@ def _v13_fetch_structured_title_candidates(
     if len(query_tokens) < 2:
         return []
 
-    # Longest terms are the most selective. SQL is only a bounded prefilter; the
-    # language-agnostic fuzzy title score below decides the ranking.
+    # Longest terms are the most selective. Each term also receives conservative
+    # singular/plural inflection patterns. SQL is only a bounded prefilter; final
+    # title ranking remains in Python and every returned candidate still requires the
+    # shared semantic gate before a direct response.
     search_terms = sorted(query_tokens, key=lambda token: (-len(token), token))[:10]
+    term_groups = [
+        (term, _v13_source_sql_match_patterns(term))
+        for term in search_terms
+    ]
+    term_groups = [(term, variants) for term, variants in term_groups if variants]
     patterns = [f"{prefix}:%" for prefix in sorted(STRUCTURED_SOURCE_TYPES)]
     term_match_expression = " + ".join(
-        ["CASE WHEN LOWER(COALESCE(text, '')) LIKE %s THEN 1 ELSE 0 END" for _ in search_terms]
+        [
+            "CASE WHEN (" + " OR ".join(
+                ["LOWER(COALESCE(text, '')) LIKE %s" for _ in variants]
+            ) + ") THEN 1 ELSE 0 END"
+            for _term, variants in term_groups
+        ]
     )
     if not term_match_expression:
         return []
-    min_term_matches = 2 if len(search_terms) >= 4 else 1
+    min_term_matches = 2 if len(term_groups) >= 4 else 1
+    term_pattern_params = [
+        f"%{variant}%"
+        for _term, variants in term_groups
+        for variant in variants
+    ]
 
     rows: list[tuple] = []
     conn = None
@@ -20585,7 +20759,7 @@ def _v13_fetch_structured_title_candidates(
                     company_id,
                     patterns,
                     machine_id,
-                    *[f"%{term}%" for term in search_terms],
+                    *term_pattern_params,
                     min_term_matches,
                     machine_id,
                     V13_SOURCE_RETRIEVAL_SCAN_LIMIT,
@@ -20651,8 +20825,11 @@ def _v13_fetch_structured_title_candidates(
                 "structured_title_match": True,
                 "structured_title_match_score": score,
                 "structured_title_coverage": float(metrics.get("title_coverage") or 0.0),
+                "structured_title_query_coverage": float(metrics.get("query_coverage") or 0.0),
                 "structured_title_strict_coverage": float(metrics.get("strict_coverage") or 0.0),
+                "structured_title_strict_query_coverage": float(metrics.get("strict_query_coverage") or 0.0),
                 "structured_title_matched_terms": matched_terms,
+                "structured_title_matched_query_terms": int(metrics.get("matched_query_terms") or 0),
                 "structured_title_term_count": title_term_count,
                 "structured_title_description_support": float(metrics.get("description_support") or 0.0),
                 "structured_title": title,
@@ -20698,17 +20875,148 @@ def _v13_merge_source_title_candidates(q: str, retrieval: dict, title_candidates
     return out
 
 
+def _v13_promote_existing_source_candidates(
+    q: str,
+    retrieval: dict,
+    *,
+    company_id: str,
+) -> list[dict]:
+    """Expose strong title or dense-semantic candidates already present in retrieval.
+
+    This closes the lexical-prefilter gap without another embedding or reasoning call.
+    It annotates copies only; the baseline retrieval order and evidence pack remain
+    unchanged unless the semantic gate later selects the item for a direct source task.
+    """
+    raw = [
+        dict(c) for c in ((retrieval or {}).get("candidates") or [])[:32]
+        if isinstance(c, dict)
+    ]
+    if not raw:
+        return []
+
+    document_ids = [
+        str(c.get("bubble_document_id") or "").strip()
+        for c in raw
+        if str(
+            c.get("source_type")
+            or _source_type_from_document_id(c.get("bubble_document_id") or "")
+        ).strip().lower() == "document"
+        and str(c.get("bubble_document_id") or "").strip()
+        and _v13_real_semantic_similarity(c) >= 0.45
+    ]
+    file_map: dict[str, str] = {}
+    if document_ids:
+        try:
+            file_map = _fetch_document_file_map(company_id, document_ids)
+        except Exception as exc:
+            print("V13_SOURCE_EXISTING_FILE_TITLE_FAIL", str(exc)[:400])
+            file_map = {}
+
+    out: list[dict] = []
+    allowed_types = set(STRUCTURED_SOURCE_TYPES) | {"document"}
+    for c in raw:
+        source_type = str(
+            c.get("source_type")
+            or _source_type_from_document_id(c.get("bubble_document_id") or "")
+        ).strip().lower()
+        if source_type not in allowed_types:
+            continue
+        bdid = str(c.get("bubble_document_id") or "").strip()
+        title, description = _v13_source_candidate_title(
+            c,
+            file_url=str(file_map.get(bdid) or ""),
+        )
+        if not title:
+            continue
+        metrics = _v13_source_title_match_metrics(q, title, description)
+        title_score = float(metrics.get("score") or 0.0)
+        semantic_score = _v13_real_semantic_similarity(c)
+        if (
+            title_score < V13_SOURCE_RETRIEVAL_MIN_TITLE_SCORE
+            and semantic_score < V13_SOURCE_RETRIEVAL_FORCE_SEMANTIC_SCORE
+        ):
+            continue
+        cc = dict(c)
+        cc["source_type"] = source_type
+        cc["structured_title_match"] = bool(title_score >= V13_SOURCE_RETRIEVAL_MIN_TITLE_SCORE)
+        cc["structured_title_match_score"] = title_score
+        cc["structured_title_coverage"] = float(metrics.get("title_coverage") or 0.0)
+        cc["structured_title_query_coverage"] = float(metrics.get("query_coverage") or 0.0)
+        cc["structured_title_strict_coverage"] = float(metrics.get("strict_coverage") or 0.0)
+        cc["structured_title_strict_query_coverage"] = float(metrics.get("strict_query_coverage") or 0.0)
+        cc["structured_title_matched_terms"] = int(metrics.get("matched_title_terms") or 0)
+        cc["structured_title_term_count"] = int(metrics.get("title_term_count") or 0)
+        cc["structured_title"] = title
+        cc["structured_description"] = description
+        cc["source_retrieval_existing_candidate"] = True
+        cc["source_retrieval_probe_score"] = max(title_score, 0.92 * semantic_score)
+        out.append(cc)
+
+    out.sort(
+        key=lambda c: (
+            -float(c.get("source_retrieval_probe_score") or 0.0),
+            -float(c.get("structured_title_match_score") or 0.0),
+            -_v13_real_semantic_similarity(c),
+            0 if bool(c.get("exact_machine_scope")) else 1,
+            str(c.get("bubble_document_id") or ""),
+        )
+    )
+    return _dedup_citations_by_snippet(out, max_items=V13_SOURCE_RETRIEVAL_MAX_CANDIDATES)
+
+
+def _v13_merge_source_probe_candidates(*groups: list[dict]) -> list[dict]:
+    by_doc: dict[str, dict] = {}
+    for group in groups:
+        for raw in group or []:
+            if not isinstance(raw, dict):
+                continue
+            c = dict(raw)
+            bdid = str(c.get("bubble_document_id") or "").strip()
+            if not bdid:
+                continue
+            c.setdefault(
+                "source_retrieval_probe_score",
+                max(
+                    float(c.get("structured_title_match_score") or 0.0),
+                    0.92 * _v13_real_semantic_similarity(c),
+                ),
+            )
+            previous = by_doc.get(bdid)
+            if previous is None or float(c.get("source_retrieval_probe_score") or 0.0) > float(previous.get("source_retrieval_probe_score") or 0.0):
+                by_doc[bdid] = c
+    ordered = sorted(
+        by_doc.values(),
+        key=lambda c: (
+            -float(c.get("source_retrieval_probe_score") or 0.0),
+            -float(c.get("structured_title_match_score") or 0.0),
+            -_v13_real_semantic_similarity(c),
+            str(c.get("bubble_document_id") or ""),
+        ),
+    )
+    return ordered[:V13_SOURCE_RETRIEVAL_MAX_CANDIDATES]
+
+
 def _v13_should_force_source_task_gate(q: str, title_candidates: list[dict]) -> bool:
     if not V13_SOURCE_RETRIEVAL_ENABLED or not title_candidates:
         return False
     if _count_query_tokens(q) > V13_SOURCE_RETRIEVAL_MAX_QUERY_TOKENS:
         return False
     top = title_candidates[0]
-    return bool(
-        float(top.get("structured_title_match_score") or 0.0) >= V13_SOURCE_RETRIEVAL_FORCE_GATE_SCORE
-        and float(top.get("structured_title_coverage") or 0.0) >= 0.68
-        and int(top.get("structured_title_matched_terms") or 0) >= 2
+    title_score = float(top.get("structured_title_match_score") or 0.0)
+    title_coverage = float(top.get("structured_title_coverage") or 0.0)
+    query_coverage = float(top.get("structured_title_query_coverage") or 0.0)
+    matched_terms = int(top.get("structured_title_matched_terms") or 0)
+    semantic_score = _v13_real_semantic_similarity(top)
+    strong_title = bool(
+        title_score >= V13_SOURCE_RETRIEVAL_FORCE_GATE_SCORE
+        and matched_terms >= 2
+        and (title_coverage >= 0.60 or query_coverage >= 0.60)
     )
+    strong_semantic = bool(
+        semantic_score >= V13_SOURCE_RETRIEVAL_FORCE_SEMANTIC_SCORE
+        and str(top.get("structured_title") or top.get("display_title") or "").strip()
+    )
+    return bool(strong_title or strong_semantic)
 
 
 def _v13_source_retrieval_result_limit(cardinality: str, top_k: int) -> int:
@@ -20718,6 +21026,76 @@ def _v13_source_retrieval_result_limit(cardinality: str, top_k: int) -> int:
     if value == "many":
         return max(1, min(int(top_k or 5), V13_SOURCE_RETRIEVAL_MAX_RESULTS_MANY))
     return max(1, min(int(top_k or 5), V13_SOURCE_RETRIEVAL_MAX_RESULTS_FEW))
+
+
+def _v13_source_candidate_title(candidate: dict, *, file_url: str = "") -> tuple[str, str]:
+    c = candidate if isinstance(candidate, dict) else {}
+    body = _v13_candidate_text(c)
+    fields = _parse_structured_source_fields(body)
+    title = _clean_display_text(
+        c.get("structured_title")
+        or c.get("display_title")
+        or fields.get("title")
+        or fields.get("short_description")
+        or "",
+        max_len=180,
+    )
+    description = _clean_display_text(
+        c.get("structured_description")
+        or fields.get("description")
+        or fields.get("solution")
+        or "",
+        max_len=700,
+    )
+    if not title:
+        title = _clean_display_text(_title_from_file_url(file_url or c.get("file_url") or ""), max_len=180)
+    return title, description
+
+
+def _v13_source_retrieval_candidate_metrics(
+    q: str,
+    candidate: dict,
+    *,
+    task_focus: str = "",
+    file_url: str = "",
+) -> dict:
+    c = candidate if isinstance(candidate, dict) else {}
+    title, description = _v13_source_candidate_title(c, file_url=file_url)
+    query_metrics = _v13_source_title_match_metrics(q, title, description) if title else {
+        "score": 0.0, "title_coverage": 0.0, "strict_coverage": 0.0,
+        "matched_title_terms": 0, "title_term_count": 0, "description_support": 0.0,
+    }
+    focus_metrics = _v13_source_title_match_metrics(task_focus, title, description) if task_focus and title else {
+        "score": 0.0, "title_coverage": 0.0, "strict_coverage": 0.0,
+        "matched_title_terms": 0, "title_term_count": 0, "description_support": 0.0,
+    }
+    stored_score = float(c.get("structured_title_match_score") or 0.0)
+    title_score = max(stored_score, float(query_metrics.get("score") or 0.0))
+    focus_score = float(focus_metrics.get("score") or 0.0)
+    semantic_score = _v13_real_semantic_similarity(c)
+    # Exact/fuzzy title evidence is strongest. Semantic similarity is retained as a
+    # conservative supplement, not as a way to turn a generic source into a title hit.
+    effective_score = max(title_score, focus_score, 0.92 * semantic_score)
+    return {
+        "title": title,
+        "description": description,
+        "title_score": max(0.0, min(1.0, title_score)),
+        "focus_score": max(0.0, min(1.0, focus_score)),
+        "semantic_score": max(0.0, min(1.0, semantic_score)),
+        "effective_score": max(0.0, min(1.0, effective_score)),
+        "title_coverage": max(
+            float(c.get("structured_title_coverage") or 0.0),
+            float(query_metrics.get("title_coverage") or 0.0),
+        ),
+        "strict_coverage": max(
+            float(c.get("structured_title_strict_coverage") or 0.0),
+            float(query_metrics.get("strict_coverage") or 0.0),
+        ),
+        "matched_title_terms": max(
+            int(c.get("structured_title_matched_terms") or 0),
+            int(query_metrics.get("matched_title_terms") or 0),
+        ),
+    }
 
 
 def _v13_direct_source_retrieval_response(
@@ -20731,7 +21109,13 @@ def _v13_direct_source_retrieval_response(
 ) -> Optional[dict]:
     """Return a link-first ASK response only after a confident semantic task decision.
 
-    If any precondition is not met, return None and leave the V13.4 answer path intact.
+    Hardening policy:
+    - content relevance dominates source modality;
+    - a preferred type may break only a near tie;
+    - a required type is enforced or the route falls back;
+    - a near-tie under cardinality=one is exposed as two choices rather than being
+      resolved by an arbitrary database/id order;
+    - missing gate-selected evidence never produces a direct answer.
     """
     if not V13_SOURCE_RETRIEVAL_ENABLED:
         return None
@@ -20752,89 +21136,212 @@ def _v13_direct_source_retrieval_response(
         for x in ((gate_meta or {}).get("relevant_evidence_ids") or [])
         if str(x or "").strip()
     }
+    if not relevant_ids:
+        return None
+
     preferred_types = {
         str(x or "").strip().lower()
         for x in ((gate_meta or {}).get("preferred_source_types") or [])
         if str(x or "").strip()
     }
+    source_type_policy = str((gate_meta or {}).get("source_type_policy") or "none").strip().lower()
+    if source_type_policy not in {"none", "prefer", "require"} or not preferred_types:
+        source_type_policy = "none"
+    task_focus = _clean_display_text((gate_meta or {}).get("task_focus") or "", max_len=240)
 
-    candidates: list[dict] = []
-    for raw in (retrieval or {}).get("candidates") or []:
-        if not isinstance(raw, dict):
+    raw_candidates = [
+        dict(c) for c in ((retrieval or {}).get("candidates") or [])
+        if isinstance(c, dict) and str(c.get("citation_id") or "").strip() in relevant_ids
+    ]
+    if not raw_candidates:
+        return None
+
+    # Normal document candidates may not carry a structured TITLE field. Reuse the
+    # current file URL only for filename/title scoring; link construction remains in
+    # the existing centralized _build_rg_links path.
+    normal_doc_ids = [
+        str(c.get("bubble_document_id") or "").strip()
+        for c in raw_candidates
+        if str(c.get("source_type") or _source_type_from_document_id(c.get("bubble_document_id") or "")).strip().lower() == "document"
+        and str(c.get("bubble_document_id") or "").strip()
+    ]
+    file_map: dict[str, str] = {}
+    if normal_doc_ids:
+        try:
+            file_map = _fetch_document_file_map(company_id, normal_doc_ids)
+        except Exception as exc:
+            print("V13_SOURCE_RETRIEVAL_FILE_TITLE_FAIL", str(exc)[:400])
+            file_map = {}
+
+    evaluated: list[dict] = []
+    for c in raw_candidates:
+        source_type = str(
+            c.get("source_type")
+            or _source_type_from_document_id(c.get("bubble_document_id") or "")
+        ).strip().lower()
+        metrics = _v13_source_retrieval_candidate_metrics(
+            q,
+            c,
+            task_focus=task_focus,
+            file_url=str(file_map.get(str(c.get("bubble_document_id") or "")) or ""),
+        )
+        title_score = float(metrics.get("title_score") or 0.0)
+        focus_score = float(metrics.get("focus_score") or 0.0)
+        semantic_score = float(metrics.get("semantic_score") or 0.0)
+        qualifies = bool(
+            title_score >= V13_SOURCE_RETRIEVAL_MIN_TITLE_SCORE
+            or focus_score >= V13_SOURCE_RETRIEVAL_MIN_FOCUS_SCORE
+            or semantic_score >= V13_SOURCE_RETRIEVAL_MIN_SEMANTIC_SCORE
+        )
+        if task_focus and title_score < V13_SOURCE_RETRIEVAL_MIN_TITLE_SCORE:
+            qualifies = bool(
+                focus_score >= V13_SOURCE_RETRIEVAL_MIN_FOCUS_SCORE
+                or semantic_score >= max(0.72, V13_SOURCE_RETRIEVAL_MIN_SEMANTIC_SCORE + 0.08)
+            )
+        if not qualifies:
             continue
-        c = dict(raw)
-        if not bool(c.get("structured_title_match")):
-            continue
-        cid = str(c.get("citation_id") or "").strip()
-        if relevant_ids and cid not in relevant_ids:
-            continue
-        source_type = str(c.get("source_type") or _source_type_from_document_id(c.get("bubble_document_id") or "")).strip().lower()
-        c["source_retrieval_preferred_type"] = bool(not preferred_types or source_type in preferred_types)
-        if float(c.get("structured_title_match_score") or 0.0) < V13_SOURCE_RETRIEVAL_MIN_TITLE_SCORE:
-            continue
-        candidates.append(c)
+        c["source_type"] = source_type
+        c["source_retrieval_preferred_type"] = bool(source_type in preferred_types)
+        c["source_retrieval_title"] = str(metrics.get("title") or "")
+        c["source_retrieval_title_score"] = title_score
+        c["source_retrieval_focus_score"] = focus_score
+        c["source_retrieval_semantic_score"] = semantic_score
+        c["source_retrieval_effective_score"] = float(metrics.get("effective_score") or 0.0)
+        c["source_retrieval_title_coverage"] = float(metrics.get("title_coverage") or 0.0)
+        c["source_retrieval_strict_coverage"] = float(metrics.get("strict_coverage") or 0.0)
+        evaluated.append(c)
+
+    if not evaluated:
+        return None
+
+    if source_type_policy == "require":
+        # ``evaluated`` already contains only candidates with objective item-level
+        # support (title, task focus or true semantic similarity). An explicit required
+        # modality therefore filters that safe set and ranks the remaining items by
+        # relevance. It must not compare them against a different source type: doing so
+        # can exclude the best required item while retaining a weaker one by an
+        # unrelated threshold.
+        candidates = [
+            c for c in evaluated
+            if bool(c.get("source_retrieval_preferred_type"))
+        ]
+    else:
+        candidates = evaluated
 
     if not candidates:
         return None
-    candidates.sort(
-        key=lambda c: (
-            0 if bool(c.get("source_retrieval_preferred_type")) else 1,
-            -float(c.get("structured_title_match_score") or 0.0),
-            -float(c.get("structured_title_coverage") or 0.0),
-            -_v13_real_semantic_similarity(c),
+
+    # Linkability is part of source retrieval quality. Preflight the bounded candidate
+    # pool before ranking so an unavailable top item cannot suppress the best usable
+    # alternative and link order remains aligned with citation order.
+    candidate_citations = _sanitize_citations_for_response(candidates, company_id=company_id)
+    try:
+        candidate_links = _build_rg_links(company_id, candidate_citations)
+    except Exception as exc:
+        print("V13_SOURCE_RETRIEVAL_LINK_PREFLIGHT_FAIL", str(exc)[:500])
+        return None
+    link_by_doc = {
+        str(link.get("bubble_document_id") or "").strip(): link
+        for link in candidate_links or []
+        if isinstance(link, dict) and str(link.get("bubble_document_id") or "").strip()
+    }
+    citation_by_doc = {
+        str(c.get("bubble_document_id") or "").strip(): c
+        for c in candidate_citations or []
+        if isinstance(c, dict) and str(c.get("bubble_document_id") or "").strip()
+    }
+    candidates = [
+        c for c in candidates
+        if str(c.get("bubble_document_id") or "").strip() in link_by_doc
+        and str(c.get("bubble_document_id") or "").strip() in citation_by_doc
+    ]
+    if not candidates:
+        return None
+
+    true_top_score = max(float(c.get("source_retrieval_effective_score") or 0.0) for c in candidates)
+
+    def source_sort_key(c: dict) -> tuple:
+        effective = float(c.get("source_retrieval_effective_score") or 0.0)
+        preferred_near_top = bool(
+            source_type_policy == "prefer"
+            and c.get("source_retrieval_preferred_type")
+            and effective >= true_top_score - V13_SOURCE_RETRIEVAL_PREFERENCE_MAX_GAP
+        )
+        # Relevance band first prevents a weak preferred modality from jumping above a
+        # materially better source. Preference is only a near-tie tiebreaker.
+        relevance_band = 0 if effective >= true_top_score - V13_SOURCE_RETRIEVAL_PREFERENCE_MAX_GAP else 1
+        preference_rank = 0 if preferred_near_top else 1
+        return (
+            relevance_band,
+            preference_rank,
+            -effective,
+            -float(c.get("source_retrieval_title_score") or 0.0),
+            -float(c.get("source_retrieval_focus_score") or 0.0),
+            -float(c.get("source_retrieval_semantic_score") or 0.0),
             0 if bool(c.get("exact_machine_scope")) else 1,
             str(c.get("bubble_document_id") or ""),
         )
-    )
 
-    limit = _v13_source_retrieval_result_limit(
-        str((gate_meta or {}).get("result_cardinality") or "few"),
-        top_k,
-    )
-    top_score = float(candidates[0].get("structured_title_match_score") or 0.0)
+    candidates.sort(key=source_sort_key)
+
+    cardinality = str((gate_meta or {}).get("result_cardinality") or "few").strip().lower()
+    limit = _v13_source_retrieval_result_limit(cardinality, top_k)
     selected: list[dict] = []
     seen_docs: set[str] = set()
     for c in candidates:
         bdid = str(c.get("bubble_document_id") or "").strip()
         if not bdid or bdid in seen_docs:
             continue
-        score = float(c.get("structured_title_match_score") or 0.0)
-        if selected and score < max(V13_SOURCE_RETRIEVAL_MIN_TITLE_SCORE, top_score - 0.16):
+        score = float(c.get("source_retrieval_effective_score") or 0.0)
+        if score < max(
+            min(V13_SOURCE_RETRIEVAL_MIN_TITLE_SCORE, V13_SOURCE_RETRIEVAL_MIN_FOCUS_SCORE),
+            true_top_score - V13_SOURCE_RETRIEVAL_RESULT_BAND,
+        ):
             continue
         selected.append(c)
         seen_docs.add(bdid)
         if len(selected) >= limit:
             break
+
+    # A single-result request must not be resolved by an arbitrary id order when two
+    # sources are effectively tied. Return the two genuine alternatives, still bounded.
+    ambiguous = False
+    if cardinality == "one" and selected:
+        first = selected[0]
+        first_score = float(first.get("source_retrieval_effective_score") or 0.0)
+        for c in candidates:
+            bdid = str(c.get("bubble_document_id") or "").strip()
+            if not bdid or bdid in seen_docs:
+                continue
+            score = float(c.get("source_retrieval_effective_score") or 0.0)
+            if abs(first_score - score) <= V13_SOURCE_RETRIEVAL_AMBIGUITY_DELTA:
+                selected.append(c)
+                seen_docs.add(bdid)
+                ambiguous = True
+                break
+
     if not selected:
         return None
 
-    response_citations = _sanitize_citations_for_response(selected, company_id=company_id)
-    try:
-        rg_links = _build_rg_links(company_id, response_citations)
-    except Exception as exc:
-        print("V13_SOURCE_RETRIEVAL_LINK_FAIL", str(exc)[:500])
-        return None
-    if not rg_links:
-        return None
-
-    linked_doc_ids = {
-        str(link.get("bubble_document_id") or "").strip()
-        for link in rg_links
-        if isinstance(link, dict) and str(link.get("bubble_document_id") or "").strip()
-    }
     response_citations = [
-        c for c in response_citations
-        if str(c.get("bubble_document_id") or "").strip() in linked_doc_ids
+        citation_by_doc[str(c.get("bubble_document_id") or "").strip()]
+        for c in selected
+        if str(c.get("bubble_document_id") or "").strip() in citation_by_doc
     ]
     if not response_citations:
+        return None
+    rg_links = [
+        link_by_doc[str(c.get("bubble_document_id") or "").strip()]
+        for c in response_citations
+        if str(c.get("bubble_document_id") or "").strip() in link_by_doc
+    ]
+    if not rg_links:
         return None
 
     labels = [
         str(link.get("display_label") or link.get("display_title") or "").strip()
         for link in rg_links
-        if isinstance(link, dict)
-        and str(link.get("bubble_document_id") or "").strip() in linked_doc_ids
-        and str(link.get("display_label") or link.get("display_title") or "").strip()
+        if str(link.get("display_label") or link.get("display_title") or "").strip()
     ]
     english = str(response_language or "").lower().startswith("en")
     if len(labels) == 1:
@@ -20844,7 +21351,14 @@ def _v13_direct_source_retrieval_response(
             f"Ho trovato il contenuto indicizzato più pertinente: {labels[0]}."
         )
     else:
-        heading = "I found these relevant indexed contents:" if english else "Ho trovato questi contenuti indicizzati pertinenti:"
+        if ambiguous:
+            heading = (
+                "I found two indexed contents with almost equivalent relevance:"
+                if english else
+                "Ho trovato due contenuti indicizzati con pertinenza quasi equivalente:"
+            )
+        else:
+            heading = "I found these relevant indexed contents:" if english else "Ho trovato questi contenuti indicizzati pertinenti:"
         answer = heading + "\n" + "\n".join(f"- {label}" for label in labels)
 
     return _finalize_ask_response_for_ui(
@@ -20854,22 +21368,22 @@ def _v13_direct_source_retrieval_response(
             "answer": answer,
             "language": response_language,
             "citations": response_citations,
-            "rg_links": rg_links[:len(response_citations)],
+            "rg_links": rg_links,
             "top_k": top_k,
             "similarity_max": max(
-                (float(c.get("structured_title_match_score") or 0.0) for c in selected),
+                (float(c.get("source_retrieval_effective_score") or 0.0) for c in selected),
                 default=None,
             ),
             "chat_model": str((gate_meta or {}).get("model") or V13_EVIDENCE_GATE_MODEL),
             "meta": {
                 "cacheable": True,
-                # Exact Worker cache is safe; semantic reuse could confuse a future
-                # explanation request with a prior link-retrieval request.
                 "semantic_cacheable": False,
                 "source_retrieval_direct": True,
                 "source_retrieval_task_mode": task_mode,
                 "source_retrieval_task_confidence": round(task_confidence, 4),
-                "source_retrieval_cardinality": str((gate_meta or {}).get("result_cardinality") or "few"),
+                "source_retrieval_cardinality": cardinality,
+                "source_retrieval_source_type_policy": source_type_policy,
+                "source_retrieval_ambiguous": bool(ambiguous),
                 "source_retrieval_selected_count": len(response_citations),
             },
         },
@@ -21112,6 +21626,7 @@ def _v13_resolve_evidence_support(
         "result_cardinality": "few",
         "requires_explanation": True,
         "preferred_source_types": [],
+        "source_type_policy": "none",
         "task_focus": "",
         "forced_semantic_gate": bool(force_semantic_gate),
         "task_contract_requested": bool(request_task_contract),
@@ -21201,6 +21716,7 @@ def _v13_resolve_evidence_support(
         "result_cardinality": str(semantic.get("result_cardinality") or "few"),
         "requires_explanation": bool(semantic.get("requires_explanation", True)),
         "preferred_source_types": list(semantic.get("preferred_source_types") or []),
+        "source_type_policy": str(semantic.get("source_type_policy") or "none"),
         "task_focus": str(semantic.get("task_focus") or ""),
     })
     if decision == "supported":
@@ -22315,6 +22831,51 @@ def _ask_v13_sync(
             plan=fallback_plan,
         )
 
+        # Preserve the exact pre-title V13.4 evidence path. The new title/task layer is
+        # allowed to replace it only by returning a valid direct source response. If the
+        # task gate rejects, is uncertain, requests an explanation, or cannot build a
+        # link, a clearly supported baseline pack is restored unchanged. This prevents a
+        # task-classification error from turning an already answerable ASK into
+        # no_sources or from polluting a normal synthesis with title-probe candidates.
+        baseline_retrieval = dict(retrieval or {})
+        baseline_retrieval["candidates"] = [
+            dict(c) for c in (retrieval.get("candidates") or []) if isinstance(c, dict)
+        ]
+        baseline_retrieval["citations"] = [
+            dict(c) for c in (retrieval.get("citations") or []) if isinstance(c, dict)
+        ]
+        baseline_state, baseline_signals = _v13_deterministic_evidence_state(
+            q,
+            baseline_retrieval.get("candidates") or [],
+            mode="ask",
+            narrow_scope=narrow_scope,
+        )
+        baseline_admitted: Optional[dict] = None
+        baseline_gate_meta: Optional[dict] = None
+        if baseline_state == "supported":
+            candidate_baseline = _v13_filter_retrieval_candidates(
+                q, baseline_retrieval, mode="ask"
+            )
+            if candidate_baseline.get("citations"):
+                baseline_admitted = candidate_baseline
+                baseline_gate_meta = {
+                    "initial_state": "supported",
+                    "semantic_gate_used": False,
+                    "refinement_used": False,
+                    "decision": "supported",
+                    "reason_code": "evidence_sufficient",
+                    "confidence": 1.0,
+                    "initial_top_similarity": round(
+                        float((baseline_signals or {}).get("top_similarity") or 0.0), 6
+                    ),
+                    "initial_top_overlap": round(
+                        float((baseline_signals or {}).get("top_overlap") or 0.0), 6
+                    ),
+                    "selected_count": len(candidate_baseline.get("citations") or []),
+                    "source_task_probe_fallback": True,
+                    "source_task_probe_fallback_reason": "preserve_clear_v13_4_baseline",
+                }
+
         # Independently probe structured titles/descriptions. These candidates do not
         # replace baseline evidence and cannot answer by themselves; a strong title
         # match merely forces the existing semantic gate to interpret the ASK task.
@@ -22333,7 +22894,19 @@ def _ask_v13_sync(
             source_title_candidates = []
         if source_title_candidates:
             retrieval = _v13_merge_source_title_candidates(q, retrieval, source_title_candidates)
-        force_source_task_gate = _v13_should_force_source_task_gate(q, source_title_candidates)
+        existing_source_candidates = _v13_promote_existing_source_candidates(
+            q,
+            baseline_retrieval,
+            company_id=company_id,
+        )
+        source_probe_candidates = _v13_merge_source_probe_candidates(
+            source_title_candidates,
+            existing_source_candidates,
+        )
+        force_source_task_gate = _v13_should_force_source_task_gate(
+            q,
+            source_probe_candidates,
+        )
 
         admitted, retrieval, _gate_meta = _v13_resolve_evidence_support(
             q=q, company_id=company_id, machine_id=machine_id, doc_ids=doc_ids,
@@ -22343,6 +22916,35 @@ def _ask_v13_sync(
             force_semantic_gate=force_source_task_gate,
             request_task_contract=force_source_task_gate,
         )
+        probe_task_mode = str((_gate_meta or {}).get("task_mode") or "other").strip().lower()
+        probe_task_confidence = float((_gate_meta or {}).get("task_confidence") or 0.0)
+        probe_requires_explanation = bool((_gate_meta or {}).get("requires_explanation", True))
+        probe_source_type_policy = str((_gate_meta or {}).get("source_type_policy") or "none").strip().lower()
+        confident_source_retrieval = bool(
+            probe_task_mode in {"retrieve_source", "list_sources"}
+            and probe_task_confidence >= V13_SOURCE_RETRIEVAL_MIN_TASK_CONFIDENCE
+            and not probe_requires_explanation
+        )
+        may_restore_clear_baseline = bool(
+            baseline_admitted is not None
+            and not confident_source_retrieval
+            and probe_source_type_policy != "require"
+        )
+
+        if not admitted and force_source_task_gate and may_restore_clear_baseline:
+            # The title/task probe is an optional improvement, not a new veto over a
+            # baseline that already crossed the unchanged deterministic evidence gate.
+            probe_meta_before_fallback = dict(_gate_meta or {})
+            retrieval = baseline_admitted
+            _gate_meta = {
+                **dict(baseline_gate_meta or {}),
+                "source_task_probe_decision": str(probe_meta_before_fallback.get("decision") or "unsupported"),
+                "source_task_probe_task_mode": probe_task_mode,
+                "source_task_probe_task_confidence": probe_task_confidence,
+            }
+            admitted = True
+            budget.evidence_gate = dict(_gate_meta)
+
         if not admitted:
             metrics = retrieval.get("metrics") or {}
             budget.route = "no_relevant_evidence"
@@ -22371,6 +22973,54 @@ def _ask_v13_sync(
                 debug=bool(payload.debug),
             )
             return final
+
+        if force_source_task_gate and confident_source_retrieval:
+            # The semantic contract says links/content retrieval itself is the task, but
+            # no objectively matching linkable item survived. Do not silently convert
+            # that request into a nearby explanation or expose unrelated sources.
+            metrics = retrieval.get("metrics") or {}
+            budget.route = "source_retrieval_no_linkable_match"
+            final = _v13_no_sources_for_insufficient_evidence(
+                q=q,
+                response_language=response_language,
+                mode="ask",
+                top_k=top_k,
+                similarity_max=metrics.get("top_similarity"),
+            )
+            final["meta"] = {
+                **dict(final.get("meta") or {}),
+                "source_retrieval_requested": True,
+                "source_retrieval_failure": "no_objectively_matching_linkable_item",
+                "cacheable": False,
+                "semantic_cacheable": False,
+            }
+            return _v13_attach_runtime_meta(final, budget, debug=bool(payload.debug))
+
+        if force_source_task_gate and may_restore_clear_baseline:
+            # No direct source response was objectively valid and the task was not a
+            # confident link-only request with a required modality. Restore the original
+            # clear-support pack and its V13.4 gate metadata before assurance/synthesis.
+            probe_meta = dict(_gate_meta or {})
+            retrieval = baseline_admitted
+            _gate_meta = {
+                **dict(baseline_gate_meta or {}),
+                "source_task_probe_decision": str(
+                    probe_meta.get("source_task_probe_decision")
+                    or probe_meta.get("decision")
+                    or ""
+                ),
+                "source_task_probe_task_mode": str(
+                    probe_meta.get("source_task_probe_task_mode")
+                    or probe_meta.get("task_mode")
+                    or "other"
+                ),
+                "source_task_probe_task_confidence": float(
+                    probe_meta.get("source_task_probe_task_confidence")
+                    or probe_meta.get("task_confidence")
+                    or 0.0
+                ),
+            }
+            budget.evidence_gate = dict(_gate_meta)
 
         retrieval, _assurance_meta = _v13_apply_retrieval_assurance(
             q=q, company_id=company_id, machine_id=machine_id, doc_ids=doc_ids,
