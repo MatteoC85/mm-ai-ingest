@@ -167,7 +167,7 @@ SEMANTIC_QUERY_PLANNER_TIMEOUT = int(os.environ.get("MM_SEMANTIC_QUERY_PLANNER_T
 SEMANTIC_MAX_DENSE_QUERIES = int(os.environ.get("MM_SEMANTIC_MAX_DENSE_QUERIES", "5"))
 SEMANTIC_MAX_LEXICAL_QUERIES = int(os.environ.get("MM_SEMANTIC_MAX_LEXICAL_QUERIES", "5"))
 SEMANTIC_EXACT_MACHINE_BONUS = float(os.environ.get("MM_SEMANTIC_EXACT_MACHINE_BONUS", "0.055"))
-ASK_ROOT_CAUSE_CODE_MARKER = "ask-root-v13-prod-adaptive-budgeted-evidence-gate-stream-v3"
+ASK_ROOT_CAUSE_CODE_MARKER = "ask-root-v13-prod-adaptive-evidence-gate-assurance-stream-v4"
 
 # Root-cause semantic intent gate
 ROOT_CAUSE_INTENT_MODEL = (os.environ.get("MM_ROOT_CAUSE_INTENT_MODEL") or "gpt-5.4-mini").strip()
@@ -634,13 +634,35 @@ def _db_conn():
     except Exception:
         budget = None
 
-    if budget is not None:
+    assurance_remaining: Optional[float] = None
+    try:
+        assurance_ctx = globals().get("_V13_ASSURANCE_DEADLINE_CTX")
+        assurance_deadline = float(assurance_ctx.get() or 0.0) if assurance_ctx is not None else 0.0
+        if assurance_deadline > 0.0:
+            assurance_remaining = max(0.1, assurance_deadline - time_module.monotonic())
+    except Exception:
+        assurance_remaining = None
+
+    if budget is not None and assurance_remaining is None:
+        # Preserve the pre-assurance V13 behavior exactly outside the bounded layer.
         budget.ensure_time(1.5)
         remaining = max(1.5, float(budget.remaining()))
         connect_limit = int(globals().get("V13_DB_CONNECT_TIMEOUT_SECONDS", 5) or 5)
         statement_limit = int(globals().get("V13_DB_STATEMENT_TIMEOUT_MS", 9000) or 9000)
         kwargs["connect_timeout"] = max(1, min(connect_limit, int(max(1.0, remaining - 0.5))))
         kwargs["options"] = f"-c statement_timeout={max(1000, min(statement_limit, int(max(1.0, remaining - 0.5) * 1000)))}"
+    elif budget is not None or assurance_remaining is not None:
+        if budget is not None:
+            budget.ensure_time(1.0)
+            remaining = max(0.5, float(budget.remaining()))
+        else:
+            remaining = max(0.5, float(assurance_remaining or 0.5))
+        if assurance_remaining is not None:
+            remaining = min(remaining, max(0.5, float(assurance_remaining)))
+        connect_limit = int(globals().get("V13_DB_CONNECT_TIMEOUT_SECONDS", 5) or 5)
+        statement_limit = int(globals().get("V13_DB_STATEMENT_TIMEOUT_MS", 9000) or 9000)
+        kwargs["connect_timeout"] = max(1, min(connect_limit, int(max(1.0, remaining - 0.2))))
+        kwargs["options"] = f"-c statement_timeout={max(500, min(statement_limit, int(max(0.5, remaining - 0.2) * 1000)))}"
 
     return psycopg2.connect(**kwargs)
 
@@ -12417,7 +12439,7 @@ def version():
         "v13_enabled": V13_ENABLED,
         "v13_ask_enabled": V13_ASK_ENABLED,
         "v13_root_cause_enabled": V13_ROOT_CAUSE_ENABLED,
-        "v13_architecture": "deterministic_retrieval_shared_semantic_evidence_gate_single_synthesis",
+        "v13_architecture": "deterministic_retrieval_shared_semantic_evidence_gate_bounded_retrieval_assurance_single_synthesis",
         "v13_verifier_rewrite_loop_enabled": False,
         "v13_planner_model": V13_PLANNER_MODEL,
         "v13_evidence_gate_model": V13_EVIDENCE_GATE_MODEL,
@@ -12426,6 +12448,16 @@ def version():
         "v13_evidence_gate_min_confidence": V13_EVIDENCE_GATE_MIN_CONFIDENCE,
         "v13_evidence_gate_policy": "source_sufficiency_not_input_keyword_classification",
         "v13_evidence_similarity_policy": "true_dense_cosine_separate_from_routing_scores",
+        "v13_retrieval_assurance_enabled": V13_RETRIEVAL_ASSURANCE_ENABLED,
+        "v13_retrieval_assurance_policy": "bounded_deterministic_monotonic_evidence_pack_improvement",
+        "v13_retrieval_assurance_llm_calls_added": 0,
+        "v13_retrieval_assurance_max_seconds_ask": V13_RETRIEVAL_ASSURANCE_MAX_SECONDS_ASK,
+        "v13_retrieval_assurance_max_seconds_root_cause": V13_RETRIEVAL_ASSURANCE_MAX_SECONDS_ROOT_CAUSE,
+        "v13_retrieval_assurance_pre_gate_max_seconds": V13_RETRIEVAL_ASSURANCE_PRE_GATE_MAX_SECONDS,
+        "v13_retrieval_assurance_pre_gate_policy": "bounded_deterministic_rescue_then_mandatory_semantic_gate",
+        "v13_retrieval_assurance_max_docs": V13_RETRIEVAL_ASSURANCE_MAX_DOCS,
+        "v13_retrieval_assurance_page_radius": V13_RETRIEVAL_ASSURANCE_PAGE_RADIUS,
+        "v13_retrieval_assurance_adoption_policy": "baseline_preserved_replace_only_on_objective_coverage_exact_or_semantic_gain",
         "v13_direct_answer_bypass_enabled": False,
         "v13_identifier_policy": "bare_identifier_deterministic_contextual_identifier_semantic_gate",
         "v13_fast_model": V13_FAST_MODEL,
@@ -12460,6 +12492,8 @@ def version():
         "smart_diagnostic_evidence_gate_model": SMART_DIAGNOSTIC_EVIDENCE_GATE_MODEL,
         "smart_diagnostic_evidence_gate_policy": "same_general_source_sufficiency_gate",
         "smart_diagnostic_final_grounding_policy": "final_hypothesis_and_checks_locked_to_admitted_evidence",
+        "smart_diagnostic_retrieval_assurance_enabled": SMART_DIAGNOSTIC_RETRIEVAL_ASSURANCE_ENABLED,
+        "smart_diagnostic_retrieval_assurance_policy": "bounded_start_assurance_and_answer_signal_enrichment_without_extra_reasoning_calls",
         "openai_embed_model": OPENAI_EMBED_MODEL,
         "baseline_ask_chat_model": OPENAI_CHAT_MODEL,
         "baseline_root_cause_response_model": ROOT_CAUSE_RESPONSE_MODEL,
@@ -16282,8 +16316,10 @@ def _root_cause_v1_candidate_impl(
 #   6) no permanent verifier/rewrite loop;
 #   7) a strict request budget and streaming heartbeat prevent HTTP 524 failures.
 #
-# The ingestion, Draft P&S, electrical, and Smart Diagnostic paths are deliberately
-# untouched. Existing retrieval/scoring helpers are reused, but the old V11/V12
+# Ingestion, Draft P&S and electrical paths remain unchanged. Smart Diagnostic
+# reuses the same bounded assurance policy at start and after genuinely new operator
+# evidence, without adding a reasoning call. Existing retrieval/scoring helpers are
+# reused, but the old V11/V12
 # planner -> selector -> refinement -> reasoner -> verifier -> rewrite chain is removed
 # from the live ASK/ROOT CAUSE routes.
 # =============================================================================
@@ -16291,8 +16327,8 @@ def _root_cause_v1_candidate_impl(
 V13_ENABLED = (os.environ.get("MM_V13_ENABLED") or "1").strip() != "0"
 V13_ASK_ENABLED = (os.environ.get("MM_V13_ASK_ENABLED") or "1").strip() != "0"
 V13_ROOT_CAUSE_ENABLED = (os.environ.get("MM_V13_ROOT_CAUSE_ENABLED") or "1").strip() != "0"
-V13_CODE_MARKER = "ask-root-v13-prod-adaptive-budgeted-evidence-gate-stream-v3"
-V13_RELEASE_ID = (os.environ.get("MM_V13_RELEASE_ID") or "2026-07-29.3").strip()
+V13_CODE_MARKER = "ask-root-v13-prod-adaptive-evidence-gate-assurance-stream-v4"
+V13_RELEASE_ID = (os.environ.get("MM_V13_RELEASE_ID") or "2026-07-29.4").strip()
 OPENAI_RESPONSES_URL = (os.environ.get("OPENAI_RESPONSES_URL") or "https://api.openai.com/v1/responses").strip()
 
 # Model policy. Luna is used only for optional retrieval refinement; Terra handles
@@ -16333,6 +16369,34 @@ V13_EVIDENCE_CLEAR_SUPPORT_SIM = max(0.45, min(0.80, float(os.environ.get("MM_V1
 V13_EVIDENCE_SUPPORT_SIM_WITH_OVERLAP = max(0.35, min(0.75, float(os.environ.get("MM_V13_EVIDENCE_SUPPORT_SIM_WITH_OVERLAP", "0.48"))))
 V13_EVIDENCE_CLEAR_REJECT_SIM = max(0.08, min(0.40, float(os.environ.get("MM_V13_EVIDENCE_CLEAR_REJECT_SIM", "0.18"))))
 V13_EVIDENCE_MIN_OVERLAP = max(0.01, min(0.25, float(os.environ.get("MM_V13_EVIDENCE_MIN_OVERLAP", "0.05"))))
+
+# Bounded Retrieval Assurance. This layer never buys an extra reasoning call: it
+# uses only bounded embeddings, PostgreSQL/FTS scans, adjacent-page expansion and
+# explicit structured relationships. The admitted pack remains the baseline; a
+# full bounded pack may replace a weaker item only when coverage, exact-identifier
+# support, or true semantic support objectively improves.
+V13_RETRIEVAL_ASSURANCE_ENABLED = (os.environ.get("MM_V13_RETRIEVAL_ASSURANCE_ENABLED") or "1").strip() != "0"
+V13_RETRIEVAL_ASSURANCE_MAX_SECONDS_ASK = max(2, min(10, int(os.environ.get("MM_V13_RETRIEVAL_ASSURANCE_MAX_SECONDS_ASK", "6"))))
+V13_RETRIEVAL_ASSURANCE_MAX_SECONDS_ROOT_CAUSE = max(3, min(12, int(os.environ.get("MM_V13_RETRIEVAL_ASSURANCE_MAX_SECONDS_ROOT_CAUSE", "8"))))
+# A small deterministic rescue may run before the semantic gate only when the first
+# retrieval is plausibly incomplete (explicit document scope, an exact technical
+# identifier, or a weak-but-nonzero evidence signal). It never answers by itself: any
+# recovered pack must still pass the semantic evidence gate before synthesis.
+V13_RETRIEVAL_ASSURANCE_PRE_GATE_MAX_SECONDS = max(2, min(6, int(os.environ.get("MM_V13_RETRIEVAL_ASSURANCE_PRE_GATE_MAX_SECONDS", "4"))))
+V13_RETRIEVAL_ASSURANCE_RESERVE_FINAL_SECONDS_ASK = max(8, min(24, int(os.environ.get("MM_V13_RETRIEVAL_ASSURANCE_RESERVE_FINAL_SECONDS_ASK", "12"))))
+V13_RETRIEVAL_ASSURANCE_RESERVE_FINAL_SECONDS_ROOT_CAUSE = max(12, min(30, int(os.environ.get("MM_V13_RETRIEVAL_ASSURANCE_RESERVE_FINAL_SECONDS_ROOT_CAUSE", "16"))))
+V13_RETRIEVAL_ASSURANCE_MAX_DENSE_QUERIES = max(1, min(4, int(os.environ.get("MM_V13_RETRIEVAL_ASSURANCE_MAX_DENSE_QUERIES", "3"))))
+V13_RETRIEVAL_ASSURANCE_MAX_LEXICAL_QUERIES = max(2, min(8, int(os.environ.get("MM_V13_RETRIEVAL_ASSURANCE_MAX_LEXICAL_QUERIES", "6"))))
+V13_RETRIEVAL_ASSURANCE_MAX_DOCS = max(1, min(5, int(os.environ.get("MM_V13_RETRIEVAL_ASSURANCE_MAX_DOCS", "3"))))
+V13_RETRIEVAL_ASSURANCE_PAGE_RADIUS = max(0, min(2, int(os.environ.get("MM_V13_RETRIEVAL_ASSURANCE_PAGE_RADIUS", "1"))))
+V13_RETRIEVAL_ASSURANCE_MAX_NEIGHBOR_PAGES = max(4, min(30, int(os.environ.get("MM_V13_RETRIEVAL_ASSURANCE_MAX_NEIGHBOR_PAGES", "18"))))
+V13_RETRIEVAL_ASSURANCE_MAX_CANDIDATES = max(12, min(40, int(os.environ.get("MM_V13_RETRIEVAL_ASSURANCE_MAX_CANDIDATES", "24"))))
+V13_RETRIEVAL_ASSURANCE_MAX_FACETS = max(4, min(16, int(os.environ.get("MM_V13_RETRIEVAL_ASSURANCE_MAX_FACETS", "10"))))
+V13_RETRIEVAL_ASSURANCE_MIN_FACET_GAIN = max(1, min(4, int(os.environ.get("MM_V13_RETRIEVAL_ASSURANCE_MIN_FACET_GAIN", "1"))))
+V13_RETRIEVAL_ASSURANCE_MIN_COVERAGE_GAIN = max(0.02, min(0.30, float(os.environ.get("MM_V13_RETRIEVAL_ASSURANCE_MIN_COVERAGE_GAIN", "0.08"))))
+V13_RETRIEVAL_ASSURANCE_MIN_SUPPORT_GAIN = max(0.02, min(0.25, float(os.environ.get("MM_V13_RETRIEVAL_ASSURANCE_MIN_SUPPORT_GAIN", "0.06"))))
+V13_RETRIEVAL_ASSURANCE_MIN_NEW_SEMANTIC_SIM = max(0.30, min(0.75, float(os.environ.get("MM_V13_RETRIEVAL_ASSURANCE_MIN_NEW_SEMANTIC_SIM", "0.42"))))
+V13_RETRIEVAL_ASSURANCE_MIN_NEW_OVERLAP = max(0.03, min(0.25, float(os.environ.get("MM_V13_RETRIEVAL_ASSURANCE_MIN_NEW_OVERLAP", "0.08"))))
 V13_FAST_TIMEOUT_SECONDS = max(12, min(35, int(os.environ.get("MM_V13_FAST_TIMEOUT_SECONDS", "26"))))
 V13_HEAVY_TIMEOUT_SECONDS = max(20, min(45, int(os.environ.get("MM_V13_HEAVY_TIMEOUT_SECONDS", "40"))))
 V13_PLANNER_MAX_OUTPUT_TOKENS = max(800, min(2000, int(os.environ.get("MM_V13_PLANNER_MAX_OUTPUT_TOKENS", "1200"))))
@@ -16396,6 +16460,17 @@ V13_ENGINE_KEY = hashlib.sha256(
             str(V13_EVIDENCE_SUPPORT_SIM_WITH_OVERLAP),
             str(V13_EVIDENCE_CLEAR_REJECT_SIM),
             str(V13_EVIDENCE_MIN_OVERLAP),
+            str(V13_RETRIEVAL_ASSURANCE_ENABLED),
+            str(V13_RETRIEVAL_ASSURANCE_MAX_SECONDS_ASK),
+            str(V13_RETRIEVAL_ASSURANCE_MAX_SECONDS_ROOT_CAUSE),
+            str(V13_RETRIEVAL_ASSURANCE_PRE_GATE_MAX_SECONDS),
+            str(V13_RETRIEVAL_ASSURANCE_MAX_DENSE_QUERIES),
+            str(V13_RETRIEVAL_ASSURANCE_MAX_LEXICAL_QUERIES),
+            str(V13_RETRIEVAL_ASSURANCE_PAGE_RADIUS),
+            str(V13_RETRIEVAL_ASSURANCE_MIN_COVERAGE_GAIN),
+            str(V13_RETRIEVAL_ASSURANCE_MIN_SUPPORT_GAIN),
+            str(V13_RETRIEVAL_ASSURANCE_MIN_NEW_SEMANTIC_SIM),
+            str(V13_RETRIEVAL_ASSURANCE_MIN_NEW_OVERLAP),
             V13_FAST_MODEL,
             V13_HEAVY_MODEL,
             V13_FAST_EFFORT,
@@ -16450,6 +16525,7 @@ class _V13RequestBudget:
         self.refinement_used = False
         self.semantic_cache = "miss"
         self.evidence_gate: dict = {}
+        self.retrieval_assurance: dict = {}
 
     def elapsed(self) -> float:
         return max(0.0, time_module.monotonic() - self.started_monotonic)
@@ -16600,6 +16676,7 @@ class _V13RequestBudget:
             "refinement_used": bool(self.refinement_used),
             "semantic_cache": self.semantic_cache,
             "evidence_gate": dict(self.evidence_gate or {}),
+            "retrieval_assurance": dict(self.retrieval_assurance or {}),
             "calls": list(self.call_log),
         }
 
@@ -17668,6 +17745,51 @@ def _v13_gate_term_set(text: str, *, limit: int) -> set[str]:
     }
 
 
+def _v13_structural_identifier_tokens(value: Any) -> list[str]:
+    """Extract exact technical identifiers without promoting ordinary Title Case words.
+
+    Accepted shapes are mixed letter/digit tokens (I5.3, PROC-009), all-uppercase
+    identifiers (SENTINEL), and short multi-word labels ending in a numeric/code token
+    (Tool Protection 1). Exact full-text occurrence is still required in evidence.
+    """
+    text = _normalize_unicode_advanced(str(value or ""))
+    values: list[str] = []
+    values.extend(
+        re.findall(
+            r"\b(?:[A-Za-z][A-Za-z0-9_-]{1,24}\s+){1,3}[A-Za-z0-9_.-]*\d[A-Za-z0-9_.-]*\b",
+            text,
+        )
+    )
+    values.extend(
+        re.findall(
+            r"(?<![A-Za-z0-9])([A-Za-z0-9][A-Za-z0-9_.\-/]{1,30}[A-Za-z0-9])(?![A-Za-z0-9])",
+            text,
+        )
+    )
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        token = re.sub(r"\s+", " ", str(raw or "").strip(" ._-/"))
+        if len(token) < 3:
+            continue
+        has_digit = any(ch.isdigit() for ch in token)
+        has_letter = any(ch.isalpha() for ch in token)
+        has_technical_separator = any(sep in token for sep in ("_", "-", "/", "."))
+        is_upper_identifier = token.isupper() and has_letter and len(token) >= 3
+        is_multiword_numeric_label = " " in token and has_digit and has_letter
+        is_mixed_identifier = has_digit and has_letter and (has_technical_separator or " " not in token)
+        if not (is_upper_identifier or is_multiword_numeric_label or is_mixed_identifier):
+            continue
+        key = _v13_normalize_query(token)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(token)
+        if len(out) >= 12:
+            break
+    return out
+
+
 def _v13_real_semantic_similarity(candidate: dict) -> float:
     """Return only a real embedding cosine similarity, never a routing score.
 
@@ -17698,8 +17820,12 @@ def _v13_gate_candidate_signals(q: str, candidate: dict) -> dict:
     overlap = _term_overlap_score(query_terms, text_terms) if query_terms and text_terms else 0.0
     similarity = _v13_real_semantic_similarity(c)
     normalized_text = _normalize_unicode_advanced(text).lower()
-    codes = [str(x or "").strip().lower() for x in _extract_code_tokens(q)]
-    exact_code_hit = bool(c.get("exact_code_hit")) or any(code and code in normalized_text for code in codes)
+    codes = [
+        _v13_normalize_query(x)
+        for x in _v13_structural_identifier_tokens(q)
+        if _v13_normalize_query(x)
+    ]
+    exact_code_hit = any(code and code in normalized_text for code in codes)
     return {
         "similarity": similarity,
         "overlap": max(0.0, min(1.0, float(overlap or 0.0))),
@@ -17749,11 +17875,7 @@ def _v13_is_identifier_only_request(q: str) -> bool:
     task must pass the shared semantic sufficiency gate.
     """
     codes = _dedup_text_values(
-        [
-            token for token in _extract_code_tokens(q)
-            if any(ch.isdigit() for ch in str(token))
-            or any(sep in str(token) for sep in ("_", "-", "/"))
-        ],
+        _v13_structural_identifier_tokens(q),
         limit=8,
     )
     if not codes:
@@ -17994,6 +18116,1287 @@ def _v13_filter_retrieval_candidates(q: str, retrieval: dict, *, relevant_ids: O
     out["metrics"] = _v13_evidence_metrics(selected)
     out["evidence_gate_selected_ids"] = [str(c.get("citation_id") or "") for c in selected]
     return out
+
+
+# -----------------------------------------------------------------------------
+# Bounded Retrieval Assurance
+# -----------------------------------------------------------------------------
+
+
+_V13_ASSURANCE_DEADLINE_CTX = contextvars.ContextVar("machinemind_v13_assurance_deadline", default=0.0)
+
+
+def _v13_assurance_time_left(deadline_monotonic: float) -> float:
+    return max(0.0, float(deadline_monotonic or 0.0) - time_module.monotonic())
+
+
+def _v13_assurance_deadline(*, mode: str, max_seconds: Optional[float] = None, reserve_final_seconds: Optional[float] = None) -> float:
+    mode_key = str(mode or "ask").strip().lower()
+    configured = (
+        V13_RETRIEVAL_ASSURANCE_MAX_SECONDS_ROOT_CAUSE
+        if mode_key in {"root_cause", "smart_diagnostic"}
+        else V13_RETRIEVAL_ASSURANCE_MAX_SECONDS_ASK
+    )
+    allowed = max(0.5, float(max_seconds if max_seconds is not None else configured))
+    hard_end = time_module.monotonic() + allowed
+    budget = _v13_current_budget()
+    if budget is not None:
+        reserve = (
+            V13_RETRIEVAL_ASSURANCE_RESERVE_FINAL_SECONDS_ROOT_CAUSE
+            if mode_key == "root_cause"
+            else V13_RETRIEVAL_ASSURANCE_RESERVE_FINAL_SECONDS_ASK
+        )
+        if reserve_final_seconds is not None:
+            reserve = max(0.0, float(reserve_final_seconds))
+        hard_end = min(hard_end, float(budget.deadline_monotonic) - reserve)
+    return hard_end
+
+
+def _v13_assurance_phrase(value: Any, *, max_len: int = 180) -> str:
+    text = re.sub(r"\s+", " ", _normalize_unicode_advanced(str(value or ""))).strip(" -–—:;,.\t\n")
+    if len(text) > max_len:
+        text = text[:max_len].rsplit(" ", 1)[0].strip() or text[:max_len]
+    return text
+
+
+def _v13_assurance_identifier_tokens(value: Any) -> list[str]:
+    return _v13_structural_identifier_tokens(value)
+
+
+def _v13_assurance_facets(q: str, retrieval: dict, gate_meta: Optional[dict]) -> list[str]:
+    gate = dict(gate_meta or {})
+    plan = dict((retrieval or {}).get("plan") or {})
+    values: list[Any] = []
+    values.extend(gate.get("required_facets") or [])
+    values.extend(gate.get("missing_information") or [])
+    values.extend(plan.get("required_facets") or [])
+    values.extend(gate.get("exact_terms") or [])
+    values.extend(plan.get("exact_terms") or [])
+    values.extend(_v13_assurance_identifier_tokens(q))
+
+    # Punctuation-delimited clauses are language-independent and preserve compound tasks.
+    # They are used only for coverage measurement, never to create relevance.
+    for clause in re.split(r"[?;:\n]+", str(q or "")):
+        clause = _v13_assurance_phrase(clause, max_len=180)
+        if len(_v13_gate_term_set(clause, limit=40)) >= 2:
+            values.append(clause)
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        facet = _v13_assurance_phrase(raw)
+        if not facet:
+            continue
+        norm = _v13_normalize_query(facet)
+        if not norm or norm in seen:
+            continue
+        meaningful = _v13_gate_term_set(facet, limit=40)
+        has_code_or_number = bool(_extract_code_tokens(facet) or _v13_query_number_tokens(facet))
+        if not meaningful and not has_code_or_number:
+            continue
+        seen.add(norm)
+        out.append(facet)
+        if len(out) >= V13_RETRIEVAL_ASSURANCE_MAX_FACETS:
+            break
+    return out
+
+
+def _v13_assurance_prompt_facets(q: str, gate_meta: Optional[dict]) -> list[str]:
+    """Return only high-confidence facets safe to expose to the final reasoner."""
+    gate = dict(gate_meta or {})
+    values: list[Any] = []
+    if bool(gate.get("semantic_gate_used")):
+        values.extend(gate.get("required_facets") or [])
+        values.extend(gate.get("missing_information") or [])
+    values.extend(_v13_assurance_identifier_tokens(q))
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        facet = _v13_assurance_phrase(value)
+        norm = _v13_normalize_query(facet)
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        out.append(facet)
+        if len(out) >= V13_RETRIEVAL_ASSURANCE_MAX_FACETS:
+            break
+    return out
+
+
+def _v13_assurance_facet_score(facet: str, candidate: dict) -> float:
+    facet_norm = _v13_normalize_query(facet)
+    text = _v13_candidate_text(candidate)
+    text_norm = _v13_normalize_query(text)
+    if not facet_norm or not text_norm:
+        return 0.0
+
+    exact_ids = _v13_assurance_identifier_tokens(facet)
+    numbers = _v13_query_number_tokens(facet)
+    if exact_ids and not all(_v13_normalize_query(code) in text_norm for code in exact_ids):
+        return 0.0
+    if numbers and not all(_v13_normalize_query(number) in text_norm for number in numbers):
+        return 0.0
+
+    if len(facet_norm) >= 4 and facet_norm in text_norm:
+        return 1.0
+
+    facet_terms = _v13_gate_term_set(facet, limit=50)
+    text_terms = _v13_gate_term_set(text, limit=220)
+    if not facet_terms or not text_terms:
+        return 1.0 if exact_ids else 0.0
+
+    if exact_ids:
+        remainder = facet_norm
+        for identifier in exact_ids:
+            remainder = remainder.replace(_v13_normalize_query(identifier), " ")
+        surrounding_terms = _v13_gate_term_set(remainder, limit=40)
+        if not surrounding_terms:
+            return 1.0
+        surrounding_overlap = len(surrounding_terms & text_terms) / max(1, len(surrounding_terms))
+        return max(0.0, min(1.0, float(surrounding_overlap)))
+
+    overlap = len(facet_terms & text_terms) / max(1, len(facet_terms))
+    return max(0.0, min(1.0, float(overlap)))
+
+
+def _v13_assurance_facet_covered(facet: str, score: float) -> bool:
+    exact_ids = _v13_assurance_identifier_tokens(facet)
+    if exact_ids:
+        remainder = _v13_normalize_query(facet)
+        for identifier in exact_ids:
+            remainder = remainder.replace(_v13_normalize_query(identifier), " ")
+        surrounding_terms = _v13_gate_term_set(remainder, limit=40)
+        return float(score or 0.0) >= (0.55 if surrounding_terms else 0.999)
+    term_count = len(_v13_gate_term_set(facet, limit=50))
+    threshold = 0.90 if term_count <= 1 else 0.55
+    return float(score or 0.0) >= threshold
+
+
+def _v13_assurance_coverage(facets: list[str], candidates: list[dict]) -> dict:
+    facets = [str(x or "").strip() for x in (facets or []) if str(x or "").strip()]
+    if not facets:
+        return {"facets": [], "covered": [], "missing": [], "ratio": 1.0, "matches": {}}
+    matches: dict[str, dict] = {}
+    covered: list[str] = []
+    missing: list[str] = []
+    for facet in facets:
+        best_score = 0.0
+        best_id = ""
+        for candidate in candidates or []:
+            if not isinstance(candidate, dict):
+                continue
+            score = _v13_assurance_facet_score(facet, candidate)
+            if score > best_score:
+                best_score = score
+                best_id = str(candidate.get("citation_id") or "")
+        is_covered = _v13_assurance_facet_covered(facet, best_score)
+        matches[facet] = {
+            "covered": bool(is_covered),
+            "score": round(best_score, 4),
+            "citation_id": best_id,
+        }
+        (covered if is_covered else missing).append(facet)
+    return {
+        "facets": facets,
+        "covered": covered,
+        "missing": missing,
+        "ratio": round(len(covered) / max(1, len(facets)), 4),
+        "matches": matches,
+    }
+
+
+def _v13_assurance_fetch_targeted_candidates(
+    *,
+    q: str,
+    company_id: str,
+    machine_id: str,
+    doc_ids: Optional[list[str]],
+    bubble_document_id: Optional[str],
+    ai_scope: str,
+    response_language: str,
+    mode: str,
+    retrieval: dict,
+    gate_meta: dict,
+    deadline_monotonic: float,
+) -> list[dict]:
+    if _v13_assurance_time_left(deadline_monotonic) < 1.0:
+        return []
+
+    plan = _v13_plan_from_evidence_gate(q, gate_meta, dict((retrieval or {}).get("plan") or _v13_fallback_plan(q)))
+    missing = [str(x or "").strip() for x in (gate_meta.get("missing_information") or []) if str(x or "").strip()]
+    dense_queries = _dedup_text_values(
+        list(plan.get("dense_queries") or []) + missing,
+        limit=V13_RETRIEVAL_ASSURANCE_MAX_DENSE_QUERIES,
+    )
+    lexical_queries = _dedup_text_values(
+        list(plan.get("lexical_queries") or []) + list(plan.get("exact_terms") or []) + missing,
+        limit=V13_RETRIEVAL_ASSURANCE_MAX_LEXICAL_QUERIES,
+    )
+
+    candidate_lists: list[list[dict]] = []
+    query_vectors: list[tuple[str, list[float]]] = []
+    if dense_queries and _v13_assurance_time_left(deadline_monotonic) >= 5.5:
+        try:
+            embed_timeout = max(5, min(7, int(_v13_assurance_time_left(deadline_monotonic))))
+            vectors = _openai_embed_texts(dense_queries, timeout=embed_timeout)
+            query_vectors = list(zip(dense_queries, vectors))
+            dense_lists: list[list[dict]] = []
+            candidate_k = 38 if mode in {"root_cause", "smart_diagnostic"} else 28
+            for query_text, vector in query_vectors:
+                if _v13_assurance_time_left(deadline_monotonic) < 0.8:
+                    break
+                _count, rows = _fetch_dense_chunk_candidates(
+                    company_id=company_id,
+                    machine_id=machine_id,
+                    q_vec_lit=_vector_literal(vector),
+                    candidate_k=candidate_k,
+                    doc_ids=doc_ids,
+                    bubble_document_id=bubble_document_id,
+                    debug=False,
+                )
+                dense_lists.append(_raw_rows_to_dense_candidates(rows, query_used=query_text))
+            if dense_lists:
+                candidate_lists.append(_rrf_merge_candidates(dense_lists, k=50))
+        except Exception as exc:
+            print("V13_ASSURANCE_DENSE_FAIL", str(exc)[:500])
+
+    if lexical_queries and _v13_assurance_time_left(deadline_monotonic) >= 0.8:
+        try:
+            prefix = _fts_search_chunks_prefix(
+                company_id=company_id,
+                machine_id=machine_id,
+                texts=lexical_queries,
+                top_k=18,
+                doc_ids=doc_ids,
+                bubble_document_id=bubble_document_id,
+            )
+            for c in prefix:
+                c["fts_v13"] = True
+            candidate_lists.append(prefix)
+        except Exception as exc:
+            print("V13_ASSURANCE_PREFIX_FTS_FAIL", str(exc)[:400])
+
+    if lexical_queries and _v13_assurance_time_left(deadline_monotonic) >= 0.8:
+        try:
+            exact = _fts_search_chunks_multi(
+                company_id=company_id,
+                machine_id=machine_id,
+                queries=lexical_queries,
+                top_k=18,
+                doc_ids=doc_ids,
+                bubble_document_id=bubble_document_id,
+            )
+            for c in exact:
+                c["fts_v13"] = True
+            candidate_lists.append(exact)
+        except Exception as exc:
+            print("V13_ASSURANCE_EXACT_FTS_FAIL", str(exc)[:400])
+
+    if _v13_assurance_time_left(deadline_monotonic) >= 1.0:
+        try:
+            profile = _v13_build_profile_from_plan(q, response_language, plan)
+            pages = _v13_fetch_scored_pages(
+                q=q,
+                profile=profile,
+                company_id=company_id,
+                machine_id=machine_id,
+                doc_ids=doc_ids,
+                bubble_document_id=bubble_document_id,
+                top_pages=12 if mode in {"root_cause", "smart_diagnostic"} else 10,
+            )
+            for c in pages:
+                c["retrieval_assurance_kind"] = "targeted_page_scan"
+            candidate_lists.append(pages)
+        except Exception as exc:
+            print("V13_ASSURANCE_PAGE_SCAN_FAIL", str(exc)[:500])
+
+    if query_vectors and mode == "ask" and ai_scope == "machine_all" and not doc_ids and not bubble_document_id and _v13_assurance_time_left(deadline_monotonic) >= 0.8:
+        try:
+            structured = _v13_fetch_structured_dense_candidates(
+                company_id=company_id,
+                machine_id=machine_id,
+                query_vectors=query_vectors,
+                top_k=16,
+            )
+            candidate_lists.append(structured)
+        except Exception as exc:
+            print("V13_ASSURANCE_STRUCTURED_DENSE_FAIL", str(exc)[:400])
+
+    try:
+        exact_query = " ".join(
+            _dedup_text_values([q] + list(plan.get("exact_terms") or []), limit=18)
+        )
+        identifiers = _v13_exact_identifier_candidates(
+            q=exact_query,
+            company_id=company_id,
+            machine_id=machine_id,
+            doc_ids=doc_ids,
+            bubble_document_id=bubble_document_id,
+        )
+        candidate_lists.append(identifiers)
+    except Exception as exc:
+        print("V13_ASSURANCE_IDENTIFIER_FAIL", str(exc)[:400])
+
+    merged = _v13_merge_candidates(candidate_lists)
+    scored = _v13_score_candidates(q, merged)
+    if mode in {"root_cause", "smart_diagnostic"}:
+        scored = _v13_rescore_root_candidates(q, scored)
+    for c in scored:
+        c["retrieval_assurance_candidate"] = True
+        c.setdefault("retrieval_assurance_kind", "targeted_retrieval")
+    return scored[:V13_RETRIEVAL_ASSURANCE_MAX_CANDIDATES]
+
+
+def _v13_assurance_fetch_neighbor_pages(
+    *,
+    q: str,
+    company_id: str,
+    machine_id: str,
+    candidates: list[dict],
+    retrieval: dict,
+    response_language: str,
+    deadline_monotonic: float,
+) -> list[dict]:
+    if _v13_assurance_time_left(deadline_monotonic) < 0.8:
+        return []
+    docs: dict[str, dict] = {}
+    for c in candidates or []:
+        if not isinstance(c, dict):
+            continue
+        bdid = str(c.get("bubble_document_id") or "").strip()
+        if not bdid or _is_structured_source_key(bdid):
+            continue
+        p_from = _safe_int(c.get("page_from"), 0)
+        p_to = _safe_int(c.get("page_to"), p_from)
+        if p_from <= 0:
+            continue
+        score = float(c.get("v13_score", c.get("retrieval_score", c.get("similarity", 0.0))) or 0.0)
+        row = docs.setdefault(bdid, {"low": p_from, "high": max(p_from, p_to), "score": score, "parents": []})
+        row["low"] = min(int(row["low"]), p_from)
+        row["high"] = max(int(row["high"]), max(p_from, p_to))
+        row["score"] = max(float(row["score"]), score)
+        row["parents"].append(str(c.get("citation_id") or ""))
+    ordered_docs = sorted(docs.items(), key=lambda item: -float(item[1].get("score") or 0.0))[:V13_RETRIEVAL_ASSURANCE_MAX_DOCS]
+    if not ordered_docs:
+        return []
+
+    profile = _v13_build_profile_from_plan(q, response_language, (retrieval or {}).get("plan") or {})
+    out: list[dict] = []
+    conn = None
+    try:
+        conn = _db_conn()
+        with conn.cursor() as cur:
+            for bdid, meta in ordered_docs:
+                if _v13_assurance_time_left(deadline_monotonic) < 0.5:
+                    break
+                low = max(1, int(meta["low"]) - V13_RETRIEVAL_ASSURANCE_PAGE_RADIUS)
+                high = int(meta["high"]) + V13_RETRIEVAL_ASSURANCE_PAGE_RADIUS
+                cur.execute(
+                    """
+                    SELECT machine_id, page_number, LEFT(COALESCE(text, ''), %s)
+                    FROM public.document_pages
+                    WHERE company_id=%s AND bubble_document_id=%s
+                      AND page_number BETWEEN %s AND %s
+                      AND text IS NOT NULL AND length(text) > 20
+                    ORDER BY page_number
+                    LIMIT %s;
+                    """,
+                    (
+                        V13_PAGE_TEXT_CHARS,
+                        company_id,
+                        bdid,
+                        low,
+                        high,
+                        max(3, V13_RETRIEVAL_ASSURANCE_MAX_NEIGHBOR_PAGES),
+                    ),
+                )
+                for mid, page_number, page_text in cur.fetchall():
+                    text = str(page_text or "").strip()
+                    if not text:
+                        continue
+                    page = _safe_int(page_number, 1)
+                    score = float(_ask_evidence_score_text(q, text, profile))
+                    out.append(
+                        {
+                            "citation_id": f"{bdid}:p{page}-{page}:assurance:neighbor",
+                            "bubble_document_id": bdid,
+                            "chunk_index": 0,
+                            "page_from": page,
+                            "page_to": page,
+                            "snippet": text[:ASK_SNIPPET_CHARS],
+                            "snippet_clean": text[:ASK_SNIPPET_CHARS],
+                            "chunk_full": text[:V13_PAGE_TEXT_CHARS],
+                            "similarity": min(0.90, max(0.0, 0.45 + score / 100.0)),
+                            "semantic_similarity": 0.0,
+                            "retrieval_score": score,
+                            "ask_evidence_score": score,
+                            "exact_machine_scope": str(mid or "").strip() == str(machine_id or "").strip(),
+                            "source_type": _source_type_from_document_id(bdid),
+                            "retrieval_assurance_candidate": True,
+                            "retrieval_assurance_kind": "page_neighbor",
+                            "retrieval_assurance_parent_ids": list(meta.get("parents") or []),
+                        }
+                    )
+    except Exception as exc:
+        print("V13_ASSURANCE_NEIGHBOR_FAIL", str(exc)[:500])
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    return _dedup_citations_by_snippet(out, max_items=V13_RETRIEVAL_ASSURANCE_MAX_NEIGHBOR_PAGES)
+
+
+def _v13_assurance_expand_structured_relations(
+    *,
+    company_id: str,
+    machine_id: str,
+    candidates: list[dict],
+    deadline_monotonic: float,
+) -> list[dict]:
+    if _v13_assurance_time_left(deadline_monotonic) < 0.8:
+        return []
+    structured = [dict(c) for c in candidates or [] if isinstance(c, dict) and _is_structured_source_key(str(c.get("bubble_document_id") or ""))]
+    if not structured:
+        return []
+    procedures = [c for c in structured if _v12_evidence_role(c) == "procedure"][:1]
+    steps = [c for c in structured if _v12_evidence_role(c) == "step"]
+    out: list[dict] = []
+
+    for procedure in procedures:
+        if _v13_assurance_time_left(deadline_monotonic) < 0.5:
+            break
+        try:
+            related = _v12_expand_primary_procedure_steps(
+                company_id=company_id,
+                machine_id=machine_id,
+                procedure=procedure,
+                existing_steps=steps,
+            )
+            for c in related:
+                cc = dict(c)
+                cc["retrieval_assurance_candidate"] = True
+                cc["retrieval_assurance_kind"] = "explicit_structured_relation"
+                cc["retrieval_assurance_explicit_relation"] = True
+                cc["evidence_gate_selected"] = True
+                cc["semantic_similarity"] = 0.0
+                out.append(cc)
+        except Exception as exc:
+            print("V13_ASSURANCE_PROCEDURE_STEP_EXPANSION_FAIL", str(exc)[:400])
+
+    # A Step can reveal its parent Procedure only when that relationship is explicitly
+    # present in indexed fields. No title-based guessing is permitted.
+    parent_steps = [c for c in steps if _v12_structured_parent_values(c)]
+    if parent_steps and not procedures and _v13_assurance_time_left(deadline_monotonic) >= 1.0:
+        conn = None
+        try:
+            conn = _db_conn()
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT bubble_document_id, machine_id, page_number,
+                           LEFT(COALESCE(text, ''), %s)
+                    FROM public.document_pages
+                    WHERE company_id=%s
+                      AND bubble_document_id LIKE 'procedure:%%'
+                      AND (machine_id=%s OR machine_id IS NULL OR machine_id='')
+                      AND text IS NOT NULL AND length(text) > 10
+                    ORDER BY CASE WHEN machine_id=%s THEN 0 ELSE 1 END,
+                             bubble_document_id, page_number
+                    LIMIT %s;
+                    """,
+                    (ASK_STRUCTURED_DIRECT_TEXT_CHARS, company_id, machine_id, machine_id, 320),
+                )
+                rows = cur.fetchall()
+            for idx, (bdid, mid, page_number, page_text) in enumerate(rows, start=1):
+                text = str(page_text or "").strip()
+                if not text:
+                    continue
+                page = _safe_int(page_number, 1)
+                procedure = {
+                    "citation_id": f"{bdid}:p{page}-{page}:assurance:procedure:{idx}",
+                    "bubble_document_id": str(bdid),
+                    "chunk_index": 1,
+                    "page_from": page,
+                    "page_to": page,
+                    "snippet": text[:ASK_SNIPPET_CHARS],
+                    "snippet_clean": text[:ASK_SNIPPET_CHARS],
+                    "chunk_full": text,
+                    "similarity": 0.0,
+                    "semantic_similarity": 0.0,
+                    "retrieval_score": 0.0,
+                    "source_type": "procedure",
+                    "evidence_role": "procedure",
+                    "exact_machine_scope": str(mid or "").strip() == str(machine_id or "").strip(),
+                }
+                if any(_v12_step_matches_procedure(step, procedure) is True for step in parent_steps):
+                    procedure["retrieval_assurance_candidate"] = True
+                    procedure["retrieval_assurance_kind"] = "explicit_structured_relation"
+                    procedure["retrieval_assurance_explicit_relation"] = True
+                    procedure["evidence_gate_selected"] = True
+                    out.append(procedure)
+                    related = _v12_expand_primary_procedure_steps(
+                        company_id=company_id,
+                        machine_id=machine_id,
+                        procedure=procedure,
+                        existing_steps=steps,
+                    )
+                    for c in related:
+                        cc = dict(c)
+                        cc["retrieval_assurance_candidate"] = True
+                        cc["retrieval_assurance_kind"] = "explicit_structured_relation"
+                        cc["retrieval_assurance_explicit_relation"] = True
+                        cc["evidence_gate_selected"] = True
+                        cc["semantic_similarity"] = 0.0
+                        out.append(cc)
+                    break
+        except Exception as exc:
+            print("V13_ASSURANCE_STEP_PARENT_EXPANSION_FAIL", str(exc)[:500])
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    return _dedup_citations_preserve_order(out, max_items=V13_RETRIEVAL_ASSURANCE_MAX_CANDIDATES)
+
+
+def _v13_assurance_candidate_admissible(
+    *,
+    q: str,
+    candidate: dict,
+    original_doc_ids: set[str],
+    missing_facets: list[str],
+    mode: str,
+) -> bool:
+    # An explicit Procedure→Step relationship is safe completion context for ASK.
+    # In Root Cause and Smart Diagnostic, relationship alone is not diagnostic evidence:
+    # the related record must independently match the condition/facet/code below.
+    if bool(candidate.get("retrieval_assurance_explicit_relation")) and str(mode or "").strip().lower() == "ask":
+        return True
+    signals = _v13_gate_candidate_signals(q, candidate)
+    similarity = float(signals.get("similarity") or 0.0)
+    overlap = float(signals.get("overlap") or 0.0)
+    candidate_text_norm = _v13_normalize_query(_v13_candidate_text(candidate))
+    if any(
+        _v13_normalize_query(token) in candidate_text_norm
+        for token in _v13_assurance_identifier_tokens(q)
+    ):
+        return True
+    if similarity >= V13_RETRIEVAL_ASSURANCE_MIN_NEW_SEMANTIC_SIM:
+        return True
+    if similarity >= max(0.30, V13_RETRIEVAL_ASSURANCE_MIN_NEW_SEMANTIC_SIM - 0.10) and overlap >= V13_RETRIEVAL_ASSURANCE_MIN_NEW_OVERLAP:
+        return True
+    if overlap >= max(0.14, V13_RETRIEVAL_ASSURANCE_MIN_NEW_OVERLAP * 1.6):
+        return True
+    bdid = str(candidate.get("bubble_document_id") or "")
+    if bdid in original_doc_ids and missing_facets:
+        best_facet = max((_v13_assurance_facet_score(facet, candidate) for facet in missing_facets), default=0.0)
+        if any(_v13_assurance_facet_covered(facet, _v13_assurance_facet_score(facet, candidate)) for facet in missing_facets) and best_facet >= 0.55:
+            return True
+    return False
+
+
+def _v13_assurance_select_evidence(
+    *,
+    q: str,
+    originals: list[dict],
+    additions: list[dict],
+    facets: list[str],
+    limit: int,
+    mode: str,
+) -> list[dict]:
+    """Return a bounded evidence pack without casually displacing admitted evidence.
+
+    The original admitted pack is the baseline. New evidence fills free slots first.
+    When the pack is already full, a new item may replace an old one only if the trial
+    pack covers more requested facets, covers a previously absent exact identifier, or
+    improves true semantic support by the configured minimum. The strongest original
+    citation is never replaced.
+    """
+    limit = max(1, int(limit or 1))
+    original_list = _dedup_citations_preserve_order(
+        [dict(c) for c in (originals or []) if isinstance(c, dict)],
+        max_items=limit,
+    )
+    selected = list(original_list[:limit])
+    original_ids = {str(c.get("citation_id") or "") for c in original_list}
+
+    addition_pool = _v13_score_candidates(
+        q,
+        _dedup_citations_preserve_order(
+            [dict(c) for c in (additions or []) if isinstance(c, dict)],
+            max_items=V13_RETRIEVAL_ASSURANCE_MAX_CANDIDATES,
+        ),
+    )
+    if mode in {"root_cause", "smart_diagnostic"}:
+        addition_pool = _v13_rescore_root_candidates(q, addition_pool)
+
+    query_ids = _dedup_text_values(
+        _v13_assurance_identifier_tokens(q),
+        limit=16,
+    )
+
+    def covered_identifier_count(pack: list[dict]) -> int:
+        if not query_ids:
+            return 0
+        bodies = "\n".join(_v13_normalize_query(_v13_candidate_text(c)) for c in pack)
+        return sum(1 for token in query_ids if _v13_normalize_query(token) in bodies)
+
+    def value(pack: list[dict]) -> tuple[int, int, float, int, float]:
+        coverage = _v13_assurance_coverage(facets, pack)
+        covered_count = len(coverage.get("covered") or [])
+        exact_count = covered_identifier_count(pack)
+        top_semantic = max((_v13_real_semantic_similarity(c) for c in pack), default=0.0)
+        retained_originals = sum(1 for c in pack if str(c.get("citation_id") or "") in original_ids)
+        aggregate = sum(
+            float(c.get("v13_score", c.get("retrieval_score", c.get("similarity", 0.0))) or 0.0)
+            for c in pack
+        )
+        return covered_count, exact_count, top_semantic, retained_originals, aggregate
+
+    current_value = value(selected)
+    missing = set(_v13_assurance_coverage(facets, selected).get("missing") or [])
+
+    def addition_priority(c: dict) -> tuple:
+        facet_gain = sum(
+            1 for facet in missing
+            if _v13_assurance_facet_covered(facet, _v13_assurance_facet_score(facet, c))
+        )
+        relation_bonus = 1 if (
+            str(mode or "").strip().lower() == "ask"
+            and bool(c.get("retrieval_assurance_explicit_relation"))
+        ) else 0
+        exact_bonus = covered_identifier_count([c])
+        return (
+            -facet_gain,
+            -exact_bonus,
+            -relation_bonus,
+            -_v13_real_semantic_similarity(c),
+            -float(c.get("v13_score", c.get("retrieval_score", c.get("similarity", 0.0))) or 0.0),
+        )
+
+    addition_pool.sort(key=addition_priority)
+    seen = {str(c.get("citation_id") or "") for c in selected}
+    for candidate in addition_pool:
+        cid = str(candidate.get("citation_id") or "").strip()
+        if not cid or cid in seen:
+            continue
+
+        if len(selected) < limit:
+            selected.append(dict(candidate))
+            seen.add(cid)
+            current_value = value(selected)
+            missing = set(_v13_assurance_coverage(facets, selected).get("missing") or [])
+            continue
+
+        best_trial: Optional[list[dict]] = None
+        best_value = current_value
+        # Preserve the strongest original at index 0. Prefer replacing weak later items.
+        for idx in range(len(selected) - 1, 0, -1):
+            trial = list(selected)
+            trial[idx] = dict(candidate)
+            trial_value = value(trial)
+            coverage_better = trial_value[0] > current_value[0]
+            exact_better = trial_value[1] > current_value[1]
+            semantic_better = trial_value[2] >= current_value[2] + V13_RETRIEVAL_ASSURANCE_MIN_SUPPORT_GAIN
+            # A Procedure→Step relation may replace an item only for ASK and only when it
+            # completes an uncovered facet; relation alone never displaces evidence.
+            relation_completion = bool(
+                str(mode or "").strip().lower() == "ask"
+                and candidate.get("retrieval_assurance_explicit_relation")
+                and coverage_better
+            )
+            if not (coverage_better or exact_better or semantic_better or relation_completion):
+                continue
+            if trial_value > best_value:
+                best_trial = trial
+                best_value = trial_value
+        if best_trial is not None:
+            selected = best_trial
+            seen = {str(c.get("citation_id") or "") for c in selected}
+            current_value = best_value
+            missing = set(_v13_assurance_coverage(facets, selected).get("missing") or [])
+
+    return selected[:limit]
+
+
+def _v13_should_probe_unsupported_retrieval(
+    *,
+    q: str,
+    signals: dict,
+    narrow_scope: bool,
+) -> bool:
+    """Use a bounded rescue only when retrieval may plausibly be incomplete.
+
+    This is source- and language-agnostic. A greeting/short arbitrary input has too few
+    meaningful terms and no identifier, so it fails closed. An explicit document scope,
+    a technical identifier, or a weak non-zero corpus signal may justify a small DB/FTS
+    rescue before the semantic gate.
+    """
+    meaningful = int((signals or {}).get("query_meaningful_term_count") or 0)
+    if meaningful <= 0:
+        return False
+    identifiers = _dedup_text_values(
+        _v13_assurance_identifier_tokens(q),
+        limit=12,
+    )
+    if narrow_scope:
+        return True
+    if identifiers:
+        return True
+    top_similarity = float((signals or {}).get("top_similarity") or 0.0)
+    top_overlap = float((signals or {}).get("top_overlap") or 0.0)
+    fts_hits = int((signals or {}).get("fts_overlap_count") or 0)
+    # Long/compound requests are probed only when the first pass found at least a weak
+    # corpus signal. This avoids scanning the machine corpus for unrelated prose.
+    return bool(
+        meaningful >= 4
+        and (top_similarity >= 0.08 or top_overlap > 0.0 or fts_hits > 0)
+    )
+
+
+def _v13_pre_admission_retrieval_assurance(
+    *,
+    q: str,
+    company_id: str,
+    machine_id: str,
+    doc_ids: Optional[list[str]],
+    bubble_document_id: Optional[str],
+    ai_scope: str,
+    response_language: str,
+    mode: str,
+    narrow_scope: bool,
+    retrieval: dict,
+    signals: dict,
+) -> tuple[dict, dict]:
+    """Try a short deterministic rescue; recovered evidence still requires LLM gating."""
+    original = dict(retrieval or {})
+    meta = {
+        "enabled": bool(V13_RETRIEVAL_ASSURANCE_ENABLED),
+        "attempted": False,
+        "adopted": False,
+        "reason": "not_eligible",
+        "phase": "pre_admission",
+        "llm_calls_added": 0,
+    }
+    if not V13_RETRIEVAL_ASSURANCE_ENABLED or not _v13_should_probe_unsupported_retrieval(
+        q=q, signals=signals, narrow_scope=narrow_scope
+    ):
+        return original, meta
+
+    deadline = _v13_assurance_deadline(
+        mode=mode,
+        max_seconds=V13_RETRIEVAL_ASSURANCE_PRE_GATE_MAX_SECONDS,
+    )
+    if _v13_assurance_time_left(deadline) < 0.8:
+        meta["reason"] = "insufficient_time"
+        return original, meta
+
+    meta["attempted"] = True
+    started = time_module.monotonic()
+    token = _V13_ASSURANCE_DEADLINE_CTX.set(deadline)
+    try:
+        plan = dict(original.get("plan") or _v13_fallback_plan(q))
+        seed_gate = {
+            "dense_queries": list(plan.get("dense_queries") or []),
+            "lexical_queries": list(plan.get("lexical_queries") or []),
+            "exact_terms": list(plan.get("exact_terms") or [])
+                + _extract_code_tokens(q)
+                + _v13_assurance_identifier_tokens(q),
+            "required_facets": list(plan.get("required_facets") or []),
+            "missing_information": list(plan.get("required_facets") or []),
+        }
+        additions = _v13_assurance_fetch_targeted_candidates(
+            q=q,
+            company_id=company_id,
+            machine_id=machine_id,
+            doc_ids=doc_ids,
+            bubble_document_id=bubble_document_id,
+            ai_scope=ai_scope,
+            response_language=response_language,
+            mode=mode,
+            retrieval=original,
+            gate_meta=seed_gate,
+            deadline_monotonic=deadline,
+        )
+        # In an explicit document scope, nearby pages may contain a continuation even
+        # when the matched chunk itself was too weak to pass the gate.
+        if narrow_scope and _v13_assurance_time_left(deadline) >= 0.8:
+            additions.extend(
+                _v13_assurance_fetch_neighbor_pages(
+                    q=q,
+                    company_id=company_id,
+                    machine_id=machine_id,
+                    candidates=list(original.get("candidates") or []),
+                    retrieval=original,
+                    response_language=response_language,
+                    deadline_monotonic=deadline,
+                )
+            )
+    except Exception as exc:
+        print("V13_PRE_ADMISSION_ASSURANCE_FAIL", mode, str(exc)[:500])
+        meta.update({"reason": "rescue_failed", "elapsed_seconds": round(time_module.monotonic() - started, 3)})
+        return original, meta
+    finally:
+        _V13_ASSURANCE_DEADLINE_CTX.reset(token)
+
+    additions = _v13_merge_candidates([additions])[:V13_RETRIEVAL_ASSURANCE_MAX_CANDIDATES]
+    original_candidates = [dict(c) for c in (original.get("candidates") or []) if isinstance(c, dict)]
+    original_doc_ids = {
+        str(c.get("bubble_document_id") or "")
+        for c in original_candidates
+        if str(c.get("bubble_document_id") or "")
+    }
+    facets = _v13_assurance_facets(q, original, seed_gate)
+    valid_new: list[dict] = []
+    original_ids = {str(c.get("citation_id") or "") for c in original_candidates}
+    for candidate in additions:
+        cid = str(candidate.get("citation_id") or "").strip()
+        if not cid or cid in original_ids:
+            continue
+        if _v13_assurance_candidate_admissible(
+            q=q,
+            candidate=candidate,
+            original_doc_ids=original_doc_ids,
+            missing_facets=facets,
+            mode=mode,
+        ):
+            cc = dict(candidate)
+            cc["retrieval_assurance_candidate"] = True
+            valid_new.append(cc)
+
+    meta["new_candidates_considered"] = len(additions)
+    meta["new_candidates_admitted"] = len(valid_new)
+    if not valid_new:
+        meta.update({"reason": "no_strictly_admissible_rescue", "elapsed_seconds": round(time_module.monotonic() - started, 3)})
+        return original, meta
+
+    merged = _v13_merge_candidates([original_candidates, valid_new])
+    merged = _v13_score_candidates(q, merged)
+    if mode in {"root_cause", "smart_diagnostic"}:
+        merged = _v13_rescore_root_candidates(q, merged)
+    post_state, post_signals = _v13_deterministic_evidence_state(
+        q, merged, mode=mode, narrow_scope=narrow_scope
+    )
+    before_top = float((signals or {}).get("top_similarity") or 0.0)
+    after_top = float((post_signals or {}).get("top_similarity") or 0.0)
+    after_overlap = float((post_signals or {}).get("top_overlap") or 0.0)
+    exact_after = int((post_signals or {}).get("exact_code_count") or 0)
+    objective_signal = bool(
+        exact_after > int((signals or {}).get("exact_code_count") or 0)
+        or after_top >= before_top + 0.04
+        or after_overlap >= 0.05
+        or (narrow_scope and after_overlap > 0.0)
+    )
+    if post_state == "unsupported" or not objective_signal:
+        meta.update({
+            "reason": "rescue_did_not_cross_uncertainty_band",
+            "post_state": post_state,
+            "post_top_similarity": round(after_top, 6),
+            "post_top_overlap": round(after_overlap, 6),
+            "elapsed_seconds": round(time_module.monotonic() - started, 3),
+        })
+        return original, meta
+
+    limit = V13_MAX_EVIDENCE_ITEMS_ROOT_CAUSE if mode in {"root_cause", "smart_diagnostic"} else V13_MAX_EVIDENCE_ITEMS_ASK
+    recovered = dict(original)
+    recovered["candidates"] = merged[:V13_RETRIEVAL_ASSURANCE_MAX_CANDIDATES]
+    recovered["citations"] = merged[:limit]
+    recovered["metrics"] = _v13_evidence_metrics(merged)
+    meta.update({
+        "adopted": True,
+        "reason": "recovered_evidence_requires_semantic_gate",
+        "post_state": post_state,
+        "post_top_similarity": round(after_top, 6),
+        "post_top_overlap": round(after_overlap, 6),
+        "elapsed_seconds": round(time_module.monotonic() - started, 3),
+    })
+    recovered["pre_admission_assurance"] = dict(meta)
+    return recovered, meta
+
+
+def _v13_should_run_retrieval_assurance(
+    *,
+    q: str,
+    mode: str,
+    retrieval: dict,
+    gate_meta: dict,
+    narrow_scope: bool,
+    facets: list[str],
+    before_coverage: dict,
+    deadline_monotonic: float,
+) -> bool:
+    if not V13_RETRIEVAL_ASSURANCE_ENABLED:
+        return False
+    if not (retrieval or {}).get("citations") and not (retrieval or {}).get("candidates"):
+        return False
+    if _v13_assurance_time_left(deadline_monotonic) < 0.8:
+        return False
+    if bool(gate_meta.get("refinement_used")):
+        return True
+    semantic_gate_used = bool(gate_meta.get("semantic_gate_used"))
+    coverage_ratio = float(before_coverage.get("ratio") or 0.0)
+    if semantic_gate_used and (
+        gate_meta.get("missing_information") or coverage_ratio < 0.999
+    ):
+        return True
+    if narrow_scope and facets and coverage_ratio < 0.85:
+        return True
+    # Clear one-pass ASK requests remain fast. Without a semantic gate, assurance is
+    # reserved for genuinely compound tasks or uncovered exact identifiers.
+    exact_facets = [
+        f for f in facets
+        if _extract_code_tokens(f) or _v13_assurance_identifier_tokens(f) or _v13_query_number_tokens(f)
+    ]
+    if exact_facets and any(f in (before_coverage.get("missing") or []) for f in exact_facets):
+        return True
+    if (
+        not semantic_gate_used
+        and _count_query_tokens(q) >= 12
+        and len(facets) >= 4
+        and coverage_ratio < 0.60
+    ):
+        return True
+    if semantic_gate_used and mode in {"root_cause", "smart_diagnostic"} and len((retrieval or {}).get("citations") or []) < 3:
+        return True
+    return False
+
+
+def _v13_apply_retrieval_assurance(
+    *,
+    q: str,
+    company_id: str,
+    machine_id: str,
+    doc_ids: Optional[list[str]],
+    bubble_document_id: Optional[str],
+    ai_scope: str,
+    response_language: str,
+    mode: str,
+    narrow_scope: bool,
+    retrieval: dict,
+    gate_meta: Optional[dict],
+    max_seconds: Optional[float] = None,
+    reserve_final_seconds: Optional[float] = None,
+) -> tuple[dict, dict]:
+    deadline = _v13_assurance_deadline(
+        mode=mode,
+        max_seconds=max_seconds,
+        reserve_final_seconds=reserve_final_seconds,
+    )
+    token = _V13_ASSURANCE_DEADLINE_CTX.set(deadline)
+    try:
+        return _v13_apply_retrieval_assurance_core(
+            q=q,
+            company_id=company_id,
+            machine_id=machine_id,
+            doc_ids=doc_ids,
+            bubble_document_id=bubble_document_id,
+            ai_scope=ai_scope,
+            response_language=response_language,
+            mode=mode,
+            narrow_scope=narrow_scope,
+            retrieval=retrieval,
+            gate_meta=gate_meta,
+            max_seconds=max_seconds,
+            reserve_final_seconds=reserve_final_seconds,
+            _deadline_override=deadline,
+        )
+    finally:
+        _V13_ASSURANCE_DEADLINE_CTX.reset(token)
+
+
+def _v13_apply_retrieval_assurance_core(
+    *,
+    q: str,
+    company_id: str,
+    machine_id: str,
+    doc_ids: Optional[list[str]],
+    bubble_document_id: Optional[str],
+    ai_scope: str,
+    response_language: str,
+    mode: str,
+    narrow_scope: bool,
+    retrieval: dict,
+    gate_meta: Optional[dict],
+    max_seconds: Optional[float] = None,
+    reserve_final_seconds: Optional[float] = None,
+    _deadline_override: Optional[float] = None,
+) -> tuple[dict, dict]:
+    original = dict(retrieval or {})
+    original_candidates = [dict(c) for c in (original.get("candidates") or []) if isinstance(c, dict)]
+    original_citations = [dict(c) for c in (original.get("citations") or original_candidates) if isinstance(c, dict)]
+    gate = dict(gate_meta or {})
+    facets = _v13_assurance_facets(q, original, gate)
+    prompt_facets = _v13_assurance_prompt_facets(q, gate)
+    before = _v13_assurance_coverage(facets, original_citations)
+    before_prompt = _v13_assurance_coverage(prompt_facets, original_citations)
+    deadline = float(
+        _deadline_override
+        or _v13_assurance_deadline(
+            mode=mode,
+            max_seconds=max_seconds,
+            reserve_final_seconds=reserve_final_seconds,
+        )
+    )
+    pre_assurance_meta = dict(
+        original.get("pre_admission_assurance")
+        or gate.get("pre_admission_assurance")
+        or {}
+    )
+    meta = {
+        "enabled": bool(V13_RETRIEVAL_ASSURANCE_ENABLED),
+        "pre_admission": pre_assurance_meta,
+        "attempted": False,
+        "adopted": False,
+        "reason": "not_needed",
+        "max_seconds": round(max(0.0, _v13_assurance_time_left(deadline)), 3),
+        "facets": facets,
+        "prompt_facets": prompt_facets,
+        "before_prompt_covered_facets": list(before_prompt.get("covered") or []),
+        "before_prompt_missing_facets": list(before_prompt.get("missing") or []),
+        "before_coverage_ratio": float(before.get("ratio") or 0.0),
+        "before_covered_facets": list(before.get("covered") or []),
+        "before_missing_facets": list(before.get("missing") or []),
+        "new_candidates_considered": 0,
+        "new_candidates_admitted": 0,
+        "coverage_gain": 0,
+        "support_gain": 0.0,
+        "explicit_relation_gain": 0,
+    }
+    if not _v13_should_run_retrieval_assurance(
+        q=q,
+        mode=mode,
+        retrieval=original,
+        gate_meta=gate,
+        narrow_scope=narrow_scope,
+        facets=facets,
+        before_coverage=before,
+        deadline_monotonic=deadline,
+    ):
+        original["retrieval_assurance"] = meta
+        budget = _v13_current_budget()
+        if budget is not None:
+            budget.retrieval_assurance = dict(meta)
+        return original, meta
+
+    meta["attempted"] = True
+    started = time_module.monotonic()
+    additions: list[dict] = []
+
+    # The semantic gate already supplied faithful rewrites. Use them only when the
+    # first pass remained incomplete and the resolver has not already performed its
+    # full refined retrieval.
+    if (
+        not bool(gate.get("refinement_used"))
+        and (gate.get("missing_information") or before.get("missing"))
+        and _v13_assurance_time_left(deadline) >= 1.0
+    ):
+        targeted_gate = dict(gate)
+        if not bool(targeted_gate.get("semantic_gate_used")):
+            # No extra planner call: derive bounded searches only from the original
+            # request and objectively uncovered facets.
+            uncovered = list(before.get("missing") or [])
+            targeted_gate.update(
+                {
+                    "dense_queries": _dedup_text_values([q] + uncovered, limit=V13_RETRIEVAL_ASSURANCE_MAX_DENSE_QUERIES),
+                    "lexical_queries": _dedup_text_values([q] + uncovered, limit=V13_RETRIEVAL_ASSURANCE_MAX_LEXICAL_QUERIES),
+                    "exact_terms": _dedup_text_values(
+                        list(targeted_gate.get("exact_terms") or [])
+                        + _extract_code_tokens(q)
+                        + _v13_assurance_identifier_tokens(q),
+                        limit=16,
+                    ),
+                    "required_facets": _dedup_text_values(
+                        list(targeted_gate.get("required_facets") or []) + uncovered,
+                        limit=V13_RETRIEVAL_ASSURANCE_MAX_FACETS,
+                    ),
+                    "missing_information": uncovered,
+                }
+            )
+        additions.extend(
+            _v13_assurance_fetch_targeted_candidates(
+                q=q,
+                company_id=company_id,
+                machine_id=machine_id,
+                doc_ids=doc_ids,
+                bubble_document_id=bubble_document_id,
+                ai_scope=ai_scope,
+                response_language=response_language,
+                mode=mode,
+                retrieval=original,
+                gate_meta=targeted_gate,
+                deadline_monotonic=deadline,
+            )
+        )
+
+    if _v13_assurance_time_left(deadline) >= 0.8:
+        additions.extend(
+            _v13_assurance_fetch_neighbor_pages(
+                q=q,
+                company_id=company_id,
+                machine_id=machine_id,
+                candidates=original_citations,
+                retrieval=original,
+                response_language=response_language,
+                deadline_monotonic=deadline,
+            )
+        )
+
+    if _v13_assurance_time_left(deadline) >= 0.8:
+        additions.extend(
+            _v13_assurance_expand_structured_relations(
+                company_id=company_id,
+                machine_id=machine_id,
+                candidates=original_citations,
+                deadline_monotonic=deadline,
+            )
+        )
+
+    additions = _v13_merge_candidates([additions])[:V13_RETRIEVAL_ASSURANCE_MAX_CANDIDATES]
+    meta["new_candidates_considered"] = len(additions)
+    original_ids = {str(c.get("citation_id") or "") for c in original_candidates}
+    original_doc_ids = {str(c.get("bubble_document_id") or "") for c in original_citations if str(c.get("bubble_document_id") or "")}
+    missing_facets = list(before.get("missing") or [])
+    valid_new: list[dict] = []
+    for candidate in additions:
+        cid = str(candidate.get("citation_id") or "")
+        if not cid or cid in original_ids:
+            continue
+        if _v13_assurance_candidate_admissible(
+            q=q,
+            candidate=candidate,
+            original_doc_ids=original_doc_ids,
+            missing_facets=missing_facets,
+            mode=mode,
+        ):
+            cc = dict(candidate)
+            cc["evidence_gate_selected"] = True
+            cc["retrieval_assurance_selected"] = True
+            valid_new.append(cc)
+    meta["new_candidates_admitted"] = len(valid_new)
+
+    if not valid_new:
+        meta["reason"] = "no_strictly_admissible_addition"
+        meta["elapsed_seconds"] = round(time_module.monotonic() - started, 3)
+        original["retrieval_assurance"] = meta
+        budget = _v13_current_budget()
+        if budget is not None:
+            budget.retrieval_assurance = dict(meta)
+        return original, meta
+
+    merged = _v13_merge_candidates([original_candidates, valid_new])
+    merged = _v13_score_candidates(q, merged)
+    if mode in {"root_cause", "smart_diagnostic"}:
+        merged = _v13_rescore_root_candidates(q, merged)
+    limit = V13_MAX_EVIDENCE_ITEMS_ROOT_CAUSE if mode in {"root_cause", "smart_diagnostic"} else V13_MAX_EVIDENCE_ITEMS_ASK
+    selected = _v13_assurance_select_evidence(
+        q=q,
+        originals=original_citations,
+        additions=valid_new,
+        facets=facets,
+        limit=limit,
+        mode=mode,
+    )
+    after = _v13_assurance_coverage(facets, selected)
+    after_prompt = _v13_assurance_coverage(prompt_facets, selected)
+    coverage_gain = len(after.get("covered") or []) - len(before.get("covered") or [])
+    before_top = max((_v13_real_semantic_similarity(c) for c in original_citations), default=0.0)
+    after_top = max((_v13_real_semantic_similarity(c) for c in selected), default=0.0)
+    support_gain = max(0.0, after_top - before_top)
+    selected_ids = {str(c.get("citation_id") or "") for c in selected}
+    selected_new = [c for c in valid_new if str(c.get("citation_id") or "") in selected_ids]
+    explicit_relation_gain = sum(
+        1 for c in selected_new
+        if str(mode or "").strip().lower() == "ask"
+        and bool(c.get("retrieval_assurance_explicit_relation"))
+    )
+    assurance_ids = _dedup_text_values(
+        _v13_assurance_identifier_tokens(q),
+        limit=16,
+    )
+    original_text = "\n".join(_v13_normalize_query(_v13_candidate_text(c)) for c in original_citations)
+    selected_new_text = "\n".join(_v13_normalize_query(_v13_candidate_text(c)) for c in selected_new)
+    exact_gain = any(
+        _v13_normalize_query(token) not in original_text
+        and _v13_normalize_query(token) in selected_new_text
+        for token in assurance_ids
+    )
+
+    meta.update(
+        {
+            "after_coverage_ratio": float(after.get("ratio") or 0.0),
+            "after_covered_facets": list(after.get("covered") or []),
+            "after_missing_facets": list(after.get("missing") or []),
+            "after_prompt_covered_facets": list(after_prompt.get("covered") or []),
+            "after_prompt_missing_facets": list(after_prompt.get("missing") or []),
+            "coverage_gain": int(coverage_gain),
+            "support_gain": round(float(support_gain), 4),
+            "explicit_relation_gain": int(explicit_relation_gain),
+            "exact_identifier_gain": bool(exact_gain),
+            "elapsed_seconds": round(time_module.monotonic() - started, 3),
+        }
+    )
+
+    improved = bool(
+        coverage_gain >= V13_RETRIEVAL_ASSURANCE_MIN_FACET_GAIN
+        or float(after.get("ratio") or 0.0) >= float(before.get("ratio") or 0.0) + V13_RETRIEVAL_ASSURANCE_MIN_COVERAGE_GAIN
+        or support_gain >= V13_RETRIEVAL_ASSURANCE_MIN_SUPPORT_GAIN
+        or explicit_relation_gain > 0
+        or exact_gain
+    )
+    if not improved:
+        meta["reason"] = "candidate_pack_not_objectively_better"
+        original["retrieval_assurance"] = meta
+        budget = _v13_current_budget()
+        if budget is not None:
+            budget.retrieval_assurance = dict(meta)
+        return original, meta
+
+    enhanced = dict(original)
+    enhanced["candidates"] = merged[:V13_RETRIEVAL_ASSURANCE_MAX_CANDIDATES]
+    enhanced["citations"] = selected
+    enhanced["metrics"] = _v13_evidence_metrics(merged)
+    enhanced["retrieval_assurance"] = {**meta, "adopted": True, "reason": "objective_evidence_gain"}
+    for c in enhanced["citations"]:
+        c["evidence_gate_selected"] = True
+    meta = dict(enhanced["retrieval_assurance"])
+    budget = _v13_current_budget()
+    if budget is not None:
+        budget.retrieval_assurance = dict(meta)
+    return enhanced, meta
+
+
+def _v13_assurance_prompt_block(retrieval: dict) -> str:
+    meta = dict((retrieval or {}).get("retrieval_assurance") or {})
+    facets = [str(x or "").strip() for x in (meta.get("prompt_facets") or []) if str(x or "").strip()]
+    covered = [
+        str(x or "").strip()
+        for x in (
+            meta.get("after_prompt_covered_facets")
+            or meta.get("before_prompt_covered_facets")
+            or []
+        )
+        if str(x or "").strip()
+    ]
+    missing = [
+        str(x or "").strip()
+        for x in (
+            meta.get("after_prompt_missing_facets")
+            or meta.get("before_prompt_missing_facets")
+            or []
+        )
+        if str(x or "").strip()
+    ]
+    if not facets or not bool(meta.get("attempted")):
+        return ""
+    return (
+        "RETRIEVAL_ASSURANCE:\n"
+        f"covered_required_facets={json.dumps(covered[:10], ensure_ascii=False)}\n"
+        f"still_missing_required_facets={json.dumps(missing[:8], ensure_ascii=False)}\n"
+        "Use the supplied sources for covered facets. If a required facet is still missing, state that it is not documented in the admitted evidence instead of inferring it."
+    )
 
 
 def _v13_no_sources_for_insufficient_evidence(*, q: str, response_language: str, mode: str, top_k: int, similarity_max: Optional[float]) -> dict:
@@ -19027,14 +20430,60 @@ def _v13_resolve_evidence_support(
     budget = _v13_current_budget()
     candidates = list((initial_retrieval or {}).get("candidates") or [])
     state, initial_signals = _v13_deterministic_evidence_state(q, candidates, mode=mode, narrow_scope=narrow_scope)
+    initial_plan = dict((initial_retrieval or {}).get("plan") or _v13_fallback_plan(q))
     gate_meta = {
         "initial_state": state, "semantic_gate_used": False, "refinement_used": False,
         "decision": "unsupported", "reason_code": "evidence_irrelevant",
         "confidence": 1.0 if state != "borderline" else 0.0,
         "initial_top_similarity": round(float(initial_signals.get("top_similarity") or 0.0), 6),
         "initial_top_overlap": round(float(initial_signals.get("top_overlap") or 0.0), 6),
+        "dense_queries": list(initial_plan.get("dense_queries") or []),
+        "lexical_queries": list(initial_plan.get("lexical_queries") or []),
+        "exact_terms": list(initial_plan.get("exact_terms") or []),
+        "required_facets": list(initial_plan.get("required_facets") or []),
+        "missing_information": [],
+        "relevant_evidence_ids": [],
     }
-    if state == "supported" and mode == "ask":
+    force_semantic_gate = False
+    if state == "unsupported":
+        recovered, pre_meta = _v13_pre_admission_retrieval_assurance(
+            q=q,
+            company_id=company_id,
+            machine_id=machine_id,
+            doc_ids=doc_ids,
+            bubble_document_id=bubble_document_id,
+            ai_scope=ai_scope,
+            response_language=response_language,
+            mode=mode,
+            narrow_scope=narrow_scope,
+            retrieval=initial_retrieval,
+            signals=initial_signals,
+        )
+        gate_meta["pre_admission_assurance"] = dict(pre_meta or {})
+        if bool((pre_meta or {}).get("adopted")):
+            initial_retrieval = recovered
+            candidates = list((recovered or {}).get("candidates") or [])
+            state, rescued_signals = _v13_deterministic_evidence_state(
+                q, candidates, mode=mode, narrow_scope=narrow_scope
+            )
+            gate_meta.update(
+                {
+                    "post_pre_assurance_state": state,
+                    "post_pre_assurance_top_similarity": round(float(rescued_signals.get("top_similarity") or 0.0), 6),
+                    "post_pre_assurance_top_overlap": round(float(rescued_signals.get("top_overlap") or 0.0), 6),
+                }
+            )
+            # Deterministic rescue only recovered candidates; it never grants permission
+            # to answer. A semantic gate is mandatory before synthesis.
+            force_semantic_gate = True
+            if budget is not None:
+                budget.retrieval_assurance = {"pre_admission": dict(pre_meta or {})}
+        else:
+            if budget is not None:
+                budget.evidence_gate = dict(gate_meta)
+            return False, dict(initial_retrieval or {}), gate_meta
+
+    if state == "supported" and mode == "ask" and not force_semantic_gate:
         admitted = _v13_filter_retrieval_candidates(q, initial_retrieval, mode=mode)
         gate_meta.update({"decision": "supported", "reason_code": "evidence_sufficient", "confidence": 1.0, "selected_count": len(admitted.get("citations") or [])})
         if budget is not None:
@@ -19045,10 +20494,6 @@ def _v13_resolve_evidence_support(
         # abnormal condition suitable for causal analysis. Root Cause therefore always
         # buys one semantic mode-fit gate before its single synthesis call.
         gate_meta["deterministic_support_requires_semantic_mode_fit"] = True
-    if state == "unsupported":
-        if budget is not None:
-            budget.evidence_gate = dict(gate_meta)
-        return False, dict(initial_retrieval or {}), gate_meta
     try:
         semantic = _v13_semantic_evidence_gate(
             q=q, mode=mode, response_language=response_language, company_id=company_id,
@@ -19067,6 +20512,12 @@ def _v13_resolve_evidence_support(
         "confidence": round(float(semantic.get("confidence") or 0.0), 4),
         "model": str(semantic.get("model") or V13_EVIDENCE_GATE_MODEL),
         "relevant_evidence_count": len(semantic.get("relevant_evidence_ids") or []),
+        "relevant_evidence_ids": list(semantic.get("relevant_evidence_ids") or []),
+        "dense_queries": list(semantic.get("dense_queries") or []),
+        "lexical_queries": list(semantic.get("lexical_queries") or []),
+        "exact_terms": list(semantic.get("exact_terms") or []),
+        "required_facets": list(semantic.get("required_facets") or []),
+        "missing_information": list(semantic.get("missing_information") or []),
     })
     if decision == "supported":
         admitted = _v13_filter_retrieval_candidates(q, initial_retrieval, relevant_ids=list(semantic.get("relevant_evidence_ids") or []), mode=mode)
@@ -19293,6 +20744,7 @@ def _v13_structured_ask(
     top_k: int,
     planner: dict,
     seed_citations: Optional[list[dict]] = None,
+    assurance_meta: Optional[dict] = None,
     debug: bool,
 ) -> Optional[dict]:
     structured_types = {"procedure", "step", "ps", "md_photo", "md_video"}
@@ -19354,9 +20806,11 @@ def _v13_structured_ask(
         "For P&S records, report problem, solution and notes. For photo/video records, use title/description metadata only and never claim visual or audio inspection. "
         "Every visible point must be grounded in citation_ids from SOURCES. Do not expose raw ids in text. Reply in the requested language."
     )
+    assurance_block = _v13_assurance_prompt_block({"retrieval_assurance": dict(assurance_meta or {})})
     user_msg = (
         f"QUESTION:\n{q}\n\nRESPONSE_LANGUAGE: {response_language}\n\nSOURCES:\n{sources_block}\n\n"
-        "Return JSON only. Answer from the selected structured procedure/steps first, then add a brief directly applicable manual support or safety note when present."
+        + (f"{assurance_block}\n\n" if assurance_block else "")
+        + "Return JSON only. Answer from the selected structured procedure/steps first, then add a brief directly applicable manual support or safety note when present."
     )
 
     model = V13_FAST_MODEL
@@ -19592,9 +21046,11 @@ def _v13_generate_ask_response(
         "For photo/video records, use metadata only and never claim visual/audio inspection. Do not expose citation ids or internal Bubble ids in visible text. "
         "If SOURCES do not support the answer, return no_sources. Reply in the requested language."
     )
+    assurance_block = _v13_assurance_prompt_block(retrieval)
     user_msg = (
         f"QUESTION:\n{q}\n\nRESPONSE_LANGUAGE: {response_language}\n\nSOURCES:\n{sources_block}\n\n"
-        "Return JSON only. Produce a concise but operationally complete answer, with every point supported by citation_ids from SOURCES."
+        + (f"{assurance_block}\n\n" if assurance_block else "")
+        + "Return JSON only. Produce a concise but operationally complete answer, with every point supported by citation_ids from SOURCES."
     )
 
     parsed: dict = {}
@@ -19829,9 +21285,11 @@ def _v13_generate_root_cause_response(
         "For signals, interlocks, cam windows, PLC/HMI states or automatic-cycle conditions, prioritize checks that discriminate sensor/input state, logic/consent, configuration/timing and physical mechanism only when supported by SOURCES. "
         "Every cause must cite valid citation_ids from SOURCES. Reply in the requested language."
     )
+    assurance_block = _v13_assurance_prompt_block(retrieval)
     user_msg = (
         f"SYMPTOM:\n{q}\n\nRESPONSE_LANGUAGE: {response_language}\n\nSOURCES:\n{sources_block}\n\n"
-        f"Return JSON only with at most {max_causes} ranked causes and practical discriminating checks."
+        + (f"{assurance_block}\n\n" if assurance_block else "")
+        + f"Return JSON only with at most {max_causes} ranked causes and practical discriminating checks."
     )
 
     parsed: dict = {}
@@ -20009,6 +21467,7 @@ def _v13_attach_runtime_meta(response: dict, budget: _V13RequestBudget, *, debug
     meta["v13_semantic_cache"] = budget.semantic_cache
     if budget.evidence_gate:
         meta["v13_evidence_gate"] = {key: value for key, value in budget.evidence_gate.items() if key != "gate_error"}
+    meta["v13_retrieval_assurance"] = dict(budget.retrieval_assurance or {})
     meta["v13_elapsed_seconds"] = runtime_meta["elapsed_seconds"]
     meta["v13_llm_calls"] = runtime_meta["llm_calls"]
     meta["v13_estimated_cost_usd"] = runtime_meta["estimated_cost_usd"]
@@ -20170,12 +21629,21 @@ def _ask_v13_sync(
             )
             return _v13_attach_runtime_meta(final, budget, debug=bool(payload.debug))
 
+        retrieval, _assurance_meta = _v13_apply_retrieval_assurance(
+            q=q, company_id=company_id, machine_id=machine_id, doc_ids=doc_ids,
+            bubble_document_id=bubble_document_id, ai_scope=ai_scope,
+            response_language=response_language, mode="ask", narrow_scope=narrow_scope,
+            retrieval=retrieval, gate_meta=_gate_meta,
+        )
+
         if ai_scope == "machine_all" and not narrow_scope and _v13_should_use_structured_path(q, retrieval):
             structured_response = _v13_structured_ask(
                 q=q, company_id=company_id, machine_id=machine_id,
                 response_language=response_language, top_k=top_k,
                 planner=retrieval.get("plan") or fallback_plan,
-                seed_citations=retrieval.get("candidates") or [], debug=bool(payload.debug),
+                seed_citations=retrieval.get("candidates") or [],
+                assurance_meta=retrieval.get("retrieval_assurance") or {},
+                debug=bool(payload.debug),
             )
             if structured_response and structured_response.get("ok") is True:
                 budget.route = "structured_gate_refined_single_synthesis" if budget.refinement_used else "structured_gate_single_synthesis"
@@ -20350,6 +21818,12 @@ def _root_cause_v13_sync(
                 similarity_max=metrics.get("top_similarity"),
             )
         else:
+            retrieval, _assurance_meta = _v13_apply_retrieval_assurance(
+                q=q, company_id=company_id, machine_id=machine_id, doc_ids=doc_ids,
+                bubble_document_id=bubble_document_id, ai_scope=ai_scope,
+                response_language=response_language, mode="root_cause", narrow_scope=narrow_scope,
+                retrieval=retrieval, gate_meta=_gate_meta,
+            )
             model, _effort, _reasoning_mode = _v13_root_cause_model(q, retrieval)
             budget.route = "root_gate_precise_single_synthesis" if model == V13_FAST_MODEL else "root_gate_complex_single_reasoner"
             final = _v13_generate_root_cause_response(
@@ -20943,6 +22417,10 @@ SMART_DIAGNOSTIC_EVIDENCE_GATE_TIMEOUT = int(
 SMART_DIAGNOSTIC_EVIDENCE_GATE_MIN_CONFIDENCE = float(
     os.environ.get("MM_SMART_DIAGNOSTIC_EVIDENCE_GATE_MIN_CONFIDENCE", "0.60")
 )
+SMART_DIAGNOSTIC_RETRIEVAL_ASSURANCE_ENABLED = (os.environ.get("MM_SMART_DIAGNOSTIC_RETRIEVAL_ASSURANCE_ENABLED") or "1").strip() != "0"
+SMART_DIAGNOSTIC_RETRIEVAL_ASSURANCE_MAX_SECONDS_START = max(2, min(10, int(os.environ.get("MM_SMART_DIAGNOSTIC_RETRIEVAL_ASSURANCE_MAX_SECONDS_START", "7"))))
+SMART_DIAGNOSTIC_RETRIEVAL_ASSURANCE_MAX_SECONDS_ANSWER = max(1, min(7, int(os.environ.get("MM_SMART_DIAGNOSTIC_RETRIEVAL_ASSURANCE_MAX_SECONDS_ANSWER", "4"))))
+SMART_DIAGNOSTIC_RETRIEVAL_ASSURANCE_MAX_NEW_EVIDENCE = max(1, min(6, int(os.environ.get("MM_SMART_DIAGNOSTIC_RETRIEVAL_ASSURANCE_MAX_NEW_EVIDENCE", "4"))))
 
 
 class SmartDiagnosticContext(BaseModel):
@@ -21872,9 +23350,263 @@ def _sd_semantic_evidence_gate(*, symptom_text: str, language: str, citations: l
         "accepted": accepted, "decision": decision, "confidence": confidence,
         "reason_code": str(out.get("reason_code") or "evidence_irrelevant"),
         "relevant_evidence_ids": relevant_ids,
+        "dense_queries": _dedup_text_values([symptom_text] + list(out.get("dense_queries") or []), limit=V13_DENSE_QUERY_LIMIT + 2),
+        "lexical_queries": _dedup_text_values([symptom_text] + list(out.get("lexical_queries") or []), limit=V13_LEXICAL_QUERY_LIMIT + 2),
+        "exact_terms": _dedup_text_values(list(out.get("exact_terms") or []) + _extract_code_tokens(symptom_text), limit=16),
+        "required_facets": _dedup_text_values(list(out.get("required_facets") or []), limit=12),
+        "missing_information": _dedup_text_values(list(out.get("missing_information") or []), limit=8),
         "model": SMART_DIAGNOSTIC_EVIDENCE_GATE_MODEL,
     }
 
+
+
+def _sd_run_retrieval_assurance(
+    *,
+    symptom_text: str,
+    company_id: str,
+    machine_id: str,
+    language: str,
+    raw_citations: list[dict],
+    gate_result: dict,
+    max_seconds: int,
+) -> tuple[bool, list[dict], dict]:
+    gate = dict(gate_result or {})
+    relevant_ids = {str(x or "").strip() for x in (gate.get("relevant_evidence_ids") or []) if str(x or "").strip()}
+    seed = [dict(c) for c in raw_citations or [] if isinstance(c, dict) and (not relevant_ids or str(c.get("citation_id") or "").strip() in relevant_ids)]
+    if not seed:
+        seed = [dict(c) for c in (raw_citations or [])[:SMART_DIAGNOSTIC_TOP_K] if isinstance(c, dict)]
+    for c in seed:
+        c["evidence_gate_selected"] = True
+    retrieval = {
+        "plan": _v13_plan_from_evidence_gate(symptom_text, gate, _v13_fallback_plan(symptom_text)),
+        "candidates": seed,
+        "citations": seed[:V13_MAX_EVIDENCE_ITEMS_ROOT_CAUSE],
+        "metrics": _v13_evidence_metrics(seed),
+        "source_profile": {},
+    }
+    if not SMART_DIAGNOSTIC_RETRIEVAL_ASSURANCE_ENABLED:
+        return bool(gate.get("accepted") and seed), seed, {"enabled": False, "attempted": False, "adopted": False}
+
+    temp_budget = _V13RequestBudget("root_cause")
+    temp_budget.deadline_seconds = max(2, int(max_seconds or 2) + 1)
+    temp_budget.deadline_monotonic = time_module.monotonic() + float(temp_budget.deadline_seconds)
+    temp_budget.max_llm_calls = 0
+    token = _V13_BUDGET_CTX.set(temp_budget)
+    try:
+        enhanced, assurance = _v13_apply_retrieval_assurance(
+            q=symptom_text,
+            company_id=company_id,
+            machine_id=machine_id,
+            doc_ids=None,
+            bubble_document_id=None,
+            ai_scope="machine_all",
+            response_language=language,
+            mode="smart_diagnostic",
+            narrow_scope=False,
+            retrieval=retrieval,
+            gate_meta={**gate, "semantic_gate_used": True, "refinement_used": False},
+            max_seconds=max_seconds,
+            reserve_final_seconds=0,
+        )
+    except Exception as exc:
+        print("SMART_DIAGNOSTIC_RETRIEVAL_ASSURANCE_FAIL", str(exc)[:500])
+        enhanced, assurance = retrieval, {"enabled": True, "attempted": True, "adopted": False, "reason": "assurance_failed"}
+    finally:
+        _V13_BUDGET_CTX.reset(token)
+
+    final_citations = [dict(c) for c in (enhanced.get("citations") or seed) if isinstance(c, dict)]
+    post_state, post_signals = _v13_deterministic_evidence_state(
+        symptom_text,
+        final_citations,
+        mode="smart_diagnostic",
+        narrow_scope=False,
+    )
+    accepted = bool(
+        final_citations
+        and (
+            bool(gate.get("accepted"))
+            or (
+                str(gate.get("decision") or "").strip().lower() == "refine"
+                and bool(assurance.get("adopted"))
+                and post_state == "supported"
+            )
+        )
+    )
+    assurance = {
+        **dict(assurance or {}),
+        "post_state": post_state,
+        "post_top_similarity": round(float(post_signals.get("top_similarity") or 0.0), 6),
+    }
+    return accepted, final_citations, assurance
+
+
+def _sd_answer_retrieval_signal(state: dict, current_question: dict, answer: dict) -> tuple[str, list[str]]:
+    answer_text = " ".join(
+        str(x or "").strip()
+        for x in (answer.get("free_text"), answer.get("label"), answer.get("api_value"), answer.get("value"))
+        if str(x or "").strip()
+    )
+    answer_text = re.sub(r"\s+", " ", answer_text).strip()
+    if not answer_text:
+        return "", []
+    previous_text = " ".join(
+        [
+            str(state.get("symptom_text") or ""),
+            str((current_question or {}).get("question_text") or ""),
+        ]
+        + [str(e.get("snippet") or "") for e in (state.get("evidence") or []) if isinstance(e, dict)]
+    )
+    previous_terms = _v13_gate_term_set(previous_text, limit=220)
+    answer_terms = _v13_gate_term_set(answer_text, limit=80)
+    new_terms = sorted(answer_terms - previous_terms)
+    exact_terms = _dedup_text_values(
+        _v13_assurance_identifier_tokens(answer_text) + _v13_query_number_tokens(answer_text),
+        limit=12,
+    )
+    if not exact_terms and len(new_terms) < 2:
+        return "", []
+    query = re.sub(
+        r"\s+",
+        " ",
+        " ".join(
+            [
+                str(state.get("symptom_text") or ""),
+                str((current_question or {}).get("question_text") or ""),
+                answer_text,
+            ]
+        ),
+    ).strip()
+    return query, _dedup_text_values(exact_terms + new_terms, limit=10)
+
+
+def _sd_enrich_state_evidence_from_answer(
+    *,
+    state: dict,
+    company_id: str,
+    machine_id: str,
+    language: str,
+    current_question: dict,
+    answer: dict,
+) -> dict:
+    if not SMART_DIAGNOSTIC_RETRIEVAL_ASSURANCE_ENABLED:
+        return state
+    query, new_facets = _sd_answer_retrieval_signal(state, current_question, answer)
+    if not query or not new_facets:
+        return state
+    base = []
+    for e in state.get("evidence") or []:
+        if not isinstance(e, dict) or not str(e.get("citation_id") or "").strip():
+            continue
+        base.append(
+            {
+                "citation_id": str(e.get("citation_id") or ""),
+                "bubble_document_id": str(e.get("bubble_document_id") or ""),
+                "source_type": str(e.get("source_type") or ""),
+                "page_from": _safe_int(e.get("page_from"), 0),
+                "page_to": _safe_int(e.get("page_to"), 0),
+                "snippet": str(e.get("snippet") or ""),
+                "snippet_clean": str(e.get("snippet") or ""),
+                "chunk_full": str(e.get("snippet") or ""),
+                "similarity": 0.0,
+                "semantic_similarity": 0.0,
+                "retrieval_score": 0.0,
+                "evidence_gate_selected": True,
+            }
+        )
+    if not base:
+        return state
+    gate = {
+        "semantic_gate_used": True,
+        "refinement_used": False,
+        "decision": "supported",
+        "confidence": 1.0,
+        "dense_queries": [query],
+        "lexical_queries": [query] + new_facets,
+        "exact_terms": _dedup_text_values(
+            _v13_assurance_identifier_tokens(query) + _v13_query_number_tokens(query),
+            limit=16,
+        ),
+        "required_facets": new_facets,
+        "missing_information": new_facets,
+        "relevant_evidence_ids": [str(c.get("citation_id") or "") for c in base],
+    }
+    retrieval = {
+        "plan": _v13_plan_from_evidence_gate(query, gate, _v13_fallback_plan(query)),
+        "candidates": base,
+        "citations": base,
+        "metrics": _v13_evidence_metrics(base),
+        "source_profile": {},
+    }
+    temp_budget = _V13RequestBudget("root_cause")
+    temp_budget.deadline_seconds = SMART_DIAGNOSTIC_RETRIEVAL_ASSURANCE_MAX_SECONDS_ANSWER + 1
+    temp_budget.deadline_monotonic = time_module.monotonic() + float(temp_budget.deadline_seconds)
+    temp_budget.max_llm_calls = 0
+    token = _V13_BUDGET_CTX.set(temp_budget)
+    try:
+        enhanced, assurance = _v13_apply_retrieval_assurance(
+            q=query,
+            company_id=company_id,
+            machine_id=machine_id,
+            doc_ids=None,
+            bubble_document_id=None,
+            ai_scope="machine_all",
+            response_language=language,
+            mode="smart_diagnostic",
+            narrow_scope=False,
+            retrieval=retrieval,
+            gate_meta=gate,
+            max_seconds=SMART_DIAGNOSTIC_RETRIEVAL_ASSURANCE_MAX_SECONDS_ANSWER,
+            reserve_final_seconds=0,
+        )
+    except Exception as exc:
+        print("SMART_DIAGNOSTIC_ANSWER_ASSURANCE_FAIL", str(exc)[:500])
+        return state
+    finally:
+        _V13_BUDGET_CTX.reset(token)
+    if not bool((assurance or {}).get("adopted")):
+        return state
+    citations = _sanitize_citations_for_response(enhanced.get("citations") or [], company_id=company_id)
+    current_ids = {str(e.get("citation_id") or "") for e in (state.get("evidence") or []) if isinstance(e, dict)}
+    existing = [c for c in citations if str(c.get("citation_id") or "") in current_ids]
+    additions = [c for c in citations if str(c.get("citation_id") or "") not in current_ids][:SMART_DIAGNOSTIC_RETRIEVAL_ASSURANCE_MAX_NEW_EVIDENCE]
+    citations = _sd_prepare_citations_for_response(
+        existing + additions,
+        max_items=SMART_DIAGNOSTIC_MAX_EVIDENCE_IN_STATE,
+    )
+    if not citations:
+        return state
+    try:
+        links = _build_rg_links(company_id, citations)
+    except Exception:
+        links = list(state.get("rg_links") or [])
+    updated = dict(state)
+    updated["citations"] = citations
+    updated["rg_links"] = _sd_filter_rg_links_for_citations(links, citations)
+    updated["evidence"] = _sd_compact_evidence_for_state(
+        citations,
+        max_items=SMART_DIAGNOSTIC_MAX_EVIDENCE_IN_STATE,
+    )
+    gate_state = dict(updated.get("evidence_gate") or {})
+    gate_state["accepted"] = True
+    gate_state["relevant_evidence_ids"] = _dedup_text_values(
+        list(gate_state.get("relevant_evidence_ids") or [])
+        + [str(c.get("citation_id") or "") for c in additions],
+        limit=SMART_DIAGNOSTIC_MAX_EVIDENCE_IN_STATE,
+    )
+    gate_state["answer_assurance_updates"] = int(gate_state.get("answer_assurance_updates") or 0) + 1
+    updated["evidence_gate"] = gate_state
+    history_meta = list(updated.get("retrieval_assurance_history") or [])
+    history_meta.append(
+        {
+            "step": _safe_int((current_question or {}).get("question_number"), len(updated.get("history") or [])),
+            "adopted": True,
+            "new_facets": new_facets,
+            "new_candidates_admitted": int((assurance or {}).get("new_candidates_admitted") or 0),
+            "coverage_gain": int((assurance or {}).get("coverage_gain") or 0),
+        }
+    )
+    updated["retrieval_assurance_history"] = history_meta[-6:]
+    return updated
 
 def _sd_filter_citations_by_gate(citations: list[dict], gate_result: dict) -> list[dict]:
     wanted = {str(x or "").strip() for x in (gate_result.get("relevant_evidence_ids") or []) if str(x or "").strip()}
@@ -22369,6 +24101,8 @@ def _sd_response_from_step(
                 "decision": str((current_state.get("evidence_gate") or {}).get("decision") or ""),
                 "confidence": float((current_state.get("evidence_gate") or {}).get("confidence") or 0.0),
             },
+            "retrieval_assurance": dict(current_state.get("retrieval_assurance") or {}),
+            "retrieval_assurance_updates": len(current_state.get("retrieval_assurance_history") or []),
         },
     }
     _sd_flatten_question(resp, question)
@@ -22417,15 +24151,39 @@ def smart_diagnostic_start_v1(
     deterministic_state, deterministic_signals = _v13_deterministic_evidence_state(
         symptom_text, raw_citations, mode="smart_diagnostic", narrow_scope=False,
     )
+    pre_sd_assurance: dict = {}
     if deterministic_state == "unsupported":
-        return _sd_no_sources_response(
-            language, session_id, symptom_text, debug=bool(payload.debug),
-            gate_result={
-                "accepted": False, "decision": "unsupported", "confidence": 1.0,
-                "reason_code": "evidence_irrelevant",
-                "top_similarity": deterministic_signals.get("top_similarity"),
-            },
+        seed_retrieval = {
+            "plan": _v13_fallback_plan(symptom_text),
+            "candidates": raw_citations,
+            "citations": raw_citations[:V13_MAX_EVIDENCE_ITEMS_ROOT_CAUSE],
+            "metrics": _v13_evidence_metrics(raw_citations),
+            "source_profile": {},
+        }
+        recovered, pre_sd_assurance = _v13_pre_admission_retrieval_assurance(
+            q=symptom_text,
+            company_id=company_id,
+            machine_id=machine_id,
+            doc_ids=None,
+            bubble_document_id=None,
+            ai_scope="machine_all",
+            response_language=language,
+            mode="smart_diagnostic",
+            narrow_scope=False,
+            retrieval=seed_retrieval,
+            signals=deterministic_signals,
         )
+        if not bool((pre_sd_assurance or {}).get("adopted")):
+            return _sd_no_sources_response(
+                language, session_id, symptom_text, debug=bool(payload.debug),
+                gate_result={
+                    "accepted": False, "decision": "unsupported", "confidence": 1.0,
+                    "reason_code": "evidence_irrelevant",
+                    "top_similarity": deterministic_signals.get("top_similarity"),
+                    "pre_admission_assurance": pre_sd_assurance,
+                },
+            )
+        raw_citations = list(recovered.get("citations") or recovered.get("candidates") or [])
     try:
         evidence_gate = _sd_semantic_evidence_gate(
             symptom_text=symptom_text, language=language, citations=raw_citations,
@@ -22433,11 +24191,33 @@ def smart_diagnostic_start_v1(
     except Exception as e:
         print("SMART_DIAGNOSTIC_EVIDENCE_GATE_FAIL", str(e)[:500])
         raise HTTPException(status_code=502, detail={"code": "SMART_DIAGNOSTIC_EVIDENCE_GATE_FAILED", "message": "Smart Diagnostic could not verify indexed evidence sufficiency."})
-    if not bool(evidence_gate.get("accepted")):
+    pre_elapsed = float((pre_sd_assurance or {}).get("elapsed_seconds") or 0.0)
+    assurance_seconds_left = max(
+        1,
+        int(math.floor(float(SMART_DIAGNOSTIC_RETRIEVAL_ASSURANCE_MAX_SECONDS_START) - pre_elapsed)),
+    )
+    assurance_accepted, assured_citations, assurance_meta = _sd_run_retrieval_assurance(
+        symptom_text=symptom_text, company_id=company_id, machine_id=machine_id,
+        language=language, raw_citations=raw_citations, gate_result=evidence_gate,
+        max_seconds=assurance_seconds_left,
+    )
+    if pre_sd_assurance:
+        assurance_meta = {
+            **dict(assurance_meta or {}),
+            "pre_admission": dict(pre_sd_assurance),
+            "total_assurance_budget_seconds": SMART_DIAGNOSTIC_RETRIEVAL_ASSURANCE_MAX_SECONDS_START,
+        }
+    if not assurance_accepted:
+        evidence_gate = {**dict(evidence_gate or {}), "retrieval_assurance": assurance_meta}
         return _sd_no_sources_response(language, session_id, symptom_text, debug=bool(payload.debug), gate_result=evidence_gate)
-    raw_citations = _sd_filter_citations_by_gate(raw_citations, evidence_gate)
-    if not raw_citations:
-        return _sd_no_sources_response(language, session_id, symptom_text, debug=bool(payload.debug), gate_result=evidence_gate)
+    raw_citations = assured_citations
+    evidence_gate = {
+        **dict(evidence_gate or {}),
+        "accepted": True,
+        "decision": "supported_after_assurance" if bool((assurance_meta or {}).get("adopted")) else "supported",
+        "retrieval_assurance": assurance_meta,
+        "relevant_evidence_ids": [str(c.get("citation_id") or "") for c in raw_citations],
+    }
     response_citations = _sanitize_citations_for_response(raw_citations, company_id=company_id)
     response_citations = _sd_prepare_citations_for_response(response_citations, max_items=SMART_DIAGNOSTIC_MAX_EVIDENCE_IN_STATE)
     try:
@@ -22472,7 +24252,8 @@ def smart_diagnostic_start_v1(
         "max_questions": max_questions, "max_hypotheses": max_hypotheses,
         "top_k": top_k, "history": [], "evidence": evidence_state,
         "evidence_gate": {
-            "accepted": True, "decision": "supported",
+            "accepted": True,
+            "decision": str(evidence_gate.get("decision") or "supported"),
             "confidence": float(evidence_gate.get("confidence") or 0.0),
             "reason_code": str(evidence_gate.get("reason_code") or "evidence_sufficient"),
             "model": str(evidence_gate.get("model") or SMART_DIAGNOSTIC_EVIDENCE_GATE_MODEL),
@@ -22482,6 +24263,7 @@ def smart_diagnostic_start_v1(
             "similarity_max": retrieval.get("similarity_max"),
             "diagnostic_matrix": retrieval.get("diagnostic_matrix") or {},
         },
+        "retrieval_assurance": dict(assurance_meta or {}),
     }
     return _sd_response_from_step(
         session_id=session_id, company_id=company_id, machine_id=machine_id,
@@ -22521,6 +24303,10 @@ def smart_diagnostic_answer_v1(
     current_question = dict(state.get("current_question") or {})
     history.append({"question": current_question, "answer": answer})
     state["history"] = history
+    state = _sd_enrich_state_evidence_from_answer(
+        state=state, company_id=company_id, machine_id=machine_id, language=language,
+        current_question=current_question, answer=answer,
+    )
     parsed = _sd_llm_step_answer(state=state, answer=answer, language=language, max_hypotheses=max_hypotheses)
     question_number_default = _sd_clamp_int(current_question.get("question_number"), len(history), 1, 99) + 1
     allowed_ids = {str(e.get("citation_id") or "").strip() for e in (state.get("evidence") or []) if isinstance(e, dict) and str(e.get("citation_id") or "").strip()}
