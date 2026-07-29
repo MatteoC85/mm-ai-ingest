@@ -1,5 +1,8 @@
 import os
 import re
+import asyncio
+import contextvars
+import threading
 import base64
 import binascii
 import math
@@ -21,6 +24,7 @@ try:
 except Exception:
     openpyxl = None
 from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from google.cloud import tasks_v2
 from urllib.parse import urlparse, unquote
@@ -163,7 +167,7 @@ SEMANTIC_QUERY_PLANNER_TIMEOUT = int(os.environ.get("MM_SEMANTIC_QUERY_PLANNER_T
 SEMANTIC_MAX_DENSE_QUERIES = int(os.environ.get("MM_SEMANTIC_MAX_DENSE_QUERIES", "5"))
 SEMANTIC_MAX_LEXICAL_QUERIES = int(os.environ.get("MM_SEMANTIC_MAX_LEXICAL_QUERIES", "5"))
 SEMANTIC_EXACT_MACHINE_BONUS = float(os.environ.get("MM_SEMANTIC_EXACT_MACHINE_BONUS", "0.055"))
-ASK_ROOT_CAUSE_CODE_MARKER = "ask-root-v12-gpt56-verified-hybrid-evidence-links"
+ASK_ROOT_CAUSE_CODE_MARKER = "ask-root-v13-prod-adaptive-budgeted-evidence-cache-stream-v1"
 
 # Root-cause semantic intent gate
 ROOT_CAUSE_INTENT_MODEL = (os.environ.get("MM_ROOT_CAUSE_INTENT_MODEL") or "gpt-5.4-mini").strip()
@@ -608,12 +612,32 @@ def _raw_rows_to_dense_candidates(
 def _db_conn():
     if not (DB_HOST and DB_USER and DB_PASSWORD):
         raise HTTPException(status_code=500, detail="DB env missing")
-    return psycopg2.connect(
-        host=DB_HOST,
-        dbname=DB_NAME,
-        user=DB_USER,
-        password=DB_PASSWORD,
-    )
+
+    kwargs: dict[str, Any] = {
+        "host": DB_HOST,
+        "dbname": DB_NAME,
+        "user": DB_USER,
+        "password": DB_PASSWORD,
+    }
+
+    # Existing ingest/electrical/Smart Diagnostic behavior is unchanged. Only a live
+    # V13 ASK/Root Cause request receives bounded connect/statement timeouts.
+    budget = None
+    try:
+        budget_fn = globals().get("_v13_current_budget")
+        budget = budget_fn() if callable(budget_fn) else None
+    except Exception:
+        budget = None
+
+    if budget is not None:
+        budget.ensure_time(1.5)
+        remaining = max(1.5, float(budget.remaining()))
+        connect_limit = int(globals().get("V13_DB_CONNECT_TIMEOUT_SECONDS", 5) or 5)
+        statement_limit = int(globals().get("V13_DB_STATEMENT_TIMEOUT_MS", 9000) or 9000)
+        kwargs["connect_timeout"] = max(1, min(connect_limit, int(max(1.0, remaining - 0.5))))
+        kwargs["options"] = f"-c statement_timeout={max(1000, min(statement_limit, int(max(1.0, remaining - 0.5) * 1000)))}"
+
+    return psycopg2.connect(**kwargs)
 
 
 def _vector_literal(vec: list[float]) -> str:
@@ -6321,28 +6345,86 @@ def _chunk_sentences_with_pages(
     return [c for c in chunks if c.get("chunk_text")]
 
 
-def _openai_embed_texts(texts: list[str]) -> list[list[float]]:
+def _openai_embed_texts(texts: list[str], *, timeout: int = 60) -> list[list[float]]:
     if not OPENAI_API_KEY:
         raise Exception("OPENAI_API_KEY missing")
 
-    payload = {"model": OPENAI_EMBED_MODEL, "input": texts}
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
+    normalized_texts = [str(value or "") for value in (texts or [])]
+    if not normalized_texts:
+        return []
 
-    r = requests.post(OPENAI_EMBED_URL, headers=headers, json=payload, timeout=60)
-    if r.status_code != 200:
-        raise Exception(f"OpenAI embeddings failed: {r.status_code} {r.text}")
+    budget = None
+    try:
+        budget_fn = globals().get("_v13_current_budget")
+        budget = budget_fn() if callable(budget_fn) else None
+    except Exception:
+        budget = None
 
-    data = r.json()
-    out = [None] * len(texts)
-    for item in data.get("data", []):
-        out[int(item["index"])] = item["embedding"]
+    cache: dict[tuple[str, str], list[float]] = (
+        budget.embedding_cache if budget is not None else {}
+    )
+    keys = [(OPENAI_EMBED_MODEL, value) for value in normalized_texts]
+    unique_missing: list[str] = []
+    seen_missing: set[tuple[str, str]] = set()
+    cache_hits = 0
+    for key, value in zip(keys, normalized_texts):
+        if key in cache:
+            cache_hits += 1
+            continue
+        if key in seen_missing:
+            # Duplicate text inside the same embedding batch is also a request-local
+            # cache hit: only one vector is purchased and reused for every duplicate.
+            cache_hits += 1
+            continue
+        seen_missing.add(key)
+        unique_missing.append(value)
 
-    if any(v is None for v in out):
-        raise Exception("OpenAI embeddings response missing some items")
+    if unique_missing:
+        request_timeout = max(5, int(timeout or 60))
+        if budget is not None:
+            budget.ensure_time(3.0)
+            request_timeout = max(5, min(request_timeout, int(max(5.0, budget.remaining() - 1.0))))
 
+        payload = {"model": OPENAI_EMBED_MODEL, "input": unique_missing}
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        }
+
+        r = requests.post(
+            OPENAI_EMBED_URL,
+            headers=headers,
+            json=payload,
+            timeout=request_timeout,
+        )
+        if r.status_code != 200:
+            raise Exception(f"OpenAI embeddings failed: {r.status_code} {r.text}")
+
+        data = r.json()
+        vectors: list[Optional[list[float]]] = [None] * len(unique_missing)
+        for item in data.get("data", []):
+            idx = int(item["index"])
+            if 0 <= idx < len(vectors):
+                vectors[idx] = item["embedding"]
+
+        if any(vector is None for vector in vectors):
+            raise Exception("OpenAI embeddings response missing some items")
+
+        for value, vector in zip(unique_missing, vectors):
+            cache[(OPENAI_EMBED_MODEL, value)] = list(vector or [])
+
+        if budget is not None:
+            approx_tokens = sum(max(1, int(math.ceil(len(value) / 4.0))) for value in unique_missing)
+            budget.record_embedding(input_tokens=approx_tokens, cache_hits=cache_hits)
+    elif budget is not None:
+        budget.embedding_cache_hits += len(normalized_texts)
+
+    out: list[list[float]] = []
+    for key in keys:
+        vector = cache.get(key)
+        if vector is None:
+            raise Exception("OpenAI embeddings cache reconstruction failed")
+        out.append(vector)
     return out
 
 
@@ -9868,32 +9950,15 @@ def _ask_structured_direct_answer(
     )
 
     try:
-        # This is the user-visible reasoning step for procedures. Use the same
-        # frontier GPT-5.6 Sol reasoning engine as broad ASK, but only once: the
-        # procedure family and ordered steps have already been curated locally.
-        if "_v11_json_models" in globals() and bool(globals().get("REASONING_V11_ENABLED", False)):
-            parsed = _v11_json_models(
-                [
-                    {"role": "system", "content": system_msg},
-                    {"role": "user", "content": user_msg},
-                ],
-                models=[REASONING_V11_MODEL, REASONING_V11_SELECTOR_MODEL],
-                json_schema=_ask_evidence_answer_schema(),
-                effort="high",
-                reasoning_mode="pro",
-                timeout=max(int(ASK_STRUCTURED_DIRECT_TIMEOUT or 60), 120),
-                safety_identifier=_v11_safety_identifier(company_id),
-            )
-        else:
-            parsed = _openai_chat_json_models(
-                [
-                    {"role": "system", "content": system_msg},
-                    {"role": "user", "content": user_msg},
-                ],
-                models=[ASK_STRUCTURED_DIRECT_MODEL, ASK_EVIDENCE_ANSWER_MODEL, OPENAI_CHAT_MODEL, ROOT_CAUSE_RESPONSE_MODEL],
-                json_schema=_ask_evidence_answer_schema(),
-                timeout=int(ASK_STRUCTURED_DIRECT_TIMEOUT or 60),
-            )
+        parsed = _openai_chat_json_models(
+            [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            models=[ASK_STRUCTURED_DIRECT_MODEL, ASK_EVIDENCE_ANSWER_MODEL, OPENAI_CHAT_MODEL, ROOT_CAUSE_RESPONSE_MODEL],
+            json_schema=_ask_evidence_answer_schema(),
+            timeout=int(ASK_STRUCTURED_DIRECT_TIMEOUT or 60),
+        )
     except Exception as exc:
         print("ASK_STRUCTURED_DIRECT_FAIL", str(exc)[:700])
         return None
@@ -12341,26 +12406,49 @@ def version():
         "revision": os.environ.get("K_REVISION"),
         "commit_sha": os.environ.get("COMMIT_SHA"),
         "ask_root_cause_code_marker": ASK_ROOT_CAUSE_CODE_MARKER,
-        "ask_chat_model": OPENAI_CHAT_MODEL,
-        "ask_evidence_answer_model": ASK_EVIDENCE_ANSWER_MODEL,
-        "root_cause_response_model": ROOT_CAUSE_RESPONSE_MODEL,
-        "semantic_exact_machine_bonus": SEMANTIC_EXACT_MACHINE_BONUS,
-        "ask_structured_direct_scan_limit": ASK_STRUCTURED_DIRECT_SCAN_LIMIT,
-        "reasoning_v11_code_marker": REASONING_V11_CODE_MARKER,
-        "reasoning_v12_code_marker": REASONING_V11_CODE_MARKER,
-        "reasoning_v11_enabled": REASONING_V11_ENABLED,
-        "reasoning_v11_fail_closed": REASONING_V11_FAIL_CLOSED,
-        "reasoning_v11_planner_model": REASONING_V11_PLANNER_MODEL,
-        "reasoning_v11_selector_model": REASONING_V11_SELECTOR_MODEL,
-        "reasoning_v11_reasoner_model": REASONING_V11_MODEL,
-        "reasoning_v11_verifier_model": REASONING_V11_VERIFIER_MODEL,
-        "reasoning_v11_reasoner_effort": REASONING_V11_REASONER_EFFORT,
-        "reasoning_v11_reasoner_mode": REASONING_V11_REASONER_MODE,
-        "reasoning_v11_planner_mode": REASONING_V11_PLANNER_MODE or "standard",
-        "reasoning_v11_selector_mode": REASONING_V11_SELECTOR_MODE or "standard",
-        "reasoning_v11_verifier_mode": REASONING_V11_VERIFIER_MODE or "standard",
-        "reasoning_v11_max_retrieval_passes": REASONING_V11_MAX_RETRIEVAL_PASSES,
+        "v13_code_marker": V13_CODE_MARKER,
+        "v13_release_id": V13_RELEASE_ID,
+        "v13_engine_key": V13_ENGINE_KEY,
+        "v13_enabled": V13_ENABLED,
+        "v13_ask_enabled": V13_ASK_ENABLED,
+        "v13_root_cause_enabled": V13_ROOT_CAUSE_ENABLED,
+        "v13_architecture": "deterministic_retrieval_optional_luna_single_synthesis",
+        "v13_verifier_rewrite_loop_enabled": False,
+        "v13_planner_model": V13_PLANNER_MODEL,
+        "v13_fast_model": V13_FAST_MODEL,
+        "v13_heavy_model": V13_HEAVY_MODEL,
+        "v13_fast_effort": V13_FAST_EFFORT,
+        "v13_ask_heavy_effort": V13_ASK_HEAVY_EFFORT,
+        "v13_root_heavy_effort": V13_ROOT_HEAVY_EFFORT,
+        "v13_heavy_reasoning_mode": V13_HEAVY_REASONING_MODE or "standard",
+        "v13_ask_deadline_seconds": V13_ASK_DEADLINE_SECONDS,
+        "v13_root_cause_deadline_seconds": V13_ROOT_CAUSE_DEADLINE_SECONDS,
+        "v13_max_llm_calls_ask": V13_MAX_LLM_CALLS_ASK,
+        "v13_max_llm_calls_root_cause": V13_MAX_LLM_CALLS_ROOT_CAUSE,
+        "v13_max_estimated_cost_ask_usd": V13_MAX_ESTIMATED_COST_ASK_USD,
+        "v13_max_estimated_cost_root_cause_usd": V13_MAX_ESTIMATED_COST_ROOT_CAUSE_USD,
+        "v13_planner_timeout_seconds": V13_PLANNER_TIMEOUT_SECONDS,
+        "v13_fast_timeout_seconds": V13_FAST_TIMEOUT_SECONDS,
+        "v13_heavy_timeout_seconds": V13_HEAVY_TIMEOUT_SECONDS,
+        "v13_fast_max_output_tokens": V13_FAST_MAX_OUTPUT_TOKENS,
+        "v13_heavy_max_output_tokens": V13_HEAVY_MAX_OUTPUT_TOKENS,
+        "v13_fast_context_chars": V13_FAST_CONTEXT_CHARS,
+        "v13_heavy_context_chars": V13_HEAVY_CONTEXT_CHARS,
+        "v13_db_connect_timeout_seconds": V13_DB_CONNECT_TIMEOUT_SECONDS,
+        "v13_db_statement_timeout_ms": V13_DB_STATEMENT_TIMEOUT_MS,
+        "v13_semantic_cache_enabled": V13_SEMANTIC_CACHE_ENABLED,
+        "v13_semantic_cache_auto_ddl": V13_SEMANTIC_CACHE_AUTO_DDL,
+        "v13_semantic_cache_ttl_seconds": V13_SEMANTIC_CACHE_TTL_SECONDS,
+        "v13_semantic_cache_threshold_ask": V13_SEMANTIC_CACHE_THRESHOLD_ASK,
+        "v13_semantic_cache_threshold_root_cause": V13_SEMANTIC_CACHE_THRESHOLD_ROOT_CAUSE,
+        "v13_stream_heartbeat_enabled": V13_STREAM_HEARTBEAT_ENABLED,
+        "v13_stream_heartbeat_seconds": V13_STREAM_HEARTBEAT_SECONDS,
+        "v13_stream_heartbeat_bytes": V13_STREAM_HEARTBEAT_BYTES,
+        "openai_embed_model": OPENAI_EMBED_MODEL,
+        "baseline_ask_chat_model": OPENAI_CHAT_MODEL,
+        "baseline_root_cause_response_model": ROOT_CAUSE_RESPONSE_MODEL,
     }
+
 
 def _strip_data_url_prefix(value: str) -> str:
     raw = (value or "").strip()
@@ -12718,6 +12806,8 @@ def ingest_document(
     finally:
         conn.close()
 
+    _v13_invalidate_company_knowledge(company_id)
+
     try:
         project = (
             os.environ.get("GOOGLE_CLOUD_PROJECT")
@@ -12908,6 +12998,8 @@ def ingest_structured_source(
         conn.commit()
     finally:
         conn.close()
+
+    _v13_invalidate_company_knowledge(company_id)
 
     if source_url:
         _db_upsert_document_file(company_id, source_key, source_url)
@@ -13119,6 +13211,8 @@ def index_document(
         conn.commit()
     finally:
         conn.close()
+
+    _v13_invalidate_company_knowledge(company_id)
 
     return {
         "ok": True,
@@ -13429,7 +13523,7 @@ def _ask_v1_baseline_impl(
                 max_causes=2,
                 debug=payload.debug,
             )
-            root_response = root_cause_v1(root_payload, x_ai_internal_secret)
+            root_response = _root_cause_v1_baseline_impl(root_payload, x_ai_internal_secret)
             bridged = _build_ask_response_from_root_cause_bridge(
                 q=q,
                 company_id=company_id,
@@ -16160,66 +16254,361 @@ def _root_cause_v1_candidate_impl(
 
 
 # =============================================================================
-# MACHINE MIND REASONING V11 — evidence-first ASK / ROOT CAUSE
+# MACHINEMIND V13 — adaptive, budgeted, evidence-first ASK / ROOT CAUSE
 # -----------------------------------------------------------------------------
-# This layer is intentionally isolated from ingest, Draft P&S and Smart Diagnostic.
-# It fixes the broad-machine retrieval regressions without deleting the previous
-# implementation. Broad V11 requests fail closed by default on internal failure;
-# the previous baseline remains available only through explicit feature flags or
-# for narrow/source-specific legacy routes.
+# Stable production architecture:
+#   1) exact cache remains in the Cloudflare Worker;
+#   2) high-threshold semantic cache is handled here and invalidated on knowledge changes;
+#   3) deterministic retrieval is always attempted before an LLM planner;
+#   4) precise/structured requests use one synthesis call;
+#   5) only ambiguous, genuinely complex requests may use one retrieval-planning call
+#      followed by one final reasoning call;
+#   6) no permanent verifier/rewrite loop;
+#   7) a strict request budget and streaming heartbeat prevent HTTP 524 failures.
+#
+# The ingestion, Draft P&S, electrical, and Smart Diagnostic paths are deliberately
+# untouched. Existing retrieval/scoring helpers are reused, but the old V11/V12
+# planner -> selector -> refinement -> reasoner -> verifier -> rewrite chain is removed
+# from the live ASK/ROOT CAUSE routes.
 # =============================================================================
 
-REASONING_V11_ENABLED = (os.environ.get("MM_REASONING_V11_ENABLED") or "1").strip() != "0"
-REASONING_V11_ASK_ENABLED = (os.environ.get("MM_REASONING_V11_ASK_ENABLED") or "1").strip() != "0"
-REASONING_V11_ROOT_CAUSE_ENABLED = (os.environ.get("MM_REASONING_V11_ROOT_CAUSE_ENABLED") or "1").strip() != "0"
-REASONING_V11_FAIL_CLOSED = (os.environ.get("MM_REASONING_V11_FAIL_CLOSED") or "1").strip() != "0"
-REASONING_V11_ALLOW_LEGACY_FALLBACK = (os.environ.get("MM_REASONING_V11_ALLOW_LEGACY_FALLBACK") or "1").strip() == "1"
-REASONING_V11_CODE_MARKER = "ask-root-v12-gpt56-sol-pro-verified-hybrid-evidence-agent"
+V13_ENABLED = (os.environ.get("MM_V13_ENABLED") or "1").strip() != "0"
+V13_ASK_ENABLED = (os.environ.get("MM_V13_ASK_ENABLED") or "1").strip() != "0"
+V13_ROOT_CAUSE_ENABLED = (os.environ.get("MM_V13_ROOT_CAUSE_ENABLED") or "1").strip() != "0"
+V13_CODE_MARKER = "ask-root-v13-prod-adaptive-budgeted-evidence-cache-stream-v1"
+V13_RELEASE_ID = (os.environ.get("MM_V13_RELEASE_ID") or "2026-07-29.1").strip()
 OPENAI_RESPONSES_URL = (os.environ.get("OPENAI_RESPONSES_URL") or "https://api.openai.com/v1/responses").strip()
-REASONING_V11_PLANNER_MODEL = (os.environ.get("MM_REASONING_V11_PLANNER_MODEL") or "gpt-5.6-terra").strip()
-REASONING_V11_SELECTOR_MODEL = (os.environ.get("MM_REASONING_V11_SELECTOR_MODEL") or "gpt-5.6-sol").strip()
-REASONING_V11_MODEL = (os.environ.get("MM_REASONING_V11_MODEL") or "gpt-5.6-sol").strip()
-REASONING_V11_VERIFIER_MODEL = (os.environ.get("MM_REASONING_V11_VERIFIER_MODEL") or "gpt-5.6-sol").strip()
-REASONING_V11_PLANNER_EFFORT = (os.environ.get("MM_REASONING_V11_PLANNER_EFFORT") or "medium").strip()
-REASONING_V11_PLANNER_MODE = (os.environ.get("MM_REASONING_V11_PLANNER_MODE") or "").strip()
-REASONING_V11_SELECTOR_EFFORT = (os.environ.get("MM_REASONING_V11_SELECTOR_EFFORT") or "high").strip()
-REASONING_V11_SELECTOR_MODE = (os.environ.get("MM_REASONING_V11_SELECTOR_MODE") or "").strip()
-REASONING_V11_REASONER_EFFORT = (os.environ.get("MM_REASONING_V11_REASONER_EFFORT") or "xhigh").strip()
-REASONING_V11_REASONER_MODE = (os.environ.get("MM_REASONING_V11_REASONER_MODE") or "pro").strip()
-REASONING_V11_VERIFIER_EFFORT = (os.environ.get("MM_REASONING_V11_VERIFIER_EFFORT") or "high").strip()
-REASONING_V11_VERIFIER_MODE = (os.environ.get("MM_REASONING_V11_VERIFIER_MODE") or "").strip()
-REASONING_V11_MAX_RETRIEVAL_PASSES = int(os.environ.get("MM_REASONING_V11_MAX_RETRIEVAL_PASSES", "2"))
-REASONING_V11_OPENAI_RETRIES = int(os.environ.get("MM_REASONING_V11_OPENAI_RETRIES", "3"))
-REASONING_V11_TIMEOUT = int(os.environ.get("MM_REASONING_V11_TIMEOUT_SECONDS", "240"))
-REASONING_V11_MAX_OUTPUT_TOKENS = int(os.environ.get("MM_REASONING_V11_MAX_OUTPUT_TOKENS", "24000"))
-REASONING_V11_DENSE_EXACT_K = int(os.environ.get("MM_REASONING_V11_DENSE_EXACT_K", "56"))
-REASONING_V11_DENSE_GENERAL_K = int(os.environ.get("MM_REASONING_V11_DENSE_GENERAL_K", "20"))
-REASONING_V11_FTS_EXACT_K = int(os.environ.get("MM_REASONING_V11_FTS_EXACT_K", "36"))
-REASONING_V11_FTS_GENERAL_K = int(os.environ.get("MM_REASONING_V11_FTS_GENERAL_K", "14"))
-REASONING_V11_STRUCTURED_SCAN_LIMIT = int(os.environ.get("MM_REASONING_V11_STRUCTURED_SCAN_LIMIT", "2400"))
-REASONING_V11_PAGE_SCAN_LIMIT = int(os.environ.get("MM_REASONING_V11_PAGE_SCAN_LIMIT", "800"))
-REASONING_V11_PAGE_EXACT_K = int(os.environ.get("MM_REASONING_V11_PAGE_EXACT_K", "48"))
-REASONING_V11_PAGE_GENERAL_K = int(os.environ.get("MM_REASONING_V11_PAGE_GENERAL_K", "18"))
-REASONING_V11_MAX_SELECTOR_CANDIDATES = int(os.environ.get("MM_REASONING_V11_MAX_SELECTOR_CANDIDATES", "110"))
-REASONING_V11_SELECTOR_CONTEXT_CHARS = int(os.environ.get("MM_REASONING_V11_SELECTOR_CONTEXT_CHARS", "120000"))
-REASONING_V11_ANSWER_CONTEXT_CHARS = int(os.environ.get("MM_REASONING_V11_ANSWER_CONTEXT_CHARS", "70000"))
-REASONING_V11_SELECTED_MAX = int(os.environ.get("MM_REASONING_V11_SELECTED_MAX", "10"))
-REASONING_V11_MIN_RELEVANCE = float(os.environ.get("MM_REASONING_V11_MIN_RELEVANCE", "62"))
-REASONING_V11_PAGE_EXPANSION_RADIUS = int(os.environ.get("MM_REASONING_V11_PAGE_EXPANSION_RADIUS", "1"))
-REASONING_V11_PAGE_EXPANSION_CHARS = int(os.environ.get("MM_REASONING_V11_PAGE_EXPANSION_CHARS", "7000"))
 
-V11_STRUCTURED_PREFIXES = (
-    "procedure:",
-    "step:",
-    "ps:",
-    "problem_solution:",
-    "problemsolution:",
-    "md_photo:",
-    "md_video:",
-)
+# Model policy. Luna is used only for optional retrieval refinement; Terra handles
+# precise/high-confidence synthesis; Sol is reserved for genuinely complex cases.
+V13_PLANNER_MODEL = (os.environ.get("MM_V13_PLANNER_MODEL") or "gpt-5.6-luna").strip()
+V13_FAST_MODEL = (os.environ.get("MM_V13_FAST_MODEL") or "gpt-5.6-terra").strip()
+V13_HEAVY_MODEL = (os.environ.get("MM_V13_HEAVY_MODEL") or "gpt-5.6-sol").strip()
+V13_FAST_EFFORT = (os.environ.get("MM_V13_FAST_EFFORT") or "medium").strip()
+V13_ASK_HEAVY_EFFORT = (os.environ.get("MM_V13_ASK_HEAVY_EFFORT") or "medium").strip()
+V13_ROOT_HEAVY_EFFORT = (os.environ.get("MM_V13_ROOT_HEAVY_EFFORT") or "high").strip()
+# Pro mode is opt-in. Standard mode is the production default because it is faster and cheaper.
+V13_HEAVY_REASONING_MODE = (os.environ.get("MM_V13_HEAVY_REASONING_MODE") or "").strip().lower()
+if V13_HEAVY_REASONING_MODE not in {"", "pro"}:
+    V13_HEAVY_REASONING_MODE = ""
+
+# Hard synchronous budgets. These are intentionally below the proxy timeout.
+V13_ASK_DEADLINE_SECONDS = max(20, min(58, int(os.environ.get("MM_V13_ASK_DEADLINE_SECONDS", "48"))))
+V13_ROOT_CAUSE_DEADLINE_SECONDS = max(25, min(58, int(os.environ.get("MM_V13_ROOT_CAUSE_DEADLINE_SECONDS", "55"))))
+V13_MAX_LLM_CALLS_ASK = max(1, min(2, int(os.environ.get("MM_V13_MAX_LLM_CALLS_ASK", "2"))))
+V13_MAX_LLM_CALLS_ROOT_CAUSE = max(1, min(2, int(os.environ.get("MM_V13_MAX_LLM_CALLS_ROOT_CAUSE", "2"))))
+V13_MAX_ESTIMATED_COST_ASK_USD = max(0.05, float(os.environ.get("MM_V13_MAX_ESTIMATED_COST_ASK_USD", "0.30")))
+V13_MAX_ESTIMATED_COST_ROOT_CAUSE_USD = max(0.08, float(os.environ.get("MM_V13_MAX_ESTIMATED_COST_ROOT_CAUSE_USD", "0.45")))
+V13_PLANNER_TIMEOUT_SECONDS = max(6, min(15, int(os.environ.get("MM_V13_PLANNER_TIMEOUT_SECONDS", "10"))))
+V13_FAST_TIMEOUT_SECONDS = max(12, min(35, int(os.environ.get("MM_V13_FAST_TIMEOUT_SECONDS", "26"))))
+V13_HEAVY_TIMEOUT_SECONDS = max(20, min(45, int(os.environ.get("MM_V13_HEAVY_TIMEOUT_SECONDS", "40"))))
+V13_PLANNER_MAX_OUTPUT_TOKENS = max(800, min(2000, int(os.environ.get("MM_V13_PLANNER_MAX_OUTPUT_TOKENS", "1200"))))
+V13_FAST_MAX_OUTPUT_TOKENS = max(1800, min(4200, int(os.environ.get("MM_V13_FAST_MAX_OUTPUT_TOKENS", "3000"))))
+V13_HEAVY_MAX_OUTPUT_TOKENS = max(3000, min(8000, int(os.environ.get("MM_V13_HEAVY_MAX_OUTPUT_TOKENS", "6000"))))
+V13_FAST_CONTEXT_CHARS = max(8000, min(28000, int(os.environ.get("MM_V13_FAST_CONTEXT_CHARS", "18000"))))
+V13_HEAVY_CONTEXT_CHARS = max(16000, min(60000, int(os.environ.get("MM_V13_HEAVY_CONTEXT_CHARS", "38000"))))
+V13_MAX_EVIDENCE_ITEMS_ASK = max(4, min(12, int(os.environ.get("MM_V13_MAX_EVIDENCE_ITEMS_ASK", "8"))))
+V13_MAX_EVIDENCE_ITEMS_ROOT_CAUSE = max(6, min(16, int(os.environ.get("MM_V13_MAX_EVIDENCE_ITEMS_ROOT_CAUSE", "10"))))
+V13_MIN_SECONDS_FOR_REFINEMENT = max(24, min(40, int(os.environ.get("MM_V13_MIN_SECONDS_FOR_REFINEMENT", "32"))))
+V13_DENSE_QUERY_LIMIT = max(1, min(5, int(os.environ.get("MM_V13_DENSE_QUERY_LIMIT", "4"))))
+V13_LEXICAL_QUERY_LIMIT = max(2, min(8, int(os.environ.get("MM_V13_LEXICAL_QUERY_LIMIT", "6"))))
+V13_PAGE_SCAN_LIMIT = max(80, min(900, int(os.environ.get("MM_V13_PAGE_SCAN_LIMIT", "500"))))
+V13_PAGE_TEXT_CHARS = max(1800, min(12000, int(os.environ.get("MM_V13_PAGE_TEXT_CHARS", "7000"))))
+V13_PREFERRED_PAGE_SCAN_LIMIT = max(80, min(900, int(os.environ.get("MM_V13_PREFERRED_PAGE_SCAN_LIMIT", "500"))))
+V13_DB_CONNECT_TIMEOUT_SECONDS = max(2, min(10, int(os.environ.get("MM_V13_DB_CONNECT_TIMEOUT_SECONDS", "5"))))
+V13_DB_STATEMENT_TIMEOUT_MS = max(3000, min(20000, int(os.environ.get("MM_V13_DB_STATEMENT_TIMEOUT_MS", "9000"))))
+
+# Semantic cache. It is deliberately conservative: changed codes, numbers, polarity,
+# source constraints, or root-cause symptom class prevent reuse even at high similarity.
+V13_SEMANTIC_CACHE_ENABLED = (os.environ.get("MM_V13_SEMANTIC_CACHE_ENABLED") or "1").strip() != "0"
+V13_SEMANTIC_CACHE_AUTO_DDL = (os.environ.get("MM_V13_SEMANTIC_CACHE_AUTO_DDL") or "1").strip() != "0"
+V13_SEMANTIC_CACHE_TTL_SECONDS = max(300, min(30 * 24 * 3600, int(os.environ.get("MM_V13_SEMANTIC_CACHE_TTL_SECONDS", "604800"))))
+V13_SEMANTIC_CACHE_SCAN_LIMIT = max(10, min(250, int(os.environ.get("MM_V13_SEMANTIC_CACHE_SCAN_LIMIT", "80"))))
+V13_SEMANTIC_CACHE_THRESHOLD_ASK = max(0.90, min(0.995, float(os.environ.get("MM_V13_SEMANTIC_CACHE_THRESHOLD_ASK", "0.965"))))
+V13_SEMANTIC_CACHE_THRESHOLD_ROOT_CAUSE = max(0.93, min(0.999, float(os.environ.get("MM_V13_SEMANTIC_CACHE_THRESHOLD_ROOT_CAUSE", "0.978"))))
+V13_SEMANTIC_CACHE_MIN_QUALITY = max(0.60, min(0.98, float(os.environ.get("MM_V13_SEMANTIC_CACHE_MIN_QUALITY", "0.80"))))
+V13_SEMANTIC_CACHE_MAX_ROWS_PER_COMPANY = max(50, min(5000, int(os.environ.get("MM_V13_SEMANTIC_CACHE_MAX_ROWS_PER_COMPANY", "600"))))
+V13_SEMANTIC_CACHE_BOOTSTRAP_RETRY_SECONDS = max(15, min(300, int(os.environ.get("MM_V13_SEMANTIC_CACHE_BOOTSTRAP_RETRY_SECONDS", "60"))))
+
+# Standard API prices per 1M text tokens. Cache reads/writes are accounted from usage details.
+V13_PRICE_SOL_INPUT = float(os.environ.get("MM_V13_PRICE_SOL_INPUT", "5.0"))
+V13_PRICE_SOL_OUTPUT = float(os.environ.get("MM_V13_PRICE_SOL_OUTPUT", "30.0"))
+V13_PRICE_TERRA_INPUT = float(os.environ.get("MM_V13_PRICE_TERRA_INPUT", "2.5"))
+V13_PRICE_TERRA_OUTPUT = float(os.environ.get("MM_V13_PRICE_TERRA_OUTPUT", "15.0"))
+V13_PRICE_LUNA_INPUT = float(os.environ.get("MM_V13_PRICE_LUNA_INPUT", "1.0"))
+V13_PRICE_LUNA_OUTPUT = float(os.environ.get("MM_V13_PRICE_LUNA_OUTPUT", "6.0"))
+V13_PRICE_EMBED_INPUT = float(os.environ.get("MM_V13_PRICE_EMBED_INPUT", "0.02"))
+
+# Both ASK and Root Cause stream valid JSON whitespace while processing. Bubble still
+# receives exactly one JSON object because the Worker calls response.text()/JSON.parse().
+V13_STREAM_HEARTBEAT_ENABLED = (os.environ.get("MM_V13_STREAM_HEARTBEAT_ENABLED") or "1").strip() != "0"
+V13_STREAM_HEARTBEAT_SECONDS = max(5, min(25, int(os.environ.get("MM_V13_STREAM_HEARTBEAT_SECONDS", "12"))))
+V13_STREAM_HEARTBEAT_BYTES = max(512, min(8192, int(os.environ.get("MM_V13_STREAM_HEARTBEAT_BYTES", "4096"))))
+
+# Semantic-cache entries are isolated by the complete active engine policy, not only
+# by the public marker. Changing a model/budget creates a new cache generation.
+V13_ENGINE_KEY = hashlib.sha256(
+    "|".join(
+        [
+            V13_CODE_MARKER,
+            V13_RELEASE_ID,
+            V13_PLANNER_MODEL,
+            V13_FAST_MODEL,
+            V13_HEAVY_MODEL,
+            V13_FAST_EFFORT,
+            V13_ASK_HEAVY_EFFORT,
+            V13_ROOT_HEAVY_EFFORT,
+            V13_HEAVY_REASONING_MODE or "standard",
+            str(V13_MAX_LLM_CALLS_ASK),
+            str(V13_MAX_LLM_CALLS_ROOT_CAUSE),
+            str(V13_FAST_CONTEXT_CHARS),
+            str(V13_HEAVY_CONTEXT_CHARS),
+            str(V13_FAST_MAX_OUTPUT_TOKENS),
+            str(V13_HEAVY_MAX_OUTPUT_TOKENS),
+        ]
+    ).encode("utf-8")
+).hexdigest()[:32]
 
 
-def _v11_response_text(data: dict) -> str:
+class _V13BudgetExceeded(RuntimeError):
+    pass
+
+
+class _V13RequestBudget:
+    def __init__(self, mode: str):
+        self.mode = str(mode or "ask").strip().lower()
+        self.started_monotonic = time_module.monotonic()
+        self.deadline_seconds = (
+            V13_ROOT_CAUSE_DEADLINE_SECONDS if self.mode == "root_cause" else V13_ASK_DEADLINE_SECONDS
+        )
+        self.deadline_monotonic = self.started_monotonic + float(self.deadline_seconds)
+        self.max_llm_calls = (
+            V13_MAX_LLM_CALLS_ROOT_CAUSE if self.mode == "root_cause" else V13_MAX_LLM_CALLS_ASK
+        )
+        self.max_estimated_cost_usd = (
+            V13_MAX_ESTIMATED_COST_ROOT_CAUSE_USD
+            if self.mode == "root_cause"
+            else V13_MAX_ESTIMATED_COST_ASK_USD
+        )
+        self.llm_calls = 0
+        self.estimated_cost_usd = 0.0
+        self.input_tokens = 0
+        self.cached_input_tokens = 0
+        self.cache_write_tokens = 0
+        self.output_tokens = 0
+        self.reasoning_tokens = 0
+        self.embedding_calls = 0
+        self.embedding_input_tokens = 0
+        self.embedding_cache_hits = 0
+        self.embedding_estimated_cost_usd = 0.0
+        self.call_log: list[dict] = []
+        self.embedding_cache: dict[tuple[str, str], list[float]] = {}
+        self.route = "unselected"
+        self.refinement_used = False
+        self.semantic_cache = "miss"
+
+    def elapsed(self) -> float:
+        return max(0.0, time_module.monotonic() - self.started_monotonic)
+
+    def remaining(self) -> float:
+        return max(0.0, self.deadline_monotonic - time_module.monotonic())
+
+    def ensure_time(self, minimum_seconds: float = 2.0) -> None:
+        if self.remaining() < float(minimum_seconds):
+            raise _V13BudgetExceeded(
+                f"V13 {self.mode} deadline exhausted after {self.elapsed():.2f}s"
+            )
+
+    def reserve_call(
+        self,
+        *,
+        model: str,
+        purpose: str,
+        requested_timeout: int,
+        max_output_tokens: int,
+        messages: list[dict],
+    ) -> tuple[int, int, int]:
+        self.ensure_time(4.0)
+        if self.llm_calls >= self.max_llm_calls:
+            raise _V13BudgetExceeded(
+                f"V13 {self.mode} LLM call budget exhausted ({self.llm_calls}/{self.max_llm_calls})"
+            )
+        if self.estimated_cost_usd >= self.max_estimated_cost_usd:
+            raise _V13BudgetExceeded(
+                f"V13 {self.mode} estimated cost budget exhausted ({self.estimated_cost_usd:.4f} USD)"
+            )
+
+        message_chars = 0
+        for msg in messages or []:
+            try:
+                message_chars += len(json.dumps(msg, ensure_ascii=False))
+            except Exception:
+                message_chars += len(str(msg))
+        approx_input_tokens = max(1, int(math.ceil(message_chars / 3.0)))
+
+        remaining = self.remaining()
+        timeout = max(5, min(int(requested_timeout or 30), int(max(5.0, remaining - 2.0))))
+        output_cap = max(800, int(max_output_tokens or 2000))
+
+        # Enforce the monetary budget before the request. Reasoning tokens are part of
+        # output_tokens, so max_output_tokens is also the hard cost ceiling.
+        input_rate, output_rate = _v13_model_rates(model)
+        remaining_cost = max(0.0, self.max_estimated_cost_usd - self.estimated_cost_usd)
+        affordable_output = int(
+            max(0.0, (remaining_cost * 1_000_000.0 - approx_input_tokens * input_rate) / max(0.000001, output_rate))
+        )
+        output_cap = min(output_cap, affordable_output)
+        if output_cap < 800:
+            raise _V13BudgetExceeded(
+                f"V13 {self.mode} call would exceed cost budget ({self.estimated_cost_usd:.4f}/{self.max_estimated_cost_usd:.4f} USD)"
+            )
+
+        self.llm_calls += 1
+        call_index = self.llm_calls
+        self.call_log.append(
+            {
+                "call": call_index,
+                "model": str(model or ""),
+                "purpose": str(purpose or "reasoning"),
+                "timeout_seconds": timeout,
+                "max_output_tokens": output_cap,
+                "approx_input_tokens": approx_input_tokens,
+                "started_at_elapsed_seconds": round(self.elapsed(), 3),
+            }
+        )
+        return timeout, output_cap, call_index
+
+    def record_usage(self, call_index: int, model: str, usage: dict) -> None:
+        usage = usage if isinstance(usage, dict) else {}
+        input_tokens = int(
+            usage.get("input_tokens")
+            or usage.get("prompt_tokens")
+            or 0
+        )
+        output_tokens = int(
+            usage.get("output_tokens")
+            or usage.get("completion_tokens")
+            or 0
+        )
+        input_details = usage.get("input_tokens_details") or usage.get("prompt_tokens_details") or {}
+        output_details = usage.get("output_tokens_details") or usage.get("completion_tokens_details") or {}
+        cached_input_tokens = int((input_details or {}).get("cached_tokens") or 0)
+        cache_write_tokens = int((input_details or {}).get("cache_write_tokens") or 0)
+        reasoning_tokens = int(
+            (output_details or {}).get("reasoning_tokens")
+            or usage.get("reasoning_tokens")
+            or 0
+        )
+        self.input_tokens += input_tokens
+        self.cached_input_tokens += cached_input_tokens
+        self.cache_write_tokens += cache_write_tokens
+        self.output_tokens += output_tokens
+        self.reasoning_tokens += reasoning_tokens
+        call_cost = _v13_estimate_model_cost_usd(
+            model,
+            input_tokens,
+            output_tokens,
+            cached_input_tokens=cached_input_tokens,
+            cache_write_tokens=cache_write_tokens,
+        )
+        self.estimated_cost_usd += call_cost
+
+        for row in self.call_log:
+            if int(row.get("call") or 0) == int(call_index):
+                row["input_tokens"] = input_tokens
+                row["cached_input_tokens"] = cached_input_tokens
+                row["cache_write_tokens"] = cache_write_tokens
+                row["output_tokens"] = output_tokens
+                row["reasoning_tokens"] = reasoning_tokens
+                row["estimated_cost_usd"] = round(call_cost, 6)
+                row["completed_at_elapsed_seconds"] = round(self.elapsed(), 3)
+                break
+
+
+    def record_embedding(self, *, input_tokens: int, cache_hits: int = 0) -> None:
+        tokens = max(0, int(input_tokens or 0))
+        self.embedding_calls += 1
+        self.embedding_input_tokens += tokens
+        self.embedding_cache_hits += max(0, int(cache_hits or 0))
+        cost = (tokens * float(V13_PRICE_EMBED_INPUT or 0.0)) / 1_000_000.0
+        self.embedding_estimated_cost_usd += cost
+        self.estimated_cost_usd += cost
+
+    def public_meta(self) -> dict:
+        return {
+            "engine": "v13",
+            "route": self.route,
+            "elapsed_seconds": round(self.elapsed(), 3),
+            "deadline_seconds": self.deadline_seconds,
+            "llm_calls": self.llm_calls,
+            "max_llm_calls": self.max_llm_calls,
+            "input_tokens": self.input_tokens,
+            "cached_input_tokens": self.cached_input_tokens,
+            "cache_write_tokens": self.cache_write_tokens,
+            "output_tokens": self.output_tokens,
+            "reasoning_tokens": self.reasoning_tokens,
+            "embedding_calls": self.embedding_calls,
+            "embedding_input_tokens": self.embedding_input_tokens,
+            "embedding_cache_hits": self.embedding_cache_hits,
+            "embedding_estimated_cost_usd": round(self.embedding_estimated_cost_usd, 8),
+            "estimated_cost_usd": round(self.estimated_cost_usd, 6),
+            "max_estimated_cost_usd": self.max_estimated_cost_usd,
+            "refinement_used": bool(self.refinement_used),
+            "semantic_cache": self.semantic_cache,
+            "calls": list(self.call_log),
+        }
+
+
+_V13_BUDGET_CTX = contextvars.ContextVar("machinemind_v13_budget", default=None)
+
+
+def _v13_current_budget() -> Optional[_V13RequestBudget]:
+    try:
+        value = _V13_BUDGET_CTX.get()
+        return value if isinstance(value, _V13RequestBudget) else None
+    except Exception:
+        return None
+
+
+def _v13_model_rates(model: str) -> tuple[float, float]:
+    name = str(model or "").strip().lower()
+    if "gpt-5.6-sol" in name:
+        return V13_PRICE_SOL_INPUT, V13_PRICE_SOL_OUTPUT
+    if "gpt-5.6-terra" in name:
+        return V13_PRICE_TERRA_INPUT, V13_PRICE_TERRA_OUTPUT
+    if "gpt-5.6-luna" in name:
+        return V13_PRICE_LUNA_INPUT, V13_PRICE_LUNA_OUTPUT
+    # Conservative fallback used only for runtime accounting.
+    return V13_PRICE_SOL_INPUT, V13_PRICE_SOL_OUTPUT
+
+
+def _v13_estimate_model_cost_usd(
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    *,
+    cached_input_tokens: int = 0,
+    cache_write_tokens: int = 0,
+) -> float:
+    input_rate, output_rate = _v13_model_rates(model)
+    total_input = max(0, int(input_tokens or 0))
+    cached = max(0, min(total_input, int(cached_input_tokens or 0)))
+    writes = max(0, min(total_input - cached, int(cache_write_tokens or 0)))
+    uncached = max(0, total_input - cached - writes)
+    return (
+        uncached * input_rate
+        + cached * input_rate * 0.10
+        + writes * input_rate * 1.25
+        + max(0, int(output_tokens or 0)) * output_rate
+    ) / 1_000_000.0
+
+
+def _v13_safety_identifier(company_id: str) -> str:
+    raw = str(company_id or "").encode("utf-8", errors="ignore")
+    return "mm_" + hashlib.sha256(raw).hexdigest()[:40]
+
+
+def _v13_response_text(data: dict) -> str:
     direct = data.get("output_text")
     if isinstance(direct, str) and direct.strip():
         return direct.strip()
@@ -16232,11 +16621,12 @@ def _v11_response_text(data: dict) -> str:
         for content in item.get("content") or []:
             if not isinstance(content, dict):
                 continue
-            ctype = str(content.get("type") or "")
-            if ctype == "output_text" and str(content.get("text") or "").strip():
+            content_type = str(content.get("type") or "")
+            if content_type == "output_text" and str(content.get("text") or "").strip():
                 parts.append(str(content.get("text") or "").strip())
-            elif ctype == "refusal" and str(content.get("refusal") or "").strip():
+            elif content_type == "refusal" and str(content.get("refusal") or "").strip():
                 refusals.append(str(content.get("refusal") or "").strip())
+
     if parts:
         return "\n".join(parts).strip()
     if refusals:
@@ -16244,20 +16634,34 @@ def _v11_response_text(data: dict) -> str:
     raise RuntimeError("OpenAI Responses API returned no output_text")
 
 
-def _v11_responses_json(
+def _v13_responses_json(
     messages: list[dict],
     *,
     model: str,
     json_schema: dict,
     effort: str,
     reasoning_mode: str = "",
-    timeout: Optional[int] = None,
-    safety_identifier: str = "",
+    timeout: int,
+    max_output_tokens: int,
+    company_id: str,
+    purpose: str,
 ) -> dict:
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY missing")
 
-    schema_name = str(json_schema.get("name") or "machinemind_output")
+    budget = _v13_current_budget()
+    if budget is None:
+        raise RuntimeError("V13 budget context missing")
+
+    timeout, output_cap, call_index = budget.reserve_call(
+        model=model,
+        purpose=purpose,
+        requested_timeout=timeout,
+        max_output_tokens=max_output_tokens,
+        messages=messages,
+    )
+
+    schema_name = str(json_schema.get("name") or "machinemind_v13_output")
     schema_body = json_schema.get("schema") or {}
     payload: dict[str, Any] = {
         "model": model,
@@ -16272,53 +16676,42 @@ def _v11_responses_json(
                 "schema": schema_body,
             }
         },
-        # Reasoning tokens count against this budget. Keep enough headroom for
-        # GPT-5.6 Sol Pro/xhigh while the visible JSON remains compact.
-        "max_output_tokens": max(4000, int(REASONING_V11_MAX_OUTPUT_TOKENS or 24000)),
+        "max_output_tokens": output_cap,
+        "safety_identifier": _v13_safety_identifier(company_id),
     }
     if reasoning_mode:
         payload["reasoning"]["mode"] = reasoning_mode
-    if safety_identifier:
-        payload["safety_identifier"] = safety_identifier[:64]
 
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json",
     }
-    attempts = max(1, min(int(REASONING_V11_OPENAI_RETRIES or 3), 5))
-    last_error = "unknown error"
-    data: dict = {}
-    for attempt in range(attempts):
-        try:
-            response = requests.post(
-                OPENAI_RESPONSES_URL,
-                headers=headers,
-                json=payload,
-                timeout=max(30, int(timeout or REASONING_V11_TIMEOUT or 240)),
-            )
-            if response.status_code == 200:
-                data = response.json()
-                break
-            last_error = f"HTTP {response.status_code}: {response.text[:1200]}"
-            transient = response.status_code in {408, 409, 429, 500, 502, 503, 504}
-            if not transient or attempt + 1 >= attempts:
-                raise RuntimeError("OpenAI Responses failed: " + last_error)
-        except requests.RequestException as exc:
-            last_error = f"request error: {str(exc)[:800]}"
-            if attempt + 1 >= attempts:
-                raise RuntimeError("OpenAI Responses failed: " + last_error)
-        time_module.sleep(min(4.0, 0.8 * (2 ** attempt)))
-    else:
-        raise RuntimeError("OpenAI Responses failed: " + last_error)
+
+    response = requests.post(
+        OPENAI_RESPONSES_URL,
+        headers=headers,
+        json=payload,
+        timeout=timeout,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"OpenAI Responses failed: HTTP {response.status_code}: {response.text[:1200]}"
+        )
+
+    data = response.json()
+    budget.record_usage(call_index, model, data.get("usage") or {})
 
     status = str(data.get("status") or "completed").strip().lower()
     if status == "incomplete":
         details = json.dumps(data.get("incomplete_details") or {}, ensure_ascii=False)[:700]
         raise RuntimeError(f"OpenAI Responses incomplete: {details}")
     if status in {"failed", "cancelled"}:
-        raise RuntimeError(f"OpenAI Responses status={status}: {json.dumps(data.get('error') or {}, ensure_ascii=False)[:700]}")
+        raise RuntimeError(
+            f"OpenAI Responses status={status}: "
+            f"{json.dumps(data.get('error') or {}, ensure_ascii=False)[:700]}"
+        )
 
-    text = _v11_response_text(data)
+    text = _v13_response_text(data)
     try:
         parsed = json.loads(text)
     except Exception as exc:
@@ -16328,51 +16721,862 @@ def _v11_responses_json(
     return parsed
 
 
-def _v11_json_models(
+def _v13_json_models(
     messages: list[dict],
     *,
     models: list[str],
     json_schema: dict,
     effort: str,
-    reasoning_mode: str = "",
-    timeout: Optional[int] = None,
-    safety_identifier: str = "",
-) -> dict:
+    reasoning_mode: str,
+    timeout: int,
+    max_output_tokens: int,
+    company_id: str,
+    purpose: str,
+) -> tuple[dict, str]:
     candidates = _normalize_model_candidates(models)
     if not candidates:
-        candidates = [REASONING_V11_MODEL]
+        candidates = [V13_FAST_MODEL]
+
     errors: list[str] = []
     for model in candidates:
         try:
             if str(model).startswith("gpt-5.6"):
-                return _v11_responses_json(
-                    messages,
-                    model=model,
-                    json_schema=json_schema,
-                    effort=effort,
-                    reasoning_mode=reasoning_mode,
-                    timeout=timeout,
-                    safety_identifier=safety_identifier,
+                return (
+                    _v13_responses_json(
+                        messages,
+                        model=model,
+                        json_schema=json_schema,
+                        effort=effort,
+                        reasoning_mode=reasoning_mode,
+                        timeout=timeout,
+                        max_output_tokens=max_output_tokens,
+                        company_id=company_id,
+                        purpose=purpose,
+                    ),
+                    model,
                 )
-            return _openai_chat_json(
+
+            budget = _v13_current_budget()
+            if budget is None:
+                raise RuntimeError("V13 budget context missing")
+            call_timeout, _output_cap, call_index = budget.reserve_call(
+                model=model,
+                purpose=purpose,
+                requested_timeout=timeout,
+                max_output_tokens=max_output_tokens,
+                messages=messages,
+            )
+            parsed = _openai_chat_json(
                 messages,
                 model=model,
                 json_schema=json_schema,
-                timeout=max(30, int(timeout or REASONING_V11_TIMEOUT or 240)),
+                timeout=call_timeout,
             )
+            # Legacy helper does not expose usage; keep accounting conservative.
+            budget.record_usage(call_index, model, {})
+            return parsed, model
+        except _V13BudgetExceeded as exc:
+            # If a previous model was already attempted, do not turn the lack of
+            # fallback budget into a global request failure. Let the caller use its
+            # grounded deterministic fallback instead. A budget rejection before
+            # any model attempt still propagates to the protected budget response.
+            if errors:
+                errors.append(f"{model}: fallback skipped by budget: {str(exc)[:300]}")
+                break
+            raise
         except Exception as exc:
             errors.append(f"{model}: {str(exc)[:500]}")
-    raise RuntimeError("All V11 model calls failed: " + " | ".join(errors)[:1800])
+
+    raise RuntimeError("All V13 model calls failed: " + " | ".join(errors)[:1800])
 
 
-def _v11_safety_identifier(company_id: str) -> str:
-    raw = str(company_id or "").encode("utf-8", errors="ignore")
-    return "mm_" + hashlib.sha256(raw).hexdigest()[:40]
+# -----------------------------------------------------------------------------
+# V13 semantic cache and knowledge versioning
+# -----------------------------------------------------------------------------
+
+_V13_CACHE_LOCK = threading.Lock()
+_V13_CACHE_READY: Optional[bool] = None
+_V13_CACHE_ERROR = ""
+_V13_CACHE_RETRY_AT = 0.0
 
 
-def _v11_query_plan_schema() -> dict:
+def _v13_cache_bootstrap() -> bool:
+    global _V13_CACHE_READY, _V13_CACHE_ERROR, _V13_CACHE_RETRY_AT
+
+    if not V13_SEMANTIC_CACHE_ENABLED:
+        return False
+    if _V13_CACHE_READY is True:
+        return True
+    now = time_module.monotonic()
+    if _V13_CACHE_READY is False and now < float(_V13_CACHE_RETRY_AT or 0.0):
+        return False
+
+    with _V13_CACHE_LOCK:
+        now = time_module.monotonic()
+        if _V13_CACHE_READY is True:
+            return True
+        if _V13_CACHE_READY is False and now < float(_V13_CACHE_RETRY_AT or 0.0):
+            return False
+        if _V13_CACHE_READY is False:
+            _V13_CACHE_READY = None
+        if not V13_SEMANTIC_CACHE_AUTO_DDL:
+            _V13_CACHE_READY = True
+            return True
+
+        conn = None
+        try:
+            conn = _db_conn()
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS public.mm_v13_knowledge_versions (
+                        company_id TEXT PRIMARY KEY,
+                        version BIGINT NOT NULL DEFAULT 1,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS public.mm_v13_semantic_cache (
+                        id BIGSERIAL PRIMARY KEY,
+                        company_id TEXT NOT NULL,
+                        machine_id TEXT NOT NULL DEFAULT '',
+                        ai_scope TEXT NOT NULL,
+                        scope_key TEXT NOT NULL,
+                        mode TEXT NOT NULL,
+                        language TEXT NOT NULL,
+                        engine_key TEXT NOT NULL DEFAULT '',
+                        knowledge_version BIGINT NOT NULL,
+                        query_hash TEXT,
+                        query_text TEXT NOT NULL,
+                        query_embedding JSONB NOT NULL,
+                        response_json JSONB NOT NULL,
+                        quality_score DOUBLE PRECISION NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        expires_at TIMESTAMPTZ NOT NULL
+                    );
+                    """
+                )
+                cur.execute(
+                    """
+                    ALTER TABLE public.mm_v13_semantic_cache
+                        ADD COLUMN IF NOT EXISTS engine_key TEXT NOT NULL DEFAULT '',
+                        ADD COLUMN IF NOT EXISTS query_hash TEXT;
+                    """
+                )
+                cur.execute(
+                    """
+                    UPDATE public.mm_v13_semantic_cache
+                    SET query_hash = 'legacy:' || md5(
+                        COALESCE(engine_key, '') || E'\n' ||
+                        COALESCE(query_text, '') || E'\n' || id::text
+                    )
+                    WHERE query_hash IS NULL OR btrim(query_hash) = '';
+                    """
+                )
+                cur.execute(
+                    """
+                    DELETE FROM public.mm_v13_semantic_cache older
+                    USING public.mm_v13_semantic_cache newer
+                    WHERE older.id < newer.id
+                      AND older.company_id = newer.company_id
+                      AND older.machine_id = newer.machine_id
+                      AND older.ai_scope = newer.ai_scope
+                      AND older.scope_key = newer.scope_key
+                      AND older.mode = newer.mode
+                      AND older.language = newer.language
+                      AND older.engine_key = newer.engine_key
+                      AND older.knowledge_version = newer.knowledge_version
+                      AND older.query_hash = newer.query_hash;
+                    """
+                )
+                cur.execute(
+                    """
+                    ALTER TABLE public.mm_v13_semantic_cache
+                        ALTER COLUMN query_hash SET NOT NULL;
+                    """
+                )
+                cur.execute(
+                    """
+                    ALTER TABLE public.mm_v13_semantic_cache
+                        DROP CONSTRAINT IF EXISTS mm_v13_semantic_cache_exact_key;
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS uq_mm_v13_semantic_cache_key
+                    ON public.mm_v13_semantic_cache (
+                        company_id, machine_id, ai_scope, scope_key,
+                        mode, language, engine_key, knowledge_version, query_hash
+                    );
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_mm_v13_semantic_cache_lookup
+                    ON public.mm_v13_semantic_cache (
+                        company_id, machine_id, ai_scope, scope_key,
+                        mode, language, engine_key, knowledge_version, expires_at DESC
+                    );
+                    """
+                )
+            conn.commit()
+            _V13_CACHE_READY = True
+            _V13_CACHE_ERROR = ""
+            _V13_CACHE_RETRY_AT = 0.0
+        except Exception as exc:
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            _V13_CACHE_READY = False
+            _V13_CACHE_ERROR = str(exc)[:800]
+            _V13_CACHE_RETRY_AT = time_module.monotonic() + float(V13_SEMANTIC_CACHE_BOOTSTRAP_RETRY_SECONDS)
+            print("V13_CACHE_BOOTSTRAP_RETRY", _V13_CACHE_ERROR)
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    return bool(_V13_CACHE_READY)
+
+
+def _v13_normalize_query(value: str) -> str:
+    value = _normalize_unicode_advanced(str(value or "")).lower()
+    value = re.sub(r"\s+", " ", value).strip()
+    return value
+
+
+def _v13_scope_key(scope: dict) -> str:
+    doc_ids = _normalize_document_ids(scope.get("document_ids")) or []
+    bubble_document_id = str(scope.get("bubble_document_id") or "").strip()
+    payload = {
+        "ai_scope": str(scope.get("ai_scope") or "machine_all"),
+        "bubble_document_id": bubble_document_id,
+        "document_ids": sorted(doc_ids),
+        "top_k": _safe_int(scope.get("_v13_top_k"), 0),
+        "max_causes": _safe_int(scope.get("_v13_max_causes"), 0),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:40]
+
+
+def _v13_get_knowledge_version(company_id: str) -> int:
+    if not _v13_cache_bootstrap():
+        return 0
+    company_id = str(company_id or "").strip()
+    if not company_id:
+        return 0
+
+    conn = None
+    try:
+        conn = _db_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO public.mm_v13_knowledge_versions(company_id, version, updated_at)
+                VALUES (%s, 1, NOW())
+                ON CONFLICT (company_id) DO NOTHING;
+                """,
+                (company_id,),
+            )
+            cur.execute(
+                "SELECT version FROM public.mm_v13_knowledge_versions WHERE company_id=%s;",
+                (company_id,),
+            )
+            row = cur.fetchone()
+        conn.commit()
+        return int((row or [1])[0] or 1)
+    except Exception as exc:
+        if conn is not None:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        print("V13_CACHE_VERSION_FAIL_OPEN", str(exc)[:500])
+        return 0
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _v13_bump_knowledge_version(company_id: str) -> None:
+    company_id = str(company_id or "").strip()
+    if not company_id or not _v13_cache_bootstrap():
+        return
+
+    conn = _db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO public.mm_v13_knowledge_versions(company_id, version, updated_at)
+                VALUES (%s, 1, NOW())
+                ON CONFLICT (company_id)
+                DO UPDATE SET version = public.mm_v13_knowledge_versions.version + 1,
+                              updated_at = NOW();
+                """,
+                (company_id,),
+            )
+            cur.execute(
+                "DELETE FROM public.mm_v13_semantic_cache WHERE company_id=%s;",
+                (company_id,),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _v13_invalidate_company_knowledge(company_id: str) -> None:
+    try:
+        _v13_bump_knowledge_version(company_id)
+    except Exception as exc:
+        # Cache invalidation must never break ingest/delete/indexing.
+        print("V13_CACHE_INVALIDATION_SKIPPED", str(exc)[:500])
+
+
+def _v13_cache_code_tokens(q: str) -> list[str]:
+    """Return only identifier-like tokens that are safe semantic-cache guards.
+
+    The generic retrieval helper intentionally accepts title-case words such as
+    ``Protection`` as potential codes. That is useful for recall, but too strict for
+    cache compatibility: harmless paraphrases or capitalization changes would miss.
+    Here we keep only tokens that look like actual industrial identifiers: tokens
+    containing digits/separators, or acronyms written fully in uppercase.
+    """
+    text = _normalize_unicode_advanced(q or "")
+    raw = re.findall(r"(?<![A-Za-z0-9])[A-Za-z0-9][A-Za-z0-9_.:/\-]{1,63}(?![A-Za-z0-9])", text)
+    out: list[str] = []
+    seen: set[str] = set()
+    for token in raw:
+        token = str(token or "").strip("._:/-")
+        if not token or token.isdigit():
+            continue
+        letters = "".join(ch for ch in token if ch.isalpha())
+        has_digit = any(ch.isdigit() for ch in token)
+        has_separator = any(ch in "_./:-" for ch in token)
+        is_acronym = bool(letters) and len(letters) >= 2 and letters.upper() == letters
+        if not (has_digit or has_separator or is_acronym):
+            continue
+        key = token.upper()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return sorted(out)
+
+
+def _v13_query_number_tokens(q: str) -> list[str]:
+    """Extract numeric constraints without swallowing ordinary following words.
+
+    The previous broad ``[A-Za-z]{1,8}`` suffix treated Italian ``1 a ogni ciclo``
+    as the quantity ``1a``. Numeric equality is a hard cache-safety guard, so that
+    false unit changed a safe paraphrase into a miss. Units are now accepted only
+    from a conservative industrial whitelist; single-letter electrical units remain
+    case-sensitive (``A``, ``V``, ``W``), avoiding the Italian article ``a``.
+    """
+    text = _normalize_unicode_advanced(q or "")
+    number_rx = re.compile(r"(?<![A-Za-z0-9])[-+]?\d+(?:[.,]\d+)?(?![A-Za-z0-9])")
+    # Longest first. Multi-letter units are matched case-insensitively below; the
+    # single-letter electrical units are handled separately and must be uppercase.
+    multi_units = [
+        "mm/min", "mm/sec", "mm/s", "m/min", "m/sec", "m/s", "l/min", "ml/min",
+        "mm2", "mm²", "cm2", "cm²", "m2", "m²", "mm3", "mm³", "cm3", "cm³", "m3", "m³",
+        "khz", "mhz", "hz", "rpm", "mbar", "kpa", "mpa", "psi", "bar", "pa",
+        "kwh", "kw", "mw", "ma", "ka", "mv", "kv", "nm", "kn",
+        "kg", "mg", "ml", "min", "ms", "µs", "us", "mm", "cm", "km",
+        "deg", "sec",
+    ]
+    multi_unit_rx = re.compile(
+        r"^\s*(" + "|".join(re.escape(x) for x in multi_units) + r")(?![A-Za-z0-9])",
+        flags=re.IGNORECASE,
+    )
+    symbol_unit_rx = re.compile(r"^\s*(%|°\s*[CFcf]?)(?![A-Za-z0-9])")
+    uppercase_single_rx = re.compile(r"^\s*([AVWNF])(?=$|[^A-Za-z0-9])")
+    lowercase_single_rx = re.compile(r"^\s*([smghl])(?=$|[^A-Za-z0-9])")
+
+    values: set[str] = set()
+    for match in number_rx.finditer(text):
+        number = str(match.group(0) or "").replace(",", ".")
+        tail = text[match.end(): match.end() + 24]
+        unit = ""
+        unit_match = symbol_unit_rx.match(tail)
+        if unit_match:
+            unit = re.sub(r"\s+", "", unit_match.group(1)).lower()
+        else:
+            unit_match = multi_unit_rx.match(tail)
+            if unit_match:
+                unit = re.sub(r"\s+", "", unit_match.group(1)).lower()
+            else:
+                unit_match = uppercase_single_rx.match(tail)
+                if unit_match:
+                    unit = unit_match.group(1).lower()
+                else:
+                    unit_match = lowercase_single_rx.match(tail)
+                    if unit_match:
+                        unit = unit_match.group(1).lower()
+        values.add(number.lower() + unit)
+    return sorted(values)
+
+
+def _v13_query_polarity_signature(q: str) -> tuple[str, ...]:
+    low = f" {_v13_normalize_query(q)} "
+    groups = {
+        "negation": [" non ", " not ", " no ", " senza ", " without ", " never ", " mai "],
+        "exclusive": [" solo ", " soltanto ", " only ", " esclusivamente ", " exclusively "],
+        "exception": [" tranne ", " eccetto ", " except ", " excluding ", " escluso "],
+        "before": [" prima ", " before ", " preventiv", " preliminar"],
+        "after": [" dopo ", " after ", " al termine ", " completed", " complet"],
+    }
+    return tuple(sorted(name for name, markers in groups.items() if any(marker in low for marker in markers)))
+
+
+def _v13_query_source_signature(q: str) -> tuple[str, str]:
+    try:
+        profile = _ask_source_preference_profile(q)
+        return (
+            str(profile.get("preferred_source") or ""),
+            str(profile.get("strength") or "none"),
+        )
+    except Exception:
+        return ("", "none")
+
+
+def _v13_semantic_cache_compatible(mode: str, current_q: str, cached_q: str) -> bool:
+    current_norm = _v13_normalize_query(current_q)
+    cached_norm = _v13_normalize_query(cached_q)
+    if not current_norm or not cached_norm:
+        return False
+
+    ratio = len(current_norm) / max(1, len(cached_norm))
+    if ratio < 0.55 or ratio > 1.80:
+        return False
+
+    current_codes = set(_v13_cache_code_tokens(current_q))
+    cached_codes = set(_v13_cache_code_tokens(cached_q))
+    if current_codes != cached_codes:
+        return False
+
+    if _v13_query_number_tokens(current_q) != _v13_query_number_tokens(cached_q):
+        return False
+
+    if _v13_query_polarity_signature(current_q) != _v13_query_polarity_signature(cached_q):
+        return False
+
+    if _v13_query_source_signature(current_q) != _v13_query_source_signature(cached_q):
+        return False
+
+    # Embedding similarity alone is not enough for industrial diagnostics. Require
+    # strong lexical-anchor preservation, especially when the symptom does not fall
+    # into one of the predefined broad classes.
+    current_terms = _content_term_set(current_q, limit=60)
+    cached_terms = _content_term_set(cached_q, limit=60)
+    if current_norm != cached_norm:
+        if min(len(current_terms), len(cached_terms)) <= 2:
+            return False
+        anchor_ratio = len(current_terms & cached_terms) / max(1, min(len(current_terms), len(cached_terms)))
+        minimum_anchor_ratio = 0.70 if str(mode or "") == "root_cause" else 0.55
+        if anchor_ratio < minimum_anchor_ratio:
+            return False
+
+    if str(mode or "") == "root_cause":
+        current_profile = _query_symptom_profile(current_q)
+        cached_profile = _query_symptom_profile(cached_q)
+        if set(current_profile.get("classes") or []) != set(cached_profile.get("classes") or []):
+            return False
+        if bool(current_profile.get("automatic_mode")) != bool(cached_profile.get("automatic_mode")):
+            return False
+
+    return True
+
+
+def _v13_jsonb_to_python(value: Any, fallback: Any) -> Any:
+    if value is None:
+        return fallback
+    if isinstance(value, (dict, list)):
+        return value
+    try:
+        return json.loads(str(value))
+    except Exception:
+        return fallback
+
+
+def _v13_cache_lookup(
+    *,
+    mode: str,
+    q: str,
+    company_id: str,
+    machine_id: str,
+    scope: dict,
+    language: str,
+    debug: bool,
+) -> Optional[dict]:
+    budget = _v13_current_budget()
+    if budget is not None:
+        budget.semantic_cache = "bypass_debug" if debug else "miss"
+    if debug or not V13_SEMANTIC_CACHE_ENABLED or not _v13_cache_bootstrap():
+        return None
+
+    knowledge_version = _v13_get_knowledge_version(company_id)
+    if knowledge_version <= 0:
+        return None
+
+    scope_key = _v13_scope_key(scope)
+    ai_scope = str(scope.get("ai_scope") or "machine_all")
+    machine_key = str(machine_id or "")
+
+    # Phase 1 intentionally does not fetch JSON embeddings. Most cached questions are
+    # rejected by deterministic code/number/polarity/source guards, so transferring
+    # dozens of 1,536-float arrays on every request would add avoidable DB latency.
+    conn = None
+    try:
+        conn = _db_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, query_text, response_json, quality_score, created_at
+                FROM public.mm_v13_semantic_cache
+                WHERE company_id=%s
+                  AND machine_id=%s
+                  AND ai_scope=%s
+                  AND scope_key=%s
+                  AND mode=%s
+                  AND language=%s
+                  AND engine_key=%s
+                  AND knowledge_version=%s
+                  AND expires_at > NOW()
+                  AND quality_score >= %s
+                ORDER BY created_at DESC
+                LIMIT %s;
+                """,
+                (
+                    company_id,
+                    machine_key,
+                    ai_scope,
+                    scope_key,
+                    mode,
+                    language,
+                    V13_ENGINE_KEY,
+                    knowledge_version,
+                    V13_SEMANTIC_CACHE_MIN_QUALITY,
+                    V13_SEMANTIC_CACHE_SCAN_LIMIT,
+                ),
+            )
+            rows = cur.fetchall()
+    except Exception as exc:
+        print("V13_CACHE_LOOKUP_FAIL_OPEN", str(exc)[:500])
+        return None
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    if not rows:
+        return None
+
+    threshold = (
+        V13_SEMANTIC_CACHE_THRESHOLD_ROOT_CAUSE
+        if mode == "root_cause"
+        else V13_SEMANTIC_CACHE_THRESHOLD_ASK
+    )
+    best: Optional[tuple[float, dict, float, Any]] = None
+    current_norm = _v13_normalize_query(q)
+
+    # Exact normalized reuse is safe after scope/engine/knowledge filtering and avoids
+    # both an embedding round-trip and reading stored embedding arrays.
+    for _row_id, cached_q, response_json, quality_score, created_at in rows:
+        if _v13_normalize_query(str(cached_q or "")) != current_norm:
+            continue
+        response = _v13_jsonb_to_python(response_json, {})
+        if isinstance(response, dict) and response.get("ok") is True:
+            best = (1.0, response, float(quality_score or 0.0), created_at)
+            break
+
+    if best is None:
+        compatible_rows = [
+            row for row in rows
+            if _v13_semantic_cache_compatible(mode, q, str(row[1] or ""))
+        ]
+        if not compatible_rows:
+            return None
+
+        try:
+            q_vec = _openai_embed_texts([q], timeout=10)[0]
+        except Exception as exc:
+            print("V13_CACHE_EMBED_LOOKUP_FAIL", str(exc)[:500])
+            return None
+
+        ids = [int(row[0]) for row in compatible_rows]
+        embedding_by_id: dict[int, list] = {}
+        conn = None
+        try:
+            conn = _db_conn()
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, query_embedding
+                    FROM public.mm_v13_semantic_cache
+                    WHERE id = ANY(%s);
+                    """,
+                    (ids,),
+                )
+                for row_id, embedding_json in cur.fetchall():
+                    embedding = _v13_jsonb_to_python(embedding_json, [])
+                    if isinstance(embedding, list) and embedding:
+                        embedding_by_id[int(row_id)] = embedding
+        except Exception as exc:
+            print("V13_CACHE_VECTOR_FETCH_FAIL_OPEN", str(exc)[:500])
+            return None
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        for row_id, _cached_q, response_json, quality_score, created_at in compatible_rows:
+            embedding = embedding_by_id.get(int(row_id)) or []
+            if not embedding:
+                continue
+            try:
+                similarity = float(_cosine_sim(q_vec, [float(x) for x in embedding]))
+            except Exception:
+                continue
+            if similarity < threshold:
+                continue
+            response = _v13_jsonb_to_python(response_json, {})
+            if not isinstance(response, dict) or response.get("ok") is not True:
+                continue
+            candidate = (similarity, response, float(quality_score or 0.0), created_at)
+            if best is None or candidate[0] > best[0]:
+                best = candidate
+
+    if best is None:
+        return None
+
+    similarity, response, quality_score, created_at = best
+    out = dict(response)
+    citations = list(out.get("citations") or [])
+    try:
+        out["rg_links"] = _build_rg_links(company_id, citations) if citations else []
+    except Exception as exc:
+        print("V13_CACHE_LINK_REFRESH_FAIL", str(exc)[:500])
+        out["rg_links"] = []
+
+    meta = dict(out.get("meta") or {})
+    meta["v13_semantic_cache"] = {
+        "hit": True,
+        "similarity": round(similarity, 6),
+        "quality_score": round(quality_score, 4),
+        "created_at": str(created_at or ""),
+        "knowledge_version": knowledge_version,
+    }
+    out["meta"] = meta
+    out["chat_model"] = "v13_semantic_cache"
+
+    if budget is not None:
+        budget.semantic_cache = "hit"
+        budget.route = "semantic_cache"
+    return out
+
+
+def _v13_response_quality(mode: str, response: dict) -> float:
+    if not isinstance(response, dict) or response.get("ok") is not True:
+        return 0.0
+    if str(response.get("status") or "").lower() != "answered":
+        return 0.0
+
+    citations = [c for c in (response.get("citations") or []) if isinstance(c, dict) and c.get("citation_id")]
+    if not citations:
+        return 0.0
+
+    if mode == "root_cause":
+        causes = [c for c in (response.get("possible_causes") or []) if isinstance(c, dict)]
+        if not causes:
+            return 0.0
+        grounded = sum(1 for c in causes if c.get("cause") and c.get("why") and c.get("citations"))
+        checks = sum(len(c.get("checks") or []) for c in causes)
+        quality = 0.68 + min(0.16, 0.06 * grounded) + min(0.10, 0.025 * checks)
+        if len({_root_cause_evidence_family_key(cit) for cit in citations}) >= 2:
+            quality += 0.04
+        return max(0.0, min(0.98, quality))
+
+    answer = str(response.get("answer") or "").strip()
+    if len(answer) < 32:
+        return 0.0
+    quality = 0.72 + min(0.12, len(citations) * 0.025)
+    if any(bool(c.get("exact_machine_scope")) for c in citations):
+        quality += 0.04
+    if any(str(c.get("evidence_role") or "") in {"procedure", "step", "manual_support"} for c in citations):
+        quality += 0.05
+    return max(0.0, min(0.98, quality))
+
+
+def _v13_cache_store(
+    *,
+    mode: str,
+    q: str,
+    company_id: str,
+    machine_id: str,
+    scope: dict,
+    language: str,
+    response: dict,
+    debug: bool,
+) -> None:
+    if debug or not V13_SEMANTIC_CACHE_ENABLED or not _v13_cache_bootstrap():
+        return
+    response_meta = response.get("meta") or {}
+    if response_meta.get("cacheable") is False or response_meta.get("semantic_cacheable") is False:
+        return
+
+    quality = _v13_response_quality(mode, response)
+    if quality < V13_SEMANTIC_CACHE_MIN_QUALITY:
+        return
+
+    # Never delay an already-completed user response by purchasing a new embedding
+    # solely for cache storage. Normal retrieval has already embedded the original
+    # query; if that vector is unavailable, skip this optional cache write.
+    budget = _v13_current_budget()
+    if budget is not None and (OPENAI_EMBED_MODEL, str(q or "")) not in budget.embedding_cache:
+        return
+
+    try:
+        embedding = _openai_embed_texts([q], timeout=10)[0]
+    except Exception as exc:
+        print("V13_CACHE_EMBED_STORE_FAIL", str(exc)[:500])
+        return
+
+    knowledge_version = _v13_get_knowledge_version(company_id)
+    if knowledge_version <= 0:
+        return
+
+    normalized_q = _v13_normalize_query(q)
+    query_hash = hashlib.sha256((V13_ENGINE_KEY + "\n" + normalized_q).encode("utf-8")).hexdigest()
+    ai_scope = str(scope.get("ai_scope") or "machine_all")
+    scope_key = _v13_scope_key(scope)
+    machine_key = str(machine_id or "")
+
+    stored_response = dict(response)
+    stored_response.pop("debug", None)
+    # Links are refreshed on every cache hit, avoiding stale signed URLs.
+    stored_response["rg_links"] = []
+    meta = dict(stored_response.get("meta") or {})
+    meta.pop("v13_runtime", None)
+    meta.pop("v13_semantic_cache", None)
+    stored_response["meta"] = meta
+
+    conn = None
+    try:
+        conn = _db_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO public.mm_v13_semantic_cache(
+                    company_id, machine_id, ai_scope, scope_key,
+                    mode, language, engine_key, knowledge_version,
+                    query_hash, query_text, query_embedding,
+                    response_json, quality_score, created_at, expires_at
+                )
+                VALUES (
+                    %s, %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s, %s::jsonb,
+                    %s::jsonb, %s, NOW(), NOW() + (%s * INTERVAL '1 second')
+                )
+                ON CONFLICT (
+                    company_id, machine_id, ai_scope, scope_key,
+                    mode, language, engine_key, knowledge_version, query_hash
+                )
+                DO UPDATE SET
+                    engine_key=EXCLUDED.engine_key,
+                    query_text=EXCLUDED.query_text,
+                    query_embedding=EXCLUDED.query_embedding,
+                    response_json=EXCLUDED.response_json,
+                    quality_score=EXCLUDED.quality_score,
+                    created_at=NOW(),
+                    expires_at=EXCLUDED.expires_at;
+                """,
+                (
+                    company_id,
+                    machine_key,
+                    ai_scope,
+                    scope_key,
+                    mode,
+                    language,
+                    V13_ENGINE_KEY,
+                    knowledge_version,
+                    query_hash,
+                    q,
+                    json.dumps(embedding),
+                    json.dumps(stored_response, ensure_ascii=False),
+                    quality,
+                    V13_SEMANTIC_CACHE_TTL_SECONDS,
+                ),
+            )
+            cur.execute(
+                "DELETE FROM public.mm_v13_semantic_cache WHERE expires_at <= NOW();"
+            )
+            cur.execute(
+                """
+                DELETE FROM public.mm_v13_semantic_cache
+                WHERE id IN (
+                    SELECT id
+                    FROM public.mm_v13_semantic_cache
+                    WHERE company_id=%s
+                    ORDER BY created_at DESC
+                    OFFSET %s
+                );
+                """,
+                (company_id, V13_SEMANTIC_CACHE_MAX_ROWS_PER_COMPANY),
+            )
+        conn.commit()
+    except Exception as exc:
+        if conn is not None:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        print("V13_CACHE_STORE_FAIL_OPEN", str(exc)[:500])
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+# -----------------------------------------------------------------------------
+# Deterministic retrieval and adaptive routing
+# -----------------------------------------------------------------------------
+
+
+def _v13_fallback_plan(q: str) -> dict:
+    q_norm = re.sub(r"\s+", " ", _normalize_unicode_advanced(q or "")).strip()
     return {
-        "name": "machinemind_query_plan_v11",
+        "intent": "diagnostic" if _should_route_ask_through_root_cause(q_norm) else "other",
+        "normalized_query": q_norm,
+        "query_language": _simple_query_language(q_norm),
+        "dense_queries": [q_norm] if q_norm else [],
+        "lexical_queries": [q_norm] if q_norm else [],
+        "exact_terms": _dedup_text_values(_extract_code_tokens(q_norm) + _v13_query_number_tokens(q_norm), limit=16),
+        "required_facets": _dedup_text_values(list(_content_term_set(q_norm, limit=12)), limit=10),
+        "ambiguities": [],
+    }
+
+
+def _v13_query_plan_schema() -> dict:
+    return {
+        "name": "machinemind_v13_retrieval_plan",
         "strict": True,
         "schema": {
             "type": "object",
@@ -16380,15 +17584,12 @@ def _v11_query_plan_schema() -> dict:
             "properties": {
                 "intent": {
                     "type": "string",
-                    "enum": [
-                        "factual", "procedural", "diagnostic", "listing",
-                        "comparison", "explanation", "other"
-                    ],
+                    "enum": ["factual", "procedural", "diagnostic", "listing", "comparison", "explanation", "other"],
                 },
                 "normalized_query": {"type": "string"},
                 "query_language": {"type": "string", "enum": ["it", "en", "mixed", "other"]},
-                "dense_queries": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
-                "lexical_queries": {"type": "array", "items": {"type": "string"}, "maxItems": 10},
+                "dense_queries": {"type": "array", "items": {"type": "string"}, "maxItems": 6},
+                "lexical_queries": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
                 "exact_terms": {"type": "array", "items": {"type": "string"}, "maxItems": 16},
                 "required_facets": {"type": "array", "items": {"type": "string"}, "maxItems": 10},
                 "ambiguities": {"type": "array", "items": {"type": "string"}, "maxItems": 6},
@@ -16401,1784 +17602,2483 @@ def _v11_query_plan_schema() -> dict:
     }
 
 
-def _v11_query_plan(q: str, *, mode: str, company_id: str) -> dict:
+def _v13_plan_retrieval(*, q: str, mode: str, company_id: str) -> dict:
+    budget = _v13_current_budget()
+    if budget is None or budget.remaining() < V13_MIN_SECONDS_FOR_REFINEMENT:
+        return _v13_fallback_plan(q)
+
     system_msg = (
-        "Plan retrieval for an industrial knowledge assistant. Do not answer. "
-        "Infer the exact user intent and the evidence facets required to satisfy it. "
-        "Create a few semantic and lexical searches in Italian and English when useful. "
-        "Preserve codes, component names, process order and negations. Do not invent facts."
+        "Prepare one compact retrieval plan for an industrial evidence assistant. "
+        "Do not answer and do not propose causes. Preserve the exact meaning, codes, numbers, negations, timing, process state and requested source type. "
+        "Generate only a few high-value semantic and lexical rewrites in Italian and English when useful. "
+        "Do not inject unsupported components, sectors, alarms or failure modes."
     )
-    user_msg = f"MODE: {mode}\nQUERY:\n{q}"
+    user_msg = f"MODE: {mode}\nQUERY:\n{q}\n\nReturn a retrieval plan only."
+
     try:
-        parsed = _v11_json_models(
+        parsed, _model = _v13_json_models(
             [
                 {"role": "system", "content": system_msg},
                 {"role": "user", "content": user_msg},
             ],
-            models=[REASONING_V11_PLANNER_MODEL, REASONING_V11_SELECTOR_MODEL],
-            json_schema=_v11_query_plan_schema(),
-            effort=REASONING_V11_PLANNER_EFFORT,
-            reasoning_mode=REASONING_V11_PLANNER_MODE,
-            timeout=min(REASONING_V11_TIMEOUT, 120),
-            safety_identifier=_v11_safety_identifier(company_id),
+            models=[V13_PLANNER_MODEL],
+            json_schema=_v13_query_plan_schema(),
+            effort="low",
+            reasoning_mode="",
+            timeout=V13_PLANNER_TIMEOUT_SECONDS,
+            max_output_tokens=V13_PLANNER_MAX_OUTPUT_TOKENS,
+            company_id=company_id,
+            purpose=f"{mode}_retrieval_refinement",
         )
-        plan = dict(parsed or {})
     except Exception as exc:
-        legacy = _semantic_query_plan(q, mode=f"v11_{mode}_fallback")
-        legacy = _augment_crosslingual_query_plan(q, legacy)
-        plan = {
-            "intent": "diagnostic" if mode == "root_cause" else "other",
-            "normalized_query": legacy.get("normalized_query") or q,
-            "query_language": legacy.get("query_language") or _simple_query_language(q),
-            "dense_queries": list(legacy.get("dense_queries") or []) + list(legacy.get("crosslingual_dense_queries") or []),
-            "lexical_queries": list(legacy.get("lexical_queries") or []) + list(legacy.get("crosslingual_lexical_queries") or []),
-            "exact_terms": _extract_code_tokens(q),
-            "required_facets": [q],
-            "ambiguities": [f"planner_fallback: {str(exc)[:180]}"],
-        }
+        print("V13_RETRIEVAL_PLAN_FAIL", str(exc)[:700])
+        return _v13_fallback_plan(q)
 
-    plan["normalized_query"] = re.sub(r"\s+", " ", str(plan.get("normalized_query") or q)).strip() or q
-    plan["dense_queries"] = _dedup_text_values(
-        [q, plan["normalized_query"]] + list(plan.get("dense_queries") or []),
-        limit=10,
+    fallback = _v13_fallback_plan(q)
+    parsed = dict(parsed or {})
+    parsed["normalized_query"] = re.sub(
+        r"\s+", " ", str(parsed.get("normalized_query") or fallback["normalized_query"])
+    ).strip()
+    parsed["dense_queries"] = _dedup_text_values(
+        [q, parsed.get("normalized_query")] + list(parsed.get("dense_queries") or []),
+        limit=V13_DENSE_QUERY_LIMIT + 1,
     )
-    plan["lexical_queries"] = _dedup_text_values(
-        [q, plan["normalized_query"]] + list(plan.get("lexical_queries") or []),
-        limit=12,
+    parsed["lexical_queries"] = _dedup_text_values(
+        [q, parsed.get("normalized_query")] + list(parsed.get("lexical_queries") or []),
+        limit=V13_LEXICAL_QUERY_LIMIT + 1,
     )
-    plan["exact_terms"] = _dedup_text_values(
-        list(plan.get("exact_terms") or []) + _extract_code_tokens(q),
+    parsed["exact_terms"] = _dedup_text_values(
+        list(parsed.get("exact_terms") or []) + fallback["exact_terms"],
         limit=18,
     )
-    plan["required_facets"] = _dedup_text_values(list(plan.get("required_facets") or []) or [q], limit=10)
-    return plan
-
-
-def _v11_sql_terms(q: str, planner: dict, *, limit: int = 20) -> list[str]:
-    raw: list[str] = []
-    raw.extend(str(x or "") for x in (planner.get("exact_terms") or []))
-    raw.extend(str(x or "") for x in (planner.get("lexical_queries") or []))
-    raw.extend(str(x or "") for x in (planner.get("dense_queries") or []))
-    raw.append(str(planner.get("normalized_query") or q))
-    raw.append(q)
-
-    out: list[str] = []
-    seen = set()
-    stop = _ask_structured_direct_stopwords()
-    for value in raw:
-        normalized = _normalize_unicode_advanced(value).lower()
-        phrases = [normalized.strip()]
-        phrases.extend(re.findall(r"[a-zà-öø-ÿ0-9][a-zà-öø-ÿ0-9_./\-]{2,}", normalized))
-        for term in phrases:
-            term = re.sub(r"\s+", " ", term).strip(" -–—:;,.()[]{}")
-            if len(term) < 3 or term in stop or term in seen:
-                continue
-            if len(term) > 90:
-                continue
-            seen.add(term)
-            out.append(term)
-            if len(out) >= limit:
-                return out
-    return out
-
-def _v11_auth_guard(x_ai_internal_secret: Optional[str]) -> None:
-    if not AI_INTERNAL_SECRET:
-        raise HTTPException(status_code=500, detail="AI_INTERNAL_SECRET missing")
-    if (x_ai_internal_secret or "").strip() != AI_INTERNAL_SECRET:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-
-def _v11_source_type(bubble_document_id: str) -> str:
-    value = str(bubble_document_id or "").strip().lower()
-    prefix = value.split(":", 1)[0] if ":" in value else ""
-    aliases = {
-        "procedure": "procedure",
-        "step": "step",
-        "ps": "ps",
-        "problem_solution": "ps",
-        "problemsolution": "ps",
-        "md_photo": "md_photo",
-        "md_video": "md_video",
-    }
-    return aliases.get(prefix, "document")
-
-
-def _v11_scope_role(row_machine_id: Any, requested_machine_id: str) -> str:
-    row_mid = str(row_machine_id or "").strip()
-    req_mid = str(requested_machine_id or "").strip()
-    if req_mid == COMPANY_GENERAL_MACHINE_SENTINEL:
-        return "company_general"
-    if row_mid and req_mid and row_mid == req_mid:
-        return "exact_machine"
-    if not row_mid:
-        return "company_general"
-    return "other_machine"
-
-
-def _v11_candidate_merge_key(item: dict) -> str:
-    cid = str(item.get("citation_id") or "").strip()
-    if cid:
-        return cid
-    return "|".join(
-        [
-            str(item.get("bubble_document_id") or ""),
-            str(int(item.get("page_from") or 0)),
-            str(int(item.get("page_to") or 0)),
-            str(int(item.get("chunk_index") or 0)),
-        ]
+    parsed["required_facets"] = _dedup_text_values(
+        list(parsed.get("required_facets") or []) + fallback["required_facets"],
+        limit=12,
     )
+    if budget is not None:
+        budget.refinement_used = True
+    return parsed
 
 
-def _v11_merge_candidate(existing: Optional[dict], incoming: dict) -> dict:
-    if existing is None:
-        out = dict(incoming)
-        out["dense_hits"] = int(out.get("dense_hits") or 0)
-        out["lexical_hits"] = int(out.get("lexical_hits") or 0)
-        out["page_overlap"] = float(out.get("page_overlap") or 0.0)
-        return out
-
-    out = dict(existing)
-    in_sim = float(incoming.get("similarity") or 0.0)
-    old_sim = float(out.get("similarity") or 0.0)
-    if in_sim > old_sim or len(str(incoming.get("chunk_full") or "")) > len(str(out.get("chunk_full") or "")):
-        for key in [
-            "snippet", "chunk_full", "page_from", "page_to", "chunk_index",
-            "similarity", "query_used", "source_title"
-        ]:
-            if incoming.get(key) not in (None, ""):
-                out[key] = incoming[key]
-
-    out["similarity"] = max(old_sim, in_sim)
-    out["lexical_rank"] = max(float(out.get("lexical_rank") or 0.0), float(incoming.get("lexical_rank") or 0.0))
-    out["structured_overlap"] = max(float(out.get("structured_overlap") or 0.0), float(incoming.get("structured_overlap") or 0.0))
-    out["page_overlap"] = max(float(out.get("page_overlap") or 0.0), float(incoming.get("page_overlap") or 0.0))
-    out["dense_hits"] = int(out.get("dense_hits") or 0) + int(incoming.get("dense_hits") or 0)
-    out["lexical_hits"] = int(out.get("lexical_hits") or 0) + int(incoming.get("lexical_hits") or 0)
-    if out.get("scope_role") != "exact_machine" and incoming.get("scope_role") == "exact_machine":
-        out["scope_role"] = "exact_machine"
-        out["machine_id"] = incoming.get("machine_id")
-    return out
+def _v13_candidate_text(c: dict) -> str:
+    return str(c.get("chunk_full") or c.get("snippet") or c.get("snippet_clean") or "").strip()
 
 
-
-def _v11_dense_query_rows(
-    *,
-    company_id: str,
-    requested_machine_id: str,
-    q_vec_lit: str,
-    limit: int,
-    scope_kind: str,
-    doc_ids: Optional[list[str]] = None,
-    bubble_document_id: Optional[str] = None,
-) -> list[tuple]:
-    where = ["company_id = %s", "embedding IS NOT NULL"]
-    params: list[Any] = [company_id]
-
-    if doc_ids:
-        where.append("bubble_document_id = ANY(%s)")
-        params.append(doc_ids)
-    elif bubble_document_id:
-        where.append("bubble_document_id = %s")
-        params.append(bubble_document_id)
-        if requested_machine_id == COMPANY_GENERAL_MACHINE_SENTINEL:
-            where.append("(machine_id IS NULL OR machine_id = '')")
-        else:
-            where.append("(machine_id = %s OR machine_id IS NULL OR machine_id = '')")
-            params.append(requested_machine_id)
-    elif scope_kind == "exact_machine":
-        where.append("machine_id = %s")
-        params.append(requested_machine_id)
-    elif scope_kind == "company_general":
-        where.append("(machine_id IS NULL OR machine_id = '')")
-    else:
-        return []
-
-    sql = f"""
-        SELECT bubble_document_id, machine_id, chunk_index, page_from, page_to,
-               LEFT(COALESCE(chunk_text, ''), 900) AS snippet,
-               LEFT(COALESCE(chunk_text, ''), 2600) AS chunk_full,
-               1 - (embedding <=> %s::vector) AS similarity
-        FROM public.document_chunks
-        WHERE {' AND '.join(where)}
-        ORDER BY embedding <=> %s::vector, bubble_document_id, page_from, chunk_index
-        LIMIT %s;
-    """
-
-    conn = _db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(sql, [q_vec_lit, *params, q_vec_lit, max(1, int(limit))])
-            return cur.fetchall()
-    finally:
-        conn.close()
-
-
-def _v11_fetch_dense_candidates(
-    *,
-    q: str,
-    planner: dict,
-    company_id: str,
-    machine_id: str,
-    doc_ids: Optional[list[str]],
-    bubble_document_id: Optional[str],
-) -> list[dict]:
-    query_texts = _dedup_text_values(
-        [q, planner.get("normalized_query")]
-        + list(planner.get("dense_queries") or [])
-        + list(planner.get("crosslingual_dense_queries") or []),
-        limit=max(3, SEMANTIC_MAX_DENSE_QUERIES + 2),
-    )
-    if not query_texts:
-        return []
-
-    vectors = _openai_embed_texts(query_texts)
-    merged: dict[str, dict] = {}
-
-    for query_used, vec in zip(query_texts, vectors):
-        q_vec_lit = _vector_literal(vec)
-        scoped_rows: list[tuple] = []
-
-        if doc_ids or bubble_document_id:
-            scoped_rows.extend(
-                _v11_dense_query_rows(
-                    company_id=company_id,
-                    requested_machine_id=machine_id,
-                    q_vec_lit=q_vec_lit,
-                    limit=max(REASONING_V11_DENSE_EXACT_K, REASONING_V11_DENSE_GENERAL_K),
-                    scope_kind="explicit",
-                    doc_ids=doc_ids,
-                    bubble_document_id=bubble_document_id,
-                )
-            )
-        elif machine_id == COMPANY_GENERAL_MACHINE_SENTINEL:
-            scoped_rows.extend(
-                _v11_dense_query_rows(
-                    company_id=company_id,
-                    requested_machine_id=machine_id,
-                    q_vec_lit=q_vec_lit,
-                    limit=REASONING_V11_DENSE_EXACT_K,
-                    scope_kind="company_general",
-                )
-            )
-        else:
-            scoped_rows.extend(
-                _v11_dense_query_rows(
-                    company_id=company_id,
-                    requested_machine_id=machine_id,
-                    q_vec_lit=q_vec_lit,
-                    limit=REASONING_V11_DENSE_EXACT_K,
-                    scope_kind="exact_machine",
-                )
-            )
-            scoped_rows.extend(
-                _v11_dense_query_rows(
-                    company_id=company_id,
-                    requested_machine_id=machine_id,
-                    q_vec_lit=q_vec_lit,
-                    limit=REASONING_V11_DENSE_GENERAL_K,
-                    scope_kind="company_general",
-                )
-            )
-
-        for row in scoped_rows:
-            bdid, row_mid, chunk_index, page_from, page_to, snippet, chunk_full, similarity = row
-            bdid_s = str(bdid or "").strip()
-            if not bdid_s:
+def _v13_merge_candidates(candidate_lists: list[list[dict]]) -> list[dict]:
+    by_id: dict[str, dict] = {}
+    for candidates in candidate_lists or []:
+        for raw in candidates or []:
+            if not isinstance(raw, dict):
                 continue
-            item = {
-                "citation_id": f"{bdid_s}:p{int(page_from)}-{int(page_to)}:c{int(chunk_index)}",
-                "bubble_document_id": bdid_s,
-                "machine_id": str(row_mid or "").strip(),
-                "scope_role": _v11_scope_role(row_mid, machine_id),
-                "source_type": _v11_source_type(bdid_s),
-                "chunk_index": int(chunk_index),
-                "page_from": int(page_from),
-                "page_to": int(page_to),
-                "snippet": str(snippet or "").strip(),
-                "chunk_full": str(chunk_full or "").strip(),
-                "similarity": float(similarity or 0.0),
-                "query_used": query_used,
-                "dense_hits": 1,
-                "lexical_hits": 0,
-                "lexical_rank": 0.0,
-                "structured_overlap": 0.0,
-                "v11_retrieval": "dense",
-            }
-            key = _v11_candidate_merge_key(item)
-            merged[key] = _v11_merge_candidate(merged.get(key), item)
+            c = dict(raw)
+            cid = str(c.get("citation_id") or "").strip()
+            if not cid:
+                continue
+            prev = by_id.get(cid)
+            if prev is None:
+                by_id[cid] = c
+                continue
 
-    return list(merged.values())
-
-
-def _v11_fts_query_rows(
-    *,
-    company_id: str,
-    requested_machine_id: str,
-    ts_query: str,
-    limit: int,
-    scope_kind: str,
-    doc_ids: Optional[list[str]] = None,
-    bubble_document_id: Optional[str] = None,
-) -> list[tuple]:
-    where = ["company_id = %s"]
-    params: list[Any] = [company_id]
-
-    if doc_ids:
-        where.append("bubble_document_id = ANY(%s)")
-        params.append(doc_ids)
-    elif bubble_document_id:
-        where.append("bubble_document_id = %s")
-        params.append(bubble_document_id)
-        if requested_machine_id == COMPANY_GENERAL_MACHINE_SENTINEL:
-            where.append("(machine_id IS NULL OR machine_id = '')")
-        else:
-            where.append("(machine_id = %s OR machine_id IS NULL OR machine_id = '')")
-            params.append(requested_machine_id)
-    elif scope_kind == "exact_machine":
-        where.append("machine_id = %s")
-        params.append(requested_machine_id)
-    elif scope_kind == "company_general":
-        where.append("(machine_id IS NULL OR machine_id = '')")
-    else:
-        return []
-
-    sql = f"""
-        SELECT bubble_document_id, machine_id, chunk_index, page_from, page_to,
-               LEFT(COALESCE(chunk_text, ''), 900) AS snippet,
-               LEFT(COALESCE(chunk_text, ''), 2600) AS chunk_full,
-               ts_rank_cd(to_tsvector('simple', chunk_text), to_tsquery('simple', %s)) AS lexical_rank
-        FROM public.document_chunks
-        WHERE {' AND '.join(where)}
-          AND to_tsvector('simple', chunk_text) @@ to_tsquery('simple', %s)
-        ORDER BY lexical_rank DESC, bubble_document_id, page_from, chunk_index
-        LIMIT %s;
-    """
-
-    conn = _db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(sql, [ts_query, *params, ts_query, max(1, int(limit))])
-            return cur.fetchall()
-    finally:
-        conn.close()
+            merged = dict(prev)
+            for key, value in c.items():
+                if value not in (None, "", [], {}):
+                    if key in {"similarity", "retrieval_score", "v13_score", "ask_evidence_score", "structured_direct_score"}:
+                        try:
+                            merged[key] = max(float(merged.get(key) or 0.0), float(value or 0.0))
+                        except Exception:
+                            merged[key] = value
+                    elif key in {"chunk_full", "snippet", "snippet_clean"}:
+                        if len(str(value or "")) > len(str(merged.get(key) or "")):
+                            merged[key] = value
+                    else:
+                        merged[key] = value
+            by_id[cid] = merged
+    return list(by_id.values())
 
 
-def _v11_fetch_lexical_candidates(
-    *,
-    q: str,
-    planner: dict,
-    company_id: str,
-    machine_id: str,
-    doc_ids: Optional[list[str]],
-    bubble_document_id: Optional[str],
-) -> list[dict]:
-    lexical_texts = _dedup_text_values(
-        [q, planner.get("normalized_query")]
-        + list(planner.get("lexical_queries") or [])
-        + list(planner.get("crosslingual_lexical_queries") or []),
-        limit=max(3, SEMANTIC_MAX_LEXICAL_QUERIES + 2),
-    )
-    ts_query = _build_prefix_tsquery_from_texts(lexical_texts, limit=14)
-    if not ts_query:
-        return []
-
-    rows: list[tuple] = []
-    if doc_ids or bubble_document_id:
-        rows.extend(
-            _v11_fts_query_rows(
-                company_id=company_id,
-                requested_machine_id=machine_id,
-                ts_query=ts_query,
-                limit=max(REASONING_V11_FTS_EXACT_K, REASONING_V11_FTS_GENERAL_K),
-                scope_kind="explicit",
-                doc_ids=doc_ids,
-                bubble_document_id=bubble_document_id,
-            )
-        )
-    elif machine_id == COMPANY_GENERAL_MACHINE_SENTINEL:
-        rows.extend(
-            _v11_fts_query_rows(
-                company_id=company_id,
-                requested_machine_id=machine_id,
-                ts_query=ts_query,
-                limit=REASONING_V11_FTS_EXACT_K,
-                scope_kind="company_general",
-            )
-        )
-    else:
-        rows.extend(
-            _v11_fts_query_rows(
-                company_id=company_id,
-                requested_machine_id=machine_id,
-                ts_query=ts_query,
-                limit=REASONING_V11_FTS_EXACT_K,
-                scope_kind="exact_machine",
-            )
-        )
-        rows.extend(
-            _v11_fts_query_rows(
-                company_id=company_id,
-                requested_machine_id=machine_id,
-                ts_query=ts_query,
-                limit=REASONING_V11_FTS_GENERAL_K,
-                scope_kind="company_general",
-            )
-        )
+def _v13_score_candidates(q: str, candidates: list[dict]) -> list[dict]:
+    query_terms = _content_term_set(q, limit=70)
+    query_style = "telegraphic" if _count_query_tokens(q) <= 6 else "natural"
+    token_count = _count_query_tokens(q)
+    codes = {str(x).lower() for x in _extract_code_tokens(q)}
 
     out: list[dict] = []
-    for bdid, row_mid, chunk_index, page_from, page_to, snippet, chunk_full, lexical_rank in rows:
-        bdid_s = str(bdid or "").strip()
-        if not bdid_s:
+    for raw in candidates or []:
+        if not isinstance(raw, dict):
             continue
-        out.append(
-            {
-                "citation_id": f"{bdid_s}:p{int(page_from)}-{int(page_to)}:c{int(chunk_index)}",
-                "bubble_document_id": bdid_s,
-                "machine_id": str(row_mid or "").strip(),
-                "scope_role": _v11_scope_role(row_mid, machine_id),
-                "source_type": _v11_source_type(bdid_s),
-                "chunk_index": int(chunk_index),
-                "page_from": int(page_from),
-                "page_to": int(page_to),
-                "snippet": str(snippet or "").strip(),
-                "chunk_full": str(chunk_full or "").strip(),
-                "similarity": 0.0,
-                "dense_hits": 0,
-                "lexical_hits": 1,
-                "lexical_rank": float(lexical_rank or 0.0),
-                "structured_overlap": 0.0,
-                "v11_retrieval": "lexical",
-            }
-        )
-    return out
-
-
-def _v11_structured_rows(
-    *,
-    company_id: str,
-    requested_machine_id: str,
-    limit: int,
-    scope_kind: str,
-    terms: Optional[list[str]] = None,
-    require_term_match: bool = False,
-    doc_ids: Optional[list[str]] = None,
-    bubble_document_id: Optional[str] = None,
-) -> list[tuple]:
-    prefix_clause = " OR ".join(["bubble_document_id LIKE %s" for _ in V11_STRUCTURED_PREFIXES])
-    where = ["company_id = %s", f"({prefix_clause})", "text IS NOT NULL", "length(text) > 10"]
-    params: list[Any] = [company_id, *[f"{p}%" for p in V11_STRUCTURED_PREFIXES]]
-
-    if doc_ids:
-        where.append("bubble_document_id = ANY(%s)")
-        params.append(doc_ids)
-    elif bubble_document_id:
-        where.append("bubble_document_id = %s")
-        params.append(bubble_document_id)
-        if requested_machine_id == COMPANY_GENERAL_MACHINE_SENTINEL:
-            where.append("(machine_id IS NULL OR machine_id = '')")
-        else:
-            where.append("(machine_id = %s OR machine_id IS NULL OR machine_id = '')")
-            params.append(requested_machine_id)
-    elif scope_kind == "exact_machine":
-        where.append("machine_id = %s")
-        params.append(requested_machine_id)
-    elif scope_kind == "company_general":
-        where.append("(machine_id IS NULL OR machine_id = '')")
-    else:
-        return []
-
-    clean_terms = [str(x or "").strip().lower() for x in (terms or []) if str(x or "").strip()]
-    if require_term_match and clean_terms:
-        where.append("(" + " OR ".join(["LOWER(COALESCE(text, '')) LIKE %s" for _ in clean_terms]) + ")")
-        params.extend([f"%{term}%" for term in clean_terms])
-
-    sql = f"""
-        SELECT bubble_document_id, machine_id, page_number,
-               LEFT(COALESCE(text, ''), 7000) AS page_text
-        FROM public.document_pages
-        WHERE {' AND '.join(where)}
-        ORDER BY bubble_document_id, page_number
-        LIMIT %s;
-    """
-    conn = _db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(sql, [*params, max(1, int(limit))])
-            return cur.fetchall()
-    finally:
-        conn.close()
-
-
-
-def _v11_fetch_structured_candidates(
-    *,
-    q: str,
-    planner: dict,
-    company_id: str,
-    machine_id: str,
-    doc_ids: Optional[list[str]],
-    bubble_document_id: Optional[str],
-) -> list[dict]:
-    rows: list[tuple] = []
-    limit = max(100, int(REASONING_V11_STRUCTURED_SCAN_LIMIT or 2400))
-    terms = _v11_sql_terms(q, planner, limit=20)
-
-    def fetch(scope_kind: str, row_limit: int, *, explicit: bool = False) -> list[tuple]:
-        kwargs = {
-            "company_id": company_id,
-            "requested_machine_id": machine_id,
-            "limit": row_limit,
-            "scope_kind": scope_kind,
-            "terms": terms,
-            "require_term_match": bool(terms),
-            "doc_ids": doc_ids if explicit else None,
-            "bubble_document_id": bubble_document_id if explicit else None,
-        }
-        matched = _v11_structured_rows(**kwargs)
-        if matched or not terms:
-            return matched
-        kwargs["require_term_match"] = False
-        return _v11_structured_rows(**kwargs)
-
-    if doc_ids or bubble_document_id:
-        rows.extend(fetch("explicit", limit, explicit=True))
-    elif machine_id == COMPANY_GENERAL_MACHINE_SENTINEL:
-        rows.extend(fetch("company_general", limit))
-    else:
-        rows.extend(fetch("exact_machine", limit))
-        rows.extend(fetch("company_general", max(100, limit // 4)))
-
-    query_terms = _planner_query_term_set(q, planner)
-    out: list[dict] = []
-    for idx, (bdid, row_mid, page_number, page_text) in enumerate(rows, start=1):
-        bdid_s = str(bdid or "").strip()
-        text = str(page_text or "").strip()
-        if not bdid_s or not text:
-            continue
-        text_terms = _content_term_set(text, limit=140)
+        c = dict(raw)
+        text = _v13_candidate_text(c)
+        text_terms = _content_term_set(text, limit=120)
         overlap = _term_overlap_score(query_terms, text_terms)
-        page_no = _safe_int(page_number, 1)
-        fields = _parse_structured_source_fields(text)
-        title = _clean_display_text(fields.get("title") or fields.get("description") or "", max_len=120)
-        out.append({
-            "citation_id": f"{bdid_s}:p{page_no}-{page_no}:v11s{idx}",
-            "bubble_document_id": bdid_s,
-            "machine_id": str(row_mid or "").strip(),
-            "scope_role": _v11_scope_role(row_mid, machine_id),
-            "source_type": _v11_source_type(bdid_s),
-            "source_title": title,
-            "chunk_index": 0,
-            "page_from": page_no,
-            "page_to": page_no,
-            "snippet": text[:1400],
-            "chunk_full": text,
-            "similarity": 0.0,
-            "dense_hits": 0,
-            "lexical_hits": 0,
-            "lexical_rank": 0.0,
-            "structured_overlap": float(overlap),
-            "page_overlap": float(overlap),
-            "v11_retrieval": "structured_inventory",
-        })
-    return out
+        source_bias, source_meta = _candidate_source_bias(
+            c,
+            query_terms,
+            query_style=query_style,
+            query_token_count=token_count,
+        )
+        specificity = _candidate_specificity_score(c)
+        similarity = float(c.get("similarity") or 0.0)
+        source_type = str(
+            c.get("source_type") or _source_type_from_document_id(c.get("bubble_document_id") or "")
+        )
+
+        base = similarity
+        if c.get("ask_evidence_score") is not None:
+            base = max(base, min(0.98, 0.50 + float(c.get("ask_evidence_score") or 0.0) / 100.0))
+        if bool(c.get("ask_structured_direct")) or source_type in {"procedure", "step", "ps", "md_photo", "md_video"}:
+            base = max(base, 0.72 + min(0.20, 0.02 * float(c.get("structured_direct_score") or 0.0)))
+        if bool(c.get("fts_v13")):
+            base = max(base, 0.48 + min(0.16, 0.45 * overlap))
+
+        exact_code_hit = any(code and code in _normalize_unicode_advanced(text).lower() for code in codes)
+        if exact_code_hit:
+            base += 0.12
+
+        v13_score = (
+            base
+            + 0.16 * overlap
+            + 0.55 * specificity
+            + 0.55 * source_bias
+            + (0.04 if bool(c.get("exact_machine_scope")) else 0.0)
+        )
+        c.update(source_meta)
+        c["source_type"] = source_type
+        c["specificity_score"] = specificity
+        c["overlap_score"] = overlap
+        c["exact_code_hit"] = exact_code_hit
+        c["v13_score"] = float(v13_score)
+        c["retrieval_score"] = float(v13_score)
+        out.append(c)
+
+    out.sort(
+        key=lambda c: (
+            -float(c.get("v13_score") or 0.0),
+            -float(c.get("similarity") or 0.0),
+            0 if bool(c.get("exact_machine_scope")) else 1,
+            str(c.get("bubble_document_id") or ""),
+            int(c.get("page_from") or 0),
+            int(c.get("chunk_index") or 0),
+        )
+    )
+    return _dedup_citations_by_snippet(out, max_items=max(20, len(out)))
 
 
+def _v13_rescore_root_candidates(q: str, candidates: list[dict]) -> list[dict]:
+    diagnostic_keywords = _collect_candidate_keywords(q, [])
+    target_subsystems = _root_cause_target_subsystems(q, [])
+    symptom_profile = _query_symptom_profile(q)
 
-def _v11_page_rows(
-    *,
-    company_id: str,
-    requested_machine_id: str,
-    terms: list[str],
-    limit: int,
-    scope_kind: str,
-    doc_ids: Optional[list[str]] = None,
-    bubble_document_id: Optional[str] = None,
-) -> list[tuple]:
-    if not terms:
-        return []
-    where = ["company_id = %s", "text IS NOT NULL", "length(text) > 20"]
-    params: list[Any] = [company_id]
-    structured_clause = " OR ".join(["bubble_document_id LIKE %s" for _ in V11_STRUCTURED_PREFIXES])
-    where.append(f"NOT ({structured_clause})")
-    params.extend([f"{p}%" for p in V11_STRUCTURED_PREFIXES])
+    rescored: list[dict] = []
+    for raw in candidates or []:
+        c = dict(raw)
+        text = _v13_candidate_text(c)
+        semantic = _score_root_cause_chunk_semantic(q, text, diagnostic_keywords)
+        causal = _score_root_cause_causal_strength(q, text, diagnostic_keywords)
+        subsystem = _score_root_cause_subsystem_alignment(q, text, target_subsystems)
+        context_fit = _score_root_cause_context_fit(
+            q=q,
+            chunk_text=text,
+            diagnostic_keywords=diagnostic_keywords,
+            symptom_profile=symptom_profile,
+            matched_subsystems=subsystem.get("matched_subsystems") or [],
+        )
+        generic_downranked = _should_downrank_generic_root_cause_chunk(q, text, diagnostic_keywords)
+        hard_excluded = _should_hard_exclude_root_cause_chunk(q, text, diagnostic_keywords)
+        role = _classify_diagnostic_role_from_text(
+            q=q,
+            chunk_text=text,
+            symptom_profile=symptom_profile,
+            diagnostic_keywords=diagnostic_keywords,
+            target_subsystems=target_subsystems,
+        )
 
-    if doc_ids:
-        where.append("bubble_document_id = ANY(%s)")
-        params.append(doc_ids)
-    elif bubble_document_id:
-        where.append("bubble_document_id = %s")
-        params.append(bubble_document_id)
-        if requested_machine_id == COMPANY_GENERAL_MACHINE_SENTINEL:
-            where.append("(machine_id IS NULL OR machine_id = '')")
-        else:
-            where.append("(machine_id = %s OR machine_id IS NULL OR machine_id = '')")
-            params.append(requested_machine_id)
-    elif scope_kind == "exact_machine":
-        where.append("machine_id = %s")
-        params.append(requested_machine_id)
-    elif scope_kind == "company_general":
-        where.append("(machine_id IS NULL OR machine_id = '')")
+        score = float(c.get("v13_score", c.get("retrieval_score", c.get("similarity", 0.0))) or 0.0)
+        score += float(semantic.get("semantic_score") or 0.0)
+        score += float(causal.get("causal_strength_score") or 0.0)
+        score += float(subsystem.get("subsystem_score") or 0.0)
+        score += float(context_fit.get("context_fit_score") or 0.0)
+        score += float(role.get("role_adjustment") or 0.0)
+        if generic_downranked:
+            score -= ROOT_CAUSE_GENERIC_DOWNRANK_PENALTY
+        if hard_excluded:
+            score -= ROOT_CAUSE_HARD_EXCLUDE_PENALTY
+
+        c.update(semantic)
+        c.update(causal)
+        c.update(subsystem)
+        c.update(context_fit)
+        c.update(role)
+        c["generic_downranked"] = bool(generic_downranked)
+        c["hard_excluded"] = bool(hard_excluded)
+        c["v13_score"] = float(score)
+        c["retrieval_score"] = float(score)
+        rescored.append(c)
+
+    rescored.sort(
+        key=lambda c: (
+            1 if bool(c.get("hard_excluded")) else 0,
+            0 if str(c.get("role_group") or "") == "core" else 1,
+            -float(c.get("v13_score") or 0.0),
+            -float(c.get("similarity") or 0.0),
+            str(c.get("bubble_document_id") or ""),
+            int(c.get("page_from") or 0),
+        )
+    )
+    non_excluded = [c for c in rescored if not bool(c.get("hard_excluded"))]
+    pool = non_excluded if len(non_excluded) >= 4 else rescored
+    pool = _dedup_root_cause_candidates_semantic(pool, max_items=24)
+    pool = _prioritize_root_cause_coverage(pool, max_items=20)
+    return pool
+
+
+def _v13_evidence_metrics(candidates: list[dict]) -> dict:
+    candidates = [c for c in (candidates or []) if isinstance(c, dict)]
+    if not candidates:
+        return {
+            "confidence": "none",
+            "top_score": 0.0,
+            "top_similarity": 0.0,
+            "strong_count": 0,
+            "unique_sources": 0,
+            "exact_machine_count": 0,
+            "structured_count": 0,
+            "core_count": 0,
+        }
+
+    ordered = sorted(candidates, key=lambda c: -float(c.get("v13_score", c.get("retrieval_score", 0.0)) or 0.0))
+    top = ordered[0]
+    top_score = float(top.get("v13_score", top.get("retrieval_score", 0.0)) or 0.0)
+    top_similarity = max(float(c.get("similarity") or 0.0) for c in ordered)
+    strong_count = sum(
+        1 for c in ordered[:10]
+        if float(c.get("v13_score", c.get("retrieval_score", 0.0)) or 0.0) >= top_score - 0.12
+    )
+    unique_sources = len({str(c.get("bubble_document_id") or "") for c in ordered[:12] if c.get("bubble_document_id")})
+    exact_machine_count = sum(1 for c in ordered[:12] if bool(c.get("exact_machine_scope")))
+    structured_count = sum(
+        1 for c in ordered[:12]
+        if str(c.get("source_type") or _source_type_from_document_id(c.get("bubble_document_id") or ""))
+        in {"procedure", "step", "ps", "md_photo", "md_video"}
+    )
+    core_count = sum(1 for c in ordered[:12] if str(c.get("role_group") or "") == "core")
+
+    if structured_count > 0 and top_score >= 0.72:
+        confidence = "high"
+    elif top_similarity >= 0.55 and strong_count >= 2:
+        confidence = "high"
+    elif top_similarity >= 0.40 or top_score >= 0.55 or any(bool(c.get("exact_code_hit")) for c in ordered[:6]):
+        confidence = "medium"
     else:
-        return []
+        confidence = "low"
 
-    where.append("(" + " OR ".join(["LOWER(COALESCE(text, '')) LIKE %s" for _ in terms]) + ")")
-    params.extend([f"%{term.lower()}%" for term in terms])
-    sql = f"""
-        SELECT bubble_document_id, machine_id, page_number,
-               LEFT(COALESCE(text, ''), 7000) AS page_text
-        FROM public.document_pages
-        WHERE {' AND '.join(where)}
-        ORDER BY bubble_document_id, page_number
-        LIMIT %s;
-    """
-    conn = _db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(sql, [*params, max(1, int(limit))])
-            return cur.fetchall()
-    finally:
-        conn.close()
+    return {
+        "confidence": confidence,
+        "top_score": top_score,
+        "top_similarity": top_similarity,
+        "strong_count": strong_count,
+        "unique_sources": unique_sources,
+        "exact_machine_count": exact_machine_count,
+        "structured_count": structured_count,
+        "core_count": core_count,
+    }
 
 
-def _v11_fetch_page_candidates(
+def _v13_build_profile_from_plan(q: str, language: str, plan: Optional[dict]) -> dict:
+    profile = _ask_evidence_fallback_profile(q, language)
+    plan = dict(plan or {})
+    profile["search_phrases"] = _dedup_text_values(
+        list(profile.get("search_phrases") or [])
+        + list(plan.get("dense_queries") or [])
+        + list(plan.get("lexical_queries") or []),
+        limit=24,
+    )
+    profile["search_terms_it"] = _dedup_text_values(
+        list(profile.get("search_terms_it") or []) + list(plan.get("exact_terms") or []) + list(plan.get("required_facets") or []),
+        limit=32,
+    )
+    profile["search_terms_en"] = _dedup_text_values(
+        list(profile.get("search_terms_en") or []) + list(plan.get("exact_terms") or []) + list(plan.get("required_facets") or []),
+        limit=32,
+    )
+    profile["required_information"] = _dedup_text_values(
+        list(profile.get("required_information") or []) + list(plan.get("required_facets") or []),
+        limit=20,
+    )
+    profile["important_codes_or_numbers"] = _dedup_text_values(
+        list(profile.get("important_codes_or_numbers") or []) + list(plan.get("exact_terms") or []),
+        limit=24,
+    )
+    intent = str(plan.get("intent") or "").strip().lower()
+    if intent in {"factual", "procedural", "listing", "comparison", "diagnostic"}:
+        profile["answer_type"] = {
+            "listing": "list",
+            "diagnostic": "diagnostic",
+        }.get(intent, intent)
+    return profile
+
+
+
+def _v13_fetch_scored_pages(
     *,
     q: str,
-    planner: dict,
+    profile: dict,
     company_id: str,
     machine_id: str,
     doc_ids: Optional[list[str]],
     bubble_document_id: Optional[str],
+    top_pages: int,
 ) -> list[dict]:
-    terms = _v11_sql_terms(q, planner, limit=18)
-    if not terms:
-        return []
-    rows: list[tuple] = []
-    if doc_ids or bubble_document_id:
-        rows.extend(_v11_page_rows(
-            company_id=company_id,
-            requested_machine_id=machine_id,
-            terms=terms,
-            limit=max(REASONING_V11_PAGE_EXACT_K, REASONING_V11_PAGE_GENERAL_K),
-            scope_kind="explicit",
-            doc_ids=doc_ids,
-            bubble_document_id=bubble_document_id,
-        ))
-    elif machine_id == COMPANY_GENERAL_MACHINE_SENTINEL:
-        rows.extend(_v11_page_rows(
-            company_id=company_id,
-            requested_machine_id=machine_id,
-            terms=terms,
-            limit=REASONING_V11_PAGE_EXACT_K,
-            scope_kind="company_general",
-        ))
-    else:
-        rows.extend(_v11_page_rows(
-            company_id=company_id,
-            requested_machine_id=machine_id,
-            terms=terms,
-            limit=REASONING_V11_PAGE_EXACT_K,
-            scope_kind="exact_machine",
-        ))
-        rows.extend(_v11_page_rows(
-            company_id=company_id,
-            requested_machine_id=machine_id,
-            terms=terms,
-            limit=REASONING_V11_PAGE_GENERAL_K,
-            scope_kind="company_general",
-        ))
+    """Bounded full-page rescue with SQL relevance predicates before LIMIT."""
+    where_sql, base_params = _ask_evidence_scope_where(
+        company_id=company_id,
+        machine_id=machine_id,
+        doc_ids=doc_ids,
+        bubble_document_id=bubble_document_id,
+    )
 
-    query_terms = _planner_query_term_set(q, planner)
-    out: list[dict] = []
-    for idx, (bdid, row_mid, page_number, page_text) in enumerate(rows, start=1):
-        bdid_s = str(bdid or "").strip()
-        text = str(page_text or "").strip()
-        if not bdid_s or not text:
+    raw_terms: list[str] = []
+    for key in (
+        "search_phrases", "search_terms_it", "search_terms_en",
+        "required_information", "important_codes_or_numbers",
+    ):
+        raw_terms.extend(str(x or "") for x in (profile.get(key) or []))
+    raw_terms.extend(_ask_evidence_tokenize(q))
+    raw_terms.extend(_ask_evidence_code_tokens(q))
+    raw_terms.extend(_ask_evidence_number_tokens(q))
+
+    search_terms: list[str] = []
+    seen_terms = set()
+    for raw in raw_terms:
+        term = _normalize_unicode_advanced(str(raw or "")).lower().strip(" -–—:;,.()[]{}")
+        term = re.sub(r"\s+", " ", term).strip()
+        if len(term) < 2 or term in seen_terms:
             continue
-        overlap = _term_overlap_score(query_terms, _content_term_set(text, limit=160))
-        page_no = _safe_int(page_number, 1)
-        out.append({
-            "citation_id": f"{bdid_s}:p{page_no}-{page_no}:v11p{idx}",
-            "bubble_document_id": bdid_s,
-            "machine_id": str(row_mid or "").strip(),
-            "scope_role": _v11_scope_role(row_mid, machine_id),
-            "source_type": "document",
-            "chunk_index": 0,
-            "page_from": page_no,
-            "page_to": page_no,
-            "snippet": text[:1400],
-            "chunk_full": text,
-            "similarity": 0.0,
-            "dense_hits": 0,
-            "lexical_hits": 1,
-            "lexical_rank": 0.0,
-            "structured_overlap": 0.0,
-            "page_overlap": float(overlap),
-            "v11_retrieval": "page_term_scan",
-        })
-    return out
-
-
-def _v11_enrich_candidate_titles(company_id: str, candidates: list[dict]) -> list[dict]:
-    doc_ids = sorted({str(c.get("bubble_document_id") or "").strip() for c in candidates if c.get("bubble_document_id")})
-    try:
-        file_map = _fetch_document_file_map(company_id, doc_ids)
-    except Exception:
-        file_map = {}
-    out: list[dict] = []
-    for item in candidates:
-        cc = dict(item)
-        if not cc.get("source_title"):
-            if str(cc.get("source_type") or "") == "document":
-                cc["source_title"] = _title_from_file_url(file_map.get(str(cc.get("bubble_document_id") or ""), "")) or "Documento"
-            else:
-                fields = _parse_structured_source_fields(cc.get("chunk_full") or cc.get("snippet") or "")
-                cc["source_title"] = _clean_display_text(
-                    fields.get("title") or fields.get("description") or cc.get("source_type") or "Fonte",
-                    max_len=120,
-                )
-        out.append(cc)
-    return out
-
-def _v11_candidate_pre_score(item: dict) -> float:
-    score = 100.0 * max(0.0, float(item.get("similarity") or 0.0))
-    score += min(18.0, 4.5 * int(item.get("dense_hits") or 0))
-    score += min(16.0, 90.0 * max(0.0, float(item.get("lexical_rank") or 0.0)))
-    score += 28.0 * max(0.0, float(item.get("structured_overlap") or 0.0))
-    score += 24.0 * max(0.0, float(item.get("page_overlap") or 0.0))
-    if str(item.get("scope_role") or "") == "exact_machine":
-        score += 12.0
-    elif str(item.get("scope_role") or "") == "company_general":
-        score -= 2.0
-    if str(item.get("source_type") or "") in {"procedure", "step", "ps", "md_photo", "md_video"}:
-        score += 3.0
-    return score
-
-
-
-def _v11_collect_candidates(
-    *,
-    q: str,
-    company_id: str,
-    machine_id: str,
-    doc_ids: Optional[list[str]],
-    bubble_document_id: Optional[str],
-    mode: str,
-    planner_override: Optional[dict] = None,
-) -> tuple[dict, list[dict]]:
-    planner = dict(planner_override or _v11_query_plan(q, mode=mode, company_id=company_id))
-
-    dense = _v11_fetch_dense_candidates(
-        q=q, planner=planner, company_id=company_id, machine_id=machine_id,
-        doc_ids=doc_ids, bubble_document_id=bubble_document_id,
-    )
-    lexical = _v11_fetch_lexical_candidates(
-        q=q, planner=planner, company_id=company_id, machine_id=machine_id,
-        doc_ids=doc_ids, bubble_document_id=bubble_document_id,
-    )
-    pages = _v11_fetch_page_candidates(
-        q=q, planner=planner, company_id=company_id, machine_id=machine_id,
-        doc_ids=doc_ids, bubble_document_id=bubble_document_id,
-    )
-    structured = _v11_fetch_structured_candidates(
-        q=q, planner=planner, company_id=company_id, machine_id=machine_id,
-        doc_ids=doc_ids, bubble_document_id=bubble_document_id,
-    )
-
-    merged: dict[str, dict] = {}
-    for item in dense + lexical + pages:
-        key = _v11_candidate_merge_key(item)
-        merged[key] = _v11_merge_candidate(merged.get(key), item)
-
-    by_doc: dict[str, list[str]] = {}
-    for key, item in merged.items():
-        by_doc.setdefault(str(item.get("bubble_document_id") or ""), []).append(key)
-
-    for item in structured:
-        bdid = str(item.get("bubble_document_id") or "")
-        related_keys = by_doc.get(bdid) or []
-        if related_keys:
-            best_key = max(related_keys, key=lambda k: float((merged.get(k) or {}).get("similarity") or 0.0))
-            merged[best_key] = _v11_merge_candidate(merged.get(best_key), item)
-        else:
-            key = _v11_candidate_merge_key(item)
-            merged[key] = _v11_merge_candidate(merged.get(key), item)
-            by_doc.setdefault(bdid, []).append(key)
-
-    candidates = _v11_enrich_candidate_titles(company_id, list(merged.values()))
-    for item in candidates:
-        item["v11_pre_score"] = _v11_candidate_pre_score(item)
-
-    exact_structured = sorted(
-        [c for c in candidates if c.get("scope_role") == "exact_machine" and c.get("source_type") != "document"],
-        key=lambda c: (-float(c.get("v11_pre_score") or 0.0), str(c.get("bubble_document_id") or "")),
-    )
-    exact_documents = sorted(
-        [c for c in candidates if c.get("scope_role") == "exact_machine" and c.get("source_type") == "document"],
-        key=lambda c: (-float(c.get("v11_pre_score") or 0.0), str(c.get("bubble_document_id") or ""), int(c.get("page_from") or 0)),
-    )
-    general = sorted(
-        [c for c in candidates if c.get("scope_role") != "exact_machine"],
-        key=lambda c: (-float(c.get("v11_pre_score") or 0.0), str(c.get("bubble_document_id") or ""), int(c.get("page_from") or 0)),
-    )
-
-    cap = max(24, int(REASONING_V11_MAX_SELECTOR_CANDIDATES or 110))
-    selected: list[dict] = []
-    selected.extend(exact_structured[: max(12, cap // 3)])
-    selected.extend(exact_documents[: max(16, cap // 3)])
-    selected.extend(general[: max(8, cap // 5)])
-    seen = {_v11_candidate_merge_key(c) for c in selected}
-    for item in sorted(candidates, key=lambda c: (-float(c.get("v11_pre_score") or 0.0), 0 if c.get("scope_role") == "exact_machine" else 1)):
-        key = _v11_candidate_merge_key(item)
-        if key in seen:
-            continue
-        selected.append(item)
-        seen.add(key)
-        if len(selected) >= cap:
+        seen_terms.add(term)
+        search_terms.append(term)
+        if len(search_terms) >= 24:
             break
 
-    selected = selected[:cap]
-    selected.sort(key=lambda c: (-float(c.get("v11_pre_score") or 0.0), 0 if c.get("scope_role") == "exact_machine" else 1, str(c.get("source_type") or "")))
-    return planner, selected
+    def fetch_rows(require_term_match: bool) -> list[tuple]:
+        term_sql = ""
+        term_params: list[Any] = []
+        if require_term_match and search_terms:
+            term_sql = " AND (" + " OR ".join(
+                ["LOWER(COALESCE(text, '')) LIKE %s" for _ in search_terms]
+            ) + ")"
+            term_params = [f"%{term}%" for term in search_terms]
 
+        conn = _db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT bubble_document_id, machine_id, page_number,
+                           LEFT(COALESCE(text, ''), %s) AS page_text
+                    FROM public.document_pages
+                    WHERE {where_sql}
+                      AND text IS NOT NULL
+                      AND length(text) > 20
+                      {term_sql}
+                    ORDER BY CASE WHEN machine_id=%s THEN 0 ELSE 1 END,
+                             bubble_document_id, page_number
+                    LIMIT %s;
+                    """,
+                    [
+                        V13_PAGE_TEXT_CHARS,
+                        *base_params,
+                        *term_params,
+                        machine_id,
+                        V13_PAGE_SCAN_LIMIT,
+                    ],
+                )
+                return cur.fetchall()
+        finally:
+            conn.close()
 
+    rows = fetch_rows(bool(search_terms))
+    if not rows and search_terms:
+        rows = fetch_rows(False)
 
-def _v11_selector_schema() -> dict:
-    max_items = max(1, int(REASONING_V11_SELECTED_MAX or 10))
-    return {
-        "name": "machinemind_evidence_selector_v11",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "answerability": {"type": "string", "enum": ["direct", "partial", "none"]},
-                "selected_evidence": {
-                    "type": "array",
-                    "maxItems": max_items,
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "properties": {
-                            "id": {"type": "string"},
-                            "role": {"type": "string", "enum": ["primary", "supporting", "counterevidence", "context"]},
-                            "relevance": {"type": "number"},
-                            "explicit_support": {"type": "boolean"},
-                            "covers_facets": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
-                            "reason": {"type": "string"},
-                        },
-                        "required": ["id", "role", "relevance", "explicit_support", "covers_facets", "reason"],
-                    },
-                },
-                "missing_information": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
-                "contradictions": {"type": "array", "items": {"type": "string"}, "maxItems": 6},
-                "reason": {"type": "string"},
-            },
-            "required": ["answerability", "selected_evidence", "missing_information", "contradictions", "reason"],
-        },
-    }
-
-
-
-def _v11_candidate_label(item: dict) -> str:
-    source_type = str(item.get("source_type") or "document")
-    title = _clean_display_text(item.get("source_title") or "", max_len=110)
-    page_from = int(item.get("page_from") or 0)
-    page_to = int(item.get("page_to") or page_from)
-    if source_type != "document":
-        fields = _parse_structured_source_fields(item.get("chunk_full") or item.get("snippet") or "")
-        step_no = _clean_display_text(fields.get("step_number") or "", max_len=20)
-        if source_type == "step" and step_no:
-            return f"step {step_no}: {title or 'step'}"
-        return f"{source_type}: {title or source_type}"
-    location = f"pages {page_from}-{page_to}" if page_from and page_to > page_from else (f"page {page_from}" if page_from else "")
-    return " — ".join(x for x in [title or "document", location] if x)
-
-
-
-def _v11_build_selector_block(candidates: list[dict]) -> tuple[str, dict[str, dict]]:
-    parts: list[str] = []
-    id_map: dict[str, dict] = {}
-    total = 0
-    max_chars = max(16000, int(REASONING_V11_SELECTOR_CONTEXT_CHARS or 120000))
-    for idx, item in enumerate(candidates, start=1):
-        eid = f"E{idx:03d}"
-        text = re.sub(r"\s+", " ", str(item.get("chunk_full") or item.get("snippet") or "").strip())
+    scored: list[dict] = []
+    for bdid, mid, page_number, page_text in rows:
+        text = str(page_text or "").strip()
         if not text:
             continue
-        text = text[:1500]
-        part = (
-            f"[{eid}] type={item.get('source_type') or 'document'}; scope={item.get('scope_role') or 'unknown'}; "
-            f"source={_v11_candidate_label(item)}; pre_score={float(item.get('v11_pre_score') or 0.0):.2f}; "
-            f"dense_similarity={float(item.get('similarity') or 0.0):.4f}; retrieval={item.get('v11_retrieval') or 'mixed'}\n"
-            f"{text}\n"
+        score = float(_ask_evidence_score_text(q, text, profile))
+        exact_machine = (
+            str(mid or "").strip() == str(machine_id or "").strip()
+            and str(machine_id or "").strip() != COMPANY_GENERAL_MACHINE_SENTINEL
         )
-        if parts and total + len(part) > max_chars:
-            break
-        parts.append(part)
-        total += len(part)
-        cc = dict(item)
-        cc["v11_evidence_id"] = eid
-        id_map[eid] = cc
-    return "\n---\n".join(parts).strip(), id_map
+        if exact_machine:
+            score += 4.0
+        if score < float(ASK_EVIDENCE_MIN_PAGE_SCORE or 0.0):
+            continue
+        page = _safe_int(page_number, 1)
+        scored.append(
+            {
+                "citation_id": f"{bdid}:p{page}-{page}:v13page",
+                "bubble_document_id": str(bdid),
+                "chunk_index": 0,
+                "page_from": page,
+                "page_to": page,
+                "snippet": text[:ASK_SNIPPET_CHARS],
+                "chunk_full": text[:V13_PAGE_TEXT_CHARS],
+                "similarity": min(0.99, 0.50 + score / 100.0),
+                "retrieval_score": score,
+                "ask_evidence_score": score,
+                "exact_machine_scope": bool(exact_machine),
+            }
+        )
 
+    scored.sort(
+        key=lambda c: (
+            -float(c.get("ask_evidence_score") or 0.0),
+            0 if bool(c.get("exact_machine_scope")) else 1,
+            str(c.get("bubble_document_id") or ""),
+            int(c.get("page_from") or 0),
+        )
+    )
+    return _dedup_citations_by_snippet(scored, max_items=max(3, min(int(top_pages or 8), 14)))
 
-
-def _v11_select_evidence(
+def _v13_fetch_preferred_source_pages(
     *,
     q: str,
-    response_language: str,
-    mode: str,
-    planner: dict,
-    candidates: list[dict],
     company_id: str,
     machine_id: str,
-) -> tuple[dict, list[dict]]:
-    candidate_block, id_map = _v11_build_selector_block(candidates)
-    if not candidate_block or not id_map:
-        return {"answerability": "none", "selected_evidence": [], "missing_information": [], "contradictions": [], "reason": "No readable candidates"}, []
+    doc_ids: Optional[list[str]],
+    bubble_document_id: Optional[str],
+    response_language: str,
+    top_k: int,
+    plan: Optional[dict],
+    source_kind: str,
+) -> list[dict]:
+    """Fetch primary pages for a soft/hard source preference.
 
-    task = (
-        "For ASK, primary evidence must answer the exact question. A procedural question needs the actual operation or ordered steps. "
-        "Generic legal, safety, overview or merely related text is not a substitute."
-        if mode == "ask" else
-        "For ROOT CAUSE, primary evidence must support a plausible mechanism, matching P&S, component-state link or discriminating check. "
-        "Generic legal, safety, installation or overview text cannot become a cause by itself."
+    source_kind="xlsx" fetches XLSX-generated pages.
+    source_kind="manual" fetches ordinary document/manual/PDF pages, excluding
+    Bubble structured records and XLSX-generated pages.
+    """
+    if source_kind not in {"xlsx", "manual"}:
+        return []
+
+    profile = _v13_build_profile_from_plan(q, response_language, plan)
+    where_sql, params = _ask_evidence_scope_where(
+        company_id=company_id,
+        machine_id=machine_id,
+        doc_ids=doc_ids,
+        bubble_document_id=bubble_document_id,
     )
-    system_msg = (
-        "Select the smallest sufficient evidence set for an industrial assistant. Reason semantically across Italian and English. "
-        "Treat retrieval scores only as recall hints. Prefer exact-machine evidence when relevance is comparable. "
-        "Mark contradictions and missing facets. Do not answer the user. " + task
-    )
-    user_msg = (
-        f"MODE: {mode}\nQUESTION_OR_SYMPTOM:\n{q}\n\n"
-        f"QUERY_PLAN_JSON:\n{json.dumps(planner, ensure_ascii=False)[:12000]}\n\n"
-        f"CANDIDATE_EVIDENCE:\n{candidate_block}\n\n"
-        "Return structured JSON. Relevance is 0-100. Primary means direct support, not context."
-    )
-    parsed = _v11_json_models(
-        [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
-        models=[REASONING_V11_SELECTOR_MODEL, REASONING_V11_MODEL],
-        json_schema=_v11_selector_schema(),
-        effort=REASONING_V11_SELECTOR_EFFORT,
-        reasoning_mode=REASONING_V11_SELECTOR_MODE,
-        timeout=REASONING_V11_TIMEOUT,
-        safety_identifier=_v11_safety_identifier(company_id),
-    )
-    parsed = dict(parsed or {})
-    threshold = float(REASONING_V11_MIN_RELEVANCE or 62.0)
-    answerability = str(parsed.get("answerability") or "none").strip().lower()
-    selected: list[dict] = []
-    used = set()
-    for row in parsed.get("selected_evidence") or []:
-        if not isinstance(row, dict):
-            continue
-        eid = str(row.get("id") or "").strip()
-        relevance = float(row.get("relevance") or 0.0)
-        role = str(row.get("role") or "context").strip().lower()
-        if eid not in id_map or eid in used:
-            continue
-        if relevance < threshold and not (answerability == "partial" and relevance >= threshold - 7.0):
-            continue
-        item = dict(id_map[eid])
-        item["v11_selector_role"] = role
-        item["v11_selector_relevance"] = relevance
-        item["v11_explicit_support"] = bool(row.get("explicit_support"))
-        item["v11_covers_facets"] = list(row.get("covers_facets") or [])
-        item["v11_selector_reason"] = str(row.get("reason") or "").strip()
-        selected.append(item)
-        used.add(eid)
-        if len(selected) >= max(1, int(REASONING_V11_SELECTED_MAX or 10)):
-            break
 
-    has_primary = any(c.get("v11_selector_role") == "primary" for c in selected)
-    exact_primary = any(c.get("v11_selector_role") == "primary" and c.get("scope_role") == "exact_machine" for c in selected)
-    intent = str(planner.get("intent") or "other")
-    machine_specific_required = machine_id != COMPANY_GENERAL_MACHINE_SENTINEL and intent in {"procedural", "diagnostic"}
-    if answerability == "none" or not selected or not has_primary or (machine_specific_required and not exact_primary):
-        selected = []
-        parsed["answerability"] = "none"
+    page_chars = min(V13_PAGE_TEXT_CHARS, max(1200, int(ASK_FULL_CONTEXT_PAGE_CHARS or 6500)))
+    scan_limit = V13_PREFERRED_PAGE_SCAN_LIMIT
 
-    role_order = {"primary": 0, "supporting": 1, "counterevidence": 2, "context": 3}
-    selected.sort(key=lambda c: (
-        role_order.get(str(c.get("v11_selector_role") or "context"), 9),
-        0 if c.get("scope_role") == "exact_machine" else 1,
-        -float(c.get("v11_selector_relevance") or 0.0),
-    ))
-    return parsed, selected
+    conn = _db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT bubble_document_id, machine_id, page_number, LEFT(COALESCE(text, ''), %s) AS page_text
+                FROM public.document_pages
+                WHERE {where_sql}
+                  AND text IS NOT NULL
+                  AND length(text) > 20
+                ORDER BY bubble_document_id, page_number
+                LIMIT %s;
+                """,
+                [page_chars, *params, scan_limit],
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
 
-
-
-def _v11_expand_selected_evidence(company_id: str, selected: list[dict]) -> list[dict]:
-    role_order = {"primary": 0, "supporting": 1, "counterevidence": 2, "context": 3}
-    selected = sorted(selected or [], key=lambda c: (
-        role_order.get(str(c.get("v11_selector_role") or "context"), 9),
-        0 if c.get("scope_role") == "exact_machine" else 1,
-        -float(c.get("v11_selector_relevance") or 0.0),
-    ))
-    out: list[dict] = []
-    radius = max(0, int(REASONING_V11_PAGE_EXPANSION_RADIUS or 1))
-    page_chars = max(1200, int(REASONING_V11_PAGE_EXPANSION_CHARS or 7000))
-    for item in selected:
-        cc = dict(item)
-        if str(cc.get("source_type") or "") != "document":
-            out.append(cc)
-            continue
-        bdid = str(cc.get("bubble_document_id") or "").strip()
-        page_from = max(1, int(cc.get("page_from") or 1))
-        page_to = max(page_from, int(cc.get("page_to") or page_from))
-        low_page = max(1, page_from - radius)
-        high_page = page_to + radius
-        rows: list[tuple] = []
+    # Targeted supplement for explicit manual maintenance/check questions.
+    # The broad scan can be diluted by cover pages, indexes or company-general manuals.
+    # This pass pulls table/frequency/maintenance pages from the same authorized scope,
+    # then the normal scorer still decides the order. It is a supplement, not a hard filter.
+    if source_kind == "manual" and _ask_manual_priority_query_is_maintenance(q):
+        targeted_patterns = [
+            "%tabella per manutenzione%",
+            "%tabella generale di manutenzione%",
+            "%ore di funzionamento%",
+            "%componenti%ore di%",
+            "%tipo di lubrificante%",
+            "%controllare il livello%",
+            "%cambio olio%",
+            "%pulizia dei filtri%",
+            "%sostituzione completa dei filtri%",
+            "%scarico della condensa%",
+            "%verifica integrità%",
+            "%verifica integrita%",
+            "%verifica corretto funzionamento%",
+            "%impianto elettrico%",
+            "%impianto pneumatico%",
+            "%raddrizzatura%",
+            "%lubrificazione%",
+            "%ogni 50 ore%",
+            "%ogni 300 ore%",
+            "%ogni 1000 ore%",
+            "%ogni 3000 ore%",
+            "%ogni giorno%",
+            "%mensilmente%",
+            "%settiman%",
+            "%annualmente%",
+        ]
+        targeted_clauses = " OR ".join(["LOWER(COALESCE(text, '')) LIKE %s" for _ in targeted_patterns])
+        target_limit = max(80, min(260, int(scan_limit // 2)))
         try:
             conn = _db_conn()
             try:
                 with conn.cursor() as cur:
                     cur.execute(
-                        """
-                        SELECT page_number, LEFT(COALESCE(text, ''), %s)
+                        f"""
+                        SELECT bubble_document_id, machine_id, page_number, LEFT(COALESCE(text, ''), %s) AS page_text
                         FROM public.document_pages
-                        WHERE company_id=%s AND bubble_document_id=%s
-                          AND page_number BETWEEN %s AND %s
-                          AND text IS NOT NULL AND length(text) > 20
-                        ORDER BY page_number;
+                        WHERE {where_sql}
+                          AND text IS NOT NULL
+                          AND length(text) > 20
+                          AND ({targeted_clauses})
+                        ORDER BY
+                          CASE
+                            WHEN machine_id = %s THEN 0
+                            WHEN machine_id IS NULL OR machine_id = '' THEN 1
+                            ELSE 2
+                          END,
+                          bubble_document_id,
+                          page_number
+                        LIMIT %s;
                         """,
-                        (page_chars, company_id, bdid, low_page, high_page),
+                        [page_chars, *params, *targeted_patterns, machine_id, target_limit],
                     )
-                    rows = cur.fetchall()
+                    targeted_rows = cur.fetchall()
             finally:
                 conn.close()
-        except Exception:
-            rows = []
-        if rows:
-            bodies = [str(text or "").strip() for _pn, text in rows if str(text or "").strip()]
-            if bodies:
-                cc["chunk_full"] = "\n\n".join(bodies)
-                cc["snippet"] = bodies[0][:1400]
-                cc["page_from"] = min(int(r[0]) for r in rows)
-                cc["page_to"] = max(int(r[0]) for r in rows)
-        out.append(cc)
-    return out
+        except Exception as e:
+            print("V13_MANUAL_TARGETED_SCAN_FAIL", str(e)[:300])
+            targeted_rows = []
 
+        if targeted_rows:
+            rows = list(rows or [])
+            seen_pages = {
+                (str(r[0] or ""), _safe_int(r[2], 0))
+                for r in rows
+            }
+            for r in targeted_rows:
+                key = (str(r[0] or ""), _safe_int(r[2], 0))
+                if key not in seen_pages:
+                    rows.append(r)
+                    seen_pages.add(key)
 
+    scored: list[dict] = []
+    q_low = _normalize_unicode_advanced(q or "").lower()
 
+    for idx, (bdid, mid, page_number, page_text) in enumerate(rows or [], start=1):
+        bdid_s = str(bdid or "").strip()
+        txt = str(page_text or "").strip()
+        if not bdid_s or not txt:
+            continue
 
-def _v11_refinement_schema() -> dict:
-    return {
-        "name": "machinemind_retrieval_refinement_v11",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "should_retry": {"type": "boolean"},
-                "dense_queries": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
-                "lexical_queries": {"type": "array", "items": {"type": "string"}, "maxItems": 10},
-                "exact_terms": {"type": "array", "items": {"type": "string"}, "maxItems": 16},
-                "required_facets": {"type": "array", "items": {"type": "string"}, "maxItems": 10},
-                "reason": {"type": "string"},
-            },
-            "required": ["should_retry", "dense_queries", "lexical_queries", "exact_terms", "required_facets", "reason"],
-        },
-    }
+        is_xlsx = _is_xlsx_indexed_page_text(txt)
+        is_structured = _is_structured_source_key(bdid_s)
 
+        if source_kind == "xlsx" and not is_xlsx:
+            continue
+        if source_kind == "manual" and (is_xlsx or is_structured):
+            continue
 
-def _v11_refine_retrieval_plan(
-    *,
-    q: str,
-    mode: str,
-    company_id: str,
-    planner: dict,
-    selector: dict,
-    selected: list[dict],
-) -> Optional[dict]:
-    if max(1, int(REASONING_V11_MAX_RETRIEVAL_PASSES or 2)) < 2:
-        return None
+        score = float(_ask_evidence_score_text(q, txt, profile))
+        # Source preference is a ranking boost, not an exclusive evidence rule.
+        score += 35.0 if source_kind == "xlsx" else 28.0
+        if source_kind == "xlsx" and any(x in q_low for x in ["excel", "xlsx", "foglio", "spreadsheet"]):
+            score += 8.0
+        if source_kind == "manual" and any(x in q_low for x in ["manual", "manuale", "pdf", "documentazione"]):
+            score += 8.0
 
-    answerability = str(selector.get("answerability") or "none").strip().lower()
-    missing = list(selector.get("missing_information") or [])
-    contradictions = list(selector.get("contradictions") or [])
-    if answerability == "direct" and not missing and not contradictions:
-        return None
+        t_low = _normalize_unicode_advanced(txt).lower()
+        for marker, bonus in [
+            ("manutenz", 8.0), ("maintenance", 8.0), ("controll", 6.0),
+            ("periodic", 5.0), ("frequenza", 5.0), ("frequency", 5.0),
+            ("lubr", 4.0), ("olio", 4.0), ("oil", 4.0),
+        ]:
+            if marker in q_low and marker in t_low:
+                score += bonus
 
-    selected_summary = []
-    for c in selected[:8]:
-        selected_summary.append({
-            "source": _v11_candidate_label(c),
-            "scope": c.get("scope_role"),
-            "role": c.get("v11_selector_role"),
-            "covers": c.get("v11_covers_facets") or [],
-            "reason": c.get("v11_selector_reason") or "",
-        })
+        exact_machine_page = False
+        real_maintenance_page = False
+        weak_meta_page = False
+        if source_kind == "manual":
+            row_mid = str(mid or "").strip()
+            exact_machine_page = bool(machine_id and machine_id != COMPANY_GENERAL_MACHINE_SENTINEL and row_mid == str(machine_id or "").strip())
+            real_maintenance_page = _ask_manual_priority_page_has_real_maintenance_content(txt)
+            weak_meta_page = _ask_manual_priority_page_is_meta_or_index(txt)
+            score = _ask_manual_priority_page_score(
+                q=q,
+                page_text=txt,
+                base_score=score,
+                row_machine_id=row_mid,
+                requested_machine_id=machine_id,
+            )
 
-    system_msg = (
-        "Refine retrieval for an industrial evidence assistant. Do not answer and do not invent a diagnosis or fact. "
-        "Generate only searches that remain faithful to the original question and target evidence facets the first pass missed. "
-        "Use Italian and English technical synonyms when helpful; preserve codes, negations, process order and machine scope."
-    )
-    user_msg = (
-        f"MODE: {mode}\nORIGINAL_QUERY:\n{q}\n\n"
-        f"FIRST_PLAN_JSON:\n{json.dumps(planner, ensure_ascii=False)[:10000]}\n\n"
-        f"FIRST_SELECTOR_JSON:\n{json.dumps(selector, ensure_ascii=False)[:10000]}\n\n"
-        f"SELECTED_EVIDENCE_SUMMARY_JSON:\n{json.dumps(selected_summary, ensure_ascii=False)[:7000]}\n\n"
-        "Return a second-pass retrieval plan only when another search can plausibly resolve a missing facet or contradiction."
-    )
-    try:
-        parsed = _v11_json_models(
-            [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
-            models=[REASONING_V11_PLANNER_MODEL, REASONING_V11_SELECTOR_MODEL],
-            json_schema=_v11_refinement_schema(),
-            effort=REASONING_V11_SELECTOR_EFFORT,
-            reasoning_mode=REASONING_V11_SELECTOR_MODE,
-            timeout=min(REASONING_V11_TIMEOUT, 160),
-            safety_identifier=_v11_safety_identifier(company_id),
+        page = _safe_int(page_number, 1)
+        row_obj = {
+            "citation_id": f"{bdid_s}:p{page}-{page}:{source_kind}priority:{idx}",
+            "bubble_document_id": bdid_s,
+            "chunk_index": 0,
+            "page_from": page,
+            "page_to": page,
+            "snippet": txt[:ASK_SNIPPET_CHARS],
+            "chunk_full": txt,
+            "similarity": min(0.99, 0.74 + score / 200.0),
+            "retrieval_score": score,
+            "ask_source_priority": True,
+            "ask_source_priority_kind": source_kind,
+        }
+        if source_kind == "manual":
+            row_obj["manual_priority_exact_machine"] = bool(exact_machine_page)
+            row_obj["manual_priority_real_maintenance"] = bool(real_maintenance_page)
+            row_obj["manual_priority_weak_meta"] = bool(weak_meta_page)
+        scored.append(row_obj)
+
+    scored.sort(
+        key=lambda c: (
+            -float(c.get("retrieval_score") or 0.0),
+            str(c.get("bubble_document_id") or ""),
+            _safe_int(c.get("page_from"), 0),
         )
-    except Exception:
-        return None
+    )
 
-    if not bool((parsed or {}).get("should_retry")):
-        return None
+    max_items = max(1, min(max(top_k, 6), 12))
+    if source_kind == "manual" and _ask_manual_priority_query_is_maintenance(q):
+        exact_strong = [
+            c for c in scored
+            if bool(c.get("manual_priority_exact_machine"))
+            and bool(c.get("manual_priority_real_maintenance"))
+            and not bool(c.get("manual_priority_weak_meta"))
+        ]
+        other_strong = [
+            c for c in scored
+            if c not in exact_strong
+            and bool(c.get("manual_priority_real_maintenance"))
+            and not bool(c.get("manual_priority_weak_meta"))
+        ]
+        weak = [c for c in scored if c not in exact_strong and c not in other_strong]
+        if exact_strong:
+            ordered = exact_strong[:min(6, max_items)] + other_strong[:max(0, max_items - min(6, len(exact_strong)))] + weak[:max_items]
+            return _dedup_citations_by_snippet(ordered, max_items=max_items)
+        if other_strong:
+            ordered = other_strong[:max_items] + weak[:max_items]
+            return _dedup_citations_by_snippet(ordered, max_items=max_items)
 
-    refined = dict(planner or {})
-    refined["dense_queries"] = _dedup_text_values(
-        [q, refined.get("normalized_query")]
-        + list(refined.get("dense_queries") or [])
-        + list((parsed or {}).get("dense_queries") or []),
-        limit=14,
-    )
-    refined["lexical_queries"] = _dedup_text_values(
-        [q, refined.get("normalized_query")]
-        + list(refined.get("lexical_queries") or [])
-        + list((parsed or {}).get("lexical_queries") or []),
-        limit=16,
-    )
-    refined["exact_terms"] = _dedup_text_values(
-        list(refined.get("exact_terms") or []) + list((parsed or {}).get("exact_terms") or []),
-        limit=20,
-    )
-    refined["required_facets"] = _dedup_text_values(
-        list(refined.get("required_facets") or []) + list((parsed or {}).get("required_facets") or []),
-        limit=14,
-    )
-    refined["refinement_reason"] = str((parsed or {}).get("reason") or "").strip()
-    refined["retrieval_pass"] = 2
-    return refined
+    return _dedup_citations_by_snippet(scored, max_items=max_items)
 
 
-def _v11_run_refinement_pass(
+
+
+def _v13_fetch_structured_dense_candidates(
+    *,
+    company_id: str,
+    machine_id: str,
+    query_vectors: list[tuple[str, list[float]]],
+    top_k: int = 18,
+) -> list[dict]:
+    """Semantic structured-source retrieval without keyword-gating or extra LLM calls."""
+    if not company_id or not machine_id or machine_id == COMPANY_GENERAL_MACHINE_SENTINEL:
+        return []
+    if not query_vectors:
+        return []
+
+    patterns = [f"{prefix}:%" for prefix in sorted(STRUCTURED_SOURCE_TYPES)]
+    ranked_lists: list[list[dict]] = []
+    per_query_k = max(8, min(24, int(top_k or 18)))
+
+    for query_text, vector in query_vectors[:V13_DENSE_QUERY_LIMIT]:
+        if not vector:
+            continue
+        conn = _db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT bubble_document_id, chunk_index, page_from, page_to,
+                           LEFT(chunk_text, %s) AS snippet,
+                           LEFT(chunk_text, 2400) AS chunk_full,
+                           1 - (embedding <=> %s::vector) AS similarity,
+                           embedding,
+                           CASE WHEN machine_id = %s THEN TRUE ELSE FALSE END AS exact_machine_scope
+                    FROM public.document_chunks
+                    WHERE company_id = %s
+                      AND bubble_document_id LIKE ANY(%s)
+                      AND embedding IS NOT NULL
+                      AND (machine_id = %s OR machine_id IS NULL OR machine_id = '')
+                    ORDER BY embedding <=> %s::vector,
+                             CASE WHEN machine_id = %s THEN 0 ELSE 1 END,
+                             bubble_document_id, page_from, chunk_index
+                    LIMIT %s;
+                    """,
+                    (
+                        ASK_SNIPPET_CHARS,
+                        _vector_literal(vector),
+                        machine_id,
+                        company_id,
+                        patterns,
+                        machine_id,
+                        _vector_literal(vector),
+                        machine_id,
+                        per_query_k,
+                    ),
+                )
+                rows = cur.fetchall()
+        finally:
+            conn.close()
+
+        ranked = _raw_rows_to_dense_candidates(rows, query_used=query_text)
+        for c in ranked:
+            source_type = _source_type_from_document_id(c.get("bubble_document_id") or "")
+            c["source_type"] = source_type
+            c["structured_semantic_v13"] = True
+            c["ask_structured_direct"] = True
+            c["structured_direct_score"] = max(
+                float(c.get("structured_direct_score") or 0.0),
+                10.0 * float(c.get("similarity") or 0.0),
+            )
+        if ranked:
+            ranked_lists.append(ranked)
+
+    merged = _rrf_merge_candidates(ranked_lists, k=40) if ranked_lists else []
+    return _dedup_citations_by_snippet(merged, max_items=max(1, int(top_k or 18)))
+
+
+def _v13_should_use_structured_path(q: str, retrieval: dict) -> bool:
+    """Choose structured synthesis from evidence, not from operation-specific keywords."""
+    candidates = [c for c in (retrieval.get("candidates") or []) if isinstance(c, dict)]
+    if not candidates:
+        return False
+
+    structured_types = {"procedure", "step", "ps", "md_photo", "md_video"}
+    structured = [
+        c for c in candidates[:12]
+        if str(c.get("source_type") or _source_type_from_document_id(c.get("bubble_document_id") or ""))
+        in structured_types
+    ]
+    if not structured:
+        return False
+
+    ordered = sorted(
+        candidates,
+        key=lambda c: -float(c.get("v13_score", c.get("retrieval_score", c.get("similarity", 0.0))) or 0.0),
+    )
+    top_score = float(ordered[0].get("v13_score", ordered[0].get("retrieval_score", 0.0)) or 0.0)
+    best_structured = max(
+        float(c.get("v13_score", c.get("retrieval_score", c.get("similarity", 0.0))) or 0.0)
+        for c in structured
+    )
+    top_three_has_structured = any(c in structured for c in ordered[:3])
+    explicit_structured_request = _structured_rescue_query_intent(q, retrieval.get("plan") or {})
+
+    # A structured record must be genuinely competitive with the best evidence.
+    # Explicit source/listing wording may relax the margin, but never the relevance floor.
+    relevance_floor = 0.54 if explicit_structured_request else 0.60
+    allowed_gap = 0.16 if explicit_structured_request else 0.09
+    return bool(
+        best_structured >= relevance_floor
+        and (top_three_has_structured or best_structured >= top_score - allowed_gap)
+    )
+
+
+def _v13_initial_retrieval(
     *,
     q: str,
-    mode: str,
-    response_language: str,
     company_id: str,
     machine_id: str,
     doc_ids: Optional[list[str]],
     bubble_document_id: Optional[str],
-    planner: dict,
-    selector: dict,
-    selected: list[dict],
-) -> tuple[dict, list[dict], dict, list[dict], bool]:
-    refined = _v11_refine_retrieval_plan(
-        q=q, mode=mode, company_id=company_id, planner=planner, selector=selector, selected=selected,
-    )
-    if not refined:
-        return planner, [], selector, selected, False
+    ai_scope: str,
+    response_language: str,
+    mode: str,
+    plan: Optional[dict] = None,
+) -> dict:
+    budget = _v13_current_budget()
+    if budget is not None:
+        budget.ensure_time(8.0)
 
-    planner2, candidates2 = _v11_collect_candidates(
-        q=q, company_id=company_id, machine_id=machine_id, doc_ids=doc_ids,
-        bubble_document_id=bubble_document_id, mode=mode, planner_override=refined,
+    plan = dict(plan or _v13_fallback_plan(q))
+    dense_queries = _dedup_text_values(
+        [q, plan.get("normalized_query")] + list(plan.get("dense_queries") or []),
+        limit=V13_DENSE_QUERY_LIMIT if plan.get("dense_queries") else 2,
     )
-    selector2, selected2 = _v11_select_evidence(
-        q=q, response_language=response_language, mode=mode, planner=planner2,
-        candidates=candidates2, company_id=company_id, machine_id=machine_id,
+    lexical_queries = _dedup_text_values(
+        [q, plan.get("normalized_query")] + list(plan.get("lexical_queries") or []),
+        limit=V13_LEXICAL_QUERY_LIMIT if plan.get("lexical_queries") else 2,
     )
-    if selected2:
-        return planner2, candidates2, selector2, selected2, True
-    return planner, candidates2, selector, selected, False
 
-def _v11_answer_sources_block(citations: list[dict]) -> str:
+    candidate_k = 52 if mode == "root_cause" else 34
+    dense_lists: list[list[dict]] = []
+    chunks_matching_filter = None
+
+    try:
+        vectors = _openai_embed_texts(dense_queries, timeout=12)
+    except Exception as exc:
+        print("V13_DENSE_EMBED_FAIL", str(exc)[:600])
+        vectors = []
+
+    for query_text, vector in zip(dense_queries, vectors):
+        try:
+            current_count, raw_rows = _fetch_dense_chunk_candidates(
+                company_id=company_id,
+                machine_id=machine_id,
+                q_vec_lit=_vector_literal(vector),
+                candidate_k=candidate_k,
+                doc_ids=doc_ids,
+                bubble_document_id=bubble_document_id,
+                debug=False,
+            )
+            if chunks_matching_filter is None:
+                chunks_matching_filter = current_count
+            dense_lists.append(_raw_rows_to_dense_candidates(raw_rows, query_used=query_text))
+        except Exception as exc:
+            print("V13_DENSE_FETCH_FAIL", str(exc)[:500])
+
+    dense_candidates = _rrf_merge_candidates(dense_lists, k=60) if dense_lists else []
+
+    prefix_hits: list[dict] = []
+    exact_hits: list[dict] = []
+    try:
+        prefix_hits = _fts_search_chunks_prefix(
+            company_id=company_id,
+            machine_id=machine_id,
+            texts=lexical_queries,
+            top_k=14,
+            doc_ids=doc_ids,
+            bubble_document_id=bubble_document_id,
+        )
+        for c in prefix_hits:
+            c["fts_v13"] = True
+    except Exception as exc:
+        print("V13_PREFIX_FTS_FAIL", str(exc)[:500])
+
+    try:
+        exact_hits = _fts_search_chunks_multi(
+            company_id=company_id,
+            machine_id=machine_id,
+            queries=lexical_queries,
+            top_k=14,
+            doc_ids=doc_ids,
+            bubble_document_id=bubble_document_id,
+        )
+        for c in exact_hits:
+            c["fts_v13"] = True
+    except Exception as exc:
+        print("V13_EXACT_FTS_FAIL", str(exc)[:500])
+
+    page_hits: list[dict] = []
+    source_profile = _ask_source_preference_profile(q)
+    should_scan_pages = bool(
+        doc_ids
+        or bubble_document_id
+        or str(source_profile.get("strength") or "none") != "none"
+        or _count_query_tokens(q) >= 5
+        or mode == "root_cause"
+    )
+    if should_scan_pages:
+        try:
+            profile = _v13_build_profile_from_plan(q, response_language, plan)
+            page_hits = _v13_fetch_scored_pages(
+                q=q,
+                profile=profile,
+                company_id=company_id,
+                machine_id=machine_id,
+                doc_ids=doc_ids,
+                bubble_document_id=bubble_document_id,
+                top_pages=10 if mode == "root_cause" else 8,
+            )
+        except Exception as exc:
+            print("V13_PAGE_SCAN_FAIL", str(exc)[:600])
+
+    preferred_hits: list[dict] = []
+    preferred = str(source_profile.get("preferred_source") or "").strip().lower()
+    strength = str(source_profile.get("strength") or "none").strip().lower()
+    if mode == "ask" and preferred in {"manual", "xlsx"} and strength in {"prefer", "hard"}:
+        try:
+            preferred_hits = _v13_fetch_preferred_source_pages(
+                q=q,
+                company_id=company_id,
+                machine_id=machine_id,
+                doc_ids=doc_ids,
+                bubble_document_id=bubble_document_id,
+                response_language=response_language,
+                top_k=8,
+                plan=plan,
+                source_kind=preferred,
+            )
+        except Exception as exc:
+            print("V13_PREFERRED_SOURCE_FETCH_FAIL", str(exc)[:500])
+
+    structured_semantic_hits: list[dict] = []
+    structured_direct_hits: list[dict] = []
+    if mode == "ask" and ai_scope == "machine_all" and not doc_ids and not bubble_document_id:
+        try:
+            structured_semantic_hits = _v13_fetch_structured_dense_candidates(
+                company_id=company_id,
+                machine_id=machine_id,
+                query_vectors=list(zip(dense_queries, vectors)),
+                top_k=18,
+            )
+        except Exception as exc:
+            print("V13_STRUCTURED_SEMANTIC_RETRIEVAL_FAIL", str(exc)[:600])
+
+        # Source/listing wording is only a supplement. Normal procedure/P&S routing is
+        # decided later from semantic evidence, not from operation-specific keywords.
+        if _structured_rescue_query_intent(q, plan):
+            try:
+                structured_direct_hits = _ask_structured_direct_fetch_sources(
+                    company_id=company_id,
+                    machine_id=machine_id,
+                    q=q,
+                    planner=plan,
+                    top_k=12,
+                )
+            except Exception as exc:
+                print("V13_STRUCTURED_DIRECT_RETRIEVAL_FAIL", str(exc)[:600])
+
+    merged = _v13_merge_candidates(
+        [preferred_hits, structured_direct_hits, structured_semantic_hits, page_hits, dense_candidates, prefix_hits, exact_hits]
+    )
+    scored = _v13_score_candidates(q, merged)
+    if mode == "root_cause":
+        scored = _v13_rescore_root_candidates(q, scored)
+
+    metrics = _v13_evidence_metrics(scored)
+    return {
+        "plan": plan,
+        "candidates": scored,
+        "citations": scored[: (
+            V13_MAX_EVIDENCE_ITEMS_ROOT_CAUSE if mode == "root_cause" else V13_MAX_EVIDENCE_ITEMS_ASK
+        )],
+        "metrics": metrics,
+        "chunks_matching_filter": chunks_matching_filter,
+        "source_profile": source_profile,
+        "dense_queries": dense_queries,
+        "lexical_queries": lexical_queries,
+    }
+
+
+def _v13_needs_refinement(q: str, retrieval: dict, *, mode: str, narrow_scope: bool) -> bool:
+    if narrow_scope:
+        return False
+    budget = _v13_current_budget()
+    if budget is None or budget.llm_calls >= budget.max_llm_calls - 1:
+        return False
+    if budget.remaining() < V13_MIN_SECONDS_FOR_REFINEMENT:
+        return False
+
+    metrics = retrieval.get("metrics") or {}
+    confidence = str(metrics.get("confidence") or "none")
+    candidates = list(retrieval.get("candidates") or [])
+    if not candidates:
+        return True
+
+    code_tokens = {str(x).lower() for x in _extract_code_tokens(q)}
+    if code_tokens and not any(bool(c.get("exact_code_hit")) for c in candidates[:10]):
+        return True
+
+    if confidence in {"none", "low"}:
+        return True
+
+    if mode == "root_cause":
+        core_count = int(metrics.get("core_count") or 0)
+        structured_ps = any(str(c.get("source_type") or "") == "ps" for c in candidates[:8])
+        if core_count <= 0 and not structured_ps and confidence != "high":
+            return True
+
+    return False
+
+
+def _v13_sources_block(citations: list[dict], *, max_context_chars: int) -> str:
     parts: list[str] = []
     total = 0
-    max_chars = max(16000, int(REASONING_V11_ANSWER_CONTEXT_CHARS or 70000))
     for c in citations or []:
-        body = str(c.get("chunk_full") or c.get("snippet") or "").strip()
-        if not body:
+        cid = str(c.get("citation_id") or "").strip()
+        body = _v13_candidate_text(c)
+        if not cid or not body:
             continue
-        role = str(c.get("v11_selector_role") or "supporting")
-        per_source_limit = 14000 if role == "primary" else 7000
-        body = body[:per_source_limit]
+        source_type = str(c.get("source_type") or _source_type_from_document_id(c.get("bubble_document_id") or ""))
+        scope_role = "exact_machine" if bool(c.get("exact_machine_scope")) else "company_or_general"
+        role = str(c.get("role_class") or c.get("evidence_role") or source_type)
+        score = round(float(c.get("v13_score", c.get("retrieval_score", c.get("similarity", 0.0))) or 0.0), 4)
         part = (
-            f"[{c['citation_id']}] role={role}; type={c.get('source_type') or 'document'}; "
-            f"scope={c.get('scope_role') or 'unknown'}; source={_v11_candidate_label(c)}; "
-            f"pages={int(c.get('page_from') or 0)}-{int(c.get('page_to') or 0)}\n{body}\n"
+            f"[{cid}] source_type={source_type}; scope={scope_role}; role={role}; score={score}; "
+            f"doc={c.get('bubble_document_id')}; p={c.get('page_from')}-{c.get('page_to')}\n"
+            f"{body}\n"
         )
-        if parts and total + len(part) > max_chars:
-            continue
+        if total + len(part) > max_context_chars:
+            if not parts:
+                parts.append(part[:max_context_chars])
+            break
         parts.append(part)
         total += len(part)
-    return "\n---\n".join(parts).strip()
+    return "\n".join(parts).strip()
 
 
-
-def _v11_verifier_schema() -> dict:
-    return {
-        "name": "machinemind_response_verifier_v11",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "verdict": {"type": "string", "enum": ["pass", "rewrite", "reject"]},
-                "question_alignment_score": {"type": "number"},
-                "groundedness_score": {"type": "number"},
-                "citation_alignment_score": {"type": "number"},
-                "machine_scope_score": {"type": "number"},
-                "completeness_score": {"type": "number"},
-                "unsupported_claims": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
-                "missing_points": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
-                "feedback": {"type": "string"},
-            },
-            "required": [
-                "verdict", "question_alignment_score", "groundedness_score",
-                "citation_alignment_score", "machine_scope_score", "completeness_score",
-                "unsupported_claims", "missing_points", "feedback"
-            ],
-        },
-    }
+# -----------------------------------------------------------------------------
+# Structured ASK: deterministic procedure family + one synthesis call
+# -----------------------------------------------------------------------------
 
 
-
-def _v11_verify_response(
+def _v13_fetch_manual_support_deterministic(
     *,
-    mode: str,
-    q: str,
-    response_language: str,
-    response_payload: dict,
-    sources_block: str,
     company_id: str,
-) -> dict:
-    system_msg = (
-        "Audit an industrial answer against the exact question and supplied sources. "
-        "Reject nearby-topic answers, unsupported facts, generic legal/safety substitutions, wrong machine scope, contradictions, or citations that do not support the associated claim. "
-        "Use rewrite only when the evidence is sufficient and the answer can be repaired."
-    )
-    user_msg = (
-        f"MODE: {mode}\nQUESTION_OR_SYMPTOM:\n{q}\n\nRESPONSE_LANGUAGE: {response_language}\n\n"
-        f"RESPONSE_JSON:\n{json.dumps(response_payload, ensure_ascii=False)[:18000]}\n\n"
-        f"SOURCES:\n{sources_block}\n\nReturn scores from 0 to 100."
-    )
-    parsed = _v11_json_models(
-        [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
-        models=[REASONING_V11_VERIFIER_MODEL, REASONING_V11_SELECTOR_MODEL],
-        json_schema=_v11_verifier_schema(),
-        effort=REASONING_V11_VERIFIER_EFFORT,
-        reasoning_mode=REASONING_V11_VERIFIER_MODE,
-        timeout=REASONING_V11_TIMEOUT,
-        safety_identifier=_v11_safety_identifier(company_id),
-    )
-    out = dict(parsed or {})
-    if str(out.get("verdict") or "reject") == "pass":
-        hard_scores = [
-            float(out.get("question_alignment_score") or 0.0),
-            float(out.get("groundedness_score") or 0.0),
-            float(out.get("citation_alignment_score") or 0.0),
-            float(out.get("machine_scope_score") or 0.0),
-        ]
-        completeness = float(out.get("completeness_score") or 0.0)
-        completeness_floor = 72.0 if mode == "ask" else 66.0
-        if min(hard_scores) < 76.0 or completeness < completeness_floor or out.get("unsupported_claims"):
-            repairable = min(hard_scores) >= 62.0 and completeness >= 50.0
-            out["verdict"] = "rewrite" if repairable else "reject"
-    return out
+    machine_id: str,
+    q: str,
+    planner: dict,
+    structured_citations: list[dict],
+) -> list[dict]:
+    if not ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_ENABLED:
+        return []
+    if not structured_citations or not machine_id or machine_id == COMPANY_GENERAL_MACHINE_SENTINEL:
+        return []
 
+    terms = _ask_structured_manual_support_terms(q, planner, structured_citations)
+    if not terms:
+        return []
 
-
-def _v11_no_sources_ask(q: str, response_language: str, top_k: int, *, debug: Optional[dict] = None) -> dict:
-    resp = {
-        "ok": True,
-        "status": "no_sources",
-        "answer": _localized_no_sources(response_language),
-        "language": response_language,
-        "citations": [],
-        "rg_links": [],
-        "top_k": top_k,
-        "similarity_max": None,
-        "chat_model": "ask_gpt56_sol_pro_v11",
-    }
-    if debug is not None:
-        resp["debug"] = {"reasoning_v11": debug}
-    return _finalize_ask_response_for_ui(resp, language=response_language)
-
-
-def _v11_no_sources_root(q: str, response_language: str, top_k: int, *, debug: Optional[dict] = None) -> dict:
-    resp = {
-        "ok": True,
-        "status": "no_sources",
-        "symptom": q,
-        "language": response_language,
-        "problem_summary": "",
-        "possible_causes": [],
-        "recommended_next_checks": [],
-        "citations": [],
-        "rg_links": [],
-        "top_k": top_k,
-        "similarity_max": None,
-        "chat_model": "root_cause_gpt56_sol_pro_v11",
-    }
-    if debug is not None:
-        resp["debug"] = {"reasoning_v11": debug}
-    return resp
-
-
-
-def _v11_ask_applicable(q: str, scope: dict) -> bool:
-    if not (REASONING_V11_ENABLED and REASONING_V11_ASK_ENABLED):
-        return False
-    if _is_lookup_or_identifier_query(q):
-        return False
-    source_profile = _ask_source_preference_profile(q)
-    if str(source_profile.get("strength") or "none") != "none":
-        return False
-    # A concrete how-to/procedure/step/P&S/media request has a more precise,
-    # cheaper source-specialized reader. Routing it there mirrors tool selection:
-    # use the narrow evidence tool first, reserve the broad reasoning agent for
-    # genuinely open-ended synthesis.
+    text_chars = max(1200, int(ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_TEXT_CHARS or 4200))
+    scan_limit = max(40, min(300, int(ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_SCAN_LIMIT or 180)))
+    rows: list[tuple] = []
     try:
-        structured_intent = _ask_structured_direct_intent(q, planner=None)
-        if bool(structured_intent.get("enabled")):
-            return False
-    except Exception:
-        pass
-    if scope.get("document_ids") or scope.get("bubble_document_id"):
-        return False
-    return True
+        conn = _db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT bubble_document_id, machine_id, page_number,
+                           LEFT(COALESCE(text, ''), %s) AS page_text
+                    FROM public.document_pages
+                    WHERE company_id=%s
+                      AND (machine_id=%s OR machine_id IS NULL OR machine_id='')
+                      AND text IS NOT NULL
+                      AND length(text) > 40
+                      AND bubble_document_id NOT LIKE 'procedure:%%'
+                      AND bubble_document_id NOT LIKE 'step:%%'
+                      AND bubble_document_id NOT LIKE 'ps:%%'
+                      AND bubble_document_id NOT LIKE 'md_photo:%%'
+                      AND bubble_document_id NOT LIKE 'md_video:%%'
+                    ORDER BY CASE WHEN machine_id=%s THEN 0 ELSE 1 END,
+                             bubble_document_id, page_number
+                    LIMIT %s;
+                    """,
+                    (text_chars, company_id, machine_id, machine_id, scan_limit),
+                )
+                rows = cur.fetchall()
+        finally:
+            conn.close()
+    except Exception as exc:
+        print("V13_MANUAL_SUPPORT_SCAN_FAIL", str(exc)[:500])
+        return []
+
+    scored: list[dict] = []
+    for idx, (bdid, mid, page_number, page_text) in enumerate(rows, start=1):
+        text = str(page_text or "").strip()
+        if not text:
+            continue
+        details = _ask_structured_manual_support_score_details(text, terms)
+        operation_score = float(details.get("operation_score") or 0.0)
+        safety_score = float(details.get("safety_score") or 0.0)
+        total_score = float(details.get("total_score") or 0.0)
+        # Generic safety by itself is not sufficient. At least one operation term must match.
+        if operation_score < 1.0 or total_score < 3.0:
+            continue
+        page = _safe_int(page_number, 1)
+        exact_machine = str(mid or "").strip() == str(machine_id or "").strip()
+        scored.append(
+            {
+                "citation_id": f"{bdid}:p{page}-{page}:manualsupport:v13:{idx}",
+                "bubble_document_id": str(bdid),
+                "chunk_index": 1,
+                "page_from": page,
+                "page_to": page,
+                "snippet": text[: int(ASK_SNIPPET_CHARS or 900)],
+                "snippet_clean": text[: int(ASK_SNIPPET_CHARS or 900)],
+                "chunk_full": text,
+                "similarity": min(0.94, 0.70 + min(0.20, total_score / 100.0)),
+                "retrieval_score": total_score,
+                "v13_score": total_score,
+                "source_type": "document",
+                "evidence_role": "manual_support",
+                "ask_structured_manual_support": True,
+                "ask_manual_support_kind": "operation" if operation_score >= safety_score else "safety",
+                "structured_manual_operation_score": operation_score,
+                "structured_manual_safety_score": safety_score,
+                "structured_manual_support_score": total_score,
+                "exact_machine_scope": exact_machine,
+            }
+        )
+
+    scored.sort(
+        key=lambda c: (
+            0 if bool(c.get("exact_machine_scope")) else 1,
+            -float(c.get("structured_manual_operation_score") or 0.0),
+            -float(c.get("structured_manual_support_score") or 0.0),
+            str(c.get("bubble_document_id") or ""),
+            int(c.get("page_from") or 0),
+        )
+    )
+    max_items = max(0, int(ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_MAX_ITEMS or 2))
+    selected = scored[:max_items]
+    selected = _v12_filter_linkable_manual_support(company_id, selected)
+    return _v12_mark_manual_support(selected)
 
 
-
-def _v11_generate_ask(
+def _v13_structured_ask(
     *,
     q: str,
-    response_language: str,
-    evidence: list[dict],
-    sources_block: str,
     company_id: str,
-    verifier_feedback: Optional[dict] = None,
-) -> tuple[str, list[dict], dict]:
+    machine_id: str,
+    response_language: str,
+    top_k: int,
+    planner: dict,
+    seed_citations: Optional[list[dict]] = None,
+    debug: bool,
+) -> Optional[dict]:
+    structured_types = {"procedure", "step", "ps", "md_photo", "md_video"}
+    raw = [
+        dict(c) for c in (seed_citations or [])
+        if isinstance(c, dict)
+        and str(c.get("source_type") or _source_type_from_document_id(c.get("bubble_document_id") or "")) in structured_types
+    ]
+
+    # Explicit listing/source requests may require records that are not semantically
+    # similar to a single operation. Merge the bounded deterministic structured scan.
+    if _structured_rescue_query_intent(q, planner):
+        try:
+            direct = _ask_structured_direct_fetch_sources(
+                company_id=company_id,
+                machine_id=machine_id,
+                q=q,
+                planner=planner,
+                top_k=max(10, top_k),
+            )
+            raw = _v13_merge_candidates([raw, direct])
+        except Exception as exc:
+            print("V13_STRUCTURED_FETCH_FAIL", str(exc)[:600])
+
+    if not raw:
+        return None
+
+    structured = _v12_curate_structured_sources(
+        company_id=company_id,
+        machine_id=machine_id,
+        q=q,
+        planner=planner,
+        citations=raw,
+        model_used=[],
+    )
+    structured = _v12_mark_structured_roles(structured)
+    if not structured:
+        return None
+
+    manual_support = _v13_fetch_manual_support_deterministic(
+        company_id=company_id,
+        machine_id=machine_id,
+        q=q,
+        planner=planner,
+        structured_citations=structured,
+    )
+    all_evidence = list(structured) + list(manual_support)
+    sources_block = _v13_sources_block(
+        all_evidence,
+        max_context_chars=min(V13_HEAVY_CONTEXT_CHARS, max(16000, ASK_STRUCTURED_DIRECT_MAX_CONTEXT_CHARS)),
+    )
+    if not sources_block:
+        return None
+
     system_msg = (
-        "Answer as an expert industrial assistant using only SOURCES for factual claims. "
-        "Resolve synonyms and page continuations, answer the exact request, preserve values and conditions, and give ordered actions for procedures. "
-        "Prefer exact-machine evidence. Distinguish supported facts from cautious inference. Do not convert generic legal or safety text into an operational answer."
+        "You are MachineMind ASK. Use only the supplied evidence. Structured procedures and their explicitly related ordered steps are primary. "
+        "Never mix steps from different procedure families. Preserve all available ordered steps, conditions and warnings needed to perform the operation. "
+        "Manual-support sources are secondary: use them only for directly relevant operating detail, prerequisite or safety context, and keep their citations so the manual appears among the links. "
+        "For P&S records, report problem, solution and notes. For photo/video records, use title/description metadata only and never claim visual or audio inspection. "
+        "Every visible point must be grounded in citation_ids from SOURCES. Do not expose raw ids in text. Reply in the requested language."
     )
-    feedback_block = f"\n\nVERIFIER_FEEDBACK_JSON:\n{json.dumps(verifier_feedback, ensure_ascii=False)[:5000]}" if verifier_feedback else ""
     user_msg = (
-        f"QUESTION:\n{q}\n\nRESPONSE_LANGUAGE: {response_language}\n\nSOURCES:\n{sources_block}"
-        f"{feedback_block}\n\nReturn 1-6 grounded points. Every point must cite source ids from SOURCES."
+        f"QUESTION:\n{q}\n\nRESPONSE_LANGUAGE: {response_language}\n\nSOURCES:\n{sources_block}\n\n"
+        "Return JSON only. Answer from the selected structured procedure/steps first, then add a brief directly applicable manual support or safety note when present."
     )
-    parsed = _v11_json_models(
-        [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
-        models=[REASONING_V11_MODEL, REASONING_V11_SELECTOR_MODEL],
-        json_schema=_ask_evidence_answer_schema(),
-        effort=REASONING_V11_REASONER_EFFORT,
-        reasoning_mode=REASONING_V11_REASONER_MODE,
-        timeout=REASONING_V11_TIMEOUT,
-        safety_identifier=_v11_safety_identifier(company_id),
-    )
-    parsed = dict(parsed or {})
-    if str(parsed.get("answer_status") or "").strip().lower() != "answered":
-        return "", [], parsed
-    answer, citations = _render_grounded_answer_points(
-        grounded_points=list(parsed.get("grounded_points") or []),
-        citations=evidence,
+
+    model = V13_FAST_MODEL
+    effort = V13_FAST_EFFORT
+    mode = ""
+    timeout = V13_FAST_TIMEOUT_SECONDS
+    output_tokens = V13_FAST_MAX_OUTPUT_TOKENS
+
+    parsed: dict = {}
+    model_used = model
+    try:
+        parsed, model_used = _v13_json_models(
+            [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            models=[model],
+            json_schema=_ask_evidence_answer_schema(),
+            effort=effort,
+            reasoning_mode=mode,
+            timeout=timeout,
+            max_output_tokens=output_tokens,
+            company_id=company_id,
+            purpose="ask_structured_synthesis",
+        )
+    except _V13BudgetExceeded:
+        raise
+    except Exception as exc:
+        print("V13_STRUCTURED_SYNTHESIS_FAIL", str(exc)[:700])
+        parsed = {"answer_status": "no_sources", "grounded_points": []}
+
+    grounded_points = list(parsed.get("grounded_points") or [])
+    model_answer, model_citations = _render_grounded_answer_points(
+        grounded_points=grounded_points,
+        citations=all_evidence,
         max_points=max(1, int(ASK_UI_MAX_POINTS or 5)),
         q=q,
     )
-    return answer, citations, parsed
 
-
-
-def _v11_ask_impl(payload: AskRequest, x_ai_internal_secret: Optional[str]) -> Optional[dict]:
-    _v11_auth_guard(x_ai_internal_secret)
-    q = str(payload.query or "").strip()
-    if not q:
-        raise HTTPException(status_code=400, detail="Missing query")
-    scope = _resolve_query_scope(
-        company_id=payload.company_id, machine_id=payload.machine_id,
-        bubble_document_id=payload.bubble_document_id, document_ids=payload.document_ids,
-        ai_scope=payload.ai_scope,
+    final_structured = _v12_curate_structured_sources(
+        company_id=company_id,
+        machine_id=machine_id,
+        q=q,
+        planner=planner,
+        citations=structured,
+        model_used=model_citations,
     )
-    if not _v11_ask_applicable(q, scope):
+    final_structured = _v12_mark_structured_roles(final_structured)
+    sectioned_answer = _format_structured_procedure_answer_for_ui(
+        structured_citations=final_structured,
+        manual_support_citations=manual_support,
+        grounded_points=grounded_points,
+        response_language=response_language,
+        q=q,
+    )
+    synthesis_grounded = bool(model_answer and model_citations)
+    answer = sectioned_answer or model_answer
+    if not answer:
         return None
 
-    company_id = scope["company_id"]
-    machine_id = scope["machine_id"]
-    doc_ids = scope.get("document_ids") if isinstance(scope.get("document_ids"), list) else None
-    bubble_document_id = scope.get("bubble_document_id")
-    top_k = max(1, min(int(payload.top_k or 5), ASK_MAX_TOP_K))
-    response_language = _select_response_language(q, preferred=payload.language)
+    # Manual support is intentionally retained when deterministically relevant so it is
+    # exposed among links, even if the synthesis cites only the structured procedure.
+    final_citations = _v12_curate_response_items_for_ui(
+        list(final_structured) + list(manual_support) + list(model_citations or []),
+        max_items=max(1, int(ASK_UI_STRUCTURED_MAX_CITATIONS or 14)),
+    )
+    if not final_citations:
+        return None
 
-    planner, candidates = _v11_collect_candidates(
-        q=q, company_id=company_id, machine_id=machine_id, doc_ids=doc_ids,
-        bubble_document_id=bubble_document_id, mode="ask",
-    )
-    selector, selected = _v11_select_evidence(
-        q=q, response_language=response_language, mode="ask", planner=planner,
-        candidates=candidates, company_id=company_id, machine_id=machine_id,
-    )
-    planner2, candidates2, selector2, selected2, refined_used = _v11_run_refinement_pass(
-        q=q, mode="ask", response_language=response_language, company_id=company_id,
-        machine_id=machine_id, doc_ids=doc_ids, bubble_document_id=bubble_document_id,
-        planner=planner, selector=selector, selected=selected,
-    )
-    if refined_used:
-        planner, candidates, selector, selected = planner2, candidates2, selector2, selected2
-    debug_payload = {
-        "planner": planner, "candidate_count": len(candidates), "selector": selector,
-        "retrieval_passes": 2 if refined_used else 1,
-        "selected_ids": [c.get("citation_id") for c in selected],
-        "models": {
-            "planner": REASONING_V11_PLANNER_MODEL, "selector": REASONING_V11_SELECTOR_MODEL,
-            "reasoner": REASONING_V11_MODEL, "verifier": REASONING_V11_VERIFIER_MODEL,
-        },
+    response_citations = _sanitize_citations_for_response(final_citations, company_id=company_id)
+    role_by_id = {
+        str(c.get("citation_id") or ""): {
+            "evidence_role": _v12_evidence_role(c),
+            "ask_structured_direct": bool(c.get("ask_structured_direct")),
+            "ask_structured_manual_support": bool(c.get("ask_structured_manual_support")),
+            "ask_manual_support_kind": str(c.get("ask_manual_support_kind") or ""),
+            "exact_machine_scope": bool(c.get("exact_machine_scope")),
+        }
+        for c in final_citations
     }
-    if not selected:
-        return _v11_no_sources_ask(q, response_language, top_k, debug=debug_payload if payload.debug else None)
+    for c in response_citations:
+        c.update(role_by_id.get(str(c.get("citation_id") or ""), {}))
 
-    evidence = _v11_expand_selected_evidence(company_id, selected)
-    sources_block = _v11_answer_sources_block(evidence)
+    try:
+        rg_links = _build_rg_links(company_id, response_citations)
+    except Exception as exc:
+        print("RG_LINKS_FAIL", str(exc)[:500])
+        rg_links = []
+
+    resp = {
+        "ok": True,
+        "status": "answered",
+        "answer": answer,
+        "language": response_language,
+        "citations": response_citations,
+        "rg_links": rg_links,
+        "top_k": top_k,
+        "similarity_max": max([float(c.get("similarity") or 0.0) for c in all_evidence], default=None),
+        "chat_model": model_used if synthesis_grounded else "v13_deterministic_structured_fallback",
+        "meta": (
+            {"cacheable": True, "semantic_cacheable": True}
+            if synthesis_grounded
+            else {
+                "cacheable": False,
+                "semantic_cacheable": False,
+                "degraded": True,
+                "degraded_reason": "structured_deterministic_fallback",
+            }
+        ),
+    }
+    if debug:
+        resp["debug"] = {
+            "v13_structured": {
+                "raw_sources": len(raw),
+                "structured_sources": len(final_structured),
+                "manual_support_sources": len(manual_support),
+                "manual_support_links": sum(1 for x in rg_links if str(x.get("evidence_role") or "") == "manual_support"),
+            }
+        }
+    return _finalize_ask_response_for_ui(resp, language=response_language)
+
+
+# -----------------------------------------------------------------------------
+# ASK synthesis and Root Cause synthesis
+# -----------------------------------------------------------------------------
+
+
+def _v13_choose_ask_model(q: str, retrieval: dict, *, narrow_scope: bool, structured: bool = False) -> tuple[str, str, str]:
+    metrics = retrieval.get("metrics") or {}
+    token_count = _count_query_tokens(q)
+    complex_surface = bool(
+        token_count >= 18
+        or len(re.findall(r"[?;]", q or "")) >= 2
+        or len(re.findall(r"\b(?:e|ed|ma|però|oppure|and|but|or|while|whereas)\b", _v13_normalize_query(q))) >= 3
+    )
+    if structured or narrow_scope or (
+        str(metrics.get("confidence") or "") == "high" and not complex_surface
+    ):
+        return V13_FAST_MODEL, V13_FAST_EFFORT, ""
+    return V13_HEAVY_MODEL, V13_ASK_HEAVY_EFFORT, V13_HEAVY_REASONING_MODE
+
+
+
+def _v13_extractive_fallback_answer(
+    citations: list[dict],
+    *,
+    response_language: str,
+    q: str,
+    max_points: int = 2,
+) -> tuple[str, list[dict]]:
+    parts: list[str] = []
+    used: list[dict] = []
+    query_terms = _content_term_set(q, limit=60)
+
+    for citation in citations or []:
+        body = re.sub(r"^SECTION:\s*[^\n]+\n?", "", _v13_candidate_text(citation), flags=re.IGNORECASE)
+        body = re.sub(r"\s+", " ", body).strip()
+        if len(body) < 24:
+            continue
+        sentences = [x.strip() for x in re.split(r"(?<=[.!?])\s+", body) if len(x.strip()) >= 24]
+        if not sentences:
+            sentences = [body[:520].rsplit(" ", 1)[0].strip() or body[:520]]
+        scored = []
+        for idx, sentence in enumerate(sentences[:12]):
+            score = _term_overlap_score(query_terms, _content_term_set(sentence, limit=80)) if query_terms else 0.0
+            scored.append((score - 0.002 * idx, sentence))
+        sentence = max(scored, key=lambda row: row[0])[1] if scored else ""
+        sentence = _strip_inline_citation_markers_for_display(sentence)
+        if not sentence:
+            continue
+        if len(sentence) > 520:
+            sentence = sentence[:520].rsplit(" ", 1)[0].strip() + "…"
+        prefix = "The source states:" if str(response_language or "").lower().startswith("en") else "La fonte indica:"
+        parts.append(f"{prefix} {sentence}")
+        used.append(citation)
+        if len(parts) >= max(1, int(max_points or 2)):
+            break
+
+    if not parts:
+        return "", []
+    if len(parts) == 1:
+        return parts[0], used
+    return "\n\n".join(f"{idx}. {text}" for idx, text in enumerate(parts, start=1)), used
+
+def _v13_generate_ask_response(
+    *,
+    q: str,
+    company_id: str,
+    response_language: str,
+    top_k: int,
+    retrieval: dict,
+    narrow_scope: bool,
+    debug: bool,
+) -> dict:
+    candidates = list(retrieval.get("citations") or retrieval.get("candidates") or [])
+    candidates = candidates[:V13_MAX_EVIDENCE_ITEMS_ASK]
+    if not candidates:
+        return {
+            "ok": True,
+            "status": "no_sources",
+            "answer": _localized_no_sources(response_language),
+            "language": response_language,
+            "citations": [],
+            "rg_links": [],
+            "top_k": top_k,
+            "similarity_max": None,
+        }
+
+    model, effort, reasoning_mode = _v13_choose_ask_model(
+        q,
+        retrieval,
+        narrow_scope=narrow_scope,
+    )
+    context_chars = V13_FAST_CONTEXT_CHARS if model == V13_FAST_MODEL else V13_HEAVY_CONTEXT_CHARS
+    sources_block = _v13_sources_block(candidates, max_context_chars=context_chars)
     if not sources_block:
-        return _v11_no_sources_ask(q, response_language, top_k, debug=debug_payload if payload.debug else None)
+        return {
+            "ok": True,
+            "status": "no_sources",
+            "answer": _localized_no_sources(response_language),
+            "language": response_language,
+            "citations": [],
+            "rg_links": [],
+            "top_k": top_k,
+            "similarity_max": None,
+        }
 
-    answer, final_citations, answer_json = _v11_generate_ask(
-        q=q, response_language=response_language, evidence=evidence,
-        sources_block=sources_block, company_id=company_id,
+    system_msg = (
+        "You are MachineMind ASK, an evidence-grounded industrial documentation assistant. Use only SOURCES. "
+        "Answer the exact user question, not a nearby topic. Prefer exact-machine evidence over company-general evidence when relevance is comparable. "
+        "For procedures, return the actual ordered operations and conditions; for lists/tables, preserve all relevant items, labels, codes, values and units; for comparisons, keep the compared facts aligned. "
+        "Structured procedure/step/P&S records are first-class evidence. Manual text may support them, but generic legal, overview, installation or safety text cannot replace a specific answer. "
+        "For photo/video records, use metadata only and never claim visual/audio inspection. Do not expose citation ids or internal Bubble ids in visible text. "
+        "If SOURCES do not support the answer, return no_sources. Reply in the requested language."
     )
-    if not answer or not final_citations:
-        return _v11_no_sources_ask(q, response_language, top_k, debug=debug_payload if payload.debug else None)
+    user_msg = (
+        f"QUESTION:\n{q}\n\nRESPONSE_LANGUAGE: {response_language}\n\nSOURCES:\n{sources_block}\n\n"
+        "Return JSON only. Produce a concise but operationally complete answer, with every point supported by citation_ids from SOURCES."
+    )
 
-    verifier = _v11_verify_response(
-        mode="ask", q=q, response_language=response_language,
-        response_payload=answer_json, sources_block=sources_block, company_id=company_id,
-    )
-    if str(verifier.get("verdict") or "reject") == "rewrite":
-        answer2, citations2, answer_json2 = _v11_generate_ask(
-            q=q, response_language=response_language, evidence=evidence,
-            sources_block=sources_block, company_id=company_id, verifier_feedback=verifier,
+    parsed: dict = {}
+    model_used = model
+    try:
+        parsed, model_used = _v13_json_models(
+            [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            models=[model, V13_FAST_MODEL] if model != V13_FAST_MODEL else [model],
+            json_schema=_ask_evidence_answer_schema(),
+            effort=effort,
+            reasoning_mode=reasoning_mode,
+            timeout=V13_HEAVY_TIMEOUT_SECONDS if model == V13_HEAVY_MODEL else V13_FAST_TIMEOUT_SECONDS,
+            max_output_tokens=V13_HEAVY_MAX_OUTPUT_TOKENS if model == V13_HEAVY_MODEL else V13_FAST_MAX_OUTPUT_TOKENS,
+            company_id=company_id,
+            purpose="ask_final_synthesis",
         )
-        if answer2 and citations2:
-            verifier2 = _v11_verify_response(
-                mode="ask", q=q, response_language=response_language,
-                response_payload=answer_json2, sources_block=sources_block, company_id=company_id,
-            )
-            if str(verifier2.get("verdict") or "reject") == "pass":
-                answer, final_citations, answer_json, verifier = answer2, citations2, answer_json2, verifier2
-            else:
-                verifier = verifier2
+    except _V13BudgetExceeded:
+        raise
+    except Exception as exc:
+        print("V13_ASK_SYNTHESIS_FAIL", str(exc)[:800])
+        parsed = {"answer_status": "no_sources", "grounded_points": []}
 
-    if str(verifier.get("verdict") or "reject") != "pass":
-        debug_payload["verifier"] = verifier
-        return _v11_no_sources_ask(q, response_language, top_k, debug=debug_payload if payload.debug else None)
+    answer = ""
+    final_citations: list[dict] = []
+    synthesis_grounded = False
+    if str(parsed.get("answer_status") or "").strip().lower() == "answered":
+        answer, final_citations = _render_grounded_answer_points(
+            grounded_points=list(parsed.get("grounded_points") or []),
+            citations=candidates,
+            max_points=max(1, int(ASK_UI_MAX_POINTS or 5)),
+            q=q,
+        )
+        synthesis_grounded = bool(answer and final_citations)
 
-    if not _looks_like_target_language(answer, response_language):
-        answer = _translate_text_preserving_citations(answer, response_language)
+    if not answer or not final_citations:
+        answer, final_citations = _v13_extractive_fallback_answer(
+            candidates,
+            response_language=response_language,
+            max_points=min(2, top_k),
+            q=q,
+        )
+
+    if not answer or not final_citations:
+        return {
+            "ok": True,
+            "status": "no_sources",
+            "answer": _localized_no_sources(response_language),
+            "language": response_language,
+            "citations": [],
+            "rg_links": [],
+            "top_k": top_k,
+            "similarity_max": (retrieval.get("metrics") or {}).get("top_similarity"),
+            "chat_model": model_used,
+            "meta": {
+                "cacheable": False,
+                "semantic_cacheable": False,
+                "degraded": True,
+                "degraded_reason": "ask_synthesis_unavailable",
+            },
+        }
+
     response_citations = _sanitize_citations_for_response(final_citations, company_id=company_id)
     try:
         rg_links = _build_rg_links(company_id, response_citations)
     except Exception as exc:
-        print("RG_LINKS_FAIL", str(exc))
+        print("RG_LINKS_FAIL", str(exc)[:500])
         rg_links = []
+
     resp = {
-        "ok": True, "status": "answered", "answer": answer, "language": response_language,
-        "citations": response_citations, "rg_links": rg_links, "top_k": top_k,
-        "similarity_max": max([float(c.get("similarity") or 0.0) for c in selected], default=None),
-        "chat_model": "ask_gpt56_sol_pro_v11",
+        "ok": True,
+        "status": "answered",
+        "answer": answer,
+        "language": response_language,
+        "citations": response_citations,
+        "rg_links": rg_links,
+        "top_k": top_k,
+        "similarity_max": (retrieval.get("metrics") or {}).get("top_similarity"),
+        "chat_model": model_used if synthesis_grounded else "v13_extractive_fallback",
+        "meta": (
+            {"cacheable": True, "semantic_cacheable": True}
+            if synthesis_grounded
+            else {
+                "cacheable": False,
+                "semantic_cacheable": False,
+                "degraded": True,
+                "degraded_reason": "ask_extractive_fallback",
+            }
+        ),
     }
-    if payload.debug:
-        debug_payload["verifier"] = verifier
-        debug_payload["evidence_count"] = len(evidence)
-        resp["debug"] = {"reasoning_v11": debug_payload}
+    if debug:
+        resp["debug"] = {
+            "v13_ask": {
+                "metrics": retrieval.get("metrics") or {},
+                "plan": retrieval.get("plan") or {},
+                "candidate_count": len(retrieval.get("candidates") or []),
+                "evidence_ids": [c.get("citation_id") for c in candidates],
+            }
+        }
     return _finalize_ask_response_for_ui(resp, language=response_language)
 
 
+def _v13_root_cause_model(q: str, retrieval: dict) -> tuple[str, str, str]:
+    metrics = retrieval.get("metrics") or {}
+    candidates = list(retrieval.get("candidates") or [])
+    exact_ps = any(
+        str(c.get("source_type") or "") == "ps"
+        and float(c.get("v13_score") or 0.0) >= float(metrics.get("top_score") or 0.0) - 0.05
+        for c in candidates[:6]
+    )
+    simple = _count_query_tokens(q) <= 10 and str(metrics.get("confidence") or "") == "high"
+    if exact_ps or simple:
+        return V13_FAST_MODEL, V13_FAST_EFFORT, ""
+    return V13_HEAVY_MODEL, V13_ROOT_HEAVY_EFFORT, V13_HEAVY_REASONING_MODE
 
-def _v11_generate_root_cause(
+
+def _v13_root_fallback_from_evidence(
     *,
     q: str,
-    response_language: str,
-    evidence: list[dict],
-    sources_block: str,
+    citations: list[dict],
     max_causes: int,
-    company_id: str,
-    verifier_feedback: Optional[dict] = None,
+    response_language: str,
 ) -> tuple[dict, list[dict]]:
-    system_msg = (
-        "Perform evidence-grounded industrial root-cause analysis. Build distinct hypotheses from the reported symptom and SOURCES. "
-        "Each cause needs a supported component, mechanism, matching P&S, or discriminating check. Separate explicit source statements from engineering inference. "
-        "Rank exact-machine evidence first. Generic company, legal, safety, installation or overview text cannot be a cause by itself. "
-        "Do not invent measurements, alarms, states or procedures."
-    )
-    feedback_block = f"\n\nVERIFIER_FEEDBACK_JSON:\n{json.dumps(verifier_feedback, ensure_ascii=False)[:5000]}" if verifier_feedback else ""
-    user_msg = (
-        f"SYMPTOM:\n{q}\n\nRESPONSE_LANGUAGE: {response_language}\n\nSOURCES:\n{sources_block}"
-        f"{feedback_block}\n\nReturn ranked causes and practical discriminating checks. Cite only ids from SOURCES."
-    )
-    parsed = _v11_json_models(
-        [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
-        models=[REASONING_V11_MODEL, REASONING_V11_SELECTOR_MODEL],
-        json_schema=_root_cause_response_schema(max_causes=max_causes),
-        effort=REASONING_V11_REASONER_EFFORT,
-        reasoning_mode=REASONING_V11_REASONER_MODE,
-        timeout=REASONING_V11_TIMEOUT,
-        safety_identifier=_v11_safety_identifier(company_id),
-    )
-    return _ground_root_cause_result(result=dict(parsed or {}), citations=evidence, max_causes=max_causes)
+    selected: list[dict] = []
+    causes: list[dict] = []
 
-
-
-def _v11_root_visible_text(result: dict) -> str:
-    lines = [str(result.get("problem_summary") or "").strip()]
-    for cause in result.get("possible_causes") or []:
-        if not isinstance(cause, dict):
-            continue
-        lines.append(str(cause.get("cause") or "").strip())
-        lines.append(str(cause.get("why") or "").strip())
-        lines.extend(str(x or "").strip() for x in (cause.get("checks") or []))
-    lines.extend(str(x or "").strip() for x in (result.get("recommended_next_checks") or []))
-    return "\n".join(x for x in lines if x).strip()
-
-
-def _v11_root_cause_impl(payload: RootCauseRequest, x_ai_internal_secret: Optional[str]) -> Optional[dict]:
-    if not (REASONING_V11_ENABLED and REASONING_V11_ROOT_CAUSE_ENABLED):
-        return None
-    _v11_auth_guard(x_ai_internal_secret)
-    q = str(payload.query or "").strip()
-    if not q:
-        raise HTTPException(status_code=400, detail="Missing query")
-    scope = _resolve_query_scope(
-        company_id=payload.company_id, machine_id=payload.machine_id,
-        bubble_document_id=payload.bubble_document_id, document_ids=payload.document_ids,
-        ai_scope=payload.ai_scope,
-    )
-    company_id = scope["company_id"]
-    machine_id = scope["machine_id"]
-    doc_ids = scope.get("document_ids") if isinstance(scope.get("document_ids"), list) else None
-    bubble_document_id = scope.get("bubble_document_id")
-    top_k = max(1, min(int(payload.top_k or 8), ASK_MAX_TOP_K))
-    max_causes = max(1, min(int(payload.max_causes or 3), 3))
-    response_language = _select_response_language(q, preferred=payload.language)
-
-    planner, candidates = _v11_collect_candidates(
-        q=q, company_id=company_id, machine_id=machine_id, doc_ids=doc_ids,
-        bubble_document_id=bubble_document_id, mode="root_cause",
-    )
-    selector, selected = _v11_select_evidence(
-        q=q, response_language=response_language, mode="root_cause", planner=planner,
-        candidates=candidates, company_id=company_id, machine_id=machine_id,
-    )
-    planner2, candidates2, selector2, selected2, refined_used = _v11_run_refinement_pass(
-        q=q, mode="root_cause", response_language=response_language, company_id=company_id,
-        machine_id=machine_id, doc_ids=doc_ids, bubble_document_id=bubble_document_id,
-        planner=planner, selector=selector, selected=selected,
-    )
-    if refined_used:
-        planner, candidates, selector, selected = planner2, candidates2, selector2, selected2
-    debug_payload = {
-        "planner": planner, "candidate_count": len(candidates), "selector": selector,
-        "retrieval_passes": 2 if refined_used else 1,
-        "selected_ids": [c.get("citation_id") for c in selected],
-        "models": {
-            "planner": REASONING_V11_PLANNER_MODEL, "selector": REASONING_V11_SELECTOR_MODEL,
-            "reasoner": REASONING_V11_MODEL, "verifier": REASONING_V11_VERIFIER_MODEL,
-        },
-    }
-    if not selected:
-        return _v11_no_sources_root(q, response_language, top_k, debug=debug_payload if payload.debug else None)
-
-    evidence = _v11_expand_selected_evidence(company_id, selected)
-    sources_block = _v11_answer_sources_block(evidence)
-    if not sources_block:
-        return _v11_no_sources_root(q, response_language, top_k, debug=debug_payload if payload.debug else None)
-
-    result, grounded_citations = _v11_generate_root_cause(
-        q=q, response_language=response_language, evidence=evidence,
-        sources_block=sources_block, max_causes=max_causes, company_id=company_id,
-    )
-    if not result.get("possible_causes") or not grounded_citations:
-        return _v11_no_sources_root(q, response_language, top_k, debug=debug_payload if payload.debug else None)
-
-    verifier = _v11_verify_response(
-        mode="root_cause", q=q, response_language=response_language,
-        response_payload=result, sources_block=sources_block, company_id=company_id,
-    )
-    if str(verifier.get("verdict") or "reject") == "rewrite":
-        result2, citations2 = _v11_generate_root_cause(
-            q=q, response_language=response_language, evidence=evidence,
-            sources_block=sources_block, max_causes=max_causes, company_id=company_id,
-            verifier_feedback=verifier,
+    for citation in citations or []:
+        source_type = str(
+            citation.get("source_type")
+            or _source_type_from_document_id(citation.get("bubble_document_id") or "")
         )
-        if result2.get("possible_causes") and citations2:
-            verifier2 = _v11_verify_response(
-                mode="root_cause", q=q, response_language=response_language,
-                response_payload=result2, sources_block=sources_block, company_id=company_id,
+        if source_type != "ps":
+            continue
+        fields = _parse_structured_source_fields(_v13_candidate_text(citation))
+        title = _clean_display_text(
+            fields.get("title") or fields.get("category") or "Problema/Soluzione",
+            max_len=100,
+        )
+        problem = _clean_display_text(fields.get("description") or fields.get("notes") or "", max_len=320)
+        solution = _clean_display_text(fields.get("solution") or "", max_len=320)
+        if not (problem or solution):
+            continue
+
+        if str(response_language or "").lower().startswith("en"):
+            why = problem or "A matching problem/solution record is present for this machine."
+            checks = _unique_non_empty_strings(
+                [solution, "Verify that the observed condition matches the cited problem/solution record."],
+                limit=3,
             )
-            if str(verifier2.get("verdict") or "reject") == "pass":
-                result, grounded_citations, verifier = result2, citations2, verifier2
-            else:
-                verifier = verifier2
+        else:
+            why = problem or "È presente una voce Problema/Soluzione pertinente per questa macchina."
+            checks = _unique_non_empty_strings(
+                [solution, "Verificare che la condizione osservata coincida con la voce Problema/Soluzione citata."],
+                limit=3,
+            )
+        causes.append(
+            {
+                "rank": len(causes) + 1,
+                "cause": title,
+                "why": why,
+                "checks": checks,
+                "citations": [str(citation.get("citation_id") or "")],
+            }
+        )
+        selected.append(citation)
+        if len(causes) >= max(1, int(max_causes or 1)):
+            break
 
-    if str(verifier.get("verdict") or "reject") != "pass":
-        debug_payload["verifier"] = verifier
-        return _v11_no_sources_root(q, response_language, top_k, debug=debug_payload if payload.debug else None)
+    result = {
+        "problem_summary": q,
+        "possible_causes": causes,
+        "recommended_next_checks": _unique_non_empty_strings(
+            [check for cause in causes for check in (cause.get("checks") or [])],
+            limit=6,
+        ),
+    }
+    return result, selected
 
-    if not result.get("problem_summary"):
-        result["problem_summary"] = planner.get("normalized_query") or q
+def _v13_generate_root_cause_response(
+    *,
+    q: str,
+    company_id: str,
+    response_language: str,
+    top_k: int,
+    max_causes: int,
+    retrieval: dict,
+    debug: bool,
+) -> dict:
+    citations = list(retrieval.get("citations") or retrieval.get("candidates") or [])
+    citations = citations[:V13_MAX_EVIDENCE_ITEMS_ROOT_CAUSE]
+    if not citations:
+        return {
+            "ok": True,
+            "status": "no_sources",
+            "symptom": q,
+            "language": response_language,
+            "problem_summary": "",
+            "possible_causes": [],
+            "recommended_next_checks": [],
+            "citations": [],
+            "rg_links": [],
+            "top_k": top_k,
+            "similarity_max": None,
+        }
+
+    model, effort, reasoning_mode = _v13_root_cause_model(q, retrieval)
+    context_chars = V13_FAST_CONTEXT_CHARS if model == V13_FAST_MODEL else V13_HEAVY_CONTEXT_CHARS
+    sources_block = _v13_sources_block(citations, max_context_chars=context_chars)
+    if not sources_block:
+        return {
+            "ok": True,
+            "status": "no_sources",
+            "symptom": q,
+            "language": response_language,
+            "problem_summary": "",
+            "possible_causes": [],
+            "recommended_next_checks": [],
+            "citations": [],
+            "rg_links": [],
+            "top_k": top_k,
+            "similarity_max": None,
+        }
+
+    system_msg = (
+        "Perform an evidence-grounded industrial root-cause analysis using only SOURCES. Build distinct, ranked hypotheses from the reported symptom. "
+        "A cause must be supported by a component/state/mechanism, a matching P&S, or a discriminating check grounded in the sources. "
+        "Prefer exact-machine evidence. Generic legal, overview, installation, start-up or safety text cannot become a cause by itself. "
+        "Separate explicit source statements from cautious engineering inference in the 'why' field. Do not invent measurements, alarms, states or procedures. "
+        "Keep labels short and stable. Merge duplicate paraphrases, but preserve different causal families when sources support them. "
+        "For signals, interlocks, cam windows, PLC/HMI states or automatic-cycle conditions, prioritize checks that discriminate sensor/input state, logic/consent, configuration/timing and physical mechanism only when supported by SOURCES. "
+        "Every cause must cite valid citation_ids from SOURCES. Reply in the requested language."
+    )
+    user_msg = (
+        f"SYMPTOM:\n{q}\n\nRESPONSE_LANGUAGE: {response_language}\n\nSOURCES:\n{sources_block}\n\n"
+        f"Return JSON only with at most {max_causes} ranked causes and practical discriminating checks."
+    )
+
+    parsed: dict = {}
+    model_used = model
+    try:
+        parsed, model_used = _v13_json_models(
+            [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            models=[model, V13_FAST_MODEL] if model != V13_FAST_MODEL else [model],
+            json_schema=_root_cause_response_schema(max_causes=max_causes),
+            effort=effort,
+            reasoning_mode=reasoning_mode,
+            timeout=V13_HEAVY_TIMEOUT_SECONDS if model == V13_HEAVY_MODEL else V13_FAST_TIMEOUT_SECONDS,
+            max_output_tokens=V13_HEAVY_MAX_OUTPUT_TOKENS if model == V13_HEAVY_MODEL else V13_FAST_MAX_OUTPUT_TOKENS,
+            company_id=company_id,
+            purpose="root_cause_final_reasoning",
+        )
+    except _V13BudgetExceeded:
+        raise
+    except Exception as exc:
+        print("V13_ROOT_CAUSE_SYNTHESIS_FAIL", str(exc)[:900])
+        parsed = {}
+
+    grounded_result, grounded_citations = _ground_root_cause_result(
+        result=parsed,
+        citations=citations,
+        max_causes=max_causes,
+    )
+    grounded_result, grounded_citations = _compact_root_cause_result_citations_by_family(
+        result=grounded_result,
+        citations=grounded_citations,
+        max_per_cause=2,
+    )
+    grounded_result, grounded_citations = _lock_root_cause_result(
+        grounded_result,
+        grounded_citations,
+        max_causes=max_causes,
+    )
+    synthesis_grounded = bool(grounded_result.get("possible_causes") and grounded_citations)
+
+    if not grounded_result.get("possible_causes"):
+        grounded_result, grounded_citations = _v13_root_fallback_from_evidence(
+            q=q,
+            citations=citations,
+            max_causes=max_causes,
+            response_language=response_language,
+        )
+
+    if not grounded_result.get("possible_causes"):
+        return {
+            "ok": True,
+            "status": "no_sources",
+            "symptom": q,
+            "language": response_language,
+            "problem_summary": "",
+            "possible_causes": [],
+            "recommended_next_checks": [],
+            "citations": [],
+            "rg_links": [],
+            "top_k": top_k,
+            "similarity_max": (retrieval.get("metrics") or {}).get("top_similarity"),
+            "chat_model": model_used,
+            "meta": {
+                "cacheable": False,
+                "semantic_cacheable": False,
+                "degraded": True,
+                "degraded_reason": "root_cause_synthesis_unavailable",
+            },
+        }
+
     response_citations = _sanitize_citations_for_response(grounded_citations, company_id=company_id)
     try:
         rg_links = _build_rg_links(company_id, response_citations)
     except Exception as exc:
-        print("RG_LINKS_FAIL", str(exc))
+        print("RG_LINKS_FAIL", str(exc)[:500])
         rg_links = []
+
     resp = {
-        "ok": True, "status": "answered", "symptom": q, "language": response_language,
-        "problem_summary": result.get("problem_summary") or q,
-        "possible_causes": result.get("possible_causes") or [],
-        "recommended_next_checks": result.get("recommended_next_checks") or [],
-        "citations": response_citations, "rg_links": rg_links, "top_k": top_k,
-        "similarity_max": max([float(c.get("similarity") or 0.0) for c in selected], default=None),
-        "chat_model": "root_cause_gpt56_sol_pro_v11",
+        "ok": True,
+        "status": "answered",
+        "symptom": q,
+        "language": response_language,
+        "problem_summary": grounded_result.get("problem_summary") or q,
+        "possible_causes": grounded_result.get("possible_causes") or [],
+        "recommended_next_checks": grounded_result.get("recommended_next_checks") or [],
+        "citations": response_citations,
+        "rg_links": rg_links,
+        "top_k": top_k,
+        "similarity_max": (retrieval.get("metrics") or {}).get("top_similarity"),
+        "chat_model": model_used if synthesis_grounded else "v13_deterministic_ps_fallback",
+        "meta": (
+            {"cacheable": True, "semantic_cacheable": True}
+            if synthesis_grounded
+            else {
+                "cacheable": False,
+                "semantic_cacheable": False,
+                "degraded": True,
+                "degraded_reason": "root_cause_deterministic_ps_fallback",
+            }
+        ),
     }
-    if payload.debug:
-        debug_payload["verifier"] = verifier
-        debug_payload["evidence_count"] = len(evidence)
-        resp["debug"] = {"reasoning_v11": debug_payload}
+    if debug:
+        resp["debug"] = {
+            "v13_root_cause": {
+                "metrics": retrieval.get("metrics") or {},
+                "plan": retrieval.get("plan") or {},
+                "candidate_count": len(retrieval.get("candidates") or []),
+                "evidence_ids": [c.get("citation_id") for c in citations],
+            }
+        }
     return resp
 
 
+def _v13_try_direct_lookup(
+    *,
+    q: str,
+    company_id: str,
+    machine_id: str,
+    doc_ids: Optional[list[str]],
+    bubble_document_id: Optional[str],
+    response_language: str,
+    top_k: int,
+) -> Optional[dict]:
+    """Zero-reasoning-call hot path for exact contacts/URLs and identifier lookups."""
+    kind = None
+    if _q_has_any(q, URL_HINTS):
+        kind = "url"
+    elif _q_has_any(q, EMAIL_HINTS):
+        kind = "email"
+    elif _q_has_any(q, PHONE_HINTS):
+        kind = "phone"
+
+    if kind:
+        hit = _db_find_entity_chunk(
+            company_id=company_id,
+            machine_id=machine_id,
+            kind=kind,
+            doc_ids=doc_ids,
+            bubble_document_id=bubble_document_id,
+        )
+        if hit:
+            citations = [
+                {
+                    "citation_id": hit["citation_id"],
+                    "bubble_document_id": hit["bubble_document_id"],
+                    "page_from": hit["page_from"],
+                    "page_to": hit["page_to"],
+                    "snippet": hit["snippet"],
+                    "chunk_full": hit["snippet"],
+                    "similarity": 1.0,
+                    "retrieval_score": 1.0,
+                }
+            ]
+            response_citations = _sanitize_citations_for_response(citations, company_id=company_id)
+            try:
+                rg_links = _build_rg_links(company_id, response_citations)
+            except Exception:
+                rg_links = []
+            return _finalize_ask_response_for_ui(
+                {
+                    "ok": True,
+                    "status": "answered",
+                    "answer": _localized_value_answer(response_language, hit["value"], hit["citation_id"]),
+                    "language": response_language,
+                    "citations": response_citations,
+                    "rg_links": rg_links,
+                    "top_k": top_k,
+                    "similarity_max": 1.0,
+                    "chat_model": "v13_deterministic_lookup",
+                    "meta": {"cacheable": True, "semantic_cacheable": False, "v13_zero_llm": True},
+                },
+                language=response_language,
+            )
+
+    # A code appearing inside a long troubleshooting question still needs synthesis.
+    # Use the zero-call token answer only for an actual lookup/identifier request.
+    if _is_lookup_or_identifier_query(q):
+        for token in _extract_code_tokens(q):
+            hit = _db_find_token_chunk(
+                company_id=company_id,
+                machine_id=machine_id,
+                token=token,
+                doc_ids=doc_ids,
+                bubble_document_id=bubble_document_id,
+            )
+            if not hit:
+                continue
+            hit = dict(hit)
+            hit["chunk_full"] = hit.get("snippet") or ""
+            hit["retrieval_score"] = 1.0
+            hit["similarity"] = 1.0
+            response_citations = _sanitize_citations_for_response([hit], company_id=company_id)
+            try:
+                rg_links = _build_rg_links(company_id, response_citations)
+            except Exception:
+                rg_links = []
+            return _finalize_ask_response_for_ui(
+                {
+                    "ok": True,
+                    "status": "answered",
+                    "answer": _localized_token_answer(response_language, token, hit["citation_id"]),
+                    "language": response_language,
+                    "citations": response_citations,
+                    "rg_links": rg_links,
+                    "top_k": top_k,
+                    "similarity_max": 1.0,
+                    "chat_model": "v13_deterministic_lookup",
+                    "meta": {"cacheable": True, "semantic_cacheable": False, "v13_zero_llm": True},
+                },
+                language=response_language,
+            )
+
+    return None
 
 
+# -----------------------------------------------------------------------------
+# Live V13 route implementations
+# -----------------------------------------------------------------------------
+
+
+def _v13_attach_runtime_meta(response: dict, budget: _V13RequestBudget, *, debug: bool) -> dict:
+    response = dict(response or {})
+    meta = dict(response.get("meta") or {})
+    runtime_meta = budget.public_meta()
+
+    cache_detail = meta.get("v13_semantic_cache") if isinstance(meta.get("v13_semantic_cache"), dict) else None
+    if cache_detail:
+        meta["v13_semantic_cache_detail"] = cache_detail
+
+    meta.setdefault("cacheable", True)
+    meta["v13_engine"] = "adaptive_budgeted_evidence_first"
+    meta["v13_code_marker"] = V13_CODE_MARKER
+    meta["v13_engine_key"] = V13_ENGINE_KEY
+    meta["v13_route"] = budget.route
+    meta["v13_semantic_cache"] = budget.semantic_cache
+    meta["v13_elapsed_seconds"] = runtime_meta["elapsed_seconds"]
+    meta["v13_llm_calls"] = runtime_meta["llm_calls"]
+    meta["v13_estimated_cost_usd"] = runtime_meta["estimated_cost_usd"]
+    if debug:
+        meta["v13_runtime"] = runtime_meta
+    response["meta"] = meta
+
+    # One compact line per request makes real latency/cost measurable without logging
+    # user text, source content, credentials, or document ids.
+    try:
+        print(
+            "V13_REQUEST",
+            json.dumps(
+                {
+                    "mode": budget.mode,
+                    "route": budget.route,
+                    "status": str(response.get("status") or ""),
+                    "elapsed_seconds": runtime_meta["elapsed_seconds"],
+                    "llm_calls": runtime_meta["llm_calls"],
+                    "estimated_cost_usd": runtime_meta["estimated_cost_usd"],
+                    "semantic_cache": budget.semantic_cache,
+                    "cacheable": bool(meta.get("cacheable", True)),
+                },
+                separators=(",", ":"),
+            ),
+        )
+    except Exception:
+        pass
+    return response
+
+
+def _v13_budget_fallback(
+    *,
+    mode: str,
+    q: str,
+    response_language: str,
+    top_k: int,
+    budget: _V13RequestBudget,
+    exc: Exception,
+) -> dict:
+    budget.route = "deadline_budget_fallback"
+    is_en = str(response_language or "it").lower().startswith("en")
+    message = (
+        "The analysis reached its protected time/cost limit before a grounded answer could be completed. Please retry."
+        if is_en
+        else "L'analisi ha raggiunto il limite protetto di tempo/costo prima di completare una risposta fondata. Riprova."
+    )
+    meta = {
+        "cacheable": False,
+        "semantic_cacheable": False,
+        "degraded": True,
+        "degraded_reason": "budget_exceeded",
+    }
+
+    if mode == "root_cause":
+        response = {
+            "ok": True,
+            "status": "no_sources",
+            "symptom": q,
+            "language": response_language,
+            "problem_summary": message,
+            "possible_causes": [],
+            "recommended_next_checks": [],
+            "citations": [],
+            "rg_links": [],
+            "top_k": top_k,
+            "similarity_max": None,
+            "chat_model": "v13_budget_fallback",
+            "meta": meta,
+        }
+    else:
+        response = {
+            "ok": True,
+            "status": "no_sources",
+            "answer": message,
+            "language": response_language,
+            "citations": [],
+            "rg_links": [],
+            "top_k": top_k,
+            "similarity_max": None,
+            "chat_model": "v13_budget_fallback",
+            "meta": meta,
+        }
+    return _v13_attach_runtime_meta(response, budget, debug=False)
+
+
+def _ask_v13_sync(
+    payload: AskRequest,
+    x_ai_internal_secret: Optional[str],
+) -> dict:
+    if not AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=500, detail="AI_INTERNAL_SECRET missing")
+    if (x_ai_internal_secret or "").strip() != AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    q = str(payload.query or "").strip()
+    if not q:
+        raise HTTPException(status_code=400, detail="Missing query")
+
+    budget = _V13RequestBudget("ask")
+    token = _V13_BUDGET_CTX.set(budget)
+    response_language = _select_response_language(q, preferred=payload.language)
+    top_k = max(1, min(int(payload.top_k or 5), ASK_MAX_TOP_K))
+    try:
+        scope = _resolve_query_scope(
+            company_id=payload.company_id,
+            machine_id=payload.machine_id,
+            bubble_document_id=payload.bubble_document_id,
+            document_ids=payload.document_ids,
+            ai_scope=payload.ai_scope,
+        )
+        company_id = scope["company_id"]
+        machine_id = scope["machine_id"]
+        doc_ids = scope.get("document_ids") if isinstance(scope.get("document_ids"), list) else None
+        bubble_document_id = scope.get("bubble_document_id")
+        ai_scope = str(scope.get("ai_scope") or "machine_all")
+        narrow_scope = bool(doc_ids or bubble_document_id or ai_scope == "document_ids")
+        cache_scope = {**scope, "_v13_top_k": top_k, "_v13_max_causes": 0}
+
+        # Exact URL/contact/identifier lookups must remain genuinely zero-model:
+        # run the deterministic DB path before semantic-cache lookup, which would
+        # otherwise purchase an embedding on a cold/non-exact cache query.
+        direct = _v13_try_direct_lookup(
+            q=q,
+            company_id=company_id,
+            machine_id=machine_id,
+            doc_ids=doc_ids,
+            bubble_document_id=bubble_document_id,
+            response_language=response_language,
+            top_k=top_k,
+        )
+        if direct is not None:
+            budget.route = "deterministic_lookup_zero_llm"
+            final = _v13_attach_runtime_meta(direct, budget, debug=bool(payload.debug))
+            _v13_cache_store(
+                mode="ask", q=q, company_id=company_id, machine_id=machine_id,
+                scope=cache_scope, language=response_language, response=final,
+                debug=bool(payload.debug),
+            )
+            return final
+
+        cached = _v13_cache_lookup(
+            mode="ask",
+            q=q,
+            company_id=company_id,
+            machine_id=machine_id,
+            scope=cache_scope,
+            language=response_language,
+            debug=bool(payload.debug),
+        )
+        if cached is not None:
+            return _v13_attach_runtime_meta(cached, budget, debug=bool(payload.debug))
+
+        fallback_plan = _v13_fallback_plan(q)
+        retrieval = _v13_initial_retrieval(
+            q=q,
+            company_id=company_id,
+            machine_id=machine_id,
+            doc_ids=doc_ids,
+            bubble_document_id=bubble_document_id,
+            ai_scope=ai_scope,
+            response_language=response_language,
+            mode="ask",
+            plan=fallback_plan,
+        )
+
+        if ai_scope == "machine_all" and not narrow_scope and _v13_should_use_structured_path(q, retrieval):
+            structured_response = _v13_structured_ask(
+                q=q,
+                company_id=company_id,
+                machine_id=machine_id,
+                response_language=response_language,
+                top_k=top_k,
+                planner=retrieval.get("plan") or fallback_plan,
+                seed_citations=retrieval.get("candidates") or [],
+                debug=bool(payload.debug),
+            )
+            if structured_response and structured_response.get("ok") is True:
+                budget.route = "structured_single_synthesis"
+                final = _v13_attach_runtime_meta(structured_response, budget, debug=bool(payload.debug))
+                _v13_cache_store(
+                    mode="ask", q=q, company_id=company_id, machine_id=machine_id,
+                    scope=cache_scope, language=response_language, response=final,
+                    debug=bool(payload.debug),
+                )
+                return final
+
+        if _v13_needs_refinement(q, retrieval, mode="ask", narrow_scope=narrow_scope):
+            refined_plan = _v13_plan_retrieval(q=q, mode="ask", company_id=company_id)
+            if budget.refinement_used:
+                retrieval = _v13_initial_retrieval(
+                    q=q,
+                    company_id=company_id,
+                    machine_id=machine_id,
+                    doc_ids=doc_ids,
+                    bubble_document_id=bubble_document_id,
+                    ai_scope=ai_scope,
+                    response_language=response_language,
+                    mode="ask",
+                    plan=refined_plan,
+                )
+                if ai_scope == "machine_all" and not narrow_scope and _v13_should_use_structured_path(q, retrieval):
+                    structured_response = _v13_structured_ask(
+                        q=q,
+                        company_id=company_id,
+                        machine_id=machine_id,
+                        response_language=response_language,
+                        top_k=top_k,
+                        planner=retrieval.get("plan") or refined_plan,
+                        seed_citations=retrieval.get("candidates") or [],
+                        debug=bool(payload.debug),
+                    )
+                    if structured_response and structured_response.get("ok") is True:
+                        budget.route = "structured_refined_single_synthesis"
+                        final = _v13_attach_runtime_meta(structured_response, budget, debug=bool(payload.debug))
+                        _v13_cache_store(
+                            mode="ask", q=q, company_id=company_id, machine_id=machine_id,
+                            scope=cache_scope, language=response_language, response=final,
+                            debug=bool(payload.debug),
+                        )
+                        return final
+
+        # ASK symptom questions share one root-cause synthesis instead of launching a
+        # nested endpoint or the old baseline/candidate/arbiter chain.
+        source_profile = retrieval.get("source_profile") or {}
+        if str(source_profile.get("strength") or "none") == "none" and _should_route_ask_through_root_cause(q):
+            rescored = _v13_rescore_root_candidates(q, retrieval.get("candidates") or [])
+            root_retrieval = {
+                **retrieval,
+                "candidates": rescored,
+                "citations": rescored[:V13_MAX_EVIDENCE_ITEMS_ROOT_CAUSE],
+                "metrics": _v13_evidence_metrics(rescored),
+            }
+            root_response = _v13_generate_root_cause_response(
+                q=q,
+                company_id=company_id,
+                response_language=response_language,
+                top_k=max(6, top_k),
+                max_causes=2,
+                retrieval=root_retrieval,
+                debug=bool(payload.debug),
+            )
+            bridged = _build_ask_response_from_root_cause_bridge(
+                q=q,
+                company_id=company_id,
+                top_k=top_k,
+                root_response=root_response,
+                response_language=response_language,
+                debug=bool(payload.debug),
+            )
+            if bridged:
+                budget.route = "diagnostic_single_reasoner"
+                final = _finalize_ask_response_for_ui(bridged, language=response_language)
+                # Preserve cache/degraded metadata from the root synthesis.
+                root_meta = dict(root_response.get("meta") or {})
+                if root_meta:
+                    final = dict(final)
+                    final["meta"] = {**dict(final.get("meta") or {}), **root_meta}
+            else:
+                budget.route = "ask_single_synthesis"
+                final = _v13_generate_ask_response(
+                    q=q,
+                    company_id=company_id,
+                    response_language=response_language,
+                    top_k=top_k,
+                    retrieval=retrieval,
+                    narrow_scope=narrow_scope,
+                    debug=bool(payload.debug),
+                )
+        else:
+            metrics = retrieval.get("metrics") or {}
+            budget.route = (
+                "precise_single_synthesis"
+                if narrow_scope or str(metrics.get("confidence") or "") == "high"
+                else "complex_single_reasoner"
+            )
+            final = _v13_generate_ask_response(
+                q=q,
+                company_id=company_id,
+                response_language=response_language,
+                top_k=top_k,
+                retrieval=retrieval,
+                narrow_scope=narrow_scope,
+                debug=bool(payload.debug),
+            )
+
+        final = _v13_attach_runtime_meta(final, budget, debug=bool(payload.debug))
+        _v13_cache_store(
+            mode="ask", q=q, company_id=company_id, machine_id=machine_id,
+            scope=cache_scope, language=response_language, response=final,
+            debug=bool(payload.debug),
+        )
+        return final
+    except _V13BudgetExceeded as exc:
+        return _v13_budget_fallback(
+            mode="ask", q=q, response_language=response_language,
+            top_k=top_k, budget=budget, exc=exc,
+        )
+    finally:
+        _V13_BUDGET_CTX.reset(token)
+
+
+def _root_cause_v13_sync(
+    payload: RootCauseRequest,
+    x_ai_internal_secret: Optional[str],
+) -> dict:
+    if not AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=500, detail="AI_INTERNAL_SECRET missing")
+    if (x_ai_internal_secret or "").strip() != AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    q = str(payload.query or "").strip()
+    if not q:
+        raise HTTPException(status_code=400, detail="Missing query")
+
+    budget = _V13RequestBudget("root_cause")
+    token = _V13_BUDGET_CTX.set(budget)
+    response_language = _select_response_language(q, preferred=payload.language)
+    top_k = max(1, min(int(payload.top_k or 8), ASK_MAX_TOP_K))
+    max_causes = max(1, min(int(payload.max_causes or 3), 3))
+    try:
+        scope = _resolve_query_scope(
+            company_id=payload.company_id,
+            machine_id=payload.machine_id,
+            bubble_document_id=payload.bubble_document_id,
+            document_ids=payload.document_ids,
+            ai_scope=payload.ai_scope,
+        )
+        company_id = scope["company_id"]
+        machine_id = scope["machine_id"]
+        doc_ids = scope.get("document_ids") if isinstance(scope.get("document_ids"), list) else None
+        bubble_document_id = scope.get("bubble_document_id")
+        ai_scope = str(scope.get("ai_scope") or "machine_all")
+        narrow_scope = bool(doc_ids or bubble_document_id or ai_scope == "document_ids")
+        cache_scope = {**scope, "_v13_top_k": top_k, "_v13_max_causes": max_causes}
+
+        cached = _v13_cache_lookup(
+            mode="root_cause",
+            q=q,
+            company_id=company_id,
+            machine_id=machine_id,
+            scope=cache_scope,
+            language=response_language,
+            debug=bool(payload.debug),
+        )
+        if cached is not None:
+            return _v13_attach_runtime_meta(cached, budget, debug=bool(payload.debug))
+
+        fallback_plan = _v13_fallback_plan(q)
+        retrieval = _v13_initial_retrieval(
+            q=q,
+            company_id=company_id,
+            machine_id=machine_id,
+            doc_ids=doc_ids,
+            bubble_document_id=bubble_document_id,
+            ai_scope=ai_scope,
+            response_language=response_language,
+            mode="root_cause",
+            plan=fallback_plan,
+        )
+
+        if _v13_needs_refinement(q, retrieval, mode="root_cause", narrow_scope=narrow_scope):
+            refined_plan = _v13_plan_retrieval(q=q, mode="root_cause", company_id=company_id)
+            if budget.refinement_used:
+                retrieval = _v13_initial_retrieval(
+                    q=q,
+                    company_id=company_id,
+                    machine_id=machine_id,
+                    doc_ids=doc_ids,
+                    bubble_document_id=bubble_document_id,
+                    ai_scope=ai_scope,
+                    response_language=response_language,
+                    mode="root_cause",
+                    plan=refined_plan,
+                )
+
+        metrics = retrieval.get("metrics") or {}
+        if not retrieval.get("citations") and str(metrics.get("confidence") or "none") == "none":
+            budget.route = "no_sources_without_llm"
+            final = {
+                "ok": True,
+                "status": "no_sources",
+                "symptom": q,
+                "language": response_language,
+                "problem_summary": "",
+                "possible_causes": [],
+                "recommended_next_checks": [],
+                "citations": [],
+                "rg_links": [],
+                "top_k": top_k,
+                "similarity_max": None,
+                "chat_model": "v13_no_sources",
+                "meta": {"cacheable": True},
+            }
+        else:
+            model, _effort, _reasoning_mode = _v13_root_cause_model(q, retrieval)
+            budget.route = "root_precise_single_synthesis" if model == V13_FAST_MODEL else "root_complex_single_reasoner"
+            final = _v13_generate_root_cause_response(
+                q=q,
+                company_id=company_id,
+                response_language=response_language,
+                top_k=top_k,
+                max_causes=max_causes,
+                retrieval=retrieval,
+                debug=bool(payload.debug),
+            )
+
+        final = _v13_attach_runtime_meta(final, budget, debug=bool(payload.debug))
+        _v13_cache_store(
+            mode="root_cause", q=q, company_id=company_id, machine_id=machine_id,
+            scope=cache_scope, language=response_language, response=final,
+            debug=bool(payload.debug),
+        )
+        return final
+    except _V13BudgetExceeded as exc:
+        return _v13_budget_fallback(
+            mode="root_cause", q=q, response_language=response_language,
+            top_k=top_k, budget=budget, exc=exc,
+        )
+    finally:
+        _V13_BUDGET_CTX.reset(token)
+
+
+def _v13_stream_error_payload(mode: str, exc: Exception) -> dict:
+    if isinstance(exc, HTTPException):
+        detail = exc.detail
+        if isinstance(detail, dict):
+            code = str(detail.get("code") or detail.get("error_code") or f"{mode.upper()}_FAILED")
+            message = str(detail.get("message") or detail.get("error_message") or detail)
+        else:
+            code = f"{mode.upper()}_FAILED"
+            message = str(detail or f"{mode} failed")
+        return {
+            "ok": False,
+            "status": "error",
+            "error": {"code": code, "message": message, "detail": detail},
+        }
+
+    if isinstance(exc, _V13BudgetExceeded):
+        if mode == "root_cause":
+            return {
+                "ok": True,
+                "status": "no_sources",
+                "symptom": "",
+                "problem_summary": "L'analisi ha raggiunto il limite protetto di tempo/costo. Riprova.",
+                "possible_causes": [],
+                "recommended_next_checks": [],
+                "citations": [],
+                "rg_links": [],
+                "meta": {"cacheable": False, "semantic_cacheable": False, "degraded": True, "degraded_reason": "budget_exceeded"},
+            }
+        return {
+            "ok": True,
+            "status": "no_sources",
+            "answer": "L'analisi ha raggiunto il limite protetto di tempo/costo. Riprova.",
+            "citations": [],
+            "rg_links": [],
+            "meta": {"cacheable": False, "semantic_cacheable": False, "degraded": True, "degraded_reason": "budget_exceeded"},
+        }
+
+    return {
+        "ok": False,
+        "status": "error",
+        "error": {
+            "code": f"{mode.upper()}_FAILED",
+            "message": f"{mode.replace('_', ' ').title()} failed",
+            "detail": str(exc)[:1800],
+        },
+    }
+
+
+async def _v13_stream_json_response(
+    *,
+    mode: str,
+    sync_func,
+    payload,
+    x_ai_internal_secret: Optional[str],
+):
+    result_task = asyncio.create_task(
+        asyncio.to_thread(sync_func, payload, x_ai_internal_secret)
+    )
+
+    async def stream_json():
+        heartbeat = (" " * V13_STREAM_HEARTBEAT_BYTES) + "\n"
+        yield heartbeat
+        while True:
+            try:
+                result = await asyncio.wait_for(
+                    asyncio.shield(result_task),
+                    timeout=V13_STREAM_HEARTBEAT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                yield heartbeat
+                continue
+            except Exception as exc:
+                result = _v13_stream_error_payload(mode, exc)
+
+            if not isinstance(result, dict):
+                result = {
+                    "ok": False,
+                    "status": "error",
+                    "error": {
+                        "code": f"{mode.upper()}_FAILED",
+                        "message": "Invalid backend payload",
+                        "detail": str(type(result)),
+                    },
+                }
+            yield json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+            break
+
+    return StreamingResponse(
+        stream_json(),
+        media_type="application/json",
+        headers={
+            "Cache-Control": "no-store, no-transform",
+            "X-Accel-Buffering": "no",
+            "X-MachineMind-V13-Heartbeat": "1",
+        },
+    )
 
 
 @app.post("/v1/ai/ask")
-def ask_v1(
+async def ask_v1(
     payload: AskRequest,
     x_ai_internal_secret: Optional[str] = Header(default=None),
 ):
-    v11_response: Optional[dict] = None
-    v11_error = ""
-    try:
-        v11_response = _v11_ask_impl(payload, x_ai_internal_secret)
-        if v11_response is not None:
-            is_no_sources = str(v11_response.get("status") or "").strip().lower() == "no_sources"
-            if not (is_no_sources and REASONING_V11_ALLOW_LEGACY_FALLBACK):
-                return _strip_internal_response_artifacts(v11_response)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        v11_error = str(exc)[:1000]
-        print("ASK_REASONING_V12_FAIL", v11_error)
-        broad_v11_query = (
-            REASONING_V11_ENABLED and REASONING_V11_ASK_ENABLED
-            and not _is_lookup_or_identifier_query(payload.query or "")
-            and str(_ask_source_preference_profile(payload.query or "").get("strength") or "none") == "none"
-            and not payload.document_ids and not payload.bubble_document_id
-        )
-        if broad_v11_query and REASONING_V11_FAIL_CLOSED and not REASONING_V11_ALLOW_LEGACY_FALLBACK:
-            language = _select_response_language(payload.query or "", preferred=payload.language)
-            debug = {"technical_failure": v11_error} if payload.debug else None
-            return _strip_internal_response_artifacts(
-                _v11_no_sources_ask(payload.query or "", language, max(1, min(int(payload.top_k or 5), ASK_MAX_TOP_K)), debug=debug)
-            )
+    if not (V13_ENABLED and V13_ASK_ENABLED):
+        return _ask_v1_baseline_impl(payload, x_ai_internal_secret)
+    if not AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=500, detail="AI_INTERNAL_SECRET missing")
+    if (x_ai_internal_secret or "").strip() != AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not str(payload.query or "").strip():
+        raise HTTPException(status_code=400, detail="Missing query")
 
-    baseline_response = _ask_v1_baseline_impl(payload, x_ai_internal_secret)
-    if not _should_attempt_ask_candidate(payload.query or "", baseline_response):
-        chosen = baseline_response
-    else:
-        candidate_response = None
-        candidate_error = None
-        try:
-            candidate_response = _ask_v1_candidate_impl(payload, x_ai_internal_secret)
-        except Exception as exc:
-            candidate_error = str(exc)
-        chosen = _choose_ask_response(payload.query or "", baseline_response, candidate_response, debug=bool(payload.debug))
-        if payload.debug and candidate_error:
-            chosen = _attach_arbiter_debug(
-                chosen,
-                baseline_eval=_ask_response_proxy_score(payload.query or "", baseline_response),
-                candidate_eval=_ask_response_proxy_score(payload.query or "", candidate_response or {}) if candidate_response else None,
-                chosen=(chosen.get("debug") or {}).get("arbiter", {}).get("chosen", "baseline"),
-                candidate_attempted=True,
-                candidate_error=candidate_error,
-            )
-
-    if payload.debug and isinstance(chosen, dict) and (v11_response is not None or v11_error):
-        dbg = dict(chosen.get("debug") or {})
-        dbg["reasoning_v12_fallback"] = {
-            "used": True,
-            "v11_status": str((v11_response or {}).get("status") or "technical_failure"),
-            "v11_error": v11_error,
-        }
-        chosen = dict(chosen)
-        chosen["debug"] = dbg
-    return _strip_internal_response_artifacts(chosen)
-
-
+    if not V13_STREAM_HEARTBEAT_ENABLED:
+        return _ask_v13_sync(payload, x_ai_internal_secret)
+    return await _v13_stream_json_response(
+        mode="ask",
+        sync_func=_ask_v13_sync,
+        payload=payload,
+        x_ai_internal_secret=x_ai_internal_secret,
+    )
 
 
 @app.post("/v1/ai/root-cause")
-def root_cause_v1(
+async def root_cause_v1(
     payload: RootCauseRequest,
     x_ai_internal_secret: Optional[str] = Header(default=None),
 ):
-    v11_response: Optional[dict] = None
-    v11_error = ""
-    try:
-        v11_response = _v11_root_cause_impl(payload, x_ai_internal_secret)
-        if v11_response is not None:
-            is_no_sources = str(v11_response.get("status") or "").strip().lower() == "no_sources"
-            if not (is_no_sources and REASONING_V11_ALLOW_LEGACY_FALLBACK):
-                return _strip_internal_response_artifacts(v11_response)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        v11_error = str(exc)[:1000]
-        print("ROOT_CAUSE_REASONING_V12_FAIL", v11_error)
-        if REASONING_V11_ENABLED and REASONING_V11_ROOT_CAUSE_ENABLED and REASONING_V11_FAIL_CLOSED and not REASONING_V11_ALLOW_LEGACY_FALLBACK:
-            language = _select_response_language(payload.query or "", preferred=payload.language)
-            debug = {"technical_failure": v11_error} if payload.debug else None
-            return _strip_internal_response_artifacts(
-                _v11_no_sources_root(payload.query or "", language, max(1, min(int(payload.top_k or 8), ASK_MAX_TOP_K)), debug=debug)
-            )
+    if not (V13_ENABLED and V13_ROOT_CAUSE_ENABLED):
+        return _root_cause_v1_baseline_impl(payload, x_ai_internal_secret)
+    if not AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=500, detail="AI_INTERNAL_SECRET missing")
+    if (x_ai_internal_secret or "").strip() != AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not str(payload.query or "").strip():
+        raise HTTPException(status_code=400, detail="Missing query")
 
-    baseline_response = _root_cause_v1_baseline_impl(payload, x_ai_internal_secret)
-    if not _should_attempt_root_cause_candidate(payload.query or "", baseline_response):
-        chosen = baseline_response
-    else:
-        candidate_response = None
-        candidate_error = None
-        try:
-            candidate_response = _root_cause_v1_candidate_impl(payload, x_ai_internal_secret)
-        except Exception as exc:
-            candidate_error = str(exc)
-        chosen = _choose_root_cause_response(payload.query or "", baseline_response, candidate_response, debug=bool(payload.debug))
-        if payload.debug and candidate_error:
-            chosen = _attach_arbiter_debug(
-                chosen,
-                baseline_eval=_root_cause_response_proxy_score(payload.query or "", baseline_response),
-                candidate_eval=_root_cause_response_proxy_score(payload.query or "", candidate_response or {}) if candidate_response else None,
-                chosen=(chosen.get("debug") or {}).get("arbiter", {}).get("chosen", "baseline"),
-                candidate_attempted=True,
-                candidate_error=candidate_error,
-            )
-
-    if payload.debug and isinstance(chosen, dict) and (v11_response is not None or v11_error):
-        dbg = dict(chosen.get("debug") or {})
-        dbg["reasoning_v12_fallback"] = {
-            "used": True,
-            "v11_status": str((v11_response or {}).get("status") or "technical_failure"),
-            "v11_error": v11_error,
-        }
-        chosen = dict(chosen)
-        chosen["debug"] = dbg
-    return _strip_internal_response_artifacts(chosen)
-
+    if not V13_STREAM_HEARTBEAT_ENABLED:
+        return _root_cause_v13_sync(payload, x_ai_internal_secret)
+    return await _v13_stream_json_response(
+        mode="root_cause",
+        sync_func=_root_cause_v13_sync,
+        payload=payload,
+        x_ai_internal_secret=x_ai_internal_secret,
+    )
 
 
 @app.post("/v1/ai/delete/document")
@@ -18229,6 +20129,8 @@ def delete_document_v1(
         conn.commit()
     finally:
         conn.close()
+
+    _v13_invalidate_company_knowledge(company_id)
 
     return {
         "ok": True,
@@ -18288,6 +20190,8 @@ def delete_company_index_v1(
 
     finally:
         conn.close()
+
+    _v13_invalidate_company_knowledge(company_id)
 
     return {
         "ok": True,
@@ -18547,7 +20451,11 @@ def ask_v1_shadow(
     payload: AskRequest,
     x_ai_internal_secret: Optional[str] = Header(default=None),
 ):
-    base_response = ask_v1(payload, x_ai_internal_secret)
+    base_response = (
+        _ask_v13_sync(payload, x_ai_internal_secret)
+        if V13_ENABLED and V13_ASK_ENABLED
+        else _ask_v1_baseline_impl(payload, x_ai_internal_secret)
+    )
     return _v8_attach_shadow_overlay("ask", payload.query or "", dict(base_response or {}))
 
 
@@ -18556,7 +20464,11 @@ def root_cause_v1_shadow(
     payload: RootCauseRequest,
     x_ai_internal_secret: Optional[str] = Header(default=None),
 ):
-    base_response = root_cause_v1(payload, x_ai_internal_secret)
+    base_response = (
+        _root_cause_v13_sync(payload, x_ai_internal_secret)
+        if V13_ENABLED and V13_ROOT_CAUSE_ENABLED
+        else _root_cause_v1_baseline_impl(payload, x_ai_internal_secret)
+    )
     return _v8_attach_shadow_overlay("root_cause", payload.query or "", dict(base_response or {}))
 
 # =============================================================================
