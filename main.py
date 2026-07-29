@@ -167,7 +167,7 @@ SEMANTIC_QUERY_PLANNER_TIMEOUT = int(os.environ.get("MM_SEMANTIC_QUERY_PLANNER_T
 SEMANTIC_MAX_DENSE_QUERIES = int(os.environ.get("MM_SEMANTIC_MAX_DENSE_QUERIES", "5"))
 SEMANTIC_MAX_LEXICAL_QUERIES = int(os.environ.get("MM_SEMANTIC_MAX_LEXICAL_QUERIES", "5"))
 SEMANTIC_EXACT_MACHINE_BONUS = float(os.environ.get("MM_SEMANTIC_EXACT_MACHINE_BONUS", "0.055"))
-ASK_ROOT_CAUSE_CODE_MARKER = "ask-root-v13-prod-adaptive-evidence-gate-assurance-stream-v4"
+ASK_ROOT_CAUSE_CODE_MARKER = "ask-root-v13-prod-task-aware-source-dominance-assurance-stream-v5"
 
 # Root-cause semantic intent gate
 ROOT_CAUSE_INTENT_MODEL = (os.environ.get("MM_ROOT_CAUSE_INTENT_MODEL") or "gpt-5.4-mini").strip()
@@ -9675,10 +9675,20 @@ def _v12_curate_structured_sources(
         and not intent.get("broad_overview")
         and any(p in {"procedure", "step"} for p in (intent.get("prefixes") or []))
     )
-    if not operational:
-        return citations
-
     model_used = [dict(c) for c in model_used or [] if isinstance(c, dict)]
+    if not operational:
+        # Before synthesis model_used is empty and the full admitted pack is preserved.
+        # After synthesis, non-procedural links must follow the sources the model
+        # actually cited; free UI slots are not a reason to expose nearby media/P&S.
+        if bool(intent.get("broad_overview")) or not model_used:
+            return citations
+        used_ids = {str(c.get("citation_id") or "").strip() for c in model_used}
+        kept = [
+            c for c in citations
+            if str(c.get("citation_id") or "").strip() in used_ids
+        ]
+        return kept or citations[:1]
+
     primary = _v12_choose_primary_procedure(citations, model_used)
     if primary is None:
         used_ids = {str(c.get("citation_id") or "") for c in model_used}
@@ -12439,7 +12449,7 @@ def version():
         "v13_enabled": V13_ENABLED,
         "v13_ask_enabled": V13_ASK_ENABLED,
         "v13_root_cause_enabled": V13_ROOT_CAUSE_ENABLED,
-        "v13_architecture": "deterministic_retrieval_shared_semantic_evidence_gate_bounded_retrieval_assurance_single_synthesis",
+        "v13_architecture": "deterministic_retrieval_task_aware_source_dominance_shared_evidence_gate_bounded_assurance_single_synthesis",
         "v13_verifier_rewrite_loop_enabled": False,
         "v13_planner_model": V13_PLANNER_MODEL,
         "v13_evidence_gate_model": V13_EVIDENCE_GATE_MODEL,
@@ -12458,6 +12468,16 @@ def version():
         "v13_retrieval_assurance_max_docs": V13_RETRIEVAL_ASSURANCE_MAX_DOCS,
         "v13_retrieval_assurance_page_radius": V13_RETRIEVAL_ASSURANCE_PAGE_RADIUS,
         "v13_retrieval_assurance_adoption_policy": "baseline_preserved_replace_only_on_objective_coverage_exact_or_semantic_gain",
+        "v13_source_retrieval_enabled": V13_SOURCE_RETRIEVAL_ENABLED,
+        "v13_source_retrieval_policy": "bounded_cross_type_title_probe_forces_semantic_task_gate_then_link_first_dominant_selection",
+        "v13_source_retrieval_scan_limit": V13_SOURCE_RETRIEVAL_SCAN_LIMIT,
+        "v13_source_retrieval_max_candidates": V13_SOURCE_RETRIEVAL_MAX_CANDIDATES,
+        "v13_source_retrieval_min_title_score": V13_SOURCE_RETRIEVAL_MIN_TITLE_SCORE,
+        "v13_source_retrieval_force_gate_score": V13_SOURCE_RETRIEVAL_FORCE_GATE_SCORE,
+        "v13_source_retrieval_min_task_confidence": V13_SOURCE_RETRIEVAL_MIN_TASK_CONFIDENCE,
+        "v13_source_retrieval_max_extra_llm_calls": 0,
+        "v13_source_retrieval_regression_policy": "if_not_confident_keep_v13_4_path_unchanged",
+        "v13_nonprocedural_link_policy": "show_only_model_used_sources_unless_explicit_broad_overview",
         "v13_direct_answer_bypass_enabled": False,
         "v13_identifier_policy": "bare_identifier_deterministic_contextual_identifier_semantic_gate",
         "v13_fast_model": V13_FAST_MODEL,
@@ -16327,8 +16347,8 @@ def _root_cause_v1_candidate_impl(
 V13_ENABLED = (os.environ.get("MM_V13_ENABLED") or "1").strip() != "0"
 V13_ASK_ENABLED = (os.environ.get("MM_V13_ASK_ENABLED") or "1").strip() != "0"
 V13_ROOT_CAUSE_ENABLED = (os.environ.get("MM_V13_ROOT_CAUSE_ENABLED") or "1").strip() != "0"
-V13_CODE_MARKER = "ask-root-v13-prod-adaptive-evidence-gate-assurance-stream-v4"
-V13_RELEASE_ID = (os.environ.get("MM_V13_RELEASE_ID") or "2026-07-29.4").strip()
+V13_CODE_MARKER = "ask-root-v13-prod-task-aware-source-dominance-assurance-stream-v5"
+V13_RELEASE_ID = (os.environ.get("MM_V13_RELEASE_ID") or "2026-07-29.5").strip()
 OPENAI_RESPONSES_URL = (os.environ.get("OPENAI_RESPONSES_URL") or "https://api.openai.com/v1/responses").strip()
 
 # Model policy. Luna is used only for optional retrieval refinement; Terra handles
@@ -16397,6 +16417,21 @@ V13_RETRIEVAL_ASSURANCE_MIN_COVERAGE_GAIN = max(0.02, min(0.30, float(os.environ
 V13_RETRIEVAL_ASSURANCE_MIN_SUPPORT_GAIN = max(0.02, min(0.25, float(os.environ.get("MM_V13_RETRIEVAL_ASSURANCE_MIN_SUPPORT_GAIN", "0.06"))))
 V13_RETRIEVAL_ASSURANCE_MIN_NEW_SEMANTIC_SIM = max(0.30, min(0.75, float(os.environ.get("MM_V13_RETRIEVAL_ASSURANCE_MIN_NEW_SEMANTIC_SIM", "0.42"))))
 V13_RETRIEVAL_ASSURANCE_MIN_NEW_OVERLAP = max(0.03, min(0.25, float(os.environ.get("MM_V13_RETRIEVAL_ASSURANCE_MIN_NEW_OVERLAP", "0.08"))))
+
+# Task-aware source retrieval. This is a monotonic ASK-only layer: it performs a
+# bounded title/description scan without changing the baseline evidence pack. When a
+# source title is a strong semantic/lexical match, the existing ASK evidence-gate call
+# is forced to classify whether the user primarily wants to open/retrieve content. If
+# that classification is not confident, the untouched V13.4 synthesis path continues.
+V13_SOURCE_RETRIEVAL_ENABLED = (os.environ.get("MM_V13_SOURCE_RETRIEVAL_ENABLED") or "1").strip() != "0"
+V13_SOURCE_RETRIEVAL_SCAN_LIMIT = max(100, min(2400, int(os.environ.get("MM_V13_SOURCE_RETRIEVAL_SCAN_LIMIT", "1200"))))
+V13_SOURCE_RETRIEVAL_MAX_CANDIDATES = max(3, min(16, int(os.environ.get("MM_V13_SOURCE_RETRIEVAL_MAX_CANDIDATES", "8"))))
+V13_SOURCE_RETRIEVAL_MIN_TITLE_SCORE = max(0.50, min(0.95, float(os.environ.get("MM_V13_SOURCE_RETRIEVAL_MIN_TITLE_SCORE", "0.68"))))
+V13_SOURCE_RETRIEVAL_FORCE_GATE_SCORE = max(0.55, min(0.98, float(os.environ.get("MM_V13_SOURCE_RETRIEVAL_FORCE_GATE_SCORE", "0.72"))))
+V13_SOURCE_RETRIEVAL_MIN_TASK_CONFIDENCE = max(0.55, min(0.95, float(os.environ.get("MM_V13_SOURCE_RETRIEVAL_MIN_TASK_CONFIDENCE", "0.72"))))
+V13_SOURCE_RETRIEVAL_MAX_RESULTS_FEW = max(2, min(5, int(os.environ.get("MM_V13_SOURCE_RETRIEVAL_MAX_RESULTS_FEW", "3"))))
+V13_SOURCE_RETRIEVAL_MAX_RESULTS_MANY = max(4, min(12, int(os.environ.get("MM_V13_SOURCE_RETRIEVAL_MAX_RESULTS_MANY", "8"))))
+V13_SOURCE_RETRIEVAL_MAX_QUERY_TOKENS = max(6, min(40, int(os.environ.get("MM_V13_SOURCE_RETRIEVAL_MAX_QUERY_TOKENS", "18"))))
 V13_FAST_TIMEOUT_SECONDS = max(12, min(35, int(os.environ.get("MM_V13_FAST_TIMEOUT_SECONDS", "26"))))
 V13_HEAVY_TIMEOUT_SECONDS = max(20, min(45, int(os.environ.get("MM_V13_HEAVY_TIMEOUT_SECONDS", "40"))))
 V13_PLANNER_MAX_OUTPUT_TOKENS = max(800, min(2000, int(os.environ.get("MM_V13_PLANNER_MAX_OUTPUT_TOKENS", "1200"))))
@@ -16471,6 +16506,14 @@ V13_ENGINE_KEY = hashlib.sha256(
             str(V13_RETRIEVAL_ASSURANCE_MIN_SUPPORT_GAIN),
             str(V13_RETRIEVAL_ASSURANCE_MIN_NEW_SEMANTIC_SIM),
             str(V13_RETRIEVAL_ASSURANCE_MIN_NEW_OVERLAP),
+            str(V13_SOURCE_RETRIEVAL_ENABLED),
+            str(V13_SOURCE_RETRIEVAL_SCAN_LIMIT),
+            str(V13_SOURCE_RETRIEVAL_MAX_CANDIDATES),
+            str(V13_SOURCE_RETRIEVAL_MIN_TITLE_SCORE),
+            str(V13_SOURCE_RETRIEVAL_FORCE_GATE_SCORE),
+            str(V13_SOURCE_RETRIEVAL_MIN_TASK_CONFIDENCE),
+            str(V13_SOURCE_RETRIEVAL_MAX_RESULTS_FEW),
+            str(V13_SOURCE_RETRIEVAL_MAX_RESULTS_MANY),
             V13_FAST_MODEL,
             V13_HEAVY_MODEL,
             V13_FAST_EFFORT,
@@ -17698,38 +17741,87 @@ def _v13_fallback_plan(q: str) -> dict:
 
 
 
-def _v13_evidence_gate_schema() -> dict:
+def _v13_evidence_gate_schema(mode: str = "", *, include_task_contract: bool = False) -> dict:
+    mode_key = str(mode or "").strip().lower()
+    properties: dict[str, Any] = {
+        "decision": {"type": "string", "enum": ["supported", "unsupported", "refine"]},
+        "confidence": {"type": "number"},
+        "reason_code": {
+            "type": "string",
+            "enum": [
+                "evidence_sufficient",
+                "evidence_irrelevant",
+                "evidence_incomplete",
+                "request_not_interpretable",
+            ],
+        },
+        "relevant_evidence_ids": {"type": "array", "items": {"type": "string"}, "maxItems": 12},
+        "dense_queries": {"type": "array", "items": {"type": "string"}, "maxItems": 6},
+        "lexical_queries": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
+        "exact_terms": {"type": "array", "items": {"type": "string"}, "maxItems": 12},
+        "required_facets": {"type": "array", "items": {"type": "string"}, "maxItems": 10},
+        "missing_information": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
+        "rationale": {"type": "string"},
+    }
+    required = [
+        "decision", "confidence", "reason_code", "relevant_evidence_ids",
+        "dense_queries", "lexical_queries", "exact_terms", "required_facets",
+        "missing_information", "rationale",
+    ]
+
+    # ASK can reuse the same semantic gate call to determine whether the user wants
+    # an explanation or primarily wants to locate/open the best matching indexed
+    # content. This is semantic task interpretation, never a keyword allowlist.
+    if mode_key == "ask" and bool(include_task_contract):
+        properties.update(
+            {
+                "task_mode": {
+                    "type": "string",
+                    "enum": [
+                        "answer",
+                        "retrieve_source",
+                        "list_sources",
+                        "procedure",
+                        "diagnostic",
+                        "comparison",
+                        "other",
+                    ],
+                },
+                "task_confidence": {"type": "number"},
+                "result_cardinality": {
+                    "type": "string",
+                    "enum": ["one", "few", "many"],
+                },
+                "requires_explanation": {"type": "boolean"},
+                "preferred_source_types": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": [
+                            "document", "procedure", "step", "ps",
+                            "md_photo", "md_video",
+                        ],
+                    },
+                    "maxItems": 6,
+                },
+                "task_focus": {"type": "string"},
+            }
+        )
+        required.extend(
+            [
+                "task_mode", "task_confidence", "result_cardinality",
+                "requires_explanation", "preferred_source_types", "task_focus",
+            ]
+        )
+
     return {
         "name": "machinemind_v13_evidence_sufficiency_gate",
         "strict": True,
         "schema": {
             "type": "object",
             "additionalProperties": False,
-            "properties": {
-                "decision": {"type": "string", "enum": ["supported", "unsupported", "refine"]},
-                "confidence": {"type": "number"},
-                "reason_code": {
-                    "type": "string",
-                    "enum": [
-                        "evidence_sufficient",
-                        "evidence_irrelevant",
-                        "evidence_incomplete",
-                        "request_not_interpretable",
-                    ],
-                },
-                "relevant_evidence_ids": {"type": "array", "items": {"type": "string"}, "maxItems": 12},
-                "dense_queries": {"type": "array", "items": {"type": "string"}, "maxItems": 6},
-                "lexical_queries": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
-                "exact_terms": {"type": "array", "items": {"type": "string"}, "maxItems": 12},
-                "required_facets": {"type": "array", "items": {"type": "string"}, "maxItems": 10},
-                "missing_information": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
-                "rationale": {"type": "string"},
-            },
-            "required": [
-                "decision", "confidence", "reason_code", "relevant_evidence_ids",
-                "dense_queries", "lexical_queries", "exact_terms", "required_facets",
-                "missing_information", "rationale",
-            ],
+            "properties": properties,
+            "required": required,
         },
     }
 
@@ -17849,6 +17941,8 @@ def _v13_evidence_signal_summary(q: str, candidates: list[dict]) -> dict:
     rows.sort(
         key=lambda c: (
             0 if bool(c.get("gate_exact_code_hit")) else 1,
+            0 if float(c.get("structured_title_match_score") or 0.0) >= V13_SOURCE_RETRIEVAL_MIN_TITLE_SCORE else 1,
+            -float(c.get("structured_title_match_score") or 0.0),
             -float(c.get("gate_similarity") or 0.0),
             -float(c.get("gate_overlap") or 0.0),
             -float(c.get("v13_score", c.get("retrieval_score", 0.0)) or 0.0),
@@ -17965,10 +18059,17 @@ def _v13_gate_candidate_block(q: str, candidates: list[dict]) -> tuple[str, list
         if not cid or not text:
             continue
         source_type = str(c.get("source_type") or _source_type_from_document_id(c.get("bubble_document_id") or ""))
+        title_match = float(c.get("structured_title_match_score") or 0.0)
+        title_value = _clean_display_text(c.get("structured_title") or "", max_len=180)
+        title_meta = (
+            f"; title_match={title_match:.4f}; title={json.dumps(title_value, ensure_ascii=False)}"
+            if title_value or title_match > 0.0
+            else ""
+        )
         part = (
             f"[{cid}] source_type={source_type}; semantic_similarity={float(c.get('gate_similarity') or 0.0):.4f}; "
             f"lexical_overlap={float(c.get('gate_overlap') or 0.0):.4f}; "
-            f"exact_identifier={str(bool(c.get('gate_exact_code_hit'))).lower()}\n{text[:1200]}\n"
+            f"exact_identifier={str(bool(c.get('gate_exact_code_hit'))).lower()}{title_meta}\n{text[:1200]}\n"
         )
         if total + len(part) > 14000:
             break
@@ -17985,9 +18086,23 @@ def _v13_semantic_evidence_gate(
     company_id: str,
     candidates: list[dict],
     narrow_scope: bool,
+    include_task_contract: bool = False,
 ) -> dict:
+    mode_key = str(mode or "").strip().lower()
     evidence_block, supplied = _v13_gate_candidate_block(q, candidates)
-    supplied_ids = {str(c.get("citation_id") or "").strip() for c in supplied if str(c.get("citation_id") or "").strip()}
+    supplied_ids = {
+        str(c.get("citation_id") or "").strip()
+        for c in supplied
+        if str(c.get("citation_id") or "").strip()
+    }
+    task_defaults = {
+        "task_mode": "other",
+        "task_confidence": 0.0,
+        "result_cardinality": "few",
+        "requires_explanation": True,
+        "preferred_source_types": [],
+        "task_focus": "",
+    }
     if not evidence_block or not supplied_ids:
         return {
             "decision": "unsupported", "confidence": 1.0,
@@ -17996,12 +18111,26 @@ def _v13_semantic_evidence_gate(
             "required_facets": [], "missing_information": [],
             "rationale": "No readable indexed evidence was supplied.",
             "model": "deterministic_no_evidence",
+            **task_defaults,
         }
+
     mode_rule = {
         "ask": "For ASK, current evidence must contain the fact, value, operation, explanation, comparison, or other information needed for the exact request.",
         "root_cause": "For ROOT CAUSE, evidence must ground a plausible mechanism, matching problem/solution, or discriminating check tied to the reported abnormal condition; generic technical or safety text is insufficient.",
         "smart_diagnostic": "For SMART DIAGNOSTIC, the input must express an abnormal machine condition and evidence must ground at least one credible hypothesis plus a useful discriminating question.",
-    }.get(mode, "Evidence must support the exact request.")
+    }.get(mode_key, "Evidence must support the exact request.")
+
+    ask_task_rule = ""
+    if mode_key == "ask" and bool(include_task_contract):
+        ask_task_rule = (
+            " In addition, classify the user's primary task semantically, without relying on a word list. "
+            "Use task_mode=retrieve_source when the user primarily wants to locate, open, view, access, or obtain the best matching indexed content item rather than receive a technical explanation. "
+            "Use list_sources when the user explicitly wants multiple indexed resources. Use answer, procedure, diagnostic, or comparison when the requested output is substantive reasoning or instructions. "
+            "result_cardinality is one for a single best item, few for a short set, and many only for an explicitly broad/exhaustive request. "
+            "requires_explanation is false only when links/content retrieval itself satisfies the request. preferred_source_types must reflect the semantic request, not merely the source types that happen to be available. "
+            "This task classification must not make irrelevant evidence sufficient."
+        )
+
     system_msg = (
         "You are a strict evidence-sufficiency gate for an industrial assistant. Do not answer. "
         "Use only USER_REQUEST and INDEXED_EVIDENCE. Do not use outside knowledge. "
@@ -18009,22 +18138,22 @@ def _v13_semantic_evidence_gate(
         "A source is not relevant merely because it belongs to the selected machine, is technical, or is a procedure, step, problem/solution, manual, photo, or video. "
         "Choose supported only when current evidence is sufficient for the exact task. Choose unsupported when the request is not interpretable as a source-grounded task or evidence is unrelated/insufficient. "
         "Choose refine only when the request is interpretable and current evidence is plausibly related, but a faithful retrieval rewrite could find missing support. "
-        "Never invent components, alarms, facts, or failure modes. " + mode_rule
+        "Never invent components, alarms, facts, or failure modes. " + mode_rule + ask_task_rule
     )
     user_msg = (
-        f"MODE: {mode}\nRESPONSE_LANGUAGE: {response_language}\nSCOPE_IS_EXPLICIT_OR_NARROW: {str(bool(narrow_scope)).lower()}\n\n"
+        f"MODE: {mode_key}\nRESPONSE_LANGUAGE: {response_language}\nSCOPE_IS_EXPLICIT_OR_NARROW: {str(bool(narrow_scope)).lower()}\n\n"
         f"USER_REQUEST:\n{q}\n\nINDEXED_EVIDENCE:\n{evidence_block}\n\n"
         "Return only the required JSON. relevant_evidence_ids may contain only ids shown above."
     )
     parsed, model_used = _v13_json_models(
         [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
         models=[V13_EVIDENCE_GATE_MODEL],
-        json_schema=_v13_evidence_gate_schema(),
+        json_schema=_v13_evidence_gate_schema(mode_key, include_task_contract=include_task_contract),
         effort=V13_EVIDENCE_GATE_EFFORT, reasoning_mode="",
         timeout=V13_EVIDENCE_GATE_TIMEOUT_SECONDS,
         max_output_tokens=V13_EVIDENCE_GATE_MAX_OUTPUT_TOKENS,
         company_id=company_id,
-        purpose=f"{mode}_evidence_sufficiency_gate",
+        purpose=f"{mode_key}_evidence_sufficiency_gate",
     )
     out = dict(parsed or {})
     decision = str(out.get("decision") or "unsupported").strip().lower()
@@ -18035,7 +18164,11 @@ def _v13_semantic_evidence_gate(
     except Exception:
         confidence = 0.0
     relevant_ids = _dedup_text_values(
-        [str(x or "").strip() for x in (out.get("relevant_evidence_ids") or []) if str(x or "").strip() in supplied_ids],
+        [
+            str(x or "").strip()
+            for x in (out.get("relevant_evidence_ids") or [])
+            if str(x or "").strip() in supplied_ids
+        ],
         limit=12,
     )
     if decision == "supported" and (not relevant_ids or confidence < V13_EVIDENCE_GATE_MIN_CONFIDENCE):
@@ -18044,6 +18177,40 @@ def _v13_semantic_evidence_gate(
     if decision == "refine" and confidence < V13_EVIDENCE_GATE_MIN_CONFIDENCE:
         decision = "unsupported"
         out["reason_code"] = "evidence_incomplete"
+
+    task_meta = dict(task_defaults)
+    if mode_key == "ask" and bool(include_task_contract):
+        task_mode = str(out.get("task_mode") or "other").strip().lower()
+        if task_mode not in {
+            "answer", "retrieve_source", "list_sources", "procedure",
+            "diagnostic", "comparison", "other",
+        }:
+            task_mode = "other"
+        try:
+            task_confidence = max(0.0, min(1.0, float(out.get("task_confidence") or 0.0)))
+        except Exception:
+            task_confidence = 0.0
+        cardinality = str(out.get("result_cardinality") or "few").strip().lower()
+        if cardinality not in {"one", "few", "many"}:
+            cardinality = "few"
+        allowed_source_types = {"document", "procedure", "step", "ps", "md_photo", "md_video"}
+        preferred_source_types = _dedup_text_values(
+            [
+                str(x or "").strip().lower()
+                for x in (out.get("preferred_source_types") or [])
+                if str(x or "").strip().lower() in allowed_source_types
+            ],
+            limit=6,
+        )
+        task_meta = {
+            "task_mode": task_mode,
+            "task_confidence": task_confidence,
+            "result_cardinality": cardinality,
+            "requires_explanation": bool(out.get("requires_explanation")),
+            "preferred_source_types": preferred_source_types,
+            "task_focus": _clean_display_text(out.get("task_focus") or "", max_len=240),
+        }
+
     return {
         "decision": decision,
         "confidence": confidence,
@@ -18056,6 +18223,7 @@ def _v13_semantic_evidence_gate(
         "missing_information": _dedup_text_values(list(out.get("missing_information") or []), limit=8),
         "rationale": _clean_display_text(out.get("rationale") or "", max_len=600),
         "model": model_used,
+        **task_meta,
     }
 
 
@@ -19528,7 +19696,13 @@ def _v13_merge_candidates(candidate_lists: list[list[dict]]) -> list[dict]:
             merged = dict(prev)
             for key, value in c.items():
                 if value not in (None, "", [], {}):
-                    if key in {"similarity", "semantic_similarity", "retrieval_score", "v13_score", "ask_evidence_score", "structured_direct_score"}:
+                    if key in {
+                        "similarity", "semantic_similarity", "retrieval_score", "v13_score",
+                        "ask_evidence_score", "structured_direct_score",
+                        "structured_title_match_score", "structured_title_coverage",
+                        "structured_title_strict_coverage", "structured_title_description_support",
+                        "structured_title_matched_terms", "structured_title_term_count",
+                    }:
                         try:
                             merged[key] = max(float(merged.get(key) or 0.0), float(value or 0.0))
                         except Exception:
@@ -19576,10 +19750,18 @@ def _v13_score_candidates(q: str, candidates: list[dict]) -> list[dict]:
         # help order candidates *after* an independent lexical or identifier signal,
         # but they can never create relevance by themselves.
         base = semantic_similarity
+        title_match_score = max(0.0, min(1.0, float(c.get("structured_title_match_score") or 0.0)))
+        title_match_terms = int(c.get("structured_title_matched_terms") or 0)
+        title_support = bool(
+            c.get("structured_title_match")
+            and title_match_terms >= 2
+            and title_match_score >= V13_SOURCE_RETRIEVAL_MIN_TITLE_SCORE
+        )
         has_real_support_signal = bool(
             exact_code_hit
             or semantic_similarity >= 0.18
             or overlap >= 0.02
+            or title_support
             or (bool(c.get("fts_v13")) and overlap > 0.0)
         )
         if has_real_support_signal and (exact_code_hit or overlap > 0.0):
@@ -19588,6 +19770,11 @@ def _v13_score_candidates(q: str, candidates: list[dict]) -> list[dict]:
             base = max(base, min(0.88, 0.44 + float(c.get("ask_evidence_score") or 0.0) / 180.0))
         if bool(c.get("ask_structured_direct")) and has_real_support_signal:
             base = max(base, min(0.82, 0.46 + 0.018 * float(c.get("structured_direct_score") or 0.0)))
+        if title_support:
+            # A strong title/description match is direct source evidence, not a generic
+            # source-type bonus. It may rank a source candidate but still cannot bypass
+            # the semantic ASK task/evidence gate.
+            base = max(base, min(0.90, title_match_score))
         if bool(c.get("fts_v13")) and overlap > 0.0:
             base = max(base, 0.42 + min(0.18, 0.50 * overlap))
 
@@ -19608,6 +19795,7 @@ def _v13_score_candidates(q: str, candidates: list[dict]) -> list[dict]:
         c["specificity_score"] = specificity
         c["overlap_score"] = overlap
         c["exact_code_hit"] = exact_code_hit
+        c["structured_title_support"] = title_support
         c["v13_score"] = float(v13_score)
         c["retrieval_score"] = float(v13_score)
         out.append(c)
@@ -20215,6 +20403,480 @@ def _v13_fetch_structured_dense_candidates(
     return _dedup_citations_by_snippet(merged, max_items=max(1, int(top_k or 18)))
 
 
+
+# -----------------------------------------------------------------------------
+# Task-aware structured source retrieval (ASK only)
+# -----------------------------------------------------------------------------
+
+
+_V13_SOURCE_TITLE_STOPWORDS = {
+    # Articles, pronouns and prepositions: linguistic normalization only.
+    "a", "ad", "al", "allo", "alla", "ai", "agli", "alle", "da", "dal", "dallo", "dalla", "dai", "dagli", "dalle",
+    "di", "del", "dello", "della", "dei", "degli", "delle", "in", "nel", "nello", "nella", "nei", "negli", "nelle",
+    "su", "sul", "sullo", "sulla", "sui", "sugli", "sulle", "con", "per", "tra", "fra", "che", "chi", "cui",
+    "the", "a", "an", "of", "to", "from", "in", "on", "at", "with", "for", "by", "into", "onto", "and", "or",
+    # Metadata/source labels must not dominate content-title matching.
+    "source", "type", "title", "description", "document", "manual", "manuale", "documento",
+    "procedure", "procedura", "step", "photo", "foto", "image", "immagine", "video", "filmato",
+}
+
+
+def _v13_source_title_tokens(value: Any, *, limit: int = 48) -> list[str]:
+    text = _normalize_unicode_advanced(str(value or "")).lower()
+    out: list[str] = []
+    seen: set[str] = set()
+    for token in re.findall(r"[a-zà-öø-ÿ0-9][a-zà-öø-ÿ0-9_.\-/]{1,}", text):
+        token = token.strip("._-/ ")
+        if len(token) < 3 or token in _V13_SOURCE_TITLE_STOPWORDS or token in seen:
+            continue
+        seen.add(token)
+        out.append(token)
+        if len(out) >= max(1, int(limit or 48)):
+            break
+    return out
+
+
+def _v13_source_title_token_similarity(left: str, right: str) -> float:
+    a = _normalize_unicode_advanced(str(left or "")).lower().strip()
+    b = _normalize_unicode_advanced(str(right or "")).lower().strip()
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+    if any(ch.isdigit() for ch in a + b):
+        return 0.0
+    if min(len(a), len(b)) >= 4:
+        common = 0
+        for ca, cb in zip(a, b):
+            if ca != cb:
+                break
+            common += 1
+        if common >= min(len(a), len(b)) - 1 and common >= 4:
+            return 0.96
+        if common >= 5:
+            return max(0.88, SequenceMatcher(None, a, b).ratio())
+    ratio = SequenceMatcher(None, a, b).ratio()
+    return float(ratio) if ratio >= 0.78 else 0.0
+
+
+def _v13_source_title_match_metrics(q: str, title: str, description: str = "") -> dict:
+    query_tokens = _v13_source_title_tokens(q, limit=64)
+    title_tokens = _v13_source_title_tokens(title, limit=32)
+    description_tokens = _v13_source_title_tokens(description, limit=96)
+    if not query_tokens or not title_tokens:
+        return {
+            "score": 0.0, "title_coverage": 0.0, "strict_coverage": 0.0,
+            "matched_title_terms": 0, "title_term_count": len(title_tokens),
+            "description_support": 0.0,
+        }
+
+    best_scores: list[float] = []
+    for title_token in title_tokens:
+        best_scores.append(
+            max(
+                (_v13_source_title_token_similarity(title_token, query_token) for query_token in query_tokens),
+                default=0.0,
+            )
+        )
+    matched = sum(1 for score in best_scores if score >= 0.82)
+    title_coverage = sum(best_scores) / max(1, len(best_scores))
+    strict_coverage = matched / max(1, len(title_tokens))
+
+    title_norm = " ".join(title_tokens)
+    query_norm = " ".join(query_tokens)
+    sequence_score = SequenceMatcher(None, title_norm, query_norm).ratio() if title_norm and query_norm else 0.0
+
+    if description_tokens:
+        query_matches = [
+            max(
+                (_v13_source_title_token_similarity(query_token, desc_token) for desc_token in description_tokens),
+                default=0.0,
+            )
+            for query_token in query_tokens
+        ]
+        # Use the strongest content-bearing half so request framing cannot dilute a
+        # genuinely matching title/description pair.
+        keep = max(1, min(len(title_tokens) + 1, len(query_matches)))
+        description_support = sum(sorted(query_matches, reverse=True)[:keep]) / keep
+    else:
+        description_support = 0.0
+
+    score = (
+        0.72 * title_coverage
+        + 0.18 * strict_coverage
+        + 0.06 * sequence_score
+        + 0.04 * description_support
+    )
+    if strict_coverage >= 0.999 and len(title_tokens) >= 2:
+        score = max(score, 0.90)
+    if len(title_tokens) == 1 and matched < 1:
+        score *= 0.55
+
+    return {
+        "score": round(max(0.0, min(1.0, score)), 6),
+        "title_coverage": round(max(0.0, min(1.0, title_coverage)), 6),
+        "strict_coverage": round(max(0.0, min(1.0, strict_coverage)), 6),
+        "matched_title_terms": int(matched),
+        "title_term_count": int(len(title_tokens)),
+        "description_support": round(max(0.0, min(1.0, description_support)), 6),
+    }
+
+
+def _v13_fetch_structured_title_candidates(
+    *,
+    q: str,
+    company_id: str,
+    machine_id: str,
+    ai_scope: str,
+    doc_ids: Optional[list[str]],
+    bubble_document_id: Optional[str],
+) -> list[dict]:
+    """Bounded cross-type title/description retrieval, independent of source keywords.
+
+    It runs only for machine-wide ASK and only returns strong content-title matches. The
+    returned rows are candidates; they never bypass the shared semantic evidence gate.
+    """
+    if not V13_SOURCE_RETRIEVAL_ENABLED:
+        return []
+    if ai_scope != "machine_all" or doc_ids or bubble_document_id:
+        return []
+    if not company_id or not machine_id or machine_id == COMPANY_GENERAL_MACHINE_SENTINEL:
+        return []
+    if _count_query_tokens(q) > V13_SOURCE_RETRIEVAL_MAX_QUERY_TOKENS:
+        return []
+
+    query_tokens = _v13_source_title_tokens(q, limit=18)
+    if len(query_tokens) < 2:
+        return []
+
+    # Longest terms are the most selective. SQL is only a bounded prefilter; the
+    # language-agnostic fuzzy title score below decides the ranking.
+    search_terms = sorted(query_tokens, key=lambda token: (-len(token), token))[:10]
+    patterns = [f"{prefix}:%" for prefix in sorted(STRUCTURED_SOURCE_TYPES)]
+    term_match_expression = " + ".join(
+        ["CASE WHEN LOWER(COALESCE(text, '')) LIKE %s THEN 1 ELSE 0 END" for _ in search_terms]
+    )
+    if not term_match_expression:
+        return []
+    min_term_matches = 2 if len(search_terms) >= 4 else 1
+
+    rows: list[tuple] = []
+    conn = None
+    try:
+        conn = _db_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT bubble_document_id, machine_id, page_number,
+                       LEFT(COALESCE(text, ''), %s) AS source_text
+                FROM public.document_pages
+                WHERE company_id=%s
+                  AND bubble_document_id LIKE ANY(%s)
+                  AND (machine_id=%s OR machine_id IS NULL OR machine_id='')
+                  AND text IS NOT NULL
+                  AND length(text) > 10
+                  AND ({term_match_expression}) >= %s
+                ORDER BY CASE WHEN machine_id=%s THEN 0 ELSE 1 END,
+                         bubble_document_id, page_number
+                LIMIT %s;
+                """,
+                [
+                    ASK_STRUCTURED_DIRECT_TEXT_CHARS,
+                    company_id,
+                    patterns,
+                    machine_id,
+                    *[f"%{term}%" for term in search_terms],
+                    min_term_matches,
+                    machine_id,
+                    V13_SOURCE_RETRIEVAL_SCAN_LIMIT,
+                ],
+            )
+            rows = cur.fetchall()
+    except Exception as exc:
+        print("V13_SOURCE_TITLE_SCAN_FAIL", str(exc)[:500])
+        return []
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    out: list[dict] = []
+    for bdid, mid, page_number, source_text in rows or []:
+        bdid_s = str(bdid or "").strip()
+        text = str(source_text or "").strip()
+        if not bdid_s or not text:
+            continue
+        fields = _parse_structured_source_fields(text)
+        title = _clean_display_text(
+            fields.get("title")
+            or fields.get("short_description")
+            or fields.get("description")
+            or "",
+            max_len=180,
+        )
+        description = _clean_display_text(fields.get("description") or "", max_len=700)
+        if not title:
+            continue
+        metrics = _v13_source_title_match_metrics(q, title, description)
+        score = float(metrics.get("score") or 0.0)
+        matched_terms = int(metrics.get("matched_title_terms") or 0)
+        title_term_count = int(metrics.get("title_term_count") or 0)
+        if score < V13_SOURCE_RETRIEVAL_MIN_TITLE_SCORE:
+            continue
+        if matched_terms < 2 and not (title_term_count == 1 and score >= 0.90):
+            continue
+
+        page = _safe_int(page_number, 1)
+        source_type = _source_type_from_document_id(bdid_s)
+        out.append(
+            {
+                "citation_id": f"{bdid_s}:p{page}-{page}:c1",
+                "bubble_document_id": bdid_s,
+                "chunk_index": 1,
+                "page_from": page,
+                "page_to": page,
+                "snippet": text[: int(ASK_SNIPPET_CHARS or 900)],
+                "snippet_clean": text[: int(ASK_SNIPPET_CHARS or 900)],
+                "chunk_full": text,
+                "similarity": 0.0,
+                "semantic_similarity": 0.0,
+                "retrieval_score": score,
+                "v13_score": score,
+                "source_type": source_type,
+                "exact_machine_scope": str(mid or "").strip() == str(machine_id or "").strip(),
+                "ask_structured_direct": True,
+                "structured_direct_score": 10.0 * score,
+                "structured_title_match": True,
+                "structured_title_match_score": score,
+                "structured_title_coverage": float(metrics.get("title_coverage") or 0.0),
+                "structured_title_strict_coverage": float(metrics.get("strict_coverage") or 0.0),
+                "structured_title_matched_terms": matched_terms,
+                "structured_title_term_count": title_term_count,
+                "structured_title_description_support": float(metrics.get("description_support") or 0.0),
+                "structured_title": title,
+                "structured_description": description,
+                "embedding_list": [],
+            }
+        )
+
+    out.sort(
+        key=lambda c: (
+            -float(c.get("structured_title_match_score") or 0.0),
+            -float(c.get("structured_title_coverage") or 0.0),
+            -int(c.get("structured_title_matched_terms") or 0),
+            0 if bool(c.get("exact_machine_scope")) else 1,
+            str(c.get("bubble_document_id") or ""),
+        )
+    )
+    return _dedup_citations_by_snippet(out, max_items=V13_SOURCE_RETRIEVAL_MAX_CANDIDATES)
+
+
+def _v13_merge_source_title_candidates(q: str, retrieval: dict, title_candidates: list[dict]) -> dict:
+    if not title_candidates:
+        return dict(retrieval or {})
+    original = dict(retrieval or {})
+    merged = _v13_merge_candidates(
+        [list(original.get("candidates") or []), list(title_candidates or [])]
+    )
+    scored = _v13_score_candidates(q, merged)
+    out = dict(original)
+    out["candidates"] = scored
+    out["citations"] = scored[:V13_MAX_EVIDENCE_ITEMS_ASK]
+    out["metrics"] = _v13_evidence_metrics(scored)
+    out["source_title_candidates"] = [
+        {
+            "citation_id": str(c.get("citation_id") or ""),
+            "bubble_document_id": str(c.get("bubble_document_id") or ""),
+            "source_type": str(c.get("source_type") or ""),
+            "title": str(c.get("structured_title") or ""),
+            "score": round(float(c.get("structured_title_match_score") or 0.0), 6),
+        }
+        for c in title_candidates[:V13_SOURCE_RETRIEVAL_MAX_CANDIDATES]
+    ]
+    return out
+
+
+def _v13_should_force_source_task_gate(q: str, title_candidates: list[dict]) -> bool:
+    if not V13_SOURCE_RETRIEVAL_ENABLED or not title_candidates:
+        return False
+    if _count_query_tokens(q) > V13_SOURCE_RETRIEVAL_MAX_QUERY_TOKENS:
+        return False
+    top = title_candidates[0]
+    return bool(
+        float(top.get("structured_title_match_score") or 0.0) >= V13_SOURCE_RETRIEVAL_FORCE_GATE_SCORE
+        and float(top.get("structured_title_coverage") or 0.0) >= 0.68
+        and int(top.get("structured_title_matched_terms") or 0) >= 2
+    )
+
+
+def _v13_source_retrieval_result_limit(cardinality: str, top_k: int) -> int:
+    value = str(cardinality or "few").strip().lower()
+    if value == "one":
+        return 1
+    if value == "many":
+        return max(1, min(int(top_k or 5), V13_SOURCE_RETRIEVAL_MAX_RESULTS_MANY))
+    return max(1, min(int(top_k or 5), V13_SOURCE_RETRIEVAL_MAX_RESULTS_FEW))
+
+
+def _v13_direct_source_retrieval_response(
+    *,
+    q: str,
+    company_id: str,
+    response_language: str,
+    top_k: int,
+    retrieval: dict,
+    gate_meta: dict,
+) -> Optional[dict]:
+    """Return a link-first ASK response only after a confident semantic task decision.
+
+    If any precondition is not met, return None and leave the V13.4 answer path intact.
+    """
+    if not V13_SOURCE_RETRIEVAL_ENABLED:
+        return None
+    task_mode = str((gate_meta or {}).get("task_mode") or "other").strip().lower()
+    try:
+        task_confidence = float((gate_meta or {}).get("task_confidence") or 0.0)
+    except Exception:
+        task_confidence = 0.0
+    if task_mode not in {"retrieve_source", "list_sources"}:
+        return None
+    if task_confidence < V13_SOURCE_RETRIEVAL_MIN_TASK_CONFIDENCE:
+        return None
+    if bool((gate_meta or {}).get("requires_explanation", True)):
+        return None
+
+    relevant_ids = {
+        str(x or "").strip()
+        for x in ((gate_meta or {}).get("relevant_evidence_ids") or [])
+        if str(x or "").strip()
+    }
+    preferred_types = {
+        str(x or "").strip().lower()
+        for x in ((gate_meta or {}).get("preferred_source_types") or [])
+        if str(x or "").strip()
+    }
+
+    candidates: list[dict] = []
+    for raw in (retrieval or {}).get("candidates") or []:
+        if not isinstance(raw, dict):
+            continue
+        c = dict(raw)
+        if not bool(c.get("structured_title_match")):
+            continue
+        cid = str(c.get("citation_id") or "").strip()
+        if relevant_ids and cid not in relevant_ids:
+            continue
+        source_type = str(c.get("source_type") or _source_type_from_document_id(c.get("bubble_document_id") or "")).strip().lower()
+        c["source_retrieval_preferred_type"] = bool(not preferred_types or source_type in preferred_types)
+        if float(c.get("structured_title_match_score") or 0.0) < V13_SOURCE_RETRIEVAL_MIN_TITLE_SCORE:
+            continue
+        candidates.append(c)
+
+    if not candidates:
+        return None
+    candidates.sort(
+        key=lambda c: (
+            0 if bool(c.get("source_retrieval_preferred_type")) else 1,
+            -float(c.get("structured_title_match_score") or 0.0),
+            -float(c.get("structured_title_coverage") or 0.0),
+            -_v13_real_semantic_similarity(c),
+            0 if bool(c.get("exact_machine_scope")) else 1,
+            str(c.get("bubble_document_id") or ""),
+        )
+    )
+
+    limit = _v13_source_retrieval_result_limit(
+        str((gate_meta or {}).get("result_cardinality") or "few"),
+        top_k,
+    )
+    top_score = float(candidates[0].get("structured_title_match_score") or 0.0)
+    selected: list[dict] = []
+    seen_docs: set[str] = set()
+    for c in candidates:
+        bdid = str(c.get("bubble_document_id") or "").strip()
+        if not bdid or bdid in seen_docs:
+            continue
+        score = float(c.get("structured_title_match_score") or 0.0)
+        if selected and score < max(V13_SOURCE_RETRIEVAL_MIN_TITLE_SCORE, top_score - 0.16):
+            continue
+        selected.append(c)
+        seen_docs.add(bdid)
+        if len(selected) >= limit:
+            break
+    if not selected:
+        return None
+
+    response_citations = _sanitize_citations_for_response(selected, company_id=company_id)
+    try:
+        rg_links = _build_rg_links(company_id, response_citations)
+    except Exception as exc:
+        print("V13_SOURCE_RETRIEVAL_LINK_FAIL", str(exc)[:500])
+        return None
+    if not rg_links:
+        return None
+
+    linked_doc_ids = {
+        str(link.get("bubble_document_id") or "").strip()
+        for link in rg_links
+        if isinstance(link, dict) and str(link.get("bubble_document_id") or "").strip()
+    }
+    response_citations = [
+        c for c in response_citations
+        if str(c.get("bubble_document_id") or "").strip() in linked_doc_ids
+    ]
+    if not response_citations:
+        return None
+
+    labels = [
+        str(link.get("display_label") or link.get("display_title") or "").strip()
+        for link in rg_links
+        if isinstance(link, dict)
+        and str(link.get("bubble_document_id") or "").strip() in linked_doc_ids
+        and str(link.get("display_label") or link.get("display_title") or "").strip()
+    ]
+    english = str(response_language or "").lower().startswith("en")
+    if len(labels) == 1:
+        answer = (
+            f"I found the most relevant indexed content: {labels[0]}."
+            if english else
+            f"Ho trovato il contenuto indicizzato più pertinente: {labels[0]}."
+        )
+    else:
+        heading = "I found these relevant indexed contents:" if english else "Ho trovato questi contenuti indicizzati pertinenti:"
+        answer = heading + "\n" + "\n".join(f"- {label}" for label in labels)
+
+    return _finalize_ask_response_for_ui(
+        {
+            "ok": True,
+            "status": "answered",
+            "answer": answer,
+            "language": response_language,
+            "citations": response_citations,
+            "rg_links": rg_links[:len(response_citations)],
+            "top_k": top_k,
+            "similarity_max": max(
+                (float(c.get("structured_title_match_score") or 0.0) for c in selected),
+                default=None,
+            ),
+            "chat_model": str((gate_meta or {}).get("model") or V13_EVIDENCE_GATE_MODEL),
+            "meta": {
+                "cacheable": True,
+                # Exact Worker cache is safe; semantic reuse could confuse a future
+                # explanation request with a prior link-retrieval request.
+                "semantic_cacheable": False,
+                "source_retrieval_direct": True,
+                "source_retrieval_task_mode": task_mode,
+                "source_retrieval_task_confidence": round(task_confidence, 4),
+                "source_retrieval_cardinality": str((gate_meta or {}).get("result_cardinality") or "few"),
+                "source_retrieval_selected_count": len(response_citations),
+            },
+        },
+        language=response_language,
+    )
+
+
 def _v13_should_use_structured_path(q: str, retrieval: dict) -> bool:
     """Choose structured synthesis only after the shared evidence gate admitted it."""
     candidates = [c for c in (retrieval.get("candidates") or []) if isinstance(c, dict)]
@@ -20426,6 +21088,8 @@ def _v13_resolve_evidence_support(
     *, q: str, company_id: str, machine_id: str, doc_ids: Optional[list[str]],
     bubble_document_id: Optional[str], ai_scope: str, response_language: str,
     mode: str, narrow_scope: bool, initial_retrieval: dict,
+    force_semantic_gate: bool = False,
+    request_task_contract: bool = False,
 ) -> tuple[bool, dict, dict]:
     budget = _v13_current_budget()
     candidates = list((initial_retrieval or {}).get("candidates") or [])
@@ -20443,9 +21107,17 @@ def _v13_resolve_evidence_support(
         "required_facets": list(initial_plan.get("required_facets") or []),
         "missing_information": [],
         "relevant_evidence_ids": [],
+        "task_mode": "other",
+        "task_confidence": 0.0,
+        "result_cardinality": "few",
+        "requires_explanation": True,
+        "preferred_source_types": [],
+        "task_focus": "",
+        "forced_semantic_gate": bool(force_semantic_gate),
+        "task_contract_requested": bool(request_task_contract),
     }
-    force_semantic_gate = False
-    if state == "unsupported":
+    must_use_semantic_gate = bool(force_semantic_gate)
+    if state == "unsupported" and not (must_use_semantic_gate and candidates):
         recovered, pre_meta = _v13_pre_admission_retrieval_assurance(
             q=q,
             company_id=company_id,
@@ -20475,15 +21147,20 @@ def _v13_resolve_evidence_support(
             )
             # Deterministic rescue only recovered candidates; it never grants permission
             # to answer. A semantic gate is mandatory before synthesis.
-            force_semantic_gate = True
+            must_use_semantic_gate = True
             if budget is not None:
                 budget.retrieval_assurance = {"pre_admission": dict(pre_meta or {})}
         else:
             if budget is not None:
                 budget.evidence_gate = dict(gate_meta)
             return False, dict(initial_retrieval or {}), gate_meta
+    elif state == "unsupported" and must_use_semantic_gate and candidates:
+        # A high-confidence structured-title match is real source evidence even when
+        # generic cosine/overlap bands remain low. It still requires the semantic gate;
+        # this branch grants no permission to answer by itself.
+        gate_meta["forced_gate_on_structured_title_match"] = True
 
-    if state == "supported" and mode == "ask" and not force_semantic_gate:
+    if state == "supported" and mode == "ask" and not must_use_semantic_gate:
         admitted = _v13_filter_retrieval_candidates(q, initial_retrieval, mode=mode)
         gate_meta.update({"decision": "supported", "reason_code": "evidence_sufficient", "confidence": 1.0, "selected_count": len(admitted.get("citations") or [])})
         if budget is not None:
@@ -20498,6 +21175,7 @@ def _v13_resolve_evidence_support(
         semantic = _v13_semantic_evidence_gate(
             q=q, mode=mode, response_language=response_language, company_id=company_id,
             candidates=candidates, narrow_scope=narrow_scope,
+            include_task_contract=bool(mode == "ask" and request_task_contract),
         )
     except Exception as exc:
         print("V13_EVIDENCE_GATE_FAIL_CLOSED", mode, str(exc)[:700])
@@ -20518,6 +21196,12 @@ def _v13_resolve_evidence_support(
         "exact_terms": list(semantic.get("exact_terms") or []),
         "required_facets": list(semantic.get("required_facets") or []),
         "missing_information": list(semantic.get("missing_information") or []),
+        "task_mode": str(semantic.get("task_mode") or "other"),
+        "task_confidence": round(float(semantic.get("task_confidence") or 0.0), 4),
+        "result_cardinality": str(semantic.get("result_cardinality") or "few"),
+        "requires_explanation": bool(semantic.get("requires_explanation", True)),
+        "preferred_source_types": list(semantic.get("preferred_source_types") or []),
+        "task_focus": str(semantic.get("task_focus") or ""),
     })
     if decision == "supported":
         admitted = _v13_filter_retrieval_candidates(q, initial_retrieval, relevant_ids=list(semantic.get("relevant_evidence_ids") or []), mode=mode)
@@ -20612,8 +21296,10 @@ def _v13_sources_block(citations: list[dict], *, max_context_chars: int) -> str:
         scope_role = "exact_machine" if bool(c.get("exact_machine_scope")) else "company_or_general"
         role = str(c.get("role_class") or c.get("evidence_role") or source_type)
         score = round(float(c.get("v13_score", c.get("retrieval_score", c.get("similarity", 0.0))) or 0.0), 4)
+        title_match = float(c.get("structured_title_match_score") or 0.0)
+        title_meta = f"; title_match={title_match:.4f}" if title_match > 0.0 else ""
         part = (
-            f"[{cid}] source_type={source_type}; scope={scope_role}; role={role}; score={score}; "
+            f"[{cid}] source_type={source_type}; scope={scope_role}; role={role}; score={score}{title_meta}; "
             f"doc={c.get('bubble_document_id')}; p={c.get('page_from')}-{c.get('page_to')}\n"
             f"{body}\n"
         )
@@ -20859,6 +21545,21 @@ def _v13_structured_ask(
         model_used=model_citations,
     )
     final_structured = _v12_mark_structured_roles(final_structured)
+    has_procedure_context = any(
+        _v12_evidence_role(c) in {"procedure", "step"}
+        for c in final_structured
+        if isinstance(c, dict)
+    )
+    if not has_procedure_context:
+        used_ids = {
+            str(c.get("citation_id") or "").strip()
+            for c in (model_citations or [])
+            if isinstance(c, dict) and str(c.get("citation_id") or "").strip()
+        }
+        manual_support = [
+            c for c in manual_support
+            if str(c.get("citation_id") or "").strip() in used_ids
+        ]
     sectioned_answer = _format_structured_procedure_answer_for_ui(
         structured_citations=final_structured,
         manual_support_citations=manual_support,
@@ -20871,8 +21572,8 @@ def _v13_structured_ask(
     if not answer:
         return None
 
-    # Manual support is intentionally retained when deterministically relevant so it is
-    # exposed among links, even if the synthesis cites only the structured procedure.
+    # Procedure/Step answers retain directly relevant manual support. For other
+    # structured tasks, links remain aligned to sources actually used by synthesis.
     final_citations = _v12_curate_response_items_for_ui(
         list(final_structured) + list(manual_support) + list(model_citations or []),
         max_items=max(1, int(ASK_UI_STRUCTURED_MAX_CITATIONS or 14)),
@@ -21614,11 +22315,33 @@ def _ask_v13_sync(
             plan=fallback_plan,
         )
 
+        # Independently probe structured titles/descriptions. These candidates do not
+        # replace baseline evidence and cannot answer by themselves; a strong title
+        # match merely forces the existing semantic gate to interpret the ASK task.
+        source_title_candidates: list[dict] = []
+        try:
+            source_title_candidates = _v13_fetch_structured_title_candidates(
+                q=q,
+                company_id=company_id,
+                machine_id=machine_id,
+                ai_scope=ai_scope,
+                doc_ids=doc_ids,
+                bubble_document_id=bubble_document_id,
+            )
+        except Exception as exc:
+            print("V13_SOURCE_TITLE_PROBE_FAIL", str(exc)[:500])
+            source_title_candidates = []
+        if source_title_candidates:
+            retrieval = _v13_merge_source_title_candidates(q, retrieval, source_title_candidates)
+        force_source_task_gate = _v13_should_force_source_task_gate(q, source_title_candidates)
+
         admitted, retrieval, _gate_meta = _v13_resolve_evidence_support(
             q=q, company_id=company_id, machine_id=machine_id, doc_ids=doc_ids,
             bubble_document_id=bubble_document_id, ai_scope=ai_scope,
             response_language=response_language, mode="ask", narrow_scope=narrow_scope,
             initial_retrieval=retrieval,
+            force_semantic_gate=force_source_task_gate,
+            request_task_contract=force_source_task_gate,
         )
         if not admitted:
             metrics = retrieval.get("metrics") or {}
@@ -21628,6 +22351,26 @@ def _ask_v13_sync(
                 similarity_max=metrics.get("top_similarity"),
             )
             return _v13_attach_runtime_meta(final, budget, debug=bool(payload.debug))
+
+        direct_source_response = _v13_direct_source_retrieval_response(
+            q=q,
+            company_id=company_id,
+            response_language=response_language,
+            top_k=top_k,
+            retrieval=retrieval,
+            gate_meta=_gate_meta,
+        )
+        if direct_source_response is not None:
+            budget.route = "task_aware_direct_source_retrieval"
+            final = _v13_attach_runtime_meta(
+                direct_source_response, budget, debug=bool(payload.debug)
+            )
+            _v13_cache_store(
+                mode="ask", q=q, company_id=company_id, machine_id=machine_id,
+                scope=cache_scope, language=response_language, response=final,
+                debug=bool(payload.debug),
+            )
+            return final
 
         retrieval, _assurance_meta = _v13_apply_retrieval_assurance(
             q=q, company_id=company_id, machine_id=machine_id, doc_ids=doc_ids,
