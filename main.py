@@ -14,7 +14,8 @@ import io
 import zipfile
 import unicodedata
 from difflib import SequenceMatcher
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Optional, List, Any, Union
 
 import requests
@@ -73,6 +74,27 @@ CHUNK_MIN_CHARS = int(os.environ.get("MM_CHUNK_MIN_CHARS", "200"))
 OPENAI_API_KEY = (os.environ.get("OPENAI_API_KEY") or "").strip()
 OPENAI_EMBED_MODEL = (os.environ.get("OPENAI_EMBED_MODEL") or "text-embedding-3-small").strip()
 OPENAI_EMBED_URL = (os.environ.get("OPENAI_EMBED_URL") or "https://api.openai.com/v1/embeddings").strip()
+
+# Document-ingest cost metering. The current document pipeline pays OpenAI only for
+# embeddings; PDF/XLSX parsing, chunking and DB writes remain infrastructure work.
+# 1 credit = USD 0.001 by default. Prices are versioned and configurable so future
+# OCR/vision/electrical stages can be added without changing Bubble's unit.
+INGEST_METERING_VERSION = "ingest-credits-v1-async-ledger"
+INGEST_PRICING_VERSION = (
+    os.environ.get("MM_INGEST_PRICING_VERSION") or "2026-07-embedding-v1"
+).strip()
+INGEST_CREDITS_PER_USD = Decimal(
+    os.environ.get("MM_INGEST_CREDITS_PER_USD", "1000")
+)
+INGEST_PRICE_EMBED_INPUT_USD_PER_MILLION = Decimal(
+    os.environ.get("MM_INGEST_PRICE_EMBED_INPUT_USD_PER_MILLION", "0.02")
+)
+INGEST_LEDGER_AUTO_DDL = (
+    os.environ.get("MM_INGEST_LEDGER_AUTO_DDL") or "1"
+).strip() != "0"
+INGEST_PROCESSING_STALE_SECONDS = max(300, min(7200, int(
+    os.environ.get("MM_INGEST_PROCESSING_STALE_SECONDS", "1800")
+)))
 
 # OpenAI Chat
 OPENAI_CHAT_MODEL = (os.environ.get("OPENAI_CHAT_MODEL") or "gpt-5.4-mini").strip()
@@ -257,6 +279,16 @@ class IngestRequest(BaseModel):
     doc_prev_embed_chars: Optional[int] = None
     doc_prev_index_storage_bytes: Optional[int] = None
 
+    # Optional context forwarded by the Worker. It is accepted now without making
+    # the Cloud Run route responsible for plan enforcement.
+    ingest_request_key: Optional[str] = None
+    ingest_month_key: Optional[str] = None
+    ingest_credits_limit_month: Optional[float] = None
+    ingest_credits_used_before: Optional[float] = None
+    ingest_credits_enforced: Optional[bool] = None
+    ingest_request_already_admitted: Optional[bool] = None
+    ingest_metering_version: Optional[str] = None
+
 
 class IndexDocumentRequest(BaseModel):
     company_id: str
@@ -264,6 +296,15 @@ class IndexDocumentRequest(BaseModel):
     bubble_document_id: str
     trace_id: Optional[str] = None
     ai_scope: Optional[str] = None
+    ingest_request_key: Optional[str] = None
+    ingest_month_key: Optional[str] = None
+    ingest_usage_event_id: Optional[str] = None
+    ingest_metering_enabled: Optional[bool] = False
+
+
+class IngestUsageMonthRequest(BaseModel):
+    company_id: str
+    month_key: Optional[str] = None
 
 
 class SearchRequest(BaseModel):
@@ -841,6 +882,632 @@ def _db_get_index_usage(company_id: str, bubble_document_id: Optional[str] = Non
         }
     finally:
         conn.close()
+
+
+# -----------------------------------------------------------------------------
+# Document-ingest AI-cost ledger
+# -----------------------------------------------------------------------------
+
+_INGEST_LEDGER_LOCK = threading.Lock()
+_INGEST_LEDGER_READY: Optional[bool] = None
+_INGEST_LEDGER_ERROR = ""
+_INGEST_METER_CTX = contextvars.ContextVar("machinemind_ingest_meter", default=None)
+
+
+def _ingest_decimal(value: Any, default: str = "0") -> Decimal:
+    try:
+        return Decimal(str(value if value is not None else default))
+    except (InvalidOperation, ValueError, TypeError):
+        return Decimal(default)
+
+
+def _normalize_ingest_month_key(value: Any) -> str:
+    raw = str(value or "").strip()
+    if re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", raw):
+        return raw
+    return datetime.now(timezone.utc).strftime("%Y-%m")
+
+
+def _effective_ingest_request_key(
+    *,
+    company_id: str,
+    bubble_document_id: str,
+    requested_key: Any,
+    file_sha256: str = "",
+) -> str:
+    base = str(requested_key or "").strip() or str(bubble_document_id or "").strip()
+    if file_sha256:
+        # Same Document + same file is idempotent; changing the file creates a new event.
+        base = f"{base}:{file_sha256[:24]}"
+    return base or hashlib.sha256(str(company_id or "").encode("utf-8")).hexdigest()[:24]
+
+
+def _build_ingest_usage_event_id(company_id: str, month_key: str, request_key: str) -> str:
+    raw = f"{company_id}\n{month_key}\n{request_key}".encode("utf-8")
+    return "ingest_" + hashlib.sha256(raw).hexdigest()[:32]
+
+
+def _ingest_credits_for_cost(cost_usd: Decimal) -> Decimal:
+    credits = max(Decimal("0"), cost_usd) * max(Decimal("0"), INGEST_CREDITS_PER_USD)
+    return credits.quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
+
+
+def _ingest_ledger_bootstrap() -> bool:
+    global _INGEST_LEDGER_READY, _INGEST_LEDGER_ERROR
+
+    if _INGEST_LEDGER_READY is True:
+        return True
+
+    with _INGEST_LEDGER_LOCK:
+        if _INGEST_LEDGER_READY is True:
+            return True
+        if not INGEST_LEDGER_AUTO_DDL:
+            _INGEST_LEDGER_READY = True
+            return True
+
+        conn = None
+        try:
+            conn = _db_conn()
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS public.mm_ingest_usage_events (
+                        usage_event_id TEXT PRIMARY KEY,
+                        request_key TEXT NOT NULL,
+                        company_id TEXT NOT NULL,
+                        bubble_document_id TEXT NOT NULL,
+                        month_key TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'queued',
+                        embedding_model TEXT NOT NULL DEFAULT '',
+                        embedding_calls BIGINT NOT NULL DEFAULT 0,
+                        embedding_input_tokens BIGINT NOT NULL DEFAULT 0,
+                        actual_cost_usd NUMERIC(20, 10) NOT NULL DEFAULT 0,
+                        ingest_credits NUMERIC(20, 6) NOT NULL DEFAULT 0,
+                        pricing_version TEXT NOT NULL DEFAULT '',
+                        metering_version TEXT NOT NULL DEFAULT '',
+                        usage_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        attempt_count INTEGER NOT NULL DEFAULT 0,
+                        last_error TEXT NOT NULL DEFAULT '',
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        completed_at TIMESTAMPTZ
+                    );
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_mm_ingest_usage_company_month
+                    ON public.mm_ingest_usage_events(company_id, month_key, updated_at);
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS uq_mm_ingest_usage_request_month
+                    ON public.mm_ingest_usage_events(company_id, month_key, request_key);
+                    """
+                )
+            conn.commit()
+            _INGEST_LEDGER_READY = True
+            _INGEST_LEDGER_ERROR = ""
+            return True
+        except Exception as exc:
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            _INGEST_LEDGER_READY = False
+            _INGEST_LEDGER_ERROR = str(exc)[:1000]
+            print("INGEST_LEDGER_BOOTSTRAP_FAIL_OPEN", _INGEST_LEDGER_ERROR)
+            return False
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+
+def _ingest_prepare_event(
+    *,
+    usage_event_id: str,
+    request_key: str,
+    company_id: str,
+    bubble_document_id: str,
+    month_key: str,
+) -> bool:
+    if not _ingest_ledger_bootstrap():
+        return False
+    conn = None
+    try:
+        conn = _db_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO public.mm_ingest_usage_events(
+                    usage_event_id, request_key, company_id, bubble_document_id,
+                    month_key, status, pricing_version, metering_version
+                )
+                VALUES (%s, %s, %s, %s, %s, 'queued', %s, %s)
+                ON CONFLICT (usage_event_id) DO NOTHING;
+                """,
+                (
+                    usage_event_id,
+                    request_key,
+                    company_id,
+                    bubble_document_id,
+                    month_key,
+                    INGEST_PRICING_VERSION,
+                    INGEST_METERING_VERSION,
+                ),
+            )
+        conn.commit()
+        return True
+    except Exception as exc:
+        if conn is not None:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        print("INGEST_LEDGER_PREPARE_FAIL_OPEN", str(exc)[:700])
+        return False
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _ingest_event_snapshot(usage_event_id: str) -> Optional[dict]:
+    if not usage_event_id or not _ingest_ledger_bootstrap():
+        return None
+    conn = None
+    try:
+        conn = _db_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT status, embedding_model, embedding_calls,
+                       embedding_input_tokens, actual_cost_usd, ingest_credits,
+                       pricing_version, metering_version, usage_json,
+                       request_key, company_id, bubble_document_id, month_key,
+                       attempt_count, updated_at
+                FROM public.mm_ingest_usage_events
+                WHERE usage_event_id=%s
+                LIMIT 1;
+                """,
+                (usage_event_id,),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "usage_event_id": usage_event_id,
+            "status": str(row[0] or ""),
+            "embedding_model": str(row[1] or ""),
+            "embedding_calls": int(row[2] or 0),
+            "embedding_input_tokens": int(row[3] or 0),
+            "actual_cost_usd": float(row[4] or 0),
+            "ingest_credits": float(row[5] or 0),
+            "pricing_version": str(row[6] or ""),
+            "metering_version": str(row[7] or ""),
+            "usage_json": row[8] if isinstance(row[8], dict) else {},
+            "request_key": str(row[9] or ""),
+            "company_id": str(row[10] or ""),
+            "bubble_document_id": str(row[11] or ""),
+            "month_key": str(row[12] or ""),
+            "attempt_count": int(row[13] or 0),
+            "updated_at": row[14],
+        }
+    except Exception as exc:
+        print("INGEST_LEDGER_SNAPSHOT_FAIL_OPEN", str(exc)[:700])
+        return None
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _ingest_claim_event(usage_event_id: str) -> tuple[str, Optional[dict]]:
+    """Return claimed/completed/processing/unavailable and the current snapshot."""
+    if not usage_event_id or not _ingest_ledger_bootstrap():
+        return "unavailable", None
+    conn = None
+    try:
+        conn = _db_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE public.mm_ingest_usage_events
+                SET status='processing',
+                    attempt_count=attempt_count + 1,
+                    updated_at=NOW(),
+                    last_error=''
+                WHERE usage_event_id=%s
+                  AND status <> 'completed'
+                  AND (
+                      status <> 'processing'
+                      OR updated_at < NOW() - (%s * INTERVAL '1 second')
+                  )
+                RETURNING usage_event_id;
+                """,
+                (usage_event_id, int(INGEST_PROCESSING_STALE_SECONDS)),
+            )
+            claimed = cur.fetchone()
+        conn.commit()
+        if claimed:
+            return "claimed", _ingest_event_snapshot(usage_event_id)
+        snap = _ingest_event_snapshot(usage_event_id)
+        if snap and snap.get("status") == "completed":
+            return "completed", snap
+        if snap and snap.get("status") == "processing":
+            return "processing", snap
+        return "unavailable", snap
+    except Exception as exc:
+        if conn is not None:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        print("INGEST_LEDGER_CLAIM_FAIL_OPEN", str(exc)[:700])
+        return "unavailable", None
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+class _IngestUsageMeter:
+    def __init__(
+        self,
+        *,
+        usage_event_id: str,
+        request_key: str,
+        company_id: str,
+        bubble_document_id: str,
+        month_key: str,
+    ):
+        self.usage_event_id = usage_event_id
+        self.request_key = request_key
+        self.company_id = company_id
+        self.bubble_document_id = bubble_document_id
+        self.month_key = month_key
+        self.embedding_calls = 0
+        self.embedding_input_tokens = 0
+        self.embedding_cost_usd = Decimal("0")
+        self.provider_usage_calls = 0
+        self.fallback_usage_calls = 0
+
+    def record_embedding(self, *, input_tokens: int, usage_source: str) -> None:
+        tokens = max(0, int(input_tokens or 0))
+        self.embedding_calls += 1
+        self.embedding_input_tokens += tokens
+        if usage_source == "provider_usage":
+            self.provider_usage_calls += 1
+        else:
+            self.fallback_usage_calls += 1
+        self.embedding_cost_usd += (
+            Decimal(tokens) * INGEST_PRICE_EMBED_INPUT_USD_PER_MILLION
+        ) / Decimal("1000000")
+
+    def usage_dict(self) -> dict:
+        cost = self.embedding_cost_usd.quantize(Decimal("0.0000000001"), rounding=ROUND_HALF_UP)
+        credits = _ingest_credits_for_cost(cost)
+        return {
+            "embedding_model": OPENAI_EMBED_MODEL,
+            "embedding_calls": self.embedding_calls,
+            "embedding_input_tokens": self.embedding_input_tokens,
+            "provider_usage_calls": self.provider_usage_calls,
+            "fallback_usage_calls": self.fallback_usage_calls,
+            "embedding_cost_usd": float(cost),
+            "ingest_credits": float(credits),
+        }
+
+    def metering_status(self) -> str:
+        if self.embedding_calls <= 0:
+            return "measured_zero_cost"
+        if self.fallback_usage_calls > 0:
+            return "estimated_partial"
+        return "measured"
+
+
+def _current_ingest_meter() -> Optional[_IngestUsageMeter]:
+    value = _INGEST_METER_CTX.get()
+    return value if isinstance(value, _IngestUsageMeter) else None
+
+
+def _ingest_finalize_event(
+    meter: _IngestUsageMeter,
+    *,
+    status: str,
+    error_text: str = "",
+) -> Optional[dict]:
+    usage = meter.usage_dict()
+    if not _ingest_ledger_bootstrap():
+        return None
+
+    attempt_cost = _ingest_decimal(usage.get("embedding_cost_usd"))
+    attempt_credits = _ingest_decimal(usage.get("ingest_credits"))
+    conn = None
+    try:
+        conn = _db_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE public.mm_ingest_usage_events
+                SET status=%s,
+                    embedding_model=%s,
+                    embedding_calls=embedding_calls + %s,
+                    embedding_input_tokens=embedding_input_tokens + %s,
+                    actual_cost_usd=actual_cost_usd + %s,
+                    ingest_credits=ingest_credits + %s,
+                    pricing_version=%s,
+                    metering_version=%s,
+                    usage_json=%s::jsonb,
+                    last_error=%s,
+                    updated_at=NOW(),
+                    completed_at=CASE WHEN %s='completed' THEN NOW() ELSE completed_at END
+                WHERE usage_event_id=%s;
+                """,
+                (
+                    status,
+                    OPENAI_EMBED_MODEL,
+                    int(usage.get("embedding_calls") or 0),
+                    int(usage.get("embedding_input_tokens") or 0),
+                    str(attempt_cost),
+                    str(attempt_credits),
+                    INGEST_PRICING_VERSION,
+                    INGEST_METERING_VERSION,
+                    json.dumps(usage, ensure_ascii=False),
+                    str(error_text or "")[:1800],
+                    status,
+                    meter.usage_event_id,
+                ),
+            )
+        conn.commit()
+        return _ingest_event_snapshot(meter.usage_event_id)
+    except Exception as exc:
+        if conn is not None:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        print("INGEST_LEDGER_FINALIZE_FAIL_OPEN", str(exc)[:700])
+        return None
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _ingest_month_usage(company_id: str, month_key: str) -> dict:
+    month_key = _normalize_ingest_month_key(month_key)
+    if not _ingest_ledger_bootstrap():
+        return {
+            "company_id": company_id,
+            "month_key": month_key,
+            "ingest_credits_used_month": 0.0,
+            "embedding_input_tokens_total": 0,
+            "ledger_available": False,
+            "ledger_error": _INGEST_LEDGER_ERROR,
+        }
+    conn = None
+    try:
+        conn = _db_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COALESCE(SUM(ingest_credits), 0),
+                       COALESCE(SUM(embedding_input_tokens), 0),
+                       MAX(updated_at)
+                FROM public.mm_ingest_usage_events
+                WHERE company_id=%s AND month_key=%s;
+                """,
+                (company_id, month_key),
+            )
+            row = cur.fetchone() or (0, 0, None)
+        return {
+            "company_id": company_id,
+            "month_key": month_key,
+            "ingest_credits_used_month": float(row[0] or 0),
+            "embedding_input_tokens_total": int(row[1] or 0),
+            "updated_at": row[2].isoformat() if row[2] is not None else None,
+            "ledger_available": True,
+            "ledger_error": "",
+        }
+    except Exception as exc:
+        print("INGEST_LEDGER_MONTH_FAIL_OPEN", str(exc)[:700])
+        return {
+            "company_id": company_id,
+            "month_key": month_key,
+            "ingest_credits_used_month": 0.0,
+            "embedding_input_tokens_total": 0,
+            "ledger_available": False,
+            "ledger_error": str(exc)[:700],
+        }
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _ingest_public_fields(
+    *,
+    meter: Optional[_IngestUsageMeter],
+    event_snapshot: Optional[dict],
+    month_usage: Optional[dict],
+    status_override: str = "",
+) -> dict:
+    snap = event_snapshot or {}
+    usage = dict(snap.get("usage_json") or {})
+    if meter is not None and not usage:
+        usage = meter.usage_dict()
+
+    actual_credits = float(
+        snap.get("ingest_credits")
+        if snap.get("ingest_credits") is not None
+        else usage.get("ingest_credits") or 0
+    )
+    status = status_override or (
+        meter.metering_status() if meter is not None else str(snap.get("status") or "unknown")
+    )
+    return {
+        "request_key": str(snap.get("request_key") or (meter.request_key if meter else "")),
+        "ingest_request_key": str(snap.get("request_key") or (meter.request_key if meter else "")),
+        "ingest_usage_event_id": str(
+            (meter.usage_event_id if meter else "") or snap.get("usage_event_id") or ""
+        ),
+        "ingest_month_key": str(snap.get("month_key") or (meter.month_key if meter else "")),
+        "ingest_credits_actual": actual_credits,
+        "ingest_credits_used_month": float(
+            (month_usage or {}).get("ingest_credits_used_month") or 0
+        ),
+        "ingest_pricing_version": str(snap.get("pricing_version") or INGEST_PRICING_VERSION),
+        "ingest_metering_status": status,
+        "ingest_metering_version": INGEST_METERING_VERSION,
+        "ingest_usage": usage,
+    }
+
+
+def _meter_index_document(func):
+    @functools.wraps(func)
+    def wrapped(
+        payload: IndexDocumentRequest,
+        x_ai_internal_secret: Optional[str] = Header(default=None),
+    ):
+        # Structured Bubble sources (procedures, steps, P&S, photos/videos) also reuse
+        # /index/document, but the new monthly quota applies only to uploaded Documents.
+        if not bool(payload.ingest_metering_enabled):
+            return func(payload, x_ai_internal_secret)
+
+        # Authentication remains owned by the original route. Do not create usage rows
+        # for unauthenticated calls.
+        if not AI_INTERNAL_SECRET or (x_ai_internal_secret or "").strip() != AI_INTERNAL_SECRET:
+            return func(payload, x_ai_internal_secret)
+
+        company_id = str(payload.company_id or "").strip()
+        bubble_document_id = str(payload.bubble_document_id or "").strip()
+        month_key = _normalize_ingest_month_key(payload.ingest_month_key)
+        request_key = str(
+            payload.ingest_request_key or payload.trace_id or bubble_document_id
+        ).strip()
+        usage_event_id = str(payload.ingest_usage_event_id or "").strip() or (
+            _build_ingest_usage_event_id(company_id, month_key, request_key)
+        )
+
+        _ingest_prepare_event(
+            usage_event_id=usage_event_id,
+            request_key=request_key,
+            company_id=company_id,
+            bubble_document_id=bubble_document_id,
+            month_key=month_key,
+        )
+        claim_status, existing = _ingest_claim_event(usage_event_id)
+
+        if claim_status == "completed":
+            month_usage = _ingest_month_usage(company_id, month_key)
+            return {
+                "ok": True,
+                "status": "indexed",
+                "company_id": company_id,
+                "machine_id": str(payload.machine_id or ""),
+                "bubble_document_id": bubble_document_id,
+                "trace_id": payload.trace_id,
+                "deduplicated": True,
+                **_ingest_public_fields(
+                    meter=None,
+                    event_snapshot=existing,
+                    month_usage=month_usage,
+                    status_override="measured_deduplicated",
+                ),
+            }
+
+        if claim_status == "processing":
+            month_usage = _ingest_month_usage(company_id, month_key)
+            return {
+                "ok": True,
+                "status": "processing",
+                "company_id": company_id,
+                "machine_id": str(payload.machine_id or ""),
+                "bubble_document_id": bubble_document_id,
+                "trace_id": payload.trace_id,
+                "deduplicated": True,
+                **_ingest_public_fields(
+                    meter=None,
+                    event_snapshot=existing,
+                    month_usage=month_usage,
+                    status_override="already_processing",
+                ),
+            }
+
+        meter = _IngestUsageMeter(
+            usage_event_id=usage_event_id,
+            request_key=request_key,
+            company_id=company_id,
+            bubble_document_id=bubble_document_id,
+            month_key=month_key,
+        )
+        ctx_token = _INGEST_METER_CTX.set(meter)
+
+        try:
+            result = func(payload, x_ai_internal_secret)
+        except Exception as exc:
+            _INGEST_METER_CTX.reset(ctx_token)
+            snapshot = _ingest_finalize_event(meter, status="error", error_text=str(exc))
+            month_usage = _ingest_month_usage(company_id, month_key)
+            print(
+                "INGEST_METER_FINAL_ERROR",
+                json.dumps(
+                    _ingest_public_fields(
+                        meter=meter,
+                        event_snapshot=snapshot,
+                        month_usage=month_usage,
+                    ),
+                    ensure_ascii=False,
+                ),
+            )
+            raise
+
+        _INGEST_METER_CTX.reset(ctx_token)
+        final_status = "completed" if isinstance(result, dict) and result.get("ok") is True else "error"
+        snapshot = _ingest_finalize_event(
+            meter,
+            status=final_status,
+            error_text="" if final_status == "completed" else str((result or {}).get("error") or "index failed"),
+        )
+        month_usage = _ingest_month_usage(company_id, month_key)
+        if isinstance(result, dict):
+            result.update(
+                _ingest_public_fields(
+                    meter=meter,
+                    event_snapshot=snapshot,
+                    month_usage=month_usage,
+                )
+            )
+        print(
+            "INGEST_METER_FINAL",
+            json.dumps(
+                _ingest_public_fields(
+                    meter=meter,
+                    event_snapshot=snapshot,
+                    month_usage=month_usage,
+                ),
+                ensure_ascii=False,
+            ),
+        )
+        return result
+
+    return wrapped
+
 
 def _fetch_document_file_map(company_id: str, doc_ids: list[str]) -> dict[str, str]:
     company_id = (company_id or "").strip()
@@ -6429,6 +7096,29 @@ def _openai_embed_texts(texts: list[str], *, timeout: int = 60) -> list[list[flo
             raise Exception(f"OpenAI embeddings failed: {r.status_code} {r.text}")
 
         data = r.json()
+
+        # The embeddings API exposes provider-side token usage. During document
+        # indexing this is the authoritative paid-AI unit; if a provider omits it,
+        # fall back conservatively to the existing character approximation.
+        approx_tokens = sum(
+            max(1, int(math.ceil(len(value) / 4.0)))
+            for value in unique_missing
+        )
+        provider_usage = data.get("usage") if isinstance(data, dict) else {}
+        provider_usage = provider_usage if isinstance(provider_usage, dict) else {}
+        provider_tokens = int(
+            provider_usage.get("prompt_tokens")
+            or provider_usage.get("input_tokens")
+            or provider_usage.get("total_tokens")
+            or 0
+        )
+        ingest_meter = _current_ingest_meter()
+        if ingest_meter is not None:
+            ingest_meter.record_embedding(
+                input_tokens=(provider_tokens if provider_tokens > 0 else approx_tokens),
+                usage_source=("provider_usage" if provider_tokens > 0 else "character_fallback"),
+            )
+
         vectors: list[Optional[list[float]]] = [None] * len(unique_missing)
         for item in data.get("data", []):
             idx = int(item["index"])
@@ -6442,7 +7132,7 @@ def _openai_embed_texts(texts: list[str], *, timeout: int = 60) -> list[list[flo
             cache[(OPENAI_EMBED_MODEL, value)] = list(vector or [])
 
         if budget is not None:
-            approx_tokens = sum(max(1, int(math.ceil(len(value) / 4.0))) for value in unique_missing)
+            # Keep the existing V13 Ask/Root Cause budget behavior unchanged.
             budget.record_embedding(input_tokens=approx_tokens, cache_hits=cache_hits)
     elif budget is not None:
         budget.embedding_cache_hits += len(normalized_texts)
@@ -12436,6 +13126,33 @@ def ping():
     return {"ok": True}
 
 
+@app.post("/v1/ai/ingest/usage/month")
+def ingest_usage_month(
+    payload: IngestUsageMonthRequest,
+    x_ai_internal_secret: Optional[str] = Header(default=None),
+):
+    if not AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=500, detail="AI_INTERNAL_SECRET missing")
+    if (x_ai_internal_secret or "").strip() != AI_INTERNAL_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    company_id = str(payload.company_id or "").strip()
+    if not company_id:
+        raise HTTPException(status_code=400, detail="Missing company_id")
+
+    usage = _ingest_month_usage(
+        company_id=company_id,
+        month_key=_normalize_ingest_month_key(payload.month_key),
+    )
+    return {
+        "ok": True,
+        "status": "ok",
+        **usage,
+        "ingest_pricing_version": INGEST_PRICING_VERSION,
+        "ingest_metering_version": INGEST_METERING_VERSION,
+    }
+
+
 @app.get("/version")
 def version():
     return {
@@ -12443,6 +13160,13 @@ def version():
         "service": os.environ.get("K_SERVICE"),
         "revision": os.environ.get("K_REVISION"),
         "commit_sha": os.environ.get("COMMIT_SHA"),
+        "ingest_metering_version": INGEST_METERING_VERSION,
+        "ingest_pricing_version": INGEST_PRICING_VERSION,
+        "ingest_credit_definition": "1_credit_equals_0.001_usd_default",
+        "ingest_credit_source": "actual_embedding_provider_usage_async_index",
+        "ingest_ledger_auto_ddl": INGEST_LEDGER_AUTO_DDL,
+        "ingest_async_indexing": True,
+        "ingest_post_threshold_enforcement": True,
         "ask_root_cause_code_marker": ASK_ROOT_CAUSE_CODE_MARKER,
         "v13_code_marker": V13_CODE_MARKER,
         "v13_release_id": V13_RELEASE_ID,
@@ -12646,6 +13370,48 @@ def ingest_document(
     if not (company_id and bubble_document_id):
         raise HTTPException(status_code=400, detail="Missing company_id/bubble_document_id")
 
+    # Authoritative post-threshold rule. The current document is admitted whenever the
+    # completed monthly total is still below the plan limit; it may push the total over.
+    # Once the stored total is already at/over the limit, the next document is rejected
+    # before parsing, chunking or any paid OpenAI call.
+    ingest_month_key_pre = _normalize_ingest_month_key(payload.ingest_month_key)
+    ingest_limit = max(Decimal("0"), _ingest_decimal(payload.ingest_credits_limit_month))
+    ingest_enforced = bool(payload.ingest_credits_enforced)
+    ingest_already_admitted = bool(payload.ingest_request_already_admitted)
+    if ingest_enforced and ingest_limit > 0 and not ingest_already_admitted:
+        usage_before = _ingest_month_usage(company_id, ingest_month_key_pre)
+        used_before = _ingest_decimal(usage_before.get("ingest_credits_used_month"))
+        if bool(usage_before.get("ledger_available")) and used_before >= ingest_limit:
+            request_key_pre = str(
+                payload.ingest_request_key or bubble_document_id
+            ).strip()
+            return {
+                "ok": False,
+                "status": "limit_exceeded",
+                "reason": "PLAN_INGEST_CREDITS_LIMIT_EXCEEDED",
+                "error_code": "PLAN_INGEST_CREDITS_LIMIT_EXCEEDED",
+                "ai_quota_exceeded": True,
+                "error": {
+                    "code": "PLAN_INGEST_CREDITS_LIMIT_EXCEEDED",
+                    "message": (
+                        "Limite mensile di elaborazione AI documenti già raggiunto. "
+                        "Il documento resta salvato in Bubble ma non viene indicizzato."
+                    ),
+                },
+                "request_key": request_key_pre,
+                "ingest_request_key": request_key_pre,
+                "ingest_usage_event_id": "",
+                "ingest_month_key": ingest_month_key_pre,
+                "ingest_credits_actual": 0,
+                "ingest_credits_used_month": float(used_before),
+                "ingest_credits_limit_month": float(ingest_limit),
+                "ingest_credits_remaining": 0,
+                "ingest_pricing_version": INGEST_PRICING_VERSION,
+                "ingest_metering_status": "not_started_quota_blocked",
+                "ingest_metering_version": INGEST_METERING_VERSION,
+                "ingest_usage": {},
+            }
+
     loaded_file = _load_ingest_document_file(payload, bubble_document_id)
 
     data = loaded_file["data"]
@@ -12655,6 +13421,18 @@ def ingest_document(
     detected_filename = loaded_file["detected_filename"]
     detected_extension = loaded_file["detected_extension"]
     source_mode = loaded_file["source_mode"]
+
+    file_sha256 = hashlib.sha256(data).hexdigest()
+    ingest_month_key = _normalize_ingest_month_key(payload.ingest_month_key)
+    ingest_request_key = _effective_ingest_request_key(
+        company_id=company_id,
+        bubble_document_id=bubble_document_id,
+        requested_key=payload.ingest_request_key,
+        file_sha256=file_sha256,
+    )
+    ingest_usage_event_id = _build_ingest_usage_event_id(
+        company_id, ingest_month_key, ingest_request_key
+    )
 
     if url:
         _db_upsert_document_file(company_id, bubble_document_id, url)
@@ -12896,6 +13674,14 @@ def ingest_document(
 
     _v13_invalidate_company_knowledge(company_id)
 
+    ledger_prepared = _ingest_prepare_event(
+        usage_event_id=ingest_usage_event_id,
+        request_key=ingest_request_key,
+        company_id=company_id,
+        bubble_document_id=bubble_document_id,
+        month_key=ingest_month_key,
+    )
+
     try:
         project = (
             os.environ.get("GOOGLE_CLOUD_PROJECT")
@@ -12931,6 +13717,10 @@ def ingest_document(
             "bubble_document_id": bubble_document_id,
             "trace_id": "ingest_auto",
             "ai_scope": ingest_scope,
+            "ingest_request_key": ingest_request_key,
+            "ingest_month_key": ingest_month_key,
+            "ingest_usage_event_id": ingest_usage_event_id,
+            "ingest_metering_enabled": True,
         }
 
         task = {
@@ -12950,6 +13740,7 @@ def ingest_document(
         print("CLOUD_TASKS_ENQUEUE_SKIPPED", str(e))
         pass
 
+    month_usage_before = _ingest_month_usage(company_id, ingest_month_key)
     return {
         "ok": True,
         "pages_total": pages_total,
@@ -12958,6 +13749,24 @@ def ingest_document(
         "text_chars": text_chars,
         "est_storage_bytes": est_storage_bytes,
         "source_file_type": source_file_type,
+        "request_key": ingest_request_key,
+        "ingest_request_key": ingest_request_key,
+        "ingest_usage_event_id": ingest_usage_event_id,
+        "ingest_month_key": ingest_month_key,
+        "ingest_credits_actual": 0,
+        "ingest_credits_used_month": float(
+            month_usage_before.get("ingest_credits_used_month") or 0
+        ),
+        "ingest_pricing_version": INGEST_PRICING_VERSION,
+        "ingest_metering_status": (
+            "pending_async_index" if ledger_prepared else "pending_async_ledger_unavailable"
+        ),
+        "ingest_metering_version": INGEST_METERING_VERSION,
+        "ingest_usage": {
+            "source_file_type": source_file_type,
+            "file_sha256": file_sha256,
+            "status": "queued",
+        },
     }
 
 
@@ -13116,6 +13925,7 @@ def ingest_structured_source(
     }
 
 @app.post("/v1/ai/index/document")
+@_meter_index_document
 def index_document(
     payload: IndexDocumentRequest,
     x_ai_internal_secret: Optional[str] = Header(default=None),
