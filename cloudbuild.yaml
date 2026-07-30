@@ -39,5 +39,21 @@ steps:
         "--quiet"
       ]
 
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      [
+        "run",
+        "services",
+        "update-traffic",
+        "mm-ai-ingest-fixed",
+        "--project",
+        "$PROJECT_ID",
+        "--region",
+        "europe-west1",
+        "--to-latest",
+        "--quiet"
+      ]
+
 images:
   - "europe-west1-docker.pkg.dev/$PROJECT_ID/mm-ai-ingest/mm-ai-ingest:$COMMIT_SHA"
