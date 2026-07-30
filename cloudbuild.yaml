@@ -7,7 +7,7 @@ steps:
       [
         "build",
         "-t",
-        "europe-west1-docker.pkg.dev/$PROJECT_ID/mm-ai-ingest/mm-ai-ingest:$COMMIT_SHA",
+        "europe-west1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/mm-ai-ingest/mm-ai-ingest-prod:$COMMIT_SHA",
         "-f",
         "Dockerfile",
         "."
@@ -17,7 +17,7 @@ steps:
     args:
       [
         "push",
-        "europe-west1-docker.pkg.dev/$PROJECT_ID/mm-ai-ingest/mm-ai-ingest:$COMMIT_SHA"
+        "europe-west1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/mm-ai-ingest/mm-ai-ingest-prod:$COMMIT_SHA"
       ]
 
   - name: gcr.io/google.com/cloudsdktool/cloud-sdk
@@ -26,18 +26,34 @@ steps:
       [
         "run",
         "deploy",
-        "mm-ai-ingest-fixed",
+        "mm-ai-ingest-prod",
         "--image",
-        "europe-west1-docker.pkg.dev/$PROJECT_ID/mm-ai-ingest/mm-ai-ingest:$COMMIT_SHA",
+        "europe-west1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/mm-ai-ingest/mm-ai-ingest-prod:$COMMIT_SHA",
         "--region",
         "europe-west1",
         "--platform",
         "managed",
         "--allow-unauthenticated",
         "--update-env-vars",
-        "COMMIT_SHA=$COMMIT_SHA",
+        "COMMIT_SHA=$COMMIT_SHA,MM_INGEST_LEDGER_AUTO_DDL=0",
+        "--quiet"
+      ]
+
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      [
+        "run",
+        "services",
+        "update-traffic",
+        "mm-ai-ingest-prod",
+        "--project",
+        "$PROJECT_ID",
+        "--region",
+        "europe-west1",
+        "--to-latest",
         "--quiet"
       ]
 
 images:
-  - "europe-west1-docker.pkg.dev/$PROJECT_ID/mm-ai-ingest/mm-ai-ingest:$COMMIT_SHA"
+  - "europe-west1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/mm-ai-ingest/mm-ai-ingest-prod:$COMMIT_SHA"
