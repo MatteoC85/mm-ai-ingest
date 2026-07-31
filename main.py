@@ -11173,7 +11173,8 @@ def _procedure_ui_model_to_html(model: dict, *, links: list[dict], response_lang
             chunks.append('<p style="margin:4px 0;color:#1e3a8a;">' + _assistant_ui_escape(note) + '</p>')
         chunks.append('</section>')
 
-    chunks.append(_assistant_ui_sources_html(links, is_en=is_en))
+    # LINK and FONTI are rendered by the existing Bubble groups.
+    # The rich HTML field must contain only the answer body.
     chunks.append('</article>')
     rendered = ''.join(chunks)
     return rendered if len(rendered) <= ASSISTANT_UI_MAX_HTML_CHARS else ""
@@ -11248,7 +11249,7 @@ def _assistant_ui_generic_html(answer: str, *, links: list[dict], response_langu
         '<article data-mm-answer="generic" data-mm-render="' + _assistant_ui_escape(ASSISTANT_UI_RENDER_VERSION) + '" '
         'style="box-sizing:border-box;width:100%;font-family:Inter,-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif;'
         'font-size:14px;line-height:1.55;color:#1f2937;">'
-        + callout + ''.join(body) + _assistant_ui_sources_html(links, is_en=is_en) + '</article>'
+        + callout + ''.join(body) + '</article>'
     )
     return rendered if len(rendered) <= ASSISTANT_UI_MAX_HTML_CHARS else ""
 
@@ -18004,9 +18005,9 @@ if V13_HEAVY_REASONING_MODE not in {"", "pro"}:
 # retrieval/synthesis primitives but chooses the response mode only after neutral
 # cross-source retrieval. Default ON; set MM_ASSISTANT_CORE_V2_ENABLED=0 only for rollback.
 ASSISTANT_CORE_V2_ENABLED = (os.environ.get("MM_ASSISTANT_CORE_V2_ENABLED") or "1").strip() != "0"
-ASSISTANT_CORE_V2_CODE_MARKER = "assistant-core-v2-rich-answer-html-20260731-5"
-ASSISTANT_CORE_V2_RELEASE_ID = (os.environ.get("MM_ASSISTANT_CORE_V2_RELEASE_ID") or "2026-07-31.5").strip()
-ASSISTANT_UI_RENDER_VERSION = "assistant-ui-html-v1-20260731-5"
+ASSISTANT_CORE_V2_CODE_MARKER = "assistant-core-v2-rich-answer-response-only-20260731-5-1"
+ASSISTANT_CORE_V2_RELEASE_ID = (os.environ.get("MM_ASSISTANT_CORE_V2_RELEASE_ID") or "2026-07-31.5.1").strip()
+ASSISTANT_UI_RENDER_VERSION = "assistant-ui-html-response-only-v1-20260731-5-1"
 ASSISTANT_UI_MAX_HTML_CHARS = max(8000, min(60000, int(
     os.environ.get("MM_ASSISTANT_UI_MAX_HTML_CHARS", "32000")
 )))
