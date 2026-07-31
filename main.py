@@ -1,4 +1,3 @@
-# main
 import os
 import re
 import asyncio
@@ -2679,10 +2678,18 @@ def _polish_answer_spacing_for_ui(text: str) -> str:
         "Passaggi operativi:",
         "Supporto operativo dal manuale:",
         "Nota di sicurezza dal manuale:",
+        "Prima di iniziare:",
+        "Procedura:",
+        "Nota dal manuale:",
+        "Verifica finale:",
         "Internal procedure:",
         "Operational steps:",
         "Manual operation support:",
         "Manual safety note:",
+        "Before starting:",
+        "Procedure:",
+        "Manual note:",
+        "Final verification:",
     )
 
     raw_lines = [re.sub(r"[ \t]+", " ", line).strip() for line in t.split("\n")]
@@ -2738,19 +2745,32 @@ def _compact_answer_for_ui(text: str, *, language: str = "it") -> str:
     max_chars = max(600, int(ASK_UI_MAX_ANSWER_CHARS or 2200))
     max_points = max(1, int(ASK_UI_MAX_POINTS or 5))
     is_sectioned_structured = bool(re.search(
-        r"(?mi)^(Procedura interna|Passaggi operativi|Supporto operativo dal manuale|Nota di sicurezza dal manuale|Internal procedure|Operational steps|Manual operation support|Manual safety note)\s*:",
+        r"(?mi)^(Procedura interna|Passaggi operativi|Supporto operativo dal manuale|Nota di sicurezza dal manuale|Prima di iniziare|Procedura|Nota dal manuale|Verifica finale|Internal procedure|Operational steps|Manual operation support|Manual safety note|Before starting|Procedure|Manual note|Final verification)\s*:",
         clean,
     ))
     if is_sectioned_structured:
-        max_chars = max(max_chars, int(ASK_UI_MAX_STRUCTURED_ANSWER_CHARS or 5200))
+        # A normal 8-12 step procedure must fit without chopping instructions.
+        max_chars = max(max_chars, int(ASK_UI_MAX_STRUCTURED_ANSWER_CHARS or 5200), 9000)
 
     # Preserve deliberate sectioned ASK answers (for example structured procedure + steps +
     # manual safety note). Re-numbering these sections would make the UI less readable.
     if is_sectioned_structured:
         out = _polish_answer_spacing_for_ui(clean.strip())
         if len(out) > max_chars:
-            cut = out[:max_chars].rsplit(" ", 1)[0].strip()
-            out = cut + "…"
+            # Keep complete paragraphs/sentences. Never show a half sentence ending
+            # with an ellipsis in an operator instruction.
+            candidate = out[:max_chars]
+            boundary = candidate.rfind("\n\n")
+            if boundary < int(max_chars * 0.65):
+                sentence_boundaries = [m.end() for m in re.finditer(r"[.!?](?:\s|$)", candidate)]
+                boundary = sentence_boundaries[-1] if sentence_boundaries else len(candidate)
+            out = candidate[:boundary].rstrip()
+            suffix = (
+                "La sequenza completa resta disponibile nella procedura collegata."
+                if str(language or "it").lower().startswith("it")
+                else "The complete sequence remains available in the linked procedure."
+            )
+            out = out + "\n\n" + suffix
         return out
 
     points = _split_answer_points_for_ui(clean)
@@ -10512,6 +10532,263 @@ def _v12_mark_structured_roles(citations: list[dict]) -> list[dict]:
     return out
 
 
+def _procedure_ui_raw_text(citation: dict) -> str:
+    return str(
+        (citation or {}).get("chunk_full")
+        or (citation or {}).get("snippet")
+        or (citation or {}).get("snippet_clean")
+        or ""
+    ).replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
+def _procedure_ui_fields(citation: dict) -> dict[str, str]:
+    """Read complete structured fields, including multiline descriptions."""
+    raw = _procedure_ui_raw_text(citation)
+    if not raw:
+        return {}
+
+    known = {
+        "source_type", "title", "procedure_type", "short_description",
+        "step_number", "description", "category", "solution", "notes",
+        "procedure", "procedura", "parent_procedure", "parent_procedura",
+        "procedure_id", "procedura_id", "procedure_code", "codice_procedura",
+        "procedure_title", "titolo_procedura", "related_procedure",
+        "procedura_collegata",
+    }
+    values: dict[str, list[str]] = {}
+    current = ""
+    for raw_line in raw.split("\n"):
+        line = re.sub(r"[ \t]+", " ", str(raw_line or "")).strip()
+        if not line:
+            continue
+        key = ""
+        value = ""
+        if ":" in line:
+            key_part, value_part = line.split(":", 1)
+            normalized = re.sub(
+                r"[^a-z0-9à-öø-ÿ]+",
+                "_",
+                _normalize_unicode_advanced(key_part).lower(),
+            ).strip("_")
+            if normalized in known:
+                key = normalized
+                value = value_part.strip()
+        if key:
+            current = key
+            values.setdefault(current, [])
+            if value:
+                values[current].append(value)
+        elif current:
+            values.setdefault(current, []).append(line)
+
+    # Compatibility with old one-line records. Prefer the complete values above.
+    out = dict(_parse_structured_source_fields(raw))
+    for key, chunks in values.items():
+        value = re.sub(r"\s+", " ", " ".join(chunks)).strip()
+        if value:
+            out[key] = value
+    return out
+
+
+def _procedure_ui_clean(value: Any, *, finish_sentence: bool = False) -> str:
+    text = re.sub(r"\s+", " ", _normalize_unicode_advanced(str(value or ""))).strip()
+    if not text:
+        return ""
+    text = re.sub(
+        r"(?i)\b(?:codice\s+interno|internal\s+code)\s+[A-Z0-9._/-]+\s*[.;,:–—-]?\s*",
+        "",
+        text,
+    )
+    text = re.sub(r"(?i)\s*[—–-]\s*(?:PROCEDURA|PROCEDURE)\s*:.*$", "", text)
+    text = re.sub(r"(?i)\b(?:MEDIA\s+CORRELATI|RELATED\s+MEDIA)\b.*$", "", text)
+    text = re.sub(r"\s+([,.;:!?])", r"\1", text)
+    text = re.sub(r"([,.;:!?])(?=[A-Za-zÀ-ÖØ-öø-ÿ])", r"\1 ", text)
+    text = re.sub(r"\s+", " ", text).strip(" -–—\t\n")
+    if finish_sentence and text and text[-1] not in ".!?":
+        text += "."
+    return text
+
+
+def _procedure_ui_sections(value: str) -> dict[str, str]:
+    """Split the labels used in Procedure/Step descriptions, in IT and EN."""
+    text = str(value or "").replace("\r", "\n").strip()
+    if not text:
+        return {}
+    labels = [
+        ("instruction", "ISTRUZIONE OPERATIVA"),
+        ("instruction", "OPERATIONAL INSTRUCTION"),
+        ("instruction", "OPERATING INSTRUCTION"),
+        ("safety", "NOTA DI SICUREZZA"),
+        ("safety", "SAFETY NOTE"),
+        ("media", "MEDIA CORRELATI"),
+        ("media", "RELATED MEDIA"),
+        ("duration", "DURATA INDICATIVA"),
+        ("duration", "INDICATIVE DURATION"),
+        ("safety_level", "LIVELLO DI SICUREZZA"),
+        ("safety_level", "SAFETY LEVEL"),
+        ("technical_sources", "FONTI TECNICHE"),
+        ("technical_sources", "TECHNICAL SOURCES"),
+        ("recipients", "DESTINATARI"),
+        ("recipients", "RECIPIENTS"),
+        ("purpose", "SCOPO"),
+        ("purpose", "PURPOSE"),
+        ("purpose", "OBJECTIVE"),
+    ]
+    labels.sort(key=lambda item: len(item[1]), reverse=True)
+    key_by_label = {label.lower(): key for key, label in labels}
+    pattern = re.compile(
+        r"\b(" + "|".join(re.escape(label) for _, label in labels) + r")\b\s*[:：–—-]?\s*",
+        flags=re.IGNORECASE,
+    )
+    matches = list(pattern.finditer(text))
+    if not matches:
+        return {"body": _procedure_ui_clean(text)}
+
+    out: dict[str, str] = {}
+    prefix = _procedure_ui_clean(text[:matches[0].start()])
+    if prefix:
+        out["body"] = prefix
+    for idx, match in enumerate(matches):
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        body = _procedure_ui_clean(text[match.end():end])
+        key = key_by_label.get(str(match.group(1) or "").lower(), "")
+        if key and body:
+            out[key] = (out.get(key, "") + " " + body).strip()
+    return out
+
+
+def _procedure_ui_complete_excerpt(value: str, *, max_chars: int) -> str:
+    """Keep complete sentences; never expose a visibly truncated fragment."""
+    text = _procedure_ui_clean(value)
+    if not text:
+        return ""
+    was_truncated = text.endswith("…") or text.endswith("...")
+    text = re.sub(r"(?:…|\.\.\.)\s*$", "", text).strip()
+    if was_truncated:
+        boundary = max(text.rfind("."), text.rfind("!"), text.rfind("?"), text.rfind(";"))
+        if boundary >= 24:
+            text = text[:boundary + 1].strip()
+        else:
+            return ""
+    if len(text) <= max_chars:
+        return _procedure_ui_clean(text, finish_sentence=True)
+    boundaries = [m.end() for m in re.finditer(r"[.!?;](?:\s|$)", text[:max_chars + 1])]
+    if boundaries:
+        return text[:boundaries[-1]].strip()
+    # A single long instruction is safer than a sentence cut in the middle.
+    return _procedure_ui_clean(text, finish_sentence=True)
+
+
+def _procedure_ui_merge_sources(*groups: list[dict]) -> list[dict]:
+    """One coherent procedure followed by unique steps in their true order."""
+    best: dict[str, dict] = {}
+    insertion: dict[str, int] = {}
+    sequence = 0
+    for group in groups:
+        for citation in group or []:
+            if not isinstance(citation, dict):
+                continue
+            role = _v12_evidence_role(citation)
+            if role not in {"procedure", "step"}:
+                continue
+            bdid = str(citation.get("bubble_document_id") or "").strip()
+            key = bdid or str(citation.get("citation_id") or "").strip()
+            if not key:
+                continue
+            sequence += 1
+            insertion.setdefault(key, sequence)
+            candidate = dict(citation)
+            candidate["evidence_role"] = role
+            candidate["ask_structured_direct"] = True
+            previous = best.get(key)
+            if previous is None or len(_procedure_ui_raw_text(candidate)) > len(_procedure_ui_raw_text(previous)):
+                best[key] = candidate
+
+    items = list(best.values())
+    procedures = [c for c in items if _v12_evidence_role(c) == "procedure"]
+    procedures.sort(key=lambda c: insertion.get(str(c.get("bubble_document_id") or ""), 999999))
+    primary = procedures[0] if procedures else None
+
+    steps: list[dict] = []
+    for citation in items:
+        if _v12_evidence_role(citation) != "step":
+            continue
+        if primary is not None and _v12_step_matches_procedure(citation, primary) is False:
+            continue
+        steps.append(citation)
+    steps.sort(key=_v12_step_sort_key)
+    return ([primary] if primary is not None else []) + steps
+
+
+def _procedure_ui_order_citations(citations: list[dict]) -> list[dict]:
+    unique = _dedup_citations_preserve_order(
+        [dict(c) for c in (citations or []) if isinstance(c, dict)],
+        max_items=max(1, len(citations or [])) + 20,
+    )
+    def sort_key(citation: dict) -> tuple:
+        role = _v12_evidence_role(citation)
+        if role == "procedure":
+            return (0, 0, str(citation.get("bubble_document_id") or ""))
+        if role == "step":
+            step_no, bdid = _v12_step_sort_key(citation)
+            if step_no >= 9999:
+                label = str(citation.get("display_label") or "")
+                match = re.search(r"(?i)\b(?:step|passaggio)\s*(\d+)\b", label)
+                if match:
+                    step_no = _safe_int(match.group(1), 9999)
+            return (1, step_no, bdid)
+        if role in {"ps", "md_photo", "md_video"}:
+            return (2, 0, str(citation.get("bubble_document_id") or ""))
+        if role == "manual_support":
+            return (4, _safe_int(citation.get("page_from"), 0), str(citation.get("bubble_document_id") or ""))
+        return (3, _safe_int(citation.get("page_from"), 0), str(citation.get("bubble_document_id") or ""))
+    return sorted(unique, key=sort_key)
+
+
+def _procedure_ui_grounded_by_citation(grounded_points: list[dict]) -> dict[str, list[str]]:
+    out: dict[str, list[str]] = {}
+    for point in grounded_points or []:
+        if not isinstance(point, dict):
+            continue
+        text = _procedure_ui_clean(
+            _strip_inline_citation_markers_for_display(point.get("text") or ""),
+            finish_sentence=True,
+        )
+        if not text:
+            continue
+        for citation_id in point.get("citation_ids") or []:
+            cid = str(citation_id or "").strip()
+            if cid:
+                out.setdefault(cid, []).append(text)
+    return out
+
+
+def _procedure_ui_is_safety_setup(text: str) -> bool:
+    normalized = _normalize_unicode_advanced(text or "").lower()
+    return bool(re.search(
+        r"\b(?:sicurezza|sicure|arrestare|isolamento|isolare|emergenza|ripari|"
+        r"safe|safety|stop|isolation|isolate|emergency|guard|guards|lockout)\b",
+        normalized,
+    ))
+
+
+def _procedure_ui_is_final_verification(text: str) -> bool:
+    normalized = _normalize_unicode_advanced(text or "").lower()
+    return bool(re.search(
+        r"\b(?:verificare|controllare|provare|testare|confermare|validare|approvare|"
+        r"verify|check|test|confirm|validate|approve|trial)\b",
+        normalized,
+    ))
+
+
+def _procedure_ui_note_is_novel(note: str, existing_text: str) -> bool:
+    note_terms = _content_term_set(note, limit=80)
+    if not note_terms:
+        return False
+    existing_terms = _content_term_set(existing_text, limit=240)
+    return len(note_terms & existing_terms) / max(1, len(note_terms)) < 0.72
+
+
 def _format_structured_procedure_answer_for_ui(
     *,
     structured_citations: list[dict],
@@ -10520,77 +10797,138 @@ def _format_structured_procedure_answer_for_ui(
     response_language: str,
     q: str = "",
 ) -> str:
-    """Readable sectioned answer for structured procedure/step questions.
-
-    This is deliberately generic: it formats first-class Bubble structured sources
-    (procedure + steps) and, when present, appends a short manual support note. It
-    does not contain object ids, benchmark terms, or document-specific values.
-    """
-    lang = str(response_language or "it").strip().lower()
-    is_en = lang.startswith("en")
-
-    procedures = [c for c in structured_citations or [] if _source_type_from_document_id(str(c.get("bubble_document_id") or "")) == "procedure"]
-    steps = [c for c in structured_citations or [] if _source_type_from_document_id(str(c.get("bubble_document_id") or "")) == "step"]
-    if not procedures and not steps:
+    """Render Procedure/Step evidence like a clear technical assistant answer."""
+    is_en = str(response_language or "it").strip().lower().startswith("en")
+    coherent = _procedure_ui_merge_sources(structured_citations)
+    procedures = [c for c in coherent if _v12_evidence_role(c) == "procedure"]
+    step_sources = [c for c in coherent if _v12_evidence_role(c) == "step"]
+    if not procedures and not step_sources:
         return ""
 
-    def step_sort_key(c: dict) -> tuple[int, str]:
-        raw = _ask_structured_field_value(c, "step_number", limit=20)
-        n = _safe_int(raw, 9999)
-        return (n, str(c.get("bubble_document_id") or ""))
-
-    steps = sorted(steps, key=step_sort_key)
-    parts: list[str] = []
-
+    grounded_by_citation = _procedure_ui_grounded_by_citation(grounded_points)
+    title = "Operating procedure" if is_en else "Procedura operativa"
+    recipients = ""
+    safety_level = ""
+    purpose = ""
     if procedures:
-        p0 = procedures[0]
-        title = _ask_structured_field_value(p0, "title", limit=90) or ("Procedure" if is_en else "Procedura")
-        ptype = _ask_structured_field_value(p0, "procedure_type", limit=80)
-        desc = _ask_structured_field_value(p0, "short_description", "description", limit=220)
-        header = "Internal procedure:" if is_en else "Procedura interna:"
-        lines = [header, f"- {('Procedure' if is_en else 'Procedura')}: {title}"]
-        if ptype:
-            lines.append(f"- {('Type' if is_en else 'Tipo')}: {ptype}")
-        if desc:
-            lines.append(f"- {('Description' if is_en else 'Descrizione')}: {desc}")
-        parts.append("\n".join(lines))
+        fields = _procedure_ui_fields(procedures[0])
+        source_title = _procedure_ui_clean(fields.get("title") or "")
+        if source_title and (not is_en or _looks_like_target_language(source_title, response_language)):
+            title = source_title
+        description = fields.get("short_description") or fields.get("description") or ""
+        sections = _procedure_ui_sections(description)
+        purpose = _procedure_ui_complete_excerpt(
+            sections.get("purpose") or sections.get("body") or description,
+            max_chars=420,
+        )
+        recipients = _procedure_ui_complete_excerpt(sections.get("recipients") or "", max_chars=240)
+        safety_level = _procedure_ui_complete_excerpt(sections.get("safety_level") or "", max_chars=100)
 
-    if steps:
-        header = "Operational steps:" if is_en else "Passaggi operativi:"
-        step_blocks: list[str] = []
-        for idx, c in enumerate(steps, start=1):
-            step_no = _ask_structured_field_value(c, "step_number", limit=20) or str(idx)
-            title = _ask_structured_field_value(c, "title", limit=100) or (f"Step {step_no}" if is_en else f"Step {step_no}")
-            desc = _ask_structured_field_value(c, "description", limit=280)
-            if desc and desc.lower() not in title.lower():
-                step_blocks.append(f"{step_no}. {title}\n   {desc}")
-            else:
-                step_blocks.append(f"{step_no}. {title}")
-        if step_blocks:
-            parts.append(header + "\n" + "\n\n".join(step_blocks))
+    records: list[dict] = []
+    for fallback_no, citation in enumerate(step_sources, start=1):
+        fields = _procedure_ui_fields(citation)
+        step_no = _safe_int(fields.get("step_number"), fallback_no)
+        step_title = _procedure_ui_clean(fields.get("title") or "") or f"Step {step_no}"
+        sections = _procedure_ui_sections(fields.get("description") or "")
+        instruction = _procedure_ui_complete_excerpt(
+            sections.get("instruction") or sections.get("body") or fields.get("description") or "",
+            max_chars=650,
+        )
+        safety = _procedure_ui_complete_excerpt(sections.get("safety") or "", max_chars=420)
+        cid = str(citation.get("citation_id") or "").strip()
+        grounded = max(grounded_by_citation.get(cid) or [""], key=len)
+
+        # Use the already-grounded model text when the indexed step is in another
+        # language; this avoids a mixed-language response without a third LLM call.
+        if grounded and instruction and not _looks_like_target_language(instruction, response_language):
+            instruction = grounded
+        elif grounded and not instruction:
+            instruction = grounded
+        if is_en and step_title and not _looks_like_target_language(step_title, response_language):
+            step_title = f"Step {step_no}"
+
+        records.append({
+            "number": step_no,
+            "title": step_title,
+            "instruction": instruction,
+            "safety": safety,
+        })
+    records.sort(key=lambda item: (int(item.get("number") or 9999), str(item.get("title") or "")))
+
+    precondition = None
+    final_verification = None
+    operational = list(records)
+    if len(operational) >= 2:
+        first_text = " ".join(str(operational[0].get(k) or "") for k in ("title", "instruction", "safety"))
+        if _procedure_ui_is_safety_setup(first_text):
+            precondition = operational.pop(0)
+    if len(operational) >= 2:
+        last_text = " ".join(str(operational[-1].get(k) or "") for k in ("title", "instruction"))
+        if _procedure_ui_is_final_verification(last_text):
+            final_verification = operational.pop()
+
+    parts: list[str] = [title]
+    if not records and purpose:
+        parts.append(purpose)
+
+    before_lines: list[str] = []
+    if precondition:
+        before_lines.append(f"{precondition['number']}. {precondition['title']}")
+        if precondition.get("instruction"):
+            before_lines.append(str(precondition["instruction"]))
+        if precondition.get("safety"):
+            before_lines.append(("Safety: " if is_en else "Sicurezza: ") + str(precondition["safety"]))
+    if recipients:
+        before_lines.append(("Qualified personnel: " if is_en else "Personale richiesto: ") + recipients)
+    if safety_level:
+        before_lines.append(("Safety level: " if is_en else "Livello di sicurezza: ") + safety_level)
+    if before_lines:
+        parts.append(("Before starting:" if is_en else "Prima di iniziare:") + "\n" + "\n".join(before_lines))
+
+    if operational:
+        blocks: list[str] = []
+        for record in operational:
+            lines = [f"{record['number']}. {record['title']}"]
+            if record.get("instruction"):
+                lines.append(str(record["instruction"]))
+            if record.get("safety"):
+                lines.append(("Safety: " if is_en else "Sicurezza: ") + str(record["safety"]))
+            blocks.append("\n".join(lines))
+        parts.append(("Procedure:" if is_en else "Procedura:") + "\n" + "\n\n".join(blocks))
+    elif purpose:
+        parts.append(("Procedure:" if is_en else "Procedura:") + "\n" + purpose)
+
+    if final_verification:
+        lines = [f"{final_verification['number']}. {final_verification['title']}"]
+        if final_verification.get("instruction"):
+            lines.append(str(final_verification["instruction"]))
+        if final_verification.get("safety"):
+            lines.append(("Safety: " if is_en else "Sicurezza: ") + str(final_verification["safety"]))
+        parts.append(("Final verification:" if is_en else "Verifica finale:") + "\n" + "\n".join(lines))
 
     if manual_support_citations:
         operation_note, safety_note = _manual_operation_and_safety_notes_from_support_citations(
             manual_support_citations,
             q=q,
-            structured_citations=structured_citations,
+            structured_citations=coherent,
             language=response_language,
         )
-        # If the LLM already produced a useful manual safety point, keep it as a
-        # fallback, but do not let it hide an operation-specific manual note.
-        llm_safety_note = _manual_note_from_grounded_points(grounded_points, language=response_language)
         if not safety_note:
-            safety_note = llm_safety_note or _manual_note_from_support_citations(manual_support_citations, language=response_language)
+            safety_note = _manual_note_from_grounded_points(grounded_points, language=response_language)
+        # Ordered structured steps are primary. A manual operation excerpt is shown
+        # only when no usable step text exists; the manual link is still returned.
+        candidates = [operation_note] if not records else []
+        candidates.append(safety_note)
+        existing = " ".join(parts)
+        notes: list[str] = []
+        for candidate in candidates:
+            note = _procedure_ui_complete_excerpt(candidate, max_chars=440)
+            if note and _procedure_ui_note_is_novel(note, existing + " " + " ".join(notes)):
+                notes.append(note)
+        if notes:
+            parts.append(("Manual note:" if is_en else "Nota dal manuale:") + "\n" + "\n".join(f"- {note}" for note in notes[:2]))
 
-        if operation_note:
-            header = "Manual operation support:" if is_en else "Supporto operativo dal manuale:"
-            parts.append(f"{header}\n- {operation_note}")
-        if safety_note:
-            header = "Manual safety note:" if is_en else "Nota di sicurezza dal manuale:"
-            parts.append(f"{header}\n- {safety_note}")
-
-    return "\n\n".join([p for p in parts if p]).strip()
-
+    return "\n\n".join(part for part in parts if str(part or "").strip()).strip()
 
 def _compact_manual_support_snippet_for_display(text: str, *, max_len: int) -> str:
     text = re.sub(r"^SECTION:\s*[^\n]+\n?", "", str(text or ""), flags=re.IGNORECASE).strip()
@@ -10748,8 +11086,13 @@ def _ask_structured_direct_answer(
     )
     final_structured = _v12_mark_structured_roles(final_structured)
 
+    ui_structured = _procedure_ui_merge_sources(
+        citations,
+        final_structured,
+        model_used_citations,
+    )
     sectioned_answer = _format_structured_procedure_answer_for_ui(
-        structured_citations=final_structured,
+        structured_citations=ui_structured,
         manual_support_citations=manual_support_citations,
         grounded_points=grounded_points,
         response_language=response_language,
@@ -10758,13 +11101,21 @@ def _ask_structured_direct_answer(
     answer = sectioned_answer or model_answer
 
     if sectioned_answer:
+        model_extras = [
+            c for c in (model_used_citations or [])
+            if isinstance(c, dict) and _v12_evidence_role(c) not in {"procedure", "step"}
+        ]
         final_citations = _v12_curate_response_items_for_ui(
-            list(final_structured) + list(manual_support_citations),
+            _procedure_ui_order_citations(
+                list(ui_structured) + list(manual_support_citations) + model_extras
+            ),
             max_items=max(1, int(ASK_UI_STRUCTURED_MAX_CITATIONS or 14)),
         )
     else:
         final_citations = _v12_curate_response_items_for_ui(
-            list(model_used_citations or []) + list(manual_support_citations or []),
+            _procedure_ui_order_citations(
+                list(model_used_citations or []) + list(manual_support_citations or [])
+            ),
             max_items=max(1, int(ASK_UI_STRUCTURED_MAX_CITATIONS or 14)),
         )
 
@@ -10788,9 +11139,12 @@ def _ask_structured_direct_answer(
     }
     for c in response_citations:
         c.update(role_by_id.get(str(c.get("citation_id") or ""), {}))
+    response_citations = _procedure_ui_order_citations(response_citations)
 
     try:
-        rg_links = _build_rg_links(company_id, response_citations)
+        rg_links = _procedure_ui_order_citations(
+            _build_rg_links(company_id, response_citations)
+        )
     except Exception as exc:
         print("RG_LINKS_FAIL", str(exc))
         rg_links = []
@@ -17253,8 +17607,8 @@ if V13_HEAVY_REASONING_MODE not in {"", "pro"}:
 # retrieval/synthesis primitives but chooses the response mode only after neutral
 # cross-source retrieval. Default ON; set MM_ASSISTANT_CORE_V2_ENABLED=0 only for rollback.
 ASSISTANT_CORE_V2_ENABLED = (os.environ.get("MM_ASSISTANT_CORE_V2_ENABLED") or "1").strip() != "0"
-ASSISTANT_CORE_V2_CODE_MARKER = "assistant-core-v2-grounded-unified-routing-20260731-3"
-ASSISTANT_CORE_V2_RELEASE_ID = (os.environ.get("MM_ASSISTANT_CORE_V2_RELEASE_ID") or "2026-07-31.3").strip()
+ASSISTANT_CORE_V2_CODE_MARKER = "assistant-core-v2-procedure-ui-20260731-4"
+ASSISTANT_CORE_V2_RELEASE_ID = (os.environ.get("MM_ASSISTANT_CORE_V2_RELEASE_ID") or "2026-07-31.4").strip()
 ASSISTANT_CORE_ROUTER_MODEL = (os.environ.get("MM_ASSISTANT_CORE_ROUTER_MODEL") or V13_FAST_MODEL).strip()
 ASSISTANT_CORE_ROUTER_EFFORT = (os.environ.get("MM_ASSISTANT_CORE_ROUTER_EFFORT") or "medium").strip()
 # Smart Diagnostic uses one quality-oriented Responses API call after routing.
@@ -22990,8 +23344,13 @@ def _v13_structured_ask(
             c for c in manual_support
             if str(c.get("citation_id") or "").strip() in used_ids
         ]
+    ui_structured = _procedure_ui_merge_sources(
+        structured,
+        final_structured,
+        model_citations,
+    )
     sectioned_answer = _format_structured_procedure_answer_for_ui(
-        structured_citations=final_structured,
+        structured_citations=ui_structured,
         manual_support_citations=manual_support,
         grounded_points=grounded_points,
         response_language=response_language,
@@ -23002,10 +23361,15 @@ def _v13_structured_ask(
     if not answer:
         return None
 
-    # Procedure/Step answers retain directly relevant manual support. For other
-    # structured tasks, links remain aligned to sources actually used by synthesis.
+    # Keep one complete ordered Procedure/Step family, then secondary evidence.
+    model_extras = [
+        c for c in (model_citations or [])
+        if isinstance(c, dict) and _v12_evidence_role(c) not in {"procedure", "step"}
+    ]
     final_citations = _v12_curate_response_items_for_ui(
-        list(final_structured) + list(manual_support) + list(model_citations or []),
+        _procedure_ui_order_citations(
+            list(ui_structured) + list(manual_support) + model_extras
+        ),
         max_items=max(1, int(ASK_UI_STRUCTURED_MAX_CITATIONS or 14)),
     )
     if not final_citations:
@@ -23024,9 +23388,12 @@ def _v13_structured_ask(
     }
     for c in response_citations:
         c.update(role_by_id.get(str(c.get("citation_id") or ""), {}))
+    response_citations = _procedure_ui_order_citations(response_citations)
 
     try:
-        rg_links = _build_rg_links(company_id, response_citations)
+        rg_links = _procedure_ui_order_citations(
+            _build_rg_links(company_id, response_citations)
+        )
     except Exception as exc:
         print("RG_LINKS_FAIL", str(exc)[:500])
         rg_links = []
