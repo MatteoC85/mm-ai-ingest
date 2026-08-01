@@ -11639,31 +11639,44 @@ def _assistant_ui_finalize_response(resp: dict, *, language: str = "it") -> dict
     status = str(out.get("status") or "answered").strip().lower()
     effective_mode = str(out.get("effective_mode") or "").strip().lower()
 
-    # Native Root Cause responses do not contain the ASK-style `answer` field.
-    # Build their rich body directly from the validated structured diagnosis.
-    if "answer" not in out:
-        is_root_cause_payload = (
-            effective_mode == "root_cause"
-            or isinstance(out.get("possible_causes"), list)
+    # Assistant Core V2 deliberately adds ``answer: ""`` to native Root Cause
+    # responses for backward compatibility with the Worker/Bubble contract.
+    # Therefore native Root Cause must be detected from ``effective_mode`` and
+    # its structured fields, never from the absence of the ASK-style answer key.
+    is_native_root_cause_payload = (
+        effective_mode == "root_cause"
+        and (
+            isinstance(out.get("possible_causes"), list)
             or "problem_summary" in out
+            or isinstance(out.get("recommended_next_checks"), list)
         )
-        if is_root_cause_payload:
+    )
+    if is_native_root_cause_payload:
+        if status == "answered":
             rendered = _assistant_ui_root_cause_html(out, response_language=language)
-            if rendered:
-                out["answer_html"] = rendered
-                out["answer_format"] = "html"
-                out["answer_render_version"] = ASSISTANT_UI_RENDER_VERSION
-                meta = dict(out.get("meta") or {})
-                meta["answer_render_version"] = ASSISTANT_UI_RENDER_VERSION
-                meta["answer_html_safe_template"] = True
-                meta["answer_html_body_only"] = True
-                meta["answer_html_contains_sources"] = False
-                meta["answer_html_mode"] = "root_cause"
-                out["meta"] = meta
-            else:
-                out.pop("answer_html", None)
-                out["answer_format"] = "text"
-                out["answer_render_version"] = ASSISTANT_UI_RENDER_VERSION
+        else:
+            rendered = ""
+        if rendered:
+            out["answer_html"] = rendered
+            out["answer_format"] = "html"
+            out["answer_render_version"] = ASSISTANT_UI_RENDER_VERSION
+            meta = dict(out.get("meta") or {})
+            meta["answer_render_version"] = ASSISTANT_UI_RENDER_VERSION
+            meta["answer_html_safe_template"] = True
+            meta["answer_html_body_only"] = True
+            meta["answer_html_contains_sources"] = False
+            meta["answer_html_mode"] = "root_cause"
+            out["meta"] = meta
+        else:
+            out.pop("answer_html", None)
+            out["answer_format"] = "text"
+            out["answer_render_version"] = ASSISTANT_UI_RENDER_VERSION
+        out.pop("_assistant_ui_model", None)
+        return out
+
+    # Non-ASK payloads that are not a native Root Cause response keep the
+    # existing text/fallback behavior.
+    if "answer" not in out:
         out.pop("_assistant_ui_model", None)
         return out
 
@@ -18412,9 +18425,9 @@ if V13_HEAVY_REASONING_MODE not in {"", "pro"}:
 # retrieval/synthesis primitives but chooses the response mode only after neutral
 # cross-source retrieval. Default ON; set MM_ASSISTANT_CORE_V2_ENABLED=0 only for rollback.
 ASSISTANT_CORE_V2_ENABLED = (os.environ.get("MM_ASSISTANT_CORE_V2_ENABLED") or "1").strip() != "0"
-ASSISTANT_CORE_V2_CODE_MARKER = "assistant-core-v2-root-cause-html-ui-v4-20260801-3"
+ASSISTANT_CORE_V2_CODE_MARKER = "assistant-core-v2-root-cause-html-ui-v4-1-20260801-4"
 ASSISTANT_CORE_V2_RELEASE_ID = (os.environ.get("MM_ASSISTANT_CORE_V2_RELEASE_ID") or "2026-08-01.3").strip()
-ASSISTANT_UI_RENDER_VERSION = "assistant-ui-html-root-cause-v4-20260801-3"
+ASSISTANT_UI_RENDER_VERSION = "assistant-ui-html-root-cause-v4-1-20260801-4"
 ASSISTANT_UI_MAX_HTML_CHARS = max(8000, min(60000, int(
     os.environ.get("MM_ASSISTANT_UI_MAX_HTML_CHARS", "32000")
 )))
