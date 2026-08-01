@@ -19063,8 +19063,8 @@ if V13_HEAVY_REASONING_MODE not in {"", "pro"}:
 # retrieval/synthesis primitives but chooses the response mode only after neutral
 # cross-source retrieval. Default ON; set MM_ASSISTANT_CORE_V2_ENABLED=0 only for rollback.
 ASSISTANT_CORE_V2_ENABLED = (os.environ.get("MM_ASSISTANT_CORE_V2_ENABLED") or "1").strip() != "0"
-ASSISTANT_CORE_V2_CODE_MARKER = "assistant-core-v2-procedure-relations-v5-20260801-5"
-ASSISTANT_CORE_V2_RELEASE_ID = (os.environ.get("MM_ASSISTANT_CORE_V2_RELEASE_ID") or "2026-08-01.5").strip()
+ASSISTANT_CORE_V2_CODE_MARKER = "assistant-core-v2-procedure-citation-manifest-v5-1-20260801-6"
+ASSISTANT_CORE_V2_RELEASE_ID = (os.environ.get("MM_ASSISTANT_CORE_V2_RELEASE_ID") or "2026-08-01.6").strip()
 ASSISTANT_UI_RENDER_VERSION = "assistant-ui-html-procedure-bundle-v5-20260801-5"
 ASSISTANT_UI_MAX_HTML_CHARS = max(8000, min(60000, int(
     os.environ.get("MM_ASSISTANT_UI_MAX_HTML_CHARS", "32000")
@@ -24873,6 +24873,11 @@ def _v13_structured_ask(
         "similarity_max": max([float(c.get("similarity") or 0.0) for c in all_evidence], default=None),
         "chat_model": model_used if synthesis_grounded else "v13_deterministic_structured_fallback",
         "_assistant_ui_model": answer_ui_model,
+        # Internal, trusted evidence manifest. These citations are loaded and
+        # curated deterministically by the backend (including Procedure->Step
+        # expansion) and must survive Assistant Core validation even when they
+        # were not part of the original semantic retrieval top-k.
+        "_assistant_core_validation_evidence": [dict(c) for c in final_citations],
         "meta": (
             {"cacheable": True, "semantic_cacheable": True}
             if synthesis_grounded
@@ -26351,17 +26356,79 @@ def _assistant_core_recover_citations(
     retrieval: dict,
     decision: AssistantCoreDecision,
 ) -> tuple[list[dict], list[dict]]:
-    selected = [
+    retrieval_selected = [
         dict(c)
         for c in (retrieval.get("citations") or retrieval.get("candidates") or [])
         if isinstance(c, dict) and str(c.get("citation_id") or "").strip()
     ]
+    trusted_manifest = [
+        dict(c)
+        for c in (response.get("_assistant_core_validation_evidence") or [])
+        if isinstance(c, dict)
+        and str(c.get("citation_id") or "").strip()
+        and (
+            bool(c.get("ask_structured_direct"))
+            or bool(c.get("ask_structured_manual_support"))
+            or _v12_evidence_role(c) in {"procedure", "step", "ps", "md_photo", "md_video", "manual_support"}
+        )
+    ]
+
+    # Merge the original retrieval pack with the deterministic structured
+    # manifest. The latter contains the complete ordered Procedure/Step family
+    # loaded from structured_source_relations, which semantic top-k may omit.
+    selected: list[dict] = []
+    selected_ids: set[str] = set()
+    for candidate in retrieval_selected + trusted_manifest:
+        cid = str(candidate.get("citation_id") or "").strip()
+        if not cid or cid in selected_ids:
+            continue
+        selected_ids.add(cid)
+        selected.append(candidate)
+
     by_id = {str(c.get("citation_id") or "").strip(): c for c in selected}
     existing = [
         dict(c)
         for c in (response.get("citations") or [])
         if isinstance(c, dict) and str(c.get("citation_id") or "").strip() in by_id
     ]
+
+    # For a deterministic structured procedure response, preserve the exact
+    # manifest used to build answer/answer_html. Do not re-rank it against the
+    # original semantic retrieval and do not apply the generic 8-source cap.
+    if trusted_manifest and decision.request_kind == KIND_PROCEDURE:
+        manifest_ids = {
+            str(c.get("citation_id") or "").strip()
+            for c in trusted_manifest
+            if str(c.get("citation_id") or "").strip()
+        }
+        ordered = [
+            dict(c) for c in (response.get("citations") or [])
+            if isinstance(c, dict)
+            and str(c.get("citation_id") or "").strip() in manifest_ids
+        ]
+        ordered_ids = {str(c.get("citation_id") or "").strip() for c in ordered}
+        ordered.extend(
+            dict(c) for c in trusted_manifest
+            if str(c.get("citation_id") or "").strip() not in ordered_ids
+        )
+        ordered = _procedure_ui_order_citations(ordered)
+        try:
+            sanitized = _sanitize_citations_for_response(ordered, company_id=request.company_id)
+        except Exception:
+            sanitized = ordered
+        sanitized = _procedure_ui_order_citations(sanitized)
+        try:
+            links = _procedure_ui_order_citations(
+                _build_rg_links(request.company_id, sanitized)
+            )
+        except Exception:
+            links = [
+                dict(link) for link in (response.get("rg_links") or [])
+                if isinstance(link, dict)
+                and str(link.get("citation_id") or "").strip()
+                in {str(c.get("citation_id") or "").strip() for c in sanitized}
+            ]
+        return sanitized, links
     existing_ids = {str(c.get("citation_id") or "").strip() for c in existing}
     answer_text = _assistant_core_response_claim_text(response, decision.effective_mode)
     answer_claims = _assistant_core_claims(answer_text)
@@ -26485,10 +26552,20 @@ def _assistant_core_validate_response(
     decision: AssistantCoreDecision,
 ) -> dict:
     out = dict(response or {})
-    allowed = {
-        str(c.get("citation_id") or "").strip(): c
+    allowed_candidates = [
+        dict(c)
         for c in (retrieval.get("citations") or retrieval.get("candidates") or [])
         if isinstance(c, dict) and str(c.get("citation_id") or "").strip()
+    ]
+    allowed_candidates.extend(
+        dict(c)
+        for c in (out.get("_assistant_core_validation_evidence") or [])
+        if isinstance(c, dict) and str(c.get("citation_id") or "").strip()
+    )
+    allowed = {
+        str(c.get("citation_id") or "").strip(): c
+        for c in allowed_candidates
+        if str(c.get("citation_id") or "").strip()
     }
     citations, links = _assistant_core_recover_citations(
         out,
@@ -26594,6 +26671,8 @@ def _assistant_core_validate_response(
         "unsupported_numeric_or_code_claims_removed": sorted(set(removed_claims))[:20],
     }
     out["meta"] = meta
+    # Internal-only manifest: never expose full raw evidence in the API payload.
+    out.pop("_assistant_core_validation_evidence", None)
     return out
 
 
