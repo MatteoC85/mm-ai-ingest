@@ -407,6 +407,13 @@ class StructuredSourceIngestRequest(BaseModel):
     short_description: Optional[str] = None
     procedure_type: Optional[str] = None
     step_number: Optional[int] = None
+
+    # Canonical Bubble relation for Step -> Procedure. These fields are metadata;
+    # they do not change the Step text/embedding contract for existing sources.
+    parent_procedure_id: Optional[str] = None
+    parent_procedure_code: Optional[str] = None
+    parent_procedure_title: Optional[str] = None
+
     category: Optional[str] = None
     solution: Optional[str] = None
     notes: Optional[str] = None
@@ -1907,6 +1914,222 @@ def _build_structured_source_key(source_type: str, source_id: str) -> str:
         raise HTTPException(status_code=400, detail="Missing source_id")
     return f"{st}:{sid}"
 
+
+STRUCTURED_RELATION_PROCEDURE_STEP = "procedure_step"
+
+
+def _normalize_structured_source_key(source_type: str, source_id_or_key: Any) -> str:
+    raw = str(source_id_or_key or "").strip()
+    if not raw:
+        return ""
+    prefix = f"{_normalize_structured_source_type(source_type)}:"
+    return raw if raw.lower().startswith(prefix.lower()) else prefix + raw
+
+
+def _parent_procedure_source_key(payload: StructuredSourceIngestRequest) -> str:
+    parent_id = str(payload.parent_procedure_id or "").strip()
+    if not parent_id:
+        return ""
+    return _normalize_structured_source_key("procedure", parent_id)
+
+
+def _db_upsert_structured_source_relation(
+    *,
+    company_id: str,
+    machine_id: str,
+    child_source_key: str,
+    parent_source_key: str,
+    ordinal: Optional[int],
+    relation_source: str,
+    metadata: Optional[dict] = None,
+) -> bool:
+    """Write only relation metadata; never re-embed or rewrite the source."""
+    if not (company_id and machine_id and child_source_key and parent_source_key):
+        return False
+
+    conn = None
+    try:
+        conn = _db_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO public.structured_source_relations(
+                    company_id,
+                    machine_id,
+                    child_source_key,
+                    parent_source_key,
+                    relation_type,
+                    child_source_type,
+                    parent_source_type,
+                    ordinal,
+                    relation_source,
+                    metadata,
+                    created_at,
+                    updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, 'step', 'procedure', %s, %s, %s::jsonb, NOW(), NOW())
+                ON CONFLICT (company_id, child_source_key, relation_type)
+                DO UPDATE SET
+                    machine_id = EXCLUDED.machine_id,
+                    parent_source_key = EXCLUDED.parent_source_key,
+                    ordinal = EXCLUDED.ordinal,
+                    relation_source = EXCLUDED.relation_source,
+                    metadata = EXCLUDED.metadata,
+                    updated_at = NOW();
+                """,
+                (
+                    company_id,
+                    machine_id,
+                    child_source_key,
+                    parent_source_key,
+                    STRUCTURED_RELATION_PROCEDURE_STEP,
+                    int(ordinal) if ordinal is not None else None,
+                    str(relation_source or "bubble").strip() or "bubble",
+                    json.dumps(metadata or {}, ensure_ascii=False),
+                ),
+            )
+        conn.commit()
+        return True
+    except Exception as exc:
+        if conn is not None:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        # Migration can be rolled out before code or vice versa. Relation failure
+        # must not break normal source ingest; retrieval has a text fallback.
+        print("STRUCTURED_RELATION_UPSERT_FAIL_OPEN", str(exc)[:700])
+        return False
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _db_fetch_related_step_pages(
+    *,
+    company_id: str,
+    machine_id: str,
+    parent_source_key: str,
+    text_chars: int,
+) -> list[tuple]:
+    """Return canonical Step children in Bubble order without semantic guessing."""
+    if not (company_id and machine_id and parent_source_key):
+        return []
+
+    conn = None
+    try:
+        conn = _db_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    r.child_source_key,
+                    r.ordinal,
+                    p.machine_id,
+                    p.page_number,
+                    LEFT(COALESCE(p.text, ''), %s) AS page_text
+                FROM public.structured_source_relations AS r
+                JOIN public.document_pages AS p
+                  ON p.company_id = r.company_id
+                 AND p.bubble_document_id = r.child_source_key
+                WHERE r.company_id = %s
+                  AND r.machine_id = %s
+                  AND r.parent_source_key = %s
+                  AND r.relation_type = %s
+                  AND p.text IS NOT NULL
+                  AND length(p.text) > 10
+                ORDER BY
+                    r.ordinal NULLS LAST,
+                    r.child_source_key,
+                    p.page_number;
+                """,
+                (
+                    int(text_chars),
+                    company_id,
+                    machine_id,
+                    parent_source_key,
+                    STRUCTURED_RELATION_PROCEDURE_STEP,
+                ),
+            )
+            return list(cur.fetchall())
+    except Exception as exc:
+        print("STRUCTURED_RELATION_READ_FALLBACK", str(exc)[:700])
+        return []
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _db_delete_structured_relations_for_source(company_id: str, source_key: str) -> int:
+    if not (company_id and source_key):
+        return 0
+    conn = None
+    try:
+        conn = _db_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM public.structured_source_relations
+                WHERE company_id=%s
+                  AND (child_source_key=%s OR parent_source_key=%s);
+                """,
+                (company_id, source_key, source_key),
+            )
+            deleted = int(cur.rowcount or 0)
+        conn.commit()
+        return deleted
+    except Exception as exc:
+        if conn is not None:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        print("STRUCTURED_RELATION_DELETE_SOURCE_FAIL_OPEN", str(exc)[:500])
+        return 0
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _db_delete_structured_relations_for_company(company_id: str) -> int:
+    if not company_id:
+        return 0
+    conn = None
+    try:
+        conn = _db_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM public.structured_source_relations WHERE company_id=%s;",
+                (company_id,),
+            )
+            deleted = int(cur.rowcount or 0)
+        conn.commit()
+        return deleted
+    except Exception as exc:
+        if conn is not None:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        print("STRUCTURED_RELATION_DELETE_COMPANY_FAIL_OPEN", str(exc)[:500])
+        return 0
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 def _is_structured_source_key(value: str) -> bool:
     v = str(value or "").strip().lower()
     if ":" not in v:
@@ -1948,6 +2171,9 @@ def _compose_structured_source_text(payload: StructuredSourceIngestRequest) -> s
         lines.append("SOURCE_TYPE: step")
         if payload.step_number is not None:
             lines.append(f"STEP_NUMBER: {int(payload.step_number)}")
+        _append_structured_field(lines, "PARENT_PROCEDURE_ID", payload.parent_procedure_id)
+        _append_structured_field(lines, "PARENT_PROCEDURE_CODE", payload.parent_procedure_code)
+        _append_structured_field(lines, "PARENT_PROCEDURE_TITLE", payload.parent_procedure_title)
         _append_structured_field(lines, "TITLE", payload.title)
         _append_structured_field(lines, "DESCRIPTION", payload.description)
 
@@ -10211,7 +10437,11 @@ def _v12_curate_response_items_for_ui(items: list[dict], *, max_items: int) -> l
 def _v12_code_keys(value: str) -> set[str]:
     raw = _normalize_unicode_advanced(str(value or "")).upper()
     out: set[str] = set()
-    for token in re.findall(r"\\b[A-Z]{1,12}[A-Z0-9]*(?:[\\s._/-]+[A-Z0-9]{1,16})+\\b|\\b[A-Z]{2,12}[-_]?\\d{1,8}[A-Z0-9._/-]*\\b", raw):
+    pattern = (
+        r"\b[A-Z]{1,12}[A-Z0-9]*(?:[-_/.][A-Z0-9]{1,16})+\b"
+        r"|\b[A-Z]{2,12}[-_ ]?\d{1,8}[A-Z0-9.,/_-]*\b"
+    )
+    for token in re.findall(pattern, raw):
         key = re.sub(r"[^A-Z0-9]", "", token)
         if len(key) >= 4 and any(ch.isdigit() for ch in key):
             out.add(key)
@@ -10231,27 +10461,83 @@ def _v12_identity_tokens(value: str) -> set[str]:
 
 
 def _v12_structured_parent_values(c: dict) -> list[str]:
+    """Read an explicit parent relation, including legacy DESCRIPTION prefixes."""
     raw = str((c or {}).get("chunk_full") or (c or {}).get("snippet") or "")
     fields = _parse_structured_source_fields(raw)
+    complete_parser = globals().get("_procedure_ui_fields")
+    if callable(complete_parser):
+        try:
+            fields.update(complete_parser(c) or {})
+        except Exception:
+            pass
+
     keys = (
+        "parent_source_key",
         "procedure", "procedura", "parent_procedure", "parent_procedura",
-        "procedure_id", "procedura_id", "procedure_code", "codice_procedura",
-        "procedure_title", "titolo_procedura", "related_procedure", "procedura_collegata",
+        "parent_procedure_id", "procedure_id", "procedura_id",
+        "parent_procedure_code", "procedure_code", "codice_procedura",
+        "parent_procedure_title", "procedure_title", "titolo_procedura",
+        "related_procedure", "procedura_collegata",
     )
     vals: list[str] = []
     seen: set[str] = set()
-    for key in keys:
-        value = _clean_display_text(fields.get(key) or "", max_len=260)
-        norm = re.sub(r"\\s+", " ", _normalize_unicode_advanced(value).lower()).strip()
+
+    def add(value: Any) -> None:
+        clean = _clean_display_text(value or "", max_len=320)
+        norm = re.sub(r"\s+", " ", _normalize_unicode_advanced(clean).lower()).strip()
         if norm and norm not in seen:
             seen.add(norm)
-            vals.append(value)
+            vals.append(clean)
+
+    for key in keys:
+        add(fields.get(key))
+
+    parent_id = str(
+        fields.get("parent_procedure_id")
+        or fields.get("procedure_id")
+        or fields.get("procedura_id")
+        or ""
+    ).strip()
+    if parent_id:
+        add(parent_id)
+        add(_normalize_structured_source_key("procedure", parent_id))
+
+    # New canonical fields, if present in the raw source.
+    for match in re.finditer(
+        r"(?im)^\s*(?:PARENT_SOURCE_KEY|PARENT_PROCEDURE_ID|PARENT_PROCEDURE_CODE|"
+        r"PARENT_PROCEDURE_TITLE|PROCEDURE_ID|PROCEDURE_CODE)\s*:\s*([^\n]+)",
+        raw,
+    ):
+        add(match.group(1))
+
+    # Legacy indexed Steps already contain:
+    # DESCRIPTION: PROCEDURA: PROC-002 — <title>
+    # This recovery path is language-neutral at the code level and supports IT/EN labels.
+    for match in re.finditer(
+        r"(?im)^\s*(?:DESCRIPTION\s*:\s*)?(?:PROCEDURA|PROCEDURE)\s*:\s*([^\n]+)",
+        raw,
+    ):
+        add(match.group(1))
+
+    description = str(fields.get("description") or "")
+    for match in re.finditer(
+        r"(?i)\b(?:PROCEDURA|PROCEDURE)\s*:\s*([A-Z]{2,12}[-_]?\d{1,8}[A-Z0-9._/-]*)",
+        description,
+    ):
+        add(match.group(1))
+
     return vals
 
 
 def _v12_procedure_identity_text(c: dict) -> str:
     raw = str((c or {}).get("chunk_full") or (c or {}).get("snippet") or "")
     fields = _parse_structured_source_fields(raw)
+    complete_parser = globals().get("_procedure_ui_fields")
+    if callable(complete_parser):
+        try:
+            fields.update(complete_parser(c) or {})
+        except Exception:
+            pass
     parts = [
         str(c.get("bubble_document_id") or ""),
         raw,
@@ -10266,24 +10552,37 @@ def _v12_procedure_identity_text(c: dict) -> str:
 
 
 def _v12_step_matches_procedure(step: dict, procedure: dict) -> Optional[bool]:
-    """True/False when the step declares a parent; None when no parent is declared."""
+    """True/False when the Step declares a parent; None when no parent is declared."""
     parents = _v12_structured_parent_values(step)
     if not parents:
         return None
 
+    proc_bdid = str((procedure or {}).get("bubble_document_id") or "").strip()
+    proc_id = proc_bdid.split(":", 1)[1].strip() if proc_bdid.lower().startswith("procedure:") else proc_bdid
     proc_text = _v12_procedure_identity_text(procedure)
     proc_norm = re.sub(r"[^a-zà-öø-ÿ0-9]+", " ", _normalize_unicode_advanced(proc_text).lower()).strip()
     proc_codes = _v12_code_keys(proc_text)
     proc_tokens = _v12_identity_tokens(proc_text)
 
     for parent in parents:
-        parent_norm = re.sub(r"[^a-zà-öø-ÿ0-9]+", " ", _normalize_unicode_advanced(parent).lower()).strip()
-        parent_codes = _v12_code_keys(parent)
+        parent_raw = str(parent or "").strip()
+        parent_key = parent_raw if parent_raw.lower().startswith("procedure:") else ""
+        if parent_key and parent_key.lower() == proc_bdid.lower():
+            return True
+        if parent_raw and proc_id and parent_raw.lower() == proc_id.lower():
+            return True
+
+        parent_norm = re.sub(
+            r"[^a-zà-öø-ÿ0-9]+",
+            " ",
+            _normalize_unicode_advanced(parent_raw).lower(),
+        ).strip()
+        parent_codes = _v12_code_keys(parent_raw)
         if parent_codes and proc_codes and (parent_codes & proc_codes):
             return True
-        if len(parent_norm) >= 5 and (parent_norm in proc_norm or proc_norm in parent_norm):
+        if len(parent_norm) >= 5 and parent_norm in proc_norm:
             return True
-        parent_tokens = _v12_identity_tokens(parent)
+        parent_tokens = _v12_identity_tokens(parent_raw)
         if parent_tokens and proc_tokens:
             overlap = len(parent_tokens & proc_tokens)
             ratio = overlap / max(1, min(len(parent_tokens), len(proc_tokens)))
@@ -10325,50 +10624,30 @@ def _v12_expand_primary_procedure_steps(
     procedure: dict,
     existing_steps: list[dict],
 ) -> list[dict]:
-    """Load all explicitly related steps for the selected procedure, without AI."""
+    """Load all Step children deterministically; text parsing is compatibility only."""
     matched: list[dict] = []
     for c in existing_steps or []:
         relation = _v12_step_matches_procedure(c, procedure)
         if relation is True:
-            matched.append(c)
+            cc = dict(c)
+            cc.setdefault("structured_relation_source", "indexed_parent_metadata")
+            matched.append(cc)
 
     text_chars = max(800, int(ASK_STRUCTURED_DIRECT_TEXT_CHARS or 5000))
-    scan_limit = max(500, int(ASK_STRUCTURED_DIRECT_SCAN_LIMIT or 1200))
-    rows: list[tuple] = []
-    try:
-        conn = _db_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT bubble_document_id, machine_id, page_number,
-                           LEFT(COALESCE(text, ''), %s) AS page_text
-                    FROM public.document_pages
-                    WHERE company_id = %s
-                      AND bubble_document_id LIKE 'step:%%'
-                      AND (machine_id = %s OR machine_id IS NULL OR machine_id = '')
-                      AND text IS NOT NULL
-                      AND length(text) > 10
-                    ORDER BY
-                      CASE WHEN machine_id = %s THEN 0 ELSE 1 END,
-                      bubble_document_id,
-                      page_number
-                    LIMIT %s;
-                    """,
-                    (text_chars, company_id, machine_id, machine_id, scan_limit),
-                )
-                rows = cur.fetchall()
-        finally:
-            conn.close()
-    except Exception as exc:
-        print("ASK_V12_STEP_EXPANSION_FAIL", str(exc)[:500])
-        rows = []
+    parent_source_key = str((procedure or {}).get("bubble_document_id") or "").strip()
 
-    for idx, (bdid, mid, page_number, page_text) in enumerate(rows, start=1):
+    def make_candidate(
+        *,
+        bdid: str,
+        mid: Any,
+        page_number: Any,
+        page_text: Any,
+        idx: int,
+        ordinal: Optional[int],
+        relation_source: str,
+    ) -> dict:
         bdid_s = str(bdid or "").strip()
         txt = str(page_text or "").strip()
-        if not bdid_s or not txt:
-            continue
         page_no = _safe_int(page_number, 1)
         candidate = {
             "citation_id": f"{bdid_s}:p{page_no}-{page_no}:structured:v12:{idx}",
@@ -10387,9 +10666,82 @@ def _v12_expand_primary_procedure_steps(
             "structured_direct_score": 10.0,
             "exact_machine_scope": str(mid or "").strip() == str(machine_id or "").strip(),
             "embedding_list": [],
+            "structured_relation_source": relation_source,
         }
-        if _v12_step_matches_procedure(candidate, procedure) is True:
+        if ordinal is not None:
+            candidate["structured_relation_ordinal"] = int(ordinal)
+        return candidate
+
+    # Preferred path: exact Bubble Step -> Procedure relation stored in Cloud SQL.
+    relation_rows = _db_fetch_related_step_pages(
+        company_id=company_id,
+        machine_id=machine_id,
+        parent_source_key=parent_source_key,
+        text_chars=text_chars,
+    )
+    for idx, (bdid, ordinal, mid, page_number, page_text) in enumerate(relation_rows, start=1):
+        candidate = make_candidate(
+            bdid=bdid,
+            mid=mid,
+            page_number=page_number,
+            page_text=page_text,
+            idx=idx,
+            ordinal=_safe_int(ordinal, 0) or None,
+            relation_source="structured_source_relations",
+        )
+        if candidate.get("bubble_document_id") and candidate.get("chunk_full"):
             matched.append(candidate)
+
+    # Compatibility path for already-indexed sources: no reindex is required.
+    # It reads the legacy "PROCEDURA/PROCEDURE: PROC-xxx" prefix from Step text.
+    if not relation_rows:
+        scan_limit = max(500, int(ASK_STRUCTURED_DIRECT_SCAN_LIMIT or 1200))
+        rows: list[tuple] = []
+        try:
+            conn = _db_conn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT bubble_document_id, machine_id, page_number,
+                               LEFT(COALESCE(text, ''), %s) AS page_text
+                        FROM public.document_pages
+                        WHERE company_id = %s
+                          AND bubble_document_id LIKE 'step:%%'
+                          AND (machine_id = %s OR machine_id IS NULL OR machine_id = '')
+                          AND text IS NOT NULL
+                          AND length(text) > 10
+                        ORDER BY
+                          CASE WHEN machine_id = %s THEN 0 ELSE 1 END,
+                          bubble_document_id,
+                          page_number
+                        LIMIT %s;
+                        """,
+                        (text_chars, company_id, machine_id, machine_id, scan_limit),
+                    )
+                    rows = cur.fetchall()
+            finally:
+                conn.close()
+        except Exception as exc:
+            print("ASK_V12_STEP_EXPANSION_FAIL", str(exc)[:500])
+            rows = []
+
+        for idx, (bdid, mid, page_number, page_text) in enumerate(rows, start=1):
+            candidate = make_candidate(
+                bdid=str(bdid or ""),
+                mid=mid,
+                page_number=page_number,
+                page_text=page_text,
+                idx=idx,
+                ordinal=None,
+                relation_source="legacy_parent_text",
+            )
+            if (
+                candidate.get("bubble_document_id")
+                and candidate.get("chunk_full")
+                and _v12_step_matches_procedure(candidate, procedure) is True
+            ):
+                matched.append(candidate)
 
     best_by_doc: dict[str, dict] = {}
     for c in matched:
@@ -10616,6 +10968,8 @@ def _procedure_ui_sections(value: str) -> dict[str, str]:
     if not text:
         return {}
     labels = [
+        ("instruction", "AZIONE OPERATIVA"),
+        ("instruction", "OPERATIONAL ACTION"),
         ("instruction", "ISTRUZIONE OPERATIVA"),
         ("instruction", "OPERATIONAL INSTRUCTION"),
         ("instruction", "OPERATING INSTRUCTION"),
@@ -10627,6 +10981,8 @@ def _procedure_ui_sections(value: str) -> dict[str, str]:
         ("duration", "INDICATIVE DURATION"),
         ("safety_level", "LIVELLO DI SICUREZZA"),
         ("safety_level", "SAFETY LEVEL"),
+        ("technical_sources", "RIFERIMENTI TECNICI"),
+        ("technical_sources", "TECHNICAL REFERENCES"),
         ("technical_sources", "FONTI TECNICHE"),
         ("technical_sources", "TECHNICAL SOURCES"),
         ("recipients", "DESTINATARI"),
@@ -10873,12 +11229,18 @@ def _build_structured_procedure_ui_model(
     final_checks: list[dict] = []
     operational = list(records)
     if operational:
-        first_text = " ".join(str(operational[0].get(k) or "") for k in ("title", "instruction", "safety"))
+        # Every Step may contain a safety note; that alone must not turn an
+        # operational Step into the "Before starting" callout.
+        first_text = " ".join(
+            str(operational[0].get(k) or "") for k in ("title", "instruction")
+        )
         if _procedure_ui_is_safety_setup(first_text):
             before.append(operational.pop(0))
     if operational:
-        last_text = " ".join(str(operational[-1].get(k) or "") for k in ("title", "instruction"))
-        if _procedure_ui_is_final_verification(last_text):
+        # A closure Step can contain the verb "verify" inside its instruction.
+        # Treat only an explicitly check/test-oriented title as the final check.
+        last_title = str(operational[-1].get("title") or "")
+        if _procedure_ui_is_final_verification(last_title):
             final_checks.insert(0, operational.pop())
 
     # Visible numbering is compact and sequential; source step numbers stay in
@@ -11774,6 +12136,184 @@ def _compact_manual_support_snippet_for_display(text: str, *, max_len: int) -> s
 
 
 
+
+def _ask_structured_procedure_answer_schema() -> dict:
+    return {
+        "name": "ask_structured_procedure_selection_v1",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "answer_status": {"type": "string", "enum": ["answered", "no_sources"]},
+                "selected_step_citation_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 20,
+                },
+                "grounded_points": {
+                    "type": "array",
+                    "maxItems": 10,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "text": {"type": "string"},
+                            "citation_ids": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "maxItems": 8,
+                            },
+                        },
+                        "required": ["text", "citation_ids"],
+                    },
+                },
+            },
+            "required": [
+                "answer_status",
+                "selected_step_citation_ids",
+                "grounded_points",
+            ],
+        },
+    }
+
+
+def _v12_query_requests_full_procedure(q: str) -> bool:
+    normalized = re.sub(
+        r"\s+",
+        " ",
+        _normalize_unicode_advanced(str(q or "")).lower(),
+    ).strip()
+    markers = (
+        "procedura completa",
+        "procedura intera",
+        "tutti i passaggi",
+        "tutti gli step",
+        "dall'inizio alla fine",
+        "sequenza completa",
+        "full procedure",
+        "entire procedure",
+        "complete procedure",
+        "all steps",
+        "from start to finish",
+        "complete sequence",
+    )
+    return any(marker in normalized for marker in markers)
+
+
+def _v12_query_requires_step_sequence(q: str, profile: Optional[dict]) -> bool:
+    if str((profile or {}).get("answer_type") or "").strip().lower() == "procedural":
+        return True
+    normalized = re.sub(
+        r"\s+",
+        " ",
+        _normalize_unicode_advanced(str(q or "")).lower(),
+    ).strip()
+    markers = (
+        "come si", "come fare", "come faccio", "cosa devo fare",
+        "passaggi", "step", "sequenza", "procedere", "eseguire",
+        "how to", "how do i", "what should i do", "steps", "sequence",
+        "perform", "execute", "thread", "insert", "replace", "change",
+    )
+    return any(marker in normalized for marker in markers)
+
+
+def _v12_select_response_steps(
+    *,
+    all_steps: list[dict],
+    selected_step_ids: list[str],
+    model_used_citations: list[dict],
+    q: str,
+) -> list[dict]:
+    """Choose one contiguous Step interval from the complete Procedure family."""
+    steps = _dedup_citations_preserve_order(
+        sorted(
+            [dict(c) for c in all_steps or [] if isinstance(c, dict)],
+            key=_v12_step_sort_key,
+        ),
+        max_items=max(1, len(all_steps or [])) + 10,
+    )
+    if not steps:
+        return []
+    if _v12_query_requests_full_procedure(q):
+        return steps
+
+    selected_ids = {
+        str(value or "").strip()
+        for value in (selected_step_ids or [])
+        if str(value or "").strip()
+    }
+    selected_bdids: set[str] = set()
+    selected_numbers: set[int] = set()
+
+    for step in steps:
+        cid = str(step.get("citation_id") or "").strip()
+        bdid = str(step.get("bubble_document_id") or "").strip()
+        if cid in selected_ids or bdid in selected_ids:
+            selected_bdids.add(bdid)
+            selected_numbers.add(_v12_step_sort_key(step)[0])
+
+    # Grounded points are a compatibility fallback when a model omits the dedicated list.
+    used_ids = {
+        str(c.get("citation_id") or "").strip()
+        for c in (model_used_citations or [])
+        if isinstance(c, dict) and _v12_evidence_role(c) == "step"
+    }
+    for step in steps:
+        if str(step.get("citation_id") or "").strip() in used_ids:
+            selected_bdids.add(str(step.get("bubble_document_id") or "").strip())
+            selected_numbers.add(_v12_step_sort_key(step)[0])
+
+    selected_numbers = {n for n in selected_numbers if 0 < n < 9999}
+    if not selected_numbers:
+        return []
+
+    first_no = min(selected_numbers)
+    last_no = max(selected_numbers)
+    # Filling gaps is deterministic and preserves the machine-authored sequence.
+    return [
+        step
+        for step in steps
+        if first_no <= _v12_step_sort_key(step)[0] <= last_no
+    ]
+
+
+def _v12_incomplete_procedure_response(
+    *,
+    response_language: str,
+    result_code: str,
+    procedure: Optional[dict],
+    debug_detail: Optional[dict] = None,
+) -> dict:
+    is_en = str(response_language or "it").lower().startswith("en")
+    answer = (
+        "I found the relevant procedure, but the indexed evidence does not provide a complete, verifiable operating Step sequence for this request."
+        if is_en
+        else "Ho trovato la procedura pertinente, ma le evidenze indicizzate non forniscono una sequenza operativa di Step completa e verificabile per questa richiesta."
+    )
+    resp = {
+        "ok": True,
+        "status": "no_sources",
+        "result_code": result_code,
+        "answer": answer,
+        "language": "en" if is_en else "it",
+        "citations": [],
+        "rg_links": [],
+        "top_k": 0,
+        "similarity_max": None,
+        "chat_model": "procedure_bundle_completeness_gate",
+        "meta": {
+            "cacheable": False,
+            "procedure_bundle_complete": False,
+            "selected_procedure_id": str((procedure or {}).get("bubble_document_id") or ""),
+        },
+    }
+    if debug_detail:
+        resp["meta"]["procedure_bundle_debug"] = dict(debug_detail)
+    return _assistant_ui_finalize_response(resp, language=response_language)
+
+
+
 def _ask_structured_direct_answer(
     *,
     q: str,
@@ -11806,6 +12346,13 @@ def _ask_structured_direct_answer(
     if not citations:
         return None
 
+    primary_procedure = _v12_choose_primary_procedure(citations, [])
+    complete_procedure_steps = sorted(
+        [c for c in citations if _v12_evidence_role(c) == "step"],
+        key=_v12_step_sort_key,
+    )
+    procedure_mode = primary_procedure is not None
+
     structured_sources_block = _ask_full_context_sources_block(
         citations,
         max_context_chars=max(6000, int(ASK_STRUCTURED_DIRECT_MAX_CONTEXT_CHARS or 28000)),
@@ -11834,6 +12381,17 @@ def _ask_structured_direct_answer(
     all_answer_citations = list(citations) + list(manual_support_citations)
 
     profile = _ask_evidence_query_profile(q, response_language)
+    procedure_sequence_mode = bool(
+        procedure_mode and _v12_query_requires_step_sequence(q, profile)
+    )
+    if procedure_sequence_mode and not complete_procedure_steps:
+        return _v12_incomplete_procedure_response(
+            response_language=response_language,
+            result_code="INCOMPLETE_PROCEDURE_BUNDLE",
+            procedure=primary_procedure,
+            debug_detail={"expanded_step_count": 0},
+        )
+
     system_msg = (
         "You are MachineMind ASK. Answer primarily from STRUCTURED SOURCES. "
         "For operational questions, use one coherent procedure family: never mix steps that explicitly belong to another procedure. "
@@ -11859,6 +12417,19 @@ def _ask_structured_direct_answer(
         "Do not put citation ids, raw Bubble ids, doc=, chunk= or debug tokens in text fields."
     )
 
+    if procedure_sequence_mode:
+        system_msg += (
+            " For a Procedure, selected_step_citation_ids is mandatory. "
+            "If the user asks for the complete Procedure, select every Step. "
+            "If the user asks for only part of it, select the smallest contiguous Step interval "
+            "that includes the immediate preparation, the requested operation, and the closing or verification Step needed to leave the machine in a coherent state. "
+            "Select only Step citation ids from the provided Procedure family, preserve their order, and cite every selected Step in grounded_points. "
+            "Never answer a how-to request from the Procedure title/summary alone."
+        )
+        procedure_schema = _ask_structured_procedure_answer_schema()
+    else:
+        procedure_schema = _ask_evidence_answer_schema()
+
     try:
         parsed = _openai_chat_json_models(
             [
@@ -11866,7 +12437,7 @@ def _ask_structured_direct_answer(
                 {"role": "user", "content": user_msg},
             ],
             models=[ASK_STRUCTURED_DIRECT_MODEL, ASK_EVIDENCE_ANSWER_MODEL, OPENAI_CHAT_MODEL, ROOT_CAUSE_RESPONSE_MODEL],
-            json_schema=_ask_evidence_answer_schema(),
+            json_schema=procedure_schema,
             timeout=int(ASK_STRUCTURED_DIRECT_TIMEOUT or 60),
         )
     except Exception as exc:
@@ -11886,18 +12457,48 @@ def _ask_structured_direct_answer(
         q=q,
     )
 
-    final_structured = _v12_curate_structured_sources(
-        company_id=company_id,
-        machine_id=machine_id,
-        q=q,
-        planner=planner,
-        citations=citations,
-        model_used=model_used_citations,
-    )
-    final_structured = _v12_mark_structured_roles(final_structured)
+    selected_step_ids = list((parsed or {}).get("selected_step_citation_ids") or [])
+    selected_procedure_steps: list[dict] = []
+    if procedure_sequence_mode:
+        selected_procedure_steps = _v12_select_response_steps(
+            all_steps=complete_procedure_steps,
+            selected_step_ids=selected_step_ids,
+            model_used_citations=model_used_citations,
+            q=q,
+        )
+        if not selected_procedure_steps:
+            return _v12_incomplete_procedure_response(
+                response_language=response_language,
+                result_code="INCOMPLETE_PROCEDURE_SELECTION",
+                procedure=primary_procedure,
+                debug_detail={
+                    "expanded_step_numbers": [
+                        _v12_step_sort_key(c)[0] for c in complete_procedure_steps
+                    ],
+                    "model_selected_step_ids": selected_step_ids,
+                },
+            )
 
+        extras = [
+            dict(c) for c in (model_used_citations or [])
+            if isinstance(c, dict) and _v12_evidence_role(c) in {"ps", "md_photo", "md_video"}
+        ]
+        final_structured = _v12_mark_structured_roles(
+            [dict(primary_procedure)] + selected_procedure_steps + extras
+        )
+    else:
+        final_structured = _v12_curate_structured_sources(
+            company_id=company_id,
+            machine_id=machine_id,
+            q=q,
+            planner=planner,
+            citations=citations,
+            model_used=model_used_citations,
+        )
+        final_structured = _v12_mark_structured_roles(final_structured)
+
+    # The answer, LINK and FONTI now share exactly the same selected Procedure bundle.
     ui_structured = _procedure_ui_merge_sources(
-        citations,
         final_structured,
         model_used_citations,
     )
@@ -11985,6 +12586,23 @@ def _ask_structured_direct_answer(
             "source_types_used": sorted(set(str(c.get("source_type") or "") for c in final_citations)),
             "doc_ids_used": _dedup_text_values([c.get("bubble_document_id") for c in final_citations], limit=30),
             "context_chars": len(structured_sources_block) + len(manual_support_block),
+            "selected_procedure_id": str((primary_procedure or {}).get("bubble_document_id") or ""),
+            "expanded_step_numbers": [
+                _v12_step_sort_key(c)[0] for c in complete_procedure_steps
+            ],
+            "selected_step_numbers": [
+                _v12_step_sort_key(c)[0] for c in selected_procedure_steps
+            ],
+            "model_selected_step_ids": selected_step_ids,
+            "procedure_relation_sources": sorted({
+                str(c.get("structured_relation_source") or "")
+                for c in complete_procedure_steps
+                if str(c.get("structured_relation_source") or "")
+            }),
+            "procedure_bundle_complete": bool(
+                not procedure_sequence_mode or selected_procedure_steps
+            ),
+            "procedure_sequence_mode": bool(procedure_sequence_mode),
         }
     return resp
 
@@ -15133,6 +15751,24 @@ def ingest_structured_source(
         x_ai_internal_secret=AI_INTERNAL_SECRET,
     )
 
+    parent_source_key = ""
+    relation_written = False
+    if source_type == "step":
+        parent_source_key = _parent_procedure_source_key(payload)
+        if parent_source_key:
+            relation_written = _db_upsert_structured_source_relation(
+                company_id=company_id,
+                machine_id=machine_id,
+                child_source_key=source_key,
+                parent_source_key=parent_source_key,
+                ordinal=payload.step_number,
+                relation_source="bubble_ingest",
+                metadata={
+                    "parent_procedure_code": str(payload.parent_procedure_code or ""),
+                    "parent_procedure_title": str(payload.parent_procedure_title or ""),
+                },
+            )
+
     return {
         "ok": True,
         "status": "indexed",
@@ -15144,6 +15780,8 @@ def ingest_structured_source(
         "text_chars": text_chars,
         "est_storage_bytes": est_storage_bytes,
         "chunks_written": int(index_result.get("chunks_written") or 0),
+        "parent_source_key": parent_source_key,
+        "structured_relation_written": bool(relation_written),
     }
 
 @app.post("/v1/ai/index/document")
@@ -18425,9 +19063,9 @@ if V13_HEAVY_REASONING_MODE not in {"", "pro"}:
 # retrieval/synthesis primitives but chooses the response mode only after neutral
 # cross-source retrieval. Default ON; set MM_ASSISTANT_CORE_V2_ENABLED=0 only for rollback.
 ASSISTANT_CORE_V2_ENABLED = (os.environ.get("MM_ASSISTANT_CORE_V2_ENABLED") or "1").strip() != "0"
-ASSISTANT_CORE_V2_CODE_MARKER = "assistant-core-v2-root-cause-html-ui-v4-1-20260801-4"
-ASSISTANT_CORE_V2_RELEASE_ID = (os.environ.get("MM_ASSISTANT_CORE_V2_RELEASE_ID") or "2026-08-01.3").strip()
-ASSISTANT_UI_RENDER_VERSION = "assistant-ui-html-root-cause-v4-1-20260801-4"
+ASSISTANT_CORE_V2_CODE_MARKER = "assistant-core-v2-procedure-relations-v5-20260801-5"
+ASSISTANT_CORE_V2_RELEASE_ID = (os.environ.get("MM_ASSISTANT_CORE_V2_RELEASE_ID") or "2026-08-01.5").strip()
+ASSISTANT_UI_RENDER_VERSION = "assistant-ui-html-procedure-bundle-v5-20260801-5"
 ASSISTANT_UI_MAX_HTML_CHARS = max(8000, min(60000, int(
     os.environ.get("MM_ASSISTANT_UI_MAX_HTML_CHARS", "32000")
 )))
@@ -27063,6 +27701,10 @@ def delete_document_v1(
     finally:
         conn.close()
 
+    deleted_relations = _db_delete_structured_relations_for_source(
+        company_id,
+        bubble_document_id,
+    )
     _v13_invalidate_company_knowledge(company_id)
 
     return {
@@ -27074,6 +27716,7 @@ def delete_document_v1(
             "document_chunks": int(deleted_chunks),
             "document_pages": int(deleted_pages),
             "document_files": int(deleted_files),
+            "structured_source_relations": int(deleted_relations),
         },
     }
 
@@ -27124,6 +27767,9 @@ def delete_company_index_v1(
     finally:
         conn.close()
 
+    deleted["structured_source_relations"] = _db_delete_structured_relations_for_company(
+        company_id
+    )
     _v13_invalidate_company_knowledge(company_id)
 
     return {
