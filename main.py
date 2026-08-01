@@ -11447,6 +11447,117 @@ def _assistant_ui_generic_html(answer: str, *, links: list[dict], citations: Opt
     rendered = ''.join(article)
     return rendered if len(rendered) <= ASSISTANT_UI_MAX_HTML_CHARS else ""
 
+
+def _assistant_ui_root_cause_html(resp: dict, *, response_language: str) -> str:
+    """Render validated Root Cause fields using the same clean visual language as ASK.
+
+    LINK and FONTI remain separate Bubble sections. This function renders only the
+    diagnostic answer body and never adds anchors, source labels or scores.
+    """
+    if not isinstance(resp, dict):
+        return ""
+
+    is_en = str(response_language or "it").strip().lower().startswith("en")
+    status = str(resp.get("status") or "answered").strip().lower()
+    summary = str(resp.get("problem_summary") or resp.get("symptom") or "").strip()
+    causes = [c for c in (resp.get("possible_causes") or []) if isinstance(c, dict)]
+    recommended = _unique_non_empty_strings(resp.get("recommended_next_checks") or [], limit=10)
+
+    article: list[str] = [
+        '<article data-mm-answer="root-cause" data-mm-render="' + _assistant_ui_escape(ASSISTANT_UI_RENDER_VERSION) + '" '
+        'style="box-sizing:border-box;width:100%;font-family:Inter,-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif;'
+        'font-size:14px;line-height:1.62;color:#1f2937;overflow-wrap:anywhere;padding:2px 2px 1px 2px;">'
+    ]
+
+    if status != "answered" or not causes:
+        title = "Analysis unavailable" if is_en else "Analisi non disponibile"
+        fallback = summary or (
+            "I cannot find enough machine evidence to propose reliable probable causes."
+            if is_en
+            else "Non trovo evidenze sufficienti della macchina per proporre cause probabili affidabili."
+        )
+        article.append('<h2 style="margin:0 0 9px 0;font-size:18px;line-height:1.35;font-weight:760;color:#111827;">' + _assistant_ui_escape(title) + '</h2>')
+        article.append('<p style="margin:0;color:#4b5563;">' + _assistant_ui_inline_markup(fallback) + '</p>')
+        article.append('</article>')
+        rendered = ''.join(article)
+        return rendered if len(rendered) <= ASSISTANT_UI_MAX_HTML_CHARS else ""
+
+    title = "Probable causes" if is_en else "Cause probabili"
+    article.append('<h2 style="margin:0 0 8px 0;font-size:18px;line-height:1.35;font-weight:760;color:#111827;">' + _assistant_ui_escape(title) + '</h2>')
+    if summary:
+        problem_label = "Problem" if is_en else "Problema"
+        article.append(
+            '<p style="margin:0 0 18px 0;color:#4b5563;"><strong style="color:#111827;">'
+            + _assistant_ui_escape(problem_label) + ':</strong> ' + _assistant_ui_inline_markup(summary) + '</p>'
+        )
+
+    flattened_checks: list[str] = []
+    for idx, cause in enumerate(causes, start=1):
+        rank = _safe_int(cause.get("rank"), idx)
+        cause_text = str(cause.get("cause") or "").strip()
+        why = str(cause.get("why") or "").strip()
+        checks = _unique_non_empty_strings(cause.get("checks") or [], limit=6)
+        flattened_checks.extend(checks)
+        if not cause_text:
+            continue
+
+        if rank == 1:
+            rank_label = "Most likely cause" if is_en else "Causa più probabile"
+            border = "#2563eb"
+            heading_color = "#1d4ed8"
+        else:
+            rank_label = (f"Possible cause {rank}" if is_en else f"Causa possibile {rank}")
+            border = "#cbd5e1"
+            heading_color = "#334155"
+
+        article.append(
+            '<section style="margin:0 0 20px 0;padding-left:14px;border-left:3px solid ' + border + ';">'
+            '<p style="margin:0 0 4px 0;font-size:12px;line-height:1.4;font-weight:760;letter-spacing:.02em;text-transform:uppercase;color:'
+            + heading_color + ';">' + _assistant_ui_escape(rank_label) + '</p>'
+            '<h3 style="margin:0 0 7px 0;font-size:15px;line-height:1.45;font-weight:760;color:#111827;">'
+            + _assistant_ui_inline_markup(cause_text) + '</h3>'
+        )
+        if why:
+            why_label = "Why" if is_en else "Perché"
+            article.append(
+                '<p style="margin:0 0 9px 0;color:#4b5563;"><strong style="color:#374151;">'
+                + _assistant_ui_escape(why_label) + ':</strong> ' + _assistant_ui_inline_markup(why) + '</p>'
+            )
+        if checks:
+            checks_label = "Checks" if is_en else "Controlli consigliati"
+            article.append('<p style="margin:0 0 6px 0;font-weight:720;color:#111827;">' + _assistant_ui_escape(checks_label) + '</p>')
+            article.append('<ol style="margin:0;padding-left:21px;color:#374151;">')
+            for check in checks:
+                article.append('<li style="margin:0 0 7px 0;padding-left:2px;">' + _assistant_ui_inline_markup(check) + '</li>')
+            article.append('</ol>')
+        article.append('</section>')
+
+    # Show a final priority block only for checks not already repeated under causes.
+    seen_checks = {
+        re.sub(r"\s+", " ", _normalize_unicode_advanced(x or "").lower()).strip()
+        for x in flattened_checks
+        if str(x or "").strip()
+    }
+    extra_checks = [
+        x for x in recommended
+        if re.sub(r"\s+", " ", _normalize_unicode_advanced(x or "").lower()).strip() not in seen_checks
+    ]
+    if extra_checks:
+        final_label = "Additional priority checks" if is_en else "Ulteriori controlli prioritari"
+        article.append(
+            '<section style="margin:0 0 18px 0;padding:10px 14px;border-left:3px solid #16a34a;background:#f0fdf4;border-radius:0 7px 7px 0;">'
+            '<h3 style="margin:0 0 7px 0;font-size:14px;font-weight:760;color:#166534;">'
+            + _assistant_ui_escape(final_label) + '</h3><ol style="margin:0;padding-left:21px;color:#166534;">'
+        )
+        for check in extra_checks[:6]:
+            article.append('<li style="margin:0 0 6px 0;padding-left:2px;">' + _assistant_ui_inline_markup(check) + '</li>')
+        article.append('</ol></section>')
+
+    article.append('</article>')
+    rendered = ''.join(article)
+    return rendered if len(rendered) <= ASSISTANT_UI_MAX_HTML_CHARS else ""
+
+
 def _assistant_ui_normalize_url_for_key(value: str) -> str:
     url = str(value or "").strip()
     if not url:
@@ -11525,11 +11636,37 @@ def _assistant_ui_finalize_response(resp: dict, *, language: str = "it") -> dict
             max_items=max(1, int(ASK_UI_STRUCTURED_MAX_CITATIONS or ASK_UI_MAX_CITATIONS or 14)),
         )
 
+    status = str(out.get("status") or "answered").strip().lower()
+    effective_mode = str(out.get("effective_mode") or "").strip().lower()
+
+    # Native Root Cause responses do not contain the ASK-style `answer` field.
+    # Build their rich body directly from the validated structured diagnosis.
     if "answer" not in out:
+        is_root_cause_payload = (
+            effective_mode == "root_cause"
+            or isinstance(out.get("possible_causes"), list)
+            or "problem_summary" in out
+        )
+        if is_root_cause_payload:
+            rendered = _assistant_ui_root_cause_html(out, response_language=language)
+            if rendered:
+                out["answer_html"] = rendered
+                out["answer_format"] = "html"
+                out["answer_render_version"] = ASSISTANT_UI_RENDER_VERSION
+                meta = dict(out.get("meta") or {})
+                meta["answer_render_version"] = ASSISTANT_UI_RENDER_VERSION
+                meta["answer_html_safe_template"] = True
+                meta["answer_html_body_only"] = True
+                meta["answer_html_contains_sources"] = False
+                meta["answer_html_mode"] = "root_cause"
+                out["meta"] = meta
+            else:
+                out.pop("answer_html", None)
+                out["answer_format"] = "text"
+                out["answer_render_version"] = ASSISTANT_UI_RENDER_VERSION
         out.pop("_assistant_ui_model", None)
         return out
 
-    status = str(out.get("status") or "answered").strip().lower()
     model = out.pop("_assistant_ui_model", None)
     existing = str(out.get("answer_html") or "").strip()
     # Procedure HTML is deterministic source rendering and can survive the final
@@ -18275,9 +18412,9 @@ if V13_HEAVY_REASONING_MODE not in {"", "pro"}:
 # retrieval/synthesis primitives but chooses the response mode only after neutral
 # cross-source retrieval. Default ON; set MM_ASSISTANT_CORE_V2_ENABLED=0 only for rollback.
 ASSISTANT_CORE_V2_ENABLED = (os.environ.get("MM_ASSISTANT_CORE_V2_ENABLED") or "1").strip() != "0"
-ASSISTANT_CORE_V2_CODE_MARKER = "assistant-core-v2-clean-answer-ui-v3-20260801-2"
-ASSISTANT_CORE_V2_RELEASE_ID = (os.environ.get("MM_ASSISTANT_CORE_V2_RELEASE_ID") or "2026-08-01.2").strip()
-ASSISTANT_UI_RENDER_VERSION = "assistant-ui-html-clean-v3-20260801-2"
+ASSISTANT_CORE_V2_CODE_MARKER = "assistant-core-v2-root-cause-html-ui-v4-20260801-3"
+ASSISTANT_CORE_V2_RELEASE_ID = (os.environ.get("MM_ASSISTANT_CORE_V2_RELEASE_ID") or "2026-08-01.3").strip()
+ASSISTANT_UI_RENDER_VERSION = "assistant-ui-html-root-cause-v4-20260801-3"
 ASSISTANT_UI_MAX_HTML_CHARS = max(8000, min(60000, int(
     os.environ.get("MM_ASSISTANT_UI_MAX_HTML_CHARS", "32000")
 )))
