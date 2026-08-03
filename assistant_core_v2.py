@@ -83,6 +83,45 @@ REQUEST_KINDS = {
     KIND_UNSAFE_REQUEST,
 }
 
+# Fine-grained semantic output contract. These values are language-independent and
+# describe the shape of information the answer must contain. They are deliberately
+# separate from request_kind, which chooses the broad assistant mode.
+INFO_PROCEDURE_FULL = "procedure_full"
+INFO_PROCEDURE_SEGMENT = "procedure_segment"
+INFO_NUMERIC_SPECIFICATION = "numeric_specification"
+INFO_INTERFACE_NAVIGATION = "interface_navigation"
+INFO_SEQUENCE_SYNCHRONIZATION = "sequence_or_synchronization"
+INFO_DOCUMENT_EXPLANATION = "document_explanation"
+INFO_SOURCE_RETRIEVAL = "source_retrieval"
+INFO_FAULT_DIAGNOSTIC = "fault_diagnostic"
+INFO_COMPARISON = "comparison"
+INFO_GENERAL_TECHNICAL = "general_technical"
+INFO_OUT_OF_SCOPE = "out_of_scope"
+INFO_OTHER = "other"
+
+INFORMATION_TASKS = {
+    INFO_PROCEDURE_FULL,
+    INFO_PROCEDURE_SEGMENT,
+    INFO_NUMERIC_SPECIFICATION,
+    INFO_INTERFACE_NAVIGATION,
+    INFO_SEQUENCE_SYNCHRONIZATION,
+    INFO_DOCUMENT_EXPLANATION,
+    INFO_SOURCE_RETRIEVAL,
+    INFO_FAULT_DIAGNOSTIC,
+    INFO_COMPARISON,
+    INFO_GENERAL_TECHNICAL,
+    INFO_OUT_OF_SCOPE,
+    INFO_OTHER,
+}
+
+PRECISION_INFORMATION_TASKS = {
+    INFO_NUMERIC_SPECIFICATION,
+    INFO_INTERFACE_NAVIGATION,
+    INFO_SEQUENCE_SYNCHRONIZATION,
+    INFO_PROCEDURE_SEGMENT,
+    INFO_FAULT_DIAGNOSTIC,
+}
+
 SOURCE_TYPES = {
     "document",
     "procedure",
@@ -117,6 +156,7 @@ class AssistantCoreDecision:
     requested_mode_fit: bool
     evidence_state: str
     evidence_policy: str
+    information_task: str = INFO_OTHER
     relevant_evidence_ids: tuple[str, ...] = ()
     preferred_source_types: tuple[str, ...] = ()
     source_type_policy: str = "none"
@@ -200,6 +240,10 @@ def build_router_schema(allowed_modes: Sequence[str]) -> dict:
                     "type": "string",
                     "enum": sorted(REQUEST_KINDS),
                 },
+                "information_task": {
+                    "type": "string",
+                    "enum": sorted(INFORMATION_TASKS),
+                },
                 "effective_mode": {"type": "string", "enum": modes},
                 "confidence": {"type": "number"},
                 "requested_mode_fit": {"type": "boolean"},
@@ -257,6 +301,7 @@ def build_router_schema(allowed_modes: Sequence[str]) -> dict:
             },
             "required": [
                 "request_kind",
+                "information_task",
                 "effective_mode",
                 "confidence",
                 "requested_mode_fit",
@@ -292,9 +337,10 @@ def _fallback_decision(request: AssistantCoreRequest, reason: str) -> AssistantC
         effective_mode=effective,
         confidence=0.0,
         requested_mode_fit=(effective == request.requested_mode),
-        evidence_state=EVIDENCE_PARTIAL,
+        evidence_state=EVIDENCE_UNSUPPORTED,
         evidence_policy=POLICY_MACHINE_REQUIRED,
-        rationale="Semantic router unavailable; using bounded ASK fallback.",
+        information_task=INFO_OTHER,
+        rationale="Semantic router unavailable; fail closed rather than answer from unrelated evidence.",
         degraded=True,
         degraded_reason=_clean_text(reason, 400) or "router_unavailable",
     )
@@ -350,6 +396,10 @@ def normalize_decision(
     if not preferred:
         source_type_policy = "none"
 
+    information_task = _clean_text(raw.get("information_task"), 80).lower()
+    if information_task not in INFORMATION_TASKS:
+        information_task = INFO_OTHER
+
     clarification = _clean_text(raw.get("clarification_question"), 500)
     if evidence_state == EVIDENCE_CLARIFY and not clarification:
         clarification = (
@@ -363,6 +413,7 @@ def normalize_decision(
     if request_kind in {KIND_OUT_OF_SCOPE, KIND_UNSAFE_REQUEST}:
         evidence_policy = POLICY_MACHINE_REQUIRED
         evidence_state = EVIDENCE_UNSUPPORTED
+        information_task = INFO_OUT_OF_SCOPE if request_kind == KIND_OUT_OF_SCOPE else INFO_OTHER
         if MODE_ASK in allowed:
             effective = MODE_ASK
 
@@ -373,6 +424,7 @@ def normalize_decision(
         requested_mode_fit=bool(raw.get("requested_mode_fit", effective == request.requested_mode)),
         evidence_state=evidence_state,
         evidence_policy=evidence_policy,
+        information_task=information_task,
         relevant_evidence_ids=_unique_strings(raw.get("relevant_evidence_ids"), 16),
         preferred_source_types=preferred,
         source_type_policy=source_type_policy,
@@ -454,6 +506,7 @@ def decorate_response(
     out["effective_mode"] = decision.effective_mode
     out["routed"] = routed
     out["request_kind"] = decision.request_kind
+    out["information_task"] = decision.information_task
     out["evidence_state"] = decision.evidence_state
     out["evidence_policy"] = decision.evidence_policy
     out["result_code"] = _status_to_result_code(out, routed)
@@ -496,6 +549,7 @@ def decorate_response(
         "effective_mode": decision.effective_mode,
         "routed": routed,
         "request_kind": decision.request_kind,
+        "information_task": decision.information_task,
         "confidence": round(decision.confidence, 4),
         "requested_mode_fit": bool(decision.requested_mode_fit),
         "evidence_state": decision.evidence_state,
@@ -548,13 +602,31 @@ class AssistantCoreV2:
                 self.hooks.build_clarification(request, decision), request, decision
             )
 
+        # A router timeout/technical degradation must never be converted into an
+        # answer merely because a nearby retrieval candidate exists. Fail closed;
+        # the user may retry and the exact-response cache will not store this result.
+        if decision.degraded and decision.evidence_state == EVIDENCE_UNSUPPORTED:
+            return decorate_response(
+                self.hooks.build_no_evidence(request, decision, retrieval),
+                request,
+                decision,
+            )
+
         has_refinement_queries = bool(
             decision.dense_queries
             or decision.lexical_queries
             or decision.exact_terms
+            or decision.required_facets
+        )
+        precision_task_requires_refinement = (
+            decision.information_task in PRECISION_INFORMATION_TASKS
+            and has_refinement_queries
         )
         if (
-            decision.evidence_state in {EVIDENCE_REFINE, EVIDENCE_PARTIAL}
+            (
+                decision.evidence_state in {EVIDENCE_REFINE, EVIDENCE_PARTIAL}
+                or precision_task_requires_refinement
+            )
             and has_refinement_queries
             and self.hooks.refine_retrieval is not None
         ):

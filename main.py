@@ -42,6 +42,19 @@ from assistant_core_v2 import (
     EVIDENCE_PARTIAL,
     EVIDENCE_REFINE,
     EVIDENCE_SUPPORTED,
+    EVIDENCE_UNSUPPORTED,
+    INFO_COMPARISON,
+    INFO_DOCUMENT_EXPLANATION,
+    INFO_FAULT_DIAGNOSTIC,
+    INFO_GENERAL_TECHNICAL,
+    INFO_INTERFACE_NAVIGATION,
+    INFO_NUMERIC_SPECIFICATION,
+    INFO_OTHER,
+    INFO_OUT_OF_SCOPE,
+    INFO_PROCEDURE_FULL,
+    INFO_PROCEDURE_SEGMENT,
+    INFO_SEQUENCE_SYNCHRONIZATION,
+    INFO_SOURCE_RETRIEVAL,
     KIND_AMBIGUOUS,
     KIND_FAULT_DIAGNOSTIC,
     KIND_GENERAL_TECHNICAL,
@@ -10872,6 +10885,76 @@ def _v12_filter_linkable_manual_support(company_id: str, citations: list[dict]) 
     ]
 
 
+def _v12_filter_manual_support_to_selected_bundle(
+    *,
+    q: str,
+    structured_citations: list[dict],
+    manual_support_citations: list[dict],
+) -> list[dict]:
+    """Keep only manual pages that still match the final selected Step span.
+
+    The strict LLM selector initially sees the complete Procedure family so it can
+    help the answer model. After a partial Procedure has been narrowed, this cheap
+    deterministic guard removes pages that supported an earlier setup Step but no
+    longer support the final answer. It changes neither retrieval nor embeddings.
+    """
+    manual_rows = [dict(c) for c in (manual_support_citations or []) if isinstance(c, dict)]
+    if not manual_rows:
+        return []
+
+    operational_texts: list[str] = []
+    all_selected_texts: list[str] = []
+    for citation in structured_citations or []:
+        if not isinstance(citation, dict):
+            continue
+        role = _v12_evidence_role(citation)
+        if role not in {"procedure", "step"}:
+            continue
+        fields = _procedure_ui_fields(citation)
+        text = " ".join(
+            [
+                str(fields.get("title") or ""),
+                str(fields.get("short_description") or fields.get("description") or ""),
+            ]
+        ).strip()
+        if not text:
+            continue
+        all_selected_texts.append(text)
+        if role == "step" and not _procedure_ui_is_safety_setup(text):
+            operational_texts.append(text)
+
+    query_terms = _content_term_set(q, limit=80)
+    operational_terms = _content_term_set(" ".join(operational_texts), limit=220)
+    all_selected_terms = _content_term_set(" ".join(all_selected_texts), limit=260)
+
+    kept: list[dict] = []
+    for citation in manual_rows:
+        manual_text = str(citation.get("chunk_full") or citation.get("snippet") or "")
+        manual_terms = _content_term_set(manual_text, limit=260)
+        if not manual_terms:
+            continue
+        kind = str(citation.get("ask_manual_support_kind") or "operation").strip().lower()
+        selected_terms = all_selected_terms if kind == "safety" else operational_terms
+        shared_query = query_terms & manual_terms
+        shared_selected = selected_terms & manual_terms
+        strong_shared = {term for term in shared_selected if len(term) >= 8}
+        query_overlap = _term_overlap_score(query_terms, manual_terms) if query_terms else 0.0
+        selected_overlap = _term_overlap_score(selected_terms, manual_terms) if selected_terms else 0.0
+
+        keep = bool(
+            query_overlap >= 0.045
+            or selected_overlap >= 0.045
+            or len(shared_query) >= 2
+            or len(shared_selected) >= 2
+            or strong_shared
+        )
+        if keep:
+            citation["selected_bundle_query_overlap"] = float(query_overlap)
+            citation["selected_bundle_step_overlap"] = float(selected_overlap)
+            kept.append(citation)
+    return kept
+
+
 def _v12_mark_structured_roles(citations: list[dict]) -> list[dict]:
     out: list[dict] = []
     for c in citations or []:
@@ -12218,6 +12301,128 @@ def _v12_query_requires_step_sequence(q: str, profile: Optional[dict]) -> bool:
     return any(marker in normalized for marker in markers)
 
 
+def _v12_step_direct_query_score(step: dict, q: str) -> float:
+    q_terms = _content_term_set(q, limit=80)
+    if not q_terms:
+        return 0.0
+    fields = _procedure_ui_fields(step)
+    text = " ".join(
+        [
+            str(fields.get("title") or ""),
+            str(fields.get("description") or ""),
+            str(step.get("snippet_clean") or step.get("chunk_full") or step.get("snippet") or ""),
+        ]
+    )
+    return _term_overlap_score(q_terms, _content_term_set(text, limit=180))
+
+
+def _v12_step_is_closing_or_verification(step: dict) -> bool:
+    fields = _procedure_ui_fields(step)
+    text = _normalize_unicode_advanced(
+        " ".join([str(fields.get("title") or ""), str(fields.get("description") or "")])
+    ).lower()
+    markers = (
+        "richiud", "regol", "riprist", "verific", "controll", "prov", "test", "conferm",
+        "close", "adjust", "restore", "verify", "check", "test", "confirm", "trial",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _v12_query_range_anchors(q: str) -> tuple[str, str]:
+    """Extract semantic start/end phrases from a procedural range request.
+
+    Examples: ``dall'aspo fino al gruppo di avanzamento`` and
+    ``from the decoiler to the feed clamp``. The phrases are used only to
+    delimit an already verified Procedure family; they never select sources
+    outside that family.
+    """
+    text = re.sub(r"\s+", " ", _normalize_unicode_advanced(str(q or "")).lower()).strip()
+    if not text:
+        return "", ""
+
+    patterns = (
+        r"(?:\bdall['’]|\bda(?:l|lla|llo|i|gli|lle)?\s+)(.+?)\s+fino\s+(?:a(?:l|lla|llo|i|gli|lle)?\s+)?(.+?)(?:[?.!]|$)",
+        r"\bfrom\s+(.+?)\s+(?:up\s+)?to\s+(.+?)(?:[?.!]|$)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        start = re.sub(r"\s+", " ", match.group(1)).strip(" -–—:;,.")
+        end = re.sub(r"\s+", " ", match.group(2)).strip(" -–—:;,.")
+        if start and end:
+            return start, end
+    return "", ""
+
+
+def _v12_step_phrase_score(step: dict, phrase: str) -> float:
+    phrase_terms = _content_term_set(phrase, limit=40)
+    if not phrase_terms:
+        return 0.0
+    fields = _procedure_ui_fields(step)
+    step_text = _normalize_unicode_advanced(
+        " ".join(
+            [
+                str(fields.get("title") or ""),
+                str(fields.get("description") or ""),
+                str(step.get("snippet_clean") or step.get("chunk_full") or step.get("snippet") or ""),
+            ]
+        )
+    ).lower()
+    step_terms = _content_term_set(step_text, limit=180)
+    overlap = _term_overlap_score(phrase_terms, step_terms)
+    exact_hits = sum(1 for term in phrase_terms if term in step_text)
+    return float(overlap + 0.08 * exact_hits)
+
+
+def _v12_range_anchor_span(steps: list[dict], q: str) -> tuple[int, int] | None:
+    start_phrase, end_phrase = _v12_query_range_anchors(q)
+    if not start_phrase or not end_phrase:
+        return None
+
+    rows = []
+    for step in steps:
+        number = _v12_step_sort_key(step)[0]
+        if not (0 < number < 9999):
+            continue
+        rows.append(
+            (
+                number,
+                _v12_step_phrase_score(step, start_phrase),
+                _v12_step_phrase_score(step, end_phrase),
+            )
+        )
+    if not rows:
+        return None
+
+    max_end = max((row[2] for row in rows), default=0.0)
+    if max_end <= 0.0:
+        return None
+    # Prefer the earliest Step among essentially tied destination matches: it is
+    # normally the point where the requested end state is first reached.
+    end_threshold = max_end * 0.85
+    end_candidates = [number for number, _, score in rows if score >= end_threshold and score > 0.0]
+    if not end_candidates:
+        return None
+    end_no = min(end_candidates)
+
+    start_rows = [(number, score) for number, score, _ in rows if number <= end_no and score > 0.0]
+    if not start_rows:
+        return None
+    max_start = max(score for _, score in start_rows)
+    start_threshold = max_start * 0.45
+    # Among plausible start matches, use the latest one before the destination.
+    # This avoids pulling generic setup references to the same component into a
+    # request that asks for a later operational segment.
+    start_candidates = [number for number, score in start_rows if score >= start_threshold]
+    if not start_candidates:
+        return None
+    start_no = max(start_candidates)
+    if start_no > end_no:
+        return None
+    return start_no, end_no
+
+
 def _v12_select_response_steps(
     *,
     all_steps: list[dict],
@@ -12225,7 +12430,13 @@ def _v12_select_response_steps(
     model_used_citations: list[dict],
     q: str,
 ) -> list[dict]:
-    """Choose one contiguous Step interval from the complete Procedure family."""
+    """Choose the smallest coherent contiguous interval from one Procedure family.
+
+    The model supplies semantic anchors. A deterministic query-to-Step check prevents
+    a partial request from expanding to the whole Procedure merely because the model
+    included generic loading/setup prerequisites. Gaps and a directly adjacent
+    closing/verification Step are preserved without hardcoding any Procedure.
+    """
     steps = _dedup_citations_preserve_order(
         sorted(
             [dict(c) for c in all_steps or [] if isinstance(c, dict)],
@@ -12243,17 +12454,13 @@ def _v12_select_response_steps(
         for value in (selected_step_ids or [])
         if str(value or "").strip()
     }
-    selected_bdids: set[str] = set()
     selected_numbers: set[int] = set()
-
     for step in steps:
         cid = str(step.get("citation_id") or "").strip()
         bdid = str(step.get("bubble_document_id") or "").strip()
         if cid in selected_ids or bdid in selected_ids:
-            selected_bdids.add(bdid)
             selected_numbers.add(_v12_step_sort_key(step)[0])
 
-    # Grounded points are a compatibility fallback when a model omits the dedicated list.
     used_ids = {
         str(c.get("citation_id") or "").strip()
         for c in (model_used_citations or [])
@@ -12261,19 +12468,59 @@ def _v12_select_response_steps(
     }
     for step in steps:
         if str(step.get("citation_id") or "").strip() in used_ids:
-            selected_bdids.add(str(step.get("bubble_document_id") or "").strip())
             selected_numbers.add(_v12_step_sort_key(step)[0])
 
     selected_numbers = {n for n in selected_numbers if 0 < n < 9999}
-    if not selected_numbers:
+
+    range_span = _v12_range_anchor_span(steps, q)
+    if range_span is not None:
+        first_no, last_no = range_span
+        by_number = {_v12_step_sort_key(step)[0]: step for step in steps}
+        next_step = by_number.get(last_no + 1)
+        if next_step is not None and _v12_step_is_closing_or_verification(next_step):
+            last_no += 1
+        return [
+            step for step in steps
+            if first_no <= _v12_step_sort_key(step)[0] <= last_no
+        ]
+
+    scored = [(_v12_step_sort_key(step)[0], _v12_step_direct_query_score(step, q), step) for step in steps]
+    max_direct = max((score for _, score, _ in scored), default=0.0)
+    direct_numbers: set[int] = set()
+    if max_direct >= 0.055:
+        threshold = max(0.055, max_direct * 0.60)
+        direct_numbers = {number for number, score, _ in scored if score >= threshold}
+
+    use_numbers = set(selected_numbers)
+    if direct_numbers:
+        direct_span = max(direct_numbers) - min(direct_numbers) + 1
+        model_span = (
+            max(selected_numbers) - min(selected_numbers) + 1
+            if selected_numbers else 9999
+        )
+        model_is_overbroad = (
+            not selected_numbers
+            or len(selected_numbers) >= max(4, int(math.ceil(len(steps) * 0.70)))
+            or model_span > direct_span + 2
+        )
+        if model_is_overbroad:
+            use_numbers = set(direct_numbers)
+
+    if not use_numbers:
         return []
 
-    first_no = min(selected_numbers)
-    last_no = max(selected_numbers)
-    # Filling gaps is deterministic and preserves the machine-authored sequence.
+    first_no = min(use_numbers)
+    last_no = max(use_numbers)
+
+    # Include one immediately adjacent closure/verification action when it is needed
+    # to leave the machine in a coherent state.
+    by_number = {_v12_step_sort_key(step)[0]: step for step in steps}
+    next_step = by_number.get(last_no + 1)
+    if next_step is not None and _v12_step_is_closing_or_verification(next_step):
+        last_no += 1
+
     return [
-        step
-        for step in steps
+        step for step in steps
         if first_no <= _v12_step_sort_key(step)[0] <= last_no
     ]
 
@@ -12409,6 +12656,8 @@ def _ask_structured_direct_answer(
         f"QUESTION:\n{q}\n\n"
         f"RESPONSE_LANGUAGE:\n{response_language}\n\n"
         f"QUERY_PROFILE:\n{json.dumps(profile, ensure_ascii=False)}\n\n"
+        f"INFORMATION_TASK:\n{str((planner or {}).get('information_task') or INFO_OTHER)}\n\n"
+        f"REQUIRED_FACETS:\n{json.dumps((planner or {}).get('required_facets') or [], ensure_ascii=False)}\n\n"
         f"STRUCTURED SOURCES — PRIMARY AND PROCEDURE-COHERENT:\n{structured_sources_block}\n\n"
         f"SUPPORTING MANUAL SOURCES — SECONDARY:\n{manual_support_block or 'None'}\n\n"
         "Return JSON only. Answer from the selected procedure/steps first. "
@@ -12421,8 +12670,9 @@ def _ask_structured_direct_answer(
         system_msg += (
             " For a Procedure, selected_step_citation_ids is mandatory. "
             "If the user asks for the complete Procedure, select every Step. "
-            "If the user asks for only part of it, select the smallest contiguous Step interval "
-            "that includes the immediate preparation, the requested operation, and the closing or verification Step needed to leave the machine in a coherent state. "
+            "If the user asks for only part of it, select the smallest contiguous Step interval that directly performs the requested operation. "
+            "Do not include earlier loading, setup or capacity checks merely because they belong to the same Procedure; include them only when the requested operation cannot safely or technically start without that exact Step. "
+            "Include the immediately adjacent closing or verification Step only when needed to leave the machine in a coherent state. "
             "Select only Step citation ids from the provided Procedure family, preserve their order, and cite every selected Step in grounded_points. "
             "Never answer a how-to request from the Procedure title/summary alone."
         )
@@ -12483,8 +12733,20 @@ def _ask_structured_direct_answer(
             dict(c) for c in (model_used_citations or [])
             if isinstance(c, dict) and _v12_evidence_role(c) in {"ps", "md_photo", "md_video"}
         ]
+        safety_prerequisites: list[dict] = []
+        selected_numbers_now = {_v12_step_sort_key(c)[0] for c in selected_procedure_steps}
+        for candidate in complete_procedure_steps:
+            number = _v12_step_sort_key(candidate)[0]
+            fields = _procedure_ui_fields(candidate)
+            safety_text = " ".join([
+                str(fields.get("title") or ""),
+                str(fields.get("description") or ""),
+            ])
+            if number not in selected_numbers_now and number < min(selected_numbers_now or {9999}) and _procedure_ui_is_safety_setup(safety_text):
+                safety_prerequisites = [dict(candidate)]
+                break
         final_structured = _v12_mark_structured_roles(
-            [dict(primary_procedure)] + selected_procedure_steps + extras
+            [dict(primary_procedure)] + safety_prerequisites + selected_procedure_steps + extras
         )
     else:
         final_structured = _v12_curate_structured_sources(
@@ -12496,6 +12758,13 @@ def _ask_structured_direct_answer(
             model_used=model_used_citations,
         )
         final_structured = _v12_mark_structured_roles(final_structured)
+
+    if procedure_sequence_mode:
+        manual_support_citations = _v12_filter_manual_support_to_selected_bundle(
+            q=q,
+            structured_citations=final_structured,
+            manual_support_citations=manual_support_citations,
+        )
 
     # The answer, LINK and FONTI now share exactly the same selected Procedure bundle.
     ui_structured = _procedure_ui_merge_sources(
@@ -15003,6 +15272,7 @@ def version():
         "assistant_ui_max_html_chars": ASSISTANT_UI_MAX_HTML_CHARS,
         "assistant_core_v2_architecture": "neutral_cross_source_retrieval_semantic_mode_routing_shared_evidence_manifest_bounded_synthesis",
         "assistant_core_v2_router_model": ASSISTANT_CORE_ROUTER_MODEL,
+        "assistant_core_v2_router_fallback_model": ASSISTANT_CORE_ROUTER_FALLBACK_MODEL,
         "assistant_core_v2_router_effort": ASSISTANT_CORE_ROUTER_EFFORT,
         "assistant_core_v2_smart_model": ASSISTANT_CORE_SMART_MODEL,
         "assistant_core_v2_smart_effort": ASSISTANT_CORE_SMART_EFFORT,
@@ -19063,13 +19333,16 @@ if V13_HEAVY_REASONING_MODE not in {"", "pro"}:
 # retrieval/synthesis primitives but chooses the response mode only after neutral
 # cross-source retrieval. Default ON; set MM_ASSISTANT_CORE_V2_ENABLED=0 only for rollback.
 ASSISTANT_CORE_V2_ENABLED = (os.environ.get("MM_ASSISTANT_CORE_V2_ENABLED") or "1").strip() != "0"
-ASSISTANT_CORE_V2_CODE_MARKER = "assistant-core-v2-procedure-citation-manifest-v5-1-20260801-6"
-ASSISTANT_CORE_V2_RELEASE_ID = (os.environ.get("MM_ASSISTANT_CORE_V2_RELEASE_ID") or "2026-08-01.6").strip()
+ASSISTANT_CORE_V2_CODE_MARKER = "assistant-core-v2-quality-contracts-v6-20260803-1"
+ASSISTANT_CORE_V2_RELEASE_ID = (os.environ.get("MM_ASSISTANT_CORE_V2_RELEASE_ID") or "2026-08-03.1").strip()
 ASSISTANT_UI_RENDER_VERSION = "assistant-ui-html-procedure-bundle-v5-20260801-5"
 ASSISTANT_UI_MAX_HTML_CHARS = max(8000, min(60000, int(
     os.environ.get("MM_ASSISTANT_UI_MAX_HTML_CHARS", "32000")
 )))
 ASSISTANT_CORE_ROUTER_MODEL = (os.environ.get("MM_ASSISTANT_CORE_ROUTER_MODEL") or V13_FAST_MODEL).strip()
+ASSISTANT_CORE_ROUTER_FALLBACK_MODEL = (
+    os.environ.get("MM_ASSISTANT_CORE_ROUTER_FALLBACK_MODEL") or V13_PLANNER_MODEL
+).strip()
 ASSISTANT_CORE_ROUTER_EFFORT = (os.environ.get("MM_ASSISTANT_CORE_ROUTER_EFFORT") or "medium").strip()
 # Smart Diagnostic uses one quality-oriented Responses API call after routing.
 # Keeping it inside the 5.6 model family gives real usage accounting and an
@@ -19089,9 +19362,9 @@ ASSISTANT_CORE_ROOT_CAUSE_DEADLINE_SECONDS = max(40, min(68, int(os.environ.get(
 ASSISTANT_CORE_SMART_START_DEADLINE_SECONDS = max(40, min(68, int(os.environ.get("MM_ASSISTANT_CORE_SMART_START_DEADLINE_SECONDS", "62"))))
 ASSISTANT_CORE_SMART_TURN_DEADLINE_SECONDS = max(30, min(62, int(os.environ.get("MM_ASSISTANT_CORE_SMART_TURN_DEADLINE_SECONDS", "56"))))
 ASSISTANT_CORE_HARD_TIMEOUT_SECONDS = max(55, min(72, int(os.environ.get("MM_ASSISTANT_CORE_HARD_TIMEOUT_SECONDS", "68"))))
-ASSISTANT_CORE_MAX_LLM_CALLS_ASK = max(1, min(2, int(os.environ.get("MM_ASSISTANT_CORE_MAX_LLM_CALLS_ASK", "2"))))
-ASSISTANT_CORE_MAX_LLM_CALLS_ROOT_CAUSE = max(1, min(2, int(os.environ.get("MM_ASSISTANT_CORE_MAX_LLM_CALLS_ROOT_CAUSE", "2"))))
-ASSISTANT_CORE_MAX_LLM_CALLS_SMART_START = max(1, min(2, int(os.environ.get("MM_ASSISTANT_CORE_MAX_LLM_CALLS_SMART_START", "2"))))
+ASSISTANT_CORE_MAX_LLM_CALLS_ASK = max(2, min(3, int(os.environ.get("MM_ASSISTANT_CORE_MAX_LLM_CALLS_ASK", "3"))))
+ASSISTANT_CORE_MAX_LLM_CALLS_ROOT_CAUSE = max(2, min(3, int(os.environ.get("MM_ASSISTANT_CORE_MAX_LLM_CALLS_ROOT_CAUSE", "3"))))
+ASSISTANT_CORE_MAX_LLM_CALLS_SMART_START = max(2, min(3, int(os.environ.get("MM_ASSISTANT_CORE_MAX_LLM_CALLS_SMART_START", "3"))))
 ASSISTANT_CORE_MAX_LLM_CALLS_SMART_TURN = max(1, min(1, int(os.environ.get("MM_ASSISTANT_CORE_MAX_LLM_CALLS_SMART_TURN", "1"))))
 ASSISTANT_CORE_MAX_COST_ASK_USD = max(0.08, float(os.environ.get("MM_ASSISTANT_CORE_MAX_COST_ASK_USD", "0.25")))
 ASSISTANT_CORE_MAX_COST_ROOT_CAUSE_USD = max(0.12, float(os.environ.get("MM_ASSISTANT_CORE_MAX_COST_ROOT_CAUSE_USD", "0.40")))
@@ -24975,6 +25248,10 @@ def _v13_generate_ask_response(
 ) -> dict:
     candidates = list(retrieval.get("citations") or retrieval.get("candidates") or [])
     candidates = candidates[:V13_MAX_EVIDENCE_ITEMS_ASK]
+    contract = dict(retrieval.get("assistant_core_contract") or {})
+    information_task = str(contract.get("information_task") or INFO_OTHER).strip().lower()
+    required_facets = _dedup_text_values(contract.get("required_facets") or [], limit=12)
+    fail_closed = bool(contract.get("fail_closed"))
     if not candidates:
         return {
             "ok": True,
@@ -25014,11 +25291,21 @@ def _v13_generate_ask_response(
         "For photo/video records, use metadata only and never claim visual/audio inspection. Do not expose citation ids or internal Bubble ids in visible text. "
         "If SOURCES do not support the answer, return no_sources. Reply in the requested language."
     )
+    if information_task == INFO_NUMERIC_SPECIFICATION:
+        system_msg += " The answer must state the requested value with its unit/context; a nearby qualitative statement is insufficient."
+    elif information_task == INFO_INTERFACE_NAVIGATION:
+        system_msg += " Name every requested screen/page/menu/location distinctly; mentioning alarms or the HMI generically is insufficient."
+    elif information_task == INFO_SEQUENCE_SYNCHRONIZATION:
+        system_msg += " State the participating functions and their temporal/state order explicitly (what opens/closes/moves and when)."
     assurance_block = _v13_assurance_prompt_block(retrieval)
+    contract_block = (
+        f"INFORMATION_TASK: {information_task}\n"
+        f"REQUIRED_FACETS: {json.dumps(required_facets, ensure_ascii=False)}\n"
+    )
     user_msg = (
-        f"QUESTION:\n{q}\n\nRESPONSE_LANGUAGE: {response_language}\n\nSOURCES:\n{sources_block}\n\n"
+        f"QUESTION:\n{q}\n\nRESPONSE_LANGUAGE: {response_language}\n\n{contract_block}\nSOURCES:\n{sources_block}\n\n"
         + (f"{assurance_block}\n\n" if assurance_block else "")
-        + "Return JSON only. Produce a concise but operationally complete answer, with every point supported by citation_ids from SOURCES."
+        + "Return JSON only. Produce a concise but operationally complete answer, satisfy every supported required facet, and cite every point using citation_ids from SOURCES."
     )
 
     parsed: dict = {}
@@ -25055,6 +25342,25 @@ def _v13_generate_ask_response(
             q=q,
         )
         synthesis_grounded = bool(answer and final_citations)
+
+    if (not answer or not final_citations) and fail_closed:
+        return {
+            "ok": True,
+            "status": "no_sources",
+            "answer": _localized_no_sources(response_language),
+            "language": response_language,
+            "citations": [],
+            "rg_links": [],
+            "top_k": top_k,
+            "similarity_max": (retrieval.get("metrics") or {}).get("top_similarity"),
+            "chat_model": model_used,
+            "meta": {
+                "cacheable": False,
+                "semantic_cacheable": False,
+                "degraded": True,
+                "degraded_reason": "assistant_core_synthesis_fail_closed",
+            },
+        }
 
     if not answer or not final_citations:
         answer, final_citations = _v13_extractive_fallback_answer(
@@ -25154,6 +25460,10 @@ def _v13_root_fallback_from_evidence(
         )
         if source_type != "ps":
             continue
+        if "assistant_core_root_viable" in citation and not bool(citation.get("assistant_core_root_viable")):
+            continue
+        if not _assistant_core_ps_is_substantive(citation):
+            continue
         fields = _parse_structured_source_fields(_v13_candidate_text(citation))
         title = _clean_display_text(
             fields.get("title") or fields.get("category") or "Problema/Soluzione",
@@ -25211,6 +25521,8 @@ def _v13_generate_root_cause_response(
 ) -> dict:
     citations = list(retrieval.get("citations") or retrieval.get("candidates") or [])
     citations = citations[:V13_MAX_EVIDENCE_ITEMS_ROOT_CAUSE]
+    contract = dict(retrieval.get("assistant_core_contract") or {})
+    required_facets = _dedup_text_values(contract.get("required_facets") or [], limit=12)
     if not citations:
         return {
             "ok": True,
@@ -25247,6 +25559,7 @@ def _v13_generate_root_cause_response(
     system_msg = (
         "Perform an evidence-grounded industrial root-cause analysis using only SOURCES. Build distinct, ranked hypotheses from the reported symptom. "
         "A cause must be supported by a component/state/mechanism, a matching P&S, or a discriminating check grounded in the sources. "
+        "A matching P&S must concern the same subsystem, observed abnormal condition and plausible mechanism; sharing only the machine, material, or a generic production outcome is insufficient. "
         "Prefer exact-machine evidence. Generic legal, overview, installation, start-up or safety text cannot become a cause by itself. "
         "Separate explicit source statements from cautious engineering inference in the 'why' field. Do not invent measurements, alarms, states or procedures. "
         "Keep labels short and stable. Merge duplicate paraphrases, but preserve different causal families when sources support them. "
@@ -25255,7 +25568,9 @@ def _v13_generate_root_cause_response(
     )
     assurance_block = _v13_assurance_prompt_block(retrieval)
     user_msg = (
-        f"SYMPTOM:\n{q}\n\nRESPONSE_LANGUAGE: {response_language}\n\nSOURCES:\n{sources_block}\n\n"
+        f"SYMPTOM:\n{q}\n\nRESPONSE_LANGUAGE: {response_language}\n\n"
+        f"REQUIRED_SYMPTOM_SUBSYSTEM_FACETS: {json.dumps(required_facets, ensure_ascii=False)}\n\n"
+        f"SOURCES:\n{sources_block}\n\n"
         + (f"{assurance_block}\n\n" if assurance_block else "")
         + f"Return JSON only with at most {max_causes} ranked causes and practical discriminating checks."
     )
@@ -25485,6 +25800,14 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
         "Understand the request by meaning in Italian, English, or mixed language; never route by a fixed keyword list. "
         "REQUESTED_MODE is a preference for ROOT_CAUSE and SMART_DIAGNOSTIC, not a reason to reject a procedural or informational request. "
         "Choose EFFECTIVE_MODE only from ALLOWED_EFFECTIVE_MODES. ASK is used for facts, explanations, procedures, ordered operations, comparisons, source retrieval, and generic technical questions. "
+        "Also classify INFORMATION_TASK by the exact shape of information the answer must contain: "
+        "procedure_full for an explicitly complete end-to-end procedure; procedure_segment for only the requested part of a procedure; "
+        "numeric_specification for a requested value, limit, capacity, range, setting, quantity or unit; "
+        "interface_navigation for where a function, alarm, history, menu, screen, page or status is found in an HMI/interface; "
+        "sequence_or_synchronization for the temporal/state relationship between two or more machine functions; "
+        "document_explanation for a grounded explanation from documentation; source_retrieval when locating content is the primary task; "
+        "fault_diagnostic for abnormal-condition causes/checks; comparison for explicit comparison; general_technical for generic engineering; out_of_scope or other otherwise. "
+        "This classification is semantic and multilingual; do not depend on a fixed wording. "
         "ROOT_CAUSE is used only when the user reports an abnormal machine condition and wants plausible causes or discriminating checks. "
         "SMART_DIAGNOSTIC is used only for an abnormal condition suitable for an interactive closed-question diagnosis. "
         "When ALLOWED_EFFECTIVE_MODES contains only ASK, keep effective_mode=ask even for a fault symptom; ASK must still answer the symptom in direct technical prose. "
@@ -25493,7 +25816,10 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
         "Classify ambiguous only when the request itself is not interpretable; lack of evidence is not ambiguity. "
         "Independently judge whether INDEXED_EVIDENCE appears to support the exact machine-specific request. Evidence IDs are advisory selections only; do not mark unsupported merely because the best source is not obvious. "
         "For procedures, prefer explicit Procedure and ordered Step records, with manuals as secondary operational/safety support. "
-        "For a documented fault, prefer a matching P&S plus specific component, state, mechanism, or discriminating-check evidence. "
+        "For a documented fault, a P&S is useful only when it matches the same subsystem, observable symptom/condition and plausible causal mechanism; machine membership alone is insufficient. "
+        "For numeric_specification, required_facets must identify the requested property and unit/context, and retrieval queries should include faithful Italian/English technical equivalents when the source language may differ. "
+        "For interface_navigation, required_facets must separately identify every requested destination (for example current state and history) and prefer HMI/operator-interface documentation. "
+        "For sequence_or_synchronization, required_facets must name every participating function plus the required ordering/state relationship. "
         "For codes, values, tables, ranges, and settings, prefer the source containing the exact datum. "
         "A source request such as manual or Excel is preferential unless the user explicitly says only that source. "
         "Use machine_sources_required for machine-specific operations, values, settings, safety, fault analysis, and guided diagnosis. "
@@ -25513,7 +25839,10 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
     )
     parsed, model_used = _v13_json_models(
         [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
-        models=[ASSISTANT_CORE_ROUTER_MODEL],
+        models=_dedup_text_values(
+            [ASSISTANT_CORE_ROUTER_MODEL, ASSISTANT_CORE_ROUTER_FALLBACK_MODEL],
+            limit=2,
+        ),
         json_schema=build_router_schema(allowed_modes),
         effort=ASSISTANT_CORE_ROUTER_EFFORT,
         reasoning_mode="",
@@ -25572,7 +25901,12 @@ def _assistant_core_refine_retrieval(
     budget = _v13_current_budget()
     if budget is not None and budget.remaining() < 20.0:
         return retrieval
-    if not (decision.dense_queries or decision.lexical_queries or decision.exact_terms):
+    if not (
+        decision.dense_queries
+        or decision.lexical_queries
+        or decision.exact_terms
+        or decision.required_facets
+    ):
         return retrieval
     doc_ids = _assistant_core_scope_value(request, "document_ids")
     bubble_document_id = _assistant_core_scope_value(request, "bubble_document_id")
@@ -25580,11 +25914,14 @@ def _assistant_core_refine_retrieval(
     plan = {
         **base_plan,
         "intent": decision.request_kind,
+        "information_task": decision.information_task,
         "dense_queries": _dedup_text_values(
-            [request.query] + list(decision.dense_queries), limit=V13_DENSE_QUERY_LIMIT + 2
+            [request.query] + list(decision.dense_queries) + list(decision.required_facets),
+            limit=V13_DENSE_QUERY_LIMIT + 4,
         ),
         "lexical_queries": _dedup_text_values(
-            [request.query] + list(decision.lexical_queries), limit=V13_LEXICAL_QUERY_LIMIT + 2
+            [request.query] + list(decision.lexical_queries) + list(decision.required_facets),
+            limit=V13_LEXICAL_QUERY_LIMIT + 4,
         ),
         "exact_terms": _dedup_text_values(
             list(base_plan.get("exact_terms") or []) + list(decision.exact_terms), limit=18
@@ -25622,23 +25959,173 @@ def _assistant_core_refine_retrieval(
     }
 
 
+def _assistant_core_required_facet_metrics(text: str, facets: list[str] | tuple[str, ...]) -> dict:
+    """Deterministic coverage signal for the semantic contract produced by the router.
+
+    The router is responsible for multilingual semantic interpretation. This helper
+    only verifies that the admitted evidence/answer still contains the concepts the
+    router declared mandatory; it never invents missing facets.
+    """
+    normalized_text = re.sub(
+        r"\s+", " ", _normalize_unicode_advanced(str(text or "")).lower()
+    ).strip()
+    clean_facets = _dedup_text_values(list(facets or []), limit=12)
+    if not normalized_text or not clean_facets:
+        return {"coverage": 0.0, "covered": [], "missing": clean_facets}
+
+    text_terms = _content_term_set(normalized_text, limit=260)
+    covered: list[str] = []
+    missing: list[str] = []
+    for facet in clean_facets:
+        normalized_facet = re.sub(
+            r"\s+", " ", _normalize_unicode_advanced(str(facet or "")).lower()
+        ).strip()
+        facet_terms = _content_term_set(normalized_facet, limit=30)
+        phrase_hit = bool(normalized_facet and normalized_facet in normalized_text)
+        if phrase_hit:
+            covered.append(facet)
+            continue
+        if not facet_terms:
+            missing.append(facet)
+            continue
+        overlap = len(facet_terms & text_terms) / max(1, len(facet_terms))
+        if overlap >= 0.50 or (len(facet_terms) == 1 and overlap >= 1.0):
+            covered.append(facet)
+        else:
+            missing.append(facet)
+    return {
+        "coverage": len(covered) / max(1, len(clean_facets)),
+        "covered": covered,
+        "missing": missing,
+    }
+
+
+def _assistant_core_numeric_signal(text: str) -> dict:
+    value = _normalize_unicode_advanced(str(text or ""))
+    number_matches = re.findall(r"(?<![A-Za-z0-9_])[+\-]?\d+(?:[.,]\d+)?", value)
+    unit_matches = re.findall(
+        r"(?i)(?<![A-Za-z0-9_])(?:[+\-]?\d+(?:[.,]\d+)?\s*)"
+        r"(?:kg|g|t|ton|lb|mm|cm|m|m/s|m/s2|m/s²|rpm|min\-?1|1/min|hz|khz|kw|w|v|a|bar|mpa|pa|nm|n|kn|°c|celsius|%|ms|s|sec|min|h|hour|hours)\b",
+        value,
+    )
+    return {
+        "has_number": bool(number_matches),
+        "has_number_with_unit": bool(unit_matches),
+        "numbers": number_matches[:12],
+    }
+
+
+def _assistant_core_interface_navigation_signal(text: str) -> bool:
+    low = _normalize_unicode_advanced(str(text or "")).lower()
+    markers = (
+        "hmi", "operator panel", "operator interface", "touch screen", "touchscreen",
+        "screen", "page", "menu", "window", "tab", "alarm history", "alarm list",
+        "pannello operatore", "interfaccia operatore", "schermata", "pagina", "menu",
+        "finestra", "scheda", "storico allarmi", "lista allarmi",
+    )
+    return any(marker in low for marker in markers)
+
+
+def _assistant_core_sequence_signal(text: str) -> bool:
+    low = _normalize_unicode_advanced(str(text or "")).lower()
+    markers = (
+        "first", "then", "next", "after", "before", "while", "when", "at the same time",
+        "simultaneously", "during the return", "at the end", "opens", "closes", "returns",
+        "prima", "poi", "quindi", "successivamente", "dopo", "prima di", "mentre",
+        "quando", "contemporaneamente", "simultaneamente", "durante il ritorno",
+        "a fine corsa", "apre", "chiude", "ritorna",
+    )
+    return sum(1 for marker in markers if marker in low) >= 2
+
+
+def _assistant_core_ps_is_substantive(candidate: dict) -> bool:
+    if _assistant_core_candidate_source_type(candidate) != "ps":
+        return True
+    raw = _v13_candidate_text(candidate)
+    fields = _parse_structured_source_fields(raw)
+    values = [
+        str(fields.get("description") or ""),
+        str(fields.get("solution") or ""),
+        str(fields.get("notes") or ""),
+    ]
+    placeholder_values = {
+        "", "-", "n/a", "na", "none", "null", "problema", "problem", "soluzione",
+        "solution", "descr", "description", "test", "other",
+    }
+    substantive = [
+        re.sub(r"\s+", " ", _normalize_unicode_advanced(v).lower()).strip(" .:;-_")
+        for v in values
+    ]
+    substantive = [v for v in substantive if v not in placeholder_values and len(v) >= 24]
+    return bool(substantive)
+
+
 def _assistant_core_source_bonus(
     source_type: str,
     request_kind: str,
     preferred_source_types: set[str],
+    information_task: str = INFO_OTHER,
 ) -> float:
     bonus = 0.0
     if source_type in preferred_source_types:
         bonus += 0.18
-    if request_kind == "procedure":
-        bonus += {"step": 0.22, "procedure": 0.20, "document": 0.04, "ps": 0.03}.get(source_type, 0.0)
-    elif request_kind in {"fault_diagnostic", "guided_diagnostic"}:
-        bonus += {"ps": 0.20, "document": 0.09, "procedure": 0.06, "step": 0.07}.get(source_type, 0.0)
-    elif request_kind == "source_retrieval":
+
+    if information_task in {INFO_PROCEDURE_FULL, INFO_PROCEDURE_SEGMENT} or request_kind == "procedure":
+        bonus += {"step": 0.22, "procedure": 0.20, "document": 0.07, "ps": 0.02}.get(source_type, 0.0)
+    elif information_task == INFO_NUMERIC_SPECIFICATION:
+        # Numeric values may live in a manual, a procedure or an exact Step. Do not
+        # systematically demote structured records in favour of PDFs.
+        bonus += {"step": 0.16, "procedure": 0.14, "document": 0.15, "ps": 0.03}.get(source_type, 0.0)
+    elif information_task == INFO_INTERFACE_NAVIGATION:
+        bonus += {"document": 0.22, "procedure": 0.02, "step": 0.01, "ps": -0.03}.get(source_type, 0.0)
+    elif information_task == INFO_SEQUENCE_SYNCHRONIZATION:
+        bonus += {"step": 0.18, "procedure": 0.14, "document": 0.17, "ps": 0.02}.get(source_type, 0.0)
+    elif request_kind in {"fault_diagnostic", "guided_diagnostic"} or information_task == INFO_FAULT_DIAGNOSTIC:
+        # A P&S is valuable only after the same-subsystem/facet gate below. The
+        # source-type prior is intentionally modest so an unrelated P&S cannot win.
+        bonus += {"ps": 0.10, "document": 0.10, "procedure": 0.07, "step": 0.08}.get(source_type, 0.0)
+    elif request_kind == "source_retrieval" or information_task == INFO_SOURCE_RETRIEVAL:
         bonus += 0.10 if source_type in preferred_source_types else 0.0
     elif request_kind in {"factual", "comparison"}:
-        bonus += 0.07 if source_type == "document" else 0.02
+        bonus += {"document": 0.08, "step": 0.06, "procedure": 0.05, "ps": 0.02}.get(source_type, 0.0)
     return bonus
+
+
+def _assistant_core_root_candidate_viable(
+    request: AssistantCoreRequest,
+    decision: AssistantCoreDecision,
+    candidate: dict,
+) -> bool:
+    if bool(candidate.get("hard_excluded")):
+        return False
+    if not _assistant_core_ps_is_substantive(candidate):
+        return False
+
+    text = _v13_candidate_text(candidate)
+    facets = _assistant_core_required_facet_metrics(text, decision.required_facets)
+    facet_coverage = float(facets.get("coverage") or 0.0)
+    router_selected = bool(candidate.get("assistant_core_router_id_bonus"))
+    semantic = float(
+        candidate.get("semantic_similarity", candidate.get("gate_similarity", candidate.get("similarity", 0.0)))
+        or 0.0
+    )
+    causal = float(candidate.get("causal_strength_score") or 0.0)
+    subsystem = float(candidate.get("subsystem_score") or 0.0)
+    context_fit = float(candidate.get("context_fit_score") or 0.0)
+    # Router selection is advisory: it still needs a same-subsystem/facet signal
+    # plus a causal/discriminating signal. This prevents a semantically nearby but
+    # unrelated P&S from becoming a cause merely because the router listed its id.
+    if (
+        router_selected
+        and causal >= 0.02
+        and (facet_coverage >= 0.20 or subsystem > 0.0 or context_fit > 0.0)
+    ):
+        return True
+    if facet_coverage >= 0.25 and (causal >= 0.02 or subsystem > 0.0 or context_fit > 0.0):
+        return True
+    if semantic >= 0.46 and causal >= 0.08 and (subsystem > 0.0 or context_fit > 0.0):
+        return True
+    return False
 
 
 def _assistant_core_prepare_evidence(
@@ -25686,8 +26173,28 @@ def _assistant_core_prepare_evidence(
             cc.get("v13_score", cc.get("retrieval_score", semantic)) or 0.0
         )
         source_bonus = _assistant_core_source_bonus(
-            source_type, decision.request_kind, preferred
+            source_type, decision.request_kind, preferred, decision.information_task
         )
+        facet_metrics = _assistant_core_required_facet_metrics(text, decision.required_facets)
+        facet_coverage = float(facet_metrics.get("coverage") or 0.0)
+        numeric_signal = _assistant_core_numeric_signal(text)
+        interface_signal = _assistant_core_interface_navigation_signal(text)
+        sequence_signal = _assistant_core_sequence_signal(text)
+        substantive_ps = _assistant_core_ps_is_substantive(cc)
+        task_contract_bonus = 0.0
+        if decision.information_task == INFO_NUMERIC_SPECIFICATION:
+            task_contract_bonus += 0.18 if numeric_signal.get("has_number_with_unit") else 0.08 if numeric_signal.get("has_number") else -0.16
+            task_contract_bonus += min(0.12, facet_coverage * 0.12)
+        elif decision.information_task == INFO_INTERFACE_NAVIGATION:
+            task_contract_bonus += 0.16 if interface_signal else -0.12
+            task_contract_bonus += min(0.14, facet_coverage * 0.14)
+        elif decision.information_task == INFO_SEQUENCE_SYNCHRONIZATION:
+            task_contract_bonus += 0.15 if sequence_signal else -0.10
+            task_contract_bonus += min(0.14, facet_coverage * 0.14)
+        elif decision.information_task in {INFO_PROCEDURE_FULL, INFO_PROCEDURE_SEGMENT}:
+            task_contract_bonus += min(0.12, facet_coverage * 0.12)
+        if source_type == "ps" and not substantive_ps:
+            task_contract_bonus -= 0.35
         router_id_bonus = 0.16 if cid and cid in relevant_ids else 0.0
         exact_bonus = 0.18 if bool(
             cc.get("exact_code_hit")
@@ -25696,7 +26203,7 @@ def _assistant_core_prepare_evidence(
         ) else 0.0
         title_bonus = min(0.16, max(0.0, float(cc.get("structured_title_match_score") or 0.0)) * 0.20)
         lexical_bonus = min(0.16, max(0.0, overlap) * 0.24)
-        score = base_score + source_bonus + router_id_bonus + exact_bonus + title_bonus + lexical_bonus
+        score = base_score + source_bonus + router_id_bonus + exact_bonus + title_bonus + lexical_bonus + task_contract_bonus
         if decision.source_type_policy == "require" and preferred and source_type not in preferred:
             score -= 0.12
         elif decision.source_type_policy == "prefer" and preferred and source_type not in preferred:
@@ -25706,6 +26213,15 @@ def _assistant_core_prepare_evidence(
         cc["assistant_core_router_id_bonus"] = router_id_bonus
         cc["assistant_core_source_bonus"] = source_bonus
         cc["assistant_core_query_overlap"] = overlap
+        cc["assistant_core_information_task"] = decision.information_task
+        cc["assistant_core_facet_coverage"] = facet_coverage
+        cc["assistant_core_covered_facets"] = list(facet_metrics.get("covered") or [])
+        cc["assistant_core_missing_facets"] = list(facet_metrics.get("missing") or [])
+        cc["assistant_core_numeric_signal"] = dict(numeric_signal)
+        cc["assistant_core_interface_signal"] = bool(interface_signal)
+        cc["assistant_core_sequence_signal"] = bool(sequence_signal)
+        cc["assistant_core_ps_substantive"] = bool(substantive_ps)
+        cc["assistant_core_task_contract_bonus"] = task_contract_bonus
         cc["v13_score"] = score
         cc["retrieval_score"] = max(float(cc.get("retrieval_score") or 0.0), score)
         if source_type in preferred and (semantic >= 0.28 or overlap >= 0.04 or title_bonus > 0.0 or exact_bonus > 0.0):
@@ -25730,11 +26246,22 @@ def _assistant_core_prepare_evidence(
     )
     scored = _dedup_citations_by_snippet(scored, max_items=24)
 
-    deterministic_mode = (
-        "root_cause"
-        if decision.effective_mode in {MODE_ROOT_CAUSE, MODE_SMART_DIAGNOSTIC}
-        else "ask"
-    )
+    diagnostic_mode = decision.effective_mode in {MODE_ROOT_CAUSE, MODE_SMART_DIAGNOSTIC}
+    if diagnostic_mode:
+        scored = _v13_rescore_root_candidates(request.query, scored)
+        for candidate in scored:
+            candidate["assistant_core_root_viable"] = _assistant_core_root_candidate_viable(
+                request, decision, candidate
+            )
+        scored.sort(
+            key=lambda c: (
+                0 if bool(c.get("assistant_core_root_viable")) else 1,
+                -float(c.get("v13_score", c.get("retrieval_score", c.get("similarity", 0.0))) or 0.0),
+                str(c.get("citation_id") or ""),
+            )
+        )
+
+    deterministic_mode = "root_cause" if diagnostic_mode else "ask"
     deterministic_state, deterministic_signals = _v13_deterministic_evidence_state(
         request.query,
         scored,
@@ -25742,66 +26269,113 @@ def _assistant_core_prepare_evidence(
         narrow_scope=request.narrow_scope,
     )
 
-    source_types = [str(c.get("source_type") or "") for c in scored[:12]]
-    has_matching_structured = any(
-        st in {"procedure", "step", "ps"}
-        for st in source_types
-    )
-    has_matching_ps = "ps" in source_types
+    top_candidates = scored[:12]
+    source_types = [str(c.get("source_type") or "") for c in top_candidates]
+    has_procedure_sources = any(st in {"procedure", "step"} for st in source_types)
     top_similarity = float(deterministic_signals.get("top_similarity") or 0.0)
     top_overlap = float(deterministic_signals.get("top_overlap") or 0.0)
     fts_hits = int(deterministic_signals.get("fts_overlap_count") or 0)
     exact_hits = int(deterministic_signals.get("exact_code_count") or 0)
 
-    # Router evidence IDs/state are advisory. Clear deterministic support wins over
-    # a mistaken router rejection; a router "supported" decision is accepted only
-    # when at least one independent retrieval signal is present.
+    numeric_viable = [
+        c for c in top_candidates
+        if bool((c.get("assistant_core_numeric_signal") or {}).get("has_number"))
+        and (
+            float(c.get("assistant_core_facet_coverage") or 0.0) >= 0.20
+            or float(c.get("assistant_core_router_id_bonus") or 0.0) > 0.0
+            or float(c.get("assistant_core_query_overlap") or 0.0) >= 0.025
+        )
+    ]
+    interface_viable = [
+        c for c in top_candidates
+        if bool(c.get("assistant_core_interface_signal"))
+        and (
+            float(c.get("assistant_core_facet_coverage") or 0.0) >= 0.20
+            or float(c.get("assistant_core_router_id_bonus") or 0.0) > 0.0
+        )
+    ]
+    sequence_viable = [
+        c for c in top_candidates
+        if bool(c.get("assistant_core_sequence_signal"))
+        and (
+            float(c.get("assistant_core_facet_coverage") or 0.0) >= 0.20
+            or float(c.get("assistant_core_router_id_bonus") or 0.0) > 0.0
+            or float(c.get("assistant_core_query_overlap") or 0.0) >= 0.035
+        )
+    ]
+    root_viable = [c for c in scored if bool(c.get("assistant_core_root_viable"))]
+
+    # Router evidence IDs/state are advisory, but a failed router is not permission
+    # to synthesize from arbitrary nearby text. Successful semantic routing can be
+    # corroborated by deterministic retrieval signals.
     independent_signal = bool(
         deterministic_state == "supported"
         or top_similarity >= 0.34
         or top_overlap >= 0.035
         or fts_hits > 0
         or exact_hits > 0
-        or has_matching_structured
+        or (decision.request_kind == KIND_PROCEDURE and has_procedure_sources)
     )
     supported = False
-    if deterministic_state == "supported":
-        supported = True
-    elif decision.evidence_state in {EVIDENCE_SUPPORTED, EVIDENCE_PARTIAL, EVIDENCE_REFINE} and independent_signal:
-        supported = True
+    if not decision.degraded:
+        if deterministic_state == "supported":
+            supported = True
+        elif decision.evidence_state in {EVIDENCE_SUPPORTED, EVIDENCE_PARTIAL, EVIDENCE_REFINE} and independent_signal:
+            supported = True
 
-    if decision.request_kind == KIND_PROCEDURE:
+    if decision.request_kind == KIND_PROCEDURE or decision.information_task in {INFO_PROCEDURE_FULL, INFO_PROCEDURE_SEGMENT}:
         supported = supported and (
-            has_matching_structured
+            has_procedure_sources
             or top_similarity >= 0.40
             or (top_similarity >= 0.32 and top_overlap >= 0.05)
         )
-    elif decision.request_kind in {KIND_FAULT_DIAGNOSTIC, KIND_GUIDED_DIAGNOSTIC}:
-        supported = supported and (
-            has_matching_ps
-            or deterministic_state == "supported"
-            or (top_similarity >= 0.38 and (top_overlap >= 0.03 or len(scored) >= 2))
-        )
+    elif decision.information_task == INFO_NUMERIC_SPECIFICATION:
+        supported = supported and bool(numeric_viable)
+    elif decision.information_task == INFO_INTERFACE_NAVIGATION:
+        supported = supported and bool(interface_viable)
+    elif decision.information_task == INFO_SEQUENCE_SYNCHRONIZATION:
+        supported = supported and bool(sequence_viable)
+    elif decision.request_kind in {KIND_FAULT_DIAGNOSTIC, KIND_GUIDED_DIAGNOSTIC} or diagnostic_mode:
+        # A P&S record is not sufficient merely because it belongs to the machine.
+        # At least one candidate must match the symptom/subsystem/facets and carry a
+        # plausible causal or discriminating-check signal.
+        supported = supported and bool(root_viable)
 
     if decision.request_kind == KIND_GENERAL_TECHNICAL and decision.evidence_policy == POLICY_GENERAL_ALLOWED:
-        # Prefer indexed evidence when clearly relevant; otherwise let the core use
-        # the separately labelled general-knowledge path.
-        supported = deterministic_state == "supported"
+        supported = deterministic_state == "supported" and not decision.degraded
 
-    if decision.effective_mode in {MODE_ROOT_CAUSE, MODE_SMART_DIAGNOSTIC}:
-        scored = _v13_rescore_root_candidates(request.query, scored)
+    if diagnostic_mode:
         limit = V13_MAX_EVIDENCE_ITEMS_ROOT_CAUSE
+        selected_pool = root_viable
     else:
-        limit = max(V13_MAX_EVIDENCE_ITEMS_ASK, 12 if decision.request_kind == KIND_PROCEDURE else V13_MAX_EVIDENCE_ITEMS_ASK)
+        limit = max(
+            V13_MAX_EVIDENCE_ITEMS_ASK,
+            12 if decision.request_kind == KIND_PROCEDURE else V13_MAX_EVIDENCE_ITEMS_ASK,
+        )
+        if decision.information_task == INFO_NUMERIC_SPECIFICATION and numeric_viable:
+            selected_pool = numeric_viable + [c for c in scored if c not in numeric_viable]
+        elif decision.information_task == INFO_INTERFACE_NAVIGATION and interface_viable:
+            selected_pool = interface_viable + [c for c in scored if c not in interface_viable]
+        elif decision.information_task == INFO_SEQUENCE_SYNCHRONIZATION and sequence_viable:
+            selected_pool = sequence_viable + [c for c in scored if c not in sequence_viable]
+        else:
+            selected_pool = scored
 
-    selected = scored[:limit] if supported else []
+    selected = selected_pool[:limit] if supported else []
     out_retrieval = {
         **dict(retrieval or {}),
         "candidates": selected,
         "citations": selected,
         "metrics": _v13_evidence_metrics(selected),
+        "assistant_core_contract": {
+            "information_task": decision.information_task,
+            "required_facets": list(decision.required_facets),
+            "missing_information": list(decision.missing_information),
+            "fail_closed": True,
+        },
         "assistant_core_decision": {
             "request_kind": decision.request_kind,
+            "information_task": decision.information_task,
             "effective_mode": decision.effective_mode,
             "router_evidence_state": decision.evidence_state,
             "preferred_source_types": list(decision.preferred_source_types),
@@ -25810,6 +26384,10 @@ def _assistant_core_prepare_evidence(
             "deterministic_state": deterministic_state,
             "deterministic_signals": deterministic_signals,
             "independent_signal": independent_signal,
+            "numeric_viable_count": len(numeric_viable),
+            "interface_viable_count": len(interface_viable),
+            "sequence_viable_count": len(sequence_viable),
+            "root_viable_count": len(root_viable),
             "supported": supported,
         },
     }
@@ -25820,14 +26398,39 @@ def _assistant_core_synthesize_ask(
     retrieval: dict,
     decision: AssistantCoreDecision,
 ) -> dict:
+    contract = {
+        "information_task": decision.information_task,
+        "required_facets": list(decision.required_facets),
+        "missing_information": list(decision.missing_information),
+        "fail_closed": True,
+    }
+    retrieval = {
+        **dict(retrieval or {}),
+        "assistant_core_contract": contract,
+    }
+    planner = dict(retrieval.get("plan") or _v13_fallback_plan(request.query))
+    planner["information_task"] = decision.information_task
+    planner["required_facets"] = _dedup_text_values(
+        list(planner.get("required_facets") or []) + list(decision.required_facets),
+        limit=14,
+    )
+    retrieval["plan"] = planner
+
     structured_types = {"procedure", "step", "ps", "md_photo", "md_video"}
     has_structured = any(
         _assistant_core_candidate_source_type(c) in structured_types
         for c in (retrieval.get("citations") or retrieval.get("candidates") or [])
         if isinstance(c, dict)
     )
+    structured_procedure_task = decision.information_task in {
+        INFO_PROCEDURE_FULL,
+        INFO_PROCEDURE_SEGMENT,
+        INFO_SEQUENCE_SYNCHRONIZATION,
+        INFO_NUMERIC_SPECIFICATION,
+    }
     if has_structured and (
         decision.request_kind == "procedure"
+        or structured_procedure_task
         or bool({"procedure", "step"} & set(decision.preferred_source_types))
     ):
         structured = _v13_structured_ask(
@@ -25836,20 +26439,19 @@ def _assistant_core_synthesize_ask(
             machine_id=request.machine_id,
             response_language=request.response_language,
             top_k=request.top_k,
-            planner=retrieval.get("plan") or _v13_fallback_plan(request.query),
+            planner=planner,
             seed_citations=retrieval.get("citations") or retrieval.get("candidates") or [],
             assurance_meta=retrieval.get("retrieval_assurance") or {},
             debug=request.debug,
         )
         if isinstance(structured, dict) and structured.get("ok") is True:
+            structured.setdefault("information_task", decision.information_task)
             return structured
         budget = _v13_current_budget()
         if budget is not None and budget.llm_calls >= budget.max_llm_calls:
-            # Never turn the first nearby text into an "answered" response. The
-            # evidence router already knows the request is procedural; when the
-            # structured synthesis cannot complete inside budget, fail closed.
             return _assistant_core_build_no_evidence(request, decision, retrieval)
-    return _v13_generate_ask_response(
+
+    response = _v13_generate_ask_response(
         q=request.query,
         company_id=request.company_id,
         response_language=request.response_language,
@@ -25858,6 +26460,14 @@ def _assistant_core_synthesize_ask(
         narrow_scope=request.narrow_scope,
         debug=request.debug,
     )
+    degraded_reason = str((response.get("meta") or {}).get("degraded_reason") or "")
+    if degraded_reason == "ask_extractive_fallback":
+        # Never present the first nearby source paragraph as a grounded answer when
+        # the semantic synthesis failed. This is the failure that produced unrelated
+        # HMI text for a decoiler-capacity question.
+        return _assistant_core_build_no_evidence(request, decision, retrieval)
+    response.setdefault("information_task", decision.information_task)
+    return response
 
 
 def _assistant_core_synthesize_root_cause(
@@ -26463,6 +27073,7 @@ def _assistant_core_recover_citations(
             source_type,
             decision.request_kind,
             set(decision.preferred_source_types),
+            decision.information_task,
         )
         score = support_count * 2.0 + overlap + task_bonus
         if support_count > 0 or (not existing and overlap >= 0.025):
@@ -26545,6 +27156,69 @@ def _assistant_core_redact_internal_text(text: str) -> str:
     return re.sub(r"[ \t]+", " ", value).strip()
 
 
+def _assistant_core_answer_contract_check(
+    *,
+    answer: str,
+    evidence_text: str,
+    decision: AssistantCoreDecision,
+) -> dict:
+    task = str(decision.information_task or INFO_OTHER).strip().lower()
+    facets = list(decision.required_facets or [])
+    answer_metrics = _assistant_core_required_facet_metrics(answer, facets)
+    evidence_metrics = _assistant_core_required_facet_metrics(evidence_text, facets)
+
+    passed = True
+    reason = "not_applicable"
+    if task == INFO_NUMERIC_SPECIFICATION:
+        answer_numeric = _assistant_core_numeric_signal(answer)
+        evidence_numeric = _assistant_core_numeric_signal(evidence_text)
+        min_coverage = 0.50 if facets else 0.0
+        passed = bool(
+            answer_numeric.get("has_number")
+            and evidence_numeric.get("has_number")
+            and float(answer_metrics.get("coverage") or 0.0) >= min_coverage
+        )
+        reason = "numeric_value_present" if passed else "requested_numeric_value_or_context_missing"
+    elif task == INFO_INTERFACE_NAVIGATION:
+        # Every separately requested destination should be represented in the
+        # answer. Evidence can be in a different language from the router facets,
+        # so do not require literal cross-language facet overlap when the evidence
+        # itself clearly contains interface/navigation wording.
+        min_coverage = 1.0 if len(facets) <= 2 and facets else 0.60
+        evidence_has_interface = bool(
+            _assistant_core_interface_navigation_signal(evidence_text)
+            or float(evidence_metrics.get("coverage") or 0.0) > 0.0
+        )
+        passed = bool(
+            _assistant_core_interface_navigation_signal(answer)
+            and float(answer_metrics.get("coverage") or 0.0) >= min_coverage
+            and evidence_has_interface
+        )
+        reason = "interface_locations_complete" if passed else "interface_locations_incomplete"
+    elif task == INFO_SEQUENCE_SYNCHRONIZATION:
+        min_coverage = 0.50 if facets else 0.0
+        evidence_has_sequence = bool(
+            _assistant_core_sequence_signal(evidence_text)
+            or float(evidence_metrics.get("coverage") or 0.0) > 0.0
+        )
+        passed = bool(
+            _assistant_core_sequence_signal(answer)
+            and float(answer_metrics.get("coverage") or 0.0) >= min_coverage
+            and evidence_has_sequence
+        )
+        reason = "sequence_complete" if passed else "sequence_or_participants_incomplete"
+
+    return {
+        "passed": bool(passed),
+        "reason": reason,
+        "information_task": task,
+        "answer_facet_coverage": float(answer_metrics.get("coverage") or 0.0),
+        "evidence_facet_coverage": float(evidence_metrics.get("coverage") or 0.0),
+        "missing_answer_facets": list(answer_metrics.get("missing") or []),
+        "missing_evidence_facets": list(evidence_metrics.get("missing") or []),
+    }
+
+
 def _assistant_core_validate_response(
     response: dict,
     request: AssistantCoreRequest,
@@ -26584,6 +27258,7 @@ def _assistant_core_validate_response(
         for candidate in allowed.values()
     )
     removed_claims: list[str] = []
+    answer_contract_result: dict = {"passed": True, "reason": "not_applicable"}
 
     if decision.effective_mode == MODE_ROOT_CAUSE:
         cleaned_causes: list[dict] = []
@@ -26608,33 +27283,41 @@ def _assistant_core_validate_response(
                 if cleaned:
                     checks.append(cleaned)
             cc["checks"] = checks
-            cause_ids = [
-                str(cid or "").strip()
-                for cid in (cc.get("citations") or [])
-                if str(cid or "").strip() in allowed
-            ]
-            if not cause_ids:
-                cause_text = "\n".join(
-                    [str(cc.get("cause") or ""), str(cc.get("why") or ""), *checks]
-                )
-                cause_terms = _content_term_set(cause_text, limit=100)
-                ranked_ids = sorted(
-                    allowed,
-                    key=lambda cid: (
-                        -_term_overlap_score(
-                            cause_terms,
-                            _content_term_set(_assistant_core_candidate_evidence_text(allowed[cid]), limit=160),
-                        ) if cause_terms else 0.0,
-                        cid,
-                    ),
-                )
-                cause_ids = [cid for cid in ranked_ids[:2] if cid]
-            cc["citations"] = cause_ids[:4]
-            if cc.get("cause") and (cc.get("why") or checks):
+            cause_ids = []
+            for raw_id in (cc.get("citations") or []):
+                cid = str(raw_id or "").strip()
+                candidate = allowed.get(cid)
+                if not cid or not isinstance(candidate, dict):
+                    continue
+                if not _assistant_core_root_candidate_viable(request, decision, candidate):
+                    continue
+                cause_ids.append(cid)
+                if len(cause_ids) >= 4:
+                    break
+            # Never launder an unsupported cause by attaching the nearest citation
+            # after synthesis. A cause without its own compatible evidence is dropped.
+            cc["citations"] = cause_ids
+            if cause_ids and cc.get("cause") and (cc.get("why") or checks):
                 cleaned_causes.append(cc)
         for idx, cause in enumerate(cleaned_causes, start=1):
             cause["rank"] = idx
         out["possible_causes"] = cleaned_causes[: max(1, request.max_causes)]
+        final_cause_ids = _dedup_text_values(
+            [cid for cause in out["possible_causes"] for cid in (cause.get("citations") or [])],
+            limit=16,
+        )
+        if final_cause_ids:
+            final_raw_citations = [allowed[cid] for cid in final_cause_ids if cid in allowed]
+            try:
+                out["citations"] = _sanitize_citations_for_response(
+                    final_raw_citations, company_id=request.company_id
+                )
+            except Exception:
+                out["citations"] = final_raw_citations
+            try:
+                out["rg_links"] = _build_rg_links(request.company_id, out["citations"])
+            except Exception:
+                out["rg_links"] = []
         out["problem_summary"] = _assistant_core_redact_internal_text(out.get("problem_summary") or "")
         out["recommended_next_checks"] = _unique_non_empty_strings(
             [check for c in out["possible_causes"] for check in (c.get("checks") or [])],
@@ -26656,6 +27339,19 @@ def _assistant_core_validate_response(
             answer, removed_claims = _assistant_core_filter_unsupported_claim_sentences(answer, source_text)
         answer = _assistant_core_media_metadata_only(answer, citations, request.response_language)
         out["answer"] = answer
+        if str(out.get("status") or "").lower() == "answered" and answer:
+            answer_contract_result = _assistant_core_answer_contract_check(
+                answer=answer,
+                evidence_text=source_text,
+                decision=decision,
+            )
+            if not bool(answer_contract_result.get("passed")):
+                no_evidence = _assistant_core_build_no_evidence(request, decision, retrieval)
+                out.update(no_evidence)
+                out.pop("answer_html", None)
+                out.pop("_assistant_ui_model", None)
+                out["citations"] = []
+                out["rg_links"] = []
         if str(out.get("status") or "").lower() == "answered" and not answer:
             no_evidence = _assistant_core_build_no_evidence(request, decision, retrieval)
             out.update(no_evidence)
@@ -26669,6 +27365,7 @@ def _assistant_core_validate_response(
         "valid_citation_count": len(out.get("citations") or []),
         "valid_link_count": len(out.get("rg_links") or []),
         "unsupported_numeric_or_code_claims_removed": sorted(set(removed_claims))[:20],
+        "answer_contract": dict(answer_contract_result),
     }
     out["meta"] = meta
     # Internal-only manifest: never expose full raw evidence in the API payload.
@@ -29393,18 +30090,79 @@ def _sd_filter_citations_by_gate(citations: list[dict], gate_result: dict) -> li
     return [dict(c) for c in citations or [] if isinstance(c, dict) and str(c.get("citation_id") or "").strip() in wanted]
 
 
+def _sd_canonical_admitted_evidence_ids(
+    relevant_ids: list[str] | tuple[str, ...],
+    evidence: list[dict],
+) -> list[str]:
+    """Map gate IDs to the compact/sanitized IDs persisted in signed state.
+
+    Retrieval assurance can replace a chunk citation with a page/compacted citation
+    for the same document/page. The old subset check treated that benign identity
+    change as loss of all evidence and stopped every Smart Diagnostic after Q1.
+    """
+    evidence_rows = [
+        dict(item) for item in (evidence or [])
+        if isinstance(item, dict) and str(item.get("citation_id") or "").strip()
+    ]
+    evidence_ids = [str(item.get("citation_id") or "").strip() for item in evidence_rows]
+    if not evidence_ids:
+        return []
+
+    exact = set(evidence_ids)
+    mapped: list[str] = []
+    seen: set[str] = set()
+
+    def loc(value: str) -> tuple[str, int, int]:
+        match = re.match(r"^(.*):p(\d+)-(\d+):", str(value or "").strip())
+        if not match:
+            return str(value or "").split(":p", 1)[0], 0, 0
+        return match.group(1), int(match.group(2)), int(match.group(3))
+
+    evidence_locations = [(eid, *loc(eid)) for eid in evidence_ids]
+    for raw in relevant_ids or []:
+        rid = str(raw or "").strip()
+        if not rid:
+            continue
+        if rid in exact and rid not in seen:
+            mapped.append(rid)
+            seen.add(rid)
+            continue
+        r_doc, r_from, r_to = loc(rid)
+        for eid, e_doc, e_from, e_to in evidence_locations:
+            if e_doc != r_doc:
+                continue
+            page_matches = (
+                r_from <= 0 or e_from <= 0
+                or not (e_to < r_from or r_to < e_from)
+            )
+            if page_matches and eid not in seen:
+                mapped.append(eid)
+                seen.add(eid)
+                break
+
+    # If assurance changed every citation representation, the compact evidence is
+    # still the signed, bounded evidence pack admitted for this session.
+    return mapped or evidence_ids
+
+
 def _sd_state_has_admitted_evidence(state: dict) -> bool:
     if not isinstance(state, dict):
         return False
     if str(state.get("status") or "").strip().lower() == "no_sources":
         return False
-    evidence = [e for e in (state.get("evidence") or []) if isinstance(e, dict) and str(e.get("citation_id") or "").strip()]
+    evidence = [
+        e for e in (state.get("evidence") or [])
+        if isinstance(e, dict) and str(e.get("citation_id") or "").strip()
+    ]
     gate = state.get("evidence_gate")
     if not evidence or not isinstance(gate, dict) or gate.get("accepted") is not True:
         return False
-    admitted_ids = {str(x or "").strip() for x in (gate.get("relevant_evidence_ids") or []) if str(x or "").strip()}
+    admitted_ids = _sd_canonical_admitted_evidence_ids(
+        list(gate.get("relevant_evidence_ids") or []),
+        evidence,
+    )
     evidence_ids = {str(e.get("citation_id") or "").strip() for e in evidence}
-    return bool(admitted_ids and admitted_ids.issubset(evidence_ids))
+    return bool(set(admitted_ids) & evidence_ids)
 
 
 def _sd_normalize_options(options: list[dict], question_type: str, language: str) -> list[dict]:
@@ -30166,7 +30924,9 @@ def _assistant_core_synthesize_smart_start(
             "confidence": decision.confidence,
             "reason_code": "evidence_sufficient",
             "model": decision.router_model or ASSISTANT_CORE_ROUTER_MODEL,
-            "relevant_evidence_ids": list(decision.relevant_evidence_ids or evidence_ids),
+            "relevant_evidence_ids": _sd_canonical_admitted_evidence_ids(
+                list(decision.relevant_evidence_ids or evidence_ids), evidence_state
+            ),
         },
         "retrieval_meta": {
             "similarity_max": (retrieval.get("metrics") or {}).get("top_similarity"),
@@ -30530,7 +31290,14 @@ def _assistant_core_budgeted_sd_turn(turn_kind: str):
                     result.setdefault("requested_mode", MODE_SMART_DIAGNOSTIC)
                     result.setdefault("effective_mode", MODE_SMART_DIAGNOSTIC)
                     result.setdefault("routed", False)
-                    result.setdefault("result_code", "ANSWERED")
+                    status_value = str(result.get("status") or "").strip().lower()
+                    if "result_code" not in result:
+                        result["result_code"] = (
+                            RESULT_NO_MACHINE_EVIDENCE if status_value == "no_sources"
+                            else RESULT_NEEDS_CLARIFICATION if status_value == "needs_clarification"
+                            else RESULT_TIMEOUT if status_value == "timeout"
+                            else "ANSWERED"
+                        )
                     budget.route = f"assistant_core_smart_{turn_kind}"
                     return _assistant_core_attach_runtime_meta(
                         result,
@@ -30724,7 +31491,9 @@ def smart_diagnostic_start_v1(
             "confidence": float(evidence_gate.get("confidence") or 0.0),
             "reason_code": str(evidence_gate.get("reason_code") or "evidence_sufficient"),
             "model": str(evidence_gate.get("model") or SMART_DIAGNOSTIC_EVIDENCE_GATE_MODEL),
-            "relevant_evidence_ids": list(evidence_gate.get("relevant_evidence_ids") or []),
+            "relevant_evidence_ids": _sd_canonical_admitted_evidence_ids(
+                list(evidence_gate.get("relevant_evidence_ids") or []), evidence_state
+            ),
         },
         "retrieval_meta": {
             "similarity_max": retrieval.get("similarity_max"),
