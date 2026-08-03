@@ -68,6 +68,13 @@ from assistant_core_v2 import (
     POLICY_GENERAL_ALLOWED,
     POLICY_MACHINE_PREFERRED,
     POLICY_MACHINE_REQUIRED,
+    REQ_CHECKLIST,
+    REQ_DIAGNOSTIC_CAUSES,
+    REQ_INTERFACE_LOCATIONS,
+    REQ_NUMERIC_VALUE,
+    REQ_ORDERED_ACTIONS,
+    REQ_SAFETY_CONDITIONS,
+    REQ_STATE_SEQUENCE,
     RESULT_BUDGET_EXCEEDED,
     RESULT_NEEDS_CLARIFICATION,
     RESULT_NO_MACHINE_EVIDENCE,
@@ -12306,11 +12313,14 @@ def _v12_step_direct_query_score(step: dict, q: str) -> float:
     if not q_terms:
         return 0.0
     fields = _procedure_ui_fields(step)
+    sections = _procedure_ui_sections(fields.get("description") or "")
+    # Score the Step's own title and operational action. Parent Procedure labels
+    # and repeated technical-reference boilerplate are present in every Step and
+    # would otherwise make a component name appear relevant to the whole family.
     text = " ".join(
         [
             str(fields.get("title") or ""),
-            str(fields.get("description") or ""),
-            str(step.get("snippet_clean") or step.get("chunk_full") or step.get("snippet") or ""),
+            str(sections.get("instruction") or sections.get("body") or ""),
         ]
     )
     return _term_overlap_score(q_terms, _content_term_set(text, limit=180))
@@ -12360,12 +12370,12 @@ def _v12_step_phrase_score(step: dict, phrase: str) -> float:
     if not phrase_terms:
         return 0.0
     fields = _procedure_ui_fields(step)
+    sections = _procedure_ui_sections(fields.get("description") or "")
     step_text = _normalize_unicode_advanced(
         " ".join(
             [
                 str(fields.get("title") or ""),
-                str(fields.get("description") or ""),
-                str(step.get("snippet_clean") or step.get("chunk_full") or step.get("snippet") or ""),
+                str(sections.get("instruction") or sections.get("body") or ""),
             ]
         )
     ).lower()
@@ -19333,8 +19343,8 @@ if V13_HEAVY_REASONING_MODE not in {"", "pro"}:
 # retrieval/synthesis primitives but chooses the response mode only after neutral
 # cross-source retrieval. Default ON; set MM_ASSISTANT_CORE_V2_ENABLED=0 only for rollback.
 ASSISTANT_CORE_V2_ENABLED = (os.environ.get("MM_ASSISTANT_CORE_V2_ENABLED") or "1").strip() != "0"
-ASSISTANT_CORE_V2_CODE_MARKER = "assistant-core-v2-quality-contracts-v6-20260803-1"
-ASSISTANT_CORE_V2_RELEASE_ID = (os.environ.get("MM_ASSISTANT_CORE_V2_RELEASE_ID") or "2026-08-03.1").strip()
+ASSISTANT_CORE_V2_CODE_MARKER = "assistant-core-v2-composite-contracts-v6-1-20260803-2"
+ASSISTANT_CORE_V2_RELEASE_ID = (os.environ.get("MM_ASSISTANT_CORE_V2_RELEASE_ID") or "2026-08-03.2").strip()
 ASSISTANT_UI_RENDER_VERSION = "assistant-ui-html-procedure-bundle-v5-20260801-5"
 ASSISTANT_UI_MAX_HTML_CHARS = max(8000, min(60000, int(
     os.environ.get("MM_ASSISTANT_UI_MAX_HTML_CHARS", "32000")
@@ -24987,14 +24997,94 @@ def _v13_structured_ask(
     if not structured:
         return None
 
+    information_task = str((planner or {}).get("information_task") or INFO_OTHER).strip().lower()
+    procedure_sequence_mode = information_task in {
+        INFO_PROCEDURE_FULL,
+        INFO_PROCEDURE_SEGMENT,
+    }
+    structured_scope = list(structured)
+    selected_step_numbers: list[int] = []
+    expanded_step_numbers: list[int] = []
+
+    if procedure_sequence_mode:
+        primary = _v12_choose_primary_procedure(structured, [])
+        complete_steps = sorted(
+            [dict(c) for c in structured if _v12_evidence_role(c) == "step"],
+            key=_v12_step_sort_key,
+        )
+        expanded_step_numbers = [
+            _v12_step_sort_key(c)[0] for c in complete_steps
+            if 0 < _v12_step_sort_key(c)[0] < 9999
+        ]
+        if primary is None or not complete_steps:
+            return _v12_incomplete_procedure_response(
+                response_language=response_language,
+                result_code="INCOMPLETE_PROCEDURE_BUNDLE",
+                procedure=primary,
+                debug_detail={"expanded_step_numbers": expanded_step_numbers},
+            )
+
+        if information_task == INFO_PROCEDURE_FULL:
+            selected_steps = complete_steps
+        else:
+            selected_steps = _v12_select_response_steps(
+                all_steps=complete_steps,
+                selected_step_ids=[],
+                model_used_citations=[],
+                q=q,
+            )
+        if not selected_steps:
+            return _v12_incomplete_procedure_response(
+                response_language=response_language,
+                result_code="INCOMPLETE_PROCEDURE_SELECTION",
+                procedure=primary,
+                debug_detail={"expanded_step_numbers": expanded_step_numbers},
+            )
+
+        selected_step_numbers = [
+            _v12_step_sort_key(c)[0] for c in selected_steps
+            if 0 < _v12_step_sort_key(c)[0] < 9999
+        ]
+        selected_number_set = set(selected_step_numbers)
+        first_selected = min(selected_number_set or {9999})
+        safety_prerequisites: list[dict] = []
+        for candidate in complete_steps:
+            number = _v12_step_sort_key(candidate)[0]
+            fields = _procedure_ui_fields(candidate)
+            safety_text = " ".join([
+                str(fields.get("title") or ""),
+                str(fields.get("description") or ""),
+            ])
+            if (
+                number < first_selected
+                and number not in selected_number_set
+                and _procedure_ui_is_safety_setup(safety_text)
+            ):
+                safety_prerequisites = [dict(candidate)]
+                break
+
+        extras = [
+            dict(c) for c in structured
+            if _v12_evidence_role(c) not in {"procedure", "step"}
+        ]
+        structured_scope = _v12_mark_structured_roles(
+            [dict(primary)] + safety_prerequisites + list(selected_steps) + extras
+        )
+
     manual_support = _v13_fetch_manual_support_deterministic(
         company_id=company_id,
         machine_id=machine_id,
         q=q,
         planner=planner,
-        structured_citations=structured,
+        structured_citations=structured_scope,
     )
-    all_evidence = list(structured) + list(manual_support)
+    if procedure_sequence_mode:
+        manual_support = _v12_filter_manual_support_to_selected_bundle(
+            q=q,
+            structured_citations=structured_scope,
+            manual_support_citations=manual_support,
+        )
+    all_evidence = list(structured_scope) + list(manual_support)
     sources_block = _v13_sources_block(
         all_evidence,
         max_context_chars=min(V13_HEAVY_CONTEXT_CHARS, max(16000, ASK_STRUCTURED_DIRECT_MAX_CONTEXT_CHARS)),
@@ -25053,15 +25143,21 @@ def _v13_structured_ask(
         q=q,
     )
 
-    final_structured = _v12_curate_structured_sources(
-        company_id=company_id,
-        machine_id=machine_id,
-        q=q,
-        planner=planner,
-        citations=structured,
-        model_used=model_citations,
-    )
-    final_structured = _v12_mark_structured_roles(final_structured)
+    if procedure_sequence_mode:
+        # The deterministic Procedure span is authoritative. Do not call the
+        # generic curator again here, because it expands the parent Procedure back
+        # to every Step and would undo a valid partial selection.
+        final_structured = _v12_mark_structured_roles(structured_scope)
+    else:
+        final_structured = _v12_curate_structured_sources(
+            company_id=company_id,
+            machine_id=machine_id,
+            q=q,
+            planner=planner,
+            citations=structured_scope,
+            model_used=model_citations,
+        )
+        final_structured = _v12_mark_structured_roles(final_structured)
     has_procedure_context = any(
         _v12_evidence_role(c) in {"procedure", "step"}
         for c in final_structured
@@ -25078,7 +25174,7 @@ def _v13_structured_ask(
             if str(c.get("citation_id") or "").strip() in used_ids
         ]
     ui_structured = _procedure_ui_merge_sources(
-        structured,
+        structured_scope,
         final_structured,
         model_citations,
     )
@@ -25169,6 +25265,10 @@ def _v13_structured_ask(
                 "structured_sources": len(final_structured),
                 "manual_support_sources": len(manual_support),
                 "manual_support_links": sum(1 for x in rg_links if str(x.get("evidence_role") or "") == "manual_support"),
+                "procedure_sequence_mode": bool(procedure_sequence_mode),
+                "information_task": information_task,
+                "expanded_step_numbers": expanded_step_numbers,
+                "selected_step_numbers": selected_step_numbers,
             }
         }
     return _finalize_ask_response_for_ui(resp, language=response_language)
@@ -25250,6 +25350,19 @@ def _v13_generate_ask_response(
     candidates = candidates[:V13_MAX_EVIDENCE_ITEMS_ASK]
     contract = dict(retrieval.get("assistant_core_contract") or {})
     information_task = str(contract.get("information_task") or INFO_OTHER).strip().lower()
+    required_answer_types = {
+        str(x or "").strip().lower()
+        for x in (contract.get("required_answer_types") or [])
+        if str(x or "").strip()
+    }
+    if information_task == INFO_NUMERIC_SPECIFICATION:
+        required_answer_types.add(REQ_NUMERIC_VALUE)
+    elif information_task == INFO_INTERFACE_NAVIGATION:
+        required_answer_types.add(REQ_INTERFACE_LOCATIONS)
+    elif information_task == INFO_SEQUENCE_SYNCHRONIZATION:
+        required_answer_types.add(REQ_STATE_SEQUENCE)
+    elif information_task in {INFO_PROCEDURE_FULL, INFO_PROCEDURE_SEGMENT}:
+        required_answer_types.add(REQ_ORDERED_ACTIONS)
     required_facets = _dedup_text_values(contract.get("required_facets") or [], limit=12)
     fail_closed = bool(contract.get("fail_closed"))
     if not candidates:
@@ -25291,15 +25404,20 @@ def _v13_generate_ask_response(
         "For photo/video records, use metadata only and never claim visual/audio inspection. Do not expose citation ids or internal Bubble ids in visible text. "
         "If SOURCES do not support the answer, return no_sources. Reply in the requested language."
     )
-    if information_task == INFO_NUMERIC_SPECIFICATION:
-        system_msg += " The answer must state the requested value with its unit/context; a nearby qualitative statement is insufficient."
-    elif information_task == INFO_INTERFACE_NAVIGATION:
-        system_msg += " Name every requested screen/page/menu/location distinctly; mentioning alarms or the HMI generically is insufficient."
-    elif information_task == INFO_SEQUENCE_SYNCHRONIZATION:
+    if REQ_NUMERIC_VALUE in required_answer_types:
+        system_msg += " The answer must state the requested value with its unit/context; a nearby qualitative statement or another unrelated number is insufficient."
+    if REQ_INTERFACE_LOCATIONS in required_answer_types:
+        system_msg += " Name every requested screen/page/menu/location distinctly; mentioning the HMI or feature generically is insufficient."
+    if REQ_STATE_SEQUENCE in required_answer_types:
         system_msg += " State the participating functions and their temporal/state order explicitly (what opens/closes/moves and when)."
+    if REQ_CHECKLIST in required_answer_types:
+        system_msg += " Include the requested practical checks as a compact checklist grounded in the sources."
+    if REQ_SAFETY_CONDITIONS in required_answer_types:
+        system_msg += " Include directly applicable authorization or safety conditions without replacing the requested technical answer."
     assurance_block = _v13_assurance_prompt_block(retrieval)
     contract_block = (
         f"INFORMATION_TASK: {information_task}\n"
+        f"REQUIRED_ANSWER_TYPES: {json.dumps(sorted(required_answer_types), ensure_ascii=False)}\n"
         f"REQUIRED_FACETS: {json.dumps(required_facets, ensure_ascii=False)}\n"
     )
     user_msg = (
@@ -25430,17 +25548,18 @@ def _v13_generate_ask_response(
 
 
 def _v13_root_cause_model(q: str, retrieval: dict) -> tuple[str, str, str]:
-    metrics = retrieval.get("metrics") or {}
-    candidates = list(retrieval.get("candidates") or [])
-    exact_ps = any(
-        str(c.get("source_type") or "") == "ps"
-        and float(c.get("v13_score") or 0.0) >= float(metrics.get("top_score") or 0.0) - 0.05
-        for c in candidates[:6]
-    )
-    simple = _count_query_tokens(q) <= 10 and str(metrics.get("confidence") or "") == "high"
-    if exact_ps or simple:
-        return V13_FAST_MODEL, V13_FAST_EFFORT, ""
-    return V13_HEAVY_MODEL, V13_ROOT_HEAVY_EFFORT, V13_HEAVY_REASONING_MODE
+    """Choose the bounded Root Cause model.
+
+    The previous heuristic selected the heavy model for almost every detailed
+    symptom merely because the query had more than ten tokens. On real evidence
+    packs that consumed the full 40-second slot and left too little time for the
+    fast fallback, producing safe but unhelpful ``no_sources`` responses near the
+    60-second deadline. The bounded fast reasoning model already produced the
+    strongest exact-P&S diagnosis in the live benchmark, so it is the stable
+    default for all normal Root Cause requests. Evidence gates, not query length,
+    continue to control correctness.
+    """
+    return V13_FAST_MODEL, V13_FAST_EFFORT, ""
 
 
 def _v13_root_fallback_from_evidence(
@@ -25800,13 +25919,16 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
         "Understand the request by meaning in Italian, English, or mixed language; never route by a fixed keyword list. "
         "REQUESTED_MODE is a preference for ROOT_CAUSE and SMART_DIAGNOSTIC, not a reason to reject a procedural or informational request. "
         "Choose EFFECTIVE_MODE only from ALLOWED_EFFECTIVE_MODES. ASK is used for facts, explanations, procedures, ordered operations, comparisons, source retrieval, and generic technical questions. "
-        "Also classify INFORMATION_TASK by the exact shape of information the answer must contain: "
+        "Also classify INFORMATION_TASK by the primary shape of information the answer must contain: "
         "procedure_full for an explicitly complete end-to-end procedure; procedure_segment for only the requested part of a procedure; "
         "numeric_specification for a requested value, limit, capacity, range, setting, quantity or unit; "
         "interface_navigation for where a function, alarm, history, menu, screen, page or status is found in an HMI/interface; "
         "sequence_or_synchronization for the temporal/state relationship between two or more machine functions; "
         "document_explanation for a grounded explanation from documentation; source_retrieval when locating content is the primary task; "
         "fault_diagnostic for abnormal-condition causes/checks; comparison for explicit comparison; general_technical for generic engineering; out_of_scope or other otherwise. "
+        "A request can require several output shapes at once. Put every mandatory shape in REQUIRED_ANSWER_TYPES: numeric_value, ordered_actions, checklist, safety_conditions, interface_locations, state_sequence, diagnostic_causes, comparison, source_locations, or explanation. "
+        "INFORMATION_TASK is the primary/hardest contract, not necessarily the only requirement. When the user asks for a numeric value/limit/capacity together with checks or safety conditions, use numeric_specification as the primary task and include numeric_value plus checklist and/or safety_conditions; do not reduce that composite request to procedure_segment. "
+        "When the user asks for only part of an operation, use procedure_segment plus ordered_actions. For a complete operation, use procedure_full plus ordered_actions. For HMI navigation use interface_navigation plus interface_locations. For synchronization use sequence_or_synchronization plus state_sequence. For diagnosis use fault_diagnostic plus diagnostic_causes and usually checklist. "
         "This classification is semantic and multilingual; do not depend on a fixed wording. "
         "ROOT_CAUSE is used only when the user reports an abnormal machine condition and wants plausible causes or discriminating checks. "
         "SMART_DIAGNOSTIC is used only for an abnormal condition suitable for an interactive closed-question diagnosis. "
@@ -25817,7 +25939,7 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
         "Independently judge whether INDEXED_EVIDENCE appears to support the exact machine-specific request. Evidence IDs are advisory selections only; do not mark unsupported merely because the best source is not obvious. "
         "For procedures, prefer explicit Procedure and ordered Step records, with manuals as secondary operational/safety support. "
         "For a documented fault, a P&S is useful only when it matches the same subsystem, observable symptom/condition and plausible causal mechanism; machine membership alone is insufficient. "
-        "For numeric_specification, required_facets must identify the requested property and unit/context, and retrieval queries should include faithful Italian/English technical equivalents when the source language may differ. "
+        "For numeric_specification or any numeric_value requirement, required_facets must identify the requested property and unit/context, and retrieval queries should include faithful Italian/English technical equivalents when the source language may differ. "
         "For interface_navigation, required_facets must separately identify every requested destination (for example current state and history) and prefer HMI/operator-interface documentation. "
         "For sequence_or_synchronization, required_facets must name every participating function plus the required ordering/state relationship. "
         "For codes, values, tables, ranges, and settings, prefer the source containing the exact datum. "
@@ -25915,6 +26037,7 @@ def _assistant_core_refine_retrieval(
         **base_plan,
         "intent": decision.request_kind,
         "information_task": decision.information_task,
+        "required_answer_types": list(decision.required_answer_types),
         "dense_queries": _dedup_text_values(
             [request.query] + list(decision.dense_queries) + list(decision.required_facets),
             limit=V13_DENSE_QUERY_LIMIT + 4,
@@ -26154,6 +26277,33 @@ def _assistant_core_prepare_evidence(
         for x in decision.preferred_source_types
         if str(x or "").strip()
     }
+    required_answer_types = {
+        str(x or "").strip().lower()
+        for x in decision.required_answer_types
+        if str(x or "").strip()
+    }
+    needs_numeric = (
+        decision.information_task == INFO_NUMERIC_SPECIFICATION
+        or REQ_NUMERIC_VALUE in required_answer_types
+    )
+    needs_interface = (
+        decision.information_task == INFO_INTERFACE_NAVIGATION
+        or REQ_INTERFACE_LOCATIONS in required_answer_types
+    )
+    needs_sequence = (
+        decision.information_task == INFO_SEQUENCE_SYNCHRONIZATION
+        or REQ_STATE_SEQUENCE in required_answer_types
+    )
+    needs_ordered_actions = (
+        decision.information_task in {INFO_PROCEDURE_FULL, INFO_PROCEDURE_SEGMENT}
+        or decision.request_kind == KIND_PROCEDURE
+        or REQ_ORDERED_ACTIONS in required_answer_types
+    )
+    needs_diagnostic = (
+        decision.request_kind in {KIND_FAULT_DIAGNOSTIC, KIND_GUIDED_DIAGNOSTIC}
+        or decision.information_task == INFO_FAULT_DIAGNOSTIC
+        or REQ_DIAGNOSTIC_CAUSES in required_answer_types
+    )
     query_terms = _content_term_set(request.query, limit=80)
 
     scored: list[dict] = []
@@ -26182,16 +26332,19 @@ def _assistant_core_prepare_evidence(
         sequence_signal = _assistant_core_sequence_signal(text)
         substantive_ps = _assistant_core_ps_is_substantive(cc)
         task_contract_bonus = 0.0
-        if decision.information_task == INFO_NUMERIC_SPECIFICATION:
+        # Composite contracts are cumulative: a value-plus-checklist request must
+        # not lose the numeric evidence merely because ordered actions are also
+        # requested.
+        if needs_numeric:
             task_contract_bonus += 0.18 if numeric_signal.get("has_number_with_unit") else 0.08 if numeric_signal.get("has_number") else -0.16
             task_contract_bonus += min(0.12, facet_coverage * 0.12)
-        elif decision.information_task == INFO_INTERFACE_NAVIGATION:
+        if needs_interface:
             task_contract_bonus += 0.16 if interface_signal else -0.12
             task_contract_bonus += min(0.14, facet_coverage * 0.14)
-        elif decision.information_task == INFO_SEQUENCE_SYNCHRONIZATION:
+        if needs_sequence:
             task_contract_bonus += 0.15 if sequence_signal else -0.10
             task_contract_bonus += min(0.14, facet_coverage * 0.14)
-        elif decision.information_task in {INFO_PROCEDURE_FULL, INFO_PROCEDURE_SEGMENT}:
+        if needs_ordered_actions:
             task_contract_bonus += min(0.12, facet_coverage * 0.12)
         if source_type == "ps" and not substantive_ps:
             task_contract_bonus -= 0.35
@@ -26277,6 +26430,15 @@ def _assistant_core_prepare_evidence(
     fts_hits = int(deterministic_signals.get("fts_overlap_count") or 0)
     exact_hits = int(deterministic_signals.get("exact_code_count") or 0)
 
+    def _contract_semantic(candidate: dict) -> float:
+        return float(
+            candidate.get(
+                "semantic_similarity",
+                candidate.get("gate_similarity", candidate.get("similarity", 0.0)),
+            )
+            or 0.0
+        )
+
     numeric_viable = [
         c for c in top_candidates
         if bool((c.get("assistant_core_numeric_signal") or {}).get("has_number"))
@@ -26284,6 +26446,15 @@ def _assistant_core_prepare_evidence(
             float(c.get("assistant_core_facet_coverage") or 0.0) >= 0.20
             or float(c.get("assistant_core_router_id_bonus") or 0.0) > 0.0
             or float(c.get("assistant_core_query_overlap") or 0.0) >= 0.025
+            # Query and source may be in different languages. A value with a real
+            # engineering unit plus independent semantic similarity is a valid
+            # cross-language contract signal; naked page/menu numbers require a
+            # materially stronger similarity and cannot win merely by being numeric.
+            or (
+                bool((c.get("assistant_core_numeric_signal") or {}).get("has_number_with_unit"))
+                and _contract_semantic(c) >= 0.30
+            )
+            or _contract_semantic(c) >= 0.46
         )
     ]
     interface_viable = [
@@ -26292,6 +26463,7 @@ def _assistant_core_prepare_evidence(
         and (
             float(c.get("assistant_core_facet_coverage") or 0.0) >= 0.20
             or float(c.get("assistant_core_router_id_bonus") or 0.0) > 0.0
+            or _contract_semantic(c) >= 0.40
         )
     ]
     sequence_viable = [
@@ -26301,6 +26473,7 @@ def _assistant_core_prepare_evidence(
             float(c.get("assistant_core_facet_coverage") or 0.0) >= 0.20
             or float(c.get("assistant_core_router_id_bonus") or 0.0) > 0.0
             or float(c.get("assistant_core_query_overlap") or 0.0) >= 0.035
+            or _contract_semantic(c) >= 0.42
         )
     ]
     root_viable = [c for c in scored if bool(c.get("assistant_core_root_viable"))]
@@ -26323,19 +26496,20 @@ def _assistant_core_prepare_evidence(
         elif decision.evidence_state in {EVIDENCE_SUPPORTED, EVIDENCE_PARTIAL, EVIDENCE_REFINE} and independent_signal:
             supported = True
 
-    if decision.request_kind == KIND_PROCEDURE or decision.information_task in {INFO_PROCEDURE_FULL, INFO_PROCEDURE_SEGMENT}:
+    # Every mandatory output shape must have independently viable evidence.
+    if needs_ordered_actions:
         supported = supported and (
             has_procedure_sources
             or top_similarity >= 0.40
             or (top_similarity >= 0.32 and top_overlap >= 0.05)
         )
-    elif decision.information_task == INFO_NUMERIC_SPECIFICATION:
+    if needs_numeric:
         supported = supported and bool(numeric_viable)
-    elif decision.information_task == INFO_INTERFACE_NAVIGATION:
+    if needs_interface:
         supported = supported and bool(interface_viable)
-    elif decision.information_task == INFO_SEQUENCE_SYNCHRONIZATION:
+    if needs_sequence:
         supported = supported and bool(sequence_viable)
-    elif decision.request_kind in {KIND_FAULT_DIAGNOSTIC, KIND_GUIDED_DIAGNOSTIC} or diagnostic_mode:
+    if needs_diagnostic or diagnostic_mode:
         # A P&S record is not sufficient merely because it belongs to the machine.
         # At least one candidate must match the symptom/subsystem/facets and carry a
         # plausible causal or discriminating-check signal.
@@ -26350,16 +26524,23 @@ def _assistant_core_prepare_evidence(
     else:
         limit = max(
             V13_MAX_EVIDENCE_ITEMS_ASK,
-            12 if decision.request_kind == KIND_PROCEDURE else V13_MAX_EVIDENCE_ITEMS_ASK,
+            12 if needs_ordered_actions else V13_MAX_EVIDENCE_ITEMS_ASK,
         )
-        if decision.information_task == INFO_NUMERIC_SPECIFICATION and numeric_viable:
-            selected_pool = numeric_viable + [c for c in scored if c not in numeric_viable]
-        elif decision.information_task == INFO_INTERFACE_NAVIGATION and interface_viable:
-            selected_pool = interface_viable + [c for c in scored if c not in interface_viable]
-        elif decision.information_task == INFO_SEQUENCE_SYNCHRONIZATION and sequence_viable:
-            selected_pool = sequence_viable + [c for c in scored if c not in sequence_viable]
-        else:
-            selected_pool = scored
+        priority_pool: list[dict] = []
+        if needs_numeric:
+            priority_pool.extend(numeric_viable)
+        if needs_interface:
+            priority_pool.extend(interface_viable)
+        if needs_sequence:
+            priority_pool.extend(sequence_viable)
+        if needs_ordered_actions:
+            priority_pool.extend(
+                c for c in scored
+                if str(c.get("source_type") or "") in {"procedure", "step"}
+            )
+        selected_pool = _v13_merge_candidates(
+            [priority_pool, scored]
+        ) if priority_pool else scored
 
     selected = selected_pool[:limit] if supported else []
     out_retrieval = {
@@ -26369,6 +26550,7 @@ def _assistant_core_prepare_evidence(
         "metrics": _v13_evidence_metrics(selected),
         "assistant_core_contract": {
             "information_task": decision.information_task,
+            "required_answer_types": list(decision.required_answer_types),
             "required_facets": list(decision.required_facets),
             "missing_information": list(decision.missing_information),
             "fail_closed": True,
@@ -26376,6 +26558,7 @@ def _assistant_core_prepare_evidence(
         "assistant_core_decision": {
             "request_kind": decision.request_kind,
             "information_task": decision.information_task,
+            "required_answer_types": list(decision.required_answer_types),
             "effective_mode": decision.effective_mode,
             "router_evidence_state": decision.evidence_state,
             "preferred_source_types": list(decision.preferred_source_types),
@@ -26400,6 +26583,7 @@ def _assistant_core_synthesize_ask(
 ) -> dict:
     contract = {
         "information_task": decision.information_task,
+        "required_answer_types": list(decision.required_answer_types),
         "required_facets": list(decision.required_facets),
         "missing_information": list(decision.missing_information),
         "fail_closed": True,
@@ -26410,6 +26594,7 @@ def _assistant_core_synthesize_ask(
     }
     planner = dict(retrieval.get("plan") or _v13_fallback_plan(request.query))
     planner["information_task"] = decision.information_task
+    planner["required_answer_types"] = list(decision.required_answer_types)
     planner["required_facets"] = _dedup_text_values(
         list(planner.get("required_facets") or []) + list(decision.required_facets),
         limit=14,
@@ -26422,16 +26607,21 @@ def _assistant_core_synthesize_ask(
         for c in (retrieval.get("citations") or retrieval.get("candidates") or [])
         if isinstance(c, dict)
     )
+    # The rich Procedure renderer is only appropriate when the primary answer is
+    # an operation. Numeric, HMI and synchronization questions may cite Steps, but
+    # must remain in the generic contract-driven synthesis path so a whole Procedure
+    # cannot replace the requested value/location/state relationship.
     structured_procedure_task = decision.information_task in {
         INFO_PROCEDURE_FULL,
         INFO_PROCEDURE_SEGMENT,
-        INFO_SEQUENCE_SYNCHRONIZATION,
-        INFO_NUMERIC_SPECIFICATION,
     }
-    if has_structured and (
+    composite_nonprocedure_contract = bool(
+        set(decision.required_answer_types)
+        & {REQ_NUMERIC_VALUE, REQ_INTERFACE_LOCATIONS, REQ_STATE_SEQUENCE}
+    )
+    if has_structured and not composite_nonprocedure_contract and (
         decision.request_kind == "procedure"
         or structured_procedure_task
-        or bool({"procedure", "step"} & set(decision.preferred_source_types))
     ):
         structured = _v13_structured_ask(
             q=request.query,
@@ -27167,53 +27357,113 @@ def _assistant_core_answer_contract_check(
     answer_metrics = _assistant_core_required_facet_metrics(answer, facets)
     evidence_metrics = _assistant_core_required_facet_metrics(evidence_text, facets)
 
-    passed = True
-    reason = "not_applicable"
+    requirements = {
+        str(x or "").strip().lower()
+        for x in decision.required_answer_types
+        if str(x or "").strip()
+    }
     if task == INFO_NUMERIC_SPECIFICATION:
+        requirements.add(REQ_NUMERIC_VALUE)
+    elif task == INFO_INTERFACE_NAVIGATION:
+        requirements.add(REQ_INTERFACE_LOCATIONS)
+    elif task == INFO_SEQUENCE_SYNCHRONIZATION:
+        requirements.add(REQ_STATE_SEQUENCE)
+    elif task in {INFO_PROCEDURE_FULL, INFO_PROCEDURE_SEGMENT}:
+        requirements.add(REQ_ORDERED_ACTIONS)
+    elif task == INFO_FAULT_DIAGNOSTIC:
+        requirements.add(REQ_DIAGNOSTIC_CAUSES)
+
+    checks: list[tuple[str, bool]] = []
+    answer_coverage = float(answer_metrics.get("coverage") or 0.0)
+    evidence_coverage = float(evidence_metrics.get("coverage") or 0.0)
+
+    if REQ_NUMERIC_VALUE in requirements:
         answer_numeric = _assistant_core_numeric_signal(answer)
         evidence_numeric = _assistant_core_numeric_signal(evidence_text)
         min_coverage = 0.50 if facets else 0.0
-        passed = bool(
-            answer_numeric.get("has_number")
-            and evidence_numeric.get("has_number")
-            and float(answer_metrics.get("coverage") or 0.0) >= min_coverage
-        )
-        reason = "numeric_value_present" if passed else "requested_numeric_value_or_context_missing"
-    elif task == INFO_INTERFACE_NAVIGATION:
-        # Every separately requested destination should be represented in the
-        # answer. Evidence can be in a different language from the router facets,
-        # so do not require literal cross-language facet overlap when the evidence
-        # itself clearly contains interface/navigation wording.
+        checks.append((
+            "numeric_value",
+            bool(
+                answer_numeric.get("has_number")
+                and evidence_numeric.get("has_number")
+                and answer_coverage >= min_coverage
+            ),
+        ))
+
+    if REQ_INTERFACE_LOCATIONS in requirements:
         min_coverage = 1.0 if len(facets) <= 2 and facets else 0.60
         evidence_has_interface = bool(
             _assistant_core_interface_navigation_signal(evidence_text)
-            or float(evidence_metrics.get("coverage") or 0.0) > 0.0
+            or evidence_coverage > 0.0
         )
-        passed = bool(
-            _assistant_core_interface_navigation_signal(answer)
-            and float(answer_metrics.get("coverage") or 0.0) >= min_coverage
-            and evidence_has_interface
-        )
-        reason = "interface_locations_complete" if passed else "interface_locations_incomplete"
-    elif task == INFO_SEQUENCE_SYNCHRONIZATION:
+        checks.append((
+            "interface_locations",
+            bool(
+                _assistant_core_interface_navigation_signal(answer)
+                and answer_coverage >= min_coverage
+                and evidence_has_interface
+            ),
+        ))
+
+    if REQ_STATE_SEQUENCE in requirements:
         min_coverage = 0.50 if facets else 0.0
         evidence_has_sequence = bool(
             _assistant_core_sequence_signal(evidence_text)
-            or float(evidence_metrics.get("coverage") or 0.0) > 0.0
+            or evidence_coverage > 0.0
         )
-        passed = bool(
-            _assistant_core_sequence_signal(answer)
-            and float(answer_metrics.get("coverage") or 0.0) >= min_coverage
-            and evidence_has_sequence
-        )
-        reason = "sequence_complete" if passed else "sequence_or_participants_incomplete"
+        checks.append((
+            "state_sequence",
+            bool(
+                _assistant_core_sequence_signal(answer)
+                and answer_coverage >= min_coverage
+                and evidence_has_sequence
+            ),
+        ))
+
+    if REQ_ORDERED_ACTIONS in requirements:
+        numbered = len(re.findall(r"(?m)^\s*\d{1,2}[.)]\s+", str(answer or "")))
+        operational_signal = bool(numbered >= 2 or _assistant_core_sequence_signal(answer))
+        min_coverage = 0.50 if facets else 0.0
+        checks.append((
+            "ordered_actions",
+            bool(operational_signal and answer_coverage >= min_coverage),
+        ))
+
+    if REQ_CHECKLIST in requirements:
+        list_items = len(re.findall(r"(?m)^\s*(?:[-•*]|\d{1,2}[.)])\s+", str(answer or "")))
+        min_coverage = 0.50 if facets else 0.0
+        checks.append((
+            "checklist",
+            bool((list_items >= 2 or answer_coverage >= 0.75) and answer_coverage >= min_coverage),
+        ))
+
+    if REQ_SAFETY_CONDITIONS in requirements:
+        # Safety facets are supplied semantically by the router in the response
+        # language. Requiring facet coverage is more general than a language-specific
+        # list of words such as "safety" or "sicurezza".
+        min_coverage = 0.34 if facets else 0.0
+        checks.append(("safety_conditions", bool(answer_coverage >= min_coverage)))
+
+    # Diagnostic causes are validated structurally in the Root Cause branch, not
+    # against the ASK answer string.
+    if not checks:
+        passed = True
+        reason = "not_applicable"
+    else:
+        failed = [name for name, ok in checks if not ok]
+        passed = not failed
+        reason = "contract_complete" if passed else "missing_" + ",".join(failed)
 
     return {
         "passed": bool(passed),
         "reason": reason,
         "information_task": task,
-        "answer_facet_coverage": float(answer_metrics.get("coverage") or 0.0),
-        "evidence_facet_coverage": float(evidence_metrics.get("coverage") or 0.0),
+        "required_answer_types": sorted(requirements),
+        "requirement_checks": [
+            {"requirement": name, "passed": bool(ok)} for name, ok in checks
+        ],
+        "answer_facet_coverage": answer_coverage,
+        "evidence_facet_coverage": evidence_coverage,
         "missing_answer_facets": list(answer_metrics.get("missing") or []),
         "missing_evidence_facets": list(evidence_metrics.get("missing") or []),
     }

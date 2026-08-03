@@ -122,6 +122,42 @@ PRECISION_INFORMATION_TASKS = {
     INFO_FAULT_DIAGNOSTIC,
 }
 
+# A request can require more than one output shape. ``information_task`` remains
+# the primary routing class, while these requirements make composite questions
+# (for example a numeric limit plus a checklist) explicit and enforceable.
+REQ_NUMERIC_VALUE = "numeric_value"
+REQ_ORDERED_ACTIONS = "ordered_actions"
+REQ_CHECKLIST = "checklist"
+REQ_SAFETY_CONDITIONS = "safety_conditions"
+REQ_INTERFACE_LOCATIONS = "interface_locations"
+REQ_STATE_SEQUENCE = "state_sequence"
+REQ_DIAGNOSTIC_CAUSES = "diagnostic_causes"
+REQ_COMPARISON = "comparison"
+REQ_SOURCE_LOCATIONS = "source_locations"
+REQ_EXPLANATION = "explanation"
+
+ANSWER_REQUIREMENTS = {
+    REQ_NUMERIC_VALUE,
+    REQ_ORDERED_ACTIONS,
+    REQ_CHECKLIST,
+    REQ_SAFETY_CONDITIONS,
+    REQ_INTERFACE_LOCATIONS,
+    REQ_STATE_SEQUENCE,
+    REQ_DIAGNOSTIC_CAUSES,
+    REQ_COMPARISON,
+    REQ_SOURCE_LOCATIONS,
+    REQ_EXPLANATION,
+}
+
+PRECISION_ANSWER_REQUIREMENTS = {
+    REQ_NUMERIC_VALUE,
+    REQ_ORDERED_ACTIONS,
+    REQ_CHECKLIST,
+    REQ_INTERFACE_LOCATIONS,
+    REQ_STATE_SEQUENCE,
+    REQ_DIAGNOSTIC_CAUSES,
+}
+
 SOURCE_TYPES = {
     "document",
     "procedure",
@@ -157,6 +193,7 @@ class AssistantCoreDecision:
     evidence_state: str
     evidence_policy: str
     information_task: str = INFO_OTHER
+    required_answer_types: tuple[str, ...] = ()
     relevant_evidence_ids: tuple[str, ...] = ()
     preferred_source_types: tuple[str, ...] = ()
     source_type_policy: str = "none"
@@ -244,6 +281,11 @@ def build_router_schema(allowed_modes: Sequence[str]) -> dict:
                     "type": "string",
                     "enum": sorted(INFORMATION_TASKS),
                 },
+                "required_answer_types": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": sorted(ANSWER_REQUIREMENTS)},
+                    "maxItems": 8,
+                },
                 "effective_mode": {"type": "string", "enum": modes},
                 "confidence": {"type": "number"},
                 "requested_mode_fit": {"type": "boolean"},
@@ -302,6 +344,7 @@ def build_router_schema(allowed_modes: Sequence[str]) -> dict:
             "required": [
                 "request_kind",
                 "information_task",
+                "required_answer_types",
                 "effective_mode",
                 "confidence",
                 "requested_mode_fit",
@@ -340,6 +383,7 @@ def _fallback_decision(request: AssistantCoreRequest, reason: str) -> AssistantC
         evidence_state=EVIDENCE_UNSUPPORTED,
         evidence_policy=POLICY_MACHINE_REQUIRED,
         information_task=INFO_OTHER,
+        required_answer_types=(),
         rationale="Semantic router unavailable; fail closed rather than answer from unrelated evidence.",
         degraded=True,
         degraded_reason=_clean_text(reason, 400) or "router_unavailable",
@@ -400,6 +444,12 @@ def normalize_decision(
     if information_task not in INFORMATION_TASKS:
         information_task = INFO_OTHER
 
+    required_answer_types = tuple(
+        x.lower()
+        for x in _unique_strings(raw.get("required_answer_types"), 8)
+        if x.lower() in ANSWER_REQUIREMENTS
+    )
+
     clarification = _clean_text(raw.get("clarification_question"), 500)
     if evidence_state == EVIDENCE_CLARIFY and not clarification:
         clarification = (
@@ -425,6 +475,7 @@ def normalize_decision(
         evidence_state=evidence_state,
         evidence_policy=evidence_policy,
         information_task=information_task,
+        required_answer_types=required_answer_types,
         relevant_evidence_ids=_unique_strings(raw.get("relevant_evidence_ids"), 16),
         preferred_source_types=preferred,
         source_type_policy=source_type_policy,
@@ -507,6 +558,7 @@ def decorate_response(
     out["routed"] = routed
     out["request_kind"] = decision.request_kind
     out["information_task"] = decision.information_task
+    out["required_answer_types"] = list(decision.required_answer_types)
     out["evidence_state"] = decision.evidence_state
     out["evidence_policy"] = decision.evidence_policy
     out["result_code"] = _status_to_result_code(out, routed)
@@ -550,6 +602,7 @@ def decorate_response(
         "routed": routed,
         "request_kind": decision.request_kind,
         "information_task": decision.information_task,
+        "required_answer_types": list(decision.required_answer_types),
         "confidence": round(decision.confidence, 4),
         "requested_mode_fit": bool(decision.requested_mode_fit),
         "evidence_state": decision.evidence_state,
@@ -619,7 +672,10 @@ class AssistantCoreV2:
             or decision.required_facets
         )
         precision_task_requires_refinement = (
-            decision.information_task in PRECISION_INFORMATION_TASKS
+            (
+                decision.information_task in PRECISION_INFORMATION_TASKS
+                or bool(set(decision.required_answer_types) & PRECISION_ANSWER_REQUIREMENTS)
+            )
             and has_refinement_queries
         )
         if (
