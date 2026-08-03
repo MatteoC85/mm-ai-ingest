@@ -169,6 +169,24 @@ SOURCE_TYPES = {
 
 
 @dataclass(frozen=True)
+class AssistantCoreFacetQuery:
+    """Language-independent retrieval plan for one mandatory answer facet.
+
+    The semantic router may provide faithful Italian and English query variants.
+    Retrieval uses these variants independently so a strong result for one facet
+    cannot hide a missing result for another facet in a composite question.
+    """
+
+    facet: str
+    answer_type: str = REQ_EXPLANATION
+    must_cover: bool = True
+    dense_queries: tuple[str, ...] = ()
+    lexical_queries: tuple[str, ...] = ()
+    exact_terms: tuple[str, ...] = ()
+    preferred_source_types: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class AssistantCoreRequest:
     query: str
     requested_mode: str
@@ -201,6 +219,12 @@ class AssistantCoreDecision:
     lexical_queries: tuple[str, ...] = ()
     exact_terms: tuple[str, ...] = ()
     required_facets: tuple[str, ...] = ()
+    facet_queries: tuple[AssistantCoreFacetQuery, ...] = ()
+    diagnostic_subsystems: tuple[str, ...] = ()
+    diagnostic_observables: tuple[str, ...] = ()
+    diagnostic_operating_conditions: tuple[str, ...] = ()
+    diagnostic_discriminants: tuple[str, ...] = ()
+    diagnostic_exclusions: tuple[str, ...] = ()
     missing_information: tuple[str, ...] = ()
     clarification_question: str = ""
     safety_reason: str = ""
@@ -213,6 +237,28 @@ class AssistantCoreDecision:
     @property
     def routed(self) -> bool:
         return self.effective_mode not in {"", "unknown"}
+
+    @property
+    def diagnostic_clues(self) -> tuple[str, ...]:
+        """All positive diagnostic observations, ordered by discriminating value."""
+        values = (
+            list(self.diagnostic_discriminants)
+            + list(self.diagnostic_operating_conditions)
+            + list(self.diagnostic_observables)
+            + list(self.diagnostic_subsystems)
+        )
+        out: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            text = _clean_text(value, 300)
+            key = text.casefold()
+            if not text or key in seen:
+                continue
+            seen.add(key)
+            out.append(text)
+            if len(out) >= 16:
+                break
+        return tuple(out)
 
 
 @dataclass(frozen=True)
@@ -234,6 +280,9 @@ class AssistantCoreHooks:
         Callable[[AssistantCoreRequest, dict, AssistantCoreDecision], dict]
     ] = None
     validate_response: Optional[
+        Callable[[dict, AssistantCoreRequest, dict, AssistantCoreDecision], dict]
+    ] = None
+    repair_response: Optional[
         Callable[[dict, AssistantCoreRequest, dict, AssistantCoreDecision], dict]
     ] = None
 
@@ -260,6 +309,78 @@ def _unique_strings(values: Any, limit: int) -> tuple[str, ...]:
         if len(out) >= limit:
             break
     return tuple(out)
+
+
+def _normalize_facet_queries(
+    values: Any,
+    required_facets: Sequence[str],
+    *,
+    default_answer_types: Sequence[str] = (),
+    default_source_types: Sequence[str] = (),
+) -> tuple[AssistantCoreFacetQuery, ...]:
+    """Normalize the router's per-facet retrieval plan.
+
+    Strict router output normally supplies every field. The defaults keep the
+    contract useful during a bounded fallback or a rolling deployment: when one
+    global answer requirement/source family exists, a missing facet annotation
+    inherits it instead of silently degrading to a generic explanation.
+    """
+    raw_values = values if isinstance(values, Sequence) and not isinstance(values, (str, bytes)) else []
+    default_types = tuple(
+        item.lower()
+        for item in _unique_strings(default_answer_types, 8)
+        if item.lower() in ANSWER_REQUIREMENTS
+    )
+    default_sources = tuple(
+        item.lower()
+        for item in _unique_strings(default_source_types, 6)
+        if item.lower() in SOURCE_TYPES
+    )
+    fallback_type = default_types[0] if len(default_types) == 1 else REQ_EXPLANATION
+
+    by_key: dict[str, AssistantCoreFacetQuery] = {}
+    for raw in raw_values:
+        if not isinstance(raw, Mapping):
+            continue
+        facet = _clean_text(raw.get("facet"), 240)
+        if not facet:
+            continue
+        answer_type = _clean_text(raw.get("answer_type"), 80).lower()
+        if answer_type not in ANSWER_REQUIREMENTS:
+            answer_type = fallback_type
+        preferred = tuple(
+            item.lower()
+            for item in _unique_strings(raw.get("preferred_source_types"), 6)
+            if item.lower() in SOURCE_TYPES
+        ) or default_sources
+        item = AssistantCoreFacetQuery(
+            facet=facet,
+            answer_type=answer_type,
+            must_cover=bool(raw.get("must_cover", True)),
+            dense_queries=_unique_strings(raw.get("dense_queries"), 4),
+            lexical_queries=_unique_strings(raw.get("lexical_queries"), 5),
+            exact_terms=_unique_strings(raw.get("exact_terms"), 8),
+            preferred_source_types=preferred,
+        )
+        by_key[facet.casefold()] = item
+        if len(by_key) >= 10:
+            break
+
+    # Every required facet gets an explicit retrieval plan even if the router did
+    # not provide translations. The facet text itself remains a safe fallback.
+    for facet in _unique_strings(required_facets, 10):
+        key = facet.casefold()
+        if key not in by_key:
+            by_key[key] = AssistantCoreFacetQuery(
+                facet=facet,
+                answer_type=fallback_type,
+                must_cover=True,
+                dense_queries=(facet,),
+                lexical_queries=(facet,),
+                exact_terms=(),
+                preferred_source_types=default_sources,
+            )
+    return tuple(by_key.values())
 
 
 def build_router_schema(allowed_modes: Sequence[str]) -> dict:
@@ -331,6 +452,54 @@ def build_router_schema(allowed_modes: Sequence[str]) -> dict:
                     "items": {"type": "string"},
                     "maxItems": 10,
                 },
+                "facet_queries": {
+                    "type": "array",
+                    "maxItems": 10,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "facet": {"type": "string"},
+                            "answer_type": {
+                                "type": "string", "enum": sorted(ANSWER_REQUIREMENTS)
+                            },
+                            "must_cover": {"type": "boolean"},
+                            "dense_queries": {
+                                "type": "array", "items": {"type": "string"}, "maxItems": 4
+                            },
+                            "lexical_queries": {
+                                "type": "array", "items": {"type": "string"}, "maxItems": 5
+                            },
+                            "exact_terms": {
+                                "type": "array", "items": {"type": "string"}, "maxItems": 8
+                            },
+                            "preferred_source_types": {
+                                "type": "array",
+                                "items": {"type": "string", "enum": sorted(SOURCE_TYPES)},
+                                "maxItems": 6,
+                            },
+                        },
+                        "required": [
+                            "facet", "answer_type", "must_cover", "dense_queries",
+                            "lexical_queries", "exact_terms", "preferred_source_types"
+                        ],
+                    },
+                },
+                "diagnostic_subsystems": {
+                    "type": "array", "items": {"type": "string"}, "maxItems": 6
+                },
+                "diagnostic_observables": {
+                    "type": "array", "items": {"type": "string"}, "maxItems": 8
+                },
+                "diagnostic_operating_conditions": {
+                    "type": "array", "items": {"type": "string"}, "maxItems": 8
+                },
+                "diagnostic_discriminants": {
+                    "type": "array", "items": {"type": "string"}, "maxItems": 8
+                },
+                "diagnostic_exclusions": {
+                    "type": "array", "items": {"type": "string"}, "maxItems": 8
+                },
                 "missing_information": {
                     "type": "array",
                     "items": {"type": "string"},
@@ -357,6 +526,12 @@ def build_router_schema(allowed_modes: Sequence[str]) -> dict:
                 "lexical_queries",
                 "exact_terms",
                 "required_facets",
+                "facet_queries",
+                "diagnostic_subsystems",
+                "diagnostic_observables",
+                "diagnostic_operating_conditions",
+                "diagnostic_discriminants",
+                "diagnostic_exclusions",
                 "missing_information",
                 "clarification_question",
                 "safety_reason",
@@ -450,6 +625,14 @@ def normalize_decision(
         if x.lower() in ANSWER_REQUIREMENTS
     )
 
+    required_facets = _unique_strings(raw.get("required_facets"), 10)
+    facet_queries = _normalize_facet_queries(
+        raw.get("facet_queries"),
+        required_facets,
+        default_answer_types=required_answer_types,
+        default_source_types=preferred,
+    )
+
     clarification = _clean_text(raw.get("clarification_question"), 500)
     if evidence_state == EVIDENCE_CLARIFY and not clarification:
         clarification = (
@@ -464,6 +647,14 @@ def normalize_decision(
         evidence_policy = POLICY_MACHINE_REQUIRED
         evidence_state = EVIDENCE_UNSUPPORTED
         information_task = INFO_OUT_OF_SCOPE if request_kind == KIND_OUT_OF_SCOPE else INFO_OTHER
+        required_facets = ()
+        facet_queries = ()
+        raw = dict(raw)
+        raw["diagnostic_subsystems"] = []
+        raw["diagnostic_observables"] = []
+        raw["diagnostic_operating_conditions"] = []
+        raw["diagnostic_discriminants"] = []
+        raw["diagnostic_exclusions"] = []
         if MODE_ASK in allowed:
             effective = MODE_ASK
 
@@ -482,7 +673,13 @@ def normalize_decision(
         dense_queries=_unique_strings(raw.get("dense_queries"), 5),
         lexical_queries=_unique_strings(raw.get("lexical_queries"), 7),
         exact_terms=_unique_strings(raw.get("exact_terms"), 12),
-        required_facets=_unique_strings(raw.get("required_facets"), 10),
+        required_facets=required_facets,
+        facet_queries=facet_queries,
+        diagnostic_subsystems=_unique_strings(raw.get("diagnostic_subsystems"), 6),
+        diagnostic_observables=_unique_strings(raw.get("diagnostic_observables"), 8),
+        diagnostic_operating_conditions=_unique_strings(raw.get("diagnostic_operating_conditions"), 8),
+        diagnostic_discriminants=_unique_strings(raw.get("diagnostic_discriminants"), 8),
+        diagnostic_exclusions=_unique_strings(raw.get("diagnostic_exclusions"), 8),
         missing_information=_unique_strings(raw.get("missing_information"), 8),
         clarification_question=clarification,
         safety_reason=_clean_text(raw.get("safety_reason"), 500),
@@ -610,6 +807,23 @@ def decorate_response(
         "preferred_source_types": list(decision.preferred_source_types),
         "source_type_policy": decision.source_type_policy,
         "required_facets": list(decision.required_facets),
+        "facet_queries": [
+            {
+                "facet": item.facet,
+                "answer_type": item.answer_type,
+                "must_cover": item.must_cover,
+                "dense_queries": list(item.dense_queries),
+                "lexical_queries": list(item.lexical_queries),
+                "exact_terms": list(item.exact_terms),
+                "preferred_source_types": list(item.preferred_source_types),
+            }
+            for item in decision.facet_queries
+        ],
+        "diagnostic_subsystems": list(decision.diagnostic_subsystems),
+        "diagnostic_observables": list(decision.diagnostic_observables),
+        "diagnostic_operating_conditions": list(decision.diagnostic_operating_conditions),
+        "diagnostic_discriminants": list(decision.diagnostic_discriminants),
+        "diagnostic_exclusions": list(decision.diagnostic_exclusions),
         "missing_information": list(decision.missing_information),
         "router_model": decision.router_model,
         "router_degraded": bool(decision.degraded),
@@ -670,6 +884,7 @@ class AssistantCoreV2:
             or decision.lexical_queries
             or decision.exact_terms
             or decision.required_facets
+            or decision.facet_queries
         )
         precision_task_requires_refinement = (
             (
@@ -733,5 +948,32 @@ class AssistantCoreV2:
             response = self.hooks.validate_response(
                 dict(response or {}), request, prepared_retrieval, decision
             )
+
+        # One bounded repair cycle is available only when the first grounded answer
+        # misses a mandatory facet/answer type. It reuses the semantic contract,
+        # retrieves only the missing facets and rewrites once. A second failure is
+        # converted to no_sources by the validator; the loop can never repeat.
+        if (
+            isinstance(response, Mapping)
+            and bool(response.get("_assistant_core_repair_needed"))
+            and not bool(response.get("_assistant_core_repair_attempted"))
+            and self.hooks.repair_response is not None
+            and decision.effective_mode == MODE_ASK
+        ):
+            repaired = dict(
+                self.hooks.repair_response(
+                    dict(response), request, prepared_retrieval, decision
+                )
+                or {}
+            )
+            repair_retrieval = repaired.pop("_assistant_core_repair_retrieval", None)
+            if isinstance(repair_retrieval, Mapping):
+                prepared_retrieval = dict(repair_retrieval)
+            repaired["_assistant_core_repair_attempted"] = True
+            response = repaired
+            if self.hooks.validate_response is not None:
+                response = self.hooks.validate_response(
+                    dict(response or {}), request, prepared_retrieval, decision
+                )
 
         return decorate_response(response, request, decision)
