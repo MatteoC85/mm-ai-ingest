@@ -20070,8 +20070,8 @@ if V13_HEAVY_REASONING_MODE not in {"", "pro"}:
 # retrieval/synthesis primitives but chooses the response mode only after neutral
 # cross-source retrieval. Default ON; set MM_ASSISTANT_CORE_V2_ENABLED=0 only for rollback.
 ASSISTANT_CORE_V2_ENABLED = (os.environ.get("MM_ASSISTANT_CORE_V2_ENABLED") or "1").strip() != "0"
-ASSISTANT_CORE_V2_CODE_MARKER = "assistant-core-v2-canonical-monotonic-v9-0-20260804-6"
-ASSISTANT_CORE_V2_RELEASE_ID = (os.environ.get("MM_ASSISTANT_CORE_V2_RELEASE_ID") or "2026-08-04.6").strip()
+ASSISTANT_CORE_V2_CODE_MARKER = "assistant-core-v2-canonical-no-buffer-v9-1-20260804-7"
+ASSISTANT_CORE_V2_RELEASE_ID = (os.environ.get("MM_ASSISTANT_CORE_V2_RELEASE_ID") or "2026-08-04.7").strip()
 RESULT_INCOMPLETE_ANSWER_CONTRACT = "INCOMPLETE_ANSWER_CONTRACT"
 ASSISTANT_UI_RENDER_VERSION = "assistant-ui-html-procedure-bundle-v5-20260801-5"
 ASSISTANT_UI_MAX_HTML_CHARS = max(8000, min(60000, int(
@@ -30808,11 +30808,31 @@ def _assistant_core_sync(payload: Union[AskRequest, RootCauseRequest], x_ai_inte
 
 
 def _assistant_core_ask_sync(payload: AskRequest, x_ai_internal_secret: Optional[str]) -> dict:
-    return _assistant_core_sync(payload, x_ai_internal_secret, requested_mode=MODE_ASK)
+    result = _assistant_core_sync(payload, x_ai_internal_secret, requested_mode=MODE_ASK)
+    # Canonicalize the final payload before the streaming layer starts. This keeps
+    # answer and answer_html aligned without buffering or replaying the HTTP request.
+    try:
+        return _mm_v12_canonicalize(
+            result,
+            str(getattr(payload, "query", "") or ""),
+            {"stability_retry_attempted": False, "transport_buffering": False},
+        )
+    except Exception as exc:
+        print("MM_V12_CANONICALIZE_FAIL ask", str(exc)[:500])
+        return result
 
 
 def _assistant_core_root_cause_sync(payload: RootCauseRequest, x_ai_internal_secret: Optional[str]) -> dict:
-    return _assistant_core_sync(payload, x_ai_internal_secret, requested_mode=MODE_ROOT_CAUSE)
+    result = _assistant_core_sync(payload, x_ai_internal_secret, requested_mode=MODE_ROOT_CAUSE)
+    try:
+        return _mm_v12_canonicalize(
+            result,
+            str(getattr(payload, "query", "") or ""),
+            {"stability_retry_attempted": False, "transport_buffering": False},
+        )
+    except Exception as exc:
+        print("MM_V12_CANONICALIZE_FAIL root_cause", str(exc)[:500])
+        return result
 
 
 # -----------------------------------------------------------------------------
@@ -34998,8 +35018,8 @@ import time as _mm_v12_time
 import uuid as _mm_v12_uuid
 from typing import Any as _MMV12Any
 
-_MM_V12_RENDER_VERSION = "assistant-ui-html-canonical-v9-0-20260804-6"
-_MM_V12_LAYER_VERSION = "canonical-monotonic-v9-0-20260804-6"
+_MM_V12_RENDER_VERSION = "assistant-ui-html-canonical-v9-1-20260804-7"
+_MM_V12_LAYER_VERSION = "canonical-no-buffer-v9-1-20260804-7"
 _MM_V12_RECOVERABLE_CODES = {
     "NO_MACHINE_EVIDENCE",
     "INCOMPLETE_ANSWER_CONTRACT",
@@ -35407,9 +35427,12 @@ for _mm_v12_name in _MM_V12_MONOTONIC_TARGETS:
     _mm_v12_fn = globals().get(_mm_v12_name)
     if callable(_mm_v12_fn): globals()[_mm_v12_name] = _mm_v12_wrap_monotonic(_mm_v12_fn)
 
-# Add the ASGI layer once. FastAPI applies it when the middleware stack is built.
-if "app" in globals() and hasattr(app, "add_middleware"):
-    app.add_middleware(_MMV12StabilityMiddleware)
+# IMPORTANT: do not wrap ASK/Root Cause with the V12 ASGI replay middleware.
+# Those endpoints intentionally stream heartbeat bytes. Buffering the stream hides
+# every heartbeat from the client, and replaying the complete request can double the
+# total duration beyond the caller timeout. Canonicalization is applied inside the
+# sync handlers above, before StreamingResponse is created.
+_MM_V12_TRANSPORT_MIDDLEWARE_ENABLED = False
 
 # ============================================================================
 # End MachineMind V12 stability layer
