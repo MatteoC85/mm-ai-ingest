@@ -19345,8 +19345,8 @@ if V13_HEAVY_REASONING_MODE not in {"", "pro"}:
 # retrieval/synthesis primitives but chooses the response mode only after neutral
 # cross-source retrieval. Default ON; set MM_ASSISTANT_CORE_V2_ENABLED=0 only for rollback.
 ASSISTANT_CORE_V2_ENABLED = (os.environ.get("MM_ASSISTANT_CORE_V2_ENABLED") or "1").strip() != "0"
-ASSISTANT_CORE_V2_CODE_MARKER = "assistant-core-v2-grounded-contract-repair-v7-2-20260803-5"
-ASSISTANT_CORE_V2_RELEASE_ID = (os.environ.get("MM_ASSISTANT_CORE_V2_RELEASE_ID") or "2026-08-03.5").strip()
+ASSISTANT_CORE_V2_CODE_MARKER = "assistant-core-v2-monotonic-evidence-fallback-v7-3-20260804-1"
+ASSISTANT_CORE_V2_RELEASE_ID = (os.environ.get("MM_ASSISTANT_CORE_V2_RELEASE_ID") or "2026-08-04.1").strip()
 RESULT_INCOMPLETE_ANSWER_CONTRACT = "INCOMPLETE_ANSWER_CONTRACT"
 ASSISTANT_UI_RENDER_VERSION = "assistant-ui-html-procedure-bundle-v5-20260801-5"
 ASSISTANT_UI_MAX_HTML_CHARS = max(8000, min(60000, int(
@@ -27176,15 +27176,22 @@ def _assistant_core_prepare_evidence(
         REQ_CHECKLIST,
         REQ_DIAGNOSTIC_CAUSES,
     }
+    minimum_facet_coverage: Optional[float] = None
+    missing_precision_types: set[str] = set()
+    facet_threshold_pass = True
+    precision_type_annotations_pass = True
     if must_cover_facets and precision_requirements:
-        # Do not require perfect deterministic lexical coverage across languages,
-        # but require a genuine multi-facet pack before spending a synthesis call.
+        # The strict multi-facet gate remains the preferred path. It is useful for
+        # ranking and for avoiding a synthesis call on obviously incomplete packs,
+        # but its lexical/annotation coverage is not ground truth: cross-language
+        # wording and distributed procedure evidence can under-report coverage.
         minimum_facet_coverage = 0.70 if len(must_cover_facets) >= 4 else 0.80
-        supported = supported and facet_evidence_coverage >= minimum_facet_coverage
+        facet_threshold_pass = facet_evidence_coverage >= minimum_facet_coverage
+        supported = supported and facet_threshold_pass
         if covered_answer_types:
             missing_precision_types = precision_requirements - covered_answer_types
-            # The global candidate contract signals above can cover a type even when
-            # a degraded router did not annotate the corresponding facet query.
+            # Independent contract signals can satisfy precision types even when a
+            # router/facet annotation is absent.
             if REQ_NUMERIC_VALUE in missing_precision_types and numeric_viable:
                 missing_precision_types.remove(REQ_NUMERIC_VALUE)
             if REQ_INTERFACE_LOCATIONS in missing_precision_types and interface_viable:
@@ -27193,10 +27200,74 @@ def _assistant_core_prepare_evidence(
                 missing_precision_types.remove(REQ_STATE_SEQUENCE)
             if REQ_DIAGNOSTIC_CAUSES in missing_precision_types and root_viable:
                 missing_precision_types.remove(REQ_DIAGNOSTIC_CAUSES)
-            supported = supported and not missing_precision_types
+            precision_type_annotations_pass = not missing_precision_types
+            supported = supported and precision_type_annotations_pass
+
+    strict_supported = bool(supported)
+    baseline_fallback_used = False
+    baseline_fallback_reason = ""
+
+    # Monotonic ASK admission: V10.2's facet annotations may add evidence and
+    # improve ranking, but they must not erase an independently viable baseline
+    # evidence pack. When the strict gate alone rejects an ASK pack, admit the
+    # baseline to synthesis and let the existing grounded answer-contract + one
+    # bounded repair call decide whether the final answer is complete. Hard
+    # numeric/interface/sequence signals remain mandatory, and diagnostics never
+    # use this fallback.
+    if (
+        not supported
+        and decision.effective_mode == MODE_ASK
+        and not decision.degraded
+        and decision.request_kind not in {KIND_FAULT_DIAGNOSTIC, KIND_GUIDED_DIAGNOSTIC}
+        and decision.evidence_state in {EVIDENCE_SUPPORTED, EVIDENCE_PARTIAL, EVIDENCE_REFINE}
+    ):
+        baseline_strength = bool(
+            top_candidates
+            and independent_signal
+            and (
+                deterministic_state == "supported"
+                or top_similarity >= 0.38
+                or (
+                    has_procedure_sources
+                    and (
+                        top_similarity >= 0.28
+                        or facet_evidence_coverage > 0.0
+                        or top_overlap >= 0.025
+                    )
+                )
+                or (fts_hits > 0 and top_overlap >= 0.03)
+                or exact_hits > 0
+            )
+        )
+        baseline_contract_viable = bool(
+            (not needs_numeric or numeric_viable)
+            and (not needs_interface or interface_viable)
+            and (not needs_sequence or sequence_viable)
+            and (
+                not needs_ordered_actions
+                or has_procedure_sources
+                or top_similarity >= 0.40
+                or (top_similarity >= 0.32 and top_overlap >= 0.05)
+            )
+        )
+        baseline_scope_viable = bool(
+            decision.source_type_policy != "require"
+            or not preferred
+            or preferred_viable
+        )
+        if baseline_strength and baseline_contract_viable and baseline_scope_viable:
+            supported = True
+            baseline_fallback_used = True
+            baseline_fallback_reason = (
+                "strict_facet_or_annotation_gate_rejected_"
+                "independently_viable_ask_evidence"
+            )
 
     if decision.request_kind == KIND_GENERAL_TECHNICAL and decision.evidence_policy == POLICY_GENERAL_ALLOWED:
         supported = deterministic_state == "supported" and not decision.degraded
+        strict_supported = bool(supported)
+        baseline_fallback_used = False
+        baseline_fallback_reason = ""
 
     if diagnostic_mode:
         limit = V13_MAX_EVIDENCE_ITEMS_ROOT_CAUSE
@@ -27274,8 +27345,15 @@ def _assistant_core_prepare_evidence(
             "sequence_viable_count": len(sequence_viable),
             "root_viable_count": len(root_viable),
             "facet_evidence_coverage": facet_evidence_coverage,
+            "minimum_facet_coverage": minimum_facet_coverage,
+            "facet_threshold_pass": facet_threshold_pass,
             "covered_facets": sorted(covered_facets),
             "covered_answer_types": sorted(covered_answer_types),
+            "missing_precision_types": sorted(missing_precision_types),
+            "precision_type_annotations_pass": precision_type_annotations_pass,
+            "strict_supported": strict_supported,
+            "baseline_fallback_used": baseline_fallback_used,
+            "baseline_fallback_reason": baseline_fallback_reason,
             "diagnostic_clues": list(decision.diagnostic_clues),
             "diagnostic_exclusions": list(decision.diagnostic_exclusions),
             "supported": supported,
@@ -27800,6 +27878,11 @@ def _assistant_core_build_no_evidence(
             if is_en else
             "La richiesta è adatta all'analisi cause, ma nelle fonti indicizzate autorizzate non ci sono evidenze specifiche sufficienti per proporre cause affidabili."
         )
+        meta = {"cacheable": False, "semantic_cacheable": False}
+        if request.debug:
+            meta["assistant_core_evidence_admission"] = dict(
+                retrieval.get("assistant_core_decision") or {}
+            )
         return {
             "ok": True, "status": "no_sources", "result_code": RESULT_NO_MACHINE_EVIDENCE,
             "symptom": request.query, "language": request.response_language,
@@ -27807,20 +27890,25 @@ def _assistant_core_build_no_evidence(
             "citations": [], "rg_links": [], "top_k": request.top_k,
             "similarity_max": (retrieval.get("metrics") or {}).get("top_similarity"),
             "chat_model": "assistant_core_evidence_router",
-            "meta": {"cacheable": False, "semantic_cacheable": False},
+            "meta": meta,
         }
     message = (
         "I cannot find enough information in the authorized indexed sources for this machine to answer reliably."
         if is_en else
         "Non trovo nelle fonti indicizzate autorizzate di questa macchina informazioni sufficienti per rispondere in modo affidabile."
     )
+    meta = {"cacheable": False, "semantic_cacheable": False}
+    if request.debug:
+        meta["assistant_core_evidence_admission"] = dict(
+            retrieval.get("assistant_core_decision") or {}
+        )
     return {
         "ok": True, "status": "no_sources", "result_code": RESULT_NO_MACHINE_EVIDENCE,
         "answer": message, "language": request.response_language,
         "citations": [], "rg_links": [], "top_k": request.top_k,
         "similarity_max": (retrieval.get("metrics") or {}).get("top_similarity"),
         "chat_model": "assistant_core_evidence_router",
-        "meta": {"cacheable": False, "semantic_cacheable": False},
+        "meta": meta,
     }
 
 
@@ -29189,6 +29277,10 @@ def _assistant_core_validate_response(
         "unsupported_numeric_or_code_claims_removed": sorted(set(removed_claims))[:20],
         "answer_contract": dict(answer_contract_result),
     }
+    if request.debug:
+        meta["assistant_core_evidence_admission"] = dict(
+            retrieval.get("assistant_core_decision") or {}
+        )
     out["meta"] = meta
     # Internal-only data survives only between the first validation and the
     # single bounded repair hook. It is never exposed in the final API payload.
