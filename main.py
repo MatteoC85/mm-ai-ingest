@@ -2088,6 +2088,134 @@ def _db_fetch_related_step_pages(
                 pass
 
 
+
+def _db_fetch_parent_procedure_pages_for_steps(
+    *,
+    company_id: str,
+    machine_id: str,
+    child_source_keys: list[str],
+    text_chars: int,
+) -> list[dict]:
+    """Resolve Step -> Procedure using the canonical relation table.
+
+    The query is read-only and never touches chunks or embeddings. A LEFT JOIN keeps
+    the relation usable even when the Procedure page is temporarily unavailable; the
+    caller can then build a minimal parent placeholder and fall back safely.
+    """
+    child_keys = _dedup_text_values(
+        [str(value or "").strip() for value in (child_source_keys or [])],
+        limit=500,
+    )
+    if not (company_id and machine_id and child_keys):
+        return []
+
+    conn = None
+    try:
+        conn = _db_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    r.child_source_key,
+                    r.parent_source_key,
+                    r.ordinal,
+                    p.machine_id,
+                    p.page_number,
+                    LEFT(COALESCE(p.text, ''), %s) AS parent_text
+                FROM public.structured_source_relations AS r
+                LEFT JOIN public.document_pages AS p
+                  ON p.company_id = r.company_id
+                 AND p.bubble_document_id = r.parent_source_key
+                 AND (p.machine_id = r.machine_id OR p.machine_id IS NULL OR p.machine_id = '')
+                WHERE r.company_id = %s
+                  AND r.machine_id = %s
+                  AND r.child_source_key = ANY(%s)
+                  AND r.relation_type = %s
+                ORDER BY
+                    r.child_source_key,
+                    r.ordinal NULLS LAST,
+                    CASE WHEN p.machine_id = %s THEN 0 ELSE 1 END,
+                    p.page_number NULLS LAST;
+                """,
+                (
+                    int(text_chars),
+                    company_id,
+                    machine_id,
+                    child_keys,
+                    STRUCTURED_RELATION_PROCEDURE_STEP,
+                    machine_id,
+                ),
+            )
+            rows = cur.fetchall()
+    except Exception as exc:
+        print("STRUCTURED_RELATION_PARENT_READ_FALLBACK", str(exc)[:700])
+        return []
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    out: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for child_key, parent_key, ordinal, parent_mid, page_number, parent_text in rows:
+        child = str(child_key or "").strip()
+        parent = str(parent_key or "").strip()
+        if not child or not parent:
+            continue
+        key = (child, parent)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(
+            {
+                "child_source_key": child,
+                "parent_source_key": parent,
+                "ordinal": _safe_int(ordinal, 0) or None,
+                "machine_id": str(parent_mid or "").strip(),
+                "page_number": _safe_int(page_number, 1),
+                "parent_text": str(parent_text or "").strip(),
+            }
+        )
+    return out
+
+
+def _v12_relation_procedure_candidate(
+    *,
+    parent_source_key: str,
+    machine_id: str,
+    page_number: int,
+    parent_text: str,
+    fallback_title: str = "",
+) -> dict:
+    """Build a normal structured Procedure candidate from a relation row."""
+    parent_key = str(parent_source_key or "").strip()
+    page_no = max(1, _safe_int(page_number, 1))
+    title = _clean_display_text(fallback_title, max_len=140)
+    body = str(parent_text or "").strip()
+    if not body:
+        body = "SOURCE_TYPE: procedure\nTITLE: " + (title or "Procedura")
+    return {
+        "citation_id": f"{parent_key}:p{page_no}-{page_no}:procedure-family:v10_5",
+        "bubble_document_id": parent_key,
+        "chunk_index": 1,
+        "page_from": page_no,
+        "page_to": page_no,
+        "snippet": body[: int(ASK_SNIPPET_CHARS or 900)],
+        "snippet_clean": body[: int(ASK_SNIPPET_CHARS or 900)],
+        "chunk_full": body,
+        "similarity": 0.96,
+        "retrieval_score": 0.96,
+        "source_type": "procedure",
+        "evidence_role": "procedure",
+        "ask_structured_direct": True,
+        "structured_direct_score": 12.0,
+        "exact_machine_scope": bool(machine_id),
+        "embedding_list": [],
+        "structured_relation_source": "structured_source_relations_parent_recovery",
+    }
+
 def _db_delete_structured_relations_for_source(company_id: str, source_key: str) -> int:
     if not (company_id and source_key):
         return 0
@@ -10776,6 +10904,364 @@ def _v12_expand_primary_procedure_steps(
     return sorted(best_by_doc.values(), key=_v12_step_sort_key)
 
 
+
+def _v12_merge_candidate_metadata(preferred: dict, secondary: dict) -> dict:
+    """Preserve semantic/facet annotations while keeping the better source body."""
+    out = dict(secondary or {})
+    out.update(dict(preferred or {}))
+    for key in (
+        "assistant_core_facet_hits",
+        "assistant_core_covered_facets",
+        "matched_subsystems",
+    ):
+        merged = _dedup_text_values(
+            list((preferred or {}).get(key) or []) + list((secondary or {}).get(key) or []),
+            limit=24,
+        )
+        if merged:
+            out[key] = merged
+    for key in (
+        "v13_score",
+        "retrieval_score",
+        "similarity",
+        "semantic_similarity",
+        "assistant_core_facet_coverage",
+    ):
+        values = []
+        for source in (preferred or {}, secondary or {}):
+            try:
+                values.append(float(source.get(key) or 0.0))
+            except Exception:
+                pass
+        if values:
+            out[key] = max(values)
+    return out
+
+
+def _v12_dedupe_family_steps(steps: list[dict]) -> list[dict]:
+    """Deduplicate Step representations and conflicting duplicate ordinals."""
+    best_by_doc: dict[str, dict] = {}
+    for candidate in steps or []:
+        if not isinstance(candidate, dict):
+            continue
+        bdid = str(candidate.get("bubble_document_id") or "").strip()
+        if not bdid:
+            continue
+        current = best_by_doc.get(bdid)
+        if current is None:
+            best_by_doc[bdid] = dict(candidate)
+            continue
+        if _v12_structured_rank(candidate, set()) < _v12_structured_rank(current, set()):
+            best_by_doc[bdid] = _v12_merge_candidate_metadata(candidate, current)
+        else:
+            best_by_doc[bdid] = _v12_merge_candidate_metadata(current, candidate)
+
+    best_by_number: dict[tuple[int, str], dict] = {}
+    for candidate in best_by_doc.values():
+        number = _v12_step_sort_key(candidate)[0]
+        key = (number, "") if 0 < number < 9999 else (number, str(candidate.get("bubble_document_id") or ""))
+        current = best_by_number.get(key)
+        if current is None:
+            best_by_number[key] = candidate
+            continue
+        current_relation = str(current.get("structured_relation_source") or "")
+        new_relation = str(candidate.get("structured_relation_source") or "")
+        current_priority = 0 if current_relation == "structured_source_relations" else 1
+        new_priority = 0 if new_relation == "structured_source_relations" else 1
+        if (new_priority, _v12_structured_rank(candidate, set())) < (
+            current_priority,
+            _v12_structured_rank(current, set()),
+        ):
+            best_by_number[key] = _v12_merge_candidate_metadata(candidate, current)
+        else:
+            best_by_number[key] = _v12_merge_candidate_metadata(current, candidate)
+    return sorted(best_by_number.values(), key=_v12_step_sort_key)
+
+
+def _v12_family_facet_queries(planner: Optional[dict]) -> list[dict]:
+    rows: list[dict] = []
+    for raw in list((planner or {}).get("facet_queries") or []):
+        if not isinstance(raw, dict):
+            continue
+        facet = str(raw.get("facet") or "").strip()
+        if not facet:
+            continue
+        rows.append(
+            {
+                "facet": facet,
+                "answer_type": str(raw.get("answer_type") or "").strip().lower(),
+                "must_cover": bool(raw.get("must_cover", True)),
+                "dense_queries": _dedup_text_values(raw.get("dense_queries") or [], limit=8),
+                "lexical_queries": _dedup_text_values(raw.get("lexical_queries") or [], limit=8),
+                "exact_terms": _dedup_text_values(raw.get("exact_terms") or [], limit=10),
+            }
+        )
+    return rows
+
+
+def _v12_family_score(
+    *,
+    q: str,
+    planner: Optional[dict],
+    procedure: dict,
+    seed_steps: list[dict],
+    complete_steps: list[dict],
+    raw_procedure_present: bool,
+) -> dict:
+    facets = _dedup_text_values((planner or {}).get("required_facets") or [], limit=12)
+    complete_text = "\n".join(
+        _v13_candidate_text(candidate)
+        for candidate in [procedure] + list(complete_steps or [])
+        if isinstance(candidate, dict)
+    )
+    seed_text = "\n".join(
+        _v13_candidate_text(candidate)
+        for candidate in list(seed_steps or [])
+        if isinstance(candidate, dict)
+    )
+    complete_metrics = _assistant_core_required_facet_metrics(complete_text, facets)
+    seed_metrics = _assistant_core_required_facet_metrics(seed_text, facets)
+    direct_scores = [
+        _v12_step_direct_query_score(step, q)
+        for step in (complete_steps or [])
+        if isinstance(step, dict)
+    ]
+    procedure_terms = _content_term_set(_v13_candidate_text(procedure), limit=160)
+    query_terms = _content_term_set(q, limit=80)
+    procedure_overlap = (
+        _term_overlap_score(query_terms, procedure_terms)
+        if query_terms and procedure_terms else 0.0
+    )
+    seed_quality = max(
+        [
+            float(step.get("v13_score", step.get("retrieval_score", step.get("similarity", 0.0))) or 0.0)
+            for step in (seed_steps or [])
+        ]
+        or [0.0]
+    )
+    relation_seed_count = sum(
+        1
+        for step in (seed_steps or [])
+        if str(step.get("_v10_5_parent_source_key") or "").strip()
+    )
+    exact_machine = any(bool(step.get("exact_machine_scope")) for step in (seed_steps or []))
+    complete_coverage = float(complete_metrics.get("coverage") or 0.0)
+    seed_coverage = float(seed_metrics.get("coverage") or 0.0)
+    max_direct = max(direct_scores or [0.0])
+    seed_count = len({str(step.get("bubble_document_id") or "") for step in (seed_steps or []) if str(step.get("bubble_document_id") or "")})
+    score = (
+        4.0 * complete_coverage
+        + 2.2 * seed_coverage
+        + 0.38 * min(seed_count, 6)
+        + 1.30 * max_direct
+        + 0.70 * procedure_overlap
+        + 0.28 * min(relation_seed_count, 4)
+        + 0.18 * min(1.0, seed_quality)
+        + (0.12 if exact_machine else 0.0)
+        + (0.08 if raw_procedure_present else 0.0)
+    )
+    return {
+        "score": float(score),
+        "facet_coverage": complete_coverage,
+        "seed_facet_coverage": seed_coverage,
+        "covered_facets": list(complete_metrics.get("covered") or []),
+        "missing_facets": list(complete_metrics.get("missing") or []),
+        "seed_count": seed_count,
+        "relation_seed_count": relation_seed_count,
+        "max_direct_step_score": float(max_direct),
+        "procedure_overlap": float(procedure_overlap),
+        "seed_quality": float(seed_quality),
+        "raw_procedure_present": bool(raw_procedure_present),
+    }
+
+
+def _v12_choose_primary_procedure_family(
+    *,
+    company_id: str,
+    machine_id: str,
+    q: str,
+    planner: Optional[dict],
+    citations: list[dict],
+    model_used: Optional[list[dict]] = None,
+) -> tuple[Optional[dict], list[dict], dict]:
+    """Recover and rank Procedure families from the Step children first.
+
+    Semantic ranking may omit the parent Procedure or include a nearby parent from
+    another family. The canonical relation table is therefore authoritative. The
+    family that best covers the router facets and has the strongest admitted Step
+    support wins; a Procedure title alone cannot outvote its own children.
+    """
+    citations = [dict(c) for c in (citations or []) if isinstance(c, dict)]
+    model_used = [dict(c) for c in (model_used or []) if isinstance(c, dict)]
+    raw_procedures = [c for c in citations if _v12_evidence_role(c) == "procedure"]
+    raw_steps = [c for c in citations if _v12_evidence_role(c) == "step"]
+    if not raw_steps and not raw_procedures:
+        return None, [], {"reason": "no_procedure_or_step_sources"}
+
+    procedure_by_key: dict[str, dict] = {}
+    raw_procedure_keys: set[str] = set()
+    for procedure in raw_procedures:
+        key = str(procedure.get("bubble_document_id") or "").strip()
+        if not key:
+            continue
+        raw_procedure_keys.add(key)
+        current = procedure_by_key.get(key)
+        if current is None or _v12_structured_rank(procedure, set()) < _v12_structured_rank(current, set()):
+            procedure_by_key[key] = dict(procedure)
+
+    child_keys = _dedup_text_values(
+        [str(step.get("bubble_document_id") or "").strip() for step in raw_steps],
+        limit=500,
+    )
+    relation_rows = _db_fetch_parent_procedure_pages_for_steps(
+        company_id=company_id,
+        machine_id=machine_id,
+        child_source_keys=child_keys,
+        text_chars=max(800, int(ASK_STRUCTURED_DIRECT_TEXT_CHARS or 5000)),
+    )
+    parent_by_child: dict[str, dict] = {}
+    children_by_parent: dict[str, list[dict]] = {}
+    for row in relation_rows:
+        child = str(row.get("child_source_key") or "").strip()
+        parent = str(row.get("parent_source_key") or "").strip()
+        if not child or not parent:
+            continue
+        parent_by_child[child] = dict(row)
+        fallback_title = ""
+        for step in raw_steps:
+            if str(step.get("bubble_document_id") or "").strip() != child:
+                continue
+            values = _v12_structured_parent_values(step)
+            if values:
+                fallback_title = str(values[0] or "")
+            break
+        if parent not in procedure_by_key:
+            procedure_by_key[parent] = _v12_relation_procedure_candidate(
+                parent_source_key=parent,
+                machine_id=str(row.get("machine_id") or machine_id),
+                page_number=_safe_int(row.get("page_number"), 1),
+                parent_text=str(row.get("parent_text") or ""),
+                fallback_title=fallback_title,
+            )
+        children_by_parent.setdefault(parent, [])
+
+    unresolved_steps: list[dict] = []
+    for step in raw_steps:
+        child = str(step.get("bubble_document_id") or "").strip()
+        relation = parent_by_child.get(child)
+        if relation:
+            parent = str(relation.get("parent_source_key") or "").strip()
+            cc = dict(step)
+            cc["_v10_5_parent_source_key"] = parent
+            if relation.get("ordinal") is not None:
+                cc["structured_relation_ordinal"] = _safe_int(relation.get("ordinal"), 0)
+            cc.setdefault("structured_relation_source", "structured_source_relations_seed")
+            children_by_parent.setdefault(parent, []).append(cc)
+        else:
+            unresolved_steps.append(dict(step))
+
+    # Compatibility for legacy data or a staged migration: assign a Step only when
+    # its indexed parent metadata identifies exactly one available Procedure.
+    for step in unresolved_steps:
+        matching = [
+            key for key, procedure in procedure_by_key.items()
+            if _v12_step_matches_procedure(step, procedure) is True
+        ]
+        if len(matching) == 1:
+            parent = matching[0]
+            cc = dict(step)
+            cc["_v10_5_parent_source_key"] = parent
+            cc.setdefault("structured_relation_source", "legacy_parent_text_seed")
+            children_by_parent.setdefault(parent, []).append(cc)
+
+    # Include Procedure-only families as low-priority fallbacks, but never let them
+    # beat a related Step family solely on semantic similarity.
+    for key in procedure_by_key:
+        children_by_parent.setdefault(key, [])
+
+    families: list[dict] = []
+    for parent_key, seed_steps in children_by_parent.items():
+        procedure = procedure_by_key.get(parent_key)
+        if not isinstance(procedure, dict):
+            continue
+        procedure = dict(procedure)
+        procedure["evidence_role"] = "procedure"
+        procedure["ask_structured_direct"] = True
+        complete_steps = _v12_expand_primary_procedure_steps(
+            company_id=company_id,
+            machine_id=machine_id,
+            procedure=procedure,
+            existing_steps=list(raw_steps),
+        )
+        complete_steps = _v12_dedupe_family_steps(list(complete_steps) + list(seed_steps))
+        if not complete_steps and seed_steps:
+            complete_steps = _v12_dedupe_family_steps(seed_steps)
+        metrics = _v12_family_score(
+            q=q,
+            planner=planner,
+            procedure=procedure,
+            seed_steps=seed_steps,
+            complete_steps=complete_steps,
+            raw_procedure_present=parent_key in raw_procedure_keys,
+        )
+        families.append(
+            {
+                "parent_source_key": parent_key,
+                "procedure": procedure,
+                "seed_steps": list(seed_steps),
+                "complete_steps": complete_steps,
+                "metrics": metrics,
+            }
+        )
+
+    if not families:
+        return None, [], {
+            "reason": "no_resolved_procedure_family",
+            "raw_step_count": len(raw_steps),
+            "relation_row_count": len(relation_rows),
+        }
+
+    families.sort(
+        key=lambda row: (
+            -float((row.get("metrics") or {}).get("score") or 0.0),
+            -float((row.get("metrics") or {}).get("facet_coverage") or 0.0),
+            -float((row.get("metrics") or {}).get("seed_facet_coverage") or 0.0),
+            -int((row.get("metrics") or {}).get("seed_count") or 0),
+            str(row.get("parent_source_key") or ""),
+        )
+    )
+    winner = families[0]
+    runner_up_score = float((families[1].get("metrics") or {}).get("score") or 0.0) if len(families) > 1 else None
+    winner_score = float((winner.get("metrics") or {}).get("score") or 0.0)
+    debug = {
+        "reason": "family_voting",
+        "selected_parent_source_key": str(winner.get("parent_source_key") or ""),
+        "selected_score": round(winner_score, 6),
+        "runner_up_score": round(runner_up_score, 6) if runner_up_score is not None else None,
+        "relation_row_count": len(relation_rows),
+        "families": [
+            {
+                "parent_source_key": str(row.get("parent_source_key") or ""),
+                **{
+                    key: value
+                    for key, value in dict(row.get("metrics") or {}).items()
+                    if key not in {"covered_facets", "missing_facets"}
+                },
+                "covered_facets": list((row.get("metrics") or {}).get("covered_facets") or []),
+                "step_numbers": [
+                    _v12_step_sort_key(step)[0]
+                    for step in (row.get("complete_steps") or [])
+                    if 0 < _v12_step_sort_key(step)[0] < 9999
+                ],
+            }
+            for row in families[:6]
+        ],
+    }
+    procedure = dict(winner.get("procedure") or {})
+    procedure["_v10_5_family_debug"] = debug
+    return procedure, list(winner.get("complete_steps") or []), debug
+
+
 def _v12_curate_structured_sources(
     *,
     company_id: str,
@@ -10790,10 +11276,14 @@ def _v12_curate_structured_sources(
     if not citations:
         return []
     intent = _ask_structured_direct_intent(q, planner=planner)
+    planner_task = str((planner or {}).get("information_task") or "").strip().lower()
     operational = bool(
-        intent.get("enabled")
-        and not intent.get("broad_overview")
-        and any(p in {"procedure", "step"} for p in (intent.get("prefixes") or []))
+        planner_task in {INFO_PROCEDURE_FULL, INFO_PROCEDURE_SEGMENT}
+        or (
+            intent.get("enabled")
+            and not intent.get("broad_overview")
+            and any(p in {"procedure", "step"} for p in (intent.get("prefixes") or []))
+        )
     )
     model_used = [dict(c) for c in model_used or [] if isinstance(c, dict)]
     if not operational:
@@ -10809,25 +11299,30 @@ def _v12_curate_structured_sources(
         ]
         return kept or citations[:1]
 
-    primary = _v12_choose_primary_procedure(citations, model_used)
+    primary, expanded_steps, family_debug = _v12_choose_primary_procedure_family(
+        company_id=company_id,
+        machine_id=machine_id,
+        q=q,
+        planner=planner,
+        citations=citations,
+        model_used=model_used,
+    )
     if primary is None:
         used_ids = {str(c.get("citation_id") or "") for c in model_used}
         if used_ids:
             kept = [c for c in citations if str(c.get("citation_id") or "") in used_ids]
             return kept or citations
+        # Do not manufacture INCOMPLETE_PROCEDURE_BUNDLE here. Returning the
+        # admitted evidence lets the caller fall back to a grounded multi-source
+        # procedural synthesis when no single family is objectively dominant.
         return citations
 
     primary = dict(primary)
     primary["evidence_role"] = "procedure"
     primary["ask_structured_direct"] = True
+    primary["_v10_5_family_debug"] = dict(family_debug or {})
 
     existing_steps = [c for c in citations if _v12_evidence_role(c) == "step"]
-    expanded_steps = _v12_expand_primary_procedure_steps(
-        company_id=company_id,
-        machine_id=machine_id,
-        procedure=primary,
-        existing_steps=existing_steps,
-    )
     used_ids = {str(c.get("citation_id") or "") for c in model_used}
     for c in existing_steps:
         relation = _v12_step_matches_procedure(c, primary)
@@ -12435,12 +12930,207 @@ def _v12_range_anchor_span(steps: list[dict], q: str) -> tuple[int, int] | None:
     return start_no, end_no
 
 
+
+def _v12_procedure_selection_mode(q: str, planner: Optional[dict]) -> str:
+    if _v12_query_requests_full_procedure(q):
+        return "full"
+    if _v12_query_range_anchors(q) != ("", ""):
+        return "contiguous_span"
+    required_types = {
+        str(value or "").strip().lower()
+        for value in ((planner or {}).get("required_answer_types") or [])
+        if str(value or "").strip()
+    }
+    facet_types = {
+        str(row.get("answer_type") or "").strip().lower()
+        for row in _v12_family_facet_queries(planner)
+    }
+    combined = required_types | facet_types
+    # A request for conditions/checks plus ordered actions is a procedural
+    # checklist. Relevant Steps may be non-contiguous (for example initial safety,
+    # safety reset and final deliberate start). Physical "from...to..." ranges were
+    # already handled above and remain contiguous.
+    if "checklist" in combined and (
+        "safety_conditions" in combined or "ordered_actions" in combined
+    ):
+        return "sparse_ordered_steps"
+    return "contiguous_span"
+
+
+def _v12_step_contract_text(step: dict) -> str:
+    fields = _procedure_ui_fields(step)
+    sections = _procedure_ui_sections(fields.get("description") or "")
+    return " ".join(
+        [
+            str(fields.get("title") or ""),
+            str(sections.get("instruction") or sections.get("body") or ""),
+            str(sections.get("safety") or ""),
+        ]
+    ).strip()
+
+
+def _v12_step_facet_score(step: dict, facet_query: dict, q: str) -> dict:
+    text = _normalize_unicode_advanced(_v12_step_contract_text(step)).lower()
+    text_terms = _content_term_set(text, limit=220)
+    values = _dedup_text_values(
+        [facet_query.get("facet")]
+        + list(facet_query.get("dense_queries") or [])
+        + list(facet_query.get("lexical_queries") or []),
+        limit=20,
+    )
+    phrase_score = 0.0
+    for value in values:
+        terms = _content_term_set(value, limit=45)
+        if not terms or not text_terms:
+            continue
+        overlap = _term_overlap_score(terms, text_terms)
+        exact_hits = sum(1 for term in terms if term in text)
+        phrase_score = max(phrase_score, float(overlap + 0.06 * exact_hits))
+
+    exact_terms = _dedup_text_values(facet_query.get("exact_terms") or [], limit=12)
+    matched_exact: list[str] = []
+    for term in exact_terms:
+        normalized = re.sub(
+            r"\s+", " ", _normalize_unicode_advanced(str(term or "")).lower()
+        ).strip()
+        if normalized and normalized in text:
+            matched_exact.append(term)
+            continue
+        term_set = _content_term_set(normalized, limit=20)
+        if term_set and len(term_set & text_terms) / max(1, len(term_set)) >= 0.67:
+            matched_exact.append(term)
+
+    facet = str(facet_query.get("facet") or "").strip()
+    facet_coverage = float(
+        _assistant_core_required_facet_metrics(text, [facet]).get("coverage") or 0.0
+    ) if facet else 0.0
+    direct = _v12_step_direct_query_score(step, q)
+    score = (
+        phrase_score
+        + 0.15 * min(len(matched_exact), 4)
+        + 0.22 * facet_coverage
+        + 0.14 * direct
+    )
+    return {
+        "score": float(score),
+        "phrase_score": float(phrase_score),
+        "facet_coverage": facet_coverage,
+        "matched_exact_terms": matched_exact,
+        "direct_query_score": float(direct),
+    }
+
+
+def _v12_select_sparse_ordered_steps(
+    *,
+    all_steps: list[dict],
+    q: str,
+    planner: Optional[dict],
+    seed_step_ids: Optional[set[str]] = None,
+) -> list[dict]:
+    steps = _v12_dedupe_family_steps(all_steps)
+    if not steps:
+        return []
+    facet_queries = _v12_family_facet_queries(planner)
+    selected_ids: set[str] = set()
+    step_scores: dict[str, float] = {}
+
+    for facet_query in facet_queries:
+        ranked: list[tuple[float, int, dict, dict]] = []
+        for step in steps:
+            metrics = _v12_step_facet_score(step, facet_query, q)
+            score = float(metrics.get("score") or 0.0)
+            bdid = str(step.get("bubble_document_id") or "").strip()
+            if bdid:
+                step_scores[bdid] = max(step_scores.get(bdid, 0.0), score)
+            ranked.append((score, _v12_step_sort_key(step)[0], step, metrics))
+        ranked.sort(key=lambda row: (-row[0], row[1], str(row[2].get("bubble_document_id") or "")))
+        if not ranked or ranked[0][0] <= 0.035:
+            continue
+        best_score, _, best_step, best_metrics = ranked[0]
+        best_id = str(best_step.get("bubble_document_id") or "").strip()
+        if best_id:
+            selected_ids.add(best_id)
+
+        answer_type = str(facet_query.get("answer_type") or "").strip().lower()
+        if answer_type in {"checklist", "safety_conditions"}:
+            best_exact = {
+                str(value or "").strip().casefold()
+                for value in (best_metrics.get("matched_exact_terms") or [])
+                if str(value or "").strip()
+            }
+            for second_score, _, second_step, second_metrics in ranked[1:3]:
+                if second_score < max(0.055, best_score * 0.55):
+                    continue
+                second_exact = {
+                    str(value or "").strip().casefold()
+                    for value in (second_metrics.get("matched_exact_terms") or [])
+                    if str(value or "").strip()
+                }
+                adds_information = bool(second_exact - best_exact) or (
+                    float(second_metrics.get("phrase_score") or 0.0) >= 0.12
+                    and _v12_step_sort_key(second_step)[0] != _v12_step_sort_key(best_step)[0]
+                )
+                if adds_information:
+                    second_id = str(second_step.get("bubble_document_id") or "").strip()
+                    if second_id:
+                        selected_ids.add(second_id)
+                    break
+
+    # Preserve admitted Step evidence when it belongs to the winning family and is
+    # independently relevant to the query. This improves recall without filling the
+    # gaps between sparse checks.
+    direct_rows = [
+        (
+            _v12_step_direct_query_score(step, q),
+            _v12_step_sort_key(step)[0],
+            step,
+        )
+        for step in steps
+    ]
+    max_direct = max((row[0] for row in direct_rows), default=0.0)
+    if max_direct >= 0.055:
+        threshold = max(0.055, max_direct * 0.68)
+        for direct, _, step in direct_rows:
+            bdid = str(step.get("bubble_document_id") or "").strip()
+            if bdid and direct >= threshold:
+                selected_ids.add(bdid)
+
+    for step in steps:
+        bdid = str(step.get("bubble_document_id") or "").strip()
+        cid = str(step.get("citation_id") or "").strip()
+        if not bdid:
+            continue
+        if seed_step_ids and (bdid in seed_step_ids or cid in seed_step_ids):
+            if step_scores.get(bdid, 0.0) >= 0.045 or _v12_step_direct_query_score(step, q) >= 0.045:
+                selected_ids.add(bdid)
+
+    selected = [
+        step for step in steps
+        if str(step.get("bubble_document_id") or "").strip() in selected_ids
+    ]
+    if not selected:
+        return []
+
+    # Bound UI/context growth. Keep the strongest six while restoring Bubble order.
+    if len(selected) > 6:
+        selected.sort(
+            key=lambda step: (
+                -step_scores.get(str(step.get("bubble_document_id") or ""), 0.0),
+                -_v12_step_direct_query_score(step, q),
+                _v12_step_sort_key(step)[0],
+            )
+        )
+        selected = selected[:6]
+    return sorted(selected, key=_v12_step_sort_key)
+
+
 def _v12_select_response_steps(
     *,
     all_steps: list[dict],
     selected_step_ids: list[str],
     model_used_citations: list[dict],
     q: str,
+    planner: Optional[dict] = None,
 ) -> list[dict]:
     """Choose the smallest coherent contiguous interval from one Procedure family.
 
@@ -12458,7 +13148,8 @@ def _v12_select_response_steps(
     )
     if not steps:
         return []
-    if _v12_query_requests_full_procedure(q):
+    selection_mode = _v12_procedure_selection_mode(q, planner)
+    if selection_mode == "full":
         return steps
 
     selected_ids = {
@@ -12483,6 +13174,15 @@ def _v12_select_response_steps(
             selected_numbers.add(_v12_step_sort_key(step)[0])
 
     selected_numbers = {n for n in selected_numbers if 0 < n < 9999}
+
+    if selection_mode == "sparse_ordered_steps":
+        seed_ids = set(selected_ids) | set(used_ids)
+        return _v12_select_sparse_ordered_steps(
+            all_steps=steps,
+            q=q,
+            planner=planner,
+            seed_step_ids=seed_ids,
+        )
 
     range_span = _v12_range_anchor_span(steps, q)
     if range_span is not None:
@@ -12644,12 +13344,7 @@ def _ask_structured_direct_answer(
         procedure_mode and _v12_query_requires_step_sequence(q, profile)
     )
     if procedure_sequence_mode and not complete_procedure_steps:
-        return _v12_incomplete_procedure_response(
-            response_language=response_language,
-            result_code="INCOMPLETE_PROCEDURE_BUNDLE",
-            procedure=primary_procedure,
-            debug_detail={"expanded_step_count": 0},
-        )
+        return None
 
     system_msg = (
         "You are MachineMind ASK. Answer primarily from STRUCTURED SOURCES. "
@@ -12682,7 +13377,7 @@ def _ask_structured_direct_answer(
         system_msg += (
             " For a Procedure, selected_step_citation_ids is mandatory. "
             "If the user asks for the complete Procedure, select every Step. "
-            "If the user asks for only part of it, select the smallest contiguous Step interval that directly performs the requested operation. "
+            "If the user asks for a physical/temporal part delimited by start and end anchors, select the smallest contiguous Step interval. If the request is a checklist of conditions or prerequisites, select the smallest ordered set of relevant Steps even when they are non-contiguous. "
             "Do not include earlier loading, setup or capacity checks merely because they belong to the same Procedure; include them only when the requested operation cannot safely or technically start without that exact Step. "
             "Include the immediately adjacent closing or verification Step only when needed to leave the machine in a coherent state. "
             "Select only Step citation ids from the provided Procedure family, preserve their order, and cite every selected Step in grounded_points. "
@@ -12727,19 +13422,10 @@ def _ask_structured_direct_answer(
             selected_step_ids=selected_step_ids,
             model_used_citations=model_used_citations,
             q=q,
+            planner=planner,
         )
         if not selected_procedure_steps:
-            return _v12_incomplete_procedure_response(
-                response_language=response_language,
-                result_code="INCOMPLETE_PROCEDURE_SELECTION",
-                procedure=primary_procedure,
-                debug_detail={
-                    "expanded_step_numbers": [
-                        _v12_step_sort_key(c)[0] for c in complete_procedure_steps
-                    ],
-                    "model_selected_step_ids": selected_step_ids,
-                },
-            )
+            return None
 
         extras = [
             dict(c) for c in (model_used_citations or [])
@@ -19345,8 +20031,8 @@ if V13_HEAVY_REASONING_MODE not in {"", "pro"}:
 # retrieval/synthesis primitives but chooses the response mode only after neutral
 # cross-source retrieval. Default ON; set MM_ASSISTANT_CORE_V2_ENABLED=0 only for rollback.
 ASSISTANT_CORE_V2_ENABLED = (os.environ.get("MM_ASSISTANT_CORE_V2_ENABLED") or "1").strip() != "0"
-ASSISTANT_CORE_V2_CODE_MARKER = "assistant-core-v2-monotonic-evidence-fallback-v7-3-20260804-1"
-ASSISTANT_CORE_V2_RELEASE_ID = (os.environ.get("MM_ASSISTANT_CORE_V2_RELEASE_ID") or "2026-08-04.1").strip()
+ASSISTANT_CORE_V2_CODE_MARKER = "assistant-core-v2-procedure-family-voting-v7-4-20260804-2"
+ASSISTANT_CORE_V2_RELEASE_ID = (os.environ.get("MM_ASSISTANT_CORE_V2_RELEASE_ID") or "2026-08-04.2").strip()
 RESULT_INCOMPLETE_ANSWER_CONTRACT = "INCOMPLETE_ANSWER_CONTRACT"
 ASSISTANT_UI_RENDER_VERSION = "assistant-ui-html-procedure-bundle-v5-20260801-5"
 ASSISTANT_UI_MAX_HTML_CHARS = max(8000, min(60000, int(
@@ -25026,12 +25712,12 @@ def _v13_structured_ask(
             if 0 < _v12_step_sort_key(c)[0] < 9999
         ]
         if primary is None or not complete_steps:
-            return _v12_incomplete_procedure_response(
-                response_language=response_language,
-                result_code="INCOMPLETE_PROCEDURE_BUNDLE",
-                procedure=primary,
-                debug_detail={"expanded_step_numbers": expanded_step_numbers},
-            )
+            # A Procedure title/parent may be absent from semantic top-k. Family
+            # recovery above normally restores it from Step relations; if no single
+            # family can be proven, return None so the caller can perform the normal
+            # grounded multi-source procedural synthesis instead of a false bundle
+            # error.
+            return None
 
         if information_task == INFO_PROCEDURE_FULL:
             selected_steps = complete_steps
@@ -25041,14 +25727,10 @@ def _v13_structured_ask(
                 selected_step_ids=[],
                 model_used_citations=[],
                 q=q,
+                planner=planner,
             )
         if not selected_steps:
-            return _v12_incomplete_procedure_response(
-                response_language=response_language,
-                result_code="INCOMPLETE_PROCEDURE_SELECTION",
-                procedure=primary,
-                debug_detail={"expanded_step_numbers": expanded_step_numbers},
-            )
+            return None
 
         selected_step_numbers = [
             _v12_step_sort_key(c)[0] for c in selected_steps
@@ -25103,7 +25785,7 @@ def _v13_structured_ask(
 
     system_msg = (
         "You are MachineMind ASK. Use only the supplied evidence. Structured procedures and their explicitly related ordered steps are primary. "
-        "Never mix steps from different procedure families. Preserve all available ordered steps, conditions and warnings needed to perform the operation. "
+        "Never mix steps from different procedure families. The supplied Step set is authoritative: it may be a contiguous operation span or a sparse ordered checklist of conditions. Preserve its order, do not invent missing intermediate Steps, and include all supplied conditions and warnings needed to answer the request. "
         "Manual-support sources are secondary: use them only for directly relevant operating detail, prerequisite or safety context, and keep their citations so the manual appears among the links. "
         "For P&S records, report problem, solution and notes. For photo/video records, use title/description metadata only and never claim visual or audio inspection. "
         "Every visible point must be grounded in citation_ids from SOURCES. Do not expose raw ids in text. Reply in the requested language."
@@ -25256,6 +25938,13 @@ def _v13_structured_ask(
         # expansion) and must survive Assistant Core validation even when they
         # were not part of the original semantic retrieval top-k.
         "_assistant_core_validation_evidence": [dict(c) for c in final_citations],
+        # Sparse procedural checklists combine non-contiguous conditions. Their
+        # semantic completeness cannot be judged reliably by phrase overlap alone,
+        # so the existing bounded third-call verifier is enabled only for this mode.
+        "_assistant_core_force_semantic_verify": bool(
+            procedure_sequence_mode
+            and _v12_procedure_selection_mode(q, planner) == "sparse_ordered_steps"
+        ),
         "meta": (
             {"cacheable": True, "semantic_cacheable": True}
             if synthesis_grounded
@@ -25276,6 +25965,8 @@ def _v13_structured_ask(
                 "manual_support_links": sum(1 for x in rg_links if str(x.get("evidence_role") or "") == "manual_support"),
                 "procedure_sequence_mode": bool(procedure_sequence_mode),
                 "information_task": information_task,
+                "procedure_selection_mode": _v12_procedure_selection_mode(q, planner),
+                "procedure_family": dict((primary or {}).get("_v10_5_family_debug") or {}) if procedure_sequence_mode else {},
                 "expanded_step_numbers": expanded_step_numbers,
                 "selected_step_numbers": selected_step_numbers,
             }
@@ -27467,6 +28158,8 @@ def _assistant_core_synthesize_ask(
         list(planner.get("required_facets") or []) + list(decision.required_facets),
         limit=14,
     )
+    planner["facet_queries"] = list(contract.get("facet_queries") or [])
+    planner["request_kind"] = decision.request_kind
     retrieval["plan"] = planner
 
     structured_types = {"procedure", "step", "ps", "md_photo", "md_video"}
@@ -29116,7 +29809,10 @@ def _assistant_core_validate_response(
             not semantic_contract_pass
             and str(out.get("status") or "").lower() == "answered"
             and answer
-            and _assistant_core_should_semantic_verify_answer(decision)
+            and (
+                _assistant_core_should_semantic_verify_answer(decision)
+                or bool(out.get("_assistant_core_force_semantic_verify"))
+            )
         ):
             semantic_contract = _assistant_core_verify_or_repair_answer(
                 request=request,
@@ -29289,6 +29985,7 @@ def _assistant_core_validate_response(
     )
     if not repair_pending:
         out.pop("_assistant_core_validation_evidence", None)
+        out.pop("_assistant_core_force_semantic_verify", None)
         out.pop("_assistant_core_repair_context", None)
         out.pop("_assistant_core_repair_needed", None)
         out.pop("_assistant_core_repair_attempted", None)
