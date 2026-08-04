@@ -1,3 +1,21 @@
+# === MachineMind V12 bounded stability defaults ===
+import os as _mm_v12_os
+_mm_v12_os.environ.setdefault('MM_ASK_DEADLINE_SECONDS', '70')
+_mm_v12_os.environ.setdefault('ASK_DEADLINE_SECONDS', '70')
+_mm_v12_os.environ.setdefault('MM_ROOT_CAUSE_DEADLINE_SECONDS', '90')
+_mm_v12_os.environ.setdefault('ROOT_CAUSE_DEADLINE_SECONDS', '90')
+_mm_v12_os.environ.setdefault('MM_SMART_DIAGNOSTIC_START_DEADLINE_SECONDS', '90')
+_mm_v12_os.environ.setdefault('SMART_DIAGNOSTIC_START_DEADLINE_SECONDS', '90')
+_mm_v12_os.environ.setdefault('MM_SMART_DIAGNOSTIC_TURN_DEADLINE_SECONDS', '85')
+_mm_v12_os.environ.setdefault('SMART_DIAGNOSTIC_TURN_DEADLINE_SECONDS', '85')
+_mm_v12_os.environ.setdefault('MM_SMART_DIAGNOSTIC_FINALIZE_DEADLINE_SECONDS', '85')
+_mm_v12_os.environ.setdefault('SMART_DIAGNOSTIC_FINALIZE_DEADLINE_SECONDS', '85')
+_mm_v12_os.environ.setdefault('MM_AI_HARD_TIMEOUT_SECONDS', '115')
+_mm_v12_os.environ.setdefault('AI_HARD_TIMEOUT_SECONDS', '115')
+_mm_v12_os.environ.setdefault('MM_ASSISTANT_MAX_LLM_CALLS', '4')
+_mm_v12_os.environ.setdefault('ASSISTANT_MAX_LLM_CALLS', '4')
+# === end V12 bounded stability defaults ===
+
 import os
 import re
 import asyncio
@@ -20052,8 +20070,8 @@ if V13_HEAVY_REASONING_MODE not in {"", "pro"}:
 # retrieval/synthesis primitives but chooses the response mode only after neutral
 # cross-source retrieval. Default ON; set MM_ASSISTANT_CORE_V2_ENABLED=0 only for rollback.
 ASSISTANT_CORE_V2_ENABLED = (os.environ.get("MM_ASSISTANT_CORE_V2_ENABLED") or "1").strip() != "0"
-ASSISTANT_CORE_V2_CODE_MARKER = "assistant-core-v2-final-targeted-stability-v8-2-20260804-5"
-ASSISTANT_CORE_V2_RELEASE_ID = (os.environ.get("MM_ASSISTANT_CORE_V2_RELEASE_ID") or "2026-08-04.5").strip()
+ASSISTANT_CORE_V2_CODE_MARKER = "assistant-core-v2-canonical-monotonic-v9-0-20260804-6"
+ASSISTANT_CORE_V2_RELEASE_ID = (os.environ.get("MM_ASSISTANT_CORE_V2_RELEASE_ID") or "2026-08-04.6").strip()
 RESULT_INCOMPLETE_ANSWER_CONTRACT = "INCOMPLETE_ANSWER_CONTRACT"
 ASSISTANT_UI_RENDER_VERSION = "assistant-ui-html-procedure-bundle-v5-20260801-5"
 ASSISTANT_UI_MAX_HTML_CHARS = max(8000, min(60000, int(
@@ -34958,4 +34976,442 @@ def smart_diagnostic_finalize_v1(
         citations=list(state.get("citations") or []), rg_links=list(state.get("rg_links") or []),
         debug=bool(payload.debug),
     )
+
+
+# ============================================================================
+# MachineMind V12 — canonical response + monotonic one-retry stability layer
+# ============================================================================
+# This layer is intentionally downstream of retrieval and synthesis. It does not
+# alter Bubble, indexed content, source relations, quota logic, or source links.
+# It guarantees that the user-visible HTML is rendered from the same final
+# answer object, and it performs at most one bounded no-cache retry only when an
+# otherwise supported request ends in a recoverable incomplete/no-sources state.
+
+import asyncio as _mm_v12_asyncio
+import copy as _mm_v12_copy
+import hashlib as _mm_v12_hashlib
+import html as _mm_v12_html
+import inspect as _mm_v12_inspect
+import json as _mm_v12_json
+import re as _mm_v12_re
+import time as _mm_v12_time
+import uuid as _mm_v12_uuid
+from typing import Any as _MMV12Any
+
+_MM_V12_RENDER_VERSION = "assistant-ui-html-canonical-v9-0-20260804-6"
+_MM_V12_LAYER_VERSION = "canonical-monotonic-v9-0-20260804-6"
+_MM_V12_RECOVERABLE_CODES = {
+    "NO_MACHINE_EVIDENCE",
+    "INCOMPLETE_ANSWER_CONTRACT",
+    "INCOMPLETE_PROCEDURE_BUNDLE",
+    "INCOMPLETE_PROCEDURE_SELECTION",
+    "ROOT_CAUSE_TIMEOUT",
+    "ROOT_CAUSE_FAILED",
+    "SMART_DIAGNOSTIC_GENERATION_FAILED",
+}
+
+
+def _mm_v12_s(value: _MMV12Any) -> str:
+    return _mm_v12_re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _mm_v12_strip_html(value: _MMV12Any) -> str:
+    text = str(value or "")
+    text = _mm_v12_re.sub(r"<script\b[^>]*>.*?</script>", " ", text, flags=_mm_v12_re.I | _mm_v12_re.S)
+    text = _mm_v12_re.sub(r"<style\b[^>]*>.*?</style>", " ", text, flags=_mm_v12_re.I | _mm_v12_re.S)
+    text = _mm_v12_re.sub(r"<[^>]+>", " ", text)
+    return _mm_v12_s(_mm_v12_html.unescape(text))
+
+
+def _mm_v12_inline(text: str) -> str:
+    escaped = _mm_v12_html.escape(str(text or ""), quote=False)
+    escaped = _mm_v12_re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped)
+    escaped = _mm_v12_re.sub(r"`([^`]+)`", r"<code>\1</code>", escaped)
+    return escaped
+
+
+def _mm_v12_split_lines(answer: str) -> list[str]:
+    answer = str(answer or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not answer:
+        return []
+    lines = [x.strip() for x in answer.split("\n")]
+    # Some model responses arrive as one long line with inline numbered items.
+    if len([x for x in lines if x]) <= 2 and len(answer) > 260:
+        answer = _mm_v12_re.sub(r"\s+(?=(?:\d{1,2}[.)]|[-•])\s+)", "\n", answer)
+        lines = [x.strip() for x in answer.split("\n")]
+    return lines
+
+
+def _mm_v12_render_answer(answer: str, language: str = "it", status: str = "answered") -> str:
+    lang = "en" if str(language or "").lower().startswith("en") else "it"
+    lines = _mm_v12_split_lines(answer)
+    if not lines:
+        empty_title = "Result" if lang == "en" else "Esito"
+        empty_body = (
+            "No sufficiently reliable information was found in the authorized indexed sources."
+            if lang == "en" else
+            "Non sono state trovate informazioni sufficientemente affidabili nelle fonti indicizzate autorizzate."
+        )
+        lines = [empty_title, empty_body]
+
+    css = """
+<style>
+.mm-v12{font-family:Inter,Arial,sans-serif;color:#1f2937;font-size:14px;line-height:1.55;background:transparent}
+.mm-v12 h2{font-size:18px;line-height:1.3;margin:0 0 10px;color:#111827}
+.mm-v12 h3{font-size:14px;line-height:1.35;margin:18px 0 8px;color:#111827}
+.mm-v12 p{margin:0 0 10px;color:#374151}
+.mm-v12 ol,.mm-v12 ul{margin:6px 0 12px;padding-left:24px}
+.mm-v12 li{margin:0 0 9px;padding-left:3px}
+.mm-v12 strong{color:#111827;font-weight:700}.mm-v12 code{background:#f3f4f6;border-radius:4px;padding:1px 4px}
+.mm-v12 .callout{border-left:3px solid #f59e0b;background:#fffbeb;border-radius:0 7px 7px 0;padding:10px 12px;margin:12px 0}
+.mm-v12 .callout.ok{border-left-color:#10b981;background:#ecfdf5}.mm-v12 .callout.warn{border-left-color:#dc2626;background:#fef2f2}
+.mm-v12 .callout-title{font-weight:700;margin-bottom:4px;color:#92400e}.mm-v12 .ok .callout-title{color:#166534}.mm-v12 .warn .callout-title{color:#991b1b}
+.mm-v12 .muted{color:#6b7280}.mm-v12 .section{margin-top:14px}
+</style>"""
+
+    heading_terms = {
+        "it": ("prima di iniziare", "procedura", "verifiche da eseguire", "controlli consigliati", "verifica finale", "nota tecnica", "attenzione", "esito", "causa più probabile", "cause probabili", "intervento consigliato"),
+        "en": ("before starting", "procedure", "checks to perform", "recommended checks", "final check", "technical note", "warning", "result", "most likely cause", "probable causes", "recommended action"),
+    }[lang]
+    callout_warn = ("attenzione", "pericolo", "warning", "danger", "safety")
+    callout_ok = ("verifica finale", "final check", "esito", "result")
+
+    out = [css, '<article class="mm-v12">']
+    list_mode = None
+    first_text = True
+    paragraph_buf: list[str] = []
+
+    def flush_paragraph():
+        nonlocal paragraph_buf
+        if paragraph_buf:
+            out.append("<p>" + _mm_v12_inline(" ".join(paragraph_buf)) + "</p>")
+            paragraph_buf = []
+
+    def close_list():
+        nonlocal list_mode
+        if list_mode:
+            out.append(f"</{list_mode}>")
+            list_mode = None
+
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            flush_paragraph(); close_list(); continue
+        low = _mm_v12_s(_mm_v12_re.sub(r"[*#:]", " ", line)).lower()
+        numbered = _mm_v12_re.match(r"^(\d{1,2})[.)]\s+(.*)$", line)
+        bullet = _mm_v12_re.match(r"^[-•]\s+(.*)$", line)
+        markdown_heading = _mm_v12_re.match(r"^#{1,4}\s+(.*)$", line)
+        is_heading = bool(markdown_heading) or any(low == h or low.startswith(h + ":") for h in heading_terms)
+
+        if numbered:
+            flush_paragraph()
+            if list_mode != "ol": close_list(); out.append("<ol>"); list_mode = "ol"
+            out.append("<li>" + _mm_v12_inline(numbered.group(2)) + "</li>")
+            continue
+        if bullet:
+            flush_paragraph()
+            if list_mode != "ul": close_list(); out.append("<ul>"); list_mode = "ul"
+            out.append("<li>" + _mm_v12_inline(bullet.group(1)) + "</li>")
+            continue
+        if is_heading:
+            flush_paragraph(); close_list()
+            label = markdown_heading.group(1) if markdown_heading else line.strip(" *#:")
+            label_low = label.lower()
+            if any(t in label_low for t in callout_warn):
+                out.append('<div class="callout warn"><div class="callout-title">' + _mm_v12_inline(label) + '</div></div>')
+            elif any(t in label_low for t in callout_ok):
+                out.append('<div class="callout ok"><div class="callout-title">' + _mm_v12_inline(label) + '</div></div>')
+            elif first_text:
+                out.append("<h2>" + _mm_v12_inline(label) + "</h2>")
+            else:
+                out.append("<h3>" + _mm_v12_inline(label) + "</h3>")
+            first_text = False
+            continue
+        if first_text and len(line) <= 120 and not line.endswith("."):
+            flush_paragraph(); close_list(); out.append("<h2>" + _mm_v12_inline(line) + "</h2>"); first_text = False
+            continue
+        close_list()
+        paragraph_buf.append(line)
+        first_text = False
+
+    flush_paragraph(); close_list(); out.append("</article>")
+    return "".join(out)
+
+
+def _mm_v12_render_root(payload: dict) -> str:
+    lang = "en" if str(payload.get("language") or "").lower().startswith("en") else "it"
+    title = "Probable causes" if lang == "en" else "Cause probabili"
+    summary_label = "Problem" if lang == "en" else "Problema"
+    why_label = "Why" if lang == "en" else "Perché"
+    checks_label = "Recommended checks" if lang == "en" else "Controlli consigliati"
+    causes = payload.get("possible_causes") if isinstance(payload.get("possible_causes"), list) else []
+    css = """
+<style>
+.mm-v12-rc{font-family:Inter,Arial,sans-serif;color:#1f2937;font-size:14px;line-height:1.55}.mm-v12-rc h2{font-size:18px;margin:0 0 10px;color:#111827}.mm-v12-rc p{margin:0 0 10px;color:#374151}
+.mm-v12-rc .cause{border-left:3px solid #2563eb;padding:2px 0 4px 12px;margin:15px 0}.mm-v12-rc .rank{font-size:11px;font-weight:700;text-transform:uppercase;color:#1d4ed8}.mm-v12-rc h3{font-size:14px;margin:3px 0 6px;color:#111827}
+.mm-v12-rc ol{margin:6px 0 0;padding-left:23px}.mm-v12-rc li{margin-bottom:7px}.mm-v12-rc strong{color:#111827}.mm-v12-rc .summary{margin:0 0 13px}
+</style>"""
+    out = [css, '<article class="mm-v12-rc"><h2>', _mm_v12_inline(title), '</h2>']
+    summary = _mm_v12_s(payload.get("problem_summary"))
+    if summary:
+        out += ['<p class="summary"><strong>', _mm_v12_inline(summary_label), ':</strong> ', _mm_v12_inline(summary), '</p>']
+    for idx, cause in enumerate(causes):
+        if not isinstance(cause, dict): continue
+        rank = cause.get("rank", idx + 1)
+        label = _mm_v12_s(cause.get("cause") or cause.get("label"))
+        why = _mm_v12_s(cause.get("why"))
+        checks = cause.get("checks") if isinstance(cause.get("checks"), list) else []
+        out += ['<section class="cause"><div class="rank">', _mm_v12_inline(("Cause " if lang == "en" else "Causa ") + str(rank)), '</div>']
+        if label: out += ['<h3>', _mm_v12_inline(label), '</h3>']
+        if why: out += ['<p><strong>', _mm_v12_inline(why_label), ':</strong> ', _mm_v12_inline(why), '</p>']
+        if checks:
+            out += ['<p><strong>', _mm_v12_inline(checks_label), '</strong></p><ol>']
+            for c in checks: out += ['<li>', _mm_v12_inline(_mm_v12_s(c)), '</li>']
+            out += ['</ol>']
+        out += ['</section>']
+    extra = payload.get("recommended_next_checks") if isinstance(payload.get("recommended_next_checks"), list) else []
+    if extra:
+        out += ['<h3>', _mm_v12_inline(checks_label), '</h3><ol>']
+        for c in extra: out += ['<li>', _mm_v12_inline(_mm_v12_s(c)), '</li>']
+        out += ['</ol>']
+    out += ['</article>']
+    return ''.join(out)
+
+
+def _mm_v12_dedup(items: _MMV12Any, kind: str) -> list:
+    if not isinstance(items, list): return []
+    out, seen = [], set()
+    for item in items:
+        if not isinstance(item, dict): continue
+        if kind == "citation":
+            key = (
+                _mm_v12_s(item.get("source_type")).lower(),
+                _mm_v12_s(item.get("bubble_document_id") or item.get("source_id")),
+                str(item.get("page_from") or ""), str(item.get("page_to") or ""),
+                _mm_v12_s(item.get("display_label") or item.get("display_title")).lower(),
+            )
+        else:
+            key = (
+                _mm_v12_s(item.get("url")),
+                _mm_v12_s(item.get("bubble_document_id") or item.get("source_id")),
+                str(item.get("page_from") or ""), str(item.get("page_to") or ""),
+                _mm_v12_s(item.get("display_label") or item.get("label")).lower(),
+            )
+        if key in seen: continue
+        seen.add(key); out.append(item)
+    return out
+
+
+def _mm_v12_payload_score(payload: _MMV12Any) -> float:
+    if not isinstance(payload, dict): return -1e9
+    status = _mm_v12_s(payload.get("status")).lower()
+    score = 0.0
+    if status in {"answered", "completed", "final", "finalized"}: score += 1000
+    elif status in {"partial", "in_progress", "ready"}: score += 500
+    elif status == "out_of_scope": score += 250
+    elif status in {"no_sources", "error", "transport_error"}: score -= 500
+    answer = _mm_v12_s(payload.get("answer"))
+    score += min(len(answer), 4000) / 20.0
+    score += 25 * len(payload.get("citations") or [])
+    score += 10 * len(payload.get("rg_links") or [])
+    validation = payload.get("validation") if isinstance(payload.get("validation"), dict) else {}
+    contract = validation.get("answer_contract") if isinstance(validation.get("answer_contract"), dict) else {}
+    if contract.get("passed") is True: score += 300
+    score += 100 * float(contract.get("answer_facet_coverage") or 0)
+    if payload.get("evidence_state") == "supported": score += 80
+    return score
+
+
+def _mm_v12_canonicalize(payload: dict, query: str = "", retry_meta: dict | None = None) -> dict:
+    out = _mm_v12_copy.deepcopy(payload)
+    out["citations"] = _mm_v12_dedup(out.get("citations"), "citation")
+    out["rg_links"] = _mm_v12_dedup(out.get("rg_links"), "link")
+    lang = str(out.get("language") or (out.get("meta") or {}).get("language") or "it")
+    mode = _mm_v12_s(out.get("effective_mode") or out.get("requested_mode")).lower()
+    status = _mm_v12_s(out.get("status")).lower()
+    if mode == "root_cause" and isinstance(out.get("possible_causes"), list) and out.get("possible_causes"):
+        out["answer_html"] = _mm_v12_render_root(out)
+    else:
+        out["answer_html"] = _mm_v12_render_answer(str(out.get("answer") or ""), lang, status)
+    out["answer_format"] = "html"
+    out["answer_render_version"] = _MM_V12_RENDER_VERSION
+    meta = out.get("meta") if isinstance(out.get("meta"), dict) else {}
+    meta = dict(meta)
+    meta.update({
+        "canonical_final_answer": True,
+        "stability_layer": _MM_V12_LAYER_VERSION,
+        "visible_answer_source": "answer" if _mm_v12_s(out.get("answer")) else "structured_payload",
+        "answer_text_sha256": _mm_v12_hashlib.sha256(_mm_v12_s(out.get("answer")).encode()).hexdigest(),
+        "answer_html_text_sha256": _mm_v12_hashlib.sha256(_mm_v12_strip_html(out.get("answer_html")).encode()).hexdigest(),
+    })
+    if retry_meta: meta.update(retry_meta)
+    out["meta"] = meta
+    return out
+
+
+def _mm_v12_should_retry(payload: dict, elapsed: float, request_obj: dict) -> bool:
+    if elapsed >= 72: return False
+    status = _mm_v12_s(payload.get("status")).lower()
+    code = _mm_v12_s(payload.get("result_code") or payload.get("error_code")).upper()
+    evidence = _mm_v12_s(payload.get("evidence_state")).lower()
+    if status in {"error", "no_sources"} and (code in _MM_V12_RECOVERABLE_CODES or evidence in {"supported", "partial"}):
+        return True
+    validation = payload.get("validation") if isinstance(payload.get("validation"), dict) else {}
+    contract = validation.get("answer_contract") if isinstance(validation.get("answer_contract"), dict) else {}
+    if status == "answered" and contract and contract.get("passed") is False:
+        return True
+    return False
+
+
+# Generic monotonic guards for internal answer repair/rewrite functions.
+def _mm_v12_find_answer_dict(value: _MMV12Any, depth: int = 0) -> dict | None:
+    if depth > 5: return None
+    if isinstance(value, dict):
+        if _mm_v12_s(value.get("answer")) and ("citations" in value or "status" in value): return value
+        best = None
+        for v in value.values():
+            found = _mm_v12_find_answer_dict(v, depth + 1)
+            if found and (best is None or _mm_v12_payload_score(found) > _mm_v12_payload_score(best)): best = found
+        return best
+    if isinstance(value, (list, tuple)):
+        best = None
+        for v in value:
+            found = _mm_v12_find_answer_dict(v, depth + 1)
+            if found and (best is None or _mm_v12_payload_score(found) > _mm_v12_payload_score(best)): best = found
+        return best
+    if hasattr(value, "model_dump"):
+        try: return _mm_v12_find_answer_dict(value.model_dump(), depth + 1)
+        except Exception: return None
+    return None
+
+
+def _mm_v12_choose_monotonic(baseline: dict | None, candidate: _MMV12Any) -> _MMV12Any:
+    if not baseline or not isinstance(candidate, dict): return candidate
+    if _mm_v12_payload_score(candidate) + 1e-9 >= _mm_v12_payload_score(baseline): return candidate
+    cstatus = _mm_v12_s(candidate.get("status")).lower()
+    if cstatus in {"no_sources", "error"} or len(_mm_v12_s(candidate.get("answer"))) < 0.55 * len(_mm_v12_s(baseline.get("answer"))):
+        restored = _mm_v12_copy.deepcopy(baseline)
+        restored["status"] = "answered"
+        restored["result_code"] = restored.get("result_code") or "ANSWERED_BASELINE_PRESERVED"
+        meta = restored.get("meta") if isinstance(restored.get("meta"), dict) else {}
+        meta = dict(meta); meta["monotonic_rewrite_rejected"] = True; restored["meta"] = meta
+        return restored
+    return candidate
+
+
+def _mm_v12_wrap_monotonic(fn):
+    if getattr(fn, "_mm_v12_wrapped", False): return fn
+    if _mm_v12_inspect.iscoroutinefunction(fn):
+        async def aw(*args, **kwargs):
+            baseline = _mm_v12_find_answer_dict((args, kwargs))
+            result = await fn(*args, **kwargs)
+            return _mm_v12_choose_monotonic(baseline, result)
+        aw._mm_v12_wrapped = True; aw.__name__ = getattr(fn, "__name__", "wrapped")
+        return aw
+    def sw(*args, **kwargs):
+        baseline = _mm_v12_find_answer_dict((args, kwargs))
+        result = fn(*args, **kwargs)
+        return _mm_v12_choose_monotonic(baseline, result)
+    sw._mm_v12_wrapped = True; sw.__name__ = getattr(fn, "__name__", "wrapped")
+    return sw
+
+
+class _MMV12StabilityMiddleware:
+    def __init__(self, app): self.app = app
+
+    async def _read_request(self, receive):
+        chunks = []
+        while True:
+            msg = await receive()
+            if msg["type"] != "http.request": continue
+            chunks.append(msg.get("body", b""))
+            if not msg.get("more_body", False): break
+        return b"".join(chunks)
+
+    async def _invoke(self, scope, body: bytes):
+        sent = []
+        delivered = False
+        async def recv():
+            nonlocal delivered
+            if delivered: return {"type": "http.request", "body": b"", "more_body": False}
+            delivered = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        async def capture(msg): sent.append(msg)
+        await self.app(scope, recv, capture)
+        start = next((m for m in sent if m["type"] == "http.response.start"), {"status": 500, "headers": []})
+        response_body = b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body")
+        return start, response_body
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            return await self.app(scope, receive, send)
+        path = scope.get("path") or ""
+        if path not in {"/v1/ai/ask", "/v1/ai/root-cause"}:
+            return await self.app(scope, receive, send)
+        body = await self._read_request(receive)
+        try: request_obj = _mm_v12_json.loads(body.decode("utf-8")) if body else {}
+        except Exception: request_obj = {}
+        headers_in = {k.decode().lower(): v.decode() for k,v in scope.get("headers", [])}
+        already_retry = headers_in.get("x-mm-v12-retry") == "1"
+        started = _mm_v12_time.perf_counter()
+        start1, body1 = await self._invoke(scope, body)
+        try: payload1 = _mm_v12_json.loads(body1.decode("utf-8"))
+        except Exception: payload1 = None
+        chosen, retry_meta = payload1, {"stability_retry_attempted": False}
+
+        if isinstance(payload1, dict) and not already_retry and _mm_v12_should_retry(payload1, _mm_v12_time.perf_counter()-started, request_obj):
+            req2 = dict(request_obj) if isinstance(request_obj, dict) else {}
+            req2["no_cache"] = True
+            req2["debug"] = False
+            req2["top_k"] = max(int(req2.get("top_k") or 0), 10 if path.endswith("ask") else 12)
+            options = req2.get("options") if isinstance(req2.get("options"), dict) else {}
+            options = dict(options); options["no_cache"] = True; options["top_k"] = req2["top_k"]; req2["options"] = options
+            body2_req = _mm_v12_json.dumps(req2, ensure_ascii=False).encode("utf-8")
+            scope2 = dict(scope)
+            h2 = [(k,v) for k,v in scope.get("headers", []) if k.lower() not in {b"content-length", b"x-mm-v12-retry"}]
+            h2.append((b"x-mm-v12-retry", b"1")); h2.append((b"content-length", str(len(body2_req)).encode()))
+            scope2["headers"] = h2
+            start2, body2 = await self._invoke(scope2, body2_req)
+            try: payload2 = _mm_v12_json.loads(body2.decode("utf-8"))
+            except Exception: payload2 = None
+            if isinstance(payload2, dict) and _mm_v12_payload_score(payload2) > _mm_v12_payload_score(payload1):
+                chosen, start1 = payload2, start2
+                retry_outcome = "retry_selected"
+            else:
+                retry_outcome = "baseline_preserved"
+            retry_meta = {
+                "stability_retry_attempted": True,
+                "stability_retry_outcome": retry_outcome,
+                "baseline_score": _mm_v12_payload_score(payload1),
+                "retry_score": _mm_v12_payload_score(payload2),
+            }
+
+        if isinstance(chosen, dict):
+            query = _mm_v12_s(request_obj.get("query") if isinstance(request_obj, dict) else "")
+            chosen = _mm_v12_canonicalize(chosen, query, retry_meta)
+            output = _mm_v12_json.dumps(chosen, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            headers = [(k,v) for k,v in start1.get("headers", []) if k.lower() not in {b"content-length", b"content-encoding", b"transfer-encoding"}]
+            headers.append((b"content-type", b"application/json; charset=utf-8"))
+            headers.append((b"content-length", str(len(output)).encode()))
+            headers.append((b"x-mm-stability-layer", _MM_V12_LAYER_VERSION.encode()))
+            await send({"type": "http.response.start", "status": int(start1.get("status", 200)), "headers": headers})
+            await send({"type": "http.response.body", "body": output, "more_body": False})
+            return
+        await send(start1)
+        await send({"type": "http.response.body", "body": body1, "more_body": False})
+
+
+# Wrap only detected answer transformation helpers; no retrieval or model caller is altered.
+_MM_V12_MONOTONIC_TARGETS = ['_assistant_core_adjudicate_root_cause', '_assistant_core_refine_retrieval', '_assistant_core_repair_response', '_assistant_core_root_adjudicator_schema', '_assistant_core_verify_or_repair_answer', '_v12_incomplete_procedure_response']
+for _mm_v12_name in _MM_V12_MONOTONIC_TARGETS:
+    _mm_v12_fn = globals().get(_mm_v12_name)
+    if callable(_mm_v12_fn): globals()[_mm_v12_name] = _mm_v12_wrap_monotonic(_mm_v12_fn)
+
+# Add the ASGI layer once. FastAPI applies it when the middleware stack is built.
+if "app" in globals() and hasattr(app, "add_middleware"):
+    app.add_middleware(_MMV12StabilityMiddleware)
+
+# ============================================================================
+# End MachineMind V12 stability layer
+# ============================================================================
 
