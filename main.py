@@ -1,21 +1,3 @@
-# === MachineMind V12 bounded stability defaults ===
-import os as _mm_v12_os
-_mm_v12_os.environ.setdefault('MM_ASK_DEADLINE_SECONDS', '70')
-_mm_v12_os.environ.setdefault('ASK_DEADLINE_SECONDS', '70')
-_mm_v12_os.environ.setdefault('MM_ROOT_CAUSE_DEADLINE_SECONDS', '90')
-_mm_v12_os.environ.setdefault('ROOT_CAUSE_DEADLINE_SECONDS', '90')
-_mm_v12_os.environ.setdefault('MM_SMART_DIAGNOSTIC_START_DEADLINE_SECONDS', '90')
-_mm_v12_os.environ.setdefault('SMART_DIAGNOSTIC_START_DEADLINE_SECONDS', '90')
-_mm_v12_os.environ.setdefault('MM_SMART_DIAGNOSTIC_TURN_DEADLINE_SECONDS', '85')
-_mm_v12_os.environ.setdefault('SMART_DIAGNOSTIC_TURN_DEADLINE_SECONDS', '85')
-_mm_v12_os.environ.setdefault('MM_SMART_DIAGNOSTIC_FINALIZE_DEADLINE_SECONDS', '85')
-_mm_v12_os.environ.setdefault('SMART_DIAGNOSTIC_FINALIZE_DEADLINE_SECONDS', '85')
-_mm_v12_os.environ.setdefault('MM_AI_HARD_TIMEOUT_SECONDS', '115')
-_mm_v12_os.environ.setdefault('AI_HARD_TIMEOUT_SECONDS', '115')
-_mm_v12_os.environ.setdefault('MM_ASSISTANT_MAX_LLM_CALLS', '4')
-_mm_v12_os.environ.setdefault('ASSISTANT_MAX_LLM_CALLS', '4')
-# === end V12 bounded stability defaults ===
-
 import os
 import re
 import asyncio
@@ -12269,6 +12251,76 @@ def _assistant_ui_promote_unlabelled_sections(sections: list[dict]) -> list[dict
     return out or sections
 
 
+
+def _assistant_ui_normalize_markdown_tables(text: str) -> str:
+    """Convert Markdown tables to headings/bullets before safe HTML rendering."""
+    lines = str(text or "").replace("\r", "\n").split("\n")
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if "|" in line and i + 1 < len(lines) and re.match(r"^\s*\|?\s*:?-{3,}", lines[i + 1].strip()):
+            headers = [x.strip() for x in line.strip("|").split("|")]
+            i += 2
+            rows: list[list[str]] = []
+            while i < len(lines) and "|" in lines[i]:
+                rows.append([x.strip() for x in lines[i].strip().strip("|").split("|")])
+                i += 1
+            for row in rows:
+                if not any(row):
+                    continue
+                title = row[0] if row else ""
+                if title:
+                    out.append(f"**{title}**")
+                for idx, value in enumerate(row[1:], start=1):
+                    if not value:
+                        continue
+                    label = headers[idx] if idx < len(headers) and headers[idx] else f"Campo {idx}"
+                    out.append(f"- **{label}:** {value}")
+                out.append("")
+            continue
+        out.append(lines[i])
+        i += 1
+    return "\n".join(out)
+
+
+def _assistant_ui_root_cause_text(resp: dict, *, response_language: str) -> str:
+    """Canonical plain-text representation of the same structured Root Cause body."""
+    if not isinstance(resp, dict):
+        return ""
+    is_en = str(response_language or "it").lower().startswith("en")
+    status = str(resp.get("status") or "answered").strip().lower()
+    summary = str(resp.get("problem_summary") or resp.get("symptom") or "").strip()
+    causes = [c for c in (resp.get("possible_causes") or []) if isinstance(c, dict)]
+    recommended = _unique_non_empty_strings(resp.get("recommended_next_checks") or [], limit=10)
+    if status != "answered" or not causes:
+        return summary
+    lines = ["Probable causes" if is_en else "Cause probabili"]
+    if summary:
+        lines += ["", ("Problem: " if is_en else "Problema: ") + summary]
+    used_checks: set[str] = set()
+    for idx, cause in enumerate(causes, start=1):
+        rank = _safe_int(cause.get("rank"), idx)
+        label = ("Most likely cause" if rank == 1 else f"Possible cause {rank}") if is_en else ("Causa più probabile" if rank == 1 else f"Causa possibile {rank}")
+        cause_text = str(cause.get("cause") or "").strip()
+        why = str(cause.get("why") or "").strip()
+        checks = _unique_non_empty_strings(cause.get("checks") or [], limit=6)
+        if not cause_text:
+            continue
+        lines += ["", label, cause_text]
+        if why:
+            lines += [("Why: " if is_en else "Perché: ") + why]
+        if checks:
+            lines += ["Checks" if is_en else "Controlli consigliati"]
+            for n, check in enumerate(checks, start=1):
+                lines.append(f"{n}. {check}")
+                used_checks.add(re.sub(r"\s+", " ", _normalize_unicode_advanced(check).lower()).strip())
+    extra = [x for x in recommended if re.sub(r"\s+", " ", _normalize_unicode_advanced(x).lower()).strip() not in used_checks]
+    if extra:
+        lines += ["", "Additional priority checks" if is_en else "Ulteriori controlli prioritari"]
+        lines += [f"{n}. {x}" for n, x in enumerate(extra[:6], start=1)]
+    return "\n".join(lines).strip()
+
 def _assistant_ui_generic_html(answer: str, *, links: list[dict], citations: Optional[list[dict]] = None, response_language: str, status: str = "answered") -> str:
     """Render a clean ChatGPT-like answer body without touching Bubble LINK/FONTI.
 
@@ -12276,7 +12328,9 @@ def _assistant_ui_generic_html(answer: str, *, links: list[dict], citations: Opt
     headings, whitespace, native lists and restrained left-border callouts only.
     """
     is_en = str(response_language or "it").strip().lower().startswith("en")
-    clean = _strip_inline_citation_markers_for_display(str(answer or "")).strip()
+    clean = _assistant_ui_normalize_markdown_tables(
+        _strip_inline_citation_markers_for_display(str(answer or ""))
+    ).strip()
     if not clean:
         return ""
 
@@ -12609,10 +12663,10 @@ def _assistant_ui_dedupe_citations(items: list[dict], *, max_items: int) -> list
 
 
 def _assistant_ui_finalize_response(resp: dict, *, language: str = "it") -> dict:
+    """Create one canonical user-visible answer and derive every UI field from it."""
     if not isinstance(resp, dict):
         return resp
     out = dict(resp)
-
     if isinstance(out.get("rg_links"), list):
         out["rg_links"] = _assistant_ui_dedupe_links(
             out.get("rg_links") or [],
@@ -12626,87 +12680,48 @@ def _assistant_ui_finalize_response(resp: dict, *, language: str = "it") -> dict
 
     status = str(out.get("status") or "answered").strip().lower()
     effective_mode = str(out.get("effective_mode") or "").strip().lower()
-
-    # Assistant Core V2 deliberately adds ``answer: ""`` to native Root Cause
-    # responses for backward compatibility with the Worker/Bubble contract.
-    # Therefore native Root Cause must be detected from ``effective_mode`` and
-    # its structured fields, never from the absence of the ASK-style answer key.
-    is_native_root_cause_payload = (
-        effective_mode == "root_cause"
-        and (
-            isinstance(out.get("possible_causes"), list)
-            or "problem_summary" in out
-            or isinstance(out.get("recommended_next_checks"), list)
-        )
+    is_native_root_cause = effective_mode == "root_cause" and (
+        isinstance(out.get("possible_causes"), list)
+        or "problem_summary" in out
+        or isinstance(out.get("recommended_next_checks"), list)
     )
-    if is_native_root_cause_payload:
-        if status == "answered":
-            rendered = _assistant_ui_root_cause_html(out, response_language=language)
-        else:
-            rendered = ""
-        if rendered:
-            out["answer_html"] = rendered
-            out["answer_format"] = "html"
-            out["answer_render_version"] = ASSISTANT_UI_RENDER_VERSION
-            meta = dict(out.get("meta") or {})
-            meta["answer_render_version"] = ASSISTANT_UI_RENDER_VERSION
-            meta["answer_html_safe_template"] = True
-            meta["answer_html_body_only"] = True
-            meta["answer_html_contains_sources"] = False
-            meta["answer_html_mode"] = "root_cause"
-            out["meta"] = meta
-        else:
-            out.pop("answer_html", None)
-            out["answer_format"] = "text"
-            out["answer_render_version"] = ASSISTANT_UI_RENDER_VERSION
-        out.pop("_assistant_ui_model", None)
-        return out
 
-    # Non-ASK payloads that are not a native Root Cause response keep the
-    # existing text/fallback behavior.
-    if "answer" not in out:
-        out.pop("_assistant_ui_model", None)
-        return out
-
-    model = out.pop("_assistant_ui_model", None)
-    existing = str(out.get("answer_html") or "").strip()
-    # Procedure HTML is deterministic source rendering and can survive the final
-    # claim validator. Generic HTML is always regenerated from the validated
-    # ``answer`` so removed claims can never remain visible only in HTML.
-    trusted_existing = (
-        existing.startswith('<article data-mm-answer="procedure"')
-        and ('data-mm-render="' + ASSISTANT_UI_RENDER_VERSION + '"') in existing
-    )
-    if trusted_existing:
-        rendered = existing
-    elif isinstance(model, dict) and model.get("kind") == "procedure" and status == "answered":
-        rendered = _procedure_ui_model_to_html(
-            model,
-            links=out.get("rg_links") if isinstance(out.get("rg_links"), list) else [],
-            response_language=language,
-        )
+    if is_native_root_cause:
+        canonical_text = _assistant_ui_root_cause_text(out, response_language=language)
+        out["answer"] = canonical_text
+        rendered = _assistant_ui_root_cause_html(out, response_language=language) if canonical_text else ""
+        mode = "root_cause"
     else:
+        canonical_text = str(out.get("answer") or "").strip()
+        out["answer"] = canonical_text
         rendered = _assistant_ui_generic_html(
-            str(out.get("answer") or ""),
+            canonical_text,
             links=out.get("rg_links") if isinstance(out.get("rg_links"), list) else [],
             citations=out.get("citations") if isinstance(out.get("citations"), list) else [],
             response_language=language,
             status=status,
-        )
+        ) if canonical_text else ""
+        mode = "ask"
+
+    out.pop("_assistant_ui_model", None)
     if rendered:
         out["answer_html"] = rendered
         out["answer_format"] = "html"
-        out["answer_render_version"] = ASSISTANT_UI_RENDER_VERSION
-        meta = dict(out.get("meta") or {})
-        meta["answer_render_version"] = ASSISTANT_UI_RENDER_VERSION
-        meta["answer_html_safe_template"] = True
-        meta["answer_html_body_only"] = True
-        meta["answer_html_contains_sources"] = False
-        out["meta"] = meta
     else:
         out.pop("answer_html", None)
         out["answer_format"] = "text"
-        out["answer_render_version"] = ASSISTANT_UI_RENDER_VERSION
+    out["answer_render_version"] = ASSISTANT_UI_RENDER_VERSION
+    meta = dict(out.get("meta") or {})
+    meta.update({
+        "answer_render_version": ASSISTANT_UI_RENDER_VERSION,
+        "answer_html_safe_template": True,
+        "answer_html_body_only": True,
+        "answer_html_contains_sources": False,
+        "answer_html_mode": mode,
+        "canonical_final_answer": True,
+        "canonical_text_chars": len(canonical_text),
+    })
+    out["meta"] = meta
     return out
 
 
@@ -20070,10 +20085,10 @@ if V13_HEAVY_REASONING_MODE not in {"", "pro"}:
 # retrieval/synthesis primitives but chooses the response mode only after neutral
 # cross-source retrieval. Default ON; set MM_ASSISTANT_CORE_V2_ENABLED=0 only for rollback.
 ASSISTANT_CORE_V2_ENABLED = (os.environ.get("MM_ASSISTANT_CORE_V2_ENABLED") or "1").strip() != "0"
-ASSISTANT_CORE_V2_CODE_MARKER = "assistant-core-v2-canonical-no-buffer-v9-1-20260804-7"
-ASSISTANT_CORE_V2_RELEASE_ID = (os.environ.get("MM_ASSISTANT_CORE_V2_RELEASE_ID") or "2026-08-04.7").strip()
+ASSISTANT_CORE_V2_CODE_MARKER = "assistant-core-v2-certified-canonical-v10-0-20260804-8"
+ASSISTANT_CORE_V2_RELEASE_ID = (os.environ.get("MM_ASSISTANT_CORE_V2_RELEASE_ID") or "2026-08-04.8").strip()
 RESULT_INCOMPLETE_ANSWER_CONTRACT = "INCOMPLETE_ANSWER_CONTRACT"
-ASSISTANT_UI_RENDER_VERSION = "assistant-ui-html-procedure-bundle-v5-20260801-5"
+ASSISTANT_UI_RENDER_VERSION = "assistant-ui-html-canonical-v10-0-20260804-8"
 ASSISTANT_UI_MAX_HTML_CHARS = max(8000, min(60000, int(
     os.environ.get("MM_ASSISTANT_UI_MAX_HTML_CHARS", "32000")
 )))
@@ -21420,6 +21435,44 @@ def _v13_response_quality(mode: str, response: dict) -> float:
     return max(0.0, min(0.98, quality))
 
 
+
+def _assistant_core_cache_certified(mode: str, response: dict) -> bool:
+    """Only fully validated canonical responses may enter any response cache."""
+    if not isinstance(response, dict) or response.get("ok") is not True:
+        return False
+    if str(response.get("status") or "").strip().lower() != "answered":
+        return False
+    meta = response.get("meta") if isinstance(response.get("meta"), dict) else {}
+    if not bool(meta.get("canonical_final_answer")):
+        return False
+    citations = [c for c in (response.get("citations") or []) if isinstance(c, dict)]
+    if not citations and str(response.get("grounding") or "") != "general_technical_knowledge":
+        return False
+    mode_key = str(mode or response.get("effective_mode") or "ask").strip().lower()
+    if mode_key == "root_cause":
+        causes = [c for c in (response.get("possible_causes") or []) if isinstance(c, dict) and str(c.get("cause") or "").strip()]
+        if not causes:
+            return False
+        valid_ids = {str(c.get("citation_id") or "").strip() for c in citations if str(c.get("citation_id") or "").strip()}
+        for cause in causes:
+            own = {str(x or "").strip() for x in (cause.get("citation_ids") or []) if str(x or "").strip()}
+            # When the backend does not expose per-cause ids, require at least a
+            # non-empty explanation and checks plus a global evidence manifest.
+            if own and not (own & valid_ids):
+                return False
+            if not str(cause.get("why") or "").strip() or not list(cause.get("checks") or []):
+                return False
+        return True
+    validation = meta.get("assistant_core_validation") if isinstance(meta.get("assistant_core_validation"), dict) else {}
+    contract = validation.get("answer_contract") if isinstance(validation.get("answer_contract"), dict) else {}
+    if not bool(contract.get("passed")):
+        return False
+    if contract.get("missing_answer_facets") or contract.get("missing_evidence_facets") or contract.get("missing_list_items"):
+        return False
+    if not str(response.get("answer") or "").strip() or not str(response.get("answer_html") or "").strip():
+        return False
+    return True
+
 def _v13_cache_store(
     *,
     mode: str,
@@ -21432,6 +21485,8 @@ def _v13_cache_store(
     debug: bool,
 ) -> None:
     if debug or not V13_SEMANTIC_CACHE_ENABLED or not _v13_cache_bootstrap():
+        return
+    if not _assistant_core_cache_certified(mode, response):
         return
     response_meta = response.get("meta") or {}
     if response_meta.get("cacheable") is False or response_meta.get("semantic_cacheable") is False:
@@ -26831,6 +26886,113 @@ def _assistant_core_relax_diagnostic_router_contract(
     return out
 
 
+
+def _assistant_core_deterministic_router_fallback(
+    request: AssistantCoreRequest,
+    retrieval: dict,
+    error: Exception,
+) -> dict:
+    """Bounded multilingual fallback used only when every semantic router fails.
+
+    It never invents machine facts. It keeps the original retrieval available to
+    synthesis and creates a conservative answer contract from the surface request.
+    """
+    q = re.sub(r"\s+", " ", _normalize_unicode_advanced(request.query or "")).strip()
+    low = q.casefold()
+    candidates = [dict(c) for c in (retrieval.get("candidates") or retrieval.get("citations") or []) if isinstance(c, dict)]
+    ids = [str(c.get("citation_id") or "").strip() for c in candidates[:16] if str(c.get("citation_id") or "").strip()]
+    source_types = _dedup_text_values([
+        str(c.get("source_type") or _source_type_from_document_id(c.get("bubble_document_id") or ""))
+        for c in candidates[:16]
+    ], limit=6)
+
+    is_en = str(request.response_language or "it").lower().startswith("en")
+    procedure = bool(re.search(r"\b(?:come|procedura|passaggi|step|avviare|riavviare|how|procedure|steps?|start|restart)\b", low))
+    complete = bool(re.search(r"\b(?:completa|intera|tutti i passaggi|complete|entire|all steps)\b", low))
+    numeric = bool(re.search(r"\b(?:quanto|quale valore|capacita|capacità|portata|pressione|corsa|precisione|potenza|forza|dimensioni|velocita|velocità|what .*capacity|how much|value|pressure|stroke|precision|power|force|dimensions|speed)\b", low))
+    interface = bool(re.search(r"\b(?:dove|pagina|schermata|menu|hmi|allarmi|storico|where|page|screen|menu|alarms?|history)\b", low))
+    sequence = bool(re.search(r"\b(?:sincron|sequenza|prima.*dopo|contemporaneamente|sequence|synchron|before.*after|simultaneously)\b", low))
+    comparison = bool(re.search(r"\b(?:differenza|confronta|rispetto a|difference|compare|versus| vs )\b", low))
+    list_request = bool(re.search(r"\b(?:quali|elenca|tutti|principali|which|list|all|main)\b", low))
+
+    if request.requested_mode == MODE_ROOT_CAUSE:
+        request_kind = KIND_FAULT_DIAGNOSTIC
+        effective_mode = MODE_ROOT_CAUSE
+        information_task = INFO_FAULT_DIAGNOSTIC
+        required_types = [REQ_DIAGNOSTIC_CAUSES, REQ_CHECKLIST]
+    elif sequence:
+        request_kind = KIND_FACTUAL
+        effective_mode = MODE_ASK
+        information_task = INFO_SEQUENCE_OR_SYNCHRONIZATION
+        required_types = [REQ_STATE_SEQUENCE, REQ_EXPLANATION]
+    elif interface:
+        request_kind = KIND_FACTUAL
+        effective_mode = MODE_ASK
+        information_task = INFO_INTERFACE_NAVIGATION
+        required_types = [REQ_INTERFACE_LOCATIONS, REQ_EXPLANATION]
+    elif numeric:
+        request_kind = KIND_FACTUAL
+        effective_mode = MODE_ASK
+        information_task = INFO_NUMERIC_SPECIFICATION
+        required_types = [REQ_NUMERIC_VALUE]
+        if list_request:
+            required_types.append(REQ_CHECKLIST)
+    elif comparison:
+        request_kind = KIND_COMPARISON
+        effective_mode = MODE_ASK
+        information_task = INFO_COMPARISON
+        required_types = [REQ_COMPARISON, REQ_EXPLANATION]
+    elif procedure:
+        request_kind = KIND_PROCEDURE
+        effective_mode = MODE_ASK
+        information_task = INFO_PROCEDURE_FULL if complete else INFO_PROCEDURE_SEGMENT
+        required_types = [REQ_ORDERED_ACTIONS]
+        if list_request or re.search(r"\b(?:condizioni|controlli|conditions|checks)\b", low):
+            required_types.append(REQ_CHECKLIST)
+        if re.search(r"\b(?:sicurezza|riparo|emergenz|safety|guard|emergency)\b", low):
+            required_types.append(REQ_SAFETY_CONDITIONS)
+    else:
+        request_kind = KIND_FACTUAL
+        effective_mode = MODE_ASK
+        information_task = INFO_DOCUMENT_EXPLANATION
+        required_types = [REQ_EXPLANATION]
+        if list_request:
+            required_types.append(REQ_CHECKLIST)
+
+    evidence_state = EVIDENCE_SUPPORTED if candidates else EVIDENCE_UNSUPPORTED
+    preferred = [x for x in source_types if x in {"document", "procedure", "step", "ps", "md_photo", "md_video", "photo", "video"}]
+    return {
+        "request_kind": request_kind,
+        "effective_mode": effective_mode,
+        "confidence": 0.45,
+        "requested_mode_fit": effective_mode == request.requested_mode,
+        "evidence_state": evidence_state,
+        "evidence_policy": POLICY_MACHINE_REQUIRED,
+        "information_task": information_task,
+        "required_answer_types": _dedup_text_values(required_types, limit=8),
+        "relevant_evidence_ids": ids,
+        "preferred_source_types": preferred,
+        "source_type_policy": "prefer" if preferred else "none",
+        "dense_queries": [q] if q else [],
+        "lexical_queries": [q] if q else [],
+        "exact_terms": _dedup_text_values(_extract_code_tokens(q) + _v13_query_number_tokens(q), limit=12),
+        "required_facets": [q] if q else [],
+        "facet_queries": [],
+        "diagnostic_subsystems": [],
+        "diagnostic_observables": [],
+        "diagnostic_operating_conditions": [],
+        "diagnostic_discriminants": [],
+        "diagnostic_exclusions": [],
+        "missing_information": [],
+        "clarification_question": "",
+        "safety_reason": "",
+        "out_of_scope_reason": "",
+        "rationale": "Deterministic bounded fallback after semantic router failure.",
+        "router_model": "deterministic_fallback",
+        "router_degraded": True,
+        "router_degraded_reason": str(error or "router_failed")[:700],
+    }
+
 def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) -> dict:
     candidates = [
         dict(c)
@@ -26898,22 +27060,43 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
         f"INDEXED_EVIDENCE:\n{evidence_block}\n\n"
         "Return only the required JSON. Empty safety_reason and out_of_scope_reason unless the corresponding request_kind is selected."
     )
-    parsed, model_used = _v13_json_models(
-        [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
-        models=_dedup_text_values(
-            [ASSISTANT_CORE_ROUTER_MODEL, ASSISTANT_CORE_ROUTER_FALLBACK_MODEL],
-            limit=2,
-        ),
-        json_schema=build_router_schema(allowed_modes),
-        effort=ASSISTANT_CORE_ROUTER_EFFORT,
-        reasoning_mode="",
-        timeout=ASSISTANT_CORE_ROUTER_TIMEOUT_SECONDS,
-        max_output_tokens=ASSISTANT_CORE_ROUTER_MAX_OUTPUT_TOKENS,
-        company_id=request.company_id,
-        purpose="assistant_core_v2_semantic_router",
-    )
-    out = _assistant_core_relax_diagnostic_router_contract(dict(parsed or {}), request)
-    out["router_model"] = model_used
+    try:
+        parsed, model_used = _v13_json_models(
+            [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
+            models=_dedup_text_values(
+                [ASSISTANT_CORE_ROUTER_MODEL, ASSISTANT_CORE_ROUTER_FALLBACK_MODEL],
+                limit=2,
+            ),
+            json_schema=build_router_schema(allowed_modes),
+            effort=ASSISTANT_CORE_ROUTER_EFFORT,
+            reasoning_mode="",
+            timeout=ASSISTANT_CORE_ROUTER_TIMEOUT_SECONDS,
+            max_output_tokens=ASSISTANT_CORE_ROUTER_MAX_OUTPUT_TOKENS,
+            company_id=request.company_id,
+            purpose="assistant_core_v2_semantic_router",
+        )
+        out = _assistant_core_relax_diagnostic_router_contract(dict(parsed or {}), request)
+        out["router_model"] = model_used
+    except Exception as exc:
+        print("ASSISTANT_CORE_ROUTER_DETERMINISTIC_FALLBACK", str(exc)[:700])
+        return _assistant_core_deterministic_router_fallback(request, retrieval, exc)
+    # Deterministic surface-shape correction: a successful router may still
+    # mislabel a pure WHY/explanation request as a procedure merely because the
+    # component is documented inside a Procedure. This correction is multilingual
+    # and task-generic; it never changes evidence or machine facts.
+    q_low = _normalize_unicode_advanced(request.query or "").casefold()
+    asks_why = bool(re.search(r"(?:^|[\s,;:])(?:perch[eé]|why)\b", q_low))
+    asks_comparison = bool(re.search(r"\b(?:differenza|confronta|rispetto a|difference|compare|versus| vs )\b", q_low))
+    if asks_why and str(out.get("effective_mode") or "ask").lower() == MODE_ASK:
+        out["request_kind"] = KIND_FACTUAL
+        out["information_task"] = INFO_DOCUMENT_EXPLANATION
+        req = [str(x or "").strip().lower() for x in (out.get("required_answer_types") or [])]
+        out["required_answer_types"] = _dedup_text_values([REQ_EXPLANATION] + [x for x in req if x in {REQ_NUMERIC_VALUE, REQ_CHECKLIST, REQ_SAFETY_CONDITIONS}], limit=8)
+    elif asks_comparison and str(out.get("effective_mode") or "ask").lower() == MODE_ASK:
+        out["request_kind"] = KIND_COMPARISON
+        out["information_task"] = INFO_COMPARISON
+        out["required_answer_types"] = _dedup_text_values([REQ_COMPARISON, REQ_EXPLANATION] + list(out.get("required_answer_types") or []), limit=8)
+
     out["relevant_evidence_ids"] = [
         str(cid or "").strip()
         for cid in (out.get("relevant_evidence_ids") or [])
@@ -27811,7 +27994,7 @@ def _assistant_core_extract_enumerated_items(text: str, *, limit: int = 48) -> l
         if not re.search(r"[A-Za-zÀ-ÖØ-öø-ÿ]", value):
             return
         low = value.casefold()
-        if low in {"note", "warning", "attention", "description", "section", "source_type"}:
+        if low in {"note", "attention", "description", "section", "source_type"}:
             return
         if low not in {x.casefold() for x in out}:
             out.append(value)
@@ -27841,6 +28024,19 @@ def _assistant_core_extract_enumerated_items(text: str, *, limit: int = 48) -> l
                 add(re.split(r"\s*[,;.]\s*", part, maxsplit=1)[0])
         if len(out) >= limit:
             break
+
+    # PDF/HMI extraction often flattens bullets into one paragraph. Recover short
+    # labels immediately followed by a colon without relying on a specific machine
+    # or language. The semantic verifier later keeps only labels in the requested
+    # category, so this expands recall without declaring every label mandatory.
+    flat = re.sub(r"\s+", " ", str(text or "")).strip()
+    for match in re.finditer(
+        r"(?:(?<=^)|(?<=[.;•]))\s*([A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ0-9 /_-]{1,46})\s*:\s*",
+        flat,
+    ):
+        add(match.group(1))
+        if len(out) >= limit:
+            break
     return out[:limit]
 
 
@@ -27867,6 +28063,173 @@ def _assistant_core_list_item_in_answer(item: str, answer: str) -> bool:
     # preserving exactness for short option names such as "No Control".
     required = len(tokens) if len(tokens) <= 3 else max(2, int(math.ceil(len(tokens) * 0.75)))
     return sum(1 for token in tokens if re.search(r"(?<![a-z0-9])" + re.escape(token) + r"(?![a-z0-9])", haystack)) >= required
+
+
+def _assistant_core_expand_enumeration_sections(
+    *,
+    request: AssistantCoreRequest,
+    retrieval: dict,
+    candidates: list[dict],
+    max_documents: int = 4,
+    page_radius: int = 3,
+    max_pages: int = 18,
+) -> list[dict]:
+    """Fetch complete nearby manual/HMI pages for exhaustive-list requests.
+
+    The semantic hit selects the document; this function only expands the same
+    document around that hit. It never crosses company/machine scope and therefore
+    improves recall without replacing the ranked baseline.
+    """
+    docs: dict[str, dict] = {}
+    for c in candidates or []:
+        if not isinstance(c, dict):
+            continue
+        bdid = str(c.get("bubble_document_id") or "").strip()
+        if not bdid or _is_structured_source_key(bdid):
+            continue
+        p1 = _safe_int(c.get("page_from"), 0)
+        p2 = _safe_int(c.get("page_to"), p1)
+        if p1 <= 0:
+            continue
+        score = float(c.get("v13_score", c.get("retrieval_score", c.get("similarity", 0.0))) or 0.0)
+        row = docs.setdefault(bdid, {"low": p1, "high": max(p1, p2), "score": score})
+        row["low"] = min(int(row["low"]), p1)
+        row["high"] = max(int(row["high"]), max(p1, p2))
+        row["score"] = max(float(row["score"]), score)
+    selected_docs = sorted(docs.items(), key=lambda x: -float(x[1]["score"]))[:max_documents]
+    if not selected_docs:
+        return []
+    out: list[dict] = []
+    conn = None
+    try:
+        conn = _db_conn()
+        with conn.cursor() as cur:
+            for bdid, meta in selected_docs:
+                low = max(1, int(meta["low"]) - int(page_radius))
+                high = int(meta["high"]) + int(page_radius)
+                cur.execute(
+                    """
+                    SELECT machine_id, page_number, LEFT(COALESCE(text, ''), %s)
+                    FROM public.document_pages
+                    WHERE company_id=%s AND bubble_document_id=%s
+                      AND page_number BETWEEN %s AND %s
+                      AND text IS NOT NULL AND length(text) > 20
+                    ORDER BY page_number
+                    LIMIT %s;
+                    """,
+                    (V13_PAGE_TEXT_CHARS, request.company_id, bdid, low, high, max_pages),
+                )
+                for mid, page_number, page_text in cur.fetchall():
+                    text = str(page_text or "").strip()
+                    if not text:
+                        continue
+                    page = _safe_int(page_number, 1)
+                    out.append({
+                        "citation_id": f"{bdid}:p{page}-{page}:assistant-core:section",
+                        "bubble_document_id": bdid,
+                        "chunk_index": 0,
+                        "page_from": page,
+                        "page_to": page,
+                        "snippet": text[:ASK_SNIPPET_CHARS],
+                        "snippet_clean": text[:ASK_SNIPPET_CHARS],
+                        "chunk_full": text[:V13_PAGE_TEXT_CHARS],
+                        "similarity": min(0.92, max(0.0, 0.50 + float(meta["score"]) * 0.08)),
+                        "semantic_similarity": 0.0,
+                        "retrieval_score": float(meta["score"]),
+                        "v13_score": float(meta["score"]),
+                        "exact_machine_scope": str(mid or "").strip() == str(request.machine_id or "").strip(),
+                        "source_type": _source_type_from_document_id(bdid),
+                        "assistant_core_section_expansion": True,
+                    })
+    except Exception as exc:
+        print("ASSISTANT_CORE_SECTION_EXPANSION_FAIL", str(exc)[:500])
+    finally:
+        if conn is not None:
+            try: conn.close()
+            except Exception: pass
+    return _dedup_citations_by_snippet(out, max_items=max_pages)
+
+
+def _assistant_core_source_diversity_pool(candidates: list[dict], *, per_type: int = 2) -> list[dict]:
+    """Preserve a few strong sources from every available family for overviews."""
+    grouped: dict[str, list[dict]] = {}
+    for c in candidates or []:
+        st = _assistant_core_candidate_source_type(c) or "unknown"
+        grouped.setdefault(st, []).append(c)
+    out: list[dict] = []
+    for st in sorted(grouped):
+        rows = sorted(grouped[st], key=lambda c: -float(c.get("v13_score", c.get("retrieval_score", c.get("similarity", 0.0))) or 0.0))
+        out.extend(rows[:per_type])
+    return out
+
+
+def _assistant_core_machine_catalog_candidates(
+    request: AssistantCoreRequest,
+    *,
+    max_rows: int = 48,
+) -> list[dict]:
+    """Compact machine-wide structured digest for exhaustive overview requests."""
+    if not request.machine_id:
+        return []
+    out: list[dict] = []
+    conn = None
+    try:
+        conn = _db_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT bubble_document_id, page_number, LEFT(COALESCE(text, ''), 4500)
+                FROM public.document_pages
+                WHERE company_id=%s AND machine_id=%s
+                  AND page_number=1
+                  AND (
+                    bubble_document_id LIKE 'procedure:%%'
+                    OR bubble_document_id LIKE 'md_photo:%%'
+                    OR bubble_document_id LIKE 'md_video:%%'
+                    OR bubble_document_id LIKE 'photo:%%'
+                    OR bubble_document_id LIKE 'video:%%'
+                  )
+                  AND text IS NOT NULL AND length(text) > 20
+                ORDER BY bubble_document_id
+                LIMIT %s;
+                """,
+                (request.company_id, request.machine_id, max_rows),
+            )
+            for bdid, page_number, page_text in cur.fetchall():
+                text = str(page_text or "").strip()
+                if not text:
+                    continue
+                st = _source_type_from_document_id(str(bdid or ""))
+                score = float(_ask_evidence_score_text(request.query, text, _ask_evidence_fallback_profile(request.query, request.response_language)))
+                out.append({
+                    "citation_id": f"{bdid}:p1-1:assistant-core:catalog",
+                    "bubble_document_id": str(bdid or ""),
+                    "page_from": _safe_int(page_number, 1),
+                    "page_to": _safe_int(page_number, 1),
+                    "snippet": text[:ASK_SNIPPET_CHARS],
+                    "snippet_clean": text[:ASK_SNIPPET_CHARS],
+                    "chunk_full": text[:4500],
+                    "similarity": min(0.92, max(0.0, 0.50 + score / 100.0)),
+                    "semantic_similarity": 0.0,
+                    "retrieval_score": score,
+                    "v13_score": score,
+                    "exact_machine_scope": True,
+                    "source_type": st,
+                    "assistant_core_catalog_candidate": True,
+                })
+    except Exception as exc:
+        print("ASSISTANT_CORE_CATALOG_FAIL", str(exc)[:500])
+    finally:
+        if conn is not None:
+            try: conn.close()
+            except Exception: pass
+    # Keep every photo/video and the strongest procedure descriptions.
+    media = [c for c in out if _assistant_core_candidate_source_type(c) in {"md_photo", "md_video", "photo", "video"}]
+    procedures = sorted(
+        [c for c in out if _assistant_core_candidate_source_type(c) == "procedure"],
+        key=lambda c: -float(c.get("v13_score") or 0.0),
+    )[:12]
+    return _v13_merge_candidates([media[:8], procedures])
 
 def _assistant_core_prepare_evidence(
     request: AssistantCoreRequest,
@@ -27905,6 +28268,19 @@ def _assistant_core_prepare_evidence(
         limit=12,
     )
     enumeration_requested = _assistant_core_enumeration_requested(request, decision)
+    query_low_for_catalog = _normalize_unicode_advanced(request.query or "").casefold()
+    overview_catalog_requested = bool(
+        enumeration_requested
+        and re.search(r"\b(?:gruppi|componenti|elementi|parti principali|groups?|components?|main parts?|main elements?)\b", query_low_for_catalog)
+    )
+    if overview_catalog_requested:
+        catalog = _assistant_core_machine_catalog_candidates(request)
+        if catalog:
+            candidates = _v13_merge_candidates([
+                _assistant_core_source_diversity_pool(candidates, per_type=2),
+                candidates,
+                catalog,
+            ])
     enumeration_neighbor_count = 0
     if enumeration_requested and request.machine_id:
         budget_for_neighbors = _v13_current_budget()
@@ -27926,6 +28302,18 @@ def _assistant_core_prepare_evidence(
             if enumeration_neighbors:
                 enumeration_neighbor_count = len(enumeration_neighbors)
                 candidates = _v13_merge_candidates([candidates, enumeration_neighbors])
+            section_pages = _assistant_core_expand_enumeration_sections(
+                request=request,
+                retrieval=retrieval,
+                candidates=candidates[:18],
+            )
+            if section_pages:
+                enumeration_neighbor_count += len(section_pages)
+                candidates = _v13_merge_candidates([
+                    _assistant_core_source_diversity_pool(candidates, per_type=2),
+                    candidates,
+                    section_pages,
+                ])
         except Exception as exc:
             print("ASSISTANT_CORE_ENUMERATION_NEIGHBOR_FAIL", str(exc)[:500])
     needs_numeric = (
@@ -30808,31 +31196,11 @@ def _assistant_core_sync(payload: Union[AskRequest, RootCauseRequest], x_ai_inte
 
 
 def _assistant_core_ask_sync(payload: AskRequest, x_ai_internal_secret: Optional[str]) -> dict:
-    result = _assistant_core_sync(payload, x_ai_internal_secret, requested_mode=MODE_ASK)
-    # Canonicalize the final payload before the streaming layer starts. This keeps
-    # answer and answer_html aligned without buffering or replaying the HTTP request.
-    try:
-        return _mm_v12_canonicalize(
-            result,
-            str(getattr(payload, "query", "") or ""),
-            {"stability_retry_attempted": False, "transport_buffering": False},
-        )
-    except Exception as exc:
-        print("MM_V12_CANONICALIZE_FAIL ask", str(exc)[:500])
-        return result
+    return _assistant_core_sync(payload, x_ai_internal_secret, requested_mode=MODE_ASK)
 
 
 def _assistant_core_root_cause_sync(payload: RootCauseRequest, x_ai_internal_secret: Optional[str]) -> dict:
-    result = _assistant_core_sync(payload, x_ai_internal_secret, requested_mode=MODE_ROOT_CAUSE)
-    try:
-        return _mm_v12_canonicalize(
-            result,
-            str(getattr(payload, "query", "") or ""),
-            {"stability_retry_attempted": False, "transport_buffering": False},
-        )
-    except Exception as exc:
-        print("MM_V12_CANONICALIZE_FAIL root_cause", str(exc)[:500])
-        return result
+    return _assistant_core_sync(payload, x_ai_internal_secret, requested_mode=MODE_ROOT_CAUSE)
 
 
 # -----------------------------------------------------------------------------
@@ -34996,445 +35364,4 @@ def smart_diagnostic_finalize_v1(
         citations=list(state.get("citations") or []), rg_links=list(state.get("rg_links") or []),
         debug=bool(payload.debug),
     )
-
-
-# ============================================================================
-# MachineMind V12 — canonical response + monotonic one-retry stability layer
-# ============================================================================
-# This layer is intentionally downstream of retrieval and synthesis. It does not
-# alter Bubble, indexed content, source relations, quota logic, or source links.
-# It guarantees that the user-visible HTML is rendered from the same final
-# answer object, and it performs at most one bounded no-cache retry only when an
-# otherwise supported request ends in a recoverable incomplete/no-sources state.
-
-import asyncio as _mm_v12_asyncio
-import copy as _mm_v12_copy
-import hashlib as _mm_v12_hashlib
-import html as _mm_v12_html
-import inspect as _mm_v12_inspect
-import json as _mm_v12_json
-import re as _mm_v12_re
-import time as _mm_v12_time
-import uuid as _mm_v12_uuid
-from typing import Any as _MMV12Any
-
-_MM_V12_RENDER_VERSION = "assistant-ui-html-canonical-v9-1-20260804-7"
-_MM_V12_LAYER_VERSION = "canonical-no-buffer-v9-1-20260804-7"
-_MM_V12_RECOVERABLE_CODES = {
-    "NO_MACHINE_EVIDENCE",
-    "INCOMPLETE_ANSWER_CONTRACT",
-    "INCOMPLETE_PROCEDURE_BUNDLE",
-    "INCOMPLETE_PROCEDURE_SELECTION",
-    "ROOT_CAUSE_TIMEOUT",
-    "ROOT_CAUSE_FAILED",
-    "SMART_DIAGNOSTIC_GENERATION_FAILED",
-}
-
-
-def _mm_v12_s(value: _MMV12Any) -> str:
-    return _mm_v12_re.sub(r"\s+", " ", str(value or "")).strip()
-
-
-def _mm_v12_strip_html(value: _MMV12Any) -> str:
-    text = str(value or "")
-    text = _mm_v12_re.sub(r"<script\b[^>]*>.*?</script>", " ", text, flags=_mm_v12_re.I | _mm_v12_re.S)
-    text = _mm_v12_re.sub(r"<style\b[^>]*>.*?</style>", " ", text, flags=_mm_v12_re.I | _mm_v12_re.S)
-    text = _mm_v12_re.sub(r"<[^>]+>", " ", text)
-    return _mm_v12_s(_mm_v12_html.unescape(text))
-
-
-def _mm_v12_inline(text: str) -> str:
-    escaped = _mm_v12_html.escape(str(text or ""), quote=False)
-    escaped = _mm_v12_re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped)
-    escaped = _mm_v12_re.sub(r"`([^`]+)`", r"<code>\1</code>", escaped)
-    return escaped
-
-
-def _mm_v12_split_lines(answer: str) -> list[str]:
-    answer = str(answer or "").replace("\r\n", "\n").replace("\r", "\n").strip()
-    if not answer:
-        return []
-    lines = [x.strip() for x in answer.split("\n")]
-    # Some model responses arrive as one long line with inline numbered items.
-    if len([x for x in lines if x]) <= 2 and len(answer) > 260:
-        answer = _mm_v12_re.sub(r"\s+(?=(?:\d{1,2}[.)]|[-•])\s+)", "\n", answer)
-        lines = [x.strip() for x in answer.split("\n")]
-    return lines
-
-
-def _mm_v12_render_answer(answer: str, language: str = "it", status: str = "answered") -> str:
-    lang = "en" if str(language or "").lower().startswith("en") else "it"
-    lines = _mm_v12_split_lines(answer)
-    if not lines:
-        empty_title = "Result" if lang == "en" else "Esito"
-        empty_body = (
-            "No sufficiently reliable information was found in the authorized indexed sources."
-            if lang == "en" else
-            "Non sono state trovate informazioni sufficientemente affidabili nelle fonti indicizzate autorizzate."
-        )
-        lines = [empty_title, empty_body]
-
-    css = """
-<style>
-.mm-v12{font-family:Inter,Arial,sans-serif;color:#1f2937;font-size:14px;line-height:1.55;background:transparent}
-.mm-v12 h2{font-size:18px;line-height:1.3;margin:0 0 10px;color:#111827}
-.mm-v12 h3{font-size:14px;line-height:1.35;margin:18px 0 8px;color:#111827}
-.mm-v12 p{margin:0 0 10px;color:#374151}
-.mm-v12 ol,.mm-v12 ul{margin:6px 0 12px;padding-left:24px}
-.mm-v12 li{margin:0 0 9px;padding-left:3px}
-.mm-v12 strong{color:#111827;font-weight:700}.mm-v12 code{background:#f3f4f6;border-radius:4px;padding:1px 4px}
-.mm-v12 .callout{border-left:3px solid #f59e0b;background:#fffbeb;border-radius:0 7px 7px 0;padding:10px 12px;margin:12px 0}
-.mm-v12 .callout.ok{border-left-color:#10b981;background:#ecfdf5}.mm-v12 .callout.warn{border-left-color:#dc2626;background:#fef2f2}
-.mm-v12 .callout-title{font-weight:700;margin-bottom:4px;color:#92400e}.mm-v12 .ok .callout-title{color:#166534}.mm-v12 .warn .callout-title{color:#991b1b}
-.mm-v12 .muted{color:#6b7280}.mm-v12 .section{margin-top:14px}
-</style>"""
-
-    heading_terms = {
-        "it": ("prima di iniziare", "procedura", "verifiche da eseguire", "controlli consigliati", "verifica finale", "nota tecnica", "attenzione", "esito", "causa più probabile", "cause probabili", "intervento consigliato"),
-        "en": ("before starting", "procedure", "checks to perform", "recommended checks", "final check", "technical note", "warning", "result", "most likely cause", "probable causes", "recommended action"),
-    }[lang]
-    callout_warn = ("attenzione", "pericolo", "warning", "danger", "safety")
-    callout_ok = ("verifica finale", "final check", "esito", "result")
-
-    out = [css, '<article class="mm-v12">']
-    list_mode = None
-    first_text = True
-    paragraph_buf: list[str] = []
-
-    def flush_paragraph():
-        nonlocal paragraph_buf
-        if paragraph_buf:
-            out.append("<p>" + _mm_v12_inline(" ".join(paragraph_buf)) + "</p>")
-            paragraph_buf = []
-
-    def close_list():
-        nonlocal list_mode
-        if list_mode:
-            out.append(f"</{list_mode}>")
-            list_mode = None
-
-    for raw in lines:
-        line = raw.strip()
-        if not line:
-            flush_paragraph(); close_list(); continue
-        low = _mm_v12_s(_mm_v12_re.sub(r"[*#:]", " ", line)).lower()
-        numbered = _mm_v12_re.match(r"^(\d{1,2})[.)]\s+(.*)$", line)
-        bullet = _mm_v12_re.match(r"^[-•]\s+(.*)$", line)
-        markdown_heading = _mm_v12_re.match(r"^#{1,4}\s+(.*)$", line)
-        is_heading = bool(markdown_heading) or any(low == h or low.startswith(h + ":") for h in heading_terms)
-
-        if numbered:
-            flush_paragraph()
-            if list_mode != "ol": close_list(); out.append("<ol>"); list_mode = "ol"
-            out.append("<li>" + _mm_v12_inline(numbered.group(2)) + "</li>")
-            continue
-        if bullet:
-            flush_paragraph()
-            if list_mode != "ul": close_list(); out.append("<ul>"); list_mode = "ul"
-            out.append("<li>" + _mm_v12_inline(bullet.group(1)) + "</li>")
-            continue
-        if is_heading:
-            flush_paragraph(); close_list()
-            label = markdown_heading.group(1) if markdown_heading else line.strip(" *#:")
-            label_low = label.lower()
-            if any(t in label_low for t in callout_warn):
-                out.append('<div class="callout warn"><div class="callout-title">' + _mm_v12_inline(label) + '</div></div>')
-            elif any(t in label_low for t in callout_ok):
-                out.append('<div class="callout ok"><div class="callout-title">' + _mm_v12_inline(label) + '</div></div>')
-            elif first_text:
-                out.append("<h2>" + _mm_v12_inline(label) + "</h2>")
-            else:
-                out.append("<h3>" + _mm_v12_inline(label) + "</h3>")
-            first_text = False
-            continue
-        if first_text and len(line) <= 120 and not line.endswith("."):
-            flush_paragraph(); close_list(); out.append("<h2>" + _mm_v12_inline(line) + "</h2>"); first_text = False
-            continue
-        close_list()
-        paragraph_buf.append(line)
-        first_text = False
-
-    flush_paragraph(); close_list(); out.append("</article>")
-    return "".join(out)
-
-
-def _mm_v12_render_root(payload: dict) -> str:
-    lang = "en" if str(payload.get("language") or "").lower().startswith("en") else "it"
-    title = "Probable causes" if lang == "en" else "Cause probabili"
-    summary_label = "Problem" if lang == "en" else "Problema"
-    why_label = "Why" if lang == "en" else "Perché"
-    checks_label = "Recommended checks" if lang == "en" else "Controlli consigliati"
-    causes = payload.get("possible_causes") if isinstance(payload.get("possible_causes"), list) else []
-    css = """
-<style>
-.mm-v12-rc{font-family:Inter,Arial,sans-serif;color:#1f2937;font-size:14px;line-height:1.55}.mm-v12-rc h2{font-size:18px;margin:0 0 10px;color:#111827}.mm-v12-rc p{margin:0 0 10px;color:#374151}
-.mm-v12-rc .cause{border-left:3px solid #2563eb;padding:2px 0 4px 12px;margin:15px 0}.mm-v12-rc .rank{font-size:11px;font-weight:700;text-transform:uppercase;color:#1d4ed8}.mm-v12-rc h3{font-size:14px;margin:3px 0 6px;color:#111827}
-.mm-v12-rc ol{margin:6px 0 0;padding-left:23px}.mm-v12-rc li{margin-bottom:7px}.mm-v12-rc strong{color:#111827}.mm-v12-rc .summary{margin:0 0 13px}
-</style>"""
-    out = [css, '<article class="mm-v12-rc"><h2>', _mm_v12_inline(title), '</h2>']
-    summary = _mm_v12_s(payload.get("problem_summary"))
-    if summary:
-        out += ['<p class="summary"><strong>', _mm_v12_inline(summary_label), ':</strong> ', _mm_v12_inline(summary), '</p>']
-    for idx, cause in enumerate(causes):
-        if not isinstance(cause, dict): continue
-        rank = cause.get("rank", idx + 1)
-        label = _mm_v12_s(cause.get("cause") or cause.get("label"))
-        why = _mm_v12_s(cause.get("why"))
-        checks = cause.get("checks") if isinstance(cause.get("checks"), list) else []
-        out += ['<section class="cause"><div class="rank">', _mm_v12_inline(("Cause " if lang == "en" else "Causa ") + str(rank)), '</div>']
-        if label: out += ['<h3>', _mm_v12_inline(label), '</h3>']
-        if why: out += ['<p><strong>', _mm_v12_inline(why_label), ':</strong> ', _mm_v12_inline(why), '</p>']
-        if checks:
-            out += ['<p><strong>', _mm_v12_inline(checks_label), '</strong></p><ol>']
-            for c in checks: out += ['<li>', _mm_v12_inline(_mm_v12_s(c)), '</li>']
-            out += ['</ol>']
-        out += ['</section>']
-    extra = payload.get("recommended_next_checks") if isinstance(payload.get("recommended_next_checks"), list) else []
-    if extra:
-        out += ['<h3>', _mm_v12_inline(checks_label), '</h3><ol>']
-        for c in extra: out += ['<li>', _mm_v12_inline(_mm_v12_s(c)), '</li>']
-        out += ['</ol>']
-    out += ['</article>']
-    return ''.join(out)
-
-
-def _mm_v12_dedup(items: _MMV12Any, kind: str) -> list:
-    if not isinstance(items, list): return []
-    out, seen = [], set()
-    for item in items:
-        if not isinstance(item, dict): continue
-        if kind == "citation":
-            key = (
-                _mm_v12_s(item.get("source_type")).lower(),
-                _mm_v12_s(item.get("bubble_document_id") or item.get("source_id")),
-                str(item.get("page_from") or ""), str(item.get("page_to") or ""),
-                _mm_v12_s(item.get("display_label") or item.get("display_title")).lower(),
-            )
-        else:
-            key = (
-                _mm_v12_s(item.get("url")),
-                _mm_v12_s(item.get("bubble_document_id") or item.get("source_id")),
-                str(item.get("page_from") or ""), str(item.get("page_to") or ""),
-                _mm_v12_s(item.get("display_label") or item.get("label")).lower(),
-            )
-        if key in seen: continue
-        seen.add(key); out.append(item)
-    return out
-
-
-def _mm_v12_payload_score(payload: _MMV12Any) -> float:
-    if not isinstance(payload, dict): return -1e9
-    status = _mm_v12_s(payload.get("status")).lower()
-    score = 0.0
-    if status in {"answered", "completed", "final", "finalized"}: score += 1000
-    elif status in {"partial", "in_progress", "ready"}: score += 500
-    elif status == "out_of_scope": score += 250
-    elif status in {"no_sources", "error", "transport_error"}: score -= 500
-    answer = _mm_v12_s(payload.get("answer"))
-    score += min(len(answer), 4000) / 20.0
-    score += 25 * len(payload.get("citations") or [])
-    score += 10 * len(payload.get("rg_links") or [])
-    validation = payload.get("validation") if isinstance(payload.get("validation"), dict) else {}
-    contract = validation.get("answer_contract") if isinstance(validation.get("answer_contract"), dict) else {}
-    if contract.get("passed") is True: score += 300
-    score += 100 * float(contract.get("answer_facet_coverage") or 0)
-    if payload.get("evidence_state") == "supported": score += 80
-    return score
-
-
-def _mm_v12_canonicalize(payload: dict, query: str = "", retry_meta: dict | None = None) -> dict:
-    out = _mm_v12_copy.deepcopy(payload)
-    out["citations"] = _mm_v12_dedup(out.get("citations"), "citation")
-    out["rg_links"] = _mm_v12_dedup(out.get("rg_links"), "link")
-    lang = str(out.get("language") or (out.get("meta") or {}).get("language") or "it")
-    mode = _mm_v12_s(out.get("effective_mode") or out.get("requested_mode")).lower()
-    status = _mm_v12_s(out.get("status")).lower()
-    if mode == "root_cause" and isinstance(out.get("possible_causes"), list) and out.get("possible_causes"):
-        out["answer_html"] = _mm_v12_render_root(out)
-    else:
-        out["answer_html"] = _mm_v12_render_answer(str(out.get("answer") or ""), lang, status)
-    out["answer_format"] = "html"
-    out["answer_render_version"] = _MM_V12_RENDER_VERSION
-    meta = out.get("meta") if isinstance(out.get("meta"), dict) else {}
-    meta = dict(meta)
-    meta.update({
-        "canonical_final_answer": True,
-        "stability_layer": _MM_V12_LAYER_VERSION,
-        "visible_answer_source": "answer" if _mm_v12_s(out.get("answer")) else "structured_payload",
-        "answer_text_sha256": _mm_v12_hashlib.sha256(_mm_v12_s(out.get("answer")).encode()).hexdigest(),
-        "answer_html_text_sha256": _mm_v12_hashlib.sha256(_mm_v12_strip_html(out.get("answer_html")).encode()).hexdigest(),
-    })
-    if retry_meta: meta.update(retry_meta)
-    out["meta"] = meta
-    return out
-
-
-def _mm_v12_should_retry(payload: dict, elapsed: float, request_obj: dict) -> bool:
-    if elapsed >= 72: return False
-    status = _mm_v12_s(payload.get("status")).lower()
-    code = _mm_v12_s(payload.get("result_code") or payload.get("error_code")).upper()
-    evidence = _mm_v12_s(payload.get("evidence_state")).lower()
-    if status in {"error", "no_sources"} and (code in _MM_V12_RECOVERABLE_CODES or evidence in {"supported", "partial"}):
-        return True
-    validation = payload.get("validation") if isinstance(payload.get("validation"), dict) else {}
-    contract = validation.get("answer_contract") if isinstance(validation.get("answer_contract"), dict) else {}
-    if status == "answered" and contract and contract.get("passed") is False:
-        return True
-    return False
-
-
-# Generic monotonic guards for internal answer repair/rewrite functions.
-def _mm_v12_find_answer_dict(value: _MMV12Any, depth: int = 0) -> dict | None:
-    if depth > 5: return None
-    if isinstance(value, dict):
-        if _mm_v12_s(value.get("answer")) and ("citations" in value or "status" in value): return value
-        best = None
-        for v in value.values():
-            found = _mm_v12_find_answer_dict(v, depth + 1)
-            if found and (best is None or _mm_v12_payload_score(found) > _mm_v12_payload_score(best)): best = found
-        return best
-    if isinstance(value, (list, tuple)):
-        best = None
-        for v in value:
-            found = _mm_v12_find_answer_dict(v, depth + 1)
-            if found and (best is None or _mm_v12_payload_score(found) > _mm_v12_payload_score(best)): best = found
-        return best
-    if hasattr(value, "model_dump"):
-        try: return _mm_v12_find_answer_dict(value.model_dump(), depth + 1)
-        except Exception: return None
-    return None
-
-
-def _mm_v12_choose_monotonic(baseline: dict | None, candidate: _MMV12Any) -> _MMV12Any:
-    if not baseline or not isinstance(candidate, dict): return candidate
-    if _mm_v12_payload_score(candidate) + 1e-9 >= _mm_v12_payload_score(baseline): return candidate
-    cstatus = _mm_v12_s(candidate.get("status")).lower()
-    if cstatus in {"no_sources", "error"} or len(_mm_v12_s(candidate.get("answer"))) < 0.55 * len(_mm_v12_s(baseline.get("answer"))):
-        restored = _mm_v12_copy.deepcopy(baseline)
-        restored["status"] = "answered"
-        restored["result_code"] = restored.get("result_code") or "ANSWERED_BASELINE_PRESERVED"
-        meta = restored.get("meta") if isinstance(restored.get("meta"), dict) else {}
-        meta = dict(meta); meta["monotonic_rewrite_rejected"] = True; restored["meta"] = meta
-        return restored
-    return candidate
-
-
-def _mm_v12_wrap_monotonic(fn):
-    if getattr(fn, "_mm_v12_wrapped", False): return fn
-    if _mm_v12_inspect.iscoroutinefunction(fn):
-        async def aw(*args, **kwargs):
-            baseline = _mm_v12_find_answer_dict((args, kwargs))
-            result = await fn(*args, **kwargs)
-            return _mm_v12_choose_monotonic(baseline, result)
-        aw._mm_v12_wrapped = True; aw.__name__ = getattr(fn, "__name__", "wrapped")
-        return aw
-    def sw(*args, **kwargs):
-        baseline = _mm_v12_find_answer_dict((args, kwargs))
-        result = fn(*args, **kwargs)
-        return _mm_v12_choose_monotonic(baseline, result)
-    sw._mm_v12_wrapped = True; sw.__name__ = getattr(fn, "__name__", "wrapped")
-    return sw
-
-
-class _MMV12StabilityMiddleware:
-    def __init__(self, app): self.app = app
-
-    async def _read_request(self, receive):
-        chunks = []
-        while True:
-            msg = await receive()
-            if msg["type"] != "http.request": continue
-            chunks.append(msg.get("body", b""))
-            if not msg.get("more_body", False): break
-        return b"".join(chunks)
-
-    async def _invoke(self, scope, body: bytes):
-        sent = []
-        delivered = False
-        async def recv():
-            nonlocal delivered
-            if delivered: return {"type": "http.request", "body": b"", "more_body": False}
-            delivered = True
-            return {"type": "http.request", "body": body, "more_body": False}
-        async def capture(msg): sent.append(msg)
-        await self.app(scope, recv, capture)
-        start = next((m for m in sent if m["type"] == "http.response.start"), {"status": 500, "headers": []})
-        response_body = b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body")
-        return start, response_body
-
-    async def __call__(self, scope, receive, send):
-        if scope.get("type") != "http":
-            return await self.app(scope, receive, send)
-        path = scope.get("path") or ""
-        if path not in {"/v1/ai/ask", "/v1/ai/root-cause"}:
-            return await self.app(scope, receive, send)
-        body = await self._read_request(receive)
-        try: request_obj = _mm_v12_json.loads(body.decode("utf-8")) if body else {}
-        except Exception: request_obj = {}
-        headers_in = {k.decode().lower(): v.decode() for k,v in scope.get("headers", [])}
-        already_retry = headers_in.get("x-mm-v12-retry") == "1"
-        started = _mm_v12_time.perf_counter()
-        start1, body1 = await self._invoke(scope, body)
-        try: payload1 = _mm_v12_json.loads(body1.decode("utf-8"))
-        except Exception: payload1 = None
-        chosen, retry_meta = payload1, {"stability_retry_attempted": False}
-
-        if isinstance(payload1, dict) and not already_retry and _mm_v12_should_retry(payload1, _mm_v12_time.perf_counter()-started, request_obj):
-            req2 = dict(request_obj) if isinstance(request_obj, dict) else {}
-            req2["no_cache"] = True
-            req2["debug"] = False
-            req2["top_k"] = max(int(req2.get("top_k") or 0), 10 if path.endswith("ask") else 12)
-            options = req2.get("options") if isinstance(req2.get("options"), dict) else {}
-            options = dict(options); options["no_cache"] = True; options["top_k"] = req2["top_k"]; req2["options"] = options
-            body2_req = _mm_v12_json.dumps(req2, ensure_ascii=False).encode("utf-8")
-            scope2 = dict(scope)
-            h2 = [(k,v) for k,v in scope.get("headers", []) if k.lower() not in {b"content-length", b"x-mm-v12-retry"}]
-            h2.append((b"x-mm-v12-retry", b"1")); h2.append((b"content-length", str(len(body2_req)).encode()))
-            scope2["headers"] = h2
-            start2, body2 = await self._invoke(scope2, body2_req)
-            try: payload2 = _mm_v12_json.loads(body2.decode("utf-8"))
-            except Exception: payload2 = None
-            if isinstance(payload2, dict) and _mm_v12_payload_score(payload2) > _mm_v12_payload_score(payload1):
-                chosen, start1 = payload2, start2
-                retry_outcome = "retry_selected"
-            else:
-                retry_outcome = "baseline_preserved"
-            retry_meta = {
-                "stability_retry_attempted": True,
-                "stability_retry_outcome": retry_outcome,
-                "baseline_score": _mm_v12_payload_score(payload1),
-                "retry_score": _mm_v12_payload_score(payload2),
-            }
-
-        if isinstance(chosen, dict):
-            query = _mm_v12_s(request_obj.get("query") if isinstance(request_obj, dict) else "")
-            chosen = _mm_v12_canonicalize(chosen, query, retry_meta)
-            output = _mm_v12_json.dumps(chosen, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-            headers = [(k,v) for k,v in start1.get("headers", []) if k.lower() not in {b"content-length", b"content-encoding", b"transfer-encoding"}]
-            headers.append((b"content-type", b"application/json; charset=utf-8"))
-            headers.append((b"content-length", str(len(output)).encode()))
-            headers.append((b"x-mm-stability-layer", _MM_V12_LAYER_VERSION.encode()))
-            await send({"type": "http.response.start", "status": int(start1.get("status", 200)), "headers": headers})
-            await send({"type": "http.response.body", "body": output, "more_body": False})
-            return
-        await send(start1)
-        await send({"type": "http.response.body", "body": body1, "more_body": False})
-
-
-# Wrap only detected answer transformation helpers; no retrieval or model caller is altered.
-_MM_V12_MONOTONIC_TARGETS = ['_assistant_core_adjudicate_root_cause', '_assistant_core_refine_retrieval', '_assistant_core_repair_response', '_assistant_core_root_adjudicator_schema', '_assistant_core_verify_or_repair_answer', '_v12_incomplete_procedure_response']
-for _mm_v12_name in _MM_V12_MONOTONIC_TARGETS:
-    _mm_v12_fn = globals().get(_mm_v12_name)
-    if callable(_mm_v12_fn): globals()[_mm_v12_name] = _mm_v12_wrap_monotonic(_mm_v12_fn)
-
-# IMPORTANT: do not wrap ASK/Root Cause with the V12 ASGI replay middleware.
-# Those endpoints intentionally stream heartbeat bytes. Buffering the stream hides
-# every heartbeat from the client, and replaying the complete request can double the
-# total duration beyond the caller timeout. Canonicalization is applied inside the
-# sync handlers above, before StreamingResponse is created.
-_MM_V12_TRANSPORT_MIDDLEWARE_ENABLED = False
-
-# ============================================================================
-# End MachineMind V12 stability layer
-# ============================================================================
 

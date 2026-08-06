@@ -833,6 +833,52 @@ def decorate_response(
     return dict(out)
 
 
+
+def _response_quality_tuple(response: Mapping[str, Any]) -> tuple:
+    """Monotonic quality ordering used only between one baseline and one repair.
+
+    A technical timeout/no_sources can never replace an already grounded answered
+    response. Contract completion, evidence and missing-facet count dominate length.
+    """
+    if not isinstance(response, Mapping):
+        return (0, 0, 0, -999, 0)
+    status = _clean_text(response.get("status"), 40).lower()
+    answered = status == "answered"
+    citations = [c for c in (response.get("citations") or []) if isinstance(c, Mapping)]
+    meta = response.get("meta") if isinstance(response.get("meta"), Mapping) else {}
+    validation = meta.get("assistant_core_validation") if isinstance(meta.get("assistant_core_validation"), Mapping) else {}
+    contract = validation.get("answer_contract") if isinstance(validation.get("answer_contract"), Mapping) else {}
+    passed = bool(contract.get("passed"))
+    missing = len(contract.get("missing_answer_facets") or []) + len(contract.get("missing_evidence_facets") or []) + len(contract.get("missing_list_items") or [])
+    if _clean_text(response.get("effective_mode"), 40).lower() == MODE_ROOT_CAUSE:
+        body = _clean_text(response.get("problem_summary"), 2000) + " " + " ".join(_clean_text(c.get("cause"), 300) for c in (response.get("possible_causes") or []) if isinstance(c, Mapping))
+    else:
+        body = _clean_text(response.get("answer"), 4000)
+    return (1 if answered else 0, 1 if passed else 0, 1 if citations else 0, -missing, min(len(body), 4000))
+
+
+def _choose_monotonic_response(baseline: Mapping[str, Any], candidate: Mapping[str, Any]) -> dict:
+    base = dict(baseline or {})
+    cand = dict(candidate or {})
+    if not base:
+        return cand
+    if not cand:
+        return base
+    bq = _response_quality_tuple(base)
+    cq = _response_quality_tuple(cand)
+    # Never permit a timeout/error/no_sources repair to erase an answered baseline.
+    if bq[0] and not cq[0]:
+        out = base
+        meta = dict(out.get("meta") or {})
+        meta["monotonic_repair"] = {"selected": "baseline", "baseline_quality": list(bq), "candidate_quality": list(cq)}
+        out["meta"] = meta
+        return out
+    out = cand if cq > bq else base
+    meta = dict(out.get("meta") or {})
+    meta["monotonic_repair"] = {"selected": "candidate" if out is cand else "baseline", "baseline_quality": list(bq), "candidate_quality": list(cq)}
+    out["meta"] = meta
+    return out
+
 class AssistantCoreV2:
     def __init__(self, hooks: AssistantCoreHooks):
         self.hooks = hooks
@@ -948,6 +994,7 @@ class AssistantCoreV2:
             response = self.hooks.validate_response(
                 dict(response or {}), request, prepared_retrieval, decision
             )
+        validated_baseline = dict(response or {})
 
         # One bounded repair cycle is available only when the first grounded answer
         # misses a mandatory facet/answer type. It reuses the semantic contract,
@@ -975,5 +1022,6 @@ class AssistantCoreV2:
                 response = self.hooks.validate_response(
                     dict(response or {}), request, prepared_retrieval, decision
                 )
+            response = _choose_monotonic_response(validated_baseline, dict(response or {}))
 
         return decorate_response(response, request, decision)
