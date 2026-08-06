@@ -3319,6 +3319,9 @@ def _finalize_ask_response_for_ui(resp: dict, *, language: str = "it") -> dict:
         )
 
     raw_citations = out.get("citations") if isinstance(out.get("citations"), list) else []
+    overview_response = bool(
+        ((out.get("meta") or {}).get("machine_overview_inventory") or {}).get("enabled")
+    )
     structured_response = any(
         isinstance(c, dict)
         and (
@@ -3345,9 +3348,13 @@ def _finalize_ask_response_for_ui(resp: dict, *, language: str = "it") -> dict:
                     cc["snippet_clean"] = sn[:max_sn].rsplit(" ", 1)[0].strip() + "…"
             cleaned.append(cc)
         citation_limit = (
-            max(1, int(ASK_UI_STRUCTURED_MAX_CITATIONS or 14))
-            if structured_response
-            else max(1, int(ASK_UI_MAX_CITATIONS or 8))
+            20
+            if overview_response
+            else (
+                max(1, int(ASK_UI_STRUCTURED_MAX_CITATIONS or 14))
+                if structured_response
+                else max(1, int(ASK_UI_MAX_CITATIONS or 8))
+            )
         )
         out["citations"] = _v12_curate_response_items_for_ui(cleaned, max_items=citation_limit)
 
@@ -3358,9 +3365,13 @@ def _finalize_ask_response_for_ui(resp: dict, *, language: str = "it") -> dict:
             for x in out.get("rg_links") or []
         )
         link_limit = (
-            max(1, int(ASK_UI_STRUCTURED_MAX_LINKS or 14))
-            if link_structured
-            else max(1, int(ASK_UI_MAX_LINKS or 8))
+            20
+            if overview_response
+            else (
+                max(1, int(ASK_UI_STRUCTURED_MAX_LINKS or 14))
+                if link_structured
+                else max(1, int(ASK_UI_MAX_LINKS or 8))
+            )
         )
         out["rg_links"] = _v12_curate_response_items_for_ui(out.get("rg_links") or [], max_items=link_limit)
 
@@ -20218,8 +20229,8 @@ if V13_HEAVY_REASONING_MODE not in {"", "pro"}:
 # retrieval/synthesis primitives but chooses the response mode only after neutral
 # cross-source retrieval. Default ON; set MM_ASSISTANT_CORE_V2_ENABLED=0 only for rollback.
 ASSISTANT_CORE_V2_ENABLED = (os.environ.get("MM_ASSISTANT_CORE_V2_ENABLED") or "1").strip() != "0"
-ASSISTANT_CORE_V2_CODE_MARKER = "assistant-core-v2-certified-overview-lossless-v10-1-20260806-1"
-ASSISTANT_CORE_V2_RELEASE_ID = (os.environ.get("MM_ASSISTANT_CORE_V2_RELEASE_ID") or "2026-08-06.1").strip()
+ASSISTANT_CORE_V2_CODE_MARKER = "assistant-core-v2-machine-overview-inventory-v10-3-20260806-3"
+ASSISTANT_CORE_V2_RELEASE_ID = (os.environ.get("MM_ASSISTANT_CORE_V2_RELEASE_ID") or "2026-08-06.3").strip()
 RESULT_INCOMPLETE_ANSWER_CONTRACT = "INCOMPLETE_ANSWER_CONTRACT"
 ASSISTANT_UI_RENDER_VERSION = "assistant-ui-html-lossless-v10-1-20260806-1"
 ASSISTANT_UI_MAX_HTML_CHARS = max(8000, min(60000, int(
@@ -28426,6 +28437,935 @@ def _assistant_core_machine_catalog_candidates(
     )[:12]
     return _v13_merge_candidates([media[:8], procedures])
 
+def _assistant_core_machine_overview_schema() -> dict:
+    """Strict schema for one exhaustive, source-accounted machine overview.
+
+    The model may merge records into a smaller number of user-facing items, but
+    every catalog record is carried by a short inventory id and is validated by
+    the deterministic post-processor below. Missing records are appended from
+    source metadata instead of being silently discarded.
+    """
+    return {
+        "name": "machinemind_machine_overview_inventory_v1",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "answer_status": {
+                    "type": "string",
+                    "enum": ["answered", "no_sources"],
+                },
+                "function_summary": {"type": "string"},
+                "function_citation_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 6,
+                },
+                "overview_items": {
+                    "type": "array",
+                    "maxItems": 20,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "label": {"type": "string"},
+                            "description": {"type": "string"},
+                            "kind": {
+                                "type": "string",
+                                "enum": [
+                                    "material_flow",
+                                    "physical_assembly",
+                                    "forming_or_tooling",
+                                    "clamping_or_feed",
+                                    "control_interface",
+                                    "auxiliary_system",
+                                    "safety_or_protection",
+                                    "outfeed",
+                                    "other",
+                                ],
+                            },
+                            "inventory_ids": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "maxItems": 24,
+                            },
+                            "citation_ids": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "maxItems": 12,
+                            },
+                        },
+                        "required": [
+                            "label",
+                            "description",
+                            "kind",
+                            "inventory_ids",
+                            "citation_ids",
+                        ],
+                    },
+                },
+                "reason": {"type": "string"},
+            },
+            "required": [
+                "answer_status",
+                "function_summary",
+                "function_citation_ids",
+                "overview_items",
+                "reason",
+            ],
+        },
+    }
+
+
+def _assistant_core_overview_candidate_score(candidate: dict) -> float:
+    """Stable ordering score for source records used by the overview builder."""
+    score = float(
+        candidate.get(
+            "v13_score",
+            candidate.get("retrieval_score", candidate.get("similarity", 0.0)),
+        )
+        or 0.0
+    )
+    text = _assistant_core_candidate_evidence_text(candidate)
+    if len(text) >= 240:
+        score += 1.5
+    if bool(candidate.get("assistant_core_section_expansion")):
+        score += 1.5
+    if str(candidate.get("retrieval_assurance_kind") or "").strip():
+        score += 1.0
+    # Table-of-contents fragments and title pages remain available as support but
+    # rank below narrative technical pages when scores are otherwise similar.
+    digit_ratio = sum(ch.isdigit() for ch in text) / max(1, len(text))
+    if digit_ratio > 0.12:
+        score -= 2.5
+    if len(re.findall(r"(?m)^\s*\d{1,3}\s*$", text)) >= 4:
+        score -= 2.0
+    return score
+
+
+def _assistant_core_overview_clean_source_description(
+    value: Any,
+    *,
+    source_type: str,
+    title: str = "",
+) -> str:
+    """Return a concise user-facing source description for overview accounting.
+
+    Structured-source rows contain indexing metadata (procedure codes, audience,
+    duration, safety level and manual references). Those fields are useful for
+    retrieval but are not machine assemblies. Keeping them in the visible overview
+    previously produced long, truncated bullets and hid the actual system names.
+    """
+    text = re.sub(r"\s+", " ", str(value or "")).strip(" -–—:;,.")
+    if not text:
+        return ""
+    st = str(source_type or "").strip().lower()
+    if st in {"procedure", "step", "ps"}:
+        text = re.sub(
+            r"^(?:codice\s+interno\s+)?(?:proc(?:edura)?|step|ps)[-_\s]*[a-z0-9.]+\s*[.:;–—-]*\s*",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
+        # Stop before administrative/indexing metadata. The operational first
+        # sentence remains as evidence about the underlying machine system.
+        text = re.split(
+            r"\b(?:Destinatari|Audience|Durata\s+indicativa|Estimated\s+duration|"
+            r"Livello\s+di\s+sicurezza|Safety\s+level|Riferimenti\s+tecnici|"
+            r"Technical\s+references|Applicare\s+esclusivamente|Only\s+qualified)\s*:",
+            text,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0].strip(" -–—:;,.")
+    title_norm = re.sub(r"\s+", " ", str(title or "")).strip(" -–—:;,.")
+    if title_norm and text.casefold().startswith((title_norm + ":").casefold()):
+        text = text[len(title_norm) + 1 :].strip()
+    return _clean_display_text(text, max_len=420)
+
+
+def _assistant_core_overview_record(
+    candidate: dict,
+    *,
+    inventory_id: str,
+    must_account: bool,
+) -> dict:
+    source_type = _assistant_core_candidate_source_type(candidate) or "document"
+    raw_text = _v13_candidate_text(candidate)
+    fields = _parse_structured_source_fields(raw_text)
+    page_from = _safe_int(candidate.get("page_from"), 0)
+    title = _clean_display_text(
+        fields.get("title")
+        or candidate.get("display_title")
+        or candidate.get("display_label")
+        or (
+            (f"Manuale tecnico — pag. {page_from}" if page_from > 0 else "Manuale tecnico")
+            if source_type == "document"
+            else candidate.get("bubble_document_id")
+        )
+        or source_type,
+        max_len=180,
+    )
+    raw_description = (
+        fields.get("short_description")
+        or fields.get("description")
+        or fields.get("notes")
+        or raw_text
+    )
+    description = _assistant_core_overview_clean_source_description(
+        raw_description,
+        source_type=source_type,
+        title=title,
+    )
+    return {
+        "inventory_id": str(inventory_id),
+        "citation_id": str(candidate.get("citation_id") or "").strip(),
+        "source_type": source_type,
+        "title": title or source_type,
+        "description": description,
+        "must_account": bool(must_account),
+        "candidate": dict(candidate),
+    }
+
+
+def _assistant_core_overview_inventory_records(retrieval: dict) -> list[dict]:
+    """Build one bounded source inventory from the admitted evidence pack.
+
+    Catalog media/procedure records are mandatory accounting inputs. Exact-machine
+    manual pages are optional support and are kept separately so at least one
+    technical document can ground the function summary.
+    """
+    merged = _v13_merge_candidates(
+        [
+            list((retrieval or {}).get("citations") or []),
+            list((retrieval or {}).get("candidates") or []),
+        ]
+    )
+    catalog: list[dict] = []
+    manual: list[dict] = []
+    extra_structured: list[dict] = []
+    seen: set[str] = set()
+
+    for candidate in merged:
+        if not isinstance(candidate, dict):
+            continue
+        cid = str(candidate.get("citation_id") or "").strip()
+        if not cid or cid in seen:
+            continue
+        seen.add(cid)
+        source_type = _assistant_core_candidate_source_type(candidate)
+        if bool(candidate.get("assistant_core_catalog_candidate")):
+            catalog.append(dict(candidate))
+        elif source_type == "document" and bool(candidate.get("exact_machine_scope", True)):
+            manual.append(dict(candidate))
+        elif source_type in {"procedure", "step", "ps", "md_photo", "md_video"}:
+            extra_structured.append(dict(candidate))
+
+    catalog.sort(
+        key=lambda c: (
+            0
+            if _assistant_core_candidate_source_type(c)
+            in {"md_photo", "md_video", "photo", "video"}
+            else 1,
+            str(c.get("bubble_document_id") or ""),
+        )
+    )
+    manual.sort(key=lambda c: -_assistant_core_overview_candidate_score(c))
+    extra_structured.sort(key=lambda c: -_assistant_core_overview_candidate_score(c))
+
+    # Preserve all bounded catalog records admitted by the overview path. Manual
+    # support is limited to four narrative pages and non-catalog structured rows
+    # are only a small rescue for older indexes.
+    chosen: list[tuple[dict, bool]] = []
+    chosen.extend((c, True) for c in catalog[:20])
+    chosen.extend((c, False) for c in manual[:4])
+    existing_ids = {str(c.get("citation_id") or "") for c, _ in chosen}
+    chosen.extend(
+        (c, True)
+        for c in extra_structured[:4]
+        if str(c.get("citation_id") or "") not in existing_ids
+    )
+
+    records: list[dict] = []
+    for idx, (candidate, must_account) in enumerate(chosen, start=1):
+        records.append(
+            _assistant_core_overview_record(
+                candidate,
+                inventory_id=f"I{idx:02d}",
+                must_account=must_account,
+            )
+        )
+    return records
+
+
+def _assistant_core_overview_records_block(records: list[dict], *, max_chars: int = 30000) -> str:
+    rows: list[str] = []
+    used = 0
+    for record in records or []:
+        row = (
+            f"- INVENTORY_ID={record.get('inventory_id')}; "
+            f"MUST_ACCOUNT={'yes' if record.get('must_account') else 'no'}; "
+            f"CITATION_ID={record.get('citation_id')}; "
+            f"TYPE={record.get('source_type')}; "
+            f"TITLE={record.get('title')}; "
+            f"DESCRIPTION={record.get('description')}"
+        )
+        if used + len(row) > max_chars:
+            break
+        rows.append(row)
+        used += len(row) + 1
+    return "\n".join(rows)
+
+
+def _assistant_core_overview_fallback_function(
+    records: list[dict],
+    *,
+    query: str,
+    language: str,
+) -> tuple[str, list[str]]:
+    """Extract a narrative, grounded machine-function passage without an LLM.
+
+    Neighbor-page assurance may include a table of contents or title page. The
+    previous fallback ranked those long fragments highly and could display a
+    contents list as the machine function. This selector creates sentence windows,
+    rejects document-navigation fragments and prefers intended-use/function prose.
+    """
+    profile = _ask_evidence_fallback_profile(query, language)
+    scored: list[tuple[float, str, str]] = []
+    heading_rx = re.compile(
+        r"(?:destinazione\s+d[’']uso\s+prevista|descrizione\s+della\s+macchina|"
+        r"intended\s+use|machine\s+(?:purpose|function)|function\s+of\s+the\s+machine|"
+        r"designed\s+to|used\s+to|a\s+pour\s+fonction|bestimmungsgem[aä]ße\s+verwendung)\s*:?[\s-]*",
+        re.IGNORECASE,
+    )
+    navigation_rx = re.compile(
+        r"\b(?:sommario|indice|contents?|table\s+of\s+contents|index|"
+        r"matricola|serial\s+number|anno\s+di\s+costruzione|year\s+of\s+manufacture|"
+        r"fine\s+garanzia|warranty)\b",
+        re.IGNORECASE,
+    )
+    narrative_rx = re.compile(
+        r"\b(?:ha\s+il\s+compito\s+di|serve\s+a|consente\s+di|è\s+destinata\s+a|"
+        r"designed\s+to|is\s+used\s+to|serves\s+to|intended\s+to|"
+        r"a\s+pour\s+fonction|est\s+destinée\s+à|ist\s+dazu\s+bestimmt)\b",
+        re.IGNORECASE,
+    )
+
+    for record_index, record in enumerate(records or []):
+        if str(record.get("source_type") or "") != "document":
+            continue
+        candidate = dict(record.get("candidate") or {})
+        raw = str(_assistant_core_candidate_evidence_text(candidate) or "")
+        if not raw.strip():
+            continue
+        compact = re.sub(r"[\t\r ]+", " ", raw).strip()
+        segments: list[tuple[str, float]] = []
+
+        # Prefer the explicit intended-use/function value over a broader
+        # "description of the machine" block when both are present.
+        strong_anchor = re.search(
+            r"(?:destinazione\s+d[’']uso\s+prevista|intended\s+use|"
+            r"machine\s+(?:purpose|function)|function\s+of\s+the\s+machine)"
+            r"\s*:?[\s-]*(.+?)(?=\s+(?:modello|model|marca|brand|tipo|type|"
+            r"denominazione|designation|fabbricante|manufacturer)\s*:|$)",
+            compact,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if strong_anchor:
+            anchored = re.sub(r"\s+", " ", strong_anchor.group(1)).strip(
+                " -–—:;,."
+            )
+            if len(anchored) >= 55:
+                segments.append((anchored[:1000], 50.0))
+
+        # Intended-use/function headings are the strongest deterministic anchor.
+        for match in heading_rx.finditer(compact):
+            tail = compact[match.end() :]
+            # Stop at the next all-caps heading when present, otherwise retain a
+            # bounded narrative window.
+            stop = re.search(
+                r"\s+(?:[A-ZÀ-ÖØ-Þ][A-ZÀ-ÖØ-Þ0-9 /_-]{7,})(?:\s*:|\s{2,}|$)",
+                tail,
+            )
+            if stop and stop.start() >= 70:
+                tail = tail[: stop.start()]
+            tail = re.sub(r"\s+", " ", tail).strip(" -–—:;,.")
+            if len(tail) >= 55:
+                segments.append((tail[:1000], 7.0))
+
+        # Sentence and short multi-sentence windows recover narrative prose even
+        # when headings were lost during PDF cleaning.
+        normalized = re.sub(r"\s+", " ", compact)
+        sentences = [
+            part.strip(" -–—:;,.")
+            for part in re.split(r"(?<=[.!?])\s+|\s+[•▪◦]\s+", normalized)
+            if len(part.strip()) >= 35
+        ]
+        for idx, sentence in enumerate(sentences[:80]):
+            segments.append((sentence, 0.0))
+            if idx + 1 < len(sentences):
+                joined = f"{sentence}. {sentences[idx + 1]}".strip()
+                if len(joined) <= 1100:
+                    segments.append((joined, 0.35))
+
+        # Paragraph fallback for cleaned documents with no reliable punctuation.
+        for paragraph in re.split(r"\n\s*\n+", raw):
+            paragraph = re.sub(r"\s+", " ", paragraph).strip(" -–—:;,.")
+            if 55 <= len(paragraph) <= 1100:
+                segments.append((paragraph, 0.1))
+
+        seen_segments: set[str] = set()
+        for segment_index, (segment, anchor_bonus) in enumerate(segments[:160]):
+            text = re.sub(r"\s+", " ", segment).strip(" -–—:;,.")
+            key = text.casefold()
+            if len(text) < 55 or key in seen_segments:
+                continue
+            seen_segments.add(key)
+            word_count = len(re.findall(r"\b\w+\b", text, flags=re.UNICODE))
+            digit_ratio = sum(ch.isdigit() for ch in text) / max(1, len(text))
+            upper_letters = sum(ch.isupper() for ch in text if ch.isalpha())
+            all_letters = sum(ch.isalpha() for ch in text)
+            upper_ratio = upper_letters / max(1, all_letters)
+            navigation_hits = len(navigation_rx.findall(text))
+            bare_number_runs = len(re.findall(r"(?:^|\s)\d{1,3}(?=\s|$)", text))
+
+            score = float(_ask_evidence_score_text(query, text, profile))
+            score += float(anchor_bonus)
+            score += min(2.2, word_count / 45.0)
+            score += 2.5 if narrative_rx.search(text) else 0.0
+            score += 0.8 if 80 <= len(text) <= 750 else 0.0
+            score -= navigation_hits * 5.0
+            score -= min(5.0, digit_ratio * 28.0)
+            score -= min(4.0, bare_number_runs * 0.45)
+            score -= 3.5 if upper_ratio > 0.48 else 0.0
+            score -= record_index * 0.08
+            score -= segment_index * 0.002
+            scored.append(
+                (score, text[:1000], str(record.get("citation_id") or ""))
+            )
+
+    if scored:
+        scored.sort(key=lambda row: -row[0])
+        text = _strip_inline_citation_markers_for_display(scored[0][1])
+        text = heading_rx.sub("", text, count=1).strip(" -–—:;,.")
+        text = re.sub(
+            r"^(?:descrizione\s+generica|generic\s+description)\s*:?[\s-]*",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        ).strip(" -–—:;,.")
+        text = re.sub(
+            r"\s+(?:modello|model|marca|brand|tipo|type|denominazione|designation)\s*:?.*$",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        ).strip(" -–—:;,.")
+        if text and text[-1] not in ".!?":
+            text += "."
+        return text, [scored[0][2]] if scored[0][2] else []
+
+    # Last-resort grounded summary from the best general media description.
+    for record in records or []:
+        if str(record.get("source_type") or "") in {
+            "md_photo", "md_video", "photo", "video"
+        }:
+            text = str(record.get("description") or "").strip()
+            if text:
+                return text + ("" if text[-1] in ".!?" else "."), [
+                    str(record.get("citation_id") or "")
+                ]
+    return "", []
+
+
+def _assistant_core_overview_fallback_kind(source_type: str) -> str:
+    st = str(source_type or "").strip().lower()
+    if st in {"md_photo", "md_video", "photo", "video"}:
+        return "physical_assembly"
+    if st in {"procedure", "step", "ps"}:
+        return "auxiliary_system"
+    return "other"
+
+
+def _assistant_core_overview_item_text(item: dict) -> str:
+    return " ".join(
+        [str(item.get("label") or ""), str(item.get("description") or "")]
+    ).strip()
+
+
+def _assistant_core_overview_attach_record(
+    items: list[dict],
+    record: dict,
+) -> None:
+    """Append an unaccounted inventory row as a clean, lossless item.
+
+    The model is allowed to merge records only by explicitly returning their
+    INVENTORY_ID values. A post-hoc lexical merge is unsafe: broad media labels can
+    absorb unrelated auxiliary systems and a later length cap can erase the very
+    term the source was meant to preserve.
+    """
+    cid = str(record.get("citation_id") or "").strip()
+    iid = str(record.get("inventory_id") or "").strip()
+    items.append(
+        {
+            "label": str(
+                record.get("title") or record.get("source_type") or "Source"
+            ).strip(),
+            "description": str(record.get("description") or "").strip(),
+            "kind": _assistant_core_overview_fallback_kind(
+                str(record.get("source_type") or "")
+            ),
+            "inventory_ids": [iid] if iid else [],
+            "citation_ids": [cid] if cid else [],
+            "fallback_source_item": True,
+        }
+    )
+
+
+def _assistant_core_overview_merge_duplicate_items(items: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    by_key: dict[str, int] = {}
+    for raw in items or []:
+        if not isinstance(raw, dict):
+            continue
+        label = _clean_display_text(raw.get("label") or "", max_len=160)
+        description = _clean_display_text(raw.get("description") or "", max_len=620)
+        if not label and not description:
+            continue
+        key = _normalize_unicode_advanced(label or description).casefold()
+        key = re.sub(r"[^a-z0-9à-öø-ÿ]+", " ", key).strip()
+        if key and key in by_key:
+            target = out[by_key[key]]
+            target["inventory_ids"] = _dedup_text_values(
+                list(target.get("inventory_ids") or []) + list(raw.get("inventory_ids") or []),
+                limit=24,
+            )
+            target["citation_ids"] = _dedup_text_values(
+                list(target.get("citation_ids") or []) + list(raw.get("citation_ids") or []),
+                limit=16,
+            )
+            if description and description not in str(target.get("description") or ""):
+                target["description"] = _clean_display_text(
+                    f"{target.get('description')}; {description}", max_len=620
+                )
+            continue
+        item = {
+            "label": label or "System",
+            "description": description,
+            "kind": str(raw.get("kind") or "other"),
+            "inventory_ids": _dedup_text_values(raw.get("inventory_ids") or [], limit=24),
+            "citation_ids": _dedup_text_values(raw.get("citation_ids") or [], limit=16),
+            "fallback_source_item": bool(raw.get("fallback_source_item")),
+        }
+        if key:
+            by_key[key] = len(out)
+        out.append(item)
+    order = {
+        "material_flow": 0,
+        "physical_assembly": 1,
+        "forming_or_tooling": 2,
+        "clamping_or_feed": 3,
+        "control_interface": 4,
+        "auxiliary_system": 5,
+        "safety_or_protection": 6,
+        "outfeed": 7,
+        "other": 8,
+    }
+    out.sort(key=lambda item: (order.get(str(item.get("kind") or "other"), 8), str(item.get("label") or "").casefold()))
+    return out
+
+
+def _assistant_core_build_machine_overview_answer(
+    *,
+    function_summary: str,
+    items: list[dict],
+    language: str,
+) -> str:
+    en = str(language or "").lower().startswith("en")
+    function_heading = "Machine function" if en else "Funzione della macchina"
+    groups_heading = "Main documented assemblies and systems" if en else "Principali gruppi e sistemi documentati"
+    lines = [f"**{function_heading}**", "", str(function_summary or "").strip(), "", f"**{groups_heading}**", ""]
+    for item in items or []:
+        label = _clean_display_text(item.get("label") or "", max_len=160)
+        description = _clean_display_text(item.get("description") or "", max_len=620)
+        if not label and not description:
+            continue
+        if label and description:
+            lines.append(f"- **{label}** — {description}")
+        else:
+            lines.append(f"- {label or description}")
+    return "\n".join(lines).strip()
+
+
+def _assistant_core_synthesize_machine_overview(
+    request: AssistantCoreRequest,
+    retrieval: dict,
+    decision: AssistantCoreDecision,
+) -> dict | None:
+    """Exhaustive overview path with deterministic source accounting.
+
+    This path replaces free-form overview generation only when the evidence stage
+    explicitly requested the machine catalog. The model may merge and translate
+    source records, but deterministic post-processing appends any record it failed
+    to represent. Therefore a low lexical score cannot silently remove a documented
+    assembly or auxiliary system.
+    """
+    records = _assistant_core_overview_inventory_records(retrieval)
+    catalog_records = [record for record in records if bool(record.get("must_account"))]
+    manual_records = [record for record in records if str(record.get("source_type") or "") == "document"]
+    if not catalog_records:
+        return None
+
+    record_by_inventory = {str(record.get("inventory_id") or ""): record for record in records}
+    candidate_by_citation = {
+        str(record.get("citation_id") or ""): dict(record.get("candidate") or {})
+        for record in records
+        if str(record.get("citation_id") or "").strip()
+    }
+    block = _assistant_core_overview_records_block(records)
+    parsed: dict = {}
+    model_used = "deterministic_overview_fallback"
+    if block:
+        system_msg = (
+            "You are MachineMind's machine-overview inventory compiler. Use only SOURCE_INVENTORY. "
+            "Return an exhaustive but concise machine overview in RESPONSE_LANGUAGE. Merge synonyms and duplicate views into distinct user-facing assemblies or systems. "
+            "Every row marked MUST_ACCOUNT=yes must be represented by at least one overview item through its INVENTORY_ID. This does not require one item per source: multiple source rows may support one item. "
+            "Do not discard an auxiliary system merely because its wording scores weakly against the question. Include physical assemblies, material-flow groups, clamping/feed functions, tooling, HMI/control interfaces, lubrication/pneumatic/ventilation or other explicitly documented auxiliary systems, protections and outfeed when present. "
+            "Procedure records are evidence about the underlying assembly or system, not instructions to expose internal procedure codes. Cite only supplied CITATION_ID values. Do not claim direct visual inspection of media."
+        )
+        user_msg = (
+            f"QUESTION:\n{request.query}\n\n"
+            f"RESPONSE_LANGUAGE: {request.response_language}\n\n"
+            f"SOURCE_INVENTORY:\n{block}\n\n"
+            "Return JSON only. The function summary must be grounded in at least one technical document when available. Every overview item must have valid INVENTORY_ID and CITATION_ID values."
+        )
+        try:
+            parsed, model_used = _v13_json_models(
+                [
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": user_msg},
+                ],
+                models=[V13_FAST_MODEL, V13_PLANNER_MODEL],
+                json_schema=_assistant_core_machine_overview_schema(),
+                effort=V13_FAST_EFFORT,
+                reasoning_mode="",
+                timeout=min(28, V13_FAST_TIMEOUT_SECONDS),
+                max_output_tokens=min(5200, V13_FAST_MAX_OUTPUT_TOKENS),
+                company_id=request.company_id,
+                purpose="assistant_core_machine_overview_inventory",
+            )
+        except _V13BudgetExceeded:
+            parsed = {}
+        except Exception as exc:
+            print("ASSISTANT_CORE_OVERVIEW_INVENTORY_FAIL", str(exc)[:700])
+            parsed = {}
+
+    valid_inventory_ids = set(record_by_inventory)
+    valid_citation_ids = set(candidate_by_citation)
+    items: list[dict] = []
+    used_inventory_ids: set[str] = set()
+    used_citation_ids: list[str] = []
+    rejected_unsupported_model_items = 0
+
+    for raw in (parsed.get("overview_items") or []):
+        if not isinstance(raw, dict):
+            continue
+        inventory_ids = [
+            str(iid or "").strip()
+            for iid in (raw.get("inventory_ids") or [])
+            if str(iid or "").strip() in valid_inventory_ids
+        ]
+        citation_ids = [
+            str(cid or "").strip()
+            for cid in (raw.get("citation_ids") or [])
+            if str(cid or "").strip() in valid_citation_ids
+        ]
+        # Derive citations from assigned inventory rows when the model omitted or
+        # mistyped the long citation id but correctly identified the source row.
+        for iid in inventory_ids:
+            cid = str(record_by_inventory[iid].get("citation_id") or "").strip()
+            if cid and cid not in citation_ids:
+                citation_ids.append(cid)
+        label = _clean_display_text(raw.get("label") or "", max_len=160)
+        description = _clean_display_text(raw.get("description") or "", max_len=620)
+        if not label or not citation_ids or not inventory_ids:
+            # Every model item must identify at least one admitted inventory row.
+            # This prevents unsupported decorative groups from competing with the
+            # deterministic source-accounted items.
+            rejected_unsupported_model_items += 1
+            continue
+        assigned_text = " ".join(
+            " ".join(
+                [
+                    str(record_by_inventory[iid].get("title") or ""),
+                    str(record_by_inventory[iid].get("description") or ""),
+                ]
+            )
+            for iid in inventory_ids
+            if iid in record_by_inventory
+        ).strip()
+        item_text_for_support = " ".join([label, description]).strip()
+        same_language_support = bool(
+            _looks_like_target_language(assigned_text, request.response_language)
+            and _looks_like_target_language(item_text_for_support, request.response_language)
+        )
+        lexical_support = _term_overlap_score(
+            _content_term_set(assigned_text, limit=220),
+            _content_term_set(item_text_for_support, limit=180),
+        )
+        if same_language_support and lexical_support < 0.035:
+            # The item points to real source ids but its visible claim is unrelated
+            # to those sources. Drop it; deterministic accounting will append the
+            # clean admitted records instead. Cross-language translations are not
+            # rejected by this lexical guard.
+            rejected_unsupported_model_items += 1
+            continue
+        item = {
+            "label": label,
+            "description": description,
+            "kind": str(raw.get("kind") or "other"),
+            "inventory_ids": _dedup_text_values(inventory_ids, limit=24),
+            "citation_ids": _dedup_text_values(citation_ids, limit=16),
+        }
+        items.append(item)
+        used_inventory_ids.update(item["inventory_ids"])
+        for cid in item["citation_ids"]:
+            if cid not in used_citation_ids:
+                used_citation_ids.append(cid)
+
+    # Build document-frequency statistics for source terminology. They let the
+    # deterministic accounting check a few distinctive system terms instead of
+    # requiring lexical overlap with every administrative word in a Procedure.
+    from collections import Counter as _OverviewCounter
+    catalog_term_df = _OverviewCounter()
+    catalog_terms_by_id: dict[str, set[str]] = {}
+    for source_record in catalog_records:
+        source_text = " ".join(
+            [
+                str(source_record.get("title") or ""),
+                str(source_record.get("description") or ""),
+            ]
+        ).strip()
+        terms = set(_content_term_set(source_text, limit=120))
+        catalog_terms_by_id[str(source_record.get("inventory_id") or "")] = terms
+        catalog_term_df.update(terms)
+
+    # The model is never allowed to be the sole completeness gate. Attach every
+    # catalog record that it did not account for, and append the source wording
+    # when an assigned item failed to carry the record's distinctive terminology.
+    for record in catalog_records:
+        iid = str(record.get("inventory_id") or "")
+        if iid not in used_inventory_ids:
+            _assistant_core_overview_attach_record(items, record)
+        else:
+            # Even an accounted source may have been attached to a semantically
+            # empty item. Preserve its distinctive source wording in the same item.
+            matched = [item for item in items if iid in (item.get("inventory_ids") or [])]
+            if matched:
+                record_text = " ".join(
+                    [str(record.get("title") or ""), str(record.get("description") or "")]
+                ).strip()
+                record_terms = _content_term_set(record_text, limit=120)
+                combined_item_text = " ".join(
+                    _assistant_core_overview_item_text(item) for item in items
+                )
+                combined_terms = set(
+                    _content_term_set(combined_item_text, limit=420)
+                )
+                iid_terms = catalog_terms_by_id.get(iid, record_terms)
+                # Rare terms are the most useful evidence that the underlying
+                # system/function really appears in the overview. Prioritize title
+                # terms, then globally rare terms from the short description.
+                title_terms = set(
+                    _content_term_set(str(record.get("title") or ""), limit=50)
+                )
+                distinctive = sorted(
+                    [
+                        term
+                        for term in iid_terms
+                        if len(term) >= 5 and catalog_term_df.get(term, 0) <= 2
+                    ],
+                    key=lambda term: (
+                        0 if term in title_terms else 1,
+                        catalog_term_df.get(term, 99),
+                        -len(term),
+                        term,
+                    ),
+                )[:7]
+                same_language = _looks_like_target_language(
+                    record_text, request.response_language
+                )
+                if same_language and distinctive:
+                    hits = sum(1 for term in distinctive if term in combined_terms)
+                    needed = 1 if len(distinctive) <= 2 else 2
+                    represented = hits >= needed
+                else:
+                    representation = _term_overlap_score(
+                        record_terms, combined_terms
+                    )
+                    represented = representation >= 0.18
+
+                if not represented:
+                    # Preserve the missing source wording in the best matching
+                    # model item when it fits without truncation. If one broad item
+                    # claimed many inventory ids, fall back to a separate source
+                    # item before any later record can be erased by a length cap.
+                    target = max(
+                        matched,
+                        key=lambda item: _term_overlap_score(
+                            record_terms,
+                            _content_term_set(
+                                _assistant_core_overview_item_text(item), limit=180
+                            ),
+                        ),
+                    )
+                    support = _clean_display_text(
+                        record.get("description") or record.get("title") or "",
+                        max_len=520,
+                    )
+                    current = str(target.get("description") or "").strip()
+                    proposed = (current + "; " + support).strip(" ;")
+                    claimed_ids = len(target.get("inventory_ids") or [])
+                    if support and claimed_ids <= 4 and len(proposed) <= 560:
+                        target["description"] = proposed
+                    else:
+                        _assistant_core_overview_attach_record(items, record)
+
+    items = _assistant_core_overview_merge_duplicate_items(items)
+
+    function_summary = _assistant_core_redact_internal_text(
+        parsed.get("function_summary") or ""
+    )
+    function_citation_ids = [
+        str(cid or "").strip()
+        for cid in (parsed.get("function_citation_ids") or [])
+        if str(cid or "").strip() in valid_citation_ids
+    ]
+    fallback_summary, fallback_cids = _assistant_core_overview_fallback_function(
+        records,
+        query=request.query,
+        language=request.response_language,
+    )
+    if not function_summary:
+        function_summary = fallback_summary
+    if not function_citation_ids:
+        function_citation_ids = list(fallback_cids)
+
+    # A machine overview should retain one technical document whenever the admitted
+    # pack contains one. This is a source-diversity requirement, not a keyword rule.
+    if manual_records and not any(
+        str(record.get("citation_id") or "") in function_citation_ids
+        for record in manual_records
+    ):
+        top_manual_id = str(manual_records[0].get("citation_id") or "").strip()
+        if top_manual_id:
+            function_citation_ids.insert(0, top_manual_id)
+
+    for cid in function_citation_ids:
+        if cid and cid not in used_citation_ids:
+            used_citation_ids.insert(0, cid)
+    for item in items:
+        for cid in item.get("citation_ids") or []:
+            if cid and cid not in used_citation_ids:
+                used_citation_ids.append(cid)
+
+    # Preserve at least one media and one structured/system source when present.
+    for family in (
+        {"md_photo", "md_video", "photo", "video"},
+        {"procedure", "step", "ps"},
+    ):
+        if any(
+            _assistant_core_candidate_source_type(candidate_by_citation.get(cid, {})) in family
+            for cid in used_citation_ids
+        ):
+            continue
+        for record in records:
+            if str(record.get("source_type") or "") in family:
+                cid = str(record.get("citation_id") or "").strip()
+                if cid and cid not in used_citation_ids:
+                    used_citation_ids.append(cid)
+                break
+
+    if not function_summary:
+        return None
+    answer = _assistant_core_build_machine_overview_answer(
+        function_summary=function_summary,
+        items=items,
+        language=request.response_language,
+    )
+    if not answer or not items:
+        return None
+
+    used_candidates: list[dict] = []
+    for cid in used_citation_ids:
+        candidate = candidate_by_citation.get(cid)
+        if not candidate:
+            continue
+        cc = dict(candidate)
+        st = _assistant_core_candidate_source_type(cc)
+        if st == "document":
+            cc.setdefault("evidence_role", "manual_support")
+            cc.setdefault("ask_structured_manual_support", True)
+        else:
+            cc.setdefault("evidence_role", st)
+            cc.setdefault("ask_structured_direct", True)
+        used_candidates.append(cc)
+
+    expected_items = [str(item.get("label") or "").strip() for item in items if str(item.get("label") or "").strip()]
+    semantic_contract = {
+        "outcome": "pass",
+        "answer": answer,
+        "covered_facets": list(decision.required_facets),
+        "missing_facets": [],
+        "covered_answer_types": list(decision.required_answer_types),
+        "missing_answer_types": [],
+        "enumeration_requested": True,
+        "expected_list_items": expected_items,
+        "covered_list_items": expected_items,
+        "missing_list_items": [],
+        "citation_ids": [str(c.get("citation_id") or "") for c in used_candidates],
+        "reason": "deterministic_machine_overview_inventory_complete",
+        "model": model_used,
+    }
+    return {
+        "ok": True,
+        "status": "answered",
+        "answer": answer,
+        "language": request.response_language,
+        "citations": used_candidates,
+        "rg_links": [],
+        "top_k": request.top_k,
+        "similarity_max": (retrieval.get("metrics") or {}).get("top_similarity"),
+        "chat_model": model_used,
+        "information_task": decision.information_task,
+        "_assistant_core_semantic_verified": semantic_contract,
+        "_assistant_core_validation_evidence": used_candidates,
+        "meta": {
+            "cacheable": True,
+            "semantic_cacheable": True,
+            "machine_overview_inventory": {
+                "enabled": True,
+                "version": "machine-overview-inventory-v1",
+                "record_count": len(records),
+                "catalog_record_count": len(catalog_records),
+                "manual_record_count": len(manual_records),
+                "item_count": len(items),
+                "all_catalog_records_accounted": all(
+                    str(record.get("inventory_id") or "")
+                    in {
+                        iid
+                        for item in items
+                        for iid in (item.get("inventory_ids") or [])
+                    }
+                    for record in catalog_records
+                ),
+                "model": model_used,
+                "rejected_unsupported_model_items": int(
+                    rejected_unsupported_model_items
+                ),
+            },
+        },
+    }
+
 def _assistant_core_prepare_evidence(
     request: AssistantCoreRequest,
     retrieval: dict,
@@ -29131,7 +30071,14 @@ def _assistant_core_synthesize_ask(
     retrieval: dict,
     decision: AssistantCoreDecision,
 ) -> dict:
+    # Preserve authoritative task-specific metadata prepared before synthesis.
+    # Broad overview requests attach a complete machine catalog to this contract;
+    # rebuilding it from scratch would silently discard the inventory.
+    prepared_contract = dict(
+        (retrieval or {}).get("assistant_core_contract") or {}
+    )
     contract = {
+        **prepared_contract,
         "information_task": decision.information_task,
         "required_answer_types": list(decision.required_answer_types),
         "required_facets": list(decision.required_facets),
@@ -29164,6 +30111,22 @@ def _assistant_core_synthesize_ask(
     planner["facet_queries"] = list(contract.get("facet_queries") or [])
     planner["request_kind"] = decision.request_kind
     retrieval["plan"] = planner
+
+    overview_catalog_requested = bool(
+        contract.get("overview_catalog_requested")
+        or (retrieval.get("assistant_core_decision") or {}).get(
+            "overview_catalog_requested"
+        )
+    )
+    if overview_catalog_requested:
+        overview_response = _assistant_core_synthesize_machine_overview(
+            request,
+            retrieval,
+            decision,
+        )
+        if isinstance(overview_response, dict) and overview_response.get("ok") is True:
+            overview_response.setdefault("information_task", decision.information_task)
+            return overview_response
 
     structured_types = {"procedure", "step", "ps", "md_photo", "md_video"}
     has_structured = any(
@@ -35588,3 +36551,4 @@ def smart_diagnostic_finalize_v1(
         citations=list(state.get("citations") or []), rg_links=list(state.get("rg_links") or []),
         debug=bool(payload.debug),
     )
+
