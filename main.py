@@ -9448,7 +9448,7 @@ def _ask_evidence_answer_schema() -> dict:
                 "answer_status": {"type": "string", "enum": ["answered", "no_sources"]},
                 "grounded_points": {
                     "type": "array",
-                    "maxItems": 8,
+                    "maxItems": 16,
                     "items": {
                         "type": "object",
                         "additionalProperties": False,
@@ -20218,8 +20218,8 @@ if V13_HEAVY_REASONING_MODE not in {"", "pro"}:
 # retrieval/synthesis primitives but chooses the response mode only after neutral
 # cross-source retrieval. Default ON; set MM_ASSISTANT_CORE_V2_ENABLED=0 only for rollback.
 ASSISTANT_CORE_V2_ENABLED = (os.environ.get("MM_ASSISTANT_CORE_V2_ENABLED") or "1").strip() != "0"
-ASSISTANT_CORE_V2_CODE_MARKER = "assistant-core-v2-certified-overview-lossless-v10-1-20260806-1"
-ASSISTANT_CORE_V2_RELEASE_ID = (os.environ.get("MM_ASSISTANT_CORE_V2_RELEASE_ID") or "2026-08-06.1").strip()
+ASSISTANT_CORE_V2_CODE_MARKER = "assistant-core-v2-overview-contract-preserved-v10-2-20260806-2"
+ASSISTANT_CORE_V2_RELEASE_ID = (os.environ.get("MM_ASSISTANT_CORE_V2_RELEASE_ID") or "2026-08-06.2").strip()
 RESULT_INCOMPLETE_ANSWER_CONTRACT = "INCOMPLETE_ANSWER_CONTRACT"
 ASSISTANT_UI_RENDER_VERSION = "assistant-ui-html-lossless-v10-1-20260806-1"
 ASSISTANT_UI_MAX_HTML_CHARS = max(8000, min(60000, int(
@@ -26455,10 +26455,11 @@ def _v13_generate_ask_response(
     final_citations: list[dict] = []
     synthesis_grounded = False
     if str(parsed.get("answer_status") or "").strip().lower() == "answered":
+        dynamic_point_cap = 16 if overview_catalog_requested else 8
         dynamic_max_points = max(
             1,
             min(
-                8,
+                dynamic_point_cap,
                 max(
                     int(ASK_UI_MAX_POINTS or 5),
                     len(required_facets) + (1 if len(required_answer_types) > 1 else 0),
@@ -29131,7 +29132,18 @@ def _assistant_core_synthesize_ask(
     retrieval: dict,
     decision: AssistantCoreDecision,
 ) -> dict:
+    # ``prepare_evidence`` may attach authoritative task-specific metadata that
+    # must survive into synthesis (for example the complete machine catalog used
+    # by broad overview/list requests). Rebuilding this dictionary from scratch
+    # silently discarded ``overview_catalog_requested``, ``machine_catalog_digest``
+    # and the catalog source manifest, so the final model saw only the first
+    # generic evidence slice. Preserve the prepared contract and overwrite only
+    # the fields owned by the current semantic decision.
+    prepared_contract = dict(
+        (retrieval or {}).get("assistant_core_contract") or {}
+    )
     contract = {
+        **prepared_contract,
         "information_task": decision.information_task,
         "required_answer_types": list(decision.required_answer_types),
         "required_facets": list(decision.required_facets),
@@ -35588,4 +35600,3 @@ def smart_diagnostic_finalize_v1(
         citations=list(state.get("citations") or []), rg_links=list(state.get("rg_links") or []),
         debug=bool(payload.debug),
     )
-
