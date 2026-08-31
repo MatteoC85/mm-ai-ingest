@@ -57,6 +57,8 @@ from assistant_core_v2 import (
     INFO_SEQUENCE_SYNCHRONIZATION,
     INFO_SOURCE_RETRIEVAL,
     KIND_AMBIGUOUS,
+    KIND_COMPARISON,
+    KIND_FACTUAL,
     KIND_FAULT_DIAGNOSTIC,
     KIND_GENERAL_TECHNICAL,
     KIND_GUIDED_DIAGNOSTIC,
@@ -20229,8 +20231,8 @@ if V13_HEAVY_REASONING_MODE not in {"", "pro"}:
 # retrieval/synthesis primitives but chooses the response mode only after neutral
 # cross-source retrieval. Default ON; set MM_ASSISTANT_CORE_V2_ENABLED=0 only for rollback.
 ASSISTANT_CORE_V2_ENABLED = (os.environ.get("MM_ASSISTANT_CORE_V2_ENABLED") or "1").strip() != "0"
-ASSISTANT_CORE_V2_CODE_MARKER = "assistant-core-v2-machine-overview-inventory-v10-3-20260806-3"
-ASSISTANT_CORE_V2_RELEASE_ID = (os.environ.get("MM_ASSISTANT_CORE_V2_RELEASE_ID") or "2026-08-06.3").strip()
+ASSISTANT_CORE_V2_CODE_MARKER = "assistant-core-v2-router-constants-fix-v10-3-1-20260806-4"
+ASSISTANT_CORE_V2_RELEASE_ID = (os.environ.get("MM_ASSISTANT_CORE_V2_RELEASE_ID") or "2026-08-06.4").strip()
 RESULT_INCOMPLETE_ANSWER_CONTRACT = "INCOMPLETE_ANSWER_CONTRACT"
 ASSISTANT_UI_RENDER_VERSION = "assistant-ui-html-lossless-v10-1-20260806-1"
 ASSISTANT_UI_MAX_HTML_CHARS = max(8000, min(60000, int(
@@ -27084,7 +27086,7 @@ def _assistant_core_deterministic_router_fallback(
     elif sequence:
         request_kind = KIND_FACTUAL
         effective_mode = MODE_ASK
-        information_task = INFO_SEQUENCE_OR_SYNCHRONIZATION
+        information_task = INFO_SEQUENCE_SYNCHRONIZATION
         required_types = [REQ_STATE_SEQUENCE, REQ_EXPLANATION]
     elif interface:
         request_kind = KIND_FACTUAL
