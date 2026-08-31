@@ -1890,21 +1890,6 @@ def _build_rg_links(company_id: str, citations: list[dict]) -> list[dict]:
         else:
             evidence_role = str(c.get("evidence_role") or source_type or "document").strip().lower()
 
-        # Bubble file URLs are signed, short-lived delivery URLs. They are retained
-        # only as a backward-compatible legacy value. A client must resolve normal
-        # documents from the current Bubble Document file at click time by using the
-        # stable Bubble record id below; structured MachineMind pages keep their
-        # direct application URL.
-        resolve_current_file = not is_structured
-        url_is_ephemeral = bool(
-            resolve_current_file
-            and re.search(
-                r"(?:[?&](?:Expires|Signature|AWSAccessKeyId)=)",
-                str(file_url or ""),
-                flags=re.IGNORECASE,
-            )
-        )
-
         out.append(
             {
                 "citation_id": c.get("citation_id"),
@@ -1912,14 +1897,6 @@ def _build_rg_links(company_id: str, citations: list[dict]) -> list[dict]:
                 "page_from": _safe_int(c.get("page_from"), page_from),
                 "page_to": _safe_int(c.get("page_to"), page_from),
                 "url": final_url,
-                "link_resolution": (
-                    "bubble_document_current_file"
-                    if resolve_current_file
-                    else "direct_url"
-                ),
-                "document_lookup_id": bdid if resolve_current_file else "",
-                "url_is_ephemeral": url_is_ephemeral,
-                "url_legacy_only": bool(resolve_current_file),
                 "evidence_role": evidence_role,
                 "ask_structured_manual_support": bool(c.get("ask_structured_manual_support")),
                 "ask_manual_support_kind": str(c.get("ask_manual_support_kind") or ""),
@@ -20254,8 +20231,8 @@ if V13_HEAVY_REASONING_MODE not in {"", "pro"}:
 # retrieval/synthesis primitives but chooses the response mode only after neutral
 # cross-source retrieval. Default ON; set MM_ASSISTANT_CORE_V2_ENABLED=0 only for rollback.
 ASSISTANT_CORE_V2_ENABLED = (os.environ.get("MM_ASSISTANT_CORE_V2_ENABLED") or "1").strip() != "0"
-ASSISTANT_CORE_V2_CODE_MARKER = "assistant-core-v2-root-evidence-assurance-v10-3-3-20260831-2"
-ASSISTANT_CORE_V2_RELEASE_ID = (os.environ.get("MM_ASSISTANT_CORE_V2_RELEASE_ID") or "2026-08-31.2").strip()
+ASSISTANT_CORE_V2_CODE_MARKER = "assistant-core-v2-root-evidence-assurance-v10-3-3-final-20260831-3"
+ASSISTANT_CORE_V2_RELEASE_ID = (os.environ.get("MM_ASSISTANT_CORE_V2_RELEASE_ID") or "2026-08-31.3").strip()
 RESULT_INCOMPLETE_ANSWER_CONTRACT = "INCOMPLETE_ANSWER_CONTRACT"
 ASSISTANT_UI_RENDER_VERSION = "assistant-ui-html-lossless-v10-1-20260806-1"
 ASSISTANT_UI_MAX_HTML_CHARS = max(8000, min(60000, int(
@@ -29391,7 +29368,6 @@ def _assistant_core_synthesize_machine_overview(
         },
     }
 
-
 def _assistant_core_root_diagnostic_evidence_assurance(
     request: AssistantCoreRequest,
     retrieval: dict,
@@ -29620,6 +29596,81 @@ def _assistant_core_root_diagnostic_evidence_assurance(
             },
         }
 
+def _assistant_core_root_source_page_diversity(
+    candidates: list[dict],
+    *,
+    limit: int,
+) -> list[dict]:
+    """Preserve Root Cause relevance while preventing one long manual from saturating the pack.
+
+    Retrieval produces overlapping chunks by design. A large manual can therefore
+    occupy most evidence slots even when a component datasheet, P&S, Procedure or
+    Step is more discriminative. Candidates arrive already sorted by the existing
+    viability/diagnostic score. This selector is monotonic with respect to relevance:
+    it first keeps the best candidate from each stable source, then fills remaining
+    slots in the original order with a conservative per-source cap. It never changes
+    Company/Machine scope, never invents source preference, and is used only for
+    Root Cause final evidence selection.
+    """
+    if not candidates or limit <= 0:
+        return []
+
+    ordered = [dict(c) for c in candidates if isinstance(c, dict)]
+    out: list[dict] = []
+    selected_ids: set[str] = set()
+    seen_sources: set[str] = set()
+    seen_source_pages: set[tuple[str, int, int]] = set()
+    source_counts: dict[str, int] = {}
+
+    def source_key(candidate: dict) -> str:
+        source_type = _assistant_core_candidate_source_type(candidate)
+        bdid = str(candidate.get("bubble_document_id") or "").strip()
+        return f"{source_type}|{bdid or str(candidate.get('citation_id') or '').strip()}"
+
+    def page_key(candidate: dict) -> tuple[str, int, int]:
+        key = source_key(candidate)
+        page_from = _safe_int(candidate.get("page_from"), 0)
+        page_to = _safe_int(candidate.get("page_to"), page_from)
+        return key, page_from, page_to
+
+    def candidate_id(candidate: dict) -> str:
+        return _assistant_core_candidate_stable_key(candidate)
+
+    # Pass 1: retain the highest-ranked item from each source. This guarantees that
+    # a dedicated datasheet/Step/Procedure can coexist with a large general manual.
+    for candidate in ordered:
+        cid = candidate_id(candidate)
+        skey = source_key(candidate)
+        pkey = page_key(candidate)
+        if not cid or cid in selected_ids or skey in seen_sources or pkey in seen_source_pages:
+            continue
+        out.append(candidate)
+        selected_ids.add(cid)
+        seen_sources.add(skey)
+        seen_source_pages.add(pkey)
+        source_counts[skey] = 1
+        if len(out) >= limit:
+            return out
+
+    # Pass 2: add further high-ranked passages, but cap each source so overlapping
+    # chunks from a single manual cannot crowd out the remaining evidence.
+    per_source_cap = 3
+    for candidate in ordered:
+        cid = candidate_id(candidate)
+        skey = source_key(candidate)
+        pkey = page_key(candidate)
+        if not cid or cid in selected_ids or pkey in seen_source_pages:
+            continue
+        if source_counts.get(skey, 0) >= per_source_cap:
+            continue
+        out.append(candidate)
+        selected_ids.add(cid)
+        seen_source_pages.add(pkey)
+        source_counts[skey] = source_counts.get(skey, 0) + 1
+        if len(out) >= limit:
+            break
+
+    return out
 
 def _assistant_core_prepare_evidence(
     request: AssistantCoreRequest,
@@ -30130,6 +30181,11 @@ def _assistant_core_prepare_evidence(
     if diagnostic_mode:
         limit = V13_MAX_EVIDENCE_ITEMS_ROOT_CAUSE
         selected_pool = root_viable
+        if decision.effective_mode == MODE_ROOT_CAUSE:
+            selected_pool = _assistant_core_root_source_page_diversity(
+                root_viable,
+                limit=max(limit * 2, 12),
+            )
     else:
         limit = max(
             V13_MAX_EVIDENCE_ITEMS_ASK,
@@ -30231,6 +30287,11 @@ def _assistant_core_prepare_evidence(
             "interface_viable_count": len(interface_viable),
             "sequence_viable_count": len(sequence_viable),
             "root_viable_count": len(root_viable),
+            "root_diversified_pool_count": (
+                len(selected_pool)
+                if decision.effective_mode == MODE_ROOT_CAUSE
+                else len(root_viable)
+            ),
             "facet_evidence_coverage": facet_evidence_coverage,
             "minimum_facet_coverage": minimum_facet_coverage,
             "facet_threshold_pass": facet_threshold_pass,
