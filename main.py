@@ -20231,8 +20231,8 @@ if V13_HEAVY_REASONING_MODE not in {"", "pro"}:
 # retrieval/synthesis primitives but chooses the response mode only after neutral
 # cross-source retrieval. Default ON; set MM_ASSISTANT_CORE_V2_ENABLED=0 only for rollback.
 ASSISTANT_CORE_V2_ENABLED = (os.environ.get("MM_ASSISTANT_CORE_V2_ENABLED") or "1").strip() != "0"
-ASSISTANT_CORE_V2_CODE_MARKER = "assistant-core-v2-router-constants-fix-v10-3-1-20260806-4"
-ASSISTANT_CORE_V2_RELEASE_ID = (os.environ.get("MM_ASSISTANT_CORE_V2_RELEASE_ID") or "2026-08-06.4").strip()
+ASSISTANT_CORE_V2_CODE_MARKER = "assistant-core-v2-smart-source-manifest-v10-3-2-20260831-1"
+ASSISTANT_CORE_V2_RELEASE_ID = (os.environ.get("MM_ASSISTANT_CORE_V2_RELEASE_ID") or "2026-08-31.1").strip()
 RESULT_INCOMPLETE_ANSWER_CONTRACT = "INCOMPLETE_ANSWER_CONTRACT"
 ASSISTANT_UI_RENDER_VERSION = "assistant-ui-html-lossless-v10-1-20260806-1"
 ASSISTANT_UI_MAX_HTML_CHARS = max(8000, min(60000, int(
@@ -33656,6 +33656,11 @@ SMART_DIAGNOSTIC_MAX_HYPOTHESES = int(os.environ.get("MM_SMART_DIAGNOSTIC_MAX_HY
 SMART_DIAGNOSTIC_TOP_K = int(os.environ.get("MM_SMART_DIAGNOSTIC_TOP_K", "8"))
 SMART_DIAGNOSTIC_MAX_CONTEXT_CHARS = int(os.environ.get("MM_SMART_DIAGNOSTIC_MAX_CONTEXT_CHARS", "22000"))
 SMART_DIAGNOSTIC_MAX_EVIDENCE_IN_STATE = int(os.environ.get("MM_SMART_DIAGNOSTIC_MAX_EVIDENCE_IN_STATE", "8"))
+SMART_DIAGNOSTIC_SOURCE_MANIFEST_VERSION = "smart-source-manifest-v1-20260831"
+SMART_DIAGNOSTIC_FINAL_SOURCE_LIMIT = max(
+    2,
+    min(8, int(os.environ.get("MM_SMART_DIAGNOSTIC_FINAL_SOURCE_LIMIT", "6"))),
+)
 SMART_DIAGNOSTIC_LLM_TIMEOUT = int(os.environ.get("MM_SMART_DIAGNOSTIC_LLM_TIMEOUT_SECONDS", "70"))
 
 # Smart Diagnostic uses the same general evidence-sufficiency principle.
@@ -34347,6 +34352,484 @@ def _sd_citation_dedup_key(citation: dict) -> str:
     return "|".join([source_type, source_id, title[:140], str(page_from), str(page_to), token_sig[:360]])
 
 
+
+def _sd_generic_source_label(value: Any, source_type: str = "") -> bool:
+    """Return True only for labels that carry no useful source identity.
+
+    This is deliberately limited to Smart Diagnostic presentation metadata. It
+    does not change retrieval, evidence admission, hypothesis ranking or answers.
+    """
+    label = re.sub(
+        r"\s+",
+        " ",
+        _normalize_unicode_advanced(str(value or "")),
+    ).strip(" -–—:;,.\t\n").lower()
+    kind = str(source_type or "").strip().lower()
+    if not label:
+        return True
+
+    generic = {
+        "fonte", "source", "documento", "document", "manuale", "manual",
+        "procedura", "procedure", "step", "foto", "photo", "video",
+        "p&s", "p&s p&s", "p&s: p&s", "p&s problema/soluzione",
+        "p&s: problema/soluzione", "problema/soluzione",
+    }
+    if label in generic:
+        return True
+
+    if kind == "ps" and re.fullmatch(r"p&s(?::\s*(?:p&s|problema/soluzione))?", label):
+        return True
+    if kind == "step" and re.fullmatch(r"step(?:\s+\d+)?", label):
+        return True
+    if kind == "procedure" and label == "procedura":
+        return True
+    if kind == "md_photo" and label in {"foto", "photo"}:
+        return True
+    if kind == "md_video" and label == "video":
+        return True
+    return False
+
+
+def _sd_substantive_source_snippet(value: Any) -> bool:
+    text = _sd_clean_citation_snippet_for_display(value, max_len=900)
+    if not text:
+        return False
+    tokens = _sd_tokenize_for_citation_compare(text, keep_numeric=False)
+    if len(set(tokens)) < 5:
+        return False
+    normalized = re.sub(r"\s+", " ", _normalize_unicode_advanced(text)).strip().lower()
+    generic_only = {
+        "p&s problema/soluzione", "p&s: problema/soluzione", "step", "foto",
+        "video", "procedura", "alarms",
+    }
+    return normalized not in generic_only
+
+
+def _sd_structured_meta_from_human_snippet(citation: dict) -> dict[str, str]:
+    """Recover display metadata from already-humanized structured snippets.
+
+    Signed Smart state stores bounded, human-readable snippets. A later retrieval
+    assurance pass must not turn a good title such as "Step 9: ..." back into the
+    generic labels "Step", "P&S" or "Foto" merely because raw SOURCE_TYPE fields
+    are no longer present.
+    """
+    c = citation or {}
+    source_type = str(
+        c.get("source_type")
+        or _source_type_from_document_id(str(c.get("bubble_document_id") or ""))
+        or ""
+    ).strip().lower()
+    raw = re.sub(
+        r"\s+",
+        " ",
+        str(c.get("snippet_clean") or c.get("snippet") or "").strip(),
+    )
+    out: dict[str, str] = {}
+
+    if source_type == "ps":
+        match = re.match(r"(?i)^P&S\s*:\s*([^—]+?)(?:\s+—\s+|$)", raw)
+        if match:
+            title = _clean_display_text(match.group(1), max_len=100)
+            if title and not _sd_generic_source_label(title, "ps"):
+                out["display_title"] = title
+                category_match = re.search(r"(?i)Categoria\s*:\s*([^—]+)", raw)
+                category = _clean_display_text(
+                    category_match.group(1) if category_match else "",
+                    max_len=60,
+                )
+                out["display_label"] = (
+                    f"P&S: {title} — Categoria: {category}"
+                    if category and category.lower() not in title.lower()
+                    else f"P&S: {title}"
+                )
+
+    elif source_type == "step":
+        match = re.match(r"(?i)^Step(?:\s+(\d+))?\s*:\s*([^—]+?)(?:\s+—\s+|$)", raw)
+        if match:
+            step_no = _clean_display_text(match.group(1) or "", max_len=20)
+            title = _clean_display_text(match.group(2), max_len=100)
+            if title and not _sd_generic_source_label(title, "step"):
+                out["display_title"] = title
+                out["display_location"] = f"Step {step_no}" if step_no else "Step"
+                out["display_label"] = (
+                    f"Step {step_no}: {title}" if step_no else f"Step: {title}"
+                )
+
+    elif source_type == "procedure":
+        match = re.match(r"(?i)^Procedura\s*:\s*([^—]+?)(?:\s+—\s+|$)", raw)
+        if match:
+            title = _clean_display_text(match.group(1), max_len=100)
+            if title and not _sd_generic_source_label(title, "procedure"):
+                out["display_title"] = title
+                out["display_label"] = f"Procedura: {title}"
+
+    elif source_type == "md_photo":
+        match = re.match(r"(?i)^Foto\s*:\s*([^—]+?)(?:\s+—\s+|$)", raw)
+        if match:
+            title = _clean_display_text(match.group(1), max_len=100)
+            if title and not _sd_generic_source_label(title, "md_photo"):
+                out["display_title"] = title
+                out["display_label"] = f"Foto: {title}"
+
+    elif source_type == "md_video":
+        match = re.match(r"(?i)^Video\s*:\s*([^—]+?)(?:\s+—\s+|$)", raw)
+        if match:
+            title = _clean_display_text(match.group(1), max_len=100)
+            if title and not _sd_generic_source_label(title, "md_video"):
+                out["display_title"] = title
+                out["display_label"] = f"Video: {title}"
+
+    return out
+
+
+def _sd_restore_citation_metadata(citation: dict, persisted: Optional[dict] = None) -> dict:
+    """Preserve the best known human metadata for one Smart citation."""
+    row = dict(citation or {})
+    old = dict(persisted or {})
+    bdid = str(row.get("bubble_document_id") or old.get("bubble_document_id") or "").strip()
+    source_type = str(
+        row.get("source_type")
+        or old.get("source_type")
+        or _source_type_from_document_id(bdid)
+        or "document"
+    ).strip().lower()
+    row["bubble_document_id"] = bdid
+    row["source_type"] = source_type
+
+    for key in ("source_id", "display_title", "display_location", "display_label"):
+        current = str(row.get(key) or "").strip()
+        previous = str(old.get(key) or "").strip()
+        if previous and (
+            not current
+            or (
+                key in {"display_title", "display_label"}
+                and _sd_generic_source_label(current, source_type)
+                and not _sd_generic_source_label(previous, source_type)
+            )
+        ):
+            row[key] = previous
+
+    current_snippet = str(row.get("snippet_clean") or row.get("snippet") or "").strip()
+    previous_snippet = str(old.get("snippet_clean") or old.get("snippet") or "").strip()
+    if (
+        previous_snippet
+        and _sd_substantive_source_snippet(previous_snippet)
+        and not _sd_substantive_source_snippet(current_snippet)
+    ):
+        row["snippet_clean"] = previous_snippet
+        if not str(row.get("snippet") or "").strip():
+            row["snippet"] = previous_snippet
+
+    recovered = _sd_structured_meta_from_human_snippet(row)
+    for key, value in recovered.items():
+        current = str(row.get(key) or "").strip()
+        if not current or _sd_generic_source_label(current, source_type):
+            row[key] = value
+
+    if not str(row.get("source_id") or "").strip():
+        row["source_id"] = bdid.split(":", 1)[1] if ":" in bdid else bdid
+
+    label = str(row.get("display_label") or "").strip()
+    title = str(row.get("display_title") or "").strip()
+    if _sd_generic_source_label(label, source_type) and title and not _sd_generic_source_label(title, source_type):
+        if source_type == "ps":
+            row["display_label"] = f"P&S: {title}"
+        elif source_type == "procedure":
+            row["display_label"] = f"Procedura: {title}"
+        elif source_type == "step":
+            location = str(row.get("display_location") or "Step").strip()
+            row["display_label"] = f"{location}: {title}" if location else f"Step: {title}"
+        elif source_type == "md_photo":
+            row["display_label"] = f"Foto: {title}"
+        elif source_type == "md_video":
+            row["display_label"] = f"Video: {title}"
+
+    return row
+
+
+def _sd_citation_source_page_key(citation: dict) -> str:
+    c = citation or {}
+    bdid = str(c.get("bubble_document_id") or "").strip()
+    source_type = str(
+        c.get("source_type") or _source_type_from_document_id(bdid) or "document"
+    ).strip().lower()
+    source_id = str(c.get("source_id") or "").strip() or (bdid.split(":", 1)[1] if ":" in bdid else bdid)
+    page_from = _safe_int(c.get("page_from"), 0)
+    page_to = _safe_int(c.get("page_to"), page_from)
+    if source_type in STRUCTURED_SOURCE_TYPES:
+        return f"{source_type}|{source_id or bdid}"
+    return f"document|{bdid}|{page_from}|{page_to}"
+
+
+def _sd_citation_matches_evidence_id(citation: dict, evidence_id: str) -> bool:
+    cid = str((citation or {}).get("citation_id") or "").strip()
+    wanted = str(evidence_id or "").strip()
+    if not cid or not wanted:
+        return False
+    if cid == wanted:
+        return True
+
+    def location(value: str) -> tuple[str, int, int]:
+        match = re.match(r"^(.*):p(\d+)-(\d+):", value)
+        if not match:
+            return value.split(":p", 1)[0], 0, 0
+        return match.group(1), int(match.group(2)), int(match.group(3))
+
+    c_doc, c_from, c_to = location(cid)
+    w_doc, w_from, w_to = location(wanted)
+    if c_doc != w_doc:
+        return False
+    if c_from <= 0 or w_from <= 0:
+        return True
+    return not (c_to < w_from or w_to < c_from)
+
+
+def _sd_manifest_hypotheses_in_priority_order(step: dict) -> list[dict]:
+    hypotheses = [dict(x) for x in (step.get("hypotheses") or []) if isinstance(x, dict)]
+    hypotheses.sort(
+        key=lambda h: (
+            int(h.get("rank") or 999),
+            -float(h.get("probability_pct") or 0.0),
+            str(h.get("id") or ""),
+        )
+    )
+    final_result = step.get("final_result") if isinstance(step.get("final_result"), dict) else {}
+    selected_id = str(final_result.get("most_likely_hypothesis_id") or "").strip()
+    if not selected_id:
+        return hypotheses
+    selected = [h for h in hypotheses if str(h.get("id") or "").strip() == selected_id]
+    remaining = [h for h in hypotheses if str(h.get("id") or "").strip() != selected_id]
+    return selected + remaining
+
+
+def _sd_manifest_support_text(step: dict) -> str:
+    parts = [str(step.get("operator_summary") or "")]
+    final_result = step.get("final_result") if isinstance(step.get("final_result"), dict) else {}
+    parts.extend(
+        [
+            str(final_result.get("summary") or ""),
+            str(final_result.get("most_likely_label") or ""),
+            " ".join(str(x or "") for x in (final_result.get("recommended_checks") or [])),
+        ]
+    )
+    for hypothesis in _sd_manifest_hypotheses_in_priority_order(step):
+        parts.extend(
+            [
+                str(hypothesis.get("label") or ""),
+                str(hypothesis.get("why") or ""),
+                " ".join(str(x or "") for x in (hypothesis.get("checks") or [])),
+            ]
+        )
+    return re.sub(r"\s+", " ", " ".join(parts)).strip()
+
+
+def _sd_citation_manifest_score(citation: dict, support_text: str) -> float:
+    c = citation or {}
+    score = _sd_citation_quality_score(c)
+    label = str(c.get("display_label") or c.get("display_title") or "")
+    if not _sd_generic_source_label(label, str(c.get("source_type") or "")):
+        score += 24.0
+    if _sd_substantive_source_snippet(c.get("snippet_clean") or c.get("snippet") or ""):
+        score += 18.0
+    try:
+        score += min(8.0, max(0.0, float(c.get("similarity") or 0.0)) * 8.0)
+    except Exception:
+        pass
+
+    support_tokens = set(_sd_tokenize_for_citation_compare(support_text, keep_numeric=False))
+    citation_tokens = set(
+        _sd_tokenize_for_citation_compare(
+            " ".join(
+                [
+                    str(c.get("display_label") or ""),
+                    str(c.get("snippet_clean") or c.get("snippet") or ""),
+                ]
+            ),
+            keep_numeric=False,
+        )
+    )
+    if support_tokens and citation_tokens:
+        score += 30.0 * (len(support_tokens & citation_tokens) / max(1, len(support_tokens)))
+    return score
+
+
+def _sd_dedupe_citations_by_source_page(
+    citations: list[dict],
+    *,
+    support_text: str = "",
+    max_items: int = 6,
+) -> list[dict]:
+    order: list[str] = []
+    best_by_key: dict[str, dict] = {}
+    best_score: dict[str, float] = {}
+    for raw in citations or []:
+        if not isinstance(raw, dict):
+            continue
+        citation = _sd_restore_citation_metadata(raw)
+        key = _sd_citation_source_page_key(citation)
+        if not key:
+            key = str(citation.get("citation_id") or "").strip()
+        if not key:
+            continue
+        score = _sd_citation_manifest_score(citation, support_text)
+        if key not in best_by_key:
+            order.append(key)
+            best_by_key[key] = citation
+            best_score[key] = score
+        elif score > best_score[key]:
+            best_by_key[key] = citation
+            best_score[key] = score
+    return [best_by_key[key] for key in order[: max(1, int(max_items or 6))]]
+
+
+def _sd_citations_from_state_evidence(evidence: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    for item in evidence or []:
+        if not isinstance(item, dict):
+            continue
+        cid = str(item.get("citation_id") or "").strip()
+        bdid = str(item.get("bubble_document_id") or "").strip()
+        if not cid or not bdid:
+            continue
+        out.append(
+            _sd_restore_citation_metadata(
+                {
+                    "citation_id": cid,
+                    "bubble_document_id": bdid,
+                    "source_type": item.get("source_type"),
+                    "source_id": item.get("source_id"),
+                    "display_title": item.get("display_title"),
+                    "display_location": item.get("display_location"),
+                    "display_label": item.get("display_label"),
+                    "page_from": _safe_int(item.get("page_from"), 0),
+                    "page_to": _safe_int(item.get("page_to"), 0),
+                    "snippet": str(item.get("snippet") or ""),
+                    "snippet_clean": str(item.get("snippet") or ""),
+                    "similarity": float(item.get("similarity") or 0.0),
+                    "is_structured_source": bool(item.get("is_structured_source")),
+                }
+            )
+        )
+    return out
+
+
+def _sd_curate_final_source_manifest(
+    *,
+    citations: list[dict],
+    state_evidence: list[dict],
+    step: dict,
+    max_items: int,
+) -> tuple[list[dict], dict]:
+    """Build a final UI source manifest from evidence used by hypotheses.
+
+    This function changes only citation/link presentation. The question, answer,
+    hypotheses, probabilities and checks are left untouched.
+    """
+    by_id: dict[str, dict] = {}
+    for raw in list(citations or []) + _sd_citations_from_state_evidence(state_evidence):
+        if not isinstance(raw, dict):
+            continue
+        cid = str(raw.get("citation_id") or "").strip()
+        if not cid:
+            continue
+        restored = _sd_restore_citation_metadata(raw, by_id.get(cid))
+        by_id[cid] = restored
+    catalog = list(by_id.values())
+
+    ordered_hypotheses = _sd_manifest_hypotheses_in_priority_order(step)
+    wanted_ids: list[str] = []
+    seen_ids: set[str] = set()
+    for hypothesis in ordered_hypotheses:
+        if str(hypothesis.get("status") or "").strip().lower() in {"excluded", "rejected"}:
+            continue
+        for raw_id in hypothesis.get("evidence_ids") or []:
+            evidence_id = str(raw_id or "").strip()
+            if evidence_id and evidence_id not in seen_ids:
+                wanted_ids.append(evidence_id)
+                seen_ids.add(evidence_id)
+
+    selected: list[dict] = []
+    used_citation_ids: set[str] = set()
+    for evidence_id in wanted_ids:
+        candidate = by_id.get(evidence_id)
+        if candidate is None:
+            candidate = next(
+                (c for c in catalog if _sd_citation_matches_evidence_id(c, evidence_id)),
+                None,
+            )
+        if candidate is None:
+            continue
+        cid = str(candidate.get("citation_id") or "").strip()
+        if cid and cid in used_citation_ids:
+            continue
+        if cid:
+            used_citation_ids.add(cid)
+        selected.append(candidate)
+
+    if not selected:
+        selected = catalog
+
+    support_text = _sd_manifest_support_text(step)
+    curated = _sd_dedupe_citations_by_source_page(
+        selected,
+        support_text=support_text,
+        max_items=max_items,
+    )
+    if not curated:
+        curated = _sd_dedupe_citations_by_source_page(
+            catalog,
+            support_text=support_text,
+            max_items=max_items,
+        )
+
+    source_page_keys = [_sd_citation_source_page_key(c) for c in curated]
+    meta = {
+        "version": SMART_DIAGNOSTIC_SOURCE_MANIFEST_VERSION,
+        "hypothesis_scoped": bool(wanted_ids),
+        "hypothesis_evidence_id_count": len(wanted_ids),
+        "catalog_count": len(catalog),
+        "selected_before_source_page_dedup": len(selected),
+        "citation_count": len(curated),
+        "source_page_keys": source_page_keys,
+        "generic_label_count": sum(
+            1
+            for c in curated
+            if _sd_generic_source_label(
+                c.get("display_label") or c.get("display_title"),
+                str(c.get("source_type") or ""),
+            )
+        ),
+    }
+    return curated, meta
+
+
+
+def _sd_align_rg_links_with_citations(rg_links: list[dict], citations: list[dict]) -> list[dict]:
+    """Keep Smart LINK labels identical to the curated citation manifest."""
+    by_id = {
+        str(item.get("citation_id") or "").strip(): dict(item)
+        for item in rg_links or []
+        if isinstance(item, dict) and str(item.get("citation_id") or "").strip()
+    }
+    out: list[dict] = []
+    for citation in citations or []:
+        if not isinstance(citation, dict):
+            continue
+        cid = str(citation.get("citation_id") or "").strip()
+        if not cid or cid not in by_id:
+            continue
+        link = dict(by_id[cid])
+        for key in (
+            "source_type", "source_id", "is_structured_source",
+            "display_title", "display_location", "display_label",
+        ):
+            value = citation.get(key)
+            if value not in (None, ""):
+                link[key] = value
+        out.append(link)
+    return out
+
+
 def _sd_prepare_citations_for_response(citations: list[dict], max_items: int = 6) -> list[dict]:
     """Clean, cluster and deduplicate citations only for Smart Diagnostic responses.
 
@@ -34360,7 +34843,7 @@ def _sd_prepare_citations_for_response(citations: list[dict], max_items: int = 6
         if not isinstance(item, dict):
             continue
 
-        c = dict(item)
+        c = _sd_restore_citation_metadata(dict(item))
         raw_clean = str(c.get("snippet_clean") or c.get("snippet") or "").strip()
         cleaned = _sd_clean_citation_snippet_for_display(raw_clean, max_len=520)
         if cleaned:
@@ -34409,7 +34892,8 @@ def _sd_filter_rg_links_for_citations(rg_links: list[dict], citations: list[dict
         if isinstance(x, dict) and str(x.get("citation_id") or "").strip()
     }
 
-    return [by_id[cid] for cid in wanted_ids if cid in by_id]
+    ordered = [by_id[cid] for cid in wanted_ids if cid in by_id]
+    return _sd_align_rg_links_with_citations(ordered, citations)
 
 def _sd_compact_evidence_for_state(citations: list[dict], *, max_items: int) -> list[dict]:
     citations = _sd_prepare_citations_for_response(citations, max_items=max_items)
@@ -34426,10 +34910,15 @@ def _sd_compact_evidence_for_state(citations: list[dict], *, max_items: int) -> 
                 "citation_id": cid,
                 "bubble_document_id": str(c.get("bubble_document_id") or "").strip(),
                 "source_type": str(c.get("source_type") or _source_type_from_document_id(str(c.get("bubble_document_id") or ""))).strip(),
+                "source_id": str(c.get("source_id") or "").strip(),
+                "display_title": _sd_clean_text(c.get("display_title") or "", 120),
+                "display_location": _sd_clean_text(c.get("display_location") or "", 80),
                 "display_label": _sd_clean_text(c.get("display_label") or cid, 160),
                 "page_from": _safe_int(c.get("page_from"), 0),
                 "page_to": _safe_int(c.get("page_to"), 0),
                 "snippet": _sd_clean_text(snippet, 900),
+                "similarity": float(c.get("similarity") or 0.0),
+                "is_structured_source": bool(c.get("is_structured_source")),
             }
         )
     return out
@@ -34830,12 +35319,16 @@ def _sd_enrich_state_evidence_from_answer(
                 "citation_id": str(e.get("citation_id") or ""),
                 "bubble_document_id": str(e.get("bubble_document_id") or ""),
                 "source_type": str(e.get("source_type") or ""),
+                "source_id": str(e.get("source_id") or ""),
+                "display_title": str(e.get("display_title") or ""),
+                "display_location": str(e.get("display_location") or ""),
+                "display_label": str(e.get("display_label") or ""),
                 "page_from": _safe_int(e.get("page_from"), 0),
                 "page_to": _safe_int(e.get("page_to"), 0),
                 "snippet": str(e.get("snippet") or ""),
                 "snippet_clean": str(e.get("snippet") or ""),
                 "chunk_full": str(e.get("snippet") or ""),
-                "similarity": 0.0,
+                "similarity": float(e.get("similarity") or 0.0),
                 "semantic_similarity": 0.0,
                 "retrieval_score": 0.0,
                 "evidence_gate_selected": True,
@@ -34894,6 +35387,19 @@ def _sd_enrich_state_evidence_from_answer(
     if not bool((assurance or {}).get("adopted")):
         return state
     citations = _sanitize_citations_for_response(enhanced.get("citations") or [], company_id=company_id)
+    persisted_by_id = {
+        str(item.get("citation_id") or "").strip(): dict(item)
+        for item in list(state.get("citations") or []) + list(state.get("evidence") or [])
+        if isinstance(item, dict) and str(item.get("citation_id") or "").strip()
+    }
+    citations = [
+        _sd_restore_citation_metadata(
+            citation,
+            persisted_by_id.get(str(citation.get("citation_id") or "").strip()),
+        )
+        for citation in citations
+        if isinstance(citation, dict)
+    ]
     current_ids = {str(e.get("citation_id") or "") for e in (state.get("evidence") or []) if isinstance(e, dict)}
     existing = [c for c in citations if str(c.get("citation_id") or "") in current_ids]
     additions = [c for c in citations if str(c.get("citation_id") or "") not in current_ids][:SMART_DIAGNOSTIC_RETRIEVAL_ASSURANCE_MAX_NEW_EVIDENCE]
@@ -35543,8 +36049,40 @@ def _sd_response_from_step(
         citations = []
         rg_links = []
     
-    citations = _sd_prepare_citations_for_response(citations, max_items=6)
-    rg_links = _sd_filter_rg_links_for_citations(rg_links, citations)
+    citations = _sd_prepare_citations_for_response(
+        citations,
+        max_items=SMART_DIAGNOSTIC_MAX_EVIDENCE_IN_STATE,
+    )
+    source_manifest_meta = {
+        "version": SMART_DIAGNOSTIC_SOURCE_MANIFEST_VERSION,
+        "hypothesis_scoped": False,
+        "citation_count": len(citations),
+        "generic_label_count": sum(
+            1
+            for c in citations
+            if _sd_generic_source_label(
+                c.get("display_label") or c.get("display_title"),
+                str(c.get("source_type") or ""),
+            )
+        ),
+    }
+    if final_ready and status != "no_sources":
+        citations, source_manifest_meta = _sd_curate_final_source_manifest(
+            citations=citations,
+            state_evidence=list((state or {}).get("evidence") or []),
+            step=step,
+            max_items=SMART_DIAGNOSTIC_FINAL_SOURCE_LIMIT,
+        )
+        try:
+            rg_links = _sd_align_rg_links_with_citations(
+                _build_rg_links(company_id, citations),
+                citations,
+            )
+        except Exception as exc:
+            print("SMART_DIAGNOSTIC_FINAL_RG_LINKS_FAIL", str(exc)[:400])
+            rg_links = _sd_filter_rg_links_for_citations(rg_links, citations)
+    else:
+        rg_links = _sd_filter_rg_links_for_citations(rg_links, citations)
 
     current_state = dict(state or {})
     current_state.update(
@@ -35597,6 +36135,7 @@ def _sd_response_from_step(
             },
             "retrieval_assurance": dict(current_state.get("retrieval_assurance") or {}),
             "retrieval_assurance_updates": len(current_state.get("retrieval_assurance_history") or []),
+            "source_manifest": source_manifest_meta,
         },
     }
     _sd_flatten_question(resp, question)
@@ -36422,11 +36961,15 @@ def smart_diagnostic_answer_v1(
                 "citation_id": str(e.get("citation_id") or ""),
                 "bubble_document_id": str(e.get("bubble_document_id") or ""),
                 "source_type": str(e.get("source_type") or ""),
+                "source_id": str(e.get("source_id") or ""),
+                "display_title": str(e.get("display_title") or ""),
+                "display_location": str(e.get("display_location") or ""),
                 "display_label": str(e.get("display_label") or ""),
                 "page_from": _safe_int(e.get("page_from"), 0),
                 "page_to": _safe_int(e.get("page_to"), 0),
                 "snippet_clean": str(e.get("snippet") or ""),
-                "is_structured_source": _is_structured_source_key(str(e.get("bubble_document_id") or "")),
+                "similarity": float(e.get("similarity") or 0.0),
+                "is_structured_source": bool(e.get("is_structured_source")) or _is_structured_source_key(str(e.get("bubble_document_id") or "")),
             }
             for e in state.get("evidence") or [] if isinstance(e, dict)
         ]
