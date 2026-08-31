@@ -1890,6 +1890,21 @@ def _build_rg_links(company_id: str, citations: list[dict]) -> list[dict]:
         else:
             evidence_role = str(c.get("evidence_role") or source_type or "document").strip().lower()
 
+        # Bubble file URLs are signed, short-lived delivery URLs. They are retained
+        # only as a backward-compatible legacy value. A client must resolve normal
+        # documents from the current Bubble Document file at click time by using the
+        # stable Bubble record id below; structured MachineMind pages keep their
+        # direct application URL.
+        resolve_current_file = not is_structured
+        url_is_ephemeral = bool(
+            resolve_current_file
+            and re.search(
+                r"(?:[?&](?:Expires|Signature|AWSAccessKeyId)=)",
+                str(file_url or ""),
+                flags=re.IGNORECASE,
+            )
+        )
+
         out.append(
             {
                 "citation_id": c.get("citation_id"),
@@ -1897,6 +1912,14 @@ def _build_rg_links(company_id: str, citations: list[dict]) -> list[dict]:
                 "page_from": _safe_int(c.get("page_from"), page_from),
                 "page_to": _safe_int(c.get("page_to"), page_from),
                 "url": final_url,
+                "link_resolution": (
+                    "bubble_document_current_file"
+                    if resolve_current_file
+                    else "direct_url"
+                ),
+                "document_lookup_id": bdid if resolve_current_file else "",
+                "url_is_ephemeral": url_is_ephemeral,
+                "url_legacy_only": bool(resolve_current_file),
                 "evidence_role": evidence_role,
                 "ask_structured_manual_support": bool(c.get("ask_structured_manual_support")),
                 "ask_manual_support_kind": str(c.get("ask_manual_support_kind") or ""),
@@ -20231,8 +20254,8 @@ if V13_HEAVY_REASONING_MODE not in {"", "pro"}:
 # retrieval/synthesis primitives but chooses the response mode only after neutral
 # cross-source retrieval. Default ON; set MM_ASSISTANT_CORE_V2_ENABLED=0 only for rollback.
 ASSISTANT_CORE_V2_ENABLED = (os.environ.get("MM_ASSISTANT_CORE_V2_ENABLED") or "1").strip() != "0"
-ASSISTANT_CORE_V2_CODE_MARKER = "assistant-core-v2-smart-source-manifest-v10-3-2-20260831-1"
-ASSISTANT_CORE_V2_RELEASE_ID = (os.environ.get("MM_ASSISTANT_CORE_V2_RELEASE_ID") or "2026-08-31.1").strip()
+ASSISTANT_CORE_V2_CODE_MARKER = "assistant-core-v2-root-evidence-assurance-v10-3-3-20260831-2"
+ASSISTANT_CORE_V2_RELEASE_ID = (os.environ.get("MM_ASSISTANT_CORE_V2_RELEASE_ID") or "2026-08-31.2").strip()
 RESULT_INCOMPLETE_ANSWER_CONTRACT = "INCOMPLETE_ANSWER_CONTRACT"
 ASSISTANT_UI_RENDER_VERSION = "assistant-ui-html-lossless-v10-1-20260806-1"
 ASSISTANT_UI_MAX_HTML_CHARS = max(8000, min(60000, int(
@@ -29368,11 +29391,244 @@ def _assistant_core_synthesize_machine_overview(
         },
     }
 
+
+def _assistant_core_root_diagnostic_evidence_assurance(
+    request: AssistantCoreRequest,
+    retrieval: dict,
+    decision: AssistantCoreDecision,
+) -> dict:
+    """Monotonically supplement Root Cause evidence from explicit diagnostic clues.
+
+    The semantic router may correctly classify a Root Cause request as already
+    supported by broad manual pages. In that case the normal refinement stage can be
+    skipped even though a component-specific datasheet, P&S, Procedure or Step would
+    be much more discriminative. This bounded retrieval never removes the baseline
+    pack and never decides the cause. It only runs another neutral cross-source search
+    using the router's own discriminants, operating conditions, observables,
+    subsystems and required facets, then merges any additional evidence before the
+    existing Root Cause viability/ranking logic.
+    """
+    if str(decision.effective_mode or "").strip().lower() != MODE_ROOT_CAUSE:
+        return retrieval
+
+    budget = _v13_current_budget()
+    if budget is not None and budget.remaining() < 12.0:
+        return {
+            **dict(retrieval or {}),
+            "assistant_core_root_diagnostic_assurance": {
+                "enabled": True,
+                "status": "skipped_budget",
+                "remaining_seconds": round(float(budget.remaining()), 3),
+            },
+        }
+
+    facet_queries = list(decision.facet_queries or [])[:ASSISTANT_CORE_MAX_FACETS]
+    facet_names = [
+        str(item.facet or "").strip()
+        for item in facet_queries
+        if str(item.facet or "").strip()
+    ]
+    facet_dense = [
+        str(query or "").strip()
+        for item in facet_queries
+        for query in list(item.dense_queries or [])[:2]
+        if str(query or "").strip()
+    ]
+    facet_lexical = [
+        str(query or "").strip()
+        for item in facet_queries
+        for query in list(item.lexical_queries or [])[:3]
+        if str(query or "").strip()
+    ]
+    facet_exact = [
+        str(term or "").strip()
+        for item in facet_queries
+        for term in list(item.exact_terms or [])[:5]
+        if str(term or "").strip()
+    ]
+
+    diagnostic_clues = _dedup_text_values(
+        list(decision.diagnostic_discriminants or [])
+        + list(decision.diagnostic_operating_conditions or [])
+        + list(decision.diagnostic_observables or [])
+        + list(decision.diagnostic_subsystems or []),
+        limit=16,
+    )
+    required_facets = _dedup_text_values(
+        facet_names
+        + list(decision.required_facets or [])
+        + list(decision.diagnostic_discriminants or []),
+        limit=16,
+    )
+    dense_queries = _dedup_text_values(
+        [request.query]
+        + facet_dense
+        + list(decision.dense_queries or [])
+        + diagnostic_clues
+        + required_facets,
+        limit=max(V13_DENSE_QUERY_LIMIT, 8),
+    )
+    lexical_queries = _dedup_text_values(
+        [request.query]
+        + facet_lexical
+        + list(decision.lexical_queries or [])
+        + diagnostic_clues
+        + required_facets,
+        limit=max(V13_LEXICAL_QUERY_LIMIT, 10),
+    )
+    exact_terms = _dedup_text_values(
+        facet_exact + list(decision.exact_terms or []),
+        limit=24,
+    )
+
+    if not dense_queries and not lexical_queries:
+        return retrieval
+
+    base_plan = dict(
+        (retrieval or {}).get("plan") or _v13_fallback_plan(request.query)
+    )
+    plan = {
+        **base_plan,
+        "intent": decision.request_kind,
+        "information_task": decision.information_task,
+        "required_answer_types": list(decision.required_answer_types or []),
+        "normalized_query": request.query,
+        "dense_queries": dense_queries,
+        "lexical_queries": lexical_queries,
+        "exact_terms": exact_terms,
+        "required_facets": required_facets,
+        "ambiguities": _dedup_text_values(
+            list(decision.missing_information or []),
+            limit=8,
+        ),
+    }
+
+    scoped_doc_ids = _assistant_core_scope_value(request, "document_ids")
+    doc_ids = (
+        list(scoped_doc_ids or [])
+        if isinstance(scoped_doc_ids, list)
+        else []
+    )
+    bubble_document_id = str(
+        _assistant_core_scope_value(request, "bubble_document_id") or ""
+    ).strip() or None
+
+    try:
+        assured = _v13_initial_retrieval(
+            q=request.query,
+            company_id=request.company_id,
+            machine_id=request.machine_id,
+            doc_ids=doc_ids if doc_ids else None,
+            bubble_document_id=bubble_document_id,
+            ai_scope=request.ai_scope,
+            response_language=request.response_language,
+            mode="neutral",
+            plan=plan,
+        )
+        assured_candidates = [
+            dict(candidate)
+            for candidate in (assured.get("candidates") or [])
+            if isinstance(candidate, dict)
+        ]
+
+        # A title/description probe is especially useful for component-specific
+        # datasheets and structured maintenance records whose body text may be short.
+        try:
+            title_query = " ".join(
+                _dedup_text_values(
+                    [request.query] + diagnostic_clues + required_facets,
+                    limit=12,
+                )
+            )[:1800]
+            title_candidates = _v13_fetch_structured_title_candidates(
+                q=title_query or request.query,
+                company_id=request.company_id,
+                machine_id=request.machine_id,
+                ai_scope=request.ai_scope,
+                doc_ids=doc_ids if doc_ids else None,
+                bubble_document_id=bubble_document_id,
+            )
+            assured_candidates = _assistant_core_merge_facet_candidates(
+                [assured_candidates, list(title_candidates or [])]
+            )
+        except Exception as exc:
+            print(
+                "ASSISTANT_CORE_ROOT_ASSURANCE_TITLE_FAIL",
+                str(exc)[:500],
+            )
+
+        assured_keys = {
+            _assistant_core_candidate_stable_key(candidate)
+            for candidate in assured_candidates
+            if _assistant_core_candidate_stable_key(candidate)
+        }
+        baseline_candidates = [
+            dict(candidate)
+            for candidate in (
+                (retrieval or {}).get("candidates")
+                or (retrieval or {}).get("citations")
+                or []
+            )
+            if isinstance(candidate, dict)
+        ]
+        merged = _assistant_core_merge_facet_candidates(
+            [baseline_candidates, assured_candidates]
+        )
+        merged = _v13_score_candidates(request.query, merged)
+        for candidate in merged:
+            if _assistant_core_candidate_stable_key(candidate) in assured_keys:
+                candidate["assistant_core_diagnostic_assurance"] = True
+                candidate[
+                    "assistant_core_diagnostic_assurance_query_count"
+                ] = len(dense_queries) + len(lexical_queries)
+
+        return {
+            **dict(retrieval or {}),
+            "plan": plan,
+            "candidates": merged,
+            "citations": merged[
+                : max(
+                    18,
+                    V13_MAX_EVIDENCE_ITEMS_ROOT_CAUSE,
+                    V13_MAX_EVIDENCE_ITEMS_ASK,
+                )
+            ],
+            "metrics": _v13_evidence_metrics(merged),
+            "assistant_core_root_diagnostic_assurance": {
+                "enabled": True,
+                "status": "completed",
+                "baseline_candidate_count": len(baseline_candidates),
+                "assurance_candidate_count": len(assured_candidates),
+                "merged_candidate_count": len(merged),
+                "dense_queries": dense_queries,
+                "lexical_queries": lexical_queries,
+                "exact_terms": exact_terms,
+                "required_facets": required_facets,
+            },
+        }
+    except Exception as exc:
+        print(
+            "ASSISTANT_CORE_ROOT_DIAGNOSTIC_ASSURANCE_FAIL",
+            str(exc)[:700],
+        )
+        return {
+            **dict(retrieval or {}),
+            "assistant_core_root_diagnostic_assurance": {
+                "enabled": True,
+                "status": "error",
+                "error": str(exc)[:300],
+            },
+        }
+
+
 def _assistant_core_prepare_evidence(
     request: AssistantCoreRequest,
     retrieval: dict,
     decision: AssistantCoreDecision,
 ) -> dict:
+    retrieval = _assistant_core_root_diagnostic_evidence_assurance(
+        request, retrieval, decision
+    )
     candidates = [
         dict(c)
         for c in (retrieval.get("candidates") or retrieval.get("citations") or [])
