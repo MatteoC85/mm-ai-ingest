@@ -1,0 +1,138 @@
+{
+  "candidate": {
+    "assistant_core_sha256": "dca19aba41becaffb7c0623f52dee22863c527dbbb7dc8ee965a724a25efd00d",
+    "main_lines": 36213,
+    "main_net_line_reduction": 374,
+    "main_sha256": "79192cb387d13a4ab0194d2e3387330199b7596e7fc8b1f3dfe2980f326bb5b2"
+  },
+  "commit_in_phase": 3,
+  "commit_title": "refactor: extract request budgets and execution guards",
+  "commit_unit": "2C",
+  "compatibility_surface": [
+    "_V13BudgetExceeded",
+    "_V13RequestBudget",
+    "_V13_BUDGET_CTX",
+    "_v13_current_budget",
+    "_v13_model_rates",
+    "_v13_estimate_model_cost_usd",
+    "_v13_stream_json_response",
+    "_assistant_core_json_with_hard_timeout",
+    "_assistant_core_run_smart_with_hard_timeout"
+  ],
+  "created_date": "2026-09-02",
+  "explicit_non_changes": [
+    "API routes and Pydantic request contracts",
+    "assistant_core_v2.py",
+    "OpenAI transport, payloads, parsing and fallback order",
+    "prompts and model policy",
+    "retrieval, evidence admission and source priorities",
+    "ASK, Root Cause and Smart Diagnostic reasoning",
+    "SQL, semantic cache and ingest behavior",
+    "citation, link and UI rendering",
+    "Dockerfile, cloudbuild.yaml, requirements.txt and mm_promotion_gate.py"
+  ],
+  "extracted_modules": [
+    {
+      "bytes": 14198,
+      "lines": 377,
+      "path": "machinemind/infrastructure/request_budget.py",
+      "sha256": "db1fb9231e3c39ee271f09cf72413b66fe371ad21c1be736729ff71f3716f862"
+    },
+    {
+      "bytes": 7922,
+      "lines": 237,
+      "path": "machinemind/infrastructure/execution.py",
+      "sha256": "7ada720424ec2962f4c8e383cebeb32596d371932ee064166f9e04cb4e6b916d"
+    }
+  ],
+  "limitations": [
+    "No real Cloud Build or Cloud Run startup was executed in this offline environment.",
+    "No real Cloud SQL connection was opened.",
+    "No real OpenAI request was sent.",
+    "No production concurrency, latency or soak behavior was measured.",
+    "This gate verifies the extracted infrastructure contract and is not a full product certification."
+  ],
+  "live_exit_criteria": [
+    "Successful Cloud Build from the exact refactor-phase1 commit.",
+    "Healthy newest Cloud Run revision at 100 percent traffic.",
+    "/version commit_sha equals the Cloud Build Git commit and engine markers are unchanged.",
+    "Known ASK, Root Cause and Smart Diagnostic START smoke paths execute with their expected grounded response shapes.",
+    "Ordinary known-good paths do not produce a new timeout or provider error."
+  ],
+  "mutation_checks": [
+    {
+      "behavioral_probe": "DETECTED",
+      "mutation": "cached-input request-cost multiplier changed"
+    },
+    {
+      "behavioral_probe": "DETECTED",
+      "mutation": "hard-timeout response status changed"
+    },
+    {
+      "behavioral_probe": "DETECTED",
+      "mutation": "Smart worker ContextVar propagation removed"
+    }
+  ],
+  "next_boundary_after_live_pass": "semantic cache, knowledge-version invalidation and remaining shared infrastructure/error helpers",
+  "offline_results": {
+    "assistant_core_v2_unchanged": "PASS",
+    "async_execution_scenarios": 8,
+    "budget_cost_context_scenarios": 18,
+    "budget_execution_parent_candidate_exact_parity": "PASS",
+    "historical_surface_names_and_signatures": 8,
+    "openai_transport_unchanged": "PASS",
+    "phase1_api_scope_openapi_contract": "PASS",
+    "phase2_commit1_config_database_contract": "PASS",
+    "phase2_commit2_openai_transport_contract": "PASS",
+    "self_contained_phase2c_gate": "PASS",
+    "smart_sync_success_timeout_and_context_propagation": "PASS",
+    "static_extraction_guard": "PASS",
+    "syntax_compile": "PASS"
+  },
+  "parent": {
+    "artifact": "MachineMind_Modularization_Phase2_Commit2_OpenAI_Transport",
+    "assistant_core_sha256": "dca19aba41becaffb7c0623f52dee22863c527dbbb7dc8ee965a724a25efd00d",
+    "branch": "refactor-phase1",
+    "main_lines": 36587,
+    "main_sha256": "96f12237a3528e2f4ab06709d3c04707f6805ab2e1b8a9de2473bd6cbeac1800"
+  },
+  "purpose": "Behavior-preserving extraction of request-scoped time/cost accounting, ContextVar state and generic streaming/hard-timeout execution mechanics.",
+  "roadmap_phase": "2",
+  "schema_version": "machinemind-modularization-validation-v1",
+  "static_guard": {
+    "candidate_hash_frozen": true,
+    "extracted_main_definitions": 5,
+    "extracted_modules_import_main": false,
+    "intentional_wrapper_definition_changes": 3,
+    "module_hashes_frozen": true,
+    "unexpected_top_level_definition_changes": 0
+  },
+  "status": "OFFLINE_VERIFIED",
+  "title": "Request budgets and execution guards",
+  "unchanged_production_files": {
+    "Dockerfile": {
+      "parent_equal": true,
+      "sha256": "c3b450e3013ccb032254179d4dde2c0f00e06a5354875315b03c15e7034fe424"
+    },
+    "assistant_core_v2.py": {
+      "parent_equal": true,
+      "sha256": "dca19aba41becaffb7c0623f52dee22863c527dbbb7dc8ee965a724a25efd00d"
+    },
+    "cloudbuild.yaml": {
+      "parent_equal": true,
+      "sha256": "63f6396a33c8c065d5174fa2568e34d5aa324ae21045ecd855b3f3cd4b58f9a8"
+    },
+    "machinemind/infrastructure/openai_transport.py": {
+      "parent_equal": true,
+      "sha256": "c08fddd68599763657ee3d5b0cd634e72bb3ca574cd43b56da6abfd83c6062bf"
+    },
+    "mm_promotion_gate.py": {
+      "parent_equal": true,
+      "sha256": "6fac385b6ba35a0932193ac8feeb997f246549b1b082c6c7af3b4b988d01f38f"
+    },
+    "requirements.txt": {
+      "parent_equal": true,
+      "sha256": "d29634e6a70364d52495f7fa3776259bc3745ece9db7c3160d3fb3943ca38d88"
+    }
+  }
+}

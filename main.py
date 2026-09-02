@@ -116,6 +116,12 @@ from machinemind.core.scope import (
     _resolve_query_scope,
 )
 
+from machinemind.infrastructure.execution import (
+    json_with_hard_timeout as _infra_json_with_hard_timeout,
+    run_sync_with_hard_timeout as _infra_run_sync_with_hard_timeout,
+    stream_json_response as _infra_stream_json_response,
+)
+
 def _fetch_dense_chunk_candidates(
     *,
     company_id: str,
@@ -19805,284 +19811,27 @@ def _root_cause_v1_candidate_impl(
 from machinemind.config.assistant_runtime import *  # noqa: F401,F403
 
 
-class _V13BudgetExceeded(RuntimeError):
-    pass
+from machinemind.infrastructure.request_budget import (
+    configure_request_budget_runtime as _configure_request_budget_runtime,
+    _V13BudgetExceeded,
+    _V13RequestBudget,
+    _V13_BUDGET_CTX,
+    _v13_current_budget,
+    _v13_estimate_model_cost_usd,
+    _v13_model_rates,
+)
 
-
-class _V13RequestBudget:
-    def __init__(self, mode: str):
-        self.mode = str(mode or "ask").strip().lower()
-        self.started_monotonic = time_module.monotonic()
-        self.deadline_seconds = (
-            V13_ROOT_CAUSE_DEADLINE_SECONDS if self.mode == "root_cause" else V13_ASK_DEADLINE_SECONDS
-        )
-        self.deadline_monotonic = self.started_monotonic + float(self.deadline_seconds)
-        self.max_llm_calls = (
-            V13_MAX_LLM_CALLS_ROOT_CAUSE if self.mode == "root_cause" else V13_MAX_LLM_CALLS_ASK
-        )
-        # Failed provider/model attempts are infrastructure retries, not completed
-        # reasoning stages. A bounded retry allowance preserves the downstream
-        # synthesis/verifier budget without relaxing the time or monetary ceilings.
-        self.base_max_llm_calls = int(self.max_llm_calls)
-        self.absolute_max_llm_calls = min(6, int(self.max_llm_calls) + 2)
-        self.retry_allowance_calls = 0
-        self.retry_events: list[dict] = []
-        self.max_estimated_cost_usd = (
-            V13_MAX_ESTIMATED_COST_ROOT_CAUSE_USD
-            if self.mode == "root_cause"
-            else V13_MAX_ESTIMATED_COST_ASK_USD
-        )
-        self.llm_calls = 0
-        self.estimated_cost_usd = 0.0
-        self.input_tokens = 0
-        self.cached_input_tokens = 0
-        self.cache_write_tokens = 0
-        self.output_tokens = 0
-        self.reasoning_tokens = 0
-        self.embedding_calls = 0
-        self.embedding_input_tokens = 0
-        self.embedding_cache_hits = 0
-        self.embedding_estimated_cost_usd = 0.0
-        self.call_log: list[dict] = []
-        self.embedding_cache: dict[tuple[str, str], list[float]] = {}
-        self.route = "unselected"
-        self.refinement_used = False
-        self.semantic_cache = "miss"
-        self.evidence_gate: dict = {}
-        self.retrieval_assurance: dict = {}
-
-    def elapsed(self) -> float:
-        return max(0.0, time_module.monotonic() - self.started_monotonic)
-
-    def remaining(self) -> float:
-        return max(0.0, self.deadline_monotonic - time_module.monotonic())
-
-    def ensure_time(self, minimum_seconds: float = 2.0) -> None:
-        if self.remaining() < float(minimum_seconds):
-            raise _V13BudgetExceeded(
-                f"V13 {self.mode} deadline exhausted after {self.elapsed():.2f}s"
-            )
-
-    def reserve_call(
-        self,
-        *,
-        model: str,
-        purpose: str,
-        requested_timeout: int,
-        max_output_tokens: int,
-        messages: list[dict],
-    ) -> tuple[int, int, int]:
-        self.ensure_time(4.0)
-        if self.llm_calls >= self.max_llm_calls:
-            raise _V13BudgetExceeded(
-                f"V13 {self.mode} LLM call budget exhausted ({self.llm_calls}/{self.max_llm_calls})"
-            )
-        if self.estimated_cost_usd >= self.max_estimated_cost_usd:
-            raise _V13BudgetExceeded(
-                f"V13 {self.mode} estimated cost budget exhausted ({self.estimated_cost_usd:.4f} USD)"
-            )
-
-        message_chars = 0
-        for msg in messages or []:
-            try:
-                message_chars += len(json.dumps(msg, ensure_ascii=False))
-            except Exception:
-                message_chars += len(str(msg))
-        approx_input_tokens = max(1, int(math.ceil(message_chars / 3.0)))
-
-        remaining = self.remaining()
-        timeout = max(5, min(int(requested_timeout or 30), int(max(5.0, remaining - 2.0))))
-        output_cap = max(800, int(max_output_tokens or 2000))
-
-        # Enforce the monetary budget before the request. Reasoning tokens are part of
-        # output_tokens, so max_output_tokens is also the hard cost ceiling.
-        input_rate, output_rate = _v13_model_rates(model)
-        remaining_cost = max(0.0, self.max_estimated_cost_usd - self.estimated_cost_usd)
-        affordable_output = int(
-            max(0.0, (remaining_cost * 1_000_000.0 - approx_input_tokens * input_rate) / max(0.000001, output_rate))
-        )
-        output_cap = min(output_cap, affordable_output)
-        if output_cap < 800:
-            raise _V13BudgetExceeded(
-                f"V13 {self.mode} call would exceed cost budget ({self.estimated_cost_usd:.4f}/{self.max_estimated_cost_usd:.4f} USD)"
-            )
-
-        self.llm_calls += 1
-        call_index = self.llm_calls
-        self.call_log.append(
-            {
-                "call": call_index,
-                "model": str(model or ""),
-                "purpose": str(purpose or "reasoning"),
-                "timeout_seconds": timeout,
-                "max_output_tokens": output_cap,
-                "approx_input_tokens": approx_input_tokens,
-                "started_at_elapsed_seconds": round(self.elapsed(), 3),
-            }
-        )
-        return timeout, output_cap, call_index
-
-    def mark_call_failed(self, call_index: int, error: Any) -> None:
-        """Annotate a failed provider attempt without treating it as a reasoning result."""
-        for row in self.call_log:
-            if int(row.get("call") or 0) == int(call_index):
-                row["failed"] = True
-                row["error"] = str(error or "")[:700]
-                row["completed_at_elapsed_seconds"] = round(self.elapsed(), 3)
-                break
-
-    def grant_retry_allowance(self, *, failed_attempts: int, reason: str) -> int:
-        """Restore stage capacity consumed by failed model attempts, within hard caps."""
-        requested = max(0, int(failed_attempts or 0))
-        if requested <= 0:
-            return 0
-        # Never extend a request that no longer has enough time for a useful call.
-        if self.remaining() < 8.0 or self.estimated_cost_usd >= self.max_estimated_cost_usd:
-            return 0
-        room = max(0, int(self.absolute_max_llm_calls) - int(self.max_llm_calls))
-        granted = min(requested, room)
-        if granted <= 0:
-            return 0
-        self.max_llm_calls += granted
-        self.retry_allowance_calls += granted
-        self.retry_events.append({
-            "reason": str(reason or "model_fallback")[:160],
-            "failed_attempts": requested,
-            "granted_calls": granted,
-            "max_llm_calls_after": int(self.max_llm_calls),
-            "at_elapsed_seconds": round(self.elapsed(), 3),
-        })
-        return granted
-
-    def record_usage(self, call_index: int, model: str, usage: dict) -> None:
-        usage = usage if isinstance(usage, dict) else {}
-        input_tokens = int(
-            usage.get("input_tokens")
-            or usage.get("prompt_tokens")
-            or 0
-        )
-        output_tokens = int(
-            usage.get("output_tokens")
-            or usage.get("completion_tokens")
-            or 0
-        )
-        input_details = usage.get("input_tokens_details") or usage.get("prompt_tokens_details") or {}
-        output_details = usage.get("output_tokens_details") or usage.get("completion_tokens_details") or {}
-        cached_input_tokens = int((input_details or {}).get("cached_tokens") or 0)
-        cache_write_tokens = int((input_details or {}).get("cache_write_tokens") or 0)
-        reasoning_tokens = int(
-            (output_details or {}).get("reasoning_tokens")
-            or usage.get("reasoning_tokens")
-            or 0
-        )
-        self.input_tokens += input_tokens
-        self.cached_input_tokens += cached_input_tokens
-        self.cache_write_tokens += cache_write_tokens
-        self.output_tokens += output_tokens
-        self.reasoning_tokens += reasoning_tokens
-        call_cost = _v13_estimate_model_cost_usd(
-            model,
-            input_tokens,
-            output_tokens,
-            cached_input_tokens=cached_input_tokens,
-            cache_write_tokens=cache_write_tokens,
-        )
-        self.estimated_cost_usd += call_cost
-
-        for row in self.call_log:
-            if int(row.get("call") or 0) == int(call_index):
-                row["input_tokens"] = input_tokens
-                row["cached_input_tokens"] = cached_input_tokens
-                row["cache_write_tokens"] = cache_write_tokens
-                row["output_tokens"] = output_tokens
-                row["reasoning_tokens"] = reasoning_tokens
-                row["estimated_cost_usd"] = round(call_cost, 6)
-                row["completed_at_elapsed_seconds"] = round(self.elapsed(), 3)
-                break
-
-
-    def record_embedding(self, *, input_tokens: int, cache_hits: int = 0) -> None:
-        tokens = max(0, int(input_tokens or 0))
-        self.embedding_calls += 1
-        self.embedding_input_tokens += tokens
-        self.embedding_cache_hits += max(0, int(cache_hits or 0))
-        cost = (tokens * float(V13_PRICE_EMBED_INPUT or 0.0)) / 1_000_000.0
-        self.embedding_estimated_cost_usd += cost
-        self.estimated_cost_usd += cost
-
-    def public_meta(self) -> dict:
-        return {
-            "engine": "v13",
-            "route": self.route,
-            "elapsed_seconds": round(self.elapsed(), 3),
-            "deadline_seconds": self.deadline_seconds,
-            "llm_calls": self.llm_calls,
-            "max_llm_calls": self.max_llm_calls,
-            "base_max_llm_calls": self.base_max_llm_calls,
-            "absolute_max_llm_calls": self.absolute_max_llm_calls,
-            "retry_allowance_calls": self.retry_allowance_calls,
-            "retry_events": list(self.retry_events),
-            "input_tokens": self.input_tokens,
-            "cached_input_tokens": self.cached_input_tokens,
-            "cache_write_tokens": self.cache_write_tokens,
-            "output_tokens": self.output_tokens,
-            "reasoning_tokens": self.reasoning_tokens,
-            "embedding_calls": self.embedding_calls,
-            "embedding_input_tokens": self.embedding_input_tokens,
-            "embedding_cache_hits": self.embedding_cache_hits,
-            "embedding_estimated_cost_usd": round(self.embedding_estimated_cost_usd, 8),
-            "estimated_cost_usd": round(self.estimated_cost_usd, 6),
-            "max_estimated_cost_usd": self.max_estimated_cost_usd,
-            "refinement_used": bool(self.refinement_used),
-            "semantic_cache": self.semantic_cache,
-            "evidence_gate": dict(self.evidence_gate or {}),
-            "retrieval_assurance": dict(self.retrieval_assurance or {}),
-            "calls": list(self.call_log),
-        }
-
-
-_V13_BUDGET_CTX = contextvars.ContextVar("machinemind_v13_budget", default=None)
-
-
-def _v13_current_budget() -> Optional[_V13RequestBudget]:
-    try:
-        value = _V13_BUDGET_CTX.get()
-        return value if isinstance(value, _V13RequestBudget) else None
-    except Exception:
-        return None
-
-
-def _v13_model_rates(model: str) -> tuple[float, float]:
-    name = str(model or "").strip().lower()
-    if "gpt-5.6-sol" in name:
-        return V13_PRICE_SOL_INPUT, V13_PRICE_SOL_OUTPUT
-    if "gpt-5.6-terra" in name:
-        return V13_PRICE_TERRA_INPUT, V13_PRICE_TERRA_OUTPUT
-    if "gpt-5.6-luna" in name:
-        return V13_PRICE_LUNA_INPUT, V13_PRICE_LUNA_OUTPUT
-    # Conservative fallback used only for runtime accounting.
-    return V13_PRICE_SOL_INPUT, V13_PRICE_SOL_OUTPUT
-
-
-def _v13_estimate_model_cost_usd(
-    model: str,
-    input_tokens: int,
-    output_tokens: int,
-    *,
-    cached_input_tokens: int = 0,
-    cache_write_tokens: int = 0,
-) -> float:
-    input_rate, output_rate = _v13_model_rates(model)
-    total_input = max(0, int(input_tokens or 0))
-    cached = max(0, min(total_input, int(cached_input_tokens or 0)))
-    writes = max(0, min(total_input - cached, int(cache_write_tokens or 0)))
-    uncached = max(0, total_input - cached - writes)
-    return (
-        uncached * input_rate
-        + cached * input_rate * 0.10
-        + writes * input_rate * 1.25
-        + max(0, int(output_tokens or 0)) * output_rate
-    ) / 1_000_000.0
+_configure_request_budget_runtime(globals())
+for _compat_symbol in (
+    _V13BudgetExceeded,
+    _V13RequestBudget,
+    _v13_current_budget,
+    _v13_estimate_model_cost_usd,
+    _v13_model_rates,
+):
+    _compat_symbol.__module__ = __name__
+del _compat_symbol
+del _configure_request_budget_runtime
 
 
 def _v13_safety_identifier(company_id: str) -> str:
@@ -32551,89 +32300,17 @@ async def _v13_stream_json_response(
     x_ai_internal_secret: Optional[str],
     hard_timeout_seconds: Optional[int] = None,
 ):
-    result_task = asyncio.create_task(
-        asyncio.to_thread(sync_func, payload, x_ai_internal_secret)
-    )
-    stream_started = time_module.monotonic()
-    stream_query = str(
-        getattr(payload, "query", "")
-        or getattr(payload, "symptom_text", "")
-        or ""
-    ).strip()
-    stream_language = _select_response_language(
-        stream_query, preferred=getattr(payload, "language", None)
-    )
-
-    async def stream_json():
-        heartbeat = (" " * V13_STREAM_HEARTBEAT_BYTES) + "\n"
-        yield heartbeat
-        while True:
-            hard_remaining = None
-            if hard_timeout_seconds is not None:
-                hard_remaining = max(0.0, float(hard_timeout_seconds) - (time_module.monotonic() - stream_started))
-                if hard_remaining <= 0.0:
-                    timeout_message = (
-                        "Maximum response time exceeded."
-                        if str(stream_language or "").lower().startswith("en")
-                        else "Tempo massimo di risposta superato."
-                    )
-                    result = {
-                        "ok": True,
-                        "status": "timeout",
-                        "result_code": RESULT_TIMEOUT,
-                        "requested_mode": mode,
-                        "effective_mode": mode,
-                        "routed": False,
-                        "language": stream_language,
-                        "answer": timeout_message,
-                        "problem_summary": timeout_message,
-                        "possible_causes": [],
-                        "recommended_next_checks": [],
-                        "citations": [],
-                        "rg_links": [],
-                        "meta": {"cacheable": False, "semantic_cacheable": False, "hard_timeout": True},
-                    }
-                    try:
-                        result_task.cancel()
-                    except Exception:
-                        pass
-                    yield json.dumps(result, ensure_ascii=False, separators=(",", ":"))
-                    break
-            wait_seconds = float(V13_STREAM_HEARTBEAT_SECONDS)
-            if hard_remaining is not None:
-                wait_seconds = max(0.25, min(wait_seconds, hard_remaining))
-            try:
-                result = await asyncio.wait_for(
-                    asyncio.shield(result_task),
-                    timeout=wait_seconds,
-                )
-            except asyncio.TimeoutError:
-                yield heartbeat
-                continue
-            except Exception as exc:
-                result = _v13_stream_error_payload(mode, exc)
-
-            if not isinstance(result, dict):
-                result = {
-                    "ok": False,
-                    "status": "error",
-                    "error": {
-                        "code": f"{mode.upper()}_FAILED",
-                        "message": "Invalid backend payload",
-                        "detail": str(type(result)),
-                    },
-                }
-            yield json.dumps(result, ensure_ascii=False, separators=(",", ":"))
-            break
-
-    return StreamingResponse(
-        stream_json(),
-        media_type="application/json",
-        headers={
-            "Cache-Control": "no-store, no-transform",
-            "X-Accel-Buffering": "no",
-            "X-MachineMind-V13-Heartbeat": "1",
-        },
+    return await _infra_stream_json_response(
+        mode=mode,
+        sync_func=sync_func,
+        payload=payload,
+        x_ai_internal_secret=x_ai_internal_secret,
+        hard_timeout_seconds=hard_timeout_seconds,
+        heartbeat_seconds=V13_STREAM_HEARTBEAT_SECONDS,
+        heartbeat_bytes=V13_STREAM_HEARTBEAT_BYTES,
+        timeout_result_code=RESULT_TIMEOUT,
+        select_response_language=_select_response_language,
+        error_payload=_v13_stream_error_payload,
     )
 
 
@@ -32645,57 +32322,17 @@ async def _assistant_core_json_with_hard_timeout(
     x_ai_internal_secret: Optional[str],
     hard_timeout_seconds: int,
 ) -> dict:
-    query = str(
-        getattr(payload, "query", "")
-        or getattr(payload, "symptom_text", "")
-        or ""
-    ).strip()
-    language = _select_response_language(query, preferred=getattr(payload, "language", None))
-    try:
-        result = await asyncio.wait_for(
-            asyncio.to_thread(sync_func, payload, x_ai_internal_secret),
-            timeout=max(1.0, float(hard_timeout_seconds)),
-        )
-        if isinstance(result, dict):
-            return result
-        raise RuntimeError(f"Invalid backend payload: {type(result)}")
-    except asyncio.TimeoutError:
-        message = (
-            "Maximum response time exceeded."
-            if str(language or "").lower().startswith("en")
-            else "Tempo massimo di risposta superato."
-        )
-        common = {
-            "ok": True,
-            "status": "timeout",
-            "result_code": RESULT_TIMEOUT,
-            "requested_mode": mode,
-            "effective_mode": mode,
-            "routed": False,
-            "language": language,
-            "citations": [],
-            "rg_links": [],
-            "meta": {
-                "cacheable": False,
-                "semantic_cacheable": False,
-                "hard_timeout": True,
-                "hard_timeout_seconds": hard_timeout_seconds,
-            },
-        }
-        if mode == MODE_ROOT_CAUSE:
-            common.update(
-                {
-                    "symptom": query,
-                    "problem_summary": message,
-                    "possible_causes": [],
-                    "recommended_next_checks": [],
-                }
-            )
-        else:
-            common["answer"] = message
-        return common
-    except Exception as exc:
-        return _v13_stream_error_payload(mode, exc)
+    return await _infra_json_with_hard_timeout(
+        mode=mode,
+        sync_func=sync_func,
+        payload=payload,
+        x_ai_internal_secret=x_ai_internal_secret,
+        hard_timeout_seconds=hard_timeout_seconds,
+        timeout_result_code=RESULT_TIMEOUT,
+        root_cause_mode=MODE_ROOT_CAUSE,
+        select_response_language=_select_response_language,
+        error_payload=_v13_stream_error_payload,
+    )
 
 
 @app.post("/v1/ai/ask")
@@ -36111,37 +35748,26 @@ def _assistant_core_run_smart_with_hard_timeout(
     turn_kind: str,
     hard_timeout_seconds: Optional[float] = None,
 ):
-    """Run a synchronous Smart Diagnostic turn behind a real outer timeout.
-
-    The copied context preserves the per-request budget ContextVar inside the
-    worker thread. ``shutdown(wait=False)`` ensures the HTTP handler is not held
-    beyond the timeout; lower-level OpenAI/DB timeouts and the request budget
-    still bound any in-flight work that cannot be force-cancelled by Python.
-    """
-
+    """Run a synchronous Smart Diagnostic turn behind the shared execution guard."""
     timeout = float(
         ASSISTANT_CORE_HARD_TIMEOUT_SECONDS
         if hard_timeout_seconds is None
         else hard_timeout_seconds
     )
-    timeout = max(0.01, timeout)
-    ctx = contextvars.copy_context()
-    executor = concurrent.futures.ThreadPoolExecutor(
-        max_workers=1,
-        thread_name_prefix=f"mm-smart-{str(turn_kind or 'turn')[:20]}",
+    return _infra_run_sync_with_hard_timeout(
+        func,
+        payload,
+        x_ai_internal_secret,
+        hard_timeout_seconds=timeout,
+        thread_name=f"mm-smart-{str(turn_kind or 'turn')[:20]}",
+        on_timeout=lambda timed_payload, actual_timeout: (
+            _assistant_core_smart_hard_timeout_response(
+                timed_payload,
+                turn_kind=turn_kind,
+                hard_timeout_seconds=actual_timeout,
+            )
+        ),
     )
-    future = executor.submit(ctx.run, func, payload, x_ai_internal_secret)
-    try:
-        return future.result(timeout=timeout)
-    except concurrent.futures.TimeoutError:
-        future.cancel()
-        return _assistant_core_smart_hard_timeout_response(
-            payload,
-            turn_kind=turn_kind,
-            hard_timeout_seconds=timeout,
-        )
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _assistant_core_budgeted_sd_turn(turn_kind: str):

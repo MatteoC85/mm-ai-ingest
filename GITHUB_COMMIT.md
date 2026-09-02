@@ -1,25 +1,30 @@
-# GitHub action — Phase 2, Commit 2
+# GitHub operation — Phase 2 Commit 3
 
-Branch: `refactor-phase1`
+Remain on the existing branch:
 
-1. Extract the ZIP.
-2. Copy the complete contents of the extracted folder over the current repository.
-3. Choose **Replace files in the destination** when requested.
-4. Do not delete the hidden `.git` folder.
-5. In Source Control, confirm the intended changes include:
-   - `main.py`;
-   - `machinemind/infrastructure/openai_transport.py`;
-   - Phase 2B documentation, tests and tools.
-6. The following production files must not be modified by this commit:
-   - `assistant_core_v2.py`;
-   - `cloudbuild.yaml`;
-   - `Dockerfile`;
-   - `requirements.txt`;
-   - `mm_promotion_gate.py`;
-   - existing configuration and database modules.
-7. Commit message:
+`refactor-phase1`
 
-   `refactor: extract OpenAI provider transport from production monolith`
+Extract the ZIP and copy the complete contents of the extracted folder over the current repository. Preserve the hidden `.git` directory and choose **Replace files in the destination** for matching files.
 
-8. Select **Commit and push**. The configured `refactor-phase1` trigger will build
-   and deploy the commit automatically.
+Expected source changes:
+
+- `main.py`;
+- `machinemind/infrastructure/request_budget.py`;
+- `machinemind/infrastructure/execution.py`;
+- Phase 2C tests, probe, gate and documentation;
+- validation and checksum manifests.
+
+These production files must remain unchanged from Commit 2:
+
+- `machinemind/infrastructure/openai_transport.py`;
+- `assistant_core_v2.py`;
+- `Dockerfile`;
+- `cloudbuild.yaml`;
+- `requirements.txt`;
+- `mm_promotion_gate.py`.
+
+Commit message:
+
+`refactor: extract request budgets and execution guards`
+
+Then use **Commit e push**. The configured trigger will build and deploy from `refactor-phase1`.
