@@ -92,235 +92,9 @@ from assistant_core_v2 import (
 
 app = FastAPI()
 
-AI_INTERNAL_SECRET = (os.environ.get("AI_INTERNAL_SECRET") or "").strip()
-FETCH_TIMEOUT = int(os.environ.get("MM_FETCH_TIMEOUT_SECONDS", "30"))
-MAX_PDF_BYTES = int(os.environ.get("MM_MAX_PDF_BYTES", str(50 * 1024 * 1024)))
-
-# XLSX ingest is intentionally feature-flagged and isolated from the PDF path.
-# Default OFF: deploy the code safely, then enable only after PDF regression tests pass.
-XLSX_INGEST_ENABLED = (os.environ.get("MM_XLSX_INGEST_ENABLED") or "0").strip() == "1"
-MAX_XLSX_BYTES = int(os.environ.get("MM_MAX_XLSX_BYTES", str(20 * 1024 * 1024)))
-XLSX_MAX_SHEETS = int(os.environ.get("MM_XLSX_MAX_SHEETS", "25"))
-XLSX_MAX_ROWS_PER_SHEET = int(os.environ.get("MM_XLSX_MAX_ROWS_PER_SHEET", "5000"))
-XLSX_MAX_COLS_PER_SHEET = int(os.environ.get("MM_XLSX_MAX_COLS_PER_SHEET", "80"))
-XLSX_MAX_CELLS_TOTAL = int(os.environ.get("MM_XLSX_MAX_CELLS_TOTAL", "150000"))
-XLSX_MAX_TEXT_CHARS = int(os.environ.get("MM_XLSX_MAX_TEXT_CHARS", "500000"))
-XLSX_PAGE_TARGET_CHARS = int(os.environ.get("MM_XLSX_PAGE_TARGET_CHARS", "12000"))
-XLSX_MAX_CELL_CHARS = int(os.environ.get("MM_XLSX_MAX_CELL_CHARS", "260"))
-XLSX_MAX_ROW_CHARS = int(os.environ.get("MM_XLSX_MAX_ROW_CHARS", "2400"))
-XLSX_MIN_TEXT_CHARS = int(os.environ.get("MM_XLSX_MIN_TEXT_CHARS", "120"))
-XLSX_INCLUDE_HIDDEN_SHEETS = (os.environ.get("MM_XLSX_INCLUDE_HIDDEN_SHEETS") or "0").strip() == "1"
-
-# DB
-DB_HOST = (os.environ.get("MM_DB_HOST") or "").strip()
-DB_NAME = (os.environ.get("MM_DB_NAME") or "postgres").strip()
-DB_USER = (os.environ.get("MM_DB_USER") or "").strip()
-DB_PASSWORD = (os.environ.get("MM_DB_PASSWORD") or "").strip()
-
-# Indicizzabilità
-MIN_TEXT_CHARS = int(os.environ.get("MM_MIN_TEXT_CHARS", "2000"))
-MIN_TEXT_CHARS_SHORT = int(os.environ.get("MM_MIN_TEXT_CHARS_SHORT", "800"))
-MIN_PAGE_CHARS = int(os.environ.get("MM_MIN_PAGE_CHARS", "30"))
-MIN_PAGES_WITH_TEXT_ABS = int(os.environ.get("MM_MIN_PAGES_WITH_TEXT_ABS", "2"))
-MIN_PAGES_WITH_TEXT_PCT = float(os.environ.get("MM_MIN_PAGES_WITH_TEXT_PCT", "0.20"))
-
-# Chunking
-CHUNK_TARGET_CHARS = int(os.environ.get("MM_CHUNK_TARGET_CHARS", "3800"))
-CHUNK_OVERLAP_CHARS = int(os.environ.get("MM_CHUNK_OVERLAP_CHARS", "800"))
-CHUNK_MIN_CHARS = int(os.environ.get("MM_CHUNK_MIN_CHARS", "200"))
-
-# OpenAI
-OPENAI_API_KEY = (os.environ.get("OPENAI_API_KEY") or "").strip()
-OPENAI_EMBED_MODEL = (os.environ.get("OPENAI_EMBED_MODEL") or "text-embedding-3-small").strip()
-OPENAI_EMBED_URL = (os.environ.get("OPENAI_EMBED_URL") or "https://api.openai.com/v1/embeddings").strip()
-
-# Document-ingest cost metering. The current document pipeline pays OpenAI only for
-# embeddings; PDF/XLSX parsing, chunking and DB writes remain infrastructure work.
-# 1 credit = USD 0.001 by default. Prices are versioned and configurable so future
-# OCR/vision/electrical stages can be added without changing Bubble's unit.
-INGEST_METERING_VERSION = "ingest-credits-v1-async-ledger"
-INGEST_PRICING_VERSION = (
-    os.environ.get("MM_INGEST_PRICING_VERSION") or "2026-07-embedding-v1"
-).strip()
-INGEST_CREDITS_PER_USD = Decimal(
-    os.environ.get("MM_INGEST_CREDITS_PER_USD", "1000")
-)
-INGEST_PRICE_EMBED_INPUT_USD_PER_MILLION = Decimal(
-    os.environ.get("MM_INGEST_PRICE_EMBED_INPUT_USD_PER_MILLION", "0.02")
-)
-INGEST_LEDGER_AUTO_DDL = (
-    os.environ.get("MM_INGEST_LEDGER_AUTO_DDL") or "1"
-).strip() != "0"
-INGEST_PROCESSING_STALE_SECONDS = max(300, min(7200, int(
-    os.environ.get("MM_INGEST_PROCESSING_STALE_SECONDS", "1800")
-)))
-
-# OpenAI Chat
-OPENAI_CHAT_MODEL = (os.environ.get("OPENAI_CHAT_MODEL") or "gpt-5.4-mini").strip()
-OPENAI_CHAT_URL = (os.environ.get("OPENAI_CHAT_URL") or "https://api.openai.com/v1/chat/completions").strip()
-
-# OpenAI Citation Reranker (on-demand)
-OPENAI_RERANK_MODEL = (os.environ.get("OPENAI_RERANK_MODEL") or "gpt-5.4-nano").strip()
-RERANK_MAX_CANDIDATES = int(os.environ.get("MM_RERANK_MAX_CANDIDATES", "18"))
-RERANK_SNIPPET_CHARS = int(os.environ.get("MM_RERANK_SNIPPET_CHARS", "320"))
-RERANK_TIMEOUT = int(os.environ.get("MM_RERANK_TIMEOUT_SECONDS", "30"))
-RERANK_ENABLED = (os.environ.get("MM_RERANK_ENABLED") or "1").strip() == "1"
-RERANK_MIN_SIM_MAX = float(os.environ.get("MM_RERANK_MIN_SIM_MAX", "0.38"))
-RERANK_MAX_SIM_MAX = float(os.environ.get("MM_RERANK_MAX_SIM_MAX", "0.72"))
-RERANK_MAX_SPREAD = float(os.environ.get("MM_RERANK_MAX_SPREAD", "0.10"))
-RERANK_MIN_CANDIDATES = int(os.environ.get("MM_RERANK_MIN_CANDIDATES", "4"))
-
-FINAL_CITATION_LOCK_DELTA = float(os.environ.get("MM_FINAL_CITATION_LOCK_DELTA", "0.028"))
-FINAL_CITATION_LOCK_DIAGNOSTIC_DELTA = float(os.environ.get("MM_FINAL_CITATION_LOCK_DIAGNOSTIC_DELTA", "0.042"))
-FINAL_CITATION_LOCK_SET_DELTA = float(os.environ.get("MM_FINAL_CITATION_LOCK_SET_DELTA", "0.014"))
-FINAL_CITATION_LOCK_SET_DIAGNOSTIC_DELTA = float(os.environ.get("MM_FINAL_CITATION_LOCK_SET_DIAGNOSTIC_DELTA", "0.020"))
-FINAL_CITATION_LOCK_FAMILY_WITHIN_SET_DELTA = float(os.environ.get("MM_FINAL_CITATION_LOCK_FAMILY_WITHIN_SET_DELTA", "0.016"))
-ROOT_CAUSE_SET_LOCK_DELTA = float(os.environ.get("MM_ROOT_CAUSE_SET_LOCK_DELTA", "0.028"))
-
-ASK_SIM_THRESHOLD = float(os.environ.get("MM_ASK_SIM_THRESHOLD", "0.35"))
-ASK_SHORT_QUERY_SIM_THRESHOLD = float(os.environ.get("MM_ASK_SHORT_QUERY_SIM_THRESHOLD", "0.28"))
-ASK_MAX_TOP_K = int(os.environ.get("MM_ASK_MAX_TOP_K", "8"))
-ASK_SNIPPET_CHARS = int(os.environ.get("MM_ASK_SNIPPET_CHARS", "700"))
-ASK_MAX_CONTEXT_CHARS = int(os.environ.get("MM_ASK_MAX_CONTEXT_CHARS", "9000"))
-DRAFT_PS_SIM_THRESHOLD = float(os.environ.get("MM_DRAFT_PS_SIM_THRESHOLD", "0.42"))
-
-# Structured-source rescue for machine-wide Ask queries.
-# Purpose: when the user asks about procedures/steps/P&S/photos/videos or asks a how-to
-# question, do not let long manuals dominate over exact structured records.
-STRUCTURED_RESCUE_ENABLED = (os.environ.get("MM_STRUCTURED_RESCUE_ENABLED") or "1").strip() != "0"
-STRUCTURED_RESCUE_SCAN_LIMIT = int(os.environ.get("MM_STRUCTURED_RESCUE_SCAN_LIMIT", "220"))
-STRUCTURED_RESCUE_MAX_HITS = int(os.environ.get("MM_STRUCTURED_RESCUE_MAX_HITS", "3"))
-
-# ASK v2 generic evidence compiler (query-agnostic, multilingual, non-hardcoded)
-# This is NOT a benchmark dictionary: it does not contain expected answers, document ids,
-# product codes or test questions. It improves retrieval by analyzing the user query,
-# scanning authorized pages/structured sources, then verifying groundedness and completeness.
-ASK_EVIDENCE_COMPILER_ENABLED = (os.environ.get("MM_ASK_EVIDENCE_COMPILER_ENABLED") or "1").strip() != "0"
-ASK_EVIDENCE_ANALYZER_MODEL = (os.environ.get("MM_ASK_EVIDENCE_ANALYZER_MODEL") or OPENAI_RERANK_MODEL).strip()
-ASK_EVIDENCE_ANSWER_MODEL = (os.environ.get("MM_ASK_EVIDENCE_ANSWER_MODEL") or os.environ.get("MM_ROOT_CAUSE_RESPONSE_MODEL") or "gpt-5.4").strip()
-ASK_EVIDENCE_SCOPE_PAGE_LIMIT = int(os.environ.get("MM_ASK_EVIDENCE_SCOPE_PAGE_LIMIT", "900"))
-ASK_EVIDENCE_TOP_PAGES = int(os.environ.get("MM_ASK_EVIDENCE_TOP_PAGES", "10"))
-ASK_EVIDENCE_MAX_PAGE_CHARS = int(os.environ.get("MM_ASK_EVIDENCE_MAX_PAGE_CHARS", "12000"))
-ASK_EVIDENCE_MAX_CONTEXT_CHARS = int(os.environ.get("MM_ASK_EVIDENCE_MAX_CONTEXT_CHARS", "24000"))
-ASK_EVIDENCE_MIN_PAGE_SCORE = float(os.environ.get("MM_ASK_EVIDENCE_MIN_PAGE_SCORE", "1.5"))
-ASK_EVIDENCE_VERIFIER_ENABLED = (os.environ.get("MM_ASK_EVIDENCE_VERIFIER_ENABLED") or "1").strip() != "0"
-ASK_EVIDENCE_VERIFIER_MODEL = (os.environ.get("MM_ASK_EVIDENCE_VERIFIER_MODEL") or OPENAI_RERANK_MODEL).strip()
-ASK_EVIDENCE_VERIFIER_TIMEOUT = int(os.environ.get("MM_ASK_EVIDENCE_VERIFIER_TIMEOUT_SECONDS", "45"))
-ASK_EVIDENCE_VERIFIER_MAX_CONTEXT_CHARS = int(os.environ.get("MM_ASK_EVIDENCE_VERIFIER_MAX_CONTEXT_CHARS", "16000"))
-
-# ASK full-document reader (generic, non-benchmark-specific).
-# When the authorized scope is narrow enough, this gives the answer model a much larger
-# evidence pack instead of only a few top chunks. It is meant to mimic how a human expert
-# would scan the actual manual/procedure before answering factual technical questions.
-ASK_FULL_CONTEXT_ENABLED = (os.environ.get("MM_ASK_FULL_CONTEXT_ENABLED") or "1").strip() != "0"
-ASK_FULL_CONTEXT_MAX_DOCS = int(os.environ.get("MM_ASK_FULL_CONTEXT_MAX_DOCS", "3"))
-ASK_FULL_CONTEXT_MAX_PAGES = int(os.environ.get("MM_ASK_FULL_CONTEXT_MAX_PAGES", "140"))
-ASK_FULL_CONTEXT_MAX_CHARS = int(os.environ.get("MM_ASK_FULL_CONTEXT_MAX_CHARS", "120000"))
-ASK_FULL_CONTEXT_PAGE_CHARS = int(os.environ.get("MM_ASK_FULL_CONTEXT_PAGE_CHARS", "6500"))
-ASK_FULL_CONTEXT_TIMEOUT = int(os.environ.get("MM_ASK_FULL_CONTEXT_TIMEOUT_SECONDS", "120"))
-ASK_FULL_CONTEXT_MODEL = (os.environ.get("MM_ASK_FULL_CONTEXT_MODEL") or ASK_EVIDENCE_ANSWER_MODEL).strip()
-ASK_STRUCTURED_DIRECT_ENABLED = (os.environ.get("MM_ASK_STRUCTURED_DIRECT_ENABLED") or "1").strip() != "0"
-ASK_STRUCTURED_DIRECT_MAX_ITEMS = int(os.environ.get("MM_ASK_STRUCTURED_DIRECT_MAX_ITEMS", "12"))
-ASK_STRUCTURED_DIRECT_SCAN_LIMIT = int(os.environ.get("MM_ASK_STRUCTURED_DIRECT_SCAN_LIMIT", "1200"))
-ASK_STRUCTURED_DIRECT_MAX_CONTEXT_CHARS = int(os.environ.get("MM_ASK_STRUCTURED_DIRECT_MAX_CONTEXT_CHARS", "28000"))
-ASK_STRUCTURED_DIRECT_TEXT_CHARS = int(os.environ.get("MM_ASK_STRUCTURED_DIRECT_TEXT_CHARS", "5000"))
-ASK_STRUCTURED_DIRECT_TIMEOUT = int(os.environ.get("MM_ASK_STRUCTURED_DIRECT_TIMEOUT_SECONDS", "60"))
-ASK_STRUCTURED_DIRECT_MODEL = (os.environ.get("MM_ASK_STRUCTURED_DIRECT_MODEL") or ASK_EVIDENCE_ANSWER_MODEL).strip()
-ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_ENABLED = (os.environ.get("MM_ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_ENABLED") or "1").strip() != "0"
-ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_MAX_ITEMS = int(os.environ.get("MM_ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_MAX_ITEMS", "2"))
-ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_SCAN_LIMIT = int(os.environ.get("MM_ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_SCAN_LIMIT", "180"))
-ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_TEXT_CHARS = int(os.environ.get("MM_ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_TEXT_CHARS", "4200"))
-
-# ASK user-facing output polish. Retrieval/citations remain rich; the answer box
-# must not expose internal ids or become an unreadable evidence dump.
-ASK_UI_MAX_POINTS = int(os.environ.get("MM_ASK_UI_MAX_POINTS", "5"))
-ASK_UI_MAX_ANSWER_CHARS = int(os.environ.get("MM_ASK_UI_MAX_ANSWER_CHARS", "2200"))
-ASK_UI_MAX_LINKS = int(os.environ.get("MM_ASK_UI_MAX_LINKS", "8"))
-ASK_UI_MAX_CITATIONS = int(os.environ.get("MM_ASK_UI_MAX_CITATIONS", "8"))
-ASK_UI_MAX_SNIPPET_CLEAN_CHARS = int(os.environ.get("MM_ASK_UI_MAX_SNIPPET_CLEAN_CHARS", "520"))
-ASK_UI_MANUAL_SUPPORT_SNIPPET_CHARS = int(os.environ.get("MM_ASK_UI_MANUAL_SUPPORT_SNIPPET_CHARS", "260"))
-ASK_UI_MAX_STRUCTURED_ANSWER_CHARS = int(os.environ.get("MM_ASK_UI_MAX_STRUCTURED_ANSWER_CHARS", "5200"))
-ASK_UI_STRUCTURED_MAX_CITATIONS = int(os.environ.get("MM_ASK_UI_STRUCTURED_MAX_CITATIONS", "14"))
-ASK_UI_STRUCTURED_MAX_LINKS = int(os.environ.get("MM_ASK_UI_STRUCTURED_MAX_LINKS", "14"))
-
-# Shared semantic retrieval planner
-SEMANTIC_QUERY_PLANNER_MODEL = (os.environ.get("MM_SEMANTIC_QUERY_PLANNER_MODEL") or "gpt-5.4-mini").strip()
-SEMANTIC_QUERY_PLANNER_TIMEOUT = int(os.environ.get("MM_SEMANTIC_QUERY_PLANNER_TIMEOUT_SECONDS", "20"))
-SEMANTIC_MAX_DENSE_QUERIES = int(os.environ.get("MM_SEMANTIC_MAX_DENSE_QUERIES", "5"))
-SEMANTIC_MAX_LEXICAL_QUERIES = int(os.environ.get("MM_SEMANTIC_MAX_LEXICAL_QUERIES", "5"))
-SEMANTIC_EXACT_MACHINE_BONUS = float(os.environ.get("MM_SEMANTIC_EXACT_MACHINE_BONUS", "0.055"))
-ASK_ROOT_CAUSE_CODE_MARKER = "ask-root-v13-prod-task-aware-source-selection-hardened-stream-v5-1"
-
-# Root-cause semantic intent gate
-ROOT_CAUSE_INTENT_MODEL = (os.environ.get("MM_ROOT_CAUSE_INTENT_MODEL") or "gpt-5.4-mini").strip()
-ROOT_CAUSE_GATE_MIN_SYMPTOM_SCORE = float(os.environ.get("MM_ROOT_CAUSE_GATE_MIN_SYMPTOM_SCORE", "0.33"))
-ROOT_CAUSE_GATE_MIN_MARGIN = float(os.environ.get("MM_ROOT_CAUSE_GATE_MIN_MARGIN", "0.05"))
-ROOT_CAUSE_GATE_MIN_PRELIM_SIM = float(os.environ.get("MM_ROOT_CAUSE_GATE_MIN_PRELIM_SIM", "0.36"))
-ROOT_CAUSE_GATE_MIN_PRELIM_HITS = int(os.environ.get("MM_ROOT_CAUSE_GATE_MIN_PRELIM_HITS", "2"))
-ROOT_CAUSE_GATE_PRELIM_TOP_K = int(os.environ.get("MM_ROOT_CAUSE_GATE_PRELIM_TOP_K", "6"))
-DIAGNOSTIC_PIPELINE_ENABLED = (os.environ.get("MM_DIAGNOSTIC_PIPELINE_ENABLED") or "1").strip() == "1"
-DIAGNOSTIC_EVIDENCE_MODEL = (os.environ.get("MM_DIAGNOSTIC_EVIDENCE_MODEL") or "gpt-5.4-mini").strip()
-ROOT_CAUSE_RESPONSE_MODEL = (os.environ.get("MM_ROOT_CAUSE_RESPONSE_MODEL") or "gpt-5.4").strip()
-ROOT_CAUSE_EXTRA_CANDIDATE_K = int(os.environ.get("MM_ROOT_CAUSE_EXTRA_CANDIDATE_K", "60"))
-ROOT_CAUSE_MAX_EVIDENCE_POOL = int(os.environ.get("MM_ROOT_CAUSE_MAX_EVIDENCE_POOL", "10"))
-ROOT_CAUSE_MAX_PROMPT_CITATIONS = int(os.environ.get("MM_ROOT_CAUSE_MAX_PROMPT_CITATIONS", "7"))
-ROOT_CAUSE_DIRECT_SIGNAL_BONUS = float(os.environ.get("MM_ROOT_CAUSE_DIRECT_SIGNAL_BONUS", "0.12"))
-ROOT_CAUSE_GENERIC_DOWNRANK_PENALTY = float(os.environ.get("MM_ROOT_CAUSE_GENERIC_DOWNRANK_PENALTY", "0.14"))
-ROOT_CAUSE_HARD_EXCLUDE_PENALTY = float(os.environ.get("MM_ROOT_CAUSE_HARD_EXCLUDE_PENALTY", "0.30"))
-ROOT_CAUSE_GENERIC_SUPPORT_ONLY_PENALTY = float(os.environ.get("MM_ROOT_CAUSE_GENERIC_SUPPORT_ONLY_PENALTY", "0.22"))
-ROOT_CAUSE_MATRIX_MIN_DISTINCT_CAUSES = int(os.environ.get("MM_ROOT_CAUSE_MATRIX_MIN_DISTINCT_CAUSES", "2"))
-ROOT_CAUSE_MATRIX_PROMPT_CAUSE_QUOTA = int(os.environ.get("MM_ROOT_CAUSE_MATRIX_PROMPT_CAUSE_QUOTA", "2"))
-ROOT_CAUSE_USE_DETERMINISTIC_CROSSLINGUAL = (os.environ.get("MM_ROOT_CAUSE_USE_DETERMINISTIC_CROSSLINGUAL") or "1").strip() != "0"
-
-RESPONSE_ARB_ENABLED = (os.environ.get("MM_RESPONSE_ARB_ENABLED") or "1").strip() != "0"
-ASK_CANDIDATE_ENABLED = (os.environ.get("MM_ASK_CANDIDATE_ENABLED") or "1").strip() != "0"
-ROOT_CAUSE_CANDIDATE_ENABLED = (os.environ.get("MM_ROOT_CAUSE_CANDIDATE_ENABLED") or "1").strip() != "0"
-
-# Root Cause candidate gating:
-# If the baseline proxy score is already high enough, do not run the expensive
-# candidate/arbiter branch. Set to 1.30 to effectively disable this skip.
-ROOT_CAUSE_SKIP_CANDIDATE_IF_BASELINE_PROXY_GTE = float(
-    os.environ.get("MM_ROOT_CAUSE_SKIP_CANDIDATE_IF_BASELINE_PROXY_GTE", "0.80")
-)
-
-RESPONSE_ARB_KEEP_BASELINE_ON_TIE = (os.environ.get("MM_RESPONSE_ARB_KEEP_BASELINE_ON_TIE") or "1").strip() != "0"
-ASK_ARB_MIN_DELTA = float(os.environ.get("MM_ASK_ARB_MIN_DELTA", "0.035"))
-ROOT_CAUSE_ARB_MIN_DELTA = float(os.environ.get("MM_ROOT_CAUSE_ARB_MIN_DELTA", "0.040"))
-ROOT_CAUSE_CANDIDATE_CORE_PROMOTION = float(os.environ.get("MM_ROOT_CAUSE_CANDIDATE_CORE_PROMOTION", "0.08"))
-ROOT_CAUSE_CANDIDATE_SUPPORT_PENALTY = float(os.environ.get("MM_ROOT_CAUSE_CANDIDATE_SUPPORT_PENALTY", "0.16"))
-ROOT_CAUSE_CANDIDATE_NO_START_LUBE_PENALTY = float(os.environ.get("MM_ROOT_CAUSE_CANDIDATE_NO_START_LUBE_PENALTY", "0.20"))
-ROOT_CAUSE_CANDIDATE_STARTUP_PENALTY = float(os.environ.get("MM_ROOT_CAUSE_CANDIDATE_STARTUP_PENALTY", "0.16"))
-ROOT_CAUSE_CANDIDATE_SAFETY_PENALTY = float(os.environ.get("MM_ROOT_CAUSE_CANDIDATE_SAFETY_PENALTY", "0.14"))
-ROOT_CAUSE_CANDIDATE_MATRIX_TOP_K = int(os.environ.get("MM_ROOT_CAUSE_CANDIDATE_MATRIX_TOP_K", "10"))
-ROOT_CAUSE_CANDIDATE_PROMPT_TOP_K = int(os.environ.get("MM_ROOT_CAUSE_CANDIDATE_PROMPT_TOP_K", "7"))
-ROOT_CAUSE_CANDIDATE_ENABLE_ROLE_AWARE_MATRIX = (os.environ.get("MM_ROOT_CAUSE_CANDIDATE_ENABLE_ROLE_AWARE_MATRIX") or "1").strip() != "0"
-ASK_CANDIDATE_MATRIX_TOP_K = int(os.environ.get("MM_ASK_CANDIDATE_MATRIX_TOP_K", "7"))
-ASK_CANDIDATE_PROMPT_TOP_K = int(os.environ.get("MM_ASK_CANDIDATE_PROMPT_TOP_K", "6"))
-
-
-# -----------------------------
-# Entity fallback (URL / email / phone)
-# -----------------------------
-URL_REGEX = re.compile(r"(https?://[^\s\)\]\}]+|www\.[^\s\)\]\}]+)", re.IGNORECASE)
-EMAIL_REGEX = re.compile(r"([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})", re.IGNORECASE)
-PHONE_REGEX = re.compile(r"(\+?\d[\d\s().-]{7,}\d)")
-
-# -----------------------------
-# Code token fallback (SENTINEL / part-number / codici)
-# -----------------------------
-CODE_TOKEN_REGEX = re.compile(r"\b[A-Z0-9_]{6,}\b")
-
-URL_HINTS = ["sito", "website", "web site", "url", "link", "pagina", "dominio", "www"]
-EMAIL_HINTS = ["email", "e-mail", "mail", "posta"]
-PHONE_HINTS = ["telefono", "cell", "cellulare", "tel", "contatto", "chiamare", "numero"]
-
-STRUCTURED_SOURCE_TYPES = {
-    "procedure",
-    "step",
-    "ps",
-    "md_photo",
-    "md_video",
-}
+# Runtime configuration re-exported from a normal importable module.
+# The historical names remain available in ``main`` for compatibility.
+from machinemind.config.runtime import *  # noqa: F401,F403
 
 from machinemind.api.contracts import (
     AskRequest,
@@ -531,73 +305,31 @@ def _raw_rows_to_dense_candidates(
 
     return candidates
 
+from machinemind.infrastructure.database import (
+    connect_database as _infrastructure_connect_database,
+    get_table_columns as _infrastructure_get_table_columns,
+    vector_literal as _infrastructure_vector_literal,
+)
+
+
 def _db_conn():
-    if not (DB_HOST and DB_USER and DB_PASSWORD):
-        raise HTTPException(status_code=500, detail="DB env missing")
-
-    kwargs: dict[str, Any] = {
-        "host": DB_HOST,
-        "dbname": DB_NAME,
-        "user": DB_USER,
-        "password": DB_PASSWORD,
-    }
-
-    # Existing ingest/electrical/Smart Diagnostic behavior is unchanged. Only a live
-    # V13 ASK/Root Cause request receives bounded connect/statement timeouts.
-    budget = None
-    try:
-        budget_fn = globals().get("_v13_current_budget")
-        budget = budget_fn() if callable(budget_fn) else None
-    except Exception:
-        budget = None
-
-    assurance_remaining: Optional[float] = None
-    try:
-        assurance_ctx = globals().get("_V13_ASSURANCE_DEADLINE_CTX")
-        assurance_deadline = float(assurance_ctx.get() or 0.0) if assurance_ctx is not None else 0.0
-        if assurance_deadline > 0.0:
-            assurance_remaining = max(0.1, assurance_deadline - time_module.monotonic())
-    except Exception:
-        assurance_remaining = None
-
-    if budget is not None and assurance_remaining is None:
-        # Preserve the pre-assurance V13 behavior exactly outside the bounded layer.
-        budget.ensure_time(1.5)
-        remaining = max(1.5, float(budget.remaining()))
-        connect_limit = int(globals().get("V13_DB_CONNECT_TIMEOUT_SECONDS", 5) or 5)
-        statement_limit = int(globals().get("V13_DB_STATEMENT_TIMEOUT_MS", 9000) or 9000)
-        kwargs["connect_timeout"] = max(1, min(connect_limit, int(max(1.0, remaining - 0.5))))
-        kwargs["options"] = f"-c statement_timeout={max(1000, min(statement_limit, int(max(1.0, remaining - 0.5) * 1000)))}"
-    elif budget is not None or assurance_remaining is not None:
-        if budget is not None:
-            budget.ensure_time(1.0)
-            remaining = max(0.5, float(budget.remaining()))
-        else:
-            remaining = max(0.5, float(assurance_remaining or 0.5))
-        if assurance_remaining is not None:
-            remaining = min(remaining, max(0.5, float(assurance_remaining)))
-        connect_limit = int(globals().get("V13_DB_CONNECT_TIMEOUT_SECONDS", 5) or 5)
-        statement_limit = int(globals().get("V13_DB_STATEMENT_TIMEOUT_MS", 9000) or 9000)
-        kwargs["connect_timeout"] = max(1, min(connect_limit, int(max(1.0, remaining - 0.2))))
-        kwargs["options"] = f"-c statement_timeout={max(500, min(statement_limit, int(max(0.5, remaining - 0.2) * 1000)))}"
-
-    return psycopg2.connect(**kwargs)
+    return _infrastructure_connect_database(
+        db_host=DB_HOST,
+        db_name=DB_NAME,
+        db_user=DB_USER,
+        db_password=DB_PASSWORD,
+        runtime_globals=globals(),
+        connect_fn=psycopg2.connect,
+        monotonic_fn=time_module.monotonic,
+    )
 
 
 def _vector_literal(vec: list[float]) -> str:
-    return "[" + ",".join(f"{x:.8f}" for x in vec) + "]"
+    return _infrastructure_vector_literal(vec)
 
 
 def _get_table_columns(cur, table_name: str) -> set[str]:
-    cur.execute(
-        """
-        SELECT column_name
-        FROM information_schema.columns
-        WHERE table_schema='public' AND table_name=%s;
-        """,
-        (table_name,),
-    )
-    return {r[0] for r in cur.fetchall()}
+    return _infrastructure_get_table_columns(cur, table_name)
 
 
 def _db_upsert_document_file(company_id: str, bubble_document_id: str, file_url: str) -> None:
@@ -20224,275 +19956,8 @@ def _root_cause_v1_candidate_impl(
 # from the live ASK/ROOT CAUSE routes.
 # =============================================================================
 
-V13_ENABLED = (os.environ.get("MM_V13_ENABLED") or "1").strip() != "0"
-V13_ASK_ENABLED = (os.environ.get("MM_V13_ASK_ENABLED") or "1").strip() != "0"
-V13_ROOT_CAUSE_ENABLED = (os.environ.get("MM_V13_ROOT_CAUSE_ENABLED") or "1").strip() != "0"
-V13_CODE_MARKER = "ask-root-v13-prod-task-aware-source-selection-hardened-stream-v5-1"
-V13_RELEASE_ID = (os.environ.get("MM_V13_RELEASE_ID") or "2026-07-29.5.1").strip()
-OPENAI_RESPONSES_URL = (os.environ.get("OPENAI_RESPONSES_URL") or "https://api.openai.com/v1/responses").strip()
-
-# Model policy. Luna is used only for optional retrieval refinement; Terra handles
-# precise/high-confidence synthesis and the borderline evidence-sufficiency gate;
-# Sol is reserved for genuinely complex synthesis.
-V13_PLANNER_MODEL = (os.environ.get("MM_V13_PLANNER_MODEL") or "gpt-5.6-luna").strip()
-V13_FAST_MODEL = (os.environ.get("MM_V13_FAST_MODEL") or "gpt-5.6-terra").strip()
-V13_HEAVY_MODEL = (os.environ.get("MM_V13_HEAVY_MODEL") or "gpt-5.6-sol").strip()
-# The shared gate evaluates whether indexed evidence supports the exact request.
-# It does not classify specific phrases, domains, greetings, or source types. Terra
-# is the default because false admission is more damaging than the small extra cost
-# paid only for borderline ASK cases and for Root Cause mode-fit verification.
-V13_EVIDENCE_GATE_MODEL = (os.environ.get("MM_V13_EVIDENCE_GATE_MODEL") or V13_FAST_MODEL).strip()
-V13_EVIDENCE_GATE_EFFORT = (os.environ.get("MM_V13_EVIDENCE_GATE_EFFORT") or "medium").strip()
-V13_FAST_EFFORT = (os.environ.get("MM_V13_FAST_EFFORT") or "medium").strip()
-V13_ASK_HEAVY_EFFORT = (os.environ.get("MM_V13_ASK_HEAVY_EFFORT") or "medium").strip()
-V13_ROOT_HEAVY_EFFORT = (os.environ.get("MM_V13_ROOT_HEAVY_EFFORT") or "high").strip()
-# Pro mode is opt-in. Standard mode is the production default because it is faster and cheaper.
-V13_HEAVY_REASONING_MODE = (os.environ.get("MM_V13_HEAVY_REASONING_MODE") or "").strip().lower()
-if V13_HEAVY_REASONING_MODE not in {"", "pro"}:
-    V13_HEAVY_REASONING_MODE = ""
-
-# Assistant Core V2 is the production orchestration layer. It reuses the stable V13
-# retrieval/synthesis primitives but chooses the response mode only after neutral
-# cross-source retrieval. Default ON; set MM_ASSISTANT_CORE_V2_ENABLED=0 only for rollback.
-ASSISTANT_CORE_V2_ENABLED = (os.environ.get("MM_ASSISTANT_CORE_V2_ENABLED") or "1").strip() != "0"
-ASSISTANT_CORE_V2_CODE_MARKER = "assistant-core-v2-root-evidence-assurance-v10-3-3-final-20260831-3"
-ASSISTANT_CORE_V2_RELEASE_ID = (os.environ.get("MM_ASSISTANT_CORE_V2_RELEASE_ID") or "2026-08-31.3").strip()
-RESULT_INCOMPLETE_ANSWER_CONTRACT = "INCOMPLETE_ANSWER_CONTRACT"
-ASSISTANT_UI_RENDER_VERSION = "assistant-ui-html-lossless-v10-1-20260806-1"
-ASSISTANT_ASK_UI_RENDER_VERSION = "assistant-ui-ask-root-parity-v1-20260901-1"
-ASSISTANT_UI_MAX_HTML_CHARS = max(8000, min(60000, int(
-    os.environ.get("MM_ASSISTANT_UI_MAX_HTML_CHARS", "32000")
-)))
-ASSISTANT_CORE_ROUTER_MODEL = (os.environ.get("MM_ASSISTANT_CORE_ROUTER_MODEL") or V13_FAST_MODEL).strip()
-ASSISTANT_CORE_ROUTER_FALLBACK_MODEL = (
-    os.environ.get("MM_ASSISTANT_CORE_ROUTER_FALLBACK_MODEL") or V13_PLANNER_MODEL
-).strip()
-ASSISTANT_CORE_ROUTER_EFFORT = (os.environ.get("MM_ASSISTANT_CORE_ROUTER_EFFORT") or "medium").strip()
-# Smart Diagnostic uses one quality-oriented Responses API call after routing.
-# Keeping it inside the 5.6 model family gives real usage accounting and an
-# enforceable max_output_tokens/cost ceiling, unlike the legacy chat fallback.
-ASSISTANT_CORE_SMART_MODEL = (os.environ.get("MM_ASSISTANT_CORE_SMART_MODEL") or V13_HEAVY_MODEL).strip()
-ASSISTANT_CORE_SMART_EFFORT = (os.environ.get("MM_ASSISTANT_CORE_SMART_EFFORT") or "medium").strip()
-ASSISTANT_CORE_ROUTER_TIMEOUT_SECONDS = max(8, min(18, int(os.environ.get("MM_ASSISTANT_CORE_ROUTER_TIMEOUT_SECONDS", "15"))))
-ASSISTANT_CORE_ROUTER_MAX_OUTPUT_TOKENS = max(1400, min(3600, int(os.environ.get("MM_ASSISTANT_CORE_ROUTER_MAX_OUTPUT_TOKENS", "3000"))))
-ASSISTANT_CORE_ROUTER_MAX_CONTEXT_CHARS = max(7000, min(18000, int(os.environ.get("MM_ASSISTANT_CORE_ROUTER_MAX_CONTEXT_CHARS", "14000"))))
-ASSISTANT_CORE_MAX_FACETS = max(3, min(10, int(os.environ.get("MM_ASSISTANT_CORE_MAX_FACETS", "8"))))
-ASSISTANT_CORE_MAX_FACET_DENSE_QUERIES = max(4, min(16, int(os.environ.get("MM_ASSISTANT_CORE_MAX_FACET_DENSE_QUERIES", "12"))))
-ASSISTANT_CORE_MAX_FACET_LEXICAL_QUERIES = max(6, min(28, int(os.environ.get("MM_ASSISTANT_CORE_MAX_FACET_LEXICAL_QUERIES", "20"))))
-ASSISTANT_CORE_FACET_DENSE_CANDIDATE_K = max(12, min(36, int(os.environ.get("MM_ASSISTANT_CORE_FACET_DENSE_CANDIDATE_K", "22"))))
-ASSISTANT_CORE_FACET_SUPPORT_THRESHOLD = max(0.20, min(0.60, float(os.environ.get("MM_ASSISTANT_CORE_FACET_SUPPORT_THRESHOLD", "0.30"))))
-ASSISTANT_CORE_REPAIR_MAX_OUTPUT_TOKENS = max(1600, min(6000, int(os.environ.get("MM_ASSISTANT_CORE_REPAIR_MAX_OUTPUT_TOKENS", "3600"))))
-ASSISTANT_CORE_GENERAL_KNOWLEDGE_ENABLED = (os.environ.get("MM_ASSISTANT_CORE_GENERAL_KNOWLEDGE_ENABLED") or "1").strip() != "0"
-
-# End-to-end target: normal responses should finish well below these values; the
-# hard stream guard returns an explicit TIMEOUT before 75 seconds. The monetary caps
-# are deliberately a little wider than the first proposal in favour of consistency.
-# Per-mode internal deadlines remain bounded even though the outer safety ceiling is
-# widened. ASK does not receive a two-minute reasoning budget; Root Cause and Smart
-# Diagnostic get enough room for one quality model plus one bounded fallback.
-ASSISTANT_CORE_ASK_DEADLINE_SECONDS = max(50, min(85, int(os.environ.get("MM_ASSISTANT_CORE_ASK_DEADLINE_SECONDS", "74"))))
-ASSISTANT_CORE_ROOT_CAUSE_DEADLINE_SECONDS = max(65, min(105, int(os.environ.get("MM_ASSISTANT_CORE_ROOT_CAUSE_DEADLINE_SECONDS", "92"))))
-ASSISTANT_CORE_SMART_START_DEADLINE_SECONDS = max(70, min(110, int(os.environ.get("MM_ASSISTANT_CORE_SMART_START_DEADLINE_SECONDS", "96"))))
-ASSISTANT_CORE_SMART_TURN_DEADLINE_SECONDS = max(60, min(105, int(os.environ.get("MM_ASSISTANT_CORE_SMART_TURN_DEADLINE_SECONDS", "86"))))
-ASSISTANT_CORE_HARD_TIMEOUT_SECONDS = max(95, min(120, int(os.environ.get("MM_ASSISTANT_CORE_HARD_TIMEOUT_SECONDS", "115"))))
-ASSISTANT_CORE_MAX_LLM_CALLS_ASK = max(3, min(4, int(os.environ.get("MM_ASSISTANT_CORE_MAX_LLM_CALLS_ASK", "4"))))
-ASSISTANT_CORE_MAX_LLM_CALLS_ROOT_CAUSE = max(3, min(4, int(os.environ.get("MM_ASSISTANT_CORE_MAX_LLM_CALLS_ROOT_CAUSE", "4"))))
-ASSISTANT_CORE_MAX_LLM_CALLS_SMART_START = max(3, min(4, int(os.environ.get("MM_ASSISTANT_CORE_MAX_LLM_CALLS_SMART_START", "4"))))
-ASSISTANT_CORE_MAX_LLM_CALLS_SMART_TURN = max(2, min(3, int(os.environ.get("MM_ASSISTANT_CORE_MAX_LLM_CALLS_SMART_TURN", "3"))))
-ASSISTANT_CORE_MAX_COST_ASK_USD = max(0.08, float(os.environ.get("MM_ASSISTANT_CORE_MAX_COST_ASK_USD", "0.25")))
-ASSISTANT_CORE_MAX_COST_ROOT_CAUSE_USD = max(0.12, float(os.environ.get("MM_ASSISTANT_CORE_MAX_COST_ROOT_CAUSE_USD", "0.40")))
-ASSISTANT_CORE_MAX_COST_SMART_START_USD = max(0.12, float(os.environ.get("MM_ASSISTANT_CORE_MAX_COST_SMART_START_USD", "0.35")))
-ASSISTANT_CORE_MAX_COST_SMART_TURN_USD = max(0.08, float(os.environ.get("MM_ASSISTANT_CORE_MAX_COST_SMART_TURN_USD", "0.25")))
-ASSISTANT_CORE_GENERAL_MAX_OUTPUT_TOKENS = max(1200, min(4200, int(os.environ.get("MM_ASSISTANT_CORE_GENERAL_MAX_OUTPUT_TOKENS", "2600"))))
-ASSISTANT_CORE_SMART_MAX_OUTPUT_TOKENS = max(2400, min(7000, int(os.environ.get("MM_ASSISTANT_CORE_SMART_MAX_OUTPUT_TOKENS", "5200"))))
-
-# Hard synchronous budgets. These are intentionally below the proxy timeout.
-V13_ASK_DEADLINE_SECONDS = max(20, min(58, int(os.environ.get("MM_V13_ASK_DEADLINE_SECONDS", "48"))))
-V13_ROOT_CAUSE_DEADLINE_SECONDS = max(25, min(58, int(os.environ.get("MM_V13_ROOT_CAUSE_DEADLINE_SECONDS", "55"))))
-V13_MAX_LLM_CALLS_ASK = max(1, min(2, int(os.environ.get("MM_V13_MAX_LLM_CALLS_ASK", "2"))))
-V13_MAX_LLM_CALLS_ROOT_CAUSE = max(1, min(2, int(os.environ.get("MM_V13_MAX_LLM_CALLS_ROOT_CAUSE", "2"))))
-V13_MAX_ESTIMATED_COST_ASK_USD = max(0.05, float(os.environ.get("MM_V13_MAX_ESTIMATED_COST_ASK_USD", "0.30")))
-V13_MAX_ESTIMATED_COST_ROOT_CAUSE_USD = max(0.08, float(os.environ.get("MM_V13_MAX_ESTIMATED_COST_ROOT_CAUSE_USD", "0.45")))
-V13_PLANNER_TIMEOUT_SECONDS = max(6, min(15, int(os.environ.get("MM_V13_PLANNER_TIMEOUT_SECONDS", "10"))))
-V13_EVIDENCE_GATE_TIMEOUT_SECONDS = max(6, min(18, int(os.environ.get("MM_V13_EVIDENCE_GATE_TIMEOUT_SECONDS", "14"))))
-V13_EVIDENCE_GATE_MAX_OUTPUT_TOKENS = max(900, min(2200, int(os.environ.get("MM_V13_EVIDENCE_GATE_MAX_OUTPUT_TOKENS", "1400"))))
-V13_EVIDENCE_GATE_MAX_CANDIDATES = max(6, min(16, int(os.environ.get("MM_V13_EVIDENCE_GATE_MAX_CANDIDATES", "10"))))
-V13_EVIDENCE_GATE_MIN_CONFIDENCE = max(0.50, min(0.95, float(os.environ.get("MM_V13_EVIDENCE_GATE_MIN_CONFIDENCE", "0.65"))))
-# Deterministic bands decide only clear cases. Borderline support is checked
-# semantically, preserving valid terse and multilingual technical requests.
-V13_EVIDENCE_CLEAR_SUPPORT_SIM = max(0.45, min(0.80, float(os.environ.get("MM_V13_EVIDENCE_CLEAR_SUPPORT_SIM", "0.58"))))
-V13_EVIDENCE_SUPPORT_SIM_WITH_OVERLAP = max(0.35, min(0.75, float(os.environ.get("MM_V13_EVIDENCE_SUPPORT_SIM_WITH_OVERLAP", "0.48"))))
-V13_EVIDENCE_CLEAR_REJECT_SIM = max(0.08, min(0.40, float(os.environ.get("MM_V13_EVIDENCE_CLEAR_REJECT_SIM", "0.18"))))
-V13_EVIDENCE_MIN_OVERLAP = max(0.01, min(0.25, float(os.environ.get("MM_V13_EVIDENCE_MIN_OVERLAP", "0.05"))))
-
-# Bounded Retrieval Assurance. This layer never buys an extra reasoning call: it
-# uses only bounded embeddings, PostgreSQL/FTS scans, adjacent-page expansion and
-# explicit structured relationships. The admitted pack remains the baseline; a
-# full bounded pack may replace a weaker item only when coverage, exact-identifier
-# support, or true semantic support objectively improves.
-V13_RETRIEVAL_ASSURANCE_ENABLED = (os.environ.get("MM_V13_RETRIEVAL_ASSURANCE_ENABLED") or "1").strip() != "0"
-V13_RETRIEVAL_ASSURANCE_MAX_SECONDS_ASK = max(2, min(10, int(os.environ.get("MM_V13_RETRIEVAL_ASSURANCE_MAX_SECONDS_ASK", "6"))))
-V13_RETRIEVAL_ASSURANCE_MAX_SECONDS_ROOT_CAUSE = max(3, min(12, int(os.environ.get("MM_V13_RETRIEVAL_ASSURANCE_MAX_SECONDS_ROOT_CAUSE", "8"))))
-# A small deterministic rescue may run before the semantic gate only when the first
-# retrieval is plausibly incomplete (explicit document scope, an exact technical
-# identifier, or a weak-but-nonzero evidence signal). It never answers by itself: any
-# recovered pack must still pass the semantic evidence gate before synthesis.
-V13_RETRIEVAL_ASSURANCE_PRE_GATE_MAX_SECONDS = max(2, min(6, int(os.environ.get("MM_V13_RETRIEVAL_ASSURANCE_PRE_GATE_MAX_SECONDS", "4"))))
-V13_RETRIEVAL_ASSURANCE_RESERVE_FINAL_SECONDS_ASK = max(8, min(24, int(os.environ.get("MM_V13_RETRIEVAL_ASSURANCE_RESERVE_FINAL_SECONDS_ASK", "12"))))
-V13_RETRIEVAL_ASSURANCE_RESERVE_FINAL_SECONDS_ROOT_CAUSE = max(12, min(30, int(os.environ.get("MM_V13_RETRIEVAL_ASSURANCE_RESERVE_FINAL_SECONDS_ROOT_CAUSE", "16"))))
-V13_RETRIEVAL_ASSURANCE_MAX_DENSE_QUERIES = max(1, min(4, int(os.environ.get("MM_V13_RETRIEVAL_ASSURANCE_MAX_DENSE_QUERIES", "3"))))
-V13_RETRIEVAL_ASSURANCE_MAX_LEXICAL_QUERIES = max(2, min(8, int(os.environ.get("MM_V13_RETRIEVAL_ASSURANCE_MAX_LEXICAL_QUERIES", "6"))))
-V13_RETRIEVAL_ASSURANCE_MAX_DOCS = max(1, min(5, int(os.environ.get("MM_V13_RETRIEVAL_ASSURANCE_MAX_DOCS", "3"))))
-V13_RETRIEVAL_ASSURANCE_PAGE_RADIUS = max(0, min(2, int(os.environ.get("MM_V13_RETRIEVAL_ASSURANCE_PAGE_RADIUS", "1"))))
-V13_RETRIEVAL_ASSURANCE_MAX_NEIGHBOR_PAGES = max(4, min(30, int(os.environ.get("MM_V13_RETRIEVAL_ASSURANCE_MAX_NEIGHBOR_PAGES", "18"))))
-V13_RETRIEVAL_ASSURANCE_MAX_CANDIDATES = max(12, min(40, int(os.environ.get("MM_V13_RETRIEVAL_ASSURANCE_MAX_CANDIDATES", "24"))))
-V13_RETRIEVAL_ASSURANCE_MAX_FACETS = max(4, min(16, int(os.environ.get("MM_V13_RETRIEVAL_ASSURANCE_MAX_FACETS", "10"))))
-V13_RETRIEVAL_ASSURANCE_MIN_FACET_GAIN = max(1, min(4, int(os.environ.get("MM_V13_RETRIEVAL_ASSURANCE_MIN_FACET_GAIN", "1"))))
-V13_RETRIEVAL_ASSURANCE_MIN_COVERAGE_GAIN = max(0.02, min(0.30, float(os.environ.get("MM_V13_RETRIEVAL_ASSURANCE_MIN_COVERAGE_GAIN", "0.08"))))
-V13_RETRIEVAL_ASSURANCE_MIN_SUPPORT_GAIN = max(0.02, min(0.25, float(os.environ.get("MM_V13_RETRIEVAL_ASSURANCE_MIN_SUPPORT_GAIN", "0.06"))))
-V13_RETRIEVAL_ASSURANCE_MIN_NEW_SEMANTIC_SIM = max(0.30, min(0.75, float(os.environ.get("MM_V13_RETRIEVAL_ASSURANCE_MIN_NEW_SEMANTIC_SIM", "0.42"))))
-V13_RETRIEVAL_ASSURANCE_MIN_NEW_OVERLAP = max(0.03, min(0.25, float(os.environ.get("MM_V13_RETRIEVAL_ASSURANCE_MIN_NEW_OVERLAP", "0.08"))))
-
-# Task-aware source retrieval. This is a monotonic ASK-only layer: it performs a
-# bounded title/description scan without changing the baseline evidence pack. When a
-# source title is a strong semantic/lexical match, the existing ASK evidence-gate call
-# is forced to classify whether the user primarily wants to open/retrieve content. If
-# that classification is not confident, the untouched V13.4 synthesis path continues.
-V13_SOURCE_RETRIEVAL_ENABLED = (os.environ.get("MM_V13_SOURCE_RETRIEVAL_ENABLED") or "1").strip() != "0"
-V13_SOURCE_RETRIEVAL_SCAN_LIMIT = max(100, min(2400, int(os.environ.get("MM_V13_SOURCE_RETRIEVAL_SCAN_LIMIT", "1200"))))
-V13_SOURCE_RETRIEVAL_MAX_CANDIDATES = max(3, min(16, int(os.environ.get("MM_V13_SOURCE_RETRIEVAL_MAX_CANDIDATES", "8"))))
-V13_SOURCE_RETRIEVAL_MIN_TITLE_SCORE = max(0.50, min(0.95, float(os.environ.get("MM_V13_SOURCE_RETRIEVAL_MIN_TITLE_SCORE", "0.68"))))
-V13_SOURCE_RETRIEVAL_FORCE_GATE_SCORE = max(0.55, min(0.98, float(os.environ.get("MM_V13_SOURCE_RETRIEVAL_FORCE_GATE_SCORE", "0.72"))))
-V13_SOURCE_RETRIEVAL_MIN_TASK_CONFIDENCE = max(0.55, min(0.95, float(os.environ.get("MM_V13_SOURCE_RETRIEVAL_MIN_TASK_CONFIDENCE", "0.72"))))
-V13_SOURCE_RETRIEVAL_REQUIRE_TYPE_CONFIDENCE = max(0.72, min(0.98, float(os.environ.get("MM_V13_SOURCE_RETRIEVAL_REQUIRE_TYPE_CONFIDENCE", "0.85"))))
-V13_SOURCE_RETRIEVAL_MAX_RESULTS_FEW = max(2, min(5, int(os.environ.get("MM_V13_SOURCE_RETRIEVAL_MAX_RESULTS_FEW", "3"))))
-V13_SOURCE_RETRIEVAL_MAX_RESULTS_MANY = max(4, min(12, int(os.environ.get("MM_V13_SOURCE_RETRIEVAL_MAX_RESULTS_MANY", "8"))))
-V13_SOURCE_RETRIEVAL_MAX_QUERY_TOKENS = max(6, min(48, int(os.environ.get("MM_V13_SOURCE_RETRIEVAL_MAX_QUERY_TOKENS", "24"))))
-# Hardening: source modality is never allowed to outrank a materially better content
-# match. A semantic source-type preference may decide only inside a narrow relevance
-# band; an explicit required type is enforced by the task contract and otherwise the
-# direct route falls back rather than returning a nearby-but-wrong item.
-V13_SOURCE_RETRIEVAL_MIN_SEMANTIC_SCORE = max(0.45, min(0.90, float(os.environ.get("MM_V13_SOURCE_RETRIEVAL_MIN_SEMANTIC_SCORE", "0.62"))))
-V13_SOURCE_RETRIEVAL_FORCE_SEMANTIC_SCORE = max(0.55, min(0.95, float(os.environ.get("MM_V13_SOURCE_RETRIEVAL_FORCE_SEMANTIC_SCORE", "0.74"))))
-V13_SOURCE_RETRIEVAL_PREFERENCE_MAX_GAP = max(0.0, min(0.15, float(os.environ.get("MM_V13_SOURCE_RETRIEVAL_PREFERENCE_MAX_GAP", "0.05"))))
-V13_SOURCE_RETRIEVAL_AMBIGUITY_DELTA = max(0.0, min(0.10, float(os.environ.get("MM_V13_SOURCE_RETRIEVAL_AMBIGUITY_DELTA", "0.025"))))
-V13_SOURCE_RETRIEVAL_RESULT_BAND = max(0.04, min(0.25, float(os.environ.get("MM_V13_SOURCE_RETRIEVAL_RESULT_BAND", "0.12"))))
-V13_SOURCE_RETRIEVAL_MIN_FOCUS_SCORE = max(0.35, min(0.90, float(os.environ.get("MM_V13_SOURCE_RETRIEVAL_MIN_FOCUS_SCORE", "0.58"))))
-V13_FAST_TIMEOUT_SECONDS = max(12, min(35, int(os.environ.get("MM_V13_FAST_TIMEOUT_SECONDS", "26"))))
-V13_HEAVY_TIMEOUT_SECONDS = max(20, min(45, int(os.environ.get("MM_V13_HEAVY_TIMEOUT_SECONDS", "40"))))
-V13_PLANNER_MAX_OUTPUT_TOKENS = max(800, min(2000, int(os.environ.get("MM_V13_PLANNER_MAX_OUTPUT_TOKENS", "1200"))))
-V13_FAST_MAX_OUTPUT_TOKENS = max(1800, min(4200, int(os.environ.get("MM_V13_FAST_MAX_OUTPUT_TOKENS", "3000"))))
-V13_HEAVY_MAX_OUTPUT_TOKENS = max(3000, min(8000, int(os.environ.get("MM_V13_HEAVY_MAX_OUTPUT_TOKENS", "6000"))))
-V13_FAST_CONTEXT_CHARS = max(8000, min(28000, int(os.environ.get("MM_V13_FAST_CONTEXT_CHARS", "18000"))))
-V13_HEAVY_CONTEXT_CHARS = max(16000, min(60000, int(os.environ.get("MM_V13_HEAVY_CONTEXT_CHARS", "38000"))))
-V13_MAX_EVIDENCE_ITEMS_ASK = max(4, min(12, int(os.environ.get("MM_V13_MAX_EVIDENCE_ITEMS_ASK", "8"))))
-V13_MAX_EVIDENCE_ITEMS_ROOT_CAUSE = max(6, min(16, int(os.environ.get("MM_V13_MAX_EVIDENCE_ITEMS_ROOT_CAUSE", "10"))))
-V13_MIN_SECONDS_FOR_REFINEMENT = max(24, min(40, int(os.environ.get("MM_V13_MIN_SECONDS_FOR_REFINEMENT", "32"))))
-V13_DENSE_QUERY_LIMIT = max(1, min(5, int(os.environ.get("MM_V13_DENSE_QUERY_LIMIT", "4"))))
-V13_LEXICAL_QUERY_LIMIT = max(2, min(8, int(os.environ.get("MM_V13_LEXICAL_QUERY_LIMIT", "6"))))
-V13_PAGE_SCAN_LIMIT = max(80, min(900, int(os.environ.get("MM_V13_PAGE_SCAN_LIMIT", "500"))))
-V13_PAGE_TEXT_CHARS = max(1800, min(12000, int(os.environ.get("MM_V13_PAGE_TEXT_CHARS", "7000"))))
-V13_PREFERRED_PAGE_SCAN_LIMIT = max(80, min(900, int(os.environ.get("MM_V13_PREFERRED_PAGE_SCAN_LIMIT", "500"))))
-V13_DB_CONNECT_TIMEOUT_SECONDS = max(2, min(10, int(os.environ.get("MM_V13_DB_CONNECT_TIMEOUT_SECONDS", "5"))))
-V13_DB_STATEMENT_TIMEOUT_MS = max(3000, min(20000, int(os.environ.get("MM_V13_DB_STATEMENT_TIMEOUT_MS", "9000"))))
-
-# Semantic cache. It is deliberately conservative: changed codes, numbers, polarity,
-# source constraints, or root-cause symptom class prevent reuse even at high similarity.
-V13_SEMANTIC_CACHE_ENABLED = (os.environ.get("MM_V13_SEMANTIC_CACHE_ENABLED") or "1").strip() != "0"
-V13_SEMANTIC_CACHE_AUTO_DDL = (os.environ.get("MM_V13_SEMANTIC_CACHE_AUTO_DDL") or "1").strip() != "0"
-V13_SEMANTIC_CACHE_TTL_SECONDS = max(300, min(30 * 24 * 3600, int(os.environ.get("MM_V13_SEMANTIC_CACHE_TTL_SECONDS", "604800"))))
-V13_SEMANTIC_CACHE_SCAN_LIMIT = max(10, min(250, int(os.environ.get("MM_V13_SEMANTIC_CACHE_SCAN_LIMIT", "80"))))
-V13_SEMANTIC_CACHE_THRESHOLD_ASK = max(0.90, min(0.995, float(os.environ.get("MM_V13_SEMANTIC_CACHE_THRESHOLD_ASK", "0.965"))))
-V13_SEMANTIC_CACHE_THRESHOLD_ROOT_CAUSE = max(0.93, min(0.999, float(os.environ.get("MM_V13_SEMANTIC_CACHE_THRESHOLD_ROOT_CAUSE", "0.978"))))
-V13_SEMANTIC_CACHE_MIN_QUALITY = max(0.60, min(0.98, float(os.environ.get("MM_V13_SEMANTIC_CACHE_MIN_QUALITY", "0.80"))))
-V13_SEMANTIC_CACHE_MAX_ROWS_PER_COMPANY = max(50, min(5000, int(os.environ.get("MM_V13_SEMANTIC_CACHE_MAX_ROWS_PER_COMPANY", "600"))))
-V13_SEMANTIC_CACHE_BOOTSTRAP_RETRY_SECONDS = max(15, min(300, int(os.environ.get("MM_V13_SEMANTIC_CACHE_BOOTSTRAP_RETRY_SECONDS", "60"))))
-
-# Standard API prices per 1M text tokens. Cache reads/writes are accounted from usage details.
-V13_PRICE_SOL_INPUT = float(os.environ.get("MM_V13_PRICE_SOL_INPUT", "5.0"))
-V13_PRICE_SOL_OUTPUT = float(os.environ.get("MM_V13_PRICE_SOL_OUTPUT", "30.0"))
-V13_PRICE_TERRA_INPUT = float(os.environ.get("MM_V13_PRICE_TERRA_INPUT", "2.5"))
-V13_PRICE_TERRA_OUTPUT = float(os.environ.get("MM_V13_PRICE_TERRA_OUTPUT", "15.0"))
-V13_PRICE_LUNA_INPUT = float(os.environ.get("MM_V13_PRICE_LUNA_INPUT", "1.0"))
-V13_PRICE_LUNA_OUTPUT = float(os.environ.get("MM_V13_PRICE_LUNA_OUTPUT", "6.0"))
-V13_PRICE_EMBED_INPUT = float(os.environ.get("MM_V13_PRICE_EMBED_INPUT", "0.02"))
-
-# Both ASK and Root Cause stream valid JSON whitespace while processing. Bubble still
-# receives exactly one JSON object because the Worker calls response.text()/JSON.parse().
-V13_STREAM_HEARTBEAT_ENABLED = (os.environ.get("MM_V13_STREAM_HEARTBEAT_ENABLED") or "1").strip() != "0"
-V13_STREAM_HEARTBEAT_SECONDS = max(5, min(25, int(os.environ.get("MM_V13_STREAM_HEARTBEAT_SECONDS", "12"))))
-V13_STREAM_HEARTBEAT_BYTES = max(512, min(8192, int(os.environ.get("MM_V13_STREAM_HEARTBEAT_BYTES", "4096"))))
-
-# Semantic-cache entries are isolated by the complete active engine policy, not only
-# by the public marker. Changing a model/budget creates a new cache generation.
-V13_ENGINE_KEY = hashlib.sha256(
-    "|".join(
-        [
-            V13_CODE_MARKER,
-            V13_RELEASE_ID,
-            ASSISTANT_CORE_V2_CODE_MARKER if ASSISTANT_CORE_V2_ENABLED else "assistant-core-v2-off",
-            ASSISTANT_CORE_V2_RELEASE_ID,
-            str(ASSISTANT_CORE_V2_ENABLED),
-            ASSISTANT_CORE_ROUTER_MODEL,
-            ASSISTANT_CORE_ROUTER_EFFORT,
-            str(ASSISTANT_CORE_GENERAL_KNOWLEDGE_ENABLED),
-            str(ASSISTANT_CORE_ASK_DEADLINE_SECONDS),
-            str(ASSISTANT_CORE_ROOT_CAUSE_DEADLINE_SECONDS),
-            str(ASSISTANT_CORE_MAX_COST_ASK_USD),
-            str(ASSISTANT_CORE_MAX_COST_ROOT_CAUSE_USD),
-            V13_PLANNER_MODEL,
-            V13_EVIDENCE_GATE_MODEL,
-            V13_EVIDENCE_GATE_EFFORT,
-            str(V13_EVIDENCE_GATE_TIMEOUT_SECONDS),
-            str(V13_EVIDENCE_GATE_MAX_OUTPUT_TOKENS),
-            str(V13_EVIDENCE_GATE_MAX_CANDIDATES),
-            str(V13_EVIDENCE_GATE_MIN_CONFIDENCE),
-            str(V13_EVIDENCE_CLEAR_SUPPORT_SIM),
-            str(V13_EVIDENCE_SUPPORT_SIM_WITH_OVERLAP),
-            str(V13_EVIDENCE_CLEAR_REJECT_SIM),
-            str(V13_EVIDENCE_MIN_OVERLAP),
-            str(V13_RETRIEVAL_ASSURANCE_ENABLED),
-            str(V13_RETRIEVAL_ASSURANCE_MAX_SECONDS_ASK),
-            str(V13_RETRIEVAL_ASSURANCE_MAX_SECONDS_ROOT_CAUSE),
-            str(V13_RETRIEVAL_ASSURANCE_PRE_GATE_MAX_SECONDS),
-            str(V13_RETRIEVAL_ASSURANCE_MAX_DENSE_QUERIES),
-            str(V13_RETRIEVAL_ASSURANCE_MAX_LEXICAL_QUERIES),
-            str(V13_RETRIEVAL_ASSURANCE_PAGE_RADIUS),
-            str(V13_RETRIEVAL_ASSURANCE_MIN_COVERAGE_GAIN),
-            str(V13_RETRIEVAL_ASSURANCE_MIN_SUPPORT_GAIN),
-            str(V13_RETRIEVAL_ASSURANCE_MIN_NEW_SEMANTIC_SIM),
-            str(V13_RETRIEVAL_ASSURANCE_MIN_NEW_OVERLAP),
-            str(V13_SOURCE_RETRIEVAL_ENABLED),
-            str(V13_SOURCE_RETRIEVAL_SCAN_LIMIT),
-            str(V13_SOURCE_RETRIEVAL_MAX_CANDIDATES),
-            str(V13_SOURCE_RETRIEVAL_MIN_TITLE_SCORE),
-            str(V13_SOURCE_RETRIEVAL_FORCE_GATE_SCORE),
-            str(V13_SOURCE_RETRIEVAL_MIN_TASK_CONFIDENCE),
-            str(V13_SOURCE_RETRIEVAL_REQUIRE_TYPE_CONFIDENCE),
-            str(V13_SOURCE_RETRIEVAL_MAX_RESULTS_FEW),
-            str(V13_SOURCE_RETRIEVAL_MAX_RESULTS_MANY),
-            str(V13_SOURCE_RETRIEVAL_MAX_QUERY_TOKENS),
-            str(V13_SOURCE_RETRIEVAL_MIN_SEMANTIC_SCORE),
-            str(V13_SOURCE_RETRIEVAL_FORCE_SEMANTIC_SCORE),
-            str(V13_SOURCE_RETRIEVAL_PREFERENCE_MAX_GAP),
-            str(V13_SOURCE_RETRIEVAL_AMBIGUITY_DELTA),
-            str(V13_SOURCE_RETRIEVAL_RESULT_BAND),
-            str(V13_SOURCE_RETRIEVAL_MIN_FOCUS_SCORE),
-            V13_FAST_MODEL,
-            V13_HEAVY_MODEL,
-            V13_FAST_EFFORT,
-            V13_ASK_HEAVY_EFFORT,
-            V13_ROOT_HEAVY_EFFORT,
-            V13_HEAVY_REASONING_MODE or "standard",
-            str(V13_MAX_LLM_CALLS_ASK),
-            str(V13_MAX_LLM_CALLS_ROOT_CAUSE),
-            str(V13_FAST_CONTEXT_CHARS),
-            str(V13_HEAVY_CONTEXT_CHARS),
-            str(V13_FAST_MAX_OUTPUT_TOKENS),
-            str(V13_HEAVY_MAX_OUTPUT_TOKENS),
-        ]
-    ).encode("utf-8")
-).hexdigest()[:32]
+# Assistant Core/V13 runtime policy re-exported without changing defaults.
+from machinemind.config.assistant_runtime import *  # noqa: F401,F403
 
 
 class _V13BudgetExceeded(RuntimeError):
@@ -33708,15 +33173,7 @@ def delete_company_index_v1(
     }
 
 # Commit: feat(v8): preserve v4 hot paths and add opt-in shadow reasoning endpoints
-V8_SHADOW_REASONING_ENABLED = (os.environ.get("MM_V8_SHADOW_REASONING_ENABLED") or "1").strip() != "0"
-V8_SHADOW_ASK_ENABLED = (os.environ.get("MM_V8_SHADOW_ASK_ENABLED") or "1").strip() != "0"
-V8_SHADOW_ROOT_CAUSE_ENABLED = (os.environ.get("MM_V8_SHADOW_ROOT_CAUSE_ENABLED") or "1").strip() != "0"
-V8_SHADOW_MODEL = (os.environ.get("MM_V8_SHADOW_MODEL") or DIAGNOSTIC_EVIDENCE_MODEL or OPENAI_CHAT_MODEL).strip()
-V8_SHADOW_TIMEOUT = int(os.environ.get("MM_V8_SHADOW_TIMEOUT_SECONDS", "20"))
-V8_SHADOW_MAX_CITATIONS = int(os.environ.get("MM_V8_SHADOW_MAX_CITATIONS", "4"))
-V8_SHADOW_MIN_ASK_PROXY = float(os.environ.get("MM_V8_SHADOW_MIN_ASK_PROXY", "0.78"))
-V8_SHADOW_MIN_ROOT_PROXY = float(os.environ.get("MM_V8_SHADOW_MIN_ROOT_PROXY", "0.86"))
-V8_SHADOW_MAX_CAUSES = int(os.environ.get("MM_V8_SHADOW_MAX_CAUSES", "3"))
+from machinemind.config.shadow_runtime import *  # noqa: F401,F403
 
 
 def _v8_shadow_compact_citations(citations: list[dict], *, max_items: int = 4, snippet_chars: int = 220) -> list[dict]:
@@ -33991,35 +33448,7 @@ def root_cause_v1_shadow(
 # - Default OFF via MM_SMART_DIAGNOSTIC_ENABLED=0.
 # =============================================================================
 
-SMART_DIAGNOSTIC_ENABLED = (os.environ.get("MM_SMART_DIAGNOSTIC_ENABLED") or "0").strip() == "1"
-SMART_DIAGNOSTIC_MODEL = (os.environ.get("MM_SMART_DIAGNOSTIC_MODEL") or ROOT_CAUSE_RESPONSE_MODEL).strip()
-SMART_DIAGNOSTIC_MAX_QUESTIONS = int(os.environ.get("MM_SMART_DIAGNOSTIC_MAX_QUESTIONS", "6"))
-SMART_DIAGNOSTIC_MAX_HYPOTHESES = int(os.environ.get("MM_SMART_DIAGNOSTIC_MAX_HYPOTHESES", "4"))
-SMART_DIAGNOSTIC_TOP_K = int(os.environ.get("MM_SMART_DIAGNOSTIC_TOP_K", "8"))
-SMART_DIAGNOSTIC_MAX_CONTEXT_CHARS = int(os.environ.get("MM_SMART_DIAGNOSTIC_MAX_CONTEXT_CHARS", "22000"))
-SMART_DIAGNOSTIC_MAX_EVIDENCE_IN_STATE = int(os.environ.get("MM_SMART_DIAGNOSTIC_MAX_EVIDENCE_IN_STATE", "8"))
-SMART_DIAGNOSTIC_SOURCE_MANIFEST_VERSION = "smart-source-manifest-v1-20260831"
-SMART_DIAGNOSTIC_FINAL_SOURCE_LIMIT = max(
-    2,
-    min(8, int(os.environ.get("MM_SMART_DIAGNOSTIC_FINAL_SOURCE_LIMIT", "6"))),
-)
-SMART_DIAGNOSTIC_LLM_TIMEOUT = int(os.environ.get("MM_SMART_DIAGNOSTIC_LLM_TIMEOUT_SECONDS", "70"))
-
-# Smart Diagnostic uses the same general evidence-sufficiency principle.
-# It does not recognize individual phrases or special conversational cases.
-SMART_DIAGNOSTIC_EVIDENCE_GATE_MODEL = (
-    os.environ.get("MM_SMART_DIAGNOSTIC_EVIDENCE_GATE_MODEL") or V13_EVIDENCE_GATE_MODEL
-).strip()
-SMART_DIAGNOSTIC_EVIDENCE_GATE_TIMEOUT = int(
-    os.environ.get("MM_SMART_DIAGNOSTIC_EVIDENCE_GATE_TIMEOUT_SECONDS", "18")
-)
-SMART_DIAGNOSTIC_EVIDENCE_GATE_MIN_CONFIDENCE = float(
-    os.environ.get("MM_SMART_DIAGNOSTIC_EVIDENCE_GATE_MIN_CONFIDENCE", "0.60")
-)
-SMART_DIAGNOSTIC_RETRIEVAL_ASSURANCE_ENABLED = (os.environ.get("MM_SMART_DIAGNOSTIC_RETRIEVAL_ASSURANCE_ENABLED") or "1").strip() != "0"
-SMART_DIAGNOSTIC_RETRIEVAL_ASSURANCE_MAX_SECONDS_START = max(2, min(10, int(os.environ.get("MM_SMART_DIAGNOSTIC_RETRIEVAL_ASSURANCE_MAX_SECONDS_START", "7"))))
-SMART_DIAGNOSTIC_RETRIEVAL_ASSURANCE_MAX_SECONDS_ANSWER = max(1, min(7, int(os.environ.get("MM_SMART_DIAGNOSTIC_RETRIEVAL_ASSURANCE_MAX_SECONDS_ANSWER", "4"))))
-SMART_DIAGNOSTIC_RETRIEVAL_ASSURANCE_MAX_NEW_EVIDENCE = max(1, min(6, int(os.environ.get("MM_SMART_DIAGNOSTIC_RETRIEVAL_ASSURANCE_MAX_NEW_EVIDENCE", "4"))))
+from machinemind.config.smart_diagnostic_runtime import *  # noqa: F401,F403
 
 
 def _assistant_core_sd_json_models(

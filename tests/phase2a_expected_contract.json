@@ -1,0 +1,1835 @@
+{
+  "markers": {
+    "ask_render": "assistant-ui-ask-root-parity-v1-20260901-1",
+    "core": "assistant-core-v2-root-evidence-assurance-v10-3-3-final-20260831-3",
+    "release": "2026-08-31.3"
+  },
+  "models": {
+    "AskRequest": {
+      "fields": {
+        "ai_scope": {
+          "annotation": "typing.Optional[str]",
+          "default": "None",
+          "required": false
+        },
+        "bubble_document_id": {
+          "annotation": "typing.Optional[str]",
+          "default": "None",
+          "required": false
+        },
+        "company_id": {
+          "annotation": "<class 'str'>",
+          "default": "PydanticUndefined",
+          "required": true
+        },
+        "debug": {
+          "annotation": "typing.Optional[bool]",
+          "default": "False",
+          "required": false
+        },
+        "document_ids": {
+          "annotation": "typing.Union[typing.List[str], str, NoneType]",
+          "default": "None",
+          "required": false
+        },
+        "language": {
+          "annotation": "typing.Optional[str]",
+          "default": "None",
+          "required": false
+        },
+        "machine_id": {
+          "annotation": "typing.Optional[str]",
+          "default": "None",
+          "required": false
+        },
+        "query": {
+          "annotation": "<class 'str'>",
+          "default": "PydanticUndefined",
+          "required": true
+        },
+        "top_k": {
+          "annotation": "<class 'int'>",
+          "default": "5",
+          "required": false
+        }
+      },
+      "schema": {
+        "properties": {
+          "ai_scope": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Ai Scope"
+          },
+          "bubble_document_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Bubble Document Id"
+          },
+          "company_id": {
+            "title": "Company Id",
+            "type": "string"
+          },
+          "debug": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": false,
+            "title": "Debug"
+          },
+          "document_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Document Ids"
+          },
+          "language": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Language"
+          },
+          "machine_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Machine Id"
+          },
+          "query": {
+            "title": "Query",
+            "type": "string"
+          },
+          "top_k": {
+            "default": 5,
+            "title": "Top K",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "query",
+          "company_id"
+        ],
+        "title": "AskRequest",
+        "type": "object"
+      }
+    },
+    "DeleteCompanyIndexRequest": {
+      "fields": {
+        "company_id": {
+          "annotation": "<class 'str'>",
+          "default": "PydanticUndefined",
+          "required": true
+        }
+      },
+      "schema": {
+        "properties": {
+          "company_id": {
+            "title": "Company Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "company_id"
+        ],
+        "title": "DeleteCompanyIndexRequest",
+        "type": "object"
+      }
+    },
+    "DeleteDocumentRequest": {
+      "fields": {
+        "bubble_document_id": {
+          "annotation": "<class 'str'>",
+          "default": "PydanticUndefined",
+          "required": true
+        },
+        "company_id": {
+          "annotation": "<class 'str'>",
+          "default": "PydanticUndefined",
+          "required": true
+        }
+      },
+      "schema": {
+        "properties": {
+          "bubble_document_id": {
+            "title": "Bubble Document Id",
+            "type": "string"
+          },
+          "company_id": {
+            "title": "Company Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "company_id",
+          "bubble_document_id"
+        ],
+        "title": "DeleteDocumentRequest",
+        "type": "object"
+      }
+    },
+    "DraftPSOptions": {
+      "fields": {
+        "max_causes": {
+          "annotation": "<class 'int'>",
+          "default": "3",
+          "required": false
+        },
+        "top_k": {
+          "annotation": "<class 'int'>",
+          "default": "8",
+          "required": false
+        }
+      },
+      "schema": {
+        "properties": {
+          "max_causes": {
+            "default": 3,
+            "title": "Max Causes",
+            "type": "integer"
+          },
+          "top_k": {
+            "default": 8,
+            "title": "Top K",
+            "type": "integer"
+          }
+        },
+        "title": "DraftPSOptions",
+        "type": "object"
+      }
+    },
+    "DraftPSRequest": {
+      "fields": {
+        "ai_scope": {
+          "annotation": "typing.Optional[str]",
+          "default": "None",
+          "required": false
+        },
+        "bubble_document_id": {
+          "annotation": "typing.Optional[str]",
+          "default": "None",
+          "required": false
+        },
+        "company_id": {
+          "annotation": "<class 'str'>",
+          "default": "PydanticUndefined",
+          "required": true
+        },
+        "debug": {
+          "annotation": "typing.Optional[bool]",
+          "default": "False",
+          "required": false
+        },
+        "document_ids": {
+          "annotation": "typing.Union[typing.List[str], str, NoneType]",
+          "default": "None",
+          "required": false
+        },
+        "language": {
+          "annotation": "typing.Optional[str]",
+          "default": "None",
+          "required": false
+        },
+        "machine_id": {
+          "annotation": "typing.Optional[str]",
+          "default": "None",
+          "required": false
+        },
+        "options": {
+          "annotation": "typing.Optional[main.DraftPSOptions]",
+          "default": "None",
+          "required": false
+        },
+        "query": {
+          "annotation": "<class 'str'>",
+          "default": "PydanticUndefined",
+          "required": true
+        }
+      },
+      "schema": {
+        "$defs": {
+          "DraftPSOptions": {
+            "properties": {
+              "max_causes": {
+                "default": 3,
+                "title": "Max Causes",
+                "type": "integer"
+              },
+              "top_k": {
+                "default": 8,
+                "title": "Top K",
+                "type": "integer"
+              }
+            },
+            "title": "DraftPSOptions",
+            "type": "object"
+          }
+        },
+        "properties": {
+          "ai_scope": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Ai Scope"
+          },
+          "bubble_document_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Bubble Document Id"
+          },
+          "company_id": {
+            "title": "Company Id",
+            "type": "string"
+          },
+          "debug": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": false,
+            "title": "Debug"
+          },
+          "document_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Document Ids"
+          },
+          "language": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Language"
+          },
+          "machine_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Machine Id"
+          },
+          "options": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/DraftPSOptions"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "query": {
+            "title": "Query",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query",
+          "company_id"
+        ],
+        "title": "DraftPSRequest",
+        "type": "object"
+      }
+    },
+    "IndexDocumentRequest": {
+      "fields": {
+        "ai_scope": {
+          "annotation": "typing.Optional[str]",
+          "default": "None",
+          "required": false
+        },
+        "bubble_document_id": {
+          "annotation": "<class 'str'>",
+          "default": "PydanticUndefined",
+          "required": true
+        },
+        "company_id": {
+          "annotation": "<class 'str'>",
+          "default": "PydanticUndefined",
+          "required": true
+        },
+        "ingest_metering_enabled": {
+          "annotation": "typing.Optional[bool]",
+          "default": "False",
+          "required": false
+        },
+        "ingest_month_key": {
+          "annotation": "typing.Optional[str]",
+          "default": "None",
+          "required": false
+        },
+        "ingest_request_key": {
+          "annotation": "typing.Optional[str]",
+          "default": "None",
+          "required": false
+        },
+        "ingest_usage_event_id": {
+          "annotation": "typing.Optional[str]",
+          "default": "None",
+          "required": false
+        },
+        "machine_id": {
+          "annotation": "typing.Optional[str]",
+          "default": "None",
+          "required": false
+        },
+        "trace_id": {
+          "annotation": "typing.Optional[str]",
+          "default": "None",
+          "required": false
+        }
+      },
+      "schema": {
+        "properties": {
+          "ai_scope": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Ai Scope"
+          },
+          "bubble_document_id": {
+            "title": "Bubble Document Id",
+            "type": "string"
+          },
+          "company_id": {
+            "title": "Company Id",
+            "type": "string"
+          },
+          "ingest_metering_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": false,
+            "title": "Ingest Metering Enabled"
+          },
+          "ingest_month_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Ingest Month Key"
+          },
+          "ingest_request_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Ingest Request Key"
+          },
+          "ingest_usage_event_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Ingest Usage Event Id"
+          },
+          "machine_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Machine Id"
+          },
+          "trace_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Trace Id"
+          }
+        },
+        "required": [
+          "company_id",
+          "bubble_document_id"
+        ],
+        "title": "IndexDocumentRequest",
+        "type": "object"
+      }
+    },
+    "IngestRequest": {
+      "fields": {
+        "ai_scope": {
+          "annotation": "typing.Optional[str]",
+          "default": "None",
+          "required": false
+        },
+        "bubble_document_id": {
+          "annotation": "<class 'str'>",
+          "default": "PydanticUndefined",
+          "required": true
+        },
+        "company_id": {
+          "annotation": "<class 'str'>",
+          "default": "PydanticUndefined",
+          "required": true
+        },
+        "content_type": {
+          "annotation": "typing.Optional[str]",
+          "default": "None",
+          "required": false
+        },
+        "doc_prev_embed_chars": {
+          "annotation": "typing.Optional[int]",
+          "default": "None",
+          "required": false
+        },
+        "doc_prev_index_storage_bytes": {
+          "annotation": "typing.Optional[int]",
+          "default": "None",
+          "required": false
+        },
+        "embed_chars_used_total": {
+          "annotation": "typing.Optional[int]",
+          "default": "None",
+          "required": false
+        },
+        "file_base64": {
+          "annotation": "typing.Optional[str]",
+          "default": "None",
+          "required": false
+        },
+        "file_url": {
+          "annotation": "typing.Optional[str]",
+          "default": "None",
+          "required": false
+        },
+        "filename": {
+          "annotation": "typing.Optional[str]",
+          "default": "None",
+          "required": false
+        },
+        "index_storage_used_total": {
+          "annotation": "typing.Optional[int]",
+          "default": "None",
+          "required": false
+        },
+        "ingest_credits_enforced": {
+          "annotation": "typing.Optional[bool]",
+          "default": "None",
+          "required": false
+        },
+        "ingest_credits_limit_month": {
+          "annotation": "typing.Optional[float]",
+          "default": "None",
+          "required": false
+        },
+        "ingest_credits_used_before": {
+          "annotation": "typing.Optional[float]",
+          "default": "None",
+          "required": false
+        },
+        "ingest_metering_version": {
+          "annotation": "typing.Optional[str]",
+          "default": "None",
+          "required": false
+        },
+        "ingest_month_key": {
+          "annotation": "typing.Optional[str]",
+          "default": "None",
+          "required": false
+        },
+        "ingest_request_already_admitted": {
+          "annotation": "typing.Optional[bool]",
+          "default": "None",
+          "required": false
+        },
+        "ingest_request_key": {
+          "annotation": "typing.Optional[str]",
+          "default": "None",
+          "required": false
+        },
+        "machine_id": {
+          "annotation": "typing.Optional[str]",
+          "default": "None",
+          "required": false
+        },
+        "plan_embed_chars_limit_total": {
+          "annotation": "typing.Optional[int]",
+          "default": "None",
+          "required": false
+        },
+        "plan_index_storage_limit_bytes": {
+          "annotation": "typing.Optional[int]",
+          "default": "None",
+          "required": false
+        }
+      },
+      "schema": {
+        "properties": {
+          "ai_scope": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Ai Scope"
+          },
+          "bubble_document_id": {
+            "title": "Bubble Document Id",
+            "type": "string"
+          },
+          "company_id": {
+            "title": "Company Id",
+            "type": "string"
+          },
+          "content_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Content Type"
+          },
+          "doc_prev_embed_chars": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Doc Prev Embed Chars"
+          },
+          "doc_prev_index_storage_bytes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Doc Prev Index Storage Bytes"
+          },
+          "embed_chars_used_total": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Embed Chars Used Total"
+          },
+          "file_base64": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "File Base64"
+          },
+          "file_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "File Url"
+          },
+          "filename": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Filename"
+          },
+          "index_storage_used_total": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Index Storage Used Total"
+          },
+          "ingest_credits_enforced": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Ingest Credits Enforced"
+          },
+          "ingest_credits_limit_month": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Ingest Credits Limit Month"
+          },
+          "ingest_credits_used_before": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Ingest Credits Used Before"
+          },
+          "ingest_metering_version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Ingest Metering Version"
+          },
+          "ingest_month_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Ingest Month Key"
+          },
+          "ingest_request_already_admitted": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Ingest Request Already Admitted"
+          },
+          "ingest_request_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Ingest Request Key"
+          },
+          "machine_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Machine Id"
+          },
+          "plan_embed_chars_limit_total": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Plan Embed Chars Limit Total"
+          },
+          "plan_index_storage_limit_bytes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Plan Index Storage Limit Bytes"
+          }
+        },
+        "required": [
+          "company_id",
+          "bubble_document_id"
+        ],
+        "title": "IngestRequest",
+        "type": "object"
+      }
+    },
+    "IngestUsageMonthRequest": {
+      "fields": {
+        "company_id": {
+          "annotation": "<class 'str'>",
+          "default": "PydanticUndefined",
+          "required": true
+        },
+        "month_key": {
+          "annotation": "typing.Optional[str]",
+          "default": "None",
+          "required": false
+        }
+      },
+      "schema": {
+        "properties": {
+          "company_id": {
+            "title": "Company Id",
+            "type": "string"
+          },
+          "month_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Month Key"
+          }
+        },
+        "required": [
+          "company_id"
+        ],
+        "title": "IngestUsageMonthRequest",
+        "type": "object"
+      }
+    },
+    "RootCauseRequest": {
+      "fields": {
+        "ai_scope": {
+          "annotation": "typing.Optional[str]",
+          "default": "None",
+          "required": false
+        },
+        "bubble_document_id": {
+          "annotation": "typing.Optional[str]",
+          "default": "None",
+          "required": false
+        },
+        "company_id": {
+          "annotation": "<class 'str'>",
+          "default": "PydanticUndefined",
+          "required": true
+        },
+        "debug": {
+          "annotation": "typing.Optional[bool]",
+          "default": "False",
+          "required": false
+        },
+        "document_ids": {
+          "annotation": "typing.Union[typing.List[str], str, NoneType]",
+          "default": "None",
+          "required": false
+        },
+        "language": {
+          "annotation": "typing.Optional[str]",
+          "default": "None",
+          "required": false
+        },
+        "machine_id": {
+          "annotation": "typing.Optional[str]",
+          "default": "None",
+          "required": false
+        },
+        "max_causes": {
+          "annotation": "<class 'int'>",
+          "default": "3",
+          "required": false
+        },
+        "query": {
+          "annotation": "<class 'str'>",
+          "default": "PydanticUndefined",
+          "required": true
+        },
+        "top_k": {
+          "annotation": "<class 'int'>",
+          "default": "8",
+          "required": false
+        }
+      },
+      "schema": {
+        "properties": {
+          "ai_scope": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Ai Scope"
+          },
+          "bubble_document_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Bubble Document Id"
+          },
+          "company_id": {
+            "title": "Company Id",
+            "type": "string"
+          },
+          "debug": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": false,
+            "title": "Debug"
+          },
+          "document_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Document Ids"
+          },
+          "language": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Language"
+          },
+          "machine_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Machine Id"
+          },
+          "max_causes": {
+            "default": 3,
+            "title": "Max Causes",
+            "type": "integer"
+          },
+          "query": {
+            "title": "Query",
+            "type": "string"
+          },
+          "top_k": {
+            "default": 8,
+            "title": "Top K",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "query",
+          "company_id"
+        ],
+        "title": "RootCauseRequest",
+        "type": "object"
+      }
+    },
+    "SearchRequest": {
+      "fields": {
+        "bubble_document_id": {
+          "annotation": "typing.Optional[str]",
+          "default": "None",
+          "required": false
+        },
+        "company_id": {
+          "annotation": "<class 'str'>",
+          "default": "PydanticUndefined",
+          "required": true
+        },
+        "query": {
+          "annotation": "<class 'str'>",
+          "default": "PydanticUndefined",
+          "required": true
+        },
+        "top_k": {
+          "annotation": "<class 'int'>",
+          "default": "5",
+          "required": false
+        }
+      },
+      "schema": {
+        "properties": {
+          "bubble_document_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Bubble Document Id"
+          },
+          "company_id": {
+            "title": "Company Id",
+            "type": "string"
+          },
+          "query": {
+            "title": "Query",
+            "type": "string"
+          },
+          "top_k": {
+            "default": 5,
+            "title": "Top K",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "query",
+          "company_id"
+        ],
+        "title": "SearchRequest",
+        "type": "object"
+      }
+    },
+    "StructuredSourceIngestRequest": {
+      "fields": {
+        "category": {
+          "annotation": "typing.Optional[str]",
+          "default": "None",
+          "required": false
+        },
+        "company_id": {
+          "annotation": "<class 'str'>",
+          "default": "PydanticUndefined",
+          "required": true
+        },
+        "description": {
+          "annotation": "typing.Optional[str]",
+          "default": "None",
+          "required": false
+        },
+        "doc_prev_embed_chars": {
+          "annotation": "typing.Optional[int]",
+          "default": "None",
+          "required": false
+        },
+        "doc_prev_index_storage_bytes": {
+          "annotation": "typing.Optional[int]",
+          "default": "None",
+          "required": false
+        },
+        "embed_chars_used_total": {
+          "annotation": "typing.Optional[int]",
+          "default": "None",
+          "required": false
+        },
+        "index_storage_used_total": {
+          "annotation": "typing.Optional[int]",
+          "default": "None",
+          "required": false
+        },
+        "machine_id": {
+          "annotation": "<class 'str'>",
+          "default": "PydanticUndefined",
+          "required": true
+        },
+        "notes": {
+          "annotation": "typing.Optional[str]",
+          "default": "None",
+          "required": false
+        },
+        "parent_procedure_code": {
+          "annotation": "typing.Optional[str]",
+          "default": "None",
+          "required": false
+        },
+        "parent_procedure_id": {
+          "annotation": "typing.Optional[str]",
+          "default": "None",
+          "required": false
+        },
+        "parent_procedure_title": {
+          "annotation": "typing.Optional[str]",
+          "default": "None",
+          "required": false
+        },
+        "plan_embed_chars_limit_total": {
+          "annotation": "typing.Optional[int]",
+          "default": "None",
+          "required": false
+        },
+        "plan_index_storage_limit_bytes": {
+          "annotation": "typing.Optional[int]",
+          "default": "None",
+          "required": false
+        },
+        "procedure_type": {
+          "annotation": "typing.Optional[str]",
+          "default": "None",
+          "required": false
+        },
+        "short_description": {
+          "annotation": "typing.Optional[str]",
+          "default": "None",
+          "required": false
+        },
+        "solution": {
+          "annotation": "typing.Optional[str]",
+          "default": "None",
+          "required": false
+        },
+        "source_id": {
+          "annotation": "<class 'str'>",
+          "default": "PydanticUndefined",
+          "required": true
+        },
+        "source_type": {
+          "annotation": "<class 'str'>",
+          "default": "PydanticUndefined",
+          "required": true
+        },
+        "source_url": {
+          "annotation": "typing.Optional[str]",
+          "default": "None",
+          "required": false
+        },
+        "step_number": {
+          "annotation": "typing.Optional[int]",
+          "default": "None",
+          "required": false
+        },
+        "title": {
+          "annotation": "typing.Optional[str]",
+          "default": "None",
+          "required": false
+        }
+      },
+      "schema": {
+        "properties": {
+          "category": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Category"
+          },
+          "company_id": {
+            "title": "Company Id",
+            "type": "string"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Description"
+          },
+          "doc_prev_embed_chars": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Doc Prev Embed Chars"
+          },
+          "doc_prev_index_storage_bytes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Doc Prev Index Storage Bytes"
+          },
+          "embed_chars_used_total": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Embed Chars Used Total"
+          },
+          "index_storage_used_total": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Index Storage Used Total"
+          },
+          "machine_id": {
+            "title": "Machine Id",
+            "type": "string"
+          },
+          "notes": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Notes"
+          },
+          "parent_procedure_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Parent Procedure Code"
+          },
+          "parent_procedure_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Parent Procedure Id"
+          },
+          "parent_procedure_title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Parent Procedure Title"
+          },
+          "plan_embed_chars_limit_total": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Plan Embed Chars Limit Total"
+          },
+          "plan_index_storage_limit_bytes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Plan Index Storage Limit Bytes"
+          },
+          "procedure_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Procedure Type"
+          },
+          "short_description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Short Description"
+          },
+          "solution": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Solution"
+          },
+          "source_id": {
+            "title": "Source Id",
+            "type": "string"
+          },
+          "source_type": {
+            "title": "Source Type",
+            "type": "string"
+          },
+          "source_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Source Url"
+          },
+          "step_number": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Step Number"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Title"
+          }
+        },
+        "required": [
+          "company_id",
+          "machine_id",
+          "source_type",
+          "source_id"
+        ],
+        "title": "StructuredSourceIngestRequest",
+        "type": "object"
+      }
+    }
+  },
+  "routes": [
+    {
+      "methods": [
+        "GET"
+      ],
+      "name": "ping",
+      "path": "/ping"
+    },
+    {
+      "methods": [
+        "POST"
+      ],
+      "name": "ask_v1",
+      "path": "/v1/ai/ask"
+    },
+    {
+      "methods": [
+        "POST"
+      ],
+      "name": "ask_v1_shadow",
+      "path": "/v1/ai/ask-shadow"
+    },
+    {
+      "methods": [
+        "POST"
+      ],
+      "name": "delete_company_index_v1",
+      "path": "/v1/ai/delete/company-index"
+    },
+    {
+      "methods": [
+        "POST"
+      ],
+      "name": "delete_company_index_v1",
+      "path": "/v1/ai/delete/company_index"
+    },
+    {
+      "methods": [
+        "POST"
+      ],
+      "name": "delete_document_v1",
+      "path": "/v1/ai/delete/document"
+    },
+    {
+      "methods": [
+        "POST"
+      ],
+      "name": "draft_ps_v1",
+      "path": "/v1/ai/draft_ps"
+    },
+    {
+      "methods": [
+        "POST"
+      ],
+      "name": "index_document",
+      "path": "/v1/ai/index/document"
+    },
+    {
+      "methods": [
+        "POST"
+      ],
+      "name": "ingest_document",
+      "path": "/v1/ai/ingest/document"
+    },
+    {
+      "methods": [
+        "POST"
+      ],
+      "name": "ingest_structured_source",
+      "path": "/v1/ai/ingest/source"
+    },
+    {
+      "methods": [
+        "POST"
+      ],
+      "name": "ingest_usage_month",
+      "path": "/v1/ai/ingest/usage/month"
+    },
+    {
+      "methods": [
+        "POST"
+      ],
+      "name": "root_cause_v1",
+      "path": "/v1/ai/root-cause"
+    },
+    {
+      "methods": [
+        "POST"
+      ],
+      "name": "root_cause_v1_shadow",
+      "path": "/v1/ai/root-cause-shadow"
+    },
+    {
+      "methods": [
+        "POST"
+      ],
+      "name": "search_chunks",
+      "path": "/v1/ai/search"
+    },
+    {
+      "methods": [
+        "POST"
+      ],
+      "name": "smart_diagnostic_answer_v1",
+      "path": "/v1/ai/smart-diagnostic/answer"
+    },
+    {
+      "methods": [
+        "POST"
+      ],
+      "name": "smart_diagnostic_finalize_v1",
+      "path": "/v1/ai/smart-diagnostic/finalize"
+    },
+    {
+      "methods": [
+        "POST"
+      ],
+      "name": "smart_diagnostic_start_v1",
+      "path": "/v1/ai/smart-diagnostic/start"
+    },
+    {
+      "methods": [
+        "GET"
+      ],
+      "name": "version",
+      "path": "/version"
+    }
+  ],
+  "scope_cases": [
+    {
+      "args": [
+        "c",
+        "m",
+        null,
+        null,
+        null
+      ],
+      "error": null,
+      "value": {
+        "ai_scope": "machine_all",
+        "bubble_document_id": null,
+        "company_id": "c",
+        "document_ids": null,
+        "machine_id": "m"
+      }
+    },
+    {
+      "args": [
+        " c ",
+        " m ",
+        " d ",
+        null,
+        null
+      ],
+      "error": null,
+      "value": {
+        "ai_scope": "document_ids",
+        "bubble_document_id": "d",
+        "company_id": "c",
+        "document_ids": null,
+        "machine_id": "m"
+      }
+    },
+    {
+      "args": [
+        "c",
+        "",
+        null,
+        [
+          "a",
+          " b "
+        ],
+        null
+      ],
+      "error": null,
+      "value": {
+        "ai_scope": "document_ids",
+        "bubble_document_id": null,
+        "company_id": "c",
+        "document_ids": [
+          "a",
+          "b"
+        ],
+        "machine_id": "__MM_COMPANY_GENERAL__"
+      }
+    },
+    {
+      "args": [
+        "c",
+        "m",
+        "d",
+        [
+          "x"
+        ],
+        "machine_all"
+      ],
+      "error": null,
+      "value": {
+        "ai_scope": "machine_all",
+        "bubble_document_id": null,
+        "company_id": "c",
+        "document_ids": null,
+        "machine_id": "m"
+      }
+    },
+    {
+      "args": [
+        "c",
+        "m",
+        "d",
+        [
+          "x"
+        ],
+        "company_general"
+      ],
+      "error": null,
+      "value": {
+        "ai_scope": "company_general",
+        "bubble_document_id": null,
+        "company_id": "c",
+        "document_ids": null,
+        "machine_id": "__MM_COMPANY_GENERAL__"
+      }
+    },
+    {
+      "args": [
+        "c",
+        "",
+        null,
+        "a,b",
+        "document_ids"
+      ],
+      "error": null,
+      "value": {
+        "ai_scope": "document_ids",
+        "bubble_document_id": null,
+        "company_id": "c",
+        "document_ids": [
+          "a",
+          "b"
+        ],
+        "machine_id": "__MM_COMPANY_GENERAL__"
+      }
+    },
+    {
+      "args": [
+        "",
+        "m",
+        null,
+        null,
+        null
+      ],
+      "error": {
+        "detail": "Missing company_id",
+        "status_code": 400,
+        "type": "HTTPException"
+      },
+      "value": null
+    },
+    {
+      "args": [
+        "c",
+        "",
+        null,
+        null,
+        "machine_all"
+      ],
+      "error": {
+        "detail": "Missing machine_id",
+        "status_code": 400,
+        "type": "HTTPException"
+      },
+      "value": null
+    },
+    {
+      "args": [
+        "c",
+        "m",
+        null,
+        null,
+        "bad"
+      ],
+      "error": {
+        "detail": "Unsupported ai_scope: bad",
+        "status_code": 400,
+        "type": "HTTPException"
+      },
+      "value": null
+    }
+  ],
+  "scope_signatures": {
+    "_normalize_ai_scope": "(value: Optional[str]) -> str",
+    "_normalize_document_ids": "(value: Union[List[str], str, NoneType]) -> Optional[list[str]]",
+    "_resolve_query_scope": "(company_id: str, machine_id: Optional[str], bubble_document_id: Optional[str] = None, document_ids: Union[List[str], str, NoneType] = None, ai_scope: Optional[str] = None) -> dict"
+  },
+  "sentinel": "__MM_COMPANY_GENERAL__"
+}

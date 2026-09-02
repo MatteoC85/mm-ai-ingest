@@ -1,0 +1,172 @@
+{
+  "connection_cases": [
+    {
+      "budget_ensure_calls": [],
+      "connect_calls": [],
+      "error": {
+        "detail": "DB env missing",
+        "message": "500: DB env missing",
+        "status_code": 500,
+        "type": "HTTPException"
+      },
+      "name": "missing_env",
+      "result": null
+    },
+    {
+      "budget_ensure_calls": [],
+      "connect_calls": [
+        {
+          "dbname": "machinemind",
+          "host": "db.internal",
+          "password": "secret",
+          "user": "dbuser"
+        }
+      ],
+      "error": null,
+      "name": "plain",
+      "result": "CONNECTED"
+    },
+    {
+      "budget_ensure_calls": [
+        1.5
+      ],
+      "connect_calls": [
+        {
+          "connect_timeout": 5,
+          "dbname": "machinemind",
+          "host": "db.internal",
+          "options": "-c statement_timeout=9000",
+          "password": "secret",
+          "user": "dbuser"
+        }
+      ],
+      "error": null,
+      "name": "budget_only_normal",
+      "result": "CONNECTED"
+    },
+    {
+      "budget_ensure_calls": [
+        1.5
+      ],
+      "connect_calls": [
+        {
+          "connect_timeout": 1,
+          "dbname": "machinemind",
+          "host": "db.internal",
+          "options": "-c statement_timeout=1700",
+          "password": "secret",
+          "user": "dbuser"
+        }
+      ],
+      "error": null,
+      "name": "budget_only_low",
+      "result": "CONNECTED"
+    },
+    {
+      "budget_ensure_calls": [],
+      "connect_calls": [
+        {
+          "connect_timeout": 2,
+          "dbname": "machinemind",
+          "host": "db.internal",
+          "options": "-c statement_timeout=2800",
+          "password": "secret",
+          "user": "dbuser"
+        }
+      ],
+      "error": null,
+      "name": "assurance_only",
+      "result": "CONNECTED"
+    },
+    {
+      "budget_ensure_calls": [
+        1.0
+      ],
+      "connect_calls": [
+        {
+          "connect_timeout": 1,
+          "dbname": "machinemind",
+          "host": "db.internal",
+          "options": "-c statement_timeout=1200",
+          "password": "secret",
+          "user": "dbuser"
+        }
+      ],
+      "error": null,
+      "name": "budget_and_assurance",
+      "result": "CONNECTED"
+    },
+    {
+      "budget_ensure_calls": [],
+      "connect_calls": [
+        {
+          "dbname": "machinemind",
+          "host": "db.internal",
+          "password": "secret",
+          "user": "dbuser"
+        }
+      ],
+      "error": null,
+      "name": "budget_getter_error",
+      "result": "CONNECTED"
+    },
+    {
+      "budget_ensure_calls": [
+        1.5
+      ],
+      "connect_calls": [
+        {
+          "connect_timeout": 5,
+          "dbname": "machinemind",
+          "host": "db.internal",
+          "options": "-c statement_timeout=6500",
+          "password": "secret",
+          "user": "dbuser"
+        }
+      ],
+      "error": null,
+      "name": "assurance_context_error",
+      "result": "CONNECTED"
+    },
+    {
+      "budget_ensure_calls": [],
+      "connect_calls": [
+        {
+          "dbname": "machinemind",
+          "host": "db.internal",
+          "password": "secret",
+          "user": "dbuser"
+        }
+      ],
+      "error": {
+        "detail": "connect failure",
+        "message": "connect failure",
+        "status_code": null,
+        "type": "RuntimeError"
+      },
+      "name": "connect_error",
+      "result": null
+    }
+  ],
+  "table_columns_case": {
+    "calls": [
+      {
+        "params": [
+          "document_chunks"
+        ],
+        "query": "\n        SELECT column_name\n        FROM information_schema.columns\n        WHERE table_schema='public' AND table_name=%s;\n        "
+      }
+    ],
+    "columns": [
+      "company_id",
+      "machine_id",
+      "updated_at"
+    ]
+  },
+  "vector_cases": [
+    "[]",
+    "[0.00000000]",
+    "[1.23456789,-0.00000000,999.50000000]",
+    "[-12.25000000,3.14159265]"
+  ]
+}

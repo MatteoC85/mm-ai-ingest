@@ -1,0 +1,69 @@
+{
+  "candidate": {
+    "assistant_core_v2_sha256": "dca19aba41becaffb7c0623f52dee22863c527dbbb7dc8ee965a724a25efd00d",
+    "main_line_count": 36870,
+    "main_net_line_reduction": 571,
+    "main_sha256": "7c3e6f0cae8d173b1afdcfc078cb70a4ec6ec3acbb6cd2dbec3f416229fb3875"
+  },
+  "commit_in_phase": 1,
+  "commit_title": "refactor: extract runtime configuration and database infrastructure",
+  "extraction": {
+    "compatibility_wrappers": [
+      "_db_conn",
+      "_vector_literal",
+      "_get_table_columns"
+    ],
+    "configuration_exports": 315,
+    "configuration_modules": [
+      "machinemind/config/runtime.py",
+      "machinemind/config/assistant_runtime.py",
+      "machinemind/config/shadow_runtime.py",
+      "machinemind/config/smart_diagnostic_runtime.py"
+    ],
+    "environment_inputs": 298,
+    "infrastructure_modules": [
+      "machinemind/infrastructure/database.py"
+    ]
+  },
+  "functional_changes": [],
+  "known_limit": "No claim is made yet about live Cloud SQL, OpenAI, Worker or Bubble behavior. The exact commit must be built and smoke-tested live before this commit is closed.",
+  "live_status": "NOT_YET_DEPLOYED",
+  "offline_results": {
+    "assistant_core_unchanged": "PASS",
+    "custom_configuration_exact_parity": "PASS",
+    "custom_configuration_scenarios": 3,
+    "database_contract_cases": 9,
+    "database_contract_exact_parity": "PASS",
+    "default_configuration_exact_parity": "PASS",
+    "gate_output": [
+      "PASS: syntax",
+      "PASS: assistant_core_unchanged",
+      "PASS: static_structure",
+      "PASS: configuration_extraction",
+      "PASS: runtime_contracts"
+    ],
+    "intentional_definition_changes": [
+      "FunctionDef:_db_conn",
+      "FunctionDef:_get_table_columns",
+      "FunctionDef:_vector_literal"
+    ],
+    "openapi_json_exact_parity": "PASS",
+    "phase1_runtime_contract_exact_parity": "PASS",
+    "self_contained_phase2_gate": "PASS",
+    "syntax_compile": "PASS",
+    "table_columns_exact_parity": "PASS",
+    "top_level_definition_inventory": "673/673",
+    "unchanged_definition_asts": "670/673",
+    "vector_literal_exact_parity": "PASS"
+  },
+  "parent": {
+    "branch": "refactor-phase1",
+    "git_commit_short": "9305c46",
+    "live_revision": "mm-ai-ingest-prod-00049-bgf",
+    "main_line_count": 37441,
+    "main_sha256": "ed18b1c903493d8489350c2aa0dea5c73c9807d0ab21b2fb37d0cb1149d6fdba"
+  },
+  "roadmap_phase": "2",
+  "status": "OFFLINE_VERIFIED",
+  "title": "runtime configuration and database infrastructure"
+}
