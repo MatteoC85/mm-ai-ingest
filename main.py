@@ -3007,10 +3007,36 @@ def _query_symptom_profile(q: str) -> dict:
         classes.append("vibration")
     if any(st in q_norm for st in ["noise", "noisy", "rumor", "rumore", "rumoros", "sound", "rattle", "squeal", "strid", "sfreg"]):
         classes.append("noise")
-    if any(st in q_norm for st in ["jam", "block", "stuck", "bloc", "blocc", "ferma", "arrest", "incepp", "impunt"]):
+
+    # A commanded/emergency stop is an operating condition, not a mechanical jam.
+    # Treat stop/arrest wording as a jam signal only when it is not explicitly part
+    # of an emergency-stop/reset context.  This keeps the classifier generic while
+    # preventing safety-chain questions from being expanded into unrelated
+    # mechanical-stop retrieval queries.
+    emergency_stop_context = bool(
+        re.search(
+            r"\b(?:arrest[oa]\s+(?:di\s+)?emergenza|pulsant[ei]\s+(?:di\s+)?emergenza|"
+            r"emergency\s+stop|e-?stop|after\s+an?\s+emergency)\b",
+            q_norm,
+        )
+    )
+    jam_markers = ["jam", "stuck", "incepp", "impunt", "blocc", "si ferma", "stops unexpectedly"]
+    uncommanded_stop = bool(
+        re.search(r"\b(?:si\s+arresta|si\s+ferma|arresto\s+anomalo|unexpected\s+stop|stops?)\b", q_norm)
+    )
+    if any(st in q_norm for st in jam_markers) or (uncommanded_stop and not emergency_stop_context):
         classes.append("jam")
+
     if (
-        any(st in q_norm for st in ["non parte", "non si avvia", "does not start", "won't start", "will not start", "cannot start", "can't start", "doesnt start"])
+        any(
+            st in q_norm
+            for st in [
+                "non parte", "non si avvia", "non si abilita", "non abilita",
+                "does not start", "won't start", "will not start", "cannot start",
+                "can't start", "doesnt start", "does not enable", "cannot enable",
+                "can't enable", "not enabled",
+            ]
+        )
         or ("start" in q_norm and any(st in q_norm for st in [" non ", " not ", "won't", "will not", "cannot", "can't"]))
     ):
         classes.append("no_start")
@@ -13631,12 +13657,48 @@ def _root_cause_target_subsystems(
     if any(t in q_low for t in ["straight", "straighten", "raddrizz"]):
         add("straightening")
 
-    if any(t in q_low or t in comps_low for t in [
+    # Contextualize the word chain/catena.  In industrial language it can mean a
+    # mechanical transmission chain or a safety/interlock chain.  A safety-chain
+    # phrase must not silently become a drive-train target merely because it
+    # contains the noun "catena"/"chain".
+    safety_chain_context = bool(
+        re.search(
+            r"\b(?:catena\s+(?:di\s+)?(?:sicurezza|emergenz[ae]|consens[oi]|interblocc[oi])|"
+            r"(?:safety|emergency|interlock|consent)\s+chain)\b",
+            q_low,
+        )
+    )
+    mechanical_chain_context = bool(
+        re.search(
+            r"\b(?:catena\s+(?:di\s+)?(?:trasmissione|cinematica|traino|rulli)|"
+            r"(?:drive|transmission|conveyor|roller)\s+chain)\b",
+            q_low,
+        )
+    )
+    non_chain_drive_anchor = any(t in q_low or t in comps_low for t in [
         "motor", "motore", "bearing", "cuscinet", "shaft", "albero",
         "gear", "ingran", "gearbox", "ridutt", "transmission", "trasmission",
-        "brushless", "cam", "coupling", "giunto", "belt", "cinghia", "chain", "catena"
-    ]):
+        "brushless", "cam", "coupling", "giunto", "belt", "cinghia",
+    ])
+    bare_chain_anchor = any(t in q_low or t in comps_low for t in ["chain", "catena"])
+    if non_chain_drive_anchor or mechanical_chain_context or (bare_chain_anchor and not safety_chain_context):
         add("drive_train")
+
+    safety_control_anchor = any(t in q_low for t in [
+        "safety", "sicurezza", "riparo", "ripari", "guard", "guards",
+        "emergenza", "emergency", "interlock", "interblocc", "microinter",
+        "porta di sicurezza", "safety door", "safety chain", "catena di sicurezza",
+    ])
+    if safety_control_anchor:
+        add("safety_installation")
+
+    electrical_consent_anchor = any(t in q_low for t in [
+        "consenso", "consensi", "consent", "enable", "abilit",
+        "interlock", "interblocc", "microinter", "elettroserratura",
+        "circuito di sicurezza", "safety circuit", "reset emerg", "ripristino emerg",
+    ])
+    if electrical_consent_anchor:
+        add("electrical_control")
 
     if any(t in q_low for t in ["lubric", "lubrif", "oil", "olio", "grease", "grasso", "pump", "pompa"]):
         add("lubrication")
@@ -24709,6 +24771,56 @@ def _assistant_core_root_candidate_viable(
     )
     if exact_documented_case:
         return True
+
+    # A diagnostic source must preserve at least one real clue/facet from the
+    # semantic contract.  Request-level similarity plus a generic word such as
+    # "manual" is not enough to turn a nearby maintenance page into causal
+    # evidence.  Strong cross-language semantic evidence remains admissible when
+    # it is also corroborated by a causal/subsystem/context signal.
+    diagnostic_contract_present = bool(decision.diagnostic_clues or core_facets)
+    diagnostic_group_support = max(
+        [float(value or 0.0) for value in (diag.get("groups") or {}).values()] or [0.0]
+    )
+    strongly_corroborated_crosslingual = bool(
+        semantic >= 0.60
+        and causal >= 0.12
+        and (subsystem > 0.0 or context_fit > 0.0)
+    )
+    query_subsystems = set(_root_cause_target_subsystems(request.query, []))
+    candidate_subsystems = {
+        str(value or "").strip()
+        for value in (candidate.get("matched_subsystems") or [])
+        if str(value or "").strip()
+    }
+    subsystem_mismatch = bool(
+        query_subsystems
+        and candidate_subsystems
+        and not (query_subsystems & candidate_subsystems)
+    )
+    safety_control_targets = {"safety_installation", "electrical_control"}
+    safety_control_mismatch = bool(
+        subsystem_mismatch
+        and (query_subsystems & safety_control_targets)
+        and not (candidate_subsystems & safety_control_targets)
+    )
+    if safety_control_mismatch and not strongly_corroborated_crosslingual:
+        return False
+    if (
+        diagnostic_contract_present
+        and facet_coverage < 0.50
+        and not strongly_corroborated_crosslingual
+        and (
+            (
+                diagnostic_priority <= 0.0
+                and diagnostic_group_support <= 0.0
+            )
+            or (
+                subsystem_mismatch
+                and diagnostic_priority < 0.35
+            )
+        )
+    ):
+        return False
     if (
         diagnostic_priority >= 0.28
         and (causal >= 0.02 or subsystem > 0.0 or context_fit > 0.0 or semantic >= 0.40)
