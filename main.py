@@ -310,6 +310,7 @@ from machinemind.infrastructure.database import (
     get_table_columns as _infrastructure_get_table_columns,
     vector_literal as _infrastructure_vector_literal,
 )
+from machinemind.infrastructure import openai_transport as _openai_transport
 
 
 def _db_conn():
@@ -7036,109 +7037,16 @@ def _chunk_sentences_with_pages(
 
 
 def _openai_embed_texts(texts: list[str], *, timeout: int = 60) -> list[list[float]]:
-    if not OPENAI_API_KEY:
-        raise Exception("OPENAI_API_KEY missing")
-
-    normalized_texts = [str(value or "") for value in (texts or [])]
-    if not normalized_texts:
-        return []
-
-    budget = None
-    try:
-        budget_fn = globals().get("_v13_current_budget")
-        budget = budget_fn() if callable(budget_fn) else None
-    except Exception:
-        budget = None
-
-    cache: dict[tuple[str, str], list[float]] = (
-        budget.embedding_cache if budget is not None else {}
+    return _openai_transport.embed_texts(
+        texts,
+        timeout=timeout,
+        api_key=OPENAI_API_KEY,
+        model=OPENAI_EMBED_MODEL,
+        url=OPENAI_EMBED_URL,
+        post_fn=requests.post,
+        current_budget_fn=_v13_current_budget,
+        current_ingest_meter_fn=_current_ingest_meter,
     )
-    keys = [(OPENAI_EMBED_MODEL, value) for value in normalized_texts]
-    unique_missing: list[str] = []
-    seen_missing: set[tuple[str, str]] = set()
-    cache_hits = 0
-    for key, value in zip(keys, normalized_texts):
-        if key in cache:
-            cache_hits += 1
-            continue
-        if key in seen_missing:
-            # Duplicate text inside the same embedding batch is also a request-local
-            # cache hit: only one vector is purchased and reused for every duplicate.
-            cache_hits += 1
-            continue
-        seen_missing.add(key)
-        unique_missing.append(value)
-
-    if unique_missing:
-        request_timeout = max(5, int(timeout or 60))
-        if budget is not None:
-            budget.ensure_time(3.0)
-            request_timeout = max(5, min(request_timeout, int(max(5.0, budget.remaining() - 1.0))))
-
-        payload = {"model": OPENAI_EMBED_MODEL, "input": unique_missing}
-        headers = {
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "Content-Type": "application/json",
-        }
-
-        r = requests.post(
-            OPENAI_EMBED_URL,
-            headers=headers,
-            json=payload,
-            timeout=request_timeout,
-        )
-        if r.status_code != 200:
-            raise Exception(f"OpenAI embeddings failed: {r.status_code} {r.text}")
-
-        data = r.json()
-
-        # The embeddings API exposes provider-side token usage. During document
-        # indexing this is the authoritative paid-AI unit; if a provider omits it,
-        # fall back conservatively to the existing character approximation.
-        approx_tokens = sum(
-            max(1, int(math.ceil(len(value) / 4.0)))
-            for value in unique_missing
-        )
-        provider_usage = data.get("usage") if isinstance(data, dict) else {}
-        provider_usage = provider_usage if isinstance(provider_usage, dict) else {}
-        provider_tokens = int(
-            provider_usage.get("prompt_tokens")
-            or provider_usage.get("input_tokens")
-            or provider_usage.get("total_tokens")
-            or 0
-        )
-        ingest_meter = _current_ingest_meter()
-        if ingest_meter is not None:
-            ingest_meter.record_embedding(
-                input_tokens=(provider_tokens if provider_tokens > 0 else approx_tokens),
-                usage_source=("provider_usage" if provider_tokens > 0 else "character_fallback"),
-            )
-
-        vectors: list[Optional[list[float]]] = [None] * len(unique_missing)
-        for item in data.get("data", []):
-            idx = int(item["index"])
-            if 0 <= idx < len(vectors):
-                vectors[idx] = item["embedding"]
-
-        if any(vector is None for vector in vectors):
-            raise Exception("OpenAI embeddings response missing some items")
-
-        for value, vector in zip(unique_missing, vectors):
-            cache[(OPENAI_EMBED_MODEL, value)] = list(vector or [])
-
-        if budget is not None:
-            # Keep the existing V13 Ask/Root Cause budget behavior unchanged.
-            budget.record_embedding(input_tokens=approx_tokens, cache_hits=cache_hits)
-    elif budget is not None:
-        budget.embedding_cache_hits += len(normalized_texts)
-
-    out: list[list[float]] = []
-    for key in keys:
-        vector = cache.get(key)
-        if vector is None:
-            raise Exception("OpenAI embeddings cache reconstruction failed")
-        out.append(vector)
-    return out
 
 
 def _openai_chat(
@@ -7147,25 +7055,15 @@ def _openai_chat(
     model: Optional[str] = None,
     temperature: float = 0.0,
 ) -> str:
-    if not OPENAI_API_KEY:
-        raise Exception("OPENAI_API_KEY missing")
-
-    payload = {
-        "model": (model or OPENAI_CHAT_MODEL),
-        "messages": messages,
-        "temperature": temperature,
-    }
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    r = requests.post(OPENAI_CHAT_URL, headers=headers, json=payload, timeout=60)
-    if r.status_code != 200:
-        raise Exception(f"OpenAI chat failed: {r.status_code} {r.text}")
-
-    data = r.json()
-    return (data.get("choices", [{}])[0].get("message", {}) or {}).get("content", "") or ""
+    return _openai_transport.chat_text(
+        messages,
+        model=model,
+        temperature=temperature,
+        api_key=OPENAI_API_KEY,
+        default_model=OPENAI_CHAT_MODEL,
+        url=OPENAI_CHAT_URL,
+        post_fn=requests.post,
+    )
 
 
 def _extract_section_from_text(text: str) -> str:
@@ -7218,64 +7116,20 @@ def _openai_chat_json(
     json_schema: Optional[dict] = None,
     timeout: int = 60,
 ) -> dict:
-    if not OPENAI_API_KEY:
-        raise Exception("OPENAI_API_KEY missing")
-
-    payload = {
-        "model": (model or OPENAI_CHAT_MODEL),
-        "messages": messages,
-        "temperature": 0,
-    }
-    if json_schema:
-        payload["response_format"] = {
-            "type": "json_schema",
-            "json_schema": json_schema,
-        }
-
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    r = requests.post(OPENAI_CHAT_URL, headers=headers, json=payload, timeout=timeout)
-    if r.status_code != 200:
-        raise Exception(f"OpenAI chat JSON failed: {r.status_code} {r.text}")
-
-    data = r.json()
-    msg = (data.get("choices", [{}])[0].get("message", {}) or {})
-    content = msg.get("content", "")
-
-    if isinstance(content, list):
-        text = "".join(
-            part.get("text", "")
-            for part in content
-            if isinstance(part, dict) and part.get("type") == "text"
-        ).strip()
-    else:
-        text = str(content or "").strip()
-
-    if not text:
-        raise Exception("OpenAI chat JSON empty response")
-
-    try:
-        return json.loads(text)
-    except Exception as e:
-        raise Exception(f"OpenAI chat JSON parse failed: {str(e)} | raw={text[:500]}")
+    return _openai_transport.chat_json(
+        messages,
+        model=model,
+        json_schema=json_schema,
+        timeout=timeout,
+        api_key=OPENAI_API_KEY,
+        default_model=OPENAI_CHAT_MODEL,
+        url=OPENAI_CHAT_URL,
+        post_fn=requests.post,
+    )
 
 
 def _normalize_model_candidates(models: Optional[list[str]]) -> list[str]:
-    out: list[str] = []
-    seen = set()
-
-    for model_name in models or []:
-        model_name = str(model_name or "").strip()
-        if not model_name:
-            continue
-        if model_name in seen:
-            continue
-        seen.add(model_name)
-        out.append(model_name)
-
-    return out
+    return _openai_transport.normalize_model_candidates(models)
 
 
 def _openai_chat_json_models(
@@ -7285,24 +7139,15 @@ def _openai_chat_json_models(
     json_schema: Optional[dict] = None,
     timeout: int = 60,
 ) -> dict:
-    tried = _normalize_model_candidates(models) or [OPENAI_CHAT_MODEL]
-    last_error: Optional[Exception] = None
-
-    for model_name in tried:
-        try:
-            return _openai_chat_json(
-                messages,
-                model=model_name,
-                json_schema=json_schema,
-                timeout=timeout,
-            )
-        except Exception as e:
-            last_error = e
-
-    if last_error is not None:
-        raise last_error
-
-    raise Exception("No model candidates available for JSON chat call")
+    return _openai_transport.chat_json_models(
+        messages,
+        models=models,
+        json_schema=json_schema,
+        timeout=timeout,
+        default_model=OPENAI_CHAT_MODEL,
+        normalize_models_fn=_normalize_model_candidates,
+        chat_json_fn=_openai_chat_json,
+    )
 
 
 def _llm_rerank_citations(
@@ -20241,34 +20086,11 @@ def _v13_estimate_model_cost_usd(
 
 
 def _v13_safety_identifier(company_id: str) -> str:
-    raw = str(company_id or "").encode("utf-8", errors="ignore")
-    return "mm_" + hashlib.sha256(raw).hexdigest()[:40]
+    return _openai_transport.safety_identifier(company_id)
 
 
 def _v13_response_text(data: dict) -> str:
-    direct = data.get("output_text")
-    if isinstance(direct, str) and direct.strip():
-        return direct.strip()
-
-    parts: list[str] = []
-    refusals: list[str] = []
-    for item in data.get("output") or []:
-        if not isinstance(item, dict) or item.get("type") != "message":
-            continue
-        for content in item.get("content") or []:
-            if not isinstance(content, dict):
-                continue
-            content_type = str(content.get("type") or "")
-            if content_type == "output_text" and str(content.get("text") or "").strip():
-                parts.append(str(content.get("text") or "").strip())
-            elif content_type == "refusal" and str(content.get("refusal") or "").strip():
-                refusals.append(str(content.get("refusal") or "").strip())
-
-    if parts:
-        return "\n".join(parts).strip()
-    if refusals:
-        raise RuntimeError("OpenAI refusal: " + " | ".join(refusals)[:500])
-    raise RuntimeError("OpenAI Responses API returned no output_text")
+    return _openai_transport.response_text(data)
 
 
 def _v13_responses_json(
@@ -20283,79 +20105,23 @@ def _v13_responses_json(
     company_id: str,
     purpose: str,
 ) -> dict:
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY missing")
-
-    budget = _v13_current_budget()
-    if budget is None:
-        raise RuntimeError("V13 budget context missing")
-
-    timeout, output_cap, call_index = budget.reserve_call(
+    return _openai_transport.responses_json(
+        messages,
         model=model,
-        purpose=purpose,
-        requested_timeout=timeout,
-        max_output_tokens=max_output_tokens,
-        messages=messages,
-    )
-
-    schema_name = str(json_schema.get("name") or "machinemind_v13_output")
-    schema_body = json_schema.get("schema") or {}
-    payload: dict[str, Any] = {
-        "model": model,
-        "input": messages,
-        "store": False,
-        "reasoning": {"effort": effort or "medium", "context": "current_turn"},
-        "text": {
-            "format": {
-                "type": "json_schema",
-                "name": schema_name,
-                "strict": bool(json_schema.get("strict", True)),
-                "schema": schema_body,
-            }
-        },
-        "max_output_tokens": output_cap,
-        "safety_identifier": _v13_safety_identifier(company_id),
-    }
-    if reasoning_mode:
-        payload["reasoning"]["mode"] = reasoning_mode
-
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    response = requests.post(
-        OPENAI_RESPONSES_URL,
-        headers=headers,
-        json=payload,
+        json_schema=json_schema,
+        effort=effort,
+        reasoning_mode=reasoning_mode,
         timeout=timeout,
+        max_output_tokens=max_output_tokens,
+        company_id=company_id,
+        purpose=purpose,
+        api_key=OPENAI_API_KEY,
+        url=OPENAI_RESPONSES_URL,
+        post_fn=requests.post,
+        current_budget_fn=_v13_current_budget,
+        response_text_fn=_v13_response_text,
+        safety_identifier_fn=_v13_safety_identifier,
     )
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"OpenAI Responses failed: HTTP {response.status_code}: {response.text[:1200]}"
-        )
-
-    data = response.json()
-    budget.record_usage(call_index, model, data.get("usage") or {})
-
-    status = str(data.get("status") or "completed").strip().lower()
-    if status == "incomplete":
-        details = json.dumps(data.get("incomplete_details") or {}, ensure_ascii=False)[:700]
-        raise RuntimeError(f"OpenAI Responses incomplete: {details}")
-    if status in {"failed", "cancelled"}:
-        raise RuntimeError(
-            f"OpenAI Responses status={status}: "
-            f"{json.dumps(data.get('error') or {}, ensure_ascii=False)[:700]}"
-        )
-
-    text = _v13_response_text(data)
-    try:
-        parsed = json.loads(text)
-    except Exception as exc:
-        raise RuntimeError(f"OpenAI Responses JSON parse failed: {exc}; raw={text[:800]}")
-    if not isinstance(parsed, dict):
-        raise RuntimeError("OpenAI Responses structured output is not an object")
-    return parsed
 
 
 def _v13_json_models(
@@ -20370,72 +20136,23 @@ def _v13_json_models(
     company_id: str,
     purpose: str,
 ) -> tuple[dict, str]:
-    candidates = _normalize_model_candidates(models)
-    if not candidates:
-        candidates = [V13_FAST_MODEL]
-
-    errors: list[str] = []
-    failed_provider_attempts = 0
-    for model in candidates:
-        budget = _v13_current_budget()
-        calls_before = int(budget.llm_calls) if budget is not None else 0
-        try:
-            if str(model).startswith("gpt-5.6"):
-                parsed = _v13_responses_json(
-                    messages,
-                    model=model,
-                    json_schema=json_schema,
-                    effort=effort,
-                    reasoning_mode=reasoning_mode,
-                    timeout=timeout,
-                    max_output_tokens=max_output_tokens,
-                    company_id=company_id,
-                    purpose=purpose,
-                )
-            else:
-                budget = _v13_current_budget()
-                if budget is None:
-                    raise RuntimeError("V13 budget context missing")
-                call_timeout, _output_cap, call_index = budget.reserve_call(
-                    model=model,
-                    purpose=purpose,
-                    requested_timeout=timeout,
-                    max_output_tokens=max_output_tokens,
-                    messages=messages,
-                )
-                parsed = _openai_chat_json(
-                    messages,
-                    model=model,
-                    json_schema=json_schema,
-                    timeout=call_timeout,
-                )
-                # Legacy helper does not expose usage; keep accounting conservative.
-                budget.record_usage(call_index, model, {})
-
-            budget = _v13_current_budget()
-            if budget is not None and failed_provider_attempts:
-                budget.grant_retry_allowance(
-                    failed_attempts=failed_provider_attempts,
-                    reason=f"{purpose}:model_fallback_succeeded",
-                )
-            return parsed, model
-        except _V13BudgetExceeded as exc:
-            # If a previous model was already attempted, do not turn the lack of
-            # fallback budget into a global request failure. Let the caller use its
-            # grounded deterministic fallback instead. A budget rejection before
-            # any model attempt still propagates to the protected budget response.
-            if errors:
-                errors.append(f"{model}: fallback skipped by budget: {str(exc)[:300]}")
-                break
-            raise
-        except Exception as exc:
-            budget = _v13_current_budget()
-            if budget is not None and int(budget.llm_calls) > calls_before:
-                budget.mark_call_failed(int(budget.llm_calls), exc)
-                failed_provider_attempts += 1
-            errors.append(f"{model}: {str(exc)[:500]}")
-
-    raise RuntimeError("All V13 model calls failed: " + " | ".join(errors)[:1800])
+    return _openai_transport.json_models(
+        messages,
+        models=models,
+        json_schema=json_schema,
+        effort=effort,
+        reasoning_mode=reasoning_mode,
+        timeout=timeout,
+        max_output_tokens=max_output_tokens,
+        company_id=company_id,
+        purpose=purpose,
+        default_model=V13_FAST_MODEL,
+        normalize_models_fn=_normalize_model_candidates,
+        current_budget_fn=_v13_current_budget,
+        responses_json_fn=_v13_responses_json,
+        chat_json_fn=_openai_chat_json,
+        budget_exceeded_type=_V13BudgetExceeded,
+    )
 
 
 

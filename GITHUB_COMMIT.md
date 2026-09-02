@@ -1,34 +1,25 @@
-# GitHub operation — Roadmap Phase 2, commit 1
+# GitHub action — Phase 2, Commit 2
 
 Branch: `refactor-phase1`
 
-## Apply without terminal
+1. Extract the ZIP.
+2. Copy the complete contents of the extracted folder over the current repository.
+3. Choose **Replace files in the destination** when requested.
+4. Do not delete the hidden `.git` folder.
+5. In Source Control, confirm the intended changes include:
+   - `main.py`;
+   - `machinemind/infrastructure/openai_transport.py`;
+   - Phase 2B documentation, tests and tools.
+6. The following production files must not be modified by this commit:
+   - `assistant_core_v2.py`;
+   - `cloudbuild.yaml`;
+   - `Dockerfile`;
+   - `requirements.txt`;
+   - `mm_promotion_gate.py`;
+   - existing configuration and database modules.
+7. Commit message:
 
-1. Extract `MachineMind_Modularization_Phase2_Commit1_Runtime_Config_DB.zip`.
-2. Copy all files and folders inside the extracted directory over the current
-   `mm-ai-ingest` repository.
-3. Allow Windows/VS Code to replace files with the same name.
-4. Do not delete the hidden `.git` directory.
-5. Confirm that the active branch remains `refactor-phase1`.
+   `refactor: extract OpenAI provider transport from production monolith`
 
-Expected meaningful code changes:
-
-- `main.py` modified;
-- four new files under `machinemind/config/`;
-- new `machinemind/infrastructure/` package;
-- validation, documentation and offline-gate files added.
-
-The following production files must remain unchanged:
-
-- `assistant_core_v2.py`;
-- `cloudbuild.yaml`;
-- `Dockerfile`;
-- `requirements.txt`;
-- `mm_promotion_gate.py`.
-
-Commit title:
-
-`refactor: extract runtime configuration and database infrastructure`
-
-After **Commit e push**, the configured Cloud Build trigger should build the
-`refactor-phase1` commit and deploy it to `mm-ai-ingest-prod`.
+8. Select **Commit and push**. The configured `refactor-phase1` trigger will build
+   and deploy the commit automatically.

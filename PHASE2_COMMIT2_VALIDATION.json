@@ -1,0 +1,63 @@
+{
+  "candidate": {
+    "assistant_core_v2_sha256": "dca19aba41becaffb7c0623f52dee22863c527dbbb7dc8ee965a724a25efd00d",
+    "main_line_count": 36587,
+    "main_net_line_reduction": 283,
+    "main_sha256": "96f12237a3528e2f4ab06709d3c04707f6805ab2e1b8a9de2473bd6cbeac1800"
+  },
+  "commit_in_phase": 2,
+  "commit_title": "refactor: extract OpenAI provider transport from production monolith",
+  "extraction": {
+    "compatibility_wrappers": [
+      "_openai_embed_texts",
+      "_openai_chat",
+      "_openai_chat_json",
+      "_normalize_model_candidates",
+      "_openai_chat_json_models",
+      "_v13_safety_identifier",
+      "_v13_response_text",
+      "_v13_responses_json",
+      "_v13_json_models"
+    ],
+    "module": "machinemind/infrastructure/openai_transport.py",
+    "responsibilities": [
+      "embeddings HTTP transport, cache reconstruction and ingest usage callback",
+      "legacy Chat Completions text and JSON transport",
+      "Responses API structured output transport and parsing",
+      "provider/model fallback orchestration",
+      "provider error normalization",
+      "per-company safety identifier"
+    ]
+  },
+  "functional_changes": [],
+  "known_limit": "This is an offline differential verification. The exact commit still requires a real OpenAI-backed ASK, Root Cause and Smart Diagnostic START smoke test on the deployed revision.",
+  "live_status": "NOT_YET_DEPLOYED",
+  "offline_results": {
+    "configuration_exact_parity": "PASS",
+    "database_contract_exact_parity": "PASS",
+    "embedding_cache_and_metering_parity": "PASS",
+    "intentional_definition_changes": 9,
+    "late_bound_dependency_injection_parity": "PASS",
+    "model_fallback_and_retry_parity": "PASS",
+    "mutation_negative_control": "PASS - intentional timeout mutation was detected",
+    "openai_contract_byte_exact_parity": "PASS",
+    "openai_differential_scenarios": 49,
+    "openapi_json_exact_parity": "PASS",
+    "parent_phase_non_structural_gates": "PASS",
+    "phase1_runtime_contract_exact_parity": "PASS",
+    "provider_payload_header_timeout_parity": "PASS",
+    "responses_usage_and_status_parity": "PASS",
+    "self_contained_phase2b_gate": "PASS",
+    "syntax_compile": "PASS",
+    "top_level_definition_inventory": "673/673"
+  },
+  "parent": {
+    "artifact": "MachineMind_Modularization_Phase2_Commit1_Runtime_Config_DB",
+    "branch": "refactor-phase1",
+    "main_line_count": 36870,
+    "main_sha256": "7c3e6f0cae8d173b1afdcfc078cb70a4ec6ec3acbb6cd2dbec3f416229fb3875"
+  },
+  "roadmap_phase": "2",
+  "status": "OFFLINE_VERIFIED",
+  "title": "OpenAI provider transport"
+}
