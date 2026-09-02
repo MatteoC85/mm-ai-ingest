@@ -322,216 +322,25 @@ STRUCTURED_SOURCE_TYPES = {
     "md_video",
 }
 
-class IngestRequest(BaseModel):
-    file_url: Optional[str] = None
-    file_base64: Optional[str] = None
-    filename: Optional[str] = None
-    content_type: Optional[str] = None
-    company_id: str
-    machine_id: Optional[str] = None
-    bubble_document_id: str
-    ai_scope: Optional[str] = None
-    plan_embed_chars_limit_total: Optional[int] = None
-    plan_index_storage_limit_bytes: Optional[int] = None
-    embed_chars_used_total: Optional[int] = None
-    index_storage_used_total: Optional[int] = None
-    doc_prev_embed_chars: Optional[int] = None
-    doc_prev_index_storage_bytes: Optional[int] = None
-
-    # Optional context forwarded by the Worker. It is accepted now without making
-    # the Cloud Run route responsible for plan enforcement.
-    ingest_request_key: Optional[str] = None
-    ingest_month_key: Optional[str] = None
-    ingest_credits_limit_month: Optional[float] = None
-    ingest_credits_used_before: Optional[float] = None
-    ingest_credits_enforced: Optional[bool] = None
-    ingest_request_already_admitted: Optional[bool] = None
-    ingest_metering_version: Optional[str] = None
-
-
-class IndexDocumentRequest(BaseModel):
-    company_id: str
-    machine_id: Optional[str] = None
-    bubble_document_id: str
-    trace_id: Optional[str] = None
-    ai_scope: Optional[str] = None
-    ingest_request_key: Optional[str] = None
-    ingest_month_key: Optional[str] = None
-    ingest_usage_event_id: Optional[str] = None
-    ingest_metering_enabled: Optional[bool] = False
-
-
-class IngestUsageMonthRequest(BaseModel):
-    company_id: str
-    month_key: Optional[str] = None
-
-
-class SearchRequest(BaseModel):
-    query: str
-    company_id: str
-    bubble_document_id: Optional[str] = None
-    top_k: int = 5
-
-
-class AskRequest(BaseModel):
-    query: str
-    company_id: str
-    machine_id: Optional[str] = None
-    bubble_document_id: Optional[str] = None
-    document_ids: Optional[Union[List[str], str]] = None
-    ai_scope: Optional[str] = None
-    language: Optional[str] = None
-    top_k: int = 5
-    debug: Optional[bool] = False
-
-
-class RootCauseRequest(BaseModel):
-    query: str
-    company_id: str
-    machine_id: Optional[str] = None
-    bubble_document_id: Optional[str] = None
-    document_ids: Optional[Union[List[str], str]] = None
-    ai_scope: Optional[str] = None
-    language: Optional[str] = None
-    top_k: int = 8
-    max_causes: int = 3
-    debug: Optional[bool] = False
-
-class DraftPSOptions(BaseModel):
-    top_k: int = 8
-    max_causes: int = 3
-
-
-class DraftPSRequest(BaseModel):
-    query: str
-    company_id: str
-    machine_id: Optional[str] = None
-    bubble_document_id: Optional[str] = None
-    document_ids: Optional[Union[List[str], str]] = None
-    ai_scope: Optional[str] = None
-    language: Optional[str] = None
-    options: Optional[DraftPSOptions] = None
-    debug: Optional[bool] = False
-
-class DeleteDocumentRequest(BaseModel):
-    company_id: str
-    bubble_document_id: str
-
-class DeleteCompanyIndexRequest(BaseModel):
-    company_id: str
-
-class StructuredSourceIngestRequest(BaseModel):
-    company_id: str
-    machine_id: str
-    source_type: str
-    source_id: str
-    source_url: Optional[str] = None
-
-    title: Optional[str] = None
-    description: Optional[str] = None
-    short_description: Optional[str] = None
-    procedure_type: Optional[str] = None
-    step_number: Optional[int] = None
-
-    # Canonical Bubble relation for Step -> Procedure. These fields are metadata;
-    # they do not change the Step text/embedding contract for existing sources.
-    parent_procedure_id: Optional[str] = None
-    parent_procedure_code: Optional[str] = None
-    parent_procedure_title: Optional[str] = None
-
-    category: Optional[str] = None
-    solution: Optional[str] = None
-    notes: Optional[str] = None
-
-    plan_embed_chars_limit_total: Optional[int] = None
-    plan_index_storage_limit_bytes: Optional[int] = None
-    embed_chars_used_total: Optional[int] = None
-    index_storage_used_total: Optional[int] = None
-    doc_prev_embed_chars: Optional[int] = None
-    doc_prev_index_storage_bytes: Optional[int] = None
-
-def _normalize_document_ids(value: Optional[Union[List[str], str]]) -> Optional[list[str]]:
-    if isinstance(value, str):
-        value = [x.strip() for x in value.split(",") if x.strip()]
-
-    if isinstance(value, list):
-        value = [str(x).strip() for x in value if str(x).strip()]
-        return value or None
-
-    return None
-
-COMPANY_GENERAL_MACHINE_SENTINEL = "__MM_COMPANY_GENERAL__"
-
-
-def _normalize_ai_scope(value: Optional[str]) -> str:
-    s = str(value or "").strip().lower()
-
-    if not s:
-        return "machine_all"
-
-    if s in {"machine", "machine_all", "machine_all_plus_company"}:
-        return "machine_all"
-
-    if s in {"company", "company_general", "company_only", "general"}:
-        return "company_general"
-
-    if s in {"document_ids", "documents", "document"}:
-        return "document_ids"
-
-    raise HTTPException(status_code=400, detail=f"Unsupported ai_scope: {value}")
-
-
-def _resolve_query_scope(
-    company_id: str,
-    machine_id: Optional[str],
-    bubble_document_id: Optional[str] = None,
-    document_ids: Optional[Union[List[str], str]] = None,
-    ai_scope: Optional[str] = None,
-) -> dict:
-    company_id = (company_id or "").strip()
-    if not company_id:
-        raise HTTPException(status_code=400, detail="Missing company_id")
-
-    explicit_scope = bool(str(ai_scope or "").strip())
-    resolved_scope = _normalize_ai_scope(ai_scope)
-
-    machine_id = (machine_id or "").strip()
-    bubble_document_id = (bubble_document_id or "").strip() or None
-    doc_ids = _normalize_document_ids(document_ids)
-
-    # Pagina Machines: solo conoscenza aziendale generale.
-    # Usiamo un machine_id sentinella: con i filtri SQL aggiornati prenderà solo
-    # machine_id NULL oppure machine_id = ''.
-    if resolved_scope == "company_general":
-        machine_id = COMPANY_GENERAL_MACHINE_SENTINEL
-        bubble_document_id = None
-        doc_ids = None
-
-    # Compatibilità vecchia: se NON viene passato ai_scope ma arrivano document_ids
-    # o bubble_document_id, mantieni il vecchio comportamento ristretto ai documenti.
-    elif resolved_scope == "document_ids" or (not explicit_scope and (doc_ids or bubble_document_id)):
-        resolved_scope = "document_ids"
-        if not machine_id:
-            machine_id = COMPANY_GENERAL_MACHINE_SENTINEL
-
-    # Nuovo comportamento pulito: machine_all significa davvero tutta la macchina.
-    # Se ai_scope è esplicito, ignora eventuali document_ids rimasti per errore da Bubble.
-    else:
-        resolved_scope = "machine_all"
-        if not machine_id:
-            raise HTTPException(status_code=400, detail="Missing machine_id")
-
-        if explicit_scope:
-            bubble_document_id = None
-            doc_ids = None
-
-    return {
-        "company_id": company_id,
-        "machine_id": machine_id,
-        "bubble_document_id": bubble_document_id,
-        "document_ids": doc_ids,
-        "ai_scope": resolved_scope,
-    }
+from machinemind.api.contracts import (
+    AskRequest,
+    DeleteCompanyIndexRequest,
+    DeleteDocumentRequest,
+    DraftPSOptions,
+    DraftPSRequest,
+    IndexDocumentRequest,
+    IngestRequest,
+    IngestUsageMonthRequest,
+    RootCauseRequest,
+    SearchRequest,
+    StructuredSourceIngestRequest,
+)
+from machinemind.core.scope import (
+    COMPANY_GENERAL_MACHINE_SENTINEL,
+    _normalize_ai_scope,
+    _normalize_document_ids,
+    _resolve_query_scope,
+)
 
 def _fetch_dense_chunk_candidates(
     *,

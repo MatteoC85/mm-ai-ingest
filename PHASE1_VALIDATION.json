@@ -1,0 +1,24 @@
+{
+  "phase": "1",
+  "baseline_commit": "89a33a549930003fc0761d7a3f47b70bc22e0c84",
+  "baseline_main_sha256": "1d6ffe4c595027d4e914f6f4344e21004b8af70e1f89c3fc56fd378dd25fc359",
+  "candidate_main_sha256": "ed18b1c903493d8489350c2aa0dea5c73c9807d0ab21b2fb37d0cb1149d6fdba",
+  "syntax_compile": "PASS",
+  "runtime_contract_comparison": "PASS",
+  "compared": [
+    "business route inventory",
+    "Pydantic request fields/defaults/requiredness/schema",
+    "scope outputs and HTTP errors",
+    "scope signatures",
+    "release markers"
+  ],
+  "functional_changes": [],
+  "known_limit": "This is an offline import/contract gate; Cloud SQL/OpenAI/Worker behaviour is not claimed as live-verified.",
+  "openapi_json_exact_parity": "PASS",
+  "randomized_scope_parity_cases": 5000,
+  "randomized_scope_parity": "PASS",
+  "main_line_count_before": 37632,
+  "main_line_count_after": 37441,
+  "main_lines_removed": 210,
+  "main_lines_added": 19
+}
