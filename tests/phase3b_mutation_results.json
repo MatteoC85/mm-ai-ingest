@@ -1,10 +1,15 @@
 {
-  "commit_unit": "3B",
+  "commit_unit": "3B-live-fix",
   "mutations": [
     {
       "detected": true,
-      "name": "explicit_list_values_removed",
-      "purpose": "proves the repeated-1 numbering regression is pinned"
+      "name": "source_step_removed_from_sequence",
+      "purpose": "proves every source-authored Step remains in the ordered procedure sequence"
+    },
+    {
+      "detected": true,
+      "name": "visible_procedure_number_removed",
+      "purpose": "proves numbers are visible text and do not depend on HTML list attributes"
     },
     {
       "detected": true,

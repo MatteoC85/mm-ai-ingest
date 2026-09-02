@@ -73,6 +73,7 @@
       ],
       "sha256": "59fb13b197776e1059eddf0ab8fbff7d0f6028437be06cfb7cc1826167377e6e",
       "unordered_list_count": 0,
+      "visible_list_numbers": [],
       "visible_text": "Risposta PROC-001 — Avviamento sicuro Passaggi Verificare area e ripari Azione operativa: controllare l'area. Sicurezza: non avviare con anomalie. Controllare le utenze Azione operativa: verificare aria e alimentazione. Sicurezza: personale qualificato. Inserire l'alimentazione generale"
     },
     "answer_render_version": "assistant-ui-ask-root-parity-v1-20260901-1",
@@ -153,6 +154,7 @@
       ],
       "sha256": "24338b0d6ff5f9c92040733784e0192f3e33b5a3af848d41d36cd08f2f118406",
       "unordered_list_count": 1,
+      "visible_list_numbers": [],
       "visible_text": "Risposta PROC-001 - Avviamento sicuro Sequenza validata di avvio. Prima di iniziare Personale qualificato: Operatore qualificato. Livello di sicurezza: ALTO. Procedura Passaggi Verificare area e ripari Controllare che l'area sia libera. Attenzione: Non avviare in presenza di anomalie. Passaggi Controllare le utenze Verificare collegamento elettrico e pressione 5-6 bar. Attenzione: Collegamenti riservati a personale qualificato. Passaggi Inserire l'alimentazione generale Attendere l'avvio di HMI e PLC. Supporto dal manuale Punti principali Il manuale richiede un'azione volontaria."
     },
     "answer_render_version": "assistant-ui-ask-root-parity-v1-20260901-1",
@@ -233,6 +235,7 @@
       ],
       "sha256": "24338b0d6ff5f9c92040733784e0192f3e33b5a3af848d41d36cd08f2f118406",
       "unordered_list_count": 1,
+      "visible_list_numbers": [],
       "visible_text": "Risposta PROC-001 - Avviamento sicuro Sequenza validata di avvio. Prima di iniziare Personale qualificato: Operatore qualificato. Livello di sicurezza: ALTO. Procedura Passaggi Verificare area e ripari Controllare che l'area sia libera. Attenzione: Non avviare in presenza di anomalie. Passaggi Controllare le utenze Verificare collegamento elettrico e pressione 5-6 bar. Attenzione: Collegamenti riservati a personale qualificato. Passaggi Inserire l'alimentazione generale Attendere l'avvio di HMI e PLC. Supporto dal manuale Punti principali Il manuale richiede un'azione volontaria."
     },
     "answer_render_version": "assistant-ui-ask-root-parity-v1-20260901-1",
@@ -313,6 +316,7 @@
       ],
       "sha256": "38515556e4c576ecded8311371df5301e58d7af20cfa1b4a42c8f89f53e66d9a",
       "unordered_list_count": 0,
+      "visible_list_numbers": [],
       "visible_text": "Cause probabili Problema: La macchina non si abilita. Causa più probabile Ripristino zone incompleto Perché: Ogni zona richiede il proprio reset. Controlli consigliati Premere i due reset anteriori Premere il reset posteriore Causa possibile 2 Emergenza ancora attiva Perché: L'emergenza ha priorità. Controlli consigliati Controllare tutti i funghi Ulteriori controlli prioritari Verificare HMI"
     },
     "answer_render_version": "assistant-ui-html-lossless-v10-1-20260806-1",
@@ -413,6 +417,7 @@
     ],
     "sha256": "e1bb3c3ec4e4de3f38c02d246f0ceeefb011da38714f0bf49c5e964b381a24af",
     "unordered_list_count": 0,
+    "visible_list_numbers": [],
     "visible_text": "Risposta Esito Non trovo informazioni sufficienti."
   },
   "generic_numbered_restart": {
@@ -430,6 +435,7 @@
     ],
     "sha256": "45c44702f9bc5ab67545652a337b270e84d2757e3436b43f4c26267c42a98253",
     "unordered_list_count": 0,
+    "visible_list_numbers": [],
     "visible_text": "Risposta PROC-001 — Avviamento sicuro Passaggi Verificare area e ripari Controllare le utenze Inserire l'alimentazione generale"
   },
   "generic_untrusted": {
@@ -447,6 +453,7 @@
     ],
     "sha256": "650e9050d9fa28d8089308b9f6c4129d4f9edb19fe7e17574f487f980154aac5",
     "unordered_list_count": 1,
+    "visible_list_numbers": [],
     "visible_text": "Risposta Risposta <script>alert(1)</script> Punti principali Valore: A-7"
   },
   "inline_markup": {
@@ -510,9 +517,62 @@
       ],
       "sha256": "d756892ca5de00e12fb3748a557af7128215311eb6f88f56a1a5b3ce42c20934",
       "unordered_list_count": 0,
+      "visible_list_numbers": [],
       "visible_text": "Patched Procedura X Y"
     }
   },
+  "live_proc001_html": {
+    "article_kinds": [
+      "procedure"
+    ],
+    "contains_escaped_script": false,
+    "contains_raw_script": false,
+    "contains_sources_heading": false,
+    "length": 3846,
+    "li_values": [],
+    "ordered_list_count": 1,
+    "render_versions": [
+      "assistant-ui-html-lossless-v10-1-20260806-1"
+    ],
+    "sha256": "a9c213d9bd03d7349145d8100b3b147da2f8362a2fdbd9772b6cbb97227b08f8",
+    "unordered_list_count": 0,
+    "visible_list_numbers": [],
+    "visible_text": "Avviamento sicuro e messa in ciclo automatico DESTINATARI Operatore qualificato / Tecnico di linea. DURATA INDICATIVA 15 minuti. LIVELLO DI SICUREZZA ALTO. Prima di iniziare Personale qualificato: Operatore qualificato / Tecnico di linea. Livello di sicurezza: ALTO. Verificare area e ripari Azione verificabile dello Step 1. Attenzione: Condizione di sicurezza dello Step 1. Procedura Controllare le utenze Azione verificabile dello Step 2. Attenzione: Condizione di sicurezza dello Step 2. Inserire l'alimentazione generale Azione verificabile dello Step 3. Attenzione: Condizione di sicurezza dello Step 3. Ripristinare il circuito di sicurezza Azione verificabile dello Step 4. Attenzione: Condizione di sicurezza dello Step 4. Eseguire lubrificazione generale Azione verificabile dello Step 5. Attenzione: Condizione di sicurezza dello Step 5. Richiamare la ricetta validata Azione verificabile dello Step 6. Attenzione: Condizione di sicurezza dello Step 6. Eseguire ciclo di prova Azione verificabile dello Step 7. Attenzione: Condizione di sicurezza dello Step 7. Avviare in automatico Azione verificabile dello Step 8. Attenzione: Condizione di sicurezza dello Step 8."
+  },
+  "live_proc001_model": {
+    "before_titles": [
+      "Verificare area e ripari"
+    ],
+    "display_numbers": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "final_titles": [],
+    "source_numbers": [
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8
+    ],
+    "step_titles": [
+      "Controllare le utenze",
+      "Inserire l'alimentazione generale",
+      "Ripristinare il circuito di sicurezza",
+      "Eseguire lubrificazione generale",
+      "Richiamare la ricetta validata",
+      "Eseguire ciclo di prova",
+      "Avviare in automatico"
+    ]
+  },
+  "live_proc001_sanitized_visible_text": "Avviamento sicuro e messa in ciclo automatico DESTINATARI Operatore qualificato / Tecnico di linea. DURATA INDICATIVA 15 minuti. LIVELLO DI SICUREZZA ALTO. Prima di iniziare Personale qualificato: Operatore qualificato / Tecnico di linea. Livello di sicurezza: ALTO. Verificare area e ripari Azione verificabile dello Step 1. Attenzione: Condizione di sicurezza dello Step 1. Procedura Controllare le utenze Azione verificabile dello Step 2. Attenzione: Condizione di sicurezza dello Step 2. Inserire l'alimentazione generale Azione verificabile dello Step 3. Attenzione: Condizione di sicurezza dello Step 3. Ripristinare il circuito di sicurezza Azione verificabile dello Step 4. Attenzione: Condizione di sicurezza dello Step 4. Eseguire lubrificazione generale Azione verificabile dello Step 5. Attenzione: Condizione di sicurezza dello Step 5. Richiamare la ricetta validata Azione verificabile dello Step 6. Attenzione: Condizione di sicurezza dello Step 6. Eseguire ciclo di prova Azione verificabile dello Step 7. Attenzione: Condizione di sicurezza dello Step 7. Avviare in automatico Azione verificabile dello Step 8. Attenzione: Condizione di sicurezza dello Step 8.",
   "lossless_numbered_restart": {
     "article_kinds": [
       "lossless"
@@ -528,6 +588,7 @@
     ],
     "sha256": "1d6d6c214b9580e30748cbf362e0a6fba76f5199747ec1c3c104601f4b3e4294",
     "unordered_list_count": 0,
+    "visible_list_numbers": [],
     "visible_text": "Risposta Passaggi Primo Nota Secondo Passaggi Terzo"
   },
   "normalize_markdown_table": {
@@ -550,6 +611,7 @@
     ],
     "sha256": "d0717812b0c6c183a1a5fadfee49f72bfec8c8318887e288922e8f29f79a29f8",
     "unordered_list_count": 1,
+    "visible_list_numbers": [],
     "visible_text": "PROC-001 — Avviamento sicuro Sequenza validata di avvio. Prima di iniziare Personale qualificato: Operatore qualificato Livello di sicurezza: ALTO Procedura Verificare area e ripari Controllare che l'area sia libera. Attenzione: Non avviare in presenza di anomalie. Controllare le utenze Verificare collegamento elettrico e pressione 5-6 bar. Attenzione: Collegamenti riservati a personale qualificato. Inserire l'alimentazione generale Attendere l'avvio di HMI e PLC. Supporto dal manuale Il manuale richiede un'azione volontaria."
   },
   "procedure_text": "PROC-001 - Avviamento sicuro\n\nSequenza validata di avvio.\n\nPrima di iniziare\nPersonale qualificato: Operatore qualificato.\nLivello di sicurezza: ALTO.\n\nProcedura\n1. Verificare area e ripari\nControllare che l'area sia libera.\nAttenzione: Non avviare in presenza di anomalie.\n\n2. Controllare le utenze\nVerificare collegamento elettrico e pressione 5-6 bar.\nAttenzione: Collegamenti riservati a personale qualificato.\n\n3. Inserire l'alimentazione generale\nAttendere l'avvio di HMI e PLC.\n\nSupporto dal manuale\n- Il manuale richiede un'azione volontaria.",

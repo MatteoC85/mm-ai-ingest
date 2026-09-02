@@ -1,35 +1,40 @@
 # MachineMind behavior-preserving modularization
-## Roadmap Phase 3 — Commit 2 / Response finalization and UI rendering
+## Roadmap Phase 3 — Commit 2 live fix 1
 
-This is a complete repository snapshot based on the exact live-verified Phase 3
-Commit 1 state (`4a832e2`, `mm-ai-ingest-prod-00055-h7t`).
+This delta corrects the live Bubble rendering defect found after the initial
+Phase 3 Commit 2 deployment.
 
-It extracts response finalization, the structured Procedure UI model, ASK/Root
-Cause safe HTML rendering, canonicality checks and final link/citation
-de-duplication into:
+The initial offline gate inspected raw HTML list-value attributes. The real UI
+showed that this was insufficient: every rendered item still appeared as `1.`
+and the safety-oriented source Step 1 was moved into a separate “Prima di
+iniziare” block.
+
+The correction is restricted to:
 
 `machinemind/presentation/responses.py`
 
-It also applies one explicitly tested UI-only correction: ordered Procedure
-Steps retain their real visible sequence instead of each separated list
-restarting at `1.`.
+It now:
 
-It does not change retrieval, evidence admission, source priorities, prompts,
-models, Root Cause logic, Smart Diagnostic logic or ingest.
+- keeps every source-authored Procedure Step inside the ordered sequence;
+- preserves the original source Step number instead of renumbering a reduced
+  subset;
+- emits `1.`, `2.`, … as visible escaped text rather than relying on browser
+  generated list markers or `<li value>` attributes;
+- applies the same robust numbering to structured, generic and lossless
+  renderers, including cached canonical answers re-finalized by the current
+  revision;
+- leaves retrieval, reasoning, sources, links, Root Cause, Smart Diagnostic and
+  ingest unchanged.
 
-Status: **OFFLINE_VERIFIED**
-
-Primary review documents:
-
-- `docs/PHASE3_COMMIT2.md`;
-- `docs/LIVE_GATE_PHASE3_COMMIT2.md`;
-- `docs/PHASE3_PLAN.md`;
-- `PHASE3_COMMIT2_VALIDATION.json`;
-- `GITHUB_COMMIT.md`.
+Status: **OFFLINE_VERIFIED — LIVE FIX PENDING**
 
 Offline gate:
 
 `python tools/run_phase3b_gate.py`
 
-The user workflow does not require using a terminal. Exact-commit build and live
-validation remain required before Phase 3 Commit 2 is formally complete.
+Primary documents:
+
+- `docs/PHASE3_COMMIT2_LIVE_FIX1.md`;
+- `docs/LIVE_GATE_PHASE3_COMMIT2.md`;
+- `PHASE3_COMMIT2_LIVE_FIX1_VALIDATION.json`;
+- `GITHUB_COMMIT.md`.

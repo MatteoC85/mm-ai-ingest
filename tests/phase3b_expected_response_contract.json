@@ -65,19 +65,20 @@
       "contains_escaped_script": false,
       "contains_raw_script": false,
       "contains_sources_heading": false,
-      "length": 1571,
-      "li_values": [
+      "length": 2297,
+      "li_values": [],
+      "ordered_list_count": 0,
+      "render_versions": [
+        "assistant-ui-ask-root-parity-v1-20260901-1"
+      ],
+      "sha256": "cb237dc902aadb74e588eba3c1c2d03cbaffd110f9bcc1a9d01096afc4919dba",
+      "unordered_list_count": 0,
+      "visible_list_numbers": [
         1,
         2,
         3
       ],
-      "ordered_list_count": 3,
-      "render_versions": [
-        "assistant-ui-ask-root-parity-v1-20260901-1"
-      ],
-      "sha256": "fd623ad79aea84c1f70a0ff363bb93a08938f3d580f934da23d3019fe547d7fd",
-      "unordered_list_count": 0,
-      "visible_text": "Risposta PROC-001 — Avviamento sicuro Passaggi Verificare area e ripari Azione operativa: controllare l'area. Sicurezza: non avviare con anomalie. Controllare le utenze Azione operativa: verificare aria e alimentazione. Sicurezza: personale qualificato. Inserire l'alimentazione generale"
+      "visible_text": "Risposta PROC-001 — Avviamento sicuro Passaggi 1. Verificare area e ripari Azione operativa: controllare l'area. Sicurezza: non avviare con anomalie. 2. Controllare le utenze Azione operativa: verificare aria e alimentazione. Sicurezza: personale qualificato. 3. Inserire l'alimentazione generale"
     },
     "answer_render_version": "assistant-ui-ask-root-parity-v1-20260901-1",
     "citations": [
@@ -149,19 +150,20 @@
       "contains_escaped_script": false,
       "contains_raw_script": false,
       "contains_sources_heading": false,
-      "length": 3018,
-      "li_values": [
+      "length": 3744,
+      "li_values": [],
+      "ordered_list_count": 0,
+      "render_versions": [
+        "assistant-ui-ask-root-parity-v1-20260901-1"
+      ],
+      "sha256": "9eef69611add2a9a7af1b52222fa7b03f015cd4566abbcd273dc5f934a0b5ee2",
+      "unordered_list_count": 1,
+      "visible_list_numbers": [
         1,
         2,
         3
       ],
-      "ordered_list_count": 3,
-      "render_versions": [
-        "assistant-ui-ask-root-parity-v1-20260901-1"
-      ],
-      "sha256": "0abc9ffd73442a5c7a98ff8d39d2fdf5ab27994f67c9cc7682a36bbf93e5fb9d",
-      "unordered_list_count": 1,
-      "visible_text": "Risposta PROC-001 - Avviamento sicuro Sequenza validata di avvio. Prima di iniziare Personale qualificato: Operatore qualificato. Livello di sicurezza: ALTO. Procedura Passaggi Verificare area e ripari Controllare che l'area sia libera. Attenzione: Non avviare in presenza di anomalie. Passaggi Controllare le utenze Verificare collegamento elettrico e pressione 5-6 bar. Attenzione: Collegamenti riservati a personale qualificato. Passaggi Inserire l'alimentazione generale Attendere l'avvio di HMI e PLC. Supporto dal manuale Punti principali Il manuale richiede un'azione volontaria."
+      "visible_text": "Risposta PROC-001 - Avviamento sicuro Sequenza validata di avvio. Prima di iniziare Personale qualificato: Operatore qualificato. Livello di sicurezza: ALTO. Procedura Passaggi 1. Verificare area e ripari Controllare che l'area sia libera. Attenzione: Non avviare in presenza di anomalie. Passaggi 2. Controllare le utenze Verificare collegamento elettrico e pressione 5-6 bar. Attenzione: Collegamenti riservati a personale qualificato. Passaggi 3. Inserire l'alimentazione generale Attendere l'avvio di HMI e PLC. Supporto dal manuale Punti principali Il manuale richiede un'azione volontaria."
     },
     "answer_render_version": "assistant-ui-ask-root-parity-v1-20260901-1",
     "citations": [
@@ -233,19 +235,20 @@
       "contains_escaped_script": false,
       "contains_raw_script": false,
       "contains_sources_heading": false,
-      "length": 2383,
-      "li_values": [
+      "length": 3039,
+      "li_values": [],
+      "ordered_list_count": 0,
+      "render_versions": [
+        "assistant-ui-html-lossless-v10-1-20260806-1"
+      ],
+      "sha256": "ac0c380228bd12598e8c5e0a14804cbe04710c069897dee8f9308249e0550265",
+      "unordered_list_count": 1,
+      "visible_list_numbers": [
         1,
         2,
         3
       ],
-      "ordered_list_count": 1,
-      "render_versions": [
-        "assistant-ui-html-lossless-v10-1-20260806-1"
-      ],
-      "sha256": "d26701ac7090e3d7015c25cd0783ed7abacda8a232eef85172d4840795abf3ae",
-      "unordered_list_count": 1,
-      "visible_text": "PROC-001 — Avviamento sicuro Sequenza validata di avvio. Prima di iniziare Personale qualificato: Operatore qualificato Livello di sicurezza: ALTO Procedura Verificare area e ripari Controllare che l'area sia libera. Attenzione: Non avviare in presenza di anomalie. Controllare le utenze Verificare collegamento elettrico e pressione 5-6 bar. Attenzione: Collegamenti riservati a personale qualificato. Inserire l'alimentazione generale Attendere l'avvio di HMI e PLC. Supporto dal manuale Il manuale richiede un'azione volontaria."
+      "visible_text": "PROC-001 — Avviamento sicuro Sequenza validata di avvio. Prima di iniziare Personale qualificato: Operatore qualificato Livello di sicurezza: ALTO Procedura 1. Verificare area e ripari Controllare che l'area sia libera. Attenzione: Non avviare in presenza di anomalie. 2. Controllare le utenze Verificare collegamento elettrico e pressione 5-6 bar. Attenzione: Collegamenti riservati a personale qualificato. 3. Inserire l'alimentazione generale Attendere l'avvio di HMI e PLC. Supporto dal manuale Il manuale richiede un'azione volontaria."
     },
     "answer_render_version": "assistant-ui-html-lossless-v10-1-20260806-1",
     "citations": [
@@ -325,6 +328,7 @@
       ],
       "sha256": "38515556e4c576ecded8311371df5301e58d7af20cfa1b4a42c8f89f53e66d9a",
       "unordered_list_count": 0,
+      "visible_list_numbers": [],
       "visible_text": "Cause probabili Problema: La macchina non si abilita. Causa più probabile Ripristino zone incompleto Perché: Ogni zona richiede il proprio reset. Controlli consigliati Premere i due reset anteriori Premere il reset posteriore Causa possibile 2 Emergenza ancora attiva Perché: L'emergenza ha priorità. Controlli consigliati Controllare tutti i funghi Ulteriori controlli prioritari Verificare HMI"
     },
     "answer_render_version": "assistant-ui-html-lossless-v10-1-20260806-1",
@@ -425,6 +429,7 @@
     ],
     "sha256": "e1bb3c3ec4e4de3f38c02d246f0ceeefb011da38714f0bf49c5e964b381a24af",
     "unordered_list_count": 0,
+    "visible_list_numbers": [],
     "visible_text": "Risposta Esito Non trovo informazioni sufficienti."
   },
   "generic_numbered_restart": {
@@ -434,19 +439,20 @@
     "contains_escaped_script": false,
     "contains_raw_script": false,
     "contains_sources_heading": false,
-    "length": 1226,
-    "li_values": [
+    "length": 1820,
+    "li_values": [],
+    "ordered_list_count": 0,
+    "render_versions": [
+      "assistant-ui-ask-root-parity-v1-20260901-1"
+    ],
+    "sha256": "957d72001286e751cd5b42ee71dee34928dfd3218fd16ffa2211e2f4292211e5",
+    "unordered_list_count": 0,
+    "visible_list_numbers": [
       1,
       2,
       3
     ],
-    "ordered_list_count": 1,
-    "render_versions": [
-      "assistant-ui-ask-root-parity-v1-20260901-1"
-    ],
-    "sha256": "b86be5bcde51ca5cd4aef85b9bde18e2a6b82b6d72ff953b0667ea17d8f4e939",
-    "unordered_list_count": 0,
-    "visible_text": "Risposta PROC-001 — Avviamento sicuro Passaggi Verificare area e ripari Controllare le utenze Inserire l'alimentazione generale"
+    "visible_text": "Risposta PROC-001 — Avviamento sicuro Passaggi 1. Verificare area e ripari 2. Controllare le utenze 3. Inserire l'alimentazione generale"
   },
   "generic_untrusted": {
     "article_kinds": [
@@ -463,6 +469,7 @@
     ],
     "sha256": "650e9050d9fa28d8089308b9f6c4129d4f9edb19fe7e17574f487f980154aac5",
     "unordered_list_count": 1,
+    "visible_list_numbers": [],
     "visible_text": "Risposta Risposta <script>alert(1)</script> Punti principali Valore: A-7"
   },
   "inline_markup": {
@@ -518,19 +525,82 @@
       "contains_escaped_script": false,
       "contains_raw_script": false,
       "contains_sources_heading": false,
-      "length": 785,
-      "li_values": [
-        77
-      ],
-      "ordered_list_count": 1,
+      "length": 1024,
+      "li_values": [],
+      "ordered_list_count": 0,
       "render_versions": [
         "assistant-ui-html-lossless-v10-1-20260806-1"
       ],
-      "sha256": "49b0fdb82c138e196d274e2cae4f02073ac1ea643f48b12c22851d6fabb782b6",
+      "sha256": "0480537ff6549464d45adf687794785f64ae55cad8dad43820e68660af969781",
       "unordered_list_count": 0,
-      "visible_text": "Patched Procedura X Y"
+      "visible_list_numbers": [
+        77
+      ],
+      "visible_text": "Patched Procedura 77. X Y"
     }
   },
+  "live_proc001_html": {
+    "article_kinds": [
+      "procedure"
+    ],
+    "contains_escaped_script": false,
+    "contains_raw_script": false,
+    "contains_sources_heading": false,
+    "length": 5674,
+    "li_values": [],
+    "ordered_list_count": 0,
+    "render_versions": [
+      "assistant-ui-html-lossless-v10-1-20260806-1"
+    ],
+    "sha256": "81d8a88b172bf04b8e5ff6b19aa3d5ec12ea5376f65e935a4af126c83592b92a",
+    "unordered_list_count": 0,
+    "visible_list_numbers": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8
+    ],
+    "visible_text": "Avviamento sicuro e messa in ciclo automatico DESTINATARI Operatore qualificato / Tecnico di linea. DURATA INDICATIVA 15 minuti. LIVELLO DI SICUREZZA ALTO. Prima di iniziare Personale qualificato: Operatore qualificato / Tecnico di linea. Livello di sicurezza: ALTO. Procedura 1. Verificare area e ripari Azione verificabile dello Step 1. Attenzione: Condizione di sicurezza dello Step 1. 2. Controllare le utenze Azione verificabile dello Step 2. Attenzione: Condizione di sicurezza dello Step 2. 3. Inserire l'alimentazione generale Azione verificabile dello Step 3. Attenzione: Condizione di sicurezza dello Step 3. 4. Ripristinare il circuito di sicurezza Azione verificabile dello Step 4. Attenzione: Condizione di sicurezza dello Step 4. 5. Eseguire lubrificazione generale Azione verificabile dello Step 5. Attenzione: Condizione di sicurezza dello Step 5. 6. Richiamare la ricetta validata Azione verificabile dello Step 6. Attenzione: Condizione di sicurezza dello Step 6. 7. Eseguire ciclo di prova Azione verificabile dello Step 7. Attenzione: Condizione di sicurezza dello Step 7. 8. Avviare in automatico Azione verificabile dello Step 8. Attenzione: Condizione di sicurezza dello Step 8."
+  },
+  "live_proc001_model": {
+    "before_titles": [],
+    "display_numbers": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8
+    ],
+    "final_titles": [],
+    "source_numbers": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8
+    ],
+    "step_titles": [
+      "Verificare area e ripari",
+      "Controllare le utenze",
+      "Inserire l'alimentazione generale",
+      "Ripristinare il circuito di sicurezza",
+      "Eseguire lubrificazione generale",
+      "Richiamare la ricetta validata",
+      "Eseguire ciclo di prova",
+      "Avviare in automatico"
+    ]
+  },
+  "live_proc001_sanitized_visible_text": "Avviamento sicuro e messa in ciclo automatico DESTINATARI Operatore qualificato / Tecnico di linea. DURATA INDICATIVA 15 minuti. LIVELLO DI SICUREZZA ALTO. Prima di iniziare Personale qualificato: Operatore qualificato / Tecnico di linea. Livello di sicurezza: ALTO. Procedura 1. Verificare area e ripari Azione verificabile dello Step 1. Attenzione: Condizione di sicurezza dello Step 1. 2. Controllare le utenze Azione verificabile dello Step 2. Attenzione: Condizione di sicurezza dello Step 2. 3. Inserire l'alimentazione generale Azione verificabile dello Step 3. Attenzione: Condizione di sicurezza dello Step 3. 4. Ripristinare il circuito di sicurezza Azione verificabile dello Step 4. Attenzione: Condizione di sicurezza dello Step 4. 5. Eseguire lubrificazione generale Azione verificabile dello Step 5. Attenzione: Condizione di sicurezza dello Step 5. 6. Richiamare la ricetta validata Azione verificabile dello Step 6. Attenzione: Condizione di sicurezza dello Step 6. 7. Eseguire ciclo di prova Azione verificabile dello Step 7. Attenzione: Condizione di sicurezza dello Step 7. 8. Avviare in automatico Azione verificabile dello Step 8. Attenzione: Condizione di sicurezza dello Step 8.",
   "lossless_numbered_restart": {
     "article_kinds": [
       "lossless"
@@ -538,19 +608,20 @@
     "contains_escaped_script": false,
     "contains_raw_script": false,
     "contains_sources_heading": false,
-    "length": 1556,
-    "li_values": [
+    "length": 2282,
+    "li_values": [],
+    "ordered_list_count": 0,
+    "render_versions": [
+      "assistant-ui-ask-root-parity-v1-20260901-1"
+    ],
+    "sha256": "fbd58a42a7d88daf984375f6fba03c504a971fb82ca52fe3550fcade9ecf51b6",
+    "unordered_list_count": 0,
+    "visible_list_numbers": [
       1,
       2,
       3
     ],
-    "ordered_list_count": 3,
-    "render_versions": [
-      "assistant-ui-ask-root-parity-v1-20260901-1"
-    ],
-    "sha256": "a1eaa74106a42d8e13dae7d895fa04f24c11d4324da3cdd17ac71226d90dd1ad",
-    "unordered_list_count": 0,
-    "visible_text": "Risposta Passaggi Primo Nota Secondo Passaggi Terzo"
+    "visible_text": "Risposta Passaggi 1. Primo Nota 2. Secondo Passaggi 3. Terzo"
   },
   "normalize_markdown_table": {
     "error": null,
@@ -564,19 +635,20 @@
     "contains_escaped_script": false,
     "contains_raw_script": false,
     "contains_sources_heading": false,
-    "length": 2383,
-    "li_values": [
+    "length": 3039,
+    "li_values": [],
+    "ordered_list_count": 0,
+    "render_versions": [
+      "assistant-ui-html-lossless-v10-1-20260806-1"
+    ],
+    "sha256": "ac0c380228bd12598e8c5e0a14804cbe04710c069897dee8f9308249e0550265",
+    "unordered_list_count": 1,
+    "visible_list_numbers": [
       1,
       2,
       3
     ],
-    "ordered_list_count": 1,
-    "render_versions": [
-      "assistant-ui-html-lossless-v10-1-20260806-1"
-    ],
-    "sha256": "d26701ac7090e3d7015c25cd0783ed7abacda8a232eef85172d4840795abf3ae",
-    "unordered_list_count": 1,
-    "visible_text": "PROC-001 — Avviamento sicuro Sequenza validata di avvio. Prima di iniziare Personale qualificato: Operatore qualificato Livello di sicurezza: ALTO Procedura Verificare area e ripari Controllare che l'area sia libera. Attenzione: Non avviare in presenza di anomalie. Controllare le utenze Verificare collegamento elettrico e pressione 5-6 bar. Attenzione: Collegamenti riservati a personale qualificato. Inserire l'alimentazione generale Attendere l'avvio di HMI e PLC. Supporto dal manuale Il manuale richiede un'azione volontaria."
+    "visible_text": "PROC-001 — Avviamento sicuro Sequenza validata di avvio. Prima di iniziare Personale qualificato: Operatore qualificato Livello di sicurezza: ALTO Procedura 1. Verificare area e ripari Controllare che l'area sia libera. Attenzione: Non avviare in presenza di anomalie. 2. Controllare le utenze Verificare collegamento elettrico e pressione 5-6 bar. Attenzione: Collegamenti riservati a personale qualificato. 3. Inserire l'alimentazione generale Attendere l'avvio di HMI e PLC. Supporto dal manuale Il manuale richiede un'azione volontaria."
   },
   "procedure_text": "PROC-001 - Avviamento sicuro\n\nSequenza validata di avvio.\n\nPrima di iniziare\nPersonale qualificato: Operatore qualificato.\nLivello di sicurezza: ALTO.\n\nProcedura\n1. Verificare area e ripari\nControllare che l'area sia libera.\nAttenzione: Non avviare in presenza di anomalie.\n\n2. Controllare le utenze\nVerificare collegamento elettrico e pressione 5-6 bar.\nAttenzione: Collegamenti riservati a personale qualificato.\n\n3. Inserire l'alimentazione generale\nAttendere l'avvio di HMI e PLC.\n\nSupporto dal manuale\n- Il manuale richiede un'azione volontaria.",
   "root_text": "Cause probabili\n\nProblema: La macchina non si abilita.\n\nCausa più probabile\nRipristino zone incompleto\nPerché: Ogni zona richiede il proprio reset.\nControlli consigliati\n1. Premere i due reset anteriori\n2. Premere il reset posteriore\n\nCausa possibile 2\nEmergenza ancora attiva\nPerché: L'emergenza ha priorità.\nControlli consigliati\n1. Controllare tutti i funghi\n\nUlteriori controlli prioritari\n1. Verificare HMI",

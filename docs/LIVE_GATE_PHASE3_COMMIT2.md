@@ -1,8 +1,8 @@
 # Live gate — Roadmap Phase 3 Commit 2
 ## Response finalization and safe HTML/UI rendering
 
-Phase 3 Commit 2 remains `OFFLINE_VERIFIED` until the exact Git commit passes
-this gate.
+Phase 3 Commit 2 remains open until the exact live-fix Git commit passes this gate.
+The initial candidate failed Section 2 in the real Bubble UI and is not certified.
 
 ## 1. Build and revision identity
 
@@ -26,7 +26,8 @@ Use the same structured request already validated on Phase 3 Commit 1:
 Require:
 
 - the canonical response still contains all 8 PROC-001 Steps in the same order;
-- the visible numbering is `1, 2, 3, 4, 5, 6, 7, 8`, never eight repeated `1.`;
+- Step 1 `Verificare area e ripari` remains Step 1 and is not moved into a separate prerequisite block;
+- the visible numbering is literal text `1, 2, 3, 4, 5, 6, 7, 8`, never repeated `1.` and never dependent only on browser list markers;
 - the Procedure is the primary source and all Step links remain present;
 - manual sources remain secondary;
 - no raw Bubble/citation identifiers appear;
@@ -102,6 +103,6 @@ be forgotten, but this UI commit does not claim to solve it.
 
 ## Exit decision
 
-Commit 2 is complete only when the exact revision passes all sections above.
+Commit 2 is complete only when the exact live-fix revision passes all sections above.
 A failure blocks Phase 3 Commit 3 and must be diagnosed against
 `mm-ai-ingest-prod-00055-h7t` before any further extraction.

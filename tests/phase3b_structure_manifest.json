@@ -51,8 +51,9 @@
         "def assistant_ui_finalize_response",
         "is_procedure_model",
         "mode = 'procedure'",
-        "value=\"{display_no}\"",
-        "value=\"{explicit_number}\""
+        "data-mm-list-number",
+        "A Step remains a Step",
+        "Render the number as visible text"
       ],
       "required_symbols": [
         "ResponsePresentationRuntime",
@@ -81,7 +82,7 @@
         "procedure_ui_model_to_html",
         "procedure_ui_model_to_text"
       ],
-      "sha256": "aaaacc6334df4b2ee6b0c56c8db83aaa31876aec128cc390a6d8af80b729a7b1"
+      "sha256": "d6f8ae9f75ce44ffa9e094444f068a7c04eacdf9e7cc1e2bef3fe66192e4a4f9"
     }
   },
   "parent_definition_ast_sha256": {

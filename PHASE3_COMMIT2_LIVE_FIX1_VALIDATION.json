@@ -1,0 +1,48 @@
+{
+  "commit_title": "fix: preserve all source step numbers in Bubble procedure rendering",
+  "created_date": "2026-09-02",
+  "known_unresolved_blocker": "ASK machine weight numeric property returns no_sources; Retrieval/Evidence owner",
+  "live_failure_fixed_by_design": {
+    "attribute_stripping_simulation": "PASS",
+    "numbers_are_visible_text": true,
+    "source_and_display_numbers": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8
+    ],
+    "source_step_1_kept_in_sequence": true
+  },
+  "offline_gate": [
+    "syntax PASS",
+    "all prior behavior contracts PASS",
+    "static extraction PASS",
+    "response render contract PASS",
+    "four mutation checks PASS"
+  ],
+  "production_files_changed": [
+    "machinemind/presentation/responses.py"
+  ],
+  "production_files_explicitly_unchanged": [
+    "main.py",
+    "assistant_core_v2.py",
+    "machinemind/presentation/citations.py",
+    "cloudbuild.yaml",
+    "Dockerfile",
+    "requirements.txt",
+    "mm_promotion_gate.py"
+  ],
+  "response_module": {
+    "bytes": 62962,
+    "lines": 952,
+    "sha256": "d6f8ae9f75ce44ffa9e094444f068a7c04eacdf9e7cc1e2bef3fe66192e4a4f9"
+  },
+  "roadmap_phase": 3,
+  "schema_version": "machinemind-phase3b-live-fix-validation-v1",
+  "status": "OFFLINE_VERIFIED_LIVE_PENDING",
+  "unit": "3B-live-fix1"
+}

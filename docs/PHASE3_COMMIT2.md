@@ -185,3 +185,15 @@ the live checks in `LIVE_GATE_PHASE3_COMMIT2.md` remain mandatory.
 After this exact candidate passes the live gate, the next planned unit is:
 
 **Phase 3 — Commit 3 / 3C: shared ingest text and PDF extraction primitives.**
+
+## Live validation correction — 2026-09-02
+
+The initial candidate did **not** pass its exact live PROC-001 gate. Bubble
+showed Step 1 outside the sequence and repeated `1.` for the remaining items.
+Therefore the original statement that raw `<li value>` attributes were
+sufficient is superseded by `PHASE3_COMMIT2_LIVE_FIX1.md`.
+
+The reviewed correction keeps every source Step in the sequence and renders the
+number as visible text. Phase 3 Commit 3 remains blocked until the corrective
+revision passes the live gate.
+

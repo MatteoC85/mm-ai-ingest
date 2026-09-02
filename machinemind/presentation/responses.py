@@ -85,19 +85,16 @@ def build_structured_procedure_ui_model(*, structured_citations: list[dict], man
             step_title = f'Step {source_no}'
         records.append({'source_number': source_no, 'title': step_title, 'instruction': instruction, 'safety': safety})
     records.sort(key=lambda item: (int(item.get('source_number') or 9999), str(item.get('title') or '')))
+    # A Step remains a Step.  Do not heuristically move the first safety-oriented
+    # Step into a separate prerequisite card or the last verification-oriented Step
+    # into a final card: doing so silently changes the visible source sequence.  The
+    # source-authored Step numbers are the stable presentation contract.
     before: list[dict] = []
     final_checks: list[dict] = []
     operational = list(records)
-    if operational:
-        first_text = ' '.join((str(operational[0].get(k) or '') for k in ('title', 'instruction')))
-        if _runtime.procedure_ui_is_safety_setup(first_text):
-            before.append(operational.pop(0))
-    if operational:
-        last_title = str(operational[-1].get('title') or '')
-        if _runtime.procedure_ui_is_final_verification(last_title):
-            final_checks.insert(0, operational.pop())
-    for display_no, record in enumerate(operational, start=1):
-        record['display_number'] = display_no
+    for fallback_no, record in enumerate(operational, start=1):
+        source_no = _runtime.safe_int(record.get('source_number'), fallback_no)
+        record['display_number'] = source_no if source_no > 0 else fallback_no
     manual_notes: list[str] = []
     if manual_support_citations:
         operation_note, safety_note = _runtime.manual_operation_and_safety_notes_from_support_citations(manual_support_citations, q=q, structured_citations=coherent, language=response_language)
@@ -217,20 +214,33 @@ def procedure_ui_model_to_html(model: dict, *, links: list[dict], response_langu
         heading = 'Procedure' if is_en else 'Procedura'
         chunks.append('<section style="margin:0 0 21px 0;">')
         chunks.append('<h3 style="margin:0 0 9px 0;font-size:15px;font-weight:760;color:#111827;">' + assistant_ui_escape(heading, _runtime=_runtime) + '</h3>')
-        chunks.append('<ol style="margin:0;padding-left:22px;color:#374151;">')
+        # Render the number as visible text instead of depending on ``<li value>``.
+        # Bubble/browser sanitizers may drop or ignore list-value attributes, which
+        # made every separated item appear as ``1.`` in the real UI even though the
+        # raw HTML contract contained the correct values.
+        chunks.append('<div role="list" data-mm-ordered-list="procedure" style="margin:0;color:#374151;">')
         for idx, item in enumerate(steps, start=1):
             display_no = _runtime.safe_int(item.get('display_number'), idx)
             item_title = assistant_ui_escape(item.get('title') or (f'Step {display_no}' if is_en else f'Passaggio {display_no}'), _runtime=_runtime)
             instruction = assistant_ui_escape(item.get('instruction') or '', _runtime=_runtime)
             safety = assistant_ui_escape(item.get('safety') or '', _runtime=_runtime)
-            chunks.append(f'<li value="{display_no}" style="margin:0 0 12px 0;padding-left:4px;">')
+            number_text = assistant_ui_escape(f'{display_no}.', _runtime=_runtime)
+            chunks.append(
+                f'<div role="listitem" data-mm-list-number="{display_no}" '
+                'style="display:flex;align-items:flex-start;gap:7px;margin:0 0 12px 0;">'
+            )
+            chunks.append(
+                '<span style="display:inline-block;flex:0 0 24px;min-width:24px;font-weight:760;color:#1d4ed8;">'
+                + number_text
+                + '</span><div style="flex:1 1 auto;min-width:0;">'
+            )
             chunks.append('<p style="margin:0 0 3px 0;font-weight:720;color:#111827;">' + item_title + '</p>')
             if instruction:
                 chunks.append('<p style="margin:0;color:#374151;">' + instruction + '</p>')
             if safety:
                 chunks.append('<p style="margin:5px 0 0 0;color:#991b1b;"><strong>' + assistant_ui_escape('Attention' if is_en else 'Attenzione', _runtime=_runtime) + ':</strong> ' + safety + '</p>')
-            chunks.append('</li>')
-        chunks.append('</ol></section>')
+            chunks.append('</div></div>')
+        chunks.append('</div></section>')
     final_checks = model.get('final_checks') or []
     if final_checks:
         heading = 'Final check' if is_en else 'Verifica finale'
@@ -345,16 +355,19 @@ def assistant_ui_render_numbered_cards(items: list[str], *, is_en: bool, _runtim
             clean_items.append((None, text)) if text else None
     if not clean_items:
         return ""
-    chunks = ['<ol style="margin:0;padding-left:22px;color:#374151;">']
-    for number, text in clean_items:
-        value_attr = f' value="{number}"' if number is not None else ""
+    chunks = ['<div role="list" data-mm-ordered-list="generic" style="margin:0;color:#374151;">']
+    for fallback_no, (number, text) in enumerate(clean_items, start=1):
+        display_no = number if number is not None else fallback_no
         chunks.append(
-            f'<li{value_attr} style="margin:0 0 10px 0;padding-left:4px;">'
-            '<p style="margin:0;">'
+            f'<div role="listitem" data-mm-list-number="{display_no}" '
+            'style="display:flex;align-items:flex-start;gap:7px;margin:0 0 10px 0;">'
+            '<span style="display:inline-block;flex:0 0 24px;min-width:24px;font-weight:760;color:#1d4ed8;">'
+            + assistant_ui_escape(f'{display_no}.', _runtime=_runtime)
+            + '</span><p style="flex:1 1 auto;min-width:0;margin:0;">'
             + assistant_ui_inline_markup(text, _runtime=_runtime)
-            + '</p></li>'
+            + '</p></div>'
         )
-    chunks.append("</ol>")
+    chunks.append("</div>")
     return "".join(chunks)
 
 def assistant_ui_sentence_has_any(value: str, markers: list[str], *, _runtime: ResponsePresentationRuntime) -> bool:
@@ -833,12 +846,15 @@ def assistant_ui_lossless_html(answer: str, *, response_language: str, status: s
         elif numbered:
             if not section_open:
                 open_section('Steps' if is_en else 'Passaggi')
-            if list_kind != 'ol':
-                close_list()
-                list_kind = 'ol'
-                chunks.append('<ol style="margin:0;padding-left:21px;color:#374151;">')
+            close_list()
             explicit_number = int(numbered.group(1))
-            chunks.append(f'<li value="{explicit_number}" style="margin:0 0 7px 0;padding-left:2px;">' + assistant_ui_inline_markup(numbered.group(2).strip(), _runtime=_runtime) + '</li>')
+            chunks.append(
+                assistant_ui_render_numbered_cards(
+                    [{"number": explicit_number, "text": numbered.group(2).strip()}],
+                    is_en=is_en,
+                    _runtime=_runtime,
+                )
+            )
         elif bullet:
             if not section_open:
                 open_section('Key points' if is_en else 'Punti principali')

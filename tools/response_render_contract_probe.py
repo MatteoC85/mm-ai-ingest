@@ -128,6 +128,7 @@ def html_summary(value: str) -> dict[str, Any]:
         "article_kinds": re.findall(r'data-mm-answer="([^"]+)"', html),
         "render_versions": re.findall(r'data-mm-render="([^"]+)"', html),
         "li_values": [int(x) for x in re.findall(r'<li value="(\d+)"', html)],
+        "visible_list_numbers": [int(x) for x in re.findall(r'data-mm-list-number="(\d+)"', html)],
         "ordered_list_count": len(re.findall(r"<ol\b", html)),
         "unordered_list_count": len(re.findall(r"<ul\b", html)),
         "contains_raw_script": "<script" in html.lower(),
@@ -300,6 +301,82 @@ out["procedure_html"] = html_summary(
         response_language="it",
     )
 )
+
+
+# Live-shaped PROC-001 regression: all source-authored Steps must remain inside
+# the numbered sequence, including the safety-oriented first Step. Numbers are
+# visible text so they survive an HTML sanitizer that ignores list attributes.
+live_titles = [
+    "Verificare area e ripari",
+    "Controllare le utenze",
+    "Inserire l'alimentazione generale",
+    "Ripristinare il circuito di sicurezza",
+    "Eseguire lubrificazione generale",
+    "Richiamare la ricetta validata",
+    "Eseguire ciclo di prova",
+    "Avviare in automatico",
+]
+live_sources = [
+    {
+        "citation_id": "P1",
+        "bubble_document_id": "procedure:P1",
+        "evidence_role": "procedure",
+        "fields": {
+            "title": "Avviamento sicuro e messa in ciclo automatico",
+            "short_description": (
+                "DESTINATARI Operatore qualificato / Tecnico di linea. "
+                "DURATA INDICATIVA 15 minuti. LIVELLO DI SICUREZZA ALTO."
+            ),
+        },
+    }
+]
+for idx, title in enumerate(live_titles, start=1):
+    live_sources.append(
+        {
+            "citation_id": f"S{idx}",
+            "bubble_document_id": f"step:S{idx}",
+            "evidence_role": "step",
+            "fields": {
+                "step_number": str(idx),
+                "title": title,
+                "description": (
+                    f"AZIONE OPERATIVA Azione verificabile dello Step {idx}. "
+                    f"NOTA DI SICUREZZA Condizione di sicurezza dello Step {idx}."
+                ),
+            },
+        }
+    )
+with Patch(
+    _procedure_ui_merge_sources=lambda *groups: list(groups[0] if groups else []),
+    _procedure_ui_fields=lambda citation: dict(citation.get("fields") or {}),
+    _v12_evidence_role=lambda citation: str(citation.get("evidence_role") or ""),
+):
+    live_model = main._build_structured_procedure_ui_model(
+        structured_citations=live_sources,
+        manual_support_citations=[],
+        grounded_points=[],
+        response_language="it",
+        q="Descrivimi in ordine tutti gli step della PROC-001",
+    )
+    live_html = main._procedure_ui_model_to_html(
+        live_model,
+        links=[],
+        response_language="it",
+    )
+
+# Strip all opening-tag attributes to emulate a conservative HTML host. The
+# explicit visible numbers must remain because they are text, not generated
+# browser list markers or value attributes.
+sanitized_live_html = re.sub(r'<([A-Za-z][A-Za-z0-9]*)\b[^>]*>', r'<\1>', live_html)
+out["live_proc001_model"] = {
+    "before_titles": [str(x.get("title") or "") for x in live_model.get("before") or []],
+    "step_titles": [str(x.get("title") or "") for x in live_model.get("steps") or []],
+    "source_numbers": [int(x.get("source_number") or 0) for x in live_model.get("steps") or []],
+    "display_numbers": [int(x.get("display_number") or 0) for x in live_model.get("steps") or []],
+    "final_titles": [str(x.get("title") or "") for x in live_model.get("final_checks") or []],
+}
+out["live_proc001_html"] = html_summary(live_html)
+out["live_proc001_sanitized_visible_text"] = main._assistant_ui_visible_text_from_html(sanitized_live_html)
 
 # Dedupe behavior remains stable.
 links = [

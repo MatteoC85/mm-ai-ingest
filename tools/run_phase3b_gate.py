@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline gate for Roadmap Phase 3 — Commit 2 (response/UI finalization)."""
+"""Offline gate for Roadmap Phase 3 — Commit 2 and its live rendering correction."""
 from __future__ import annotations
 
 import ast
@@ -212,13 +212,39 @@ def assert_response_contract() -> None:
             "structured-procedure rendering differs from the reviewed candidate"
         )
 
-    # Explicitly pin the live defect observed during Phase 3A validation.
-    if actual["generic_numbered_restart"]["li_values"] != [1, 2, 3]:
-        raise AssertionError("Generic separated ordered lists no longer preserve 1,2,3")
-    if actual["lossless_numbered_restart"]["li_values"] != [1, 2, 3]:
-        raise AssertionError("Lossless fallback no longer preserves explicit list values")
-    if actual["procedure_html"]["li_values"] != [1, 2, 3]:
-        raise AssertionError("Structured Procedure HTML no longer preserves Step numbers")
+    # Pin the real Bubble failure, not only raw ``<li value>`` attributes.  The
+    # visible numbers are emitted as text and therefore survive hosts that strip
+    # or ignore ordered-list attributes.
+    if actual["generic_numbered_restart"]["visible_list_numbers"] != [1, 2, 3]:
+        raise AssertionError("Generic separated lists no longer render visible 1,2,3")
+    if actual["lossless_numbered_restart"]["visible_list_numbers"] != [1, 2, 3]:
+        raise AssertionError("Lossless fallback no longer renders visible 1,2,3")
+    if actual["procedure_html"]["visible_list_numbers"] != [1, 2, 3]:
+        raise AssertionError("Structured Procedure HTML no longer renders visible Step numbers")
+
+    live_model = actual["live_proc001_model"]
+    expected_titles = [
+        "Verificare area e ripari",
+        "Controllare le utenze",
+        "Inserire l'alimentazione generale",
+        "Ripristinare il circuito di sicurezza",
+        "Eseguire lubrificazione generale",
+        "Richiamare la ricetta validata",
+        "Eseguire ciclo di prova",
+        "Avviare in automatico",
+    ]
+    if live_model["before_titles"] or live_model["final_titles"]:
+        raise AssertionError("A source-authored PROC-001 Step was moved outside the ordered sequence")
+    if live_model["step_titles"] != expected_titles:
+        raise AssertionError("PROC-001 Step titles/order changed in the presentation model")
+    if live_model["source_numbers"] != list(range(1, 9)) or live_model["display_numbers"] != list(range(1, 9)):
+        raise AssertionError("PROC-001 source/display numbering is not exactly 1..8")
+    if actual["live_proc001_html"]["visible_list_numbers"] != list(range(1, 9)):
+        raise AssertionError("Live-shaped PROC-001 HTML does not expose visible 1..8")
+    sanitized_visible = str(actual["live_proc001_sanitized_visible_text"] or "")
+    positions = [sanitized_visible.find(f"{number}. {title}") for number, title in enumerate(expected_titles, start=1)]
+    if any(position < 0 for position in positions) or positions != sorted(positions):
+        raise AssertionError("PROC-001 visible 1..8 does not survive conservative HTML attribute stripping")
 
     finalized = actual["finalize_procedure"]
     if finalized["meta"]["answer_html_mode"] != "procedure":
@@ -263,19 +289,38 @@ def assert_mutation_sensitivity() -> None:
     )
     mutations = [
         (
-            "explicit_list_values_removed",
-            """        value_attr = f' value="{number}"' if number is not None else ""\n""",
-            """        value_attr = ""\n""",
+            "source_step_removed_from_sequence",
+            """    operational = list(records)
+    for fallback_no, record in enumerate(operational, start=1):
+""",
+            """    operational = list(records)
+    if operational:
+        before.append(operational.pop(0))
+    for fallback_no, record in enumerate(operational, start=1):
+""",
+        ),
+        (
+            "visible_procedure_number_removed",
+            """                + number_text
+                + '</span><div style="flex:1 1 auto;min-width:0;">'
+""",
+            """                + ''
+                + '</span><div style="flex:1 1 auto;min-width:0;">'
+""",
         ),
         (
             "structured_procedure_renderer_disabled",
-            """    is_procedure_model = isinstance(ui_model, dict) and str(ui_model.get('kind') or '').strip().lower() == 'procedure'\n""",
-            """    is_procedure_model = False\n""",
+            """    is_procedure_model = isinstance(ui_model, dict) and str(ui_model.get('kind') or '').strip().lower() == 'procedure'
+""",
+            """    is_procedure_model = False
+""",
         ),
         (
             "html_escaping_disabled",
-            """    return html.escape(str(value or ''), quote=True)\n""",
-            """    return str(value or '')\n""",
+            """    return html.escape(str(value or ''), quote=True)
+""",
+            """    return str(value or '')
+""",
         ),
     ]
     source_rel = Path("machinemind/presentation/responses.py")
@@ -311,8 +356,9 @@ def main() -> int:
     print(
         "PHASE 3B OFFLINE GATE: PASS — response finalization, safe HTML rendering, "
         "structured Procedure presentation and final link/citation de-duplication "
-        "are isolated; the reviewed UI-only numbering correction is pinned without "
-        "changing retrieval, reasoning, Root Cause or citation/link behavior."
+        "are isolated; every source-authored Step remains in sequence and visible "
+        "numbers survive attribute-stripping hosts without changing retrieval, "
+        "reasoning, Root Cause or citation/link behavior."
     )
     return 0
 

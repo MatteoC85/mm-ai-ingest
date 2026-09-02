@@ -1,41 +1,24 @@
-# GitHub operation — Phase 3 Commit 2
+# GitHub operation — Phase 3 Commit 2 live fix 1
 
-Remain on:
+Remain on the current branch:
 
 `refactor-phase1`
 
-This package requires the current repository to contain the live-verified Phase
-3 Commit 1 parent:
+This is a **delta-only corrective package**. It assumes the initial Phase 3
+Commit 2 has already been committed and deployed. Do not delete the repository
+and do not copy any full snapshot.
 
-- commit `4a832e2`;
-- revision `mm-ai-ingest-prod-00055-h7t`.
+Copy only the contents of this delta over the current repository. The only
+production file intentionally modified is:
 
-Extract the ZIP and copy the complete contents of the extracted folder over the
-current repository. Preserve the hidden `.git` directory and choose **Replace
-files in the destination** for matching files.
+- `machinemind/presentation/responses.py`
 
-Expected production changes:
+The remaining changes are tests, validation and documentation for the live
+numbering defect.
 
-- modified `main.py`;
-- new `machinemind/presentation/responses.py`.
+These production files must remain unchanged:
 
-The existing `machinemind/presentation/citations.py` must remain unchanged.
-
-Expected verification/documentation additions:
-
-- `tools/response_render_contract_probe.py`;
-- `tools/run_phase3b_gate.py`;
-- `tests/phase3b_expected_response_contract.json`;
-- `tests/phase3b_parent_response_contract.json`;
-- `tests/phase3b_expected_parent_candidate_diff.json`;
-- `tests/phase3b_structure_manifest.json`;
-- `tests/phase3b_mutation_results.json`;
-- `PHASE3_COMMIT2_VALIDATION.json`;
-- Phase 3 documentation, `README.md`, `GITHUB_COMMIT.md` and
-  `SHA256SUMS.txt`.
-
-These production files/modules must not be modified:
-
+- `main.py`;
 - `assistant_core_v2.py`;
 - `machinemind/presentation/citations.py`;
 - every module under `machinemind/api/`, `machinemind/config/`,
@@ -47,10 +30,8 @@ These production files/modules must not be modified:
 
 Commit message:
 
-`refactor: extract response finalization and fix ordered-step rendering`
+`fix: preserve all source step numbers in Bubble procedure rendering`
 
-Then use **Commit e push**. The configured trigger should build and deploy from
-`refactor-phase1`.
-
-After deployment, apply `docs/LIVE_GATE_PHASE3_COMMIT2.md`. Do not begin Commit
-3 until the exact revision passes that live gate.
+Then use **Commit e push**. After deployment, run the exact PROC-001 question
+from `docs/LIVE_GATE_PHASE3_COMMIT2.md`. Do not begin Phase 3 Commit 3 until the
+visible response contains every Step 1 through 8 in order.

@@ -5,12 +5,15 @@
     "main_lines": 33977,
     "main_net_line_reduction": 1143,
     "main_sha256": "a0ed3fcd574a15b087e28170ae472dd071ea772f4551282fac0dd5ef05dd1691",
+    "response_module_bytes": 62962,
+    "response_module_lines": 952,
+    "response_module_sha256": "d6f8ae9f75ce44ffa9e094444f068a7c04eacdf9e7cc1e2bef3fe66192e4a4f9",
     "top_level_definition_inventory_candidate": 669,
     "top_level_definition_inventory_parent": 669
   },
   "commit_in_phase": 2,
-  "commit_title": "refactor: extract response finalization and fix ordered-step rendering",
-  "commit_unit": "3B",
+  "commit_title": "fix: preserve all source step numbers in Bubble procedure rendering",
+  "commit_unit": "3B-live-fix1",
   "compatibility_surface": [
     "_build_structured_procedure_ui_model",
     "_procedure_ui_model_to_text",
@@ -74,19 +77,19 @@
   ],
   "intentional_behavior_change": {
     "correction": [
-      "preserve explicit list numbers through safe li value attributes",
-      "apply the guard to generic, lossless and structured Procedure HTML",
-      "use the already-built structured Procedure model during finalization"
+      "keep every source-authored Step in the ordered Procedure sequence",
+      "preserve source step_number as display_number",
+      "render numbers as escaped visible text rather than relying on list value attributes",
+      "apply robust visible numbering to structured, generic and lossless renderers"
     ],
-    "observed_parent_defect": "Ordered procedure steps could each display as 1. when labelled detail sections caused separate HTML ordered-list fragments.",
-    "parent_candidate_contract_leaf_differences": 30,
+    "initial_live_defect": "The host displayed repeated 1. markers and separated source Step 1 from the sequence.",
     "scope": "UI rendering only",
     "unchanged_payloads": [
-      "canonical plain-text answer",
-      "citation order and content",
+      "canonical answer facts",
+      "citation order/content",
       "Bubble resource links",
       "source snippets",
-      "retrieval and evidence selection"
+      "retrieval/evidence selection"
     ]
   },
   "known_open_blockers": [
@@ -106,12 +109,10 @@
     }
   ],
   "limitations": [
-    "No real Cloud Build or Cloud Run startup was executed by this offline artifact.",
-    "No live browser rendering was executed against the candidate revision.",
-    "The gate characterizes safe HTML and ordered-list attributes but cannot prove every browser/CSS combination.",
-    "No live PDF, XLSX, Root Cause or Smart Diagnostic call was made against the candidate revision.",
-    "This commit does not resolve the documented numeric no_sources Retrieval/Evidence blocker.",
-    "The exact Git parent and deployed commit must be checked after applying the package."
+    "The corrected visible-number markup has not yet been deployed to the real Bubble host.",
+    "Exact Git/Cloud Build/Cloud Run identity must be verified after the corrective commit.",
+    "Known HMI/PDF, XLSX, Root Cause and Smart Diagnostic live paths must still be repeated.",
+    "The documented numeric no_sources Retrieval/Evidence blocker remains open."
   ],
   "live_exit_criteria": [
     "Successful Cloud Build from the exact refactor-phase1 commit.",
@@ -123,14 +124,29 @@
     "Known Root Cause and Smart Diagnostic START paths remain unchanged and valid.",
     "No new response-presentation import, NameError, HTML serialization or canonicality errors appear in logs."
   ],
+  "live_validation_observation": {
+    "date": "2026-09-02",
+    "decision": "Phase 3 Commit 3 blocked; corrective delta required",
+    "initial_candidate_passed": false,
+    "observed": [
+      "Step 1 moved to Prima di iniziare",
+      "remaining visible markers repeated as 1."
+    ],
+    "query": "Descrivimi in ordine tutti gli step della procedura “Avviamento sicuro e messa in ciclo automatico”, indicando per ogni step l’azione operativa principale."
+  },
   "mutation_checks": [
     {
-      "change": "remove explicit ordered-list value attributes",
+      "change": "move the first source Step out of the ordered sequence",
       "detected": true,
-      "name": "explicit_list_values_removed"
+      "name": "source_step_removed_from_sequence"
     },
     {
-      "change": "force structured Procedure renderer off",
+      "change": "remove visible number text from the structured renderer",
+      "detected": true,
+      "name": "visible_procedure_number_removed"
+    },
+    {
+      "change": "force the structured Procedure renderer off",
       "detected": true,
       "name": "structured_procedure_renderer_disabled"
     },
@@ -155,16 +171,20 @@
     "historical_helper_signatures": 24,
     "html_escape_contract": "PASS",
     "link_deduplication_parent_parity": "PASS",
-    "parent_candidate_reviewed_leaf_differences": 30,
+    "live_shaped_proc001_display_numbers_1_to_8": "PASS",
+    "live_shaped_proc001_source_numbers_1_to_8": "PASS",
+    "parent_candidate_reviewed_leaf_differences": 66,
     "phase3a_citation_link_contract": "PASS",
     "prior_phase_behavior_contracts": "PASS",
-    "response_contract_groups": 22,
+    "response_contract_groups": 25,
     "root_cause_final_envelope_parent_parity": "PASS",
     "self_contained_phase3b_gate": "PASS",
+    "source_steps_not_reclassified_as_before_or_final": "PASS",
     "structured_procedure_renderer_active": "PASS",
     "syntax_compile": "PASS",
     "top_level_definition_inventory_preserved": "PASS",
-    "unexpected_definition_changes": 0
+    "unexpected_definition_changes": 0,
+    "visible_numbers_survive_attribute_stripping": "PASS"
   },
   "parent": {
     "artifact": "MachineMind_Modularization_Phase3_Commit1_Citation_Presentation",
@@ -176,7 +196,7 @@
     "main_lines": 35120,
     "main_sha256": "d77dc2938d8cfbb6557b24230bb6936b545e39fdf945e94d76224a3e200ef05a"
   },
-  "purpose": "Extract response finalization, structured Procedure UI-model rendering, ASK/Root Cause safe HTML, canonicality checks and final link/citation de-duplication from the production composition root, with one pinned UI-only correction for repeated ordered-list numbering.",
+  "purpose": "Correct the live Bubble Procedure rendering while preserving the extracted response boundary and every non-presentation behavior.",
   "roadmap_phase": "3",
   "schema_version": "machinemind-modularization-validation-v1",
   "static_guard": {
@@ -189,6 +209,6 @@
     "phase3a_citation_module_byte_unchanged": true,
     "response_implementation_removed_from_main": true
   },
-  "status": "OFFLINE_VERIFIED",
+  "status": "OFFLINE_VERIFIED_LIVE_FIX_PENDING",
   "title": "Response finalization and safe HTML/UI rendering"
 }
