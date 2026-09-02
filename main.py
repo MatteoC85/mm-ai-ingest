@@ -133,6 +133,7 @@ from machinemind.infrastructure.cloud_tasks import (
 )
 from machinemind.presentation import citations as _presentation_citations
 from machinemind.presentation import responses as _presentation_responses
+from machinemind.ingest import text_pdf as _ingest_text_pdf
 
 
 _RESPONSE_PRESENTATION_RUNTIME = lambda: _presentation_responses.ResponsePresentationRuntime(
@@ -5952,113 +5953,32 @@ def _fts_search_chunks(
 
 
 def _normalize_unicode_advanced(s: str) -> str:
-    if not s:
-        return ""
-
-    s = unicodedata.normalize("NFKC", s)
-    s = s.replace("ﬁ", "fi")
-    s = s.replace("ﬂ", "fl")
-    s = s.replace("ﬀ", "ff")
-    s = s.replace("ﬃ", "ffi")
-    s = s.replace("ﬄ", "ffl")
-    s = s.replace("–", "-").replace("—", "-").replace("‐", "-")
-    s = s.replace("\u00A0", " ")
-    s = s.replace("\u200B", "").replace("\u200C", "").replace("\u200D", "")
-    return s
+    return _ingest_text_pdf.normalize_unicode_advanced(s)
 
 
 def _dehyphenate_lines_keep_newlines(s: str) -> str:
-    if not s:
-        return ""
-
-    lines = s.split("\n")
-    out: list[str] = []
-    i = 0
-
-    end_word_hyphen = re.compile(r"([A-Za-zÀ-ÖØ-öø-ÿ]{2,})-$")
-    next_starts_lower = re.compile(r"^[a-zà-öø-ÿ]")
-    avoid_prev = re.compile(r"[0-9_]\-$")
-    avoid_next = re.compile(r"^[0-9_]+")
-
-    while i < len(lines):
-        cur = lines[i]
-        if i + 1 < len(lines):
-            nxt = lines[i + 1]
-            cur_stripped = cur.rstrip()
-            nxt_stripped = nxt.lstrip()
-
-            if nxt_stripped.startswith(("-", "•", "·", "*")):
-                out.append(cur)
-                i += 1
-                continue
-
-            if avoid_prev.search(cur_stripped) or avoid_next.search(nxt_stripped):
-                out.append(cur)
-                i += 1
-                continue
-
-            m = end_word_hyphen.search(cur_stripped)
-            if m and next_starts_lower.search(nxt_stripped):
-                merged = cur_stripped[:-1] + nxt_stripped
-                out.append(merged)
-                i += 2
-                continue
-
-        out.append(cur)
-        i += 1
-
-    return "\n".join(out)
+    return _ingest_text_pdf.dehyphenate_lines_keep_newlines(s)
 
 
 def _normalize_text_keep_lines(s: str) -> str:
-    if not s:
-        return ""
-    s = _normalize_unicode_advanced(s)
-    s = _dehyphenate_lines_keep_newlines(s)
-    s = s.replace("\r\n", "\n").replace("\r", "\n")
-    s = s.replace("\t", " ")
-
-    out = []
-    prev_space = False
-    for ch in s:
-        if ch == " ":
-            if prev_space:
-                continue
-            prev_space = True
-            out.append(" ")
-        else:
-            prev_space = False
-            out.append(ch)
-
-    return "".join(out).strip()
+    return _ingest_text_pdf.normalize_text_keep_lines(
+        s,
+        normalize_unicode_fn=_normalize_unicode_advanced,
+        dehyphenate_fn=_dehyphenate_lines_keep_newlines,
+    )
 
 
 def _pymupdf_page_to_text_blocks(page: "fitz.Page") -> str:
-    blocks = page.get_text("blocks") or []
-    blocks_sorted = sorted(blocks, key=lambda b: (float(b[1]), float(b[0])))
-
-    parts: list[str] = []
-    for b in blocks_sorted:
-        txt = (b[4] or "").strip()
-        if not txt:
-            continue
-        parts.append(txt)
-
-    return "\n\n".join(parts).strip()
+    return _ingest_text_pdf.pymupdf_page_to_text_blocks(page)
 
 
 def _extract_pages_with_layout_blocks(pdf_bytes: bytes) -> list[str]:
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    try:
-        out: list[str] = []
-        for i in range(doc.page_count):
-            page = doc.load_page(i)
-            t = _pymupdf_page_to_text_blocks(page)
-            t = _normalize_text_keep_lines(t)
-            out.append(t)
-        return out
-    finally:
-        doc.close()
+    return _ingest_text_pdf.extract_pages_with_layout_blocks(
+        pdf_bytes,
+        fitz_module=fitz,
+        page_to_text_blocks_fn=_pymupdf_page_to_text_blocks,
+        normalize_text_keep_lines_fn=_normalize_text_keep_lines,
+    )
 
 
 class XlsxIngestError(Exception):
