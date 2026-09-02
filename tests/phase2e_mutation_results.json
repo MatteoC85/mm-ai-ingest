@@ -1,0 +1,29 @@
+[
+  {
+    "name": "protocol_relative_url_normalization_removed",
+    "file": "machinemind/infrastructure/document_transport.py",
+    "detected": true,
+    "probe_returncode": 0,
+    "contract_equal_to_parent": false,
+    "stderr": "",
+    "parse_error": ""
+  },
+  {
+    "name": "cloud_tasks_default_queue_changed",
+    "file": "machinemind/infrastructure/cloud_tasks.py",
+    "detected": true,
+    "probe_returncode": 0,
+    "contract_equal_to_parent": false,
+    "stderr": "",
+    "parse_error": ""
+  },
+  {
+    "name": "fetch_timeout_adapter_changed",
+    "file": "main.py",
+    "detected": true,
+    "probe_returncode": 0,
+    "contract_equal_to_parent": false,
+    "stderr": "",
+    "parse_error": ""
+  }
+]

@@ -122,6 +122,15 @@ from machinemind.infrastructure.execution import (
     stream_json_response as _infra_stream_json_response,
 )
 from machinemind.infrastructure import semantic_cache as _semantic_cache
+from machinemind.infrastructure.document_transport import (
+    decode_file_base64 as _infra_decode_file_base64,
+    detect_filename_from_url as _infra_detect_filename_from_url,
+    load_ingest_document_file as _infra_load_ingest_document_file,
+    strip_data_url_prefix as _infra_strip_data_url_prefix,
+)
+from machinemind.infrastructure.cloud_tasks import (
+    enqueue_document_index_task as _infra_enqueue_document_index_task,
+)
 
 def _fetch_dense_chunk_candidates(
     *,
@@ -15879,86 +15888,63 @@ def version():
 
 
 def _strip_data_url_prefix(value: str) -> str:
-    raw = (value or "").strip()
-    if "," in raw and raw.split(",", 1)[0].lower().startswith("data:"):
-        return raw.split(",", 1)[1]
-    return raw
+    return _infra_strip_data_url_prefix(value)
 
 
 def _decode_file_base64(file_base64: str) -> bytes:
-    raw = _strip_data_url_prefix(file_base64)
-    try:
-        return base64.b64decode(raw, validate=True)
-    except (binascii.Error, ValueError):
-        raise HTTPException(status_code=400, detail="Invalid file_base64")
+    return _infra_decode_file_base64(
+        file_base64,
+        strip_prefix_fn=_strip_data_url_prefix,
+        http_exception_cls=HTTPException,
+    )
 
 
 def _detect_filename_from_url(url: str) -> str:
-    try:
-        url_path = unquote(urlparse(url).path or "")
-        return os.path.basename(url_path) or ""
-    except Exception:
-        return ""
+    return _infra_detect_filename_from_url(
+        url,
+        urlparse_fn=urlparse,
+        unquote_fn=unquote,
+        basename_fn=os.path.basename,
+    )
 
 
 def _load_ingest_document_file(payload: IngestRequest, bubble_document_id: str) -> dict:
-    url = (payload.file_url or "").strip()
-    if url.startswith("//"):
-        url = "https:" + url
+    return _infra_load_ingest_document_file(
+        payload,
+        bubble_document_id,
+        fetch_timeout=FETCH_TIMEOUT,
+        get_fn=requests.get,
+        decode_base64_fn=_decode_file_base64,
+        detect_filename_fn=_detect_filename_from_url,
+        http_exception_cls=HTTPException,
+    )
 
-    file_base64 = (payload.file_base64 or "").strip()
-    payload_filename = (payload.filename or "").strip()
-    payload_content_type = (payload.content_type or "").split(";", 1)[0].strip().lower()
 
-    if not url and not file_base64:
-        raise HTTPException(status_code=400, detail="Missing file_url or file_base64")
+def _enqueue_document_index_task(
+    *,
+    company_id: str,
+    machine_id: str,
+    bubble_document_id: str,
+    ingest_scope: str,
+    ingest_request_key: str,
+    ingest_month_key: str,
+    ingest_usage_event_id: str,
+) -> None:
+    return _infra_enqueue_document_index_task(
+        company_id=company_id,
+        machine_id=machine_id,
+        bubble_document_id=bubble_document_id,
+        ingest_scope=ingest_scope,
+        ingest_request_key=ingest_request_key,
+        ingest_month_key=ingest_month_key,
+        ingest_usage_event_id=ingest_usage_event_id,
+        ai_internal_secret=AI_INTERNAL_SECRET,
+        environ=os.environ,
+        tasks_api=tasks_v2,
+        dumps_fn=json.dumps,
+        log_fn=print,
+    )
 
-    if file_base64:
-        data = _decode_file_base64(file_base64)
-
-        detected_filename = payload_filename or _detect_filename_from_url(url) or bubble_document_id
-        detected_extension = os.path.splitext(detected_filename)[1].lower()
-
-        return {
-            "data": data,
-            "url": url,
-            "content_type": payload_content_type,
-            "content_disposition": "",
-            "detected_filename": detected_filename,
-            "detected_extension": detected_extension,
-            "source_mode": "file_base64",
-        }
-
-    try:
-        r = requests.get(url, timeout=FETCH_TIMEOUT)
-        r.raise_for_status()
-        data = r.content
-    except HTTPException:
-        raise
-    except Exception:
-        raise HTTPException(status_code=502, detail="Fetch failed")
-
-    content_type = (r.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
-    content_disposition = (r.headers.get("Content-Disposition") or "").strip()
-
-    detected_filename = _detect_filename_from_url(url)
-    detected_extension = os.path.splitext(detected_filename)[1].lower()
-
-    if "filename=" in content_disposition:
-        cd_filename = content_disposition.split("filename=", 1)[1].strip().strip('"').strip("'")
-        if cd_filename:
-            detected_filename = cd_filename
-            detected_extension = os.path.splitext(detected_filename)[1].lower()
-
-    return {
-        "data": data,
-        "url": url,
-        "content_type": content_type,
-        "content_disposition": content_disposition,
-        "detected_filename": detected_filename,
-        "detected_extension": detected_extension,
-        "source_mode": "file_url",
-    }
 
 @app.post("/v1/ai/ingest/document")
 def ingest_document(
@@ -16298,63 +16284,15 @@ def ingest_document(
         month_key=ingest_month_key,
     )
 
-    try:
-        project = (
-            os.environ.get("GOOGLE_CLOUD_PROJECT")
-            or os.environ.get("GCP_PROJECT")
-            or "machinemind-ai-2a"
-        ).strip()
-
-        location = (
-            os.environ.get("MM_CLOUD_TASKS_LOCATION")
-            or "europe-west1"
-        ).strip()
-
-        queue = (
-            os.environ.get("MM_CLOUD_TASKS_QUEUE")
-            or "mm-ai-index-dev"
-        ).strip()
-
-        service_url = (
-            os.environ.get("SERVICE_URL")
-            or os.environ.get("K_SERVICE_URL")
-            or ""
-        ).strip().rstrip("/")
-
-        if not service_url:
-            raise RuntimeError("SERVICE_URL/K_SERVICE_URL missing; Cloud Tasks enqueue skipped")
-
-        client = tasks_v2.CloudTasksClient()
-        parent = client.queue_path(project, location, queue)
-
-        task_payload = {
-            "company_id": company_id,
-            "machine_id": machine_id,
-            "bubble_document_id": bubble_document_id,
-            "trace_id": "ingest_auto",
-            "ai_scope": ingest_scope,
-            "ingest_request_key": ingest_request_key,
-            "ingest_month_key": ingest_month_key,
-            "ingest_usage_event_id": ingest_usage_event_id,
-            "ingest_metering_enabled": True,
-        }
-
-        task = {
-            "http_request": {
-                "http_method": tasks_v2.HttpMethod.POST,
-                "url": f"{service_url}/v1/ai/index/document",
-                "headers": {
-                    "Content-Type": "application/json",
-                    "X-AI-Internal-Secret": AI_INTERNAL_SECRET,
-                },
-                "body": json.dumps(task_payload).encode(),
-            }
-        }
-
-        client.create_task(request={"parent": parent, "task": task})
-    except Exception as e:
-        print("CLOUD_TASKS_ENQUEUE_SKIPPED", str(e))
-        pass
+    _enqueue_document_index_task(
+        company_id=company_id,
+        machine_id=machine_id,
+        bubble_document_id=bubble_document_id,
+        ingest_scope=ingest_scope,
+        ingest_request_key=ingest_request_key,
+        ingest_month_key=ingest_month_key,
+        ingest_usage_event_id=ingest_usage_event_id,
+    )
 
     month_usage_before = _ingest_month_usage(company_id, ingest_month_key)
     return {

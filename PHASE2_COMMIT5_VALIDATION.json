@@ -1,0 +1,159 @@
+{
+  "candidate": {
+    "assistant_core_sha256": "dca19aba41becaffb7c0623f52dee22863c527dbbb7dc8ee965a724a25efd00d",
+    "main_lines": 35464,
+    "main_net_line_reduction": 62,
+    "main_sha256": "87778093aa95c256a00ed2aa2e58cafdbfdf1b9b98d8b8c49e9e1ccd1fb6d678"
+  },
+  "commit_in_phase": 5,
+  "commit_title": "refactor: extract external document transport and Cloud Tasks dispatch",
+  "commit_unit": "2E",
+  "compatibility_surface": [
+    "_strip_data_url_prefix",
+    "_decode_file_base64",
+    "_detect_filename_from_url",
+    "_load_ingest_document_file",
+    "ingest_document"
+  ],
+  "created_date": "2026-09-02",
+  "explicit_non_changes": [
+    "API routes and Pydantic request contracts",
+    "assistant_core_v2.py",
+    "runtime configuration and database infrastructure",
+    "OpenAI transport",
+    "request budgets, cost accounting, heartbeat and hard timeouts",
+    "semantic cache and knowledge-version behavior",
+    "prompts, model policy and semantic reasoning",
+    "retrieval, evidence admission and source priorities",
+    "ASK, Root Cause and Smart Diagnostic behavior",
+    "PDF/XLSX parsing, cleaning, limits, quota and metering",
+    "citations, links and rendering",
+    "Dockerfile, cloudbuild.yaml, requirements.txt and mm_promotion_gate.py"
+  ],
+  "extracted_modules": [
+    {
+      "bytes": 4587,
+      "lines": 148,
+      "path": "machinemind/infrastructure/document_transport.py",
+      "responsibilities": [
+        "data URL prefix stripping",
+        "strict base64 decode and HTTP 400 error envelope",
+        "URL filename detection",
+        "protocol-relative URL normalization",
+        "bounded external HTTP GET",
+        "Content-Type and Content-Disposition processing",
+        "ingest file metadata and source mode assembly"
+      ],
+      "sha256": "b03d4345224e3bdb308c69e8319c05438f53c6c815f2c03be28d348e0e8823da"
+    },
+    {
+      "bytes": 2843,
+      "lines": 87,
+      "path": "machinemind/infrastructure/cloud_tasks.py",
+      "responsibilities": [
+        "Cloud Tasks environment/default resolution",
+        "queue path construction",
+        "async index task payload and headers",
+        "task creation",
+        "historical fail-open logging"
+      ],
+      "sha256": "f9706739dd42916e8d3f850c2af92fdbab5e1359f43f4e8fc15e91bd8dbdacb8"
+    }
+  ],
+  "limitations": [
+    "No real Cloud Build or Cloud Run startup was executed by this offline artifact.",
+    "No real external file was fetched from the deployed service.",
+    "No real Cloud Tasks task was enqueued against the production queue.",
+    "No real PDF/XLSX async indexing completion was observed.",
+    "No production concurrency, latency or soak behavior was measured.",
+    "This gate proves the covered extraction contract, not complete product correctness."
+  ],
+  "live_exit_criteria": [
+    "Successful Cloud Build from the exact refactor-phase1 commit.",
+    "Healthy newest Cloud Run revision at 100 percent traffic.",
+    "/version commit_sha equals the Cloud Build Git commit and engine markers are unchanged.",
+    "Known ASK, Root Cause and Smart Diagnostic START smoke paths remain valid.",
+    "One known-good PDF or XLSX completes ingest and asynchronous indexing.",
+    "No new CLOUD_TASKS_ENQUEUE_SKIPPED, external file transport, import or infrastructure error appears for the known-good path."
+  ],
+  "mutation_checks": [
+    {
+      "contract_equal_to_parent": false,
+      "detected": true,
+      "file": "machinemind/infrastructure/document_transport.py",
+      "name": "protocol_relative_url_normalization_removed",
+      "parse_error": "",
+      "probe_returncode": 0,
+      "stderr": ""
+    },
+    {
+      "contract_equal_to_parent": false,
+      "detected": true,
+      "file": "machinemind/infrastructure/cloud_tasks.py",
+      "name": "cloud_tasks_default_queue_changed",
+      "parse_error": "",
+      "probe_returncode": 0,
+      "stderr": ""
+    },
+    {
+      "contract_equal_to_parent": false,
+      "detected": true,
+      "file": "main.py",
+      "name": "fetch_timeout_adapter_changed",
+      "parse_error": "",
+      "probe_returncode": 0,
+      "stderr": ""
+    }
+  ],
+  "new_internal_adapter": "_enqueue_document_index_task",
+  "next_phase_after_live_pass": "Roadmap Phase 3 \u2014 Ingest and Presentation",
+  "offline_results": {
+    "external_file_transport_rows": 30,
+    "external_io_parent_candidate_exact_parity": "PASS",
+    "full_ingest_cloud_tasks_scenarios": 6,
+    "gate_output": [
+      "PASS: syntax",
+      "PASS: prior_behavior_contracts",
+      "PASS: static_extraction",
+      "PASS: external_io_contract",
+      "PHASE 2E OFFLINE GATE: PASS \u2014 external document loading and Cloud Tasks dispatch were extracted without changing the frozen Commit 4 behavior covered here. This closes the planned Phase 2 infrastructure extraction offline; exact-commit build, live ingest/task dispatch and application smoke verification remain required."
+    ],
+    "historical_helper_signatures": 4,
+    "intentional_added_definitions": 1,
+    "intentional_existing_definition_changes": 5,
+    "phase1_api_scope_openapi_contract": "PASS",
+    "phase2_commit1_config_database_contract": "PASS",
+    "phase2_commit2_openai_transport_contract": "PASS",
+    "phase2_commit3_budget_execution_contract": "PASS",
+    "phase2_commit4_semantic_cache_contract": "PASS",
+    "prior_extracted_modules_byte_unchanged": "PASS",
+    "self_contained_phase2e_gate": "PASS",
+    "syntax_compile": "PASS",
+    "top_level_definition_inventory_candidate": 669,
+    "top_level_definition_inventory_parent": 668,
+    "unexpected_definition_changes": 0
+  },
+  "parent": {
+    "artifact": "MachineMind_Modularization_Phase2_Commit4_Semantic_Cache",
+    "assistant_core_sha256": "dca19aba41becaffb7c0623f52dee22863c527dbbb7dc8ee965a724a25efd00d",
+    "branch": "refactor-phase1",
+    "git_commit": "f13f8dda3bbe3be58aaa2bb86459e83403ebbcb3b",
+    "live_revision": "mm-ai-ingest-prod-00053-rfv",
+    "main_lines": 35526,
+    "main_sha256": "2c7e4750a985a4810cfb74330e5d851e2ebfd95d8908d9ff30de4c781afa074a"
+  },
+  "phase2_offline_status": "COMPLETE_PENDING_LIVE_GATE",
+  "purpose": "Behavior-preserving extraction of external ingest-file loading and asynchronous Cloud Tasks index dispatch, completing the planned Phase 2 infrastructure boundary.",
+  "roadmap_phase": "2",
+  "schema_version": "machinemind-modularization-validation-v1",
+  "static_guard": {
+    "candidate_hash_frozen": true,
+    "direct_external_file_and_cloud_tasks_implementation_removed_from_main": true,
+    "module_hashes_frozen": true,
+    "new_modules_import_main": false,
+    "parent_definition_hashes_frozen": true,
+    "semantic_cache_parent_equal": true
+  },
+  "status": "OFFLINE_VERIFIED",
+  "title": "External document transport and Cloud Tasks dispatch"
+}
