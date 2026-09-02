@@ -23865,6 +23865,16 @@ def _assistant_core_deterministic_router_fallback(
         effective_mode = MODE_ROOT_CAUSE
         information_task = INFO_FAULT_DIAGNOSTIC
         required_types = [REQ_DIAGNOSTIC_CAUSES, REQ_CHECKLIST]
+    elif request.requested_mode == MODE_SMART_DIAGNOSTIC:
+        # The Smart START endpoint owns an interactive diagnostic contract. A
+        # semantic-router failure must not degrade it into an ASK response with an
+        # empty question (Bubble would otherwise display a false in-progress 0/6
+        # session). Keep the fallback diagnostic and fail closed later if a valid
+        # guided turn cannot be generated.
+        request_kind = KIND_GUIDED_DIAGNOSTIC
+        effective_mode = MODE_SMART_DIAGNOSTIC
+        information_task = INFO_FAULT_DIAGNOSTIC
+        required_types = [REQ_DIAGNOSTIC_CAUSES, REQ_CHECKLIST]
     elif sequence:
         request_kind = KIND_FACTUAL
         effective_mode = MODE_ASK
@@ -23924,7 +23934,9 @@ def _assistant_core_deterministic_router_fallback(
         "required_facets": [q] if q else [],
         "facet_queries": [],
         "diagnostic_subsystems": [],
-        "diagnostic_observables": [],
+        "diagnostic_observables": (
+            [q] if request.requested_mode == MODE_SMART_DIAGNOSTIC and q else []
+        ),
         "diagnostic_operating_conditions": [],
         "diagnostic_discriminants": [],
         "diagnostic_exclusions": [],
@@ -33439,7 +33451,12 @@ def _assistant_core_smart_start_sync(
             top_k=top_k,
             max_causes=max_hypotheses,
             narrow_scope=False,
-            allowed_effective_modes=(MODE_ASK, MODE_SMART_DIAGNOSTIC),
+            # A Smart START call must return a valid guided-diagnostic turn.
+            # Routing it to ASK produces an answer envelope that Bubble cannot
+            # represent as an interactive session (empty question, 0/6, no
+            # hypotheses). Informational requests belong to ASK before entering
+            # this endpoint; once START is called, preserve the Smart contract.
+            allowed_effective_modes=(MODE_SMART_DIAGNOSTIC,),
             debug=bool(payload.debug),
             metadata={
                 "session_id": session_id,
@@ -33452,13 +33469,52 @@ def _assistant_core_smart_start_sync(
             },
         )
         final = _ASSISTANT_CORE_SMART_ENGINE.run(request)
-        if str(final.get("effective_mode") or "") == MODE_ASK:
-            final = _assistant_core_adapt_smart_routed_ask(final, request=request)
-        budget.route = (
-            "assistant_core_smart_to_ask"
-            if str(final.get("effective_mode") or "") == MODE_ASK
-            else "assistant_core_smart_diagnostic"
+
+        # Contract continuity guard: never publish a fake guided session.  The
+        # previous ASK adapter preserved citations but emitted question 0 with no
+        # hypotheses while status remained effectively in progress.  A genuine
+        # Smart START must either return a valid first turn/final result or an
+        # explicit no-sources/clarification/error outcome.
+        effective_mode = str(final.get("effective_mode") or "").strip().lower()
+        status_value = str(final.get("status") or "").strip().lower()
+        final_ready = bool(final.get("final_ready")) or status_value == "completed"
+        question = dict(final.get("question") or {})
+        question_text = str(
+            question.get("question_text")
+            or final.get("question_text")
+            or ""
+        ).strip()
+        question_number = _safe_int(
+            question.get("question_number"),
+            _safe_int(final.get("question_number"), 0),
         )
+        hypotheses = [
+            item for item in (final.get("hypotheses") or [])
+            if isinstance(item, dict)
+        ]
+
+        if effective_mode != MODE_SMART_DIAGNOSTIC:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "code": "SMART_DIAGNOSTIC_MODE_CONTINUITY_FAILED",
+                    "message": "Smart Diagnostic START was routed outside the guided-diagnostic contract.",
+                },
+            )
+        if (
+            status_value in {"answered", "in_progress"}
+            and not final_ready
+            and (not question_text or question_number < 1 or not hypotheses)
+        ):
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "code": "SMART_DIAGNOSTIC_INVALID_FIRST_TURN",
+                    "message": "Smart Diagnostic START did not return a valid first question and hypothesis set.",
+                },
+            )
+
+        budget.route = "assistant_core_smart_diagnostic"
         return _assistant_core_attach_runtime_meta(final, budget, debug=bool(payload.debug))
     except _V13BudgetExceeded as exc:
         budget.route = "assistant_core_smart_budget_guard"
