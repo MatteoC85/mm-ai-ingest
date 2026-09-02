@@ -1,4 +1,4 @@
-# GitHub operation — Phase 2 Commit 3
+# GitHub operation — Phase 2 Commit 4
 
 Remain on the existing branch:
 
@@ -9,15 +9,17 @@ Extract the ZIP and copy the complete contents of the extracted folder over the 
 Expected source changes:
 
 - `main.py`;
-- `machinemind/infrastructure/request_budget.py`;
-- `machinemind/infrastructure/execution.py`;
-- Phase 2C tests, probe, gate and documentation;
+- `machinemind/infrastructure/semantic_cache.py`;
+- Phase 2D tests, probe, gate and documentation;
 - validation and checksum manifests.
 
-These production files must remain unchanged from Commit 2:
+These production files must remain unchanged from Commit 3:
 
-- `machinemind/infrastructure/openai_transport.py`;
 - `assistant_core_v2.py`;
+- `machinemind/infrastructure/database.py`;
+- `machinemind/infrastructure/openai_transport.py`;
+- `machinemind/infrastructure/request_budget.py`;
+- `machinemind/infrastructure/execution.py`;
 - `Dockerfile`;
 - `cloudbuild.yaml`;
 - `requirements.txt`;
@@ -25,6 +27,6 @@ These production files must remain unchanged from Commit 2:
 
 Commit message:
 
-`refactor: extract request budgets and execution guards`
+`refactor: extract semantic cache and knowledge versioning`
 
 Then use **Commit e push**. The configured trigger will build and deploy from `refactor-phase1`.

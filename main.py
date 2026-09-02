@@ -121,6 +121,7 @@ from machinemind.infrastructure.execution import (
     run_sync_with_hard_timeout as _infra_run_sync_with_hard_timeout,
     stream_json_response as _infra_stream_json_response,
 )
+from machinemind.infrastructure import semantic_cache as _semantic_cache
 
 def _fetch_dense_chunk_candidates(
     *,
@@ -19909,6 +19910,9 @@ def _v13_json_models(
 # V13 semantic cache and knowledge versioning
 # -----------------------------------------------------------------------------
 
+# Mutable bootstrap state remains in the composition root so the historical names
+# and late-bound test/rollback controls remain available. Implementation lives in
+# ``machinemind.infrastructure.semantic_cache`` and receives this live namespace.
 _V13_CACHE_LOCK = threading.Lock()
 _V13_CACHE_READY: Optional[bool] = None
 _V13_CACHE_ERROR = ""
@@ -19916,412 +19920,53 @@ _V13_CACHE_RETRY_AT = 0.0
 
 
 def _v13_cache_bootstrap() -> bool:
-    global _V13_CACHE_READY, _V13_CACHE_ERROR, _V13_CACHE_RETRY_AT
-
-    if not V13_SEMANTIC_CACHE_ENABLED:
-        return False
-    if _V13_CACHE_READY is True:
-        return True
-    now = time_module.monotonic()
-    if _V13_CACHE_READY is False and now < float(_V13_CACHE_RETRY_AT or 0.0):
-        return False
-
-    with _V13_CACHE_LOCK:
-        now = time_module.monotonic()
-        if _V13_CACHE_READY is True:
-            return True
-        if _V13_CACHE_READY is False and now < float(_V13_CACHE_RETRY_AT or 0.0):
-            return False
-        if _V13_CACHE_READY is False:
-            _V13_CACHE_READY = None
-        if not V13_SEMANTIC_CACHE_AUTO_DDL:
-            _V13_CACHE_READY = True
-            return True
-
-        conn = None
-        try:
-            conn = _db_conn()
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS public.mm_v13_knowledge_versions (
-                        company_id TEXT PRIMARY KEY,
-                        version BIGINT NOT NULL DEFAULT 1,
-                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                    );
-                    """
-                )
-                cur.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS public.mm_v13_semantic_cache (
-                        id BIGSERIAL PRIMARY KEY,
-                        company_id TEXT NOT NULL,
-                        machine_id TEXT NOT NULL DEFAULT '',
-                        ai_scope TEXT NOT NULL,
-                        scope_key TEXT NOT NULL,
-                        mode TEXT NOT NULL,
-                        language TEXT NOT NULL,
-                        engine_key TEXT NOT NULL DEFAULT '',
-                        knowledge_version BIGINT NOT NULL,
-                        query_hash TEXT,
-                        query_text TEXT NOT NULL,
-                        query_embedding JSONB NOT NULL,
-                        response_json JSONB NOT NULL,
-                        quality_score DOUBLE PRECISION NOT NULL,
-                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                        expires_at TIMESTAMPTZ NOT NULL
-                    );
-                    """
-                )
-                cur.execute(
-                    """
-                    ALTER TABLE public.mm_v13_semantic_cache
-                        ADD COLUMN IF NOT EXISTS engine_key TEXT NOT NULL DEFAULT '',
-                        ADD COLUMN IF NOT EXISTS query_hash TEXT;
-                    """
-                )
-                cur.execute(
-                    """
-                    UPDATE public.mm_v13_semantic_cache
-                    SET query_hash = 'legacy:' || md5(
-                        COALESCE(engine_key, '') || E'\n' ||
-                        COALESCE(query_text, '') || E'\n' || id::text
-                    )
-                    WHERE query_hash IS NULL OR btrim(query_hash) = '';
-                    """
-                )
-                cur.execute(
-                    """
-                    DELETE FROM public.mm_v13_semantic_cache older
-                    USING public.mm_v13_semantic_cache newer
-                    WHERE older.id < newer.id
-                      AND older.company_id = newer.company_id
-                      AND older.machine_id = newer.machine_id
-                      AND older.ai_scope = newer.ai_scope
-                      AND older.scope_key = newer.scope_key
-                      AND older.mode = newer.mode
-                      AND older.language = newer.language
-                      AND older.engine_key = newer.engine_key
-                      AND older.knowledge_version = newer.knowledge_version
-                      AND older.query_hash = newer.query_hash;
-                    """
-                )
-                cur.execute(
-                    """
-                    ALTER TABLE public.mm_v13_semantic_cache
-                        ALTER COLUMN query_hash SET NOT NULL;
-                    """
-                )
-                cur.execute(
-                    """
-                    ALTER TABLE public.mm_v13_semantic_cache
-                        DROP CONSTRAINT IF EXISTS mm_v13_semantic_cache_exact_key;
-                    """
-                )
-                cur.execute(
-                    """
-                    CREATE UNIQUE INDEX IF NOT EXISTS uq_mm_v13_semantic_cache_key
-                    ON public.mm_v13_semantic_cache (
-                        company_id, machine_id, ai_scope, scope_key,
-                        mode, language, engine_key, knowledge_version, query_hash
-                    );
-                    """
-                )
-                cur.execute(
-                    """
-                    CREATE INDEX IF NOT EXISTS idx_mm_v13_semantic_cache_lookup
-                    ON public.mm_v13_semantic_cache (
-                        company_id, machine_id, ai_scope, scope_key,
-                        mode, language, engine_key, knowledge_version, expires_at DESC
-                    );
-                    """
-                )
-            conn.commit()
-            _V13_CACHE_READY = True
-            _V13_CACHE_ERROR = ""
-            _V13_CACHE_RETRY_AT = 0.0
-        except Exception as exc:
-            if conn is not None:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-            _V13_CACHE_READY = False
-            _V13_CACHE_ERROR = str(exc)[:800]
-            _V13_CACHE_RETRY_AT = time_module.monotonic() + float(V13_SEMANTIC_CACHE_BOOTSTRAP_RETRY_SECONDS)
-            print("V13_CACHE_BOOTSTRAP_RETRY", _V13_CACHE_ERROR)
-        finally:
-            if conn is not None:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-
-    return bool(_V13_CACHE_READY)
+    return _semantic_cache.cache_bootstrap(globals())
 
 
 def _v13_normalize_query(value: str) -> str:
-    value = _normalize_unicode_advanced(str(value or "")).lower()
-    value = re.sub(r"\s+", " ", value).strip()
-    return value
+    return _semantic_cache.normalize_query(value, globals())
 
 
 def _v13_scope_key(scope: dict) -> str:
-    doc_ids = _normalize_document_ids(scope.get("document_ids")) or []
-    bubble_document_id = str(scope.get("bubble_document_id") or "").strip()
-    payload = {
-        "ai_scope": str(scope.get("ai_scope") or "machine_all"),
-        "bubble_document_id": bubble_document_id,
-        "document_ids": sorted(doc_ids),
-        "top_k": _safe_int(scope.get("_v13_top_k"), 0),
-        "max_causes": _safe_int(scope.get("_v13_max_causes"), 0),
-    }
-    return hashlib.sha256(
-        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
-    ).hexdigest()[:40]
+    return _semantic_cache.scope_key(scope, globals())
 
 
 def _v13_get_knowledge_version(company_id: str) -> int:
-    if not _v13_cache_bootstrap():
-        return 0
-    company_id = str(company_id or "").strip()
-    if not company_id:
-        return 0
-
-    conn = None
-    try:
-        conn = _db_conn()
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO public.mm_v13_knowledge_versions(company_id, version, updated_at)
-                VALUES (%s, 1, NOW())
-                ON CONFLICT (company_id) DO NOTHING;
-                """,
-                (company_id,),
-            )
-            cur.execute(
-                "SELECT version FROM public.mm_v13_knowledge_versions WHERE company_id=%s;",
-                (company_id,),
-            )
-            row = cur.fetchone()
-        conn.commit()
-        return int((row or [1])[0] or 1)
-    except Exception as exc:
-        if conn is not None:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-        print("V13_CACHE_VERSION_FAIL_OPEN", str(exc)[:500])
-        return 0
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
+    return _semantic_cache.get_knowledge_version(company_id, globals())
 
 
 def _v13_bump_knowledge_version(company_id: str) -> None:
-    company_id = str(company_id or "").strip()
-    if not company_id or not _v13_cache_bootstrap():
-        return
-
-    conn = _db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO public.mm_v13_knowledge_versions(company_id, version, updated_at)
-                VALUES (%s, 1, NOW())
-                ON CONFLICT (company_id)
-                DO UPDATE SET version = public.mm_v13_knowledge_versions.version + 1,
-                              updated_at = NOW();
-                """,
-                (company_id,),
-            )
-            cur.execute(
-                "DELETE FROM public.mm_v13_semantic_cache WHERE company_id=%s;",
-                (company_id,),
-            )
-        conn.commit()
-    finally:
-        conn.close()
+    return _semantic_cache.bump_knowledge_version(company_id, globals())
 
 
 def _v13_invalidate_company_knowledge(company_id: str) -> None:
-    try:
-        _v13_bump_knowledge_version(company_id)
-    except Exception as exc:
-        # Cache invalidation must never break ingest/delete/indexing.
-        print("V13_CACHE_INVALIDATION_SKIPPED", str(exc)[:500])
+    return _semantic_cache.invalidate_company_knowledge(company_id, globals())
 
 
 def _v13_cache_code_tokens(q: str) -> list[str]:
-    """Return only identifier-like tokens that are safe semantic-cache guards.
-
-    The generic retrieval helper intentionally accepts title-case words such as
-    ``Protection`` as potential codes. That is useful for recall, but too strict for
-    cache compatibility: harmless paraphrases or capitalization changes would miss.
-    Here we keep only tokens that look like actual industrial identifiers: tokens
-    containing digits/separators, or acronyms written fully in uppercase.
-    """
-    text = _normalize_unicode_advanced(q or "")
-    raw = re.findall(r"(?<![A-Za-z0-9])[A-Za-z0-9][A-Za-z0-9_.:/\-]{1,63}(?![A-Za-z0-9])", text)
-    out: list[str] = []
-    seen: set[str] = set()
-    for token in raw:
-        token = str(token or "").strip("._:/-")
-        if not token or token.isdigit():
-            continue
-        letters = "".join(ch for ch in token if ch.isalpha())
-        has_digit = any(ch.isdigit() for ch in token)
-        has_separator = any(ch in "_./:-" for ch in token)
-        is_acronym = bool(letters) and len(letters) >= 2 and letters.upper() == letters
-        if not (has_digit or has_separator or is_acronym):
-            continue
-        key = token.upper()
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(key)
-    return sorted(out)
+    return _semantic_cache.cache_code_tokens(q, globals())
 
 
 def _v13_query_number_tokens(q: str) -> list[str]:
-    """Extract numeric constraints without swallowing ordinary following words.
-
-    The previous broad ``[A-Za-z]{1,8}`` suffix treated Italian ``1 a ogni ciclo``
-    as the quantity ``1a``. Numeric equality is a hard cache-safety guard, so that
-    false unit changed a safe paraphrase into a miss. Units are now accepted only
-    from a conservative industrial whitelist; single-letter electrical units remain
-    case-sensitive (``A``, ``V``, ``W``), avoiding the Italian article ``a``.
-    """
-    text = _normalize_unicode_advanced(q or "")
-    number_rx = re.compile(r"(?<![A-Za-z0-9])[-+]?\d+(?:[.,]\d+)?(?![A-Za-z0-9])")
-    # Longest first. Multi-letter units are matched case-insensitively below; the
-    # single-letter electrical units are handled separately and must be uppercase.
-    multi_units = [
-        "mm/min", "mm/sec", "mm/s", "m/min", "m/sec", "m/s", "l/min", "ml/min",
-        "mm2", "mm²", "cm2", "cm²", "m2", "m²", "mm3", "mm³", "cm3", "cm³", "m3", "m³",
-        "khz", "mhz", "hz", "rpm", "mbar", "kpa", "mpa", "psi", "bar", "pa",
-        "kwh", "kw", "mw", "ma", "ka", "mv", "kv", "nm", "kn",
-        "kg", "mg", "ml", "min", "ms", "µs", "us", "mm", "cm", "km",
-        "deg", "sec",
-    ]
-    multi_unit_rx = re.compile(
-        r"^\s*(" + "|".join(re.escape(x) for x in multi_units) + r")(?![A-Za-z0-9])",
-        flags=re.IGNORECASE,
-    )
-    symbol_unit_rx = re.compile(r"^\s*(%|°\s*[CFcf]?)(?![A-Za-z0-9])")
-    uppercase_single_rx = re.compile(r"^\s*([AVWNF])(?=$|[^A-Za-z0-9])")
-    lowercase_single_rx = re.compile(r"^\s*([smghl])(?=$|[^A-Za-z0-9])")
-
-    values: set[str] = set()
-    for match in number_rx.finditer(text):
-        number = str(match.group(0) or "").replace(",", ".")
-        tail = text[match.end(): match.end() + 24]
-        unit = ""
-        unit_match = symbol_unit_rx.match(tail)
-        if unit_match:
-            unit = re.sub(r"\s+", "", unit_match.group(1)).lower()
-        else:
-            unit_match = multi_unit_rx.match(tail)
-            if unit_match:
-                unit = re.sub(r"\s+", "", unit_match.group(1)).lower()
-            else:
-                unit_match = uppercase_single_rx.match(tail)
-                if unit_match:
-                    unit = unit_match.group(1).lower()
-                else:
-                    unit_match = lowercase_single_rx.match(tail)
-                    if unit_match:
-                        unit = unit_match.group(1).lower()
-        values.add(number.lower() + unit)
-    return sorted(values)
+    return _semantic_cache.query_number_tokens(q, globals())
 
 
 def _v13_query_polarity_signature(q: str) -> tuple[str, ...]:
-    low = f" {_v13_normalize_query(q)} "
-    groups = {
-        "negation": [" non ", " not ", " no ", " senza ", " without ", " never ", " mai "],
-        "exclusive": [" solo ", " soltanto ", " only ", " esclusivamente ", " exclusively "],
-        "exception": [" tranne ", " eccetto ", " except ", " excluding ", " escluso "],
-        "before": [" prima ", " before ", " preventiv", " preliminar"],
-        "after": [" dopo ", " after ", " al termine ", " completed", " complet"],
-    }
-    return tuple(sorted(name for name, markers in groups.items() if any(marker in low for marker in markers)))
+    return _semantic_cache.query_polarity_signature(q, globals())
 
 
 def _v13_query_source_signature(q: str) -> tuple[str, str]:
-    try:
-        profile = _ask_source_preference_profile(q)
-        return (
-            str(profile.get("preferred_source") or ""),
-            str(profile.get("strength") or "none"),
-        )
-    except Exception:
-        return ("", "none")
+    return _semantic_cache.query_source_signature(q, globals())
 
 
 def _v13_semantic_cache_compatible(mode: str, current_q: str, cached_q: str) -> bool:
-    current_norm = _v13_normalize_query(current_q)
-    cached_norm = _v13_normalize_query(cached_q)
-    if not current_norm or not cached_norm:
-        return False
-
-    ratio = len(current_norm) / max(1, len(cached_norm))
-    if ratio < 0.55 or ratio > 1.80:
-        return False
-
-    current_codes = set(_v13_cache_code_tokens(current_q))
-    cached_codes = set(_v13_cache_code_tokens(cached_q))
-    if current_codes != cached_codes:
-        return False
-
-    if _v13_query_number_tokens(current_q) != _v13_query_number_tokens(cached_q):
-        return False
-
-    if _v13_query_polarity_signature(current_q) != _v13_query_polarity_signature(cached_q):
-        return False
-
-    if _v13_query_source_signature(current_q) != _v13_query_source_signature(cached_q):
-        return False
-
-    # Embedding similarity alone is not enough for industrial diagnostics. Require
-    # strong lexical-anchor preservation, especially when the symptom does not fall
-    # into one of the predefined broad classes.
-    current_terms = _content_term_set(current_q, limit=60)
-    cached_terms = _content_term_set(cached_q, limit=60)
-    if current_norm != cached_norm:
-        if min(len(current_terms), len(cached_terms)) <= 2:
-            return False
-        anchor_ratio = len(current_terms & cached_terms) / max(1, min(len(current_terms), len(cached_terms)))
-        minimum_anchor_ratio = 0.70 if str(mode or "") == "root_cause" else 0.55
-        if anchor_ratio < minimum_anchor_ratio:
-            return False
-
-    if str(mode or "") == "root_cause":
-        current_profile = _query_symptom_profile(current_q)
-        cached_profile = _query_symptom_profile(cached_q)
-        if set(current_profile.get("classes") or []) != set(cached_profile.get("classes") or []):
-            return False
-        if bool(current_profile.get("automatic_mode")) != bool(cached_profile.get("automatic_mode")):
-            return False
-
-    return True
+    return _semantic_cache.semantic_cache_compatible(
+        mode, current_q, cached_q, globals()
+    )
 
 
 def _v13_jsonb_to_python(value: Any, fallback: Any) -> Any:
-    if value is None:
-        return fallback
-    if isinstance(value, (dict, list)):
-        return value
-    try:
-        return json.loads(str(value))
-    except Exception:
-        return fallback
+    return _semantic_cache.jsonb_to_python(value, fallback)
 
 
 def _v13_cache_lookup(
@@ -20334,246 +19979,25 @@ def _v13_cache_lookup(
     language: str,
     debug: bool,
 ) -> Optional[dict]:
-    budget = _v13_current_budget()
-    if budget is not None:
-        budget.semantic_cache = "bypass_debug" if debug else "miss"
-    if debug or not V13_SEMANTIC_CACHE_ENABLED or not _v13_cache_bootstrap():
-        return None
-
-    knowledge_version = _v13_get_knowledge_version(company_id)
-    if knowledge_version <= 0:
-        return None
-
-    scope_key = _v13_scope_key(scope)
-    ai_scope = str(scope.get("ai_scope") or "machine_all")
-    machine_key = str(machine_id or "")
-
-    # Phase 1 intentionally does not fetch JSON embeddings. Most cached questions are
-    # rejected by deterministic code/number/polarity/source guards, so transferring
-    # dozens of 1,536-float arrays on every request would add avoidable DB latency.
-    conn = None
-    try:
-        conn = _db_conn()
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT id, query_text, response_json, quality_score, created_at
-                FROM public.mm_v13_semantic_cache
-                WHERE company_id=%s
-                  AND machine_id=%s
-                  AND ai_scope=%s
-                  AND scope_key=%s
-                  AND mode=%s
-                  AND language=%s
-                  AND engine_key=%s
-                  AND knowledge_version=%s
-                  AND expires_at > NOW()
-                  AND quality_score >= %s
-                ORDER BY created_at DESC
-                LIMIT %s;
-                """,
-                (
-                    company_id,
-                    machine_key,
-                    ai_scope,
-                    scope_key,
-                    mode,
-                    language,
-                    V13_ENGINE_KEY,
-                    knowledge_version,
-                    V13_SEMANTIC_CACHE_MIN_QUALITY,
-                    V13_SEMANTIC_CACHE_SCAN_LIMIT,
-                ),
-            )
-            rows = cur.fetchall()
-    except Exception as exc:
-        print("V13_CACHE_LOOKUP_FAIL_OPEN", str(exc)[:500])
-        return None
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-    if not rows:
-        return None
-
-    threshold = (
-        V13_SEMANTIC_CACHE_THRESHOLD_ROOT_CAUSE
-        if mode == "root_cause"
-        else V13_SEMANTIC_CACHE_THRESHOLD_ASK
+    return _semantic_cache.cache_lookup(
+        mode=mode,
+        q=q,
+        company_id=company_id,
+        machine_id=machine_id,
+        scope=scope,
+        language=language,
+        debug=debug,
+        runtime_globals=globals(),
     )
-    best: Optional[tuple[float, dict, float, Any]] = None
-    current_norm = _v13_normalize_query(q)
-
-    # Exact normalized reuse is safe after scope/engine/knowledge filtering and avoids
-    # both an embedding round-trip and reading stored embedding arrays.
-    for _row_id, cached_q, response_json, quality_score, created_at in rows:
-        if _v13_normalize_query(str(cached_q or "")) != current_norm:
-            continue
-        response = _v13_jsonb_to_python(response_json, {})
-        if isinstance(response, dict) and response.get("ok") is True:
-            best = (1.0, response, float(quality_score or 0.0), created_at)
-            break
-
-    if best is None:
-        compatible_rows = [
-            row for row in rows
-            if _v13_semantic_cache_compatible(mode, q, str(row[1] or ""))
-        ]
-        if not compatible_rows:
-            return None
-
-        try:
-            q_vec = _openai_embed_texts([q], timeout=10)[0]
-        except Exception as exc:
-            print("V13_CACHE_EMBED_LOOKUP_FAIL", str(exc)[:500])
-            return None
-
-        ids = [int(row[0]) for row in compatible_rows]
-        embedding_by_id: dict[int, list] = {}
-        conn = None
-        try:
-            conn = _db_conn()
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT id, query_embedding
-                    FROM public.mm_v13_semantic_cache
-                    WHERE id = ANY(%s);
-                    """,
-                    (ids,),
-                )
-                for row_id, embedding_json in cur.fetchall():
-                    embedding = _v13_jsonb_to_python(embedding_json, [])
-                    if isinstance(embedding, list) and embedding:
-                        embedding_by_id[int(row_id)] = embedding
-        except Exception as exc:
-            print("V13_CACHE_VECTOR_FETCH_FAIL_OPEN", str(exc)[:500])
-            return None
-        finally:
-            if conn is not None:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-
-        for row_id, _cached_q, response_json, quality_score, created_at in compatible_rows:
-            embedding = embedding_by_id.get(int(row_id)) or []
-            if not embedding:
-                continue
-            try:
-                similarity = float(_cosine_sim(q_vec, [float(x) for x in embedding]))
-            except Exception:
-                continue
-            if similarity < threshold:
-                continue
-            response = _v13_jsonb_to_python(response_json, {})
-            if not isinstance(response, dict) or response.get("ok") is not True:
-                continue
-            candidate = (similarity, response, float(quality_score or 0.0), created_at)
-            if best is None or candidate[0] > best[0]:
-                best = candidate
-
-    if best is None:
-        return None
-
-    similarity, response, quality_score, created_at = best
-    out = dict(response)
-    citations = list(out.get("citations") or [])
-    try:
-        out["rg_links"] = _build_rg_links(company_id, citations) if citations else []
-    except Exception as exc:
-        print("V13_CACHE_LINK_REFRESH_FAIL", str(exc)[:500])
-        out["rg_links"] = []
-
-    meta = dict(out.get("meta") or {})
-    meta["v13_semantic_cache"] = {
-        "hit": True,
-        "similarity": round(similarity, 6),
-        "quality_score": round(quality_score, 4),
-        "created_at": str(created_at or ""),
-        "knowledge_version": knowledge_version,
-    }
-    out["meta"] = meta
-    out["chat_model"] = "v13_semantic_cache"
-
-    if budget is not None:
-        budget.semantic_cache = "hit"
-        budget.route = "semantic_cache"
-    return out
 
 
 def _v13_response_quality(mode: str, response: dict) -> float:
-    if not isinstance(response, dict) or response.get("ok") is not True:
-        return 0.0
-    if str(response.get("status") or "").lower() != "answered":
-        return 0.0
-
-    citations = [c for c in (response.get("citations") or []) if isinstance(c, dict) and c.get("citation_id")]
-    if not citations:
-        return 0.0
-
-    if mode == "root_cause":
-        causes = [c for c in (response.get("possible_causes") or []) if isinstance(c, dict)]
-        if not causes:
-            return 0.0
-        grounded = sum(1 for c in causes if c.get("cause") and c.get("why") and c.get("citations"))
-        checks = sum(len(c.get("checks") or []) for c in causes)
-        quality = 0.68 + min(0.16, 0.06 * grounded) + min(0.10, 0.025 * checks)
-        if len({_root_cause_evidence_family_key(cit) for cit in citations}) >= 2:
-            quality += 0.04
-        return max(0.0, min(0.98, quality))
-
-    answer = str(response.get("answer") or "").strip()
-    if len(answer) < 32:
-        return 0.0
-    quality = 0.72 + min(0.12, len(citations) * 0.025)
-    if any(bool(c.get("exact_machine_scope")) for c in citations):
-        quality += 0.04
-    if any(str(c.get("evidence_role") or "") in {"procedure", "step", "manual_support"} for c in citations):
-        quality += 0.05
-    return max(0.0, min(0.98, quality))
-
+    return _semantic_cache.response_quality(mode, response, globals())
 
 
 def _assistant_core_cache_certified(mode: str, response: dict) -> bool:
-    """Only fully validated canonical responses may enter any response cache."""
-    if not isinstance(response, dict) or response.get("ok") is not True:
-        return False
-    if str(response.get("status") or "").strip().lower() != "answered":
-        return False
-    meta = response.get("meta") if isinstance(response.get("meta"), dict) else {}
-    if not bool(meta.get("canonical_final_answer")):
-        return False
-    citations = [c for c in (response.get("citations") or []) if isinstance(c, dict)]
-    if not citations and str(response.get("grounding") or "") != "general_technical_knowledge":
-        return False
-    mode_key = str(mode or response.get("effective_mode") or "ask").strip().lower()
-    if mode_key == "root_cause":
-        causes = [c for c in (response.get("possible_causes") or []) if isinstance(c, dict) and str(c.get("cause") or "").strip()]
-        if not causes:
-            return False
-        valid_ids = {str(c.get("citation_id") or "").strip() for c in citations if str(c.get("citation_id") or "").strip()}
-        for cause in causes:
-            own = {str(x or "").strip() for x in (cause.get("citation_ids") or []) if str(x or "").strip()}
-            # When the backend does not expose per-cause ids, require at least a
-            # non-empty explanation and checks plus a global evidence manifest.
-            if own and not (own & valid_ids):
-                return False
-            if not str(cause.get("why") or "").strip() or not list(cause.get("checks") or []):
-                return False
-        return True
-    validation = meta.get("assistant_core_validation") if isinstance(meta.get("assistant_core_validation"), dict) else {}
-    contract = validation.get("answer_contract") if isinstance(validation.get("answer_contract"), dict) else {}
-    if not bool(contract.get("passed")):
-        return False
-    if contract.get("missing_answer_facets") or contract.get("missing_evidence_facets") or contract.get("missing_list_items"):
-        return False
-    if not str(response.get("answer") or "").strip() or not str(response.get("answer_html") or "").strip():
-        return False
-    return True
+    return _semantic_cache.assistant_core_cache_certified(mode, response)
+
 
 def _v13_cache_store(
     *,
@@ -20586,128 +20010,17 @@ def _v13_cache_store(
     response: dict,
     debug: bool,
 ) -> None:
-    if debug or not V13_SEMANTIC_CACHE_ENABLED or not _v13_cache_bootstrap():
-        return
-    if not _assistant_core_cache_certified(mode, response):
-        return
-    response_meta = response.get("meta") or {}
-    if response_meta.get("cacheable") is False or response_meta.get("semantic_cacheable") is False:
-        return
-
-    quality = _v13_response_quality(mode, response)
-    if quality < V13_SEMANTIC_CACHE_MIN_QUALITY:
-        return
-
-    # Never delay an already-completed user response by purchasing a new embedding
-    # solely for cache storage. Normal retrieval has already embedded the original
-    # query; if that vector is unavailable, skip this optional cache write.
-    budget = _v13_current_budget()
-    if budget is not None and (OPENAI_EMBED_MODEL, str(q or "")) not in budget.embedding_cache:
-        return
-
-    try:
-        embedding = _openai_embed_texts([q], timeout=10)[0]
-    except Exception as exc:
-        print("V13_CACHE_EMBED_STORE_FAIL", str(exc)[:500])
-        return
-
-    knowledge_version = _v13_get_knowledge_version(company_id)
-    if knowledge_version <= 0:
-        return
-
-    normalized_q = _v13_normalize_query(q)
-    query_hash = hashlib.sha256((V13_ENGINE_KEY + "\n" + normalized_q).encode("utf-8")).hexdigest()
-    ai_scope = str(scope.get("ai_scope") or "machine_all")
-    scope_key = _v13_scope_key(scope)
-    machine_key = str(machine_id or "")
-
-    stored_response = dict(response)
-    stored_response.pop("debug", None)
-    # Links are refreshed on every cache hit, avoiding stale signed URLs.
-    stored_response["rg_links"] = []
-    meta = dict(stored_response.get("meta") or {})
-    meta.pop("v13_runtime", None)
-    meta.pop("v13_semantic_cache", None)
-    stored_response["meta"] = meta
-
-    conn = None
-    try:
-        conn = _db_conn()
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO public.mm_v13_semantic_cache(
-                    company_id, machine_id, ai_scope, scope_key,
-                    mode, language, engine_key, knowledge_version,
-                    query_hash, query_text, query_embedding,
-                    response_json, quality_score, created_at, expires_at
-                )
-                VALUES (
-                    %s, %s, %s, %s,
-                    %s, %s, %s, %s,
-                    %s, %s, %s::jsonb,
-                    %s::jsonb, %s, NOW(), NOW() + (%s * INTERVAL '1 second')
-                )
-                ON CONFLICT (
-                    company_id, machine_id, ai_scope, scope_key,
-                    mode, language, engine_key, knowledge_version, query_hash
-                )
-                DO UPDATE SET
-                    engine_key=EXCLUDED.engine_key,
-                    query_text=EXCLUDED.query_text,
-                    query_embedding=EXCLUDED.query_embedding,
-                    response_json=EXCLUDED.response_json,
-                    quality_score=EXCLUDED.quality_score,
-                    created_at=NOW(),
-                    expires_at=EXCLUDED.expires_at;
-                """,
-                (
-                    company_id,
-                    machine_key,
-                    ai_scope,
-                    scope_key,
-                    mode,
-                    language,
-                    V13_ENGINE_KEY,
-                    knowledge_version,
-                    query_hash,
-                    q,
-                    json.dumps(embedding),
-                    json.dumps(stored_response, ensure_ascii=False),
-                    quality,
-                    V13_SEMANTIC_CACHE_TTL_SECONDS,
-                ),
-            )
-            cur.execute(
-                "DELETE FROM public.mm_v13_semantic_cache WHERE expires_at <= NOW();"
-            )
-            cur.execute(
-                """
-                DELETE FROM public.mm_v13_semantic_cache
-                WHERE id IN (
-                    SELECT id
-                    FROM public.mm_v13_semantic_cache
-                    WHERE company_id=%s
-                    ORDER BY created_at DESC
-                    OFFSET %s
-                );
-                """,
-                (company_id, V13_SEMANTIC_CACHE_MAX_ROWS_PER_COMPANY),
-            )
-        conn.commit()
-    except Exception as exc:
-        if conn is not None:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-        print("V13_CACHE_STORE_FAIL_OPEN", str(exc)[:500])
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
+    return _semantic_cache.cache_store(
+        mode=mode,
+        q=q,
+        company_id=company_id,
+        machine_id=machine_id,
+        scope=scope,
+        language=language,
+        response=response,
+        debug=debug,
+        runtime_globals=globals(),
+    )
 
 
 # -----------------------------------------------------------------------------

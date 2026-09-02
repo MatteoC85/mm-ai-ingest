@@ -1,0 +1,199 @@
+{
+  "candidate": {
+    "assistant_core_sha256": "dca19aba41becaffb7c0623f52dee22863c527dbbb7dc8ee965a724a25efd00d",
+    "main_lines": 35526,
+    "main_net_line_reduction": 687,
+    "main_sha256": "2c7e4750a985a4810cfb74330e5d851e2ebfd95d8908d9ff30de4c781afa074a"
+  },
+  "commit_in_phase": 4,
+  "commit_title": "refactor: extract semantic cache and knowledge versioning",
+  "commit_unit": "2D",
+  "compatibility_surface": [
+    "_v13_cache_bootstrap",
+    "_v13_normalize_query",
+    "_v13_scope_key",
+    "_v13_get_knowledge_version",
+    "_v13_bump_knowledge_version",
+    "_v13_invalidate_company_knowledge",
+    "_v13_cache_code_tokens",
+    "_v13_query_number_tokens",
+    "_v13_query_polarity_signature",
+    "_v13_query_source_signature",
+    "_v13_semantic_cache_compatible",
+    "_v13_jsonb_to_python",
+    "_v13_cache_lookup",
+    "_v13_response_quality",
+    "_assistant_core_cache_certified",
+    "_v13_cache_store"
+  ],
+  "created_date": "2026-09-02",
+  "explicit_non_changes": [
+    "cache thresholds, TTL, scan limits, SQL and conflict keys",
+    "cache compatibility, quality and certification policy",
+    "API routes and Pydantic request contracts",
+    "assistant_core_v2.py",
+    "OpenAI transport and request-budget behavior",
+    "prompts and model policy",
+    "retrieval, evidence admission and source priorities",
+    "ASK, Root Cause and Smart Diagnostic reasoning",
+    "PDF/XLSX ingest behavior",
+    "citation, link and UI rendering contracts",
+    "Dockerfile, cloudbuild.yaml, requirements.txt and mm_promotion_gate.py"
+  ],
+  "extracted_module": {
+    "bytes": 32430,
+    "lines": 855,
+    "path": "machinemind/infrastructure/semantic_cache.py",
+    "responsibilities": [
+      "semantic-cache bootstrap and optional DDL",
+      "bootstrap retry/cooldown state",
+      "company knowledge-version read, bump and invalidation",
+      "identifier, numeric, polarity and source compatibility guards",
+      "exact and embedding-based cache lookup",
+      "RG-link refresh on cache hits",
+      "response quality and canonical admission",
+      "cache response sanitization, TTL and per-company pruning",
+      "fail-open lookup, storage and invalidation behavior"
+    ],
+    "sha256": "ad36cb4cfab80a3eef291d2f1463a4a9dec5017514ded6ef514cb236494d4971"
+  },
+  "limitations": [
+    "No real Cloud Build or Cloud Run startup was executed in this offline environment.",
+    "No real Cloud SQL DDL, cache read or cache write was executed.",
+    "No real embedding request was sent for a semantic cache hit.",
+    "No production concurrency, latency or soak behavior was measured.",
+    "This gate verifies the extracted cache contract and is not a full product certification."
+  ],
+  "live_exit_criteria": [
+    "Successful Cloud Build from the exact refactor-phase1 commit.",
+    "Healthy newest Cloud Run revision at 100 percent traffic.",
+    "/version commit_sha equals the Cloud Build Git commit and engine markers are unchanged.",
+    "Known ASK, Root Cause and Smart Diagnostic START paths retain valid grounded response shapes.",
+    "A repeated grounded request produces no new cache bootstrap, lookup, vector-fetch or store failure in Cloud Run logs."
+  ],
+  "mutation_checks": [
+    {
+      "behavioral_probe": "DETECTED",
+      "mutation": "identifier/code compatibility guard removed"
+    },
+    {
+      "behavioral_probe": "DETECTED",
+      "mutation": "stale RG links retained in stored response"
+    },
+    {
+      "behavioral_probe": "DETECTED",
+      "mutation": "bootstrap retry window changed"
+    }
+  ],
+  "next_boundary_after_live_pass": "Cloud Tasks dispatch and shared external-file HTTP transport, completing Roadmap Phase 2 Infrastructure.",
+  "offline_results": {
+    "bootstrap_and_ddl_paths": "PASS",
+    "budget_metadata_and_embedding_guard_paths": "PASS",
+    "cache_store_admission_sanitization_sql_paths": "PASS",
+    "compatibility_guard_paths": "PASS",
+    "exact_and_semantic_lookup_paths": "PASS",
+    "fail_open_paths": "PASS",
+    "historical_surface_names_and_signatures": 16,
+    "intentional_wrapper_definition_changes": 16,
+    "knowledge_version_and_invalidation_paths": "PASS",
+    "phase1_api_scope_openapi_contract": "PASS",
+    "phase2_commit1_config_database_contract": "PASS",
+    "phase2_commit2_openai_transport_contract": "PASS",
+    "phase2_commit3_budget_execution_contract": "PASS",
+    "self_contained_phase2d_gate": "PASS",
+    "semantic_cache_parent_candidate_exact_parity": "PASS",
+    "syntax_compile": "PASS",
+    "top_level_definition_inventory": "668/668",
+    "unexpected_top_level_definition_changes": 0
+  },
+  "parent": {
+    "artifact": "MachineMind_Modularization_Phase2_Commit3_Request_Budget_Execution",
+    "assistant_core_sha256": "dca19aba41becaffb7c0623f52dee22863c527dbbb7dc8ee965a724a25efd00d",
+    "branch": "refactor-phase1",
+    "git_commit": "not asserted by offline artifact; use Cloud Build and /version",
+    "main_lines": 36213,
+    "main_sha256": "79192cb387d13a4ab0194d2e3387330199b7596e7fc8b1f3dfe2980f326bb5b2"
+  },
+  "purpose": "Behavior-preserving extraction of semantic response caching, compatibility guards, per-company knowledge versions and cache invalidation.",
+  "roadmap_phase": "2",
+  "schema_version": "machinemind-modularization-validation-v1",
+  "static_guard": {
+    "cache_sql_removed_from_main": true,
+    "candidate_hash_frozen": true,
+    "module_hash_frozen": true,
+    "module_imports_main": false,
+    "mutable_bootstrap_state_retained_in_main": true
+  },
+  "status": "OFFLINE_VERIFIED",
+  "title": "Semantic cache and knowledge versioning",
+  "unchanged_production_files": {
+    "Dockerfile": {
+      "parent_equal": true,
+      "sha256": "c3b450e3013ccb032254179d4dde2c0f00e06a5354875315b03c15e7034fe424"
+    },
+    "assistant_core_v2.py": {
+      "parent_equal": true,
+      "sha256": "dca19aba41becaffb7c0623f52dee22863c527dbbb7dc8ee965a724a25efd00d"
+    },
+    "cloudbuild.yaml": {
+      "parent_equal": true,
+      "sha256": "63f6396a33c8c065d5174fa2568e34d5aa324ae21045ecd855b3f3cd4b58f9a8"
+    },
+    "machinemind/api/contracts.py": {
+      "parent_equal": true,
+      "sha256": "480a95b5eae3952f0092636aa7fa0c0c60e650f5eb8df9f1e257b2d8507ab06d"
+    },
+    "machinemind/architecture/baseline_guard.py": {
+      "parent_equal": true,
+      "sha256": "636cb7cfaa2211082b99ffb4762247419278658a8b826dbc57e3f05ad0564a86"
+    },
+    "machinemind/config/assistant_runtime.py": {
+      "parent_equal": true,
+      "sha256": "428ccc3c6875be503d07016bb136b9b90973ac1df5d1a8b21a91222405f58656"
+    },
+    "machinemind/config/baseline.py": {
+      "parent_equal": true,
+      "sha256": "dddd1ce4c20b77d7a303c775a92d7655e3727174b5b1ddbcda2a25c277b9c8ca"
+    },
+    "machinemind/config/runtime.py": {
+      "parent_equal": true,
+      "sha256": "e85bf9ac94e2fe31caf10e6d5f3be3266f305d2d054ccbe0c60294ed10d58c28"
+    },
+    "machinemind/config/shadow_runtime.py": {
+      "parent_equal": true,
+      "sha256": "3a3a707cbde94b1a99758e2adb070f508abc6befb9cfe0cb80df5eb68866d463"
+    },
+    "machinemind/config/smart_diagnostic_runtime.py": {
+      "parent_equal": true,
+      "sha256": "8e927e59336844a8b2b7136058230e5b774e11eb4f24bd3dc79da79318bfd025"
+    },
+    "machinemind/core/scope.py": {
+      "parent_equal": true,
+      "sha256": "7d826215fa1b2a4a2f32208e1d73b279825ea9c3e552d3bca1d3c18423e8506f"
+    },
+    "machinemind/infrastructure/database.py": {
+      "parent_equal": true,
+      "sha256": "d5c265f34d6362204fc4beb00a7c9ab7e73b76639ee9c6656427bf1bc8df2432"
+    },
+    "machinemind/infrastructure/execution.py": {
+      "parent_equal": true,
+      "sha256": "7ada720424ec2962f4c8e383cebeb32596d371932ee064166f9e04cb4e6b916d"
+    },
+    "machinemind/infrastructure/openai_transport.py": {
+      "parent_equal": true,
+      "sha256": "c08fddd68599763657ee3d5b0cd634e72bb3ca574cd43b56da6abfd83c6062bf"
+    },
+    "machinemind/infrastructure/request_budget.py": {
+      "parent_equal": true,
+      "sha256": "db1fb9231e3c39ee271f09cf72413b66fe371ad21c1be736729ff71f3716f862"
+    },
+    "mm_promotion_gate.py": {
+      "parent_equal": true,
+      "sha256": "6fac385b6ba35a0932193ac8feeb997f246549b1b082c6c7af3b4b988d01f38f"
+    },
+    "requirements.txt": {
+      "parent_equal": true,
+      "sha256": "d29634e6a70364d52495f7fa3776259bc3745ece9db7c3160d3fb3943ca38d88"
+    }
+  }
+}
