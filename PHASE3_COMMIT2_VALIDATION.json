@@ -1,0 +1,194 @@
+{
+  "candidate": {
+    "assistant_core_sha256": "dca19aba41becaffb7c0623f52dee22863c527dbbb7dc8ee965a724a25efd00d",
+    "citation_module_sha256": "9a124df9b0876f8f447a2ed7ff3e3536df2e03d8b8d9e752a2f01da11a664926",
+    "main_lines": 33977,
+    "main_net_line_reduction": 1143,
+    "main_sha256": "a0ed3fcd574a15b087e28170ae472dd071ea772f4551282fac0dd5ef05dd1691",
+    "top_level_definition_inventory_candidate": 669,
+    "top_level_definition_inventory_parent": 669
+  },
+  "commit_in_phase": 2,
+  "commit_title": "refactor: extract response finalization and fix ordered-step rendering",
+  "commit_unit": "3B",
+  "compatibility_surface": [
+    "_build_structured_procedure_ui_model",
+    "_procedure_ui_model_to_text",
+    "_assistant_ui_escape",
+    "_procedure_ui_model_to_html",
+    "_assistant_ui_inline_markup",
+    "_assistant_ui_section_kind",
+    "_assistant_ui_extract_labeled_line",
+    "_assistant_ui_split_inline_numbered",
+    "_assistant_ui_render_numbered_cards",
+    "_assistant_ui_sentence_has_any",
+    "_assistant_ui_promote_unlabelled_sections",
+    "_assistant_ui_normalize_markdown_tables",
+    "_assistant_ui_root_cause_text",
+    "_assistant_ui_generic_html",
+    "_assistant_ui_root_cause_html",
+    "_assistant_ui_normalize_url_for_key",
+    "_assistant_ui_dedupe_links",
+    "_assistant_ui_dedupe_citations",
+    "_assistant_ui_visible_text_from_html",
+    "_assistant_ui_canonical_tokens",
+    "_assistant_ui_token_coverage",
+    "_assistant_ui_lossless_html",
+    "_assistant_ui_finalize_response",
+    "_format_structured_procedure_answer_for_ui"
+  ],
+  "created_date": "2026-09-02",
+  "explicit_non_changes": [
+    "API routes and Pydantic request contracts",
+    "assistant_core_v2.py",
+    "citation labels, sanitization, source blocks and resource links from Phase 3A",
+    "runtime configuration and all Phase 2 infrastructure modules",
+    "prompts, model policy and semantic reasoning",
+    "retrieval, routing, ranking, evidence admission and source priorities",
+    "ASK canonical semantic answer generation",
+    "Root Cause reasoning and Smart Diagnostic state/logic",
+    "PDF/XLSX extraction, cleaning, chunking, persistence and metering",
+    "semantic cache, request budgets and external I/O",
+    "Dockerfile, cloudbuild.yaml, requirements.txt and mm_promotion_gate.py"
+  ],
+  "extracted_modules": [
+    {
+      "bytes": 61889,
+      "lines": 936,
+      "path": "machinemind/presentation/responses.py",
+      "responsibilities": [
+        "structured Procedure presentation model",
+        "Procedure plain-text and HTML rendering",
+        "ASK safe HTML rendering",
+        "Root Cause canonical text and HTML rendering",
+        "safe inline markup and HTML escaping",
+        "Markdown table normalization",
+        "ordered and unordered list rendering",
+        "canonical visible-text/token coverage",
+        "lossless HTML fallback",
+        "link and citation de-duplication",
+        "final public answer envelope and render metadata"
+      ],
+      "sha256": "aaaacc6334df4b2ee6b0c56c8db83aaa31876aec128cc390a6d8af80b729a7b1"
+    }
+  ],
+  "intentional_behavior_change": {
+    "correction": [
+      "preserve explicit list numbers through safe li value attributes",
+      "apply the guard to generic, lossless and structured Procedure HTML",
+      "use the already-built structured Procedure model during finalization"
+    ],
+    "observed_parent_defect": "Ordered procedure steps could each display as 1. when labelled detail sections caused separate HTML ordered-list fragments.",
+    "parent_candidate_contract_leaf_differences": 30,
+    "scope": "UI rendering only",
+    "unchanged_payloads": [
+      "canonical plain-text answer",
+      "citation order and content",
+      "Bubble resource links",
+      "source snippets",
+      "retrieval and evidence selection"
+    ]
+  },
+  "known_open_blockers": [
+    {
+      "expected_answer": "7500 kg",
+      "expected_source": "BBX-300_40T AME1000SN IT, PDF page 20",
+      "id": "ASK_NUMERIC_PROPERTY_VALUE_RESCUE",
+      "not_changed_by_this_commit": true,
+      "observed": "no_sources",
+      "planned_owner": "later Retrieval/Evidence correction",
+      "pre_existing": true,
+      "query": "Qual è il peso della macchina BBX-300/40T?",
+      "reproduced_on": [
+        "Phase 2 Commit 5",
+        "Phase 3 Commit 1"
+      ]
+    }
+  ],
+  "limitations": [
+    "No real Cloud Build or Cloud Run startup was executed by this offline artifact.",
+    "No live browser rendering was executed against the candidate revision.",
+    "The gate characterizes safe HTML and ordered-list attributes but cannot prove every browser/CSS combination.",
+    "No live PDF, XLSX, Root Cause or Smart Diagnostic call was made against the candidate revision.",
+    "This commit does not resolve the documented numeric no_sources Retrieval/Evidence blocker.",
+    "The exact Git parent and deployed commit must be checked after applying the package."
+  ],
+  "live_exit_criteria": [
+    "Successful Cloud Build from the exact refactor-phase1 commit.",
+    "Healthy newest Cloud Run revision at 100 percent traffic.",
+    "/version commit_sha equals the Cloud Build Git commit and engine markers are unchanged.",
+    "PROC-001 full procedure displays visible numbers 1 through 8, not repeated 1.",
+    "Procedure/Step sources and links remain primary, complete and ordered.",
+    "Known HMI/PDF and XLSX answers retain correct citations, snippets and links.",
+    "Known Root Cause and Smart Diagnostic START paths remain unchanged and valid.",
+    "No new response-presentation import, NameError, HTML serialization or canonicality errors appear in logs."
+  ],
+  "mutation_checks": [
+    {
+      "change": "remove explicit ordered-list value attributes",
+      "detected": true,
+      "name": "explicit_list_values_removed"
+    },
+    {
+      "change": "force structured Procedure renderer off",
+      "detected": true,
+      "name": "structured_procedure_renderer_disabled"
+    },
+    {
+      "change": "return raw unescaped model text",
+      "detected": true,
+      "name": "html_escaping_disabled"
+    }
+  ],
+  "next_commit_after_live_pass": "Roadmap Phase 3 Commit 3 / 3C — shared ingest text and PDF extraction primitives",
+  "offline_results": {
+    "citation_deduplication_parent_parity": "PASS",
+    "explicit_list_numbering_1_2_3": "PASS",
+    "gate_output": [
+      "PASS: syntax",
+      "PASS: prior_behavior_contracts",
+      "PASS: static_extraction",
+      "PASS: response_render_contract",
+      "PASS: mutation_sensitivity",
+      "PHASE 3B OFFLINE GATE: PASS"
+    ],
+    "historical_helper_signatures": 24,
+    "html_escape_contract": "PASS",
+    "link_deduplication_parent_parity": "PASS",
+    "parent_candidate_reviewed_leaf_differences": 30,
+    "phase3a_citation_link_contract": "PASS",
+    "prior_phase_behavior_contracts": "PASS",
+    "response_contract_groups": 22,
+    "root_cause_final_envelope_parent_parity": "PASS",
+    "self_contained_phase3b_gate": "PASS",
+    "structured_procedure_renderer_active": "PASS",
+    "syntax_compile": "PASS",
+    "top_level_definition_inventory_preserved": "PASS",
+    "unexpected_definition_changes": 0
+  },
+  "parent": {
+    "artifact": "MachineMind_Modularization_Phase3_Commit1_Citation_Presentation",
+    "artifact_sha256": "c117de168d612934bb3aa163657e11ff0b83db9541ca38b3665f6ab89f71f9c7",
+    "assistant_core_sha256": "dca19aba41becaffb7c0623f52dee22863c527dbbb7dc8ee965a724a25efd00d",
+    "branch": "refactor-phase1",
+    "cloud_run_revision": "mm-ai-ingest-prod-00055-h7t",
+    "git_commit": "4a832e2",
+    "main_lines": 35120,
+    "main_sha256": "d77dc2938d8cfbb6557b24230bb6936b545e39fdf945e94d76224a3e200ef05a"
+  },
+  "purpose": "Extract response finalization, structured Procedure UI-model rendering, ASK/Root Cause safe HTML, canonicality checks and final link/citation de-duplication from the production composition root, with one pinned UI-only correction for repeated ordered-list numbering.",
+  "roadmap_phase": "3",
+  "schema_version": "machinemind-modularization-validation-v1",
+  "static_guard": {
+    "candidate_hash_frozen": true,
+    "historical_main_function_names_and_signatures_preserved": true,
+    "module_hash_frozen": true,
+    "new_module_has_infrastructure_imports": false,
+    "new_module_imports_main": false,
+    "parent_definition_hashes_frozen": true,
+    "phase3a_citation_module_byte_unchanged": true,
+    "response_implementation_removed_from_main": true
+  },
+  "status": "OFFLINE_VERIFIED",
+  "title": "Response finalization and safe HTML/UI rendering"
+}

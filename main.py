@@ -132,6 +132,37 @@ from machinemind.infrastructure.cloud_tasks import (
     enqueue_document_index_task as _infra_enqueue_document_index_task,
 )
 from machinemind.presentation import citations as _presentation_citations
+from machinemind.presentation import responses as _presentation_responses
+
+
+_RESPONSE_PRESENTATION_RUNTIME = lambda: _presentation_responses.ResponsePresentationRuntime(
+    normalize_unicode=_normalize_unicode_advanced,
+    procedure_ui_clean=_procedure_ui_clean,
+    procedure_ui_complete_excerpt=_procedure_ui_complete_excerpt,
+    procedure_ui_fields=_procedure_ui_fields,
+    procedure_ui_grounded_by_citation=_procedure_ui_grounded_by_citation,
+    procedure_ui_is_final_verification=_procedure_ui_is_final_verification,
+    procedure_ui_is_safety_setup=_procedure_ui_is_safety_setup,
+    procedure_ui_merge_sources=_procedure_ui_merge_sources,
+    procedure_ui_note_is_novel=_procedure_ui_note_is_novel,
+    procedure_ui_sections=_procedure_ui_sections,
+    safe_int=_safe_int,
+    evidence_role=_v12_evidence_role,
+    looks_like_target_language=_looks_like_target_language,
+    manual_note_from_grounded_points=_manual_note_from_grounded_points,
+    manual_operation_and_safety_notes_from_support_citations=_manual_operation_and_safety_notes_from_support_citations,
+    strip_inline_citation_markers_for_display=_strip_inline_citation_markers_for_display,
+    unique_non_empty_strings=_unique_non_empty_strings,
+    source_type_from_document_id=_source_type_from_document_id,
+    structured_source_types=STRUCTURED_SOURCE_TYPES,
+    assistant_ui_max_html_chars=ASSISTANT_UI_MAX_HTML_CHARS,
+    assistant_ui_render_version=ASSISTANT_UI_RENDER_VERSION,
+    assistant_ask_ui_render_version=ASSISTANT_ASK_UI_RENDER_VERSION,
+    ask_ui_max_citations=ASK_UI_MAX_CITATIONS,
+    ask_ui_max_links=ASK_UI_MAX_LINKS,
+    ask_ui_structured_max_citations=ASK_UI_STRUCTURED_MAX_CITATIONS,
+    ask_ui_structured_max_links=ASK_UI_STRUCTURED_MAX_LINKS,
+)
 
 def _fetch_dense_chunk_candidates(
     *,
@@ -10834,219 +10865,21 @@ def _procedure_ui_note_is_novel(note: str, existing_text: str) -> bool:
     return len(note_terms & existing_terms) / max(1, len(note_terms)) < 0.72
 
 
-def _build_structured_procedure_ui_model(
-    *,
-    structured_citations: list[dict],
-    manual_support_citations: list[dict],
-    grounded_points: list[dict],
-    response_language: str,
-    q: str = "",
-) -> dict:
+def _build_structured_procedure_ui_model(*, structured_citations: list[dict], manual_support_citations: list[dict], grounded_points: list[dict], response_language: str, q: str='') -> dict:
     """Build one safe, deterministic presentation model from grounded sources.
 
     The model never contains raw HTML. It is rendered twice: plain text for
     backward compatibility and escaped HTML for Bubble's HTML element.
     """
-    is_en = str(response_language or "it").strip().lower().startswith("en")
-    coherent = _procedure_ui_merge_sources(structured_citations)
-    procedures = [c for c in coherent if _v12_evidence_role(c) == "procedure"]
-    step_sources = [c for c in coherent if _v12_evidence_role(c) == "step"]
-    if not procedures and not step_sources:
-        return {}
-
-    grounded_by_citation = _procedure_ui_grounded_by_citation(grounded_points)
-    title = "Operating procedure" if is_en else "Procedura operativa"
-    recipients = ""
-    safety_level = ""
-    purpose = ""
-    if procedures:
-        fields = _procedure_ui_fields(procedures[0])
-        source_title = _procedure_ui_clean(fields.get("title") or "")
-        if source_title and (not is_en or _looks_like_target_language(source_title, response_language)):
-            title = source_title
-        description = fields.get("short_description") or fields.get("description") or ""
-        sections = _procedure_ui_sections(description)
-        purpose = _procedure_ui_complete_excerpt(
-            sections.get("purpose") or sections.get("body") or description,
-            max_chars=700,
-        )
-        recipients = _procedure_ui_complete_excerpt(
-            sections.get("recipients") or "",
-            max_chars=320,
-        )
-        safety_level = _procedure_ui_complete_excerpt(
-            sections.get("safety_level") or "",
-            max_chars=140,
-        )
-
-    records: list[dict] = []
-    for fallback_no, citation in enumerate(step_sources, start=1):
-        fields = _procedure_ui_fields(citation)
-        source_no = _safe_int(fields.get("step_number"), fallback_no)
-        step_title = _procedure_ui_clean(fields.get("title") or "") or f"Step {source_no}"
-        sections = _procedure_ui_sections(fields.get("description") or "")
-        instruction = _procedure_ui_complete_excerpt(
-            sections.get("instruction") or sections.get("body") or fields.get("description") or "",
-            max_chars=1500,
-        )
-        safety = _procedure_ui_complete_excerpt(
-            sections.get("safety") or "",
-            max_chars=800,
-        )
-        cid = str(citation.get("citation_id") or "").strip()
-        grounded = max(grounded_by_citation.get(cid) or [""], key=len)
-
-        # The synthesis already translated grounded points. Reuse that text only
-        # when the indexed instruction is in another language; no extra LLM call.
-        if grounded and instruction and not _looks_like_target_language(instruction, response_language):
-            instruction = grounded
-        elif grounded and not instruction:
-            instruction = grounded
-        if is_en and step_title and not _looks_like_target_language(step_title, response_language):
-            step_title = f"Step {source_no}"
-
-        records.append({
-            "source_number": source_no,
-            "title": step_title,
-            "instruction": instruction,
-            "safety": safety,
-        })
-    records.sort(key=lambda item: (int(item.get("source_number") or 9999), str(item.get("title") or "")))
-
-    before: list[dict] = []
-    final_checks: list[dict] = []
-    operational = list(records)
-    if operational:
-        # Every Step may contain a safety note; that alone must not turn an
-        # operational Step into the "Before starting" callout.
-        first_text = " ".join(
-            str(operational[0].get(k) or "") for k in ("title", "instruction")
-        )
-        if _procedure_ui_is_safety_setup(first_text):
-            before.append(operational.pop(0))
-    if operational:
-        # A closure Step can contain the verb "verify" inside its instruction.
-        # Treat only an explicitly check/test-oriented title as the final check.
-        last_title = str(operational[-1].get("title") or "")
-        if _procedure_ui_is_final_verification(last_title):
-            final_checks.insert(0, operational.pop())
-
-    # Visible numbering is compact and sequential; source step numbers stay in
-    # the model for traceability but are not shown as a confusing 2..9 sequence.
-    for display_no, record in enumerate(operational, start=1):
-        record["display_number"] = display_no
-
-    manual_notes: list[str] = []
-    if manual_support_citations:
-        operation_note, safety_note = _manual_operation_and_safety_notes_from_support_citations(
-            manual_support_citations,
-            q=q,
-            structured_citations=coherent,
-            language=response_language,
-        )
-        if not safety_note:
-            safety_note = _manual_note_from_grounded_points(
-                grounded_points,
-                language=response_language,
-            )
-        existing = " ".join(
-            [title, purpose, recipients, safety_level]
-            + [str(r.get("instruction") or "") + " " + str(r.get("safety") or "") for r in records]
-        )
-        for candidate in (operation_note if not records else "", safety_note):
-            note = _procedure_ui_complete_excerpt(candidate, max_chars=700)
-            if note and _procedure_ui_note_is_novel(note, existing + " " + " ".join(manual_notes)):
-                manual_notes.append(note)
-
-    return {
-        "kind": "procedure",
-        "language": "en" if is_en else "it",
-        "title": title,
-        "summary": purpose,
-        "personnel": recipients,
-        "safety_level": safety_level,
-        "before": before,
-        "steps": operational,
-        "final_checks": final_checks,
-        "manual_notes": manual_notes[:2],
-    }
+    return _presentation_responses.build_structured_procedure_ui_model(structured_citations=structured_citations, manual_support_citations=manual_support_citations, grounded_points=grounded_points, response_language=response_language, q=q, _runtime=_RESPONSE_PRESENTATION_RUNTIME())
 
 
 def _procedure_ui_model_to_text(model: dict, *, response_language: str) -> str:
-    if not isinstance(model, dict) or model.get("kind") != "procedure":
-        return ""
-    is_en = str(response_language or "it").strip().lower().startswith("en")
-    parts: list[str] = []
-    title = _procedure_ui_clean(model.get("title") or "")
-    if title:
-        parts.append(title)
-
-    summary = _procedure_ui_complete_excerpt(model.get("summary") or "", max_chars=700)
-    if summary:
-        parts.append(summary)
-
-    before_lines: list[str] = []
-    for item in model.get("before") or []:
-        item_title = _procedure_ui_clean(item.get("title") or "")
-        instruction = _procedure_ui_complete_excerpt(item.get("instruction") or "", max_chars=1500)
-        safety = _procedure_ui_complete_excerpt(item.get("safety") or "", max_chars=800)
-        if item_title:
-            before_lines.append(item_title)
-        if instruction:
-            before_lines.append(instruction)
-        if safety:
-            before_lines.append(("Safety: " if is_en else "Sicurezza: ") + safety)
-    personnel = _procedure_ui_complete_excerpt(model.get("personnel") or "", max_chars=320)
-    safety_level = _procedure_ui_complete_excerpt(model.get("safety_level") or "", max_chars=140)
-    if personnel:
-        before_lines.append(("Qualified personnel: " if is_en else "Personale qualificato: ") + personnel)
-    if safety_level:
-        before_lines.append(("Safety level: " if is_en else "Livello di sicurezza: ") + safety_level)
-    if before_lines:
-        parts.append(("Before starting" if is_en else "Prima di iniziare") + "\n" + "\n".join(before_lines))
-
-    step_blocks: list[str] = []
-    for idx, item in enumerate(model.get("steps") or [], start=1):
-        display_no = _safe_int(item.get("display_number"), idx)
-        title_line = _procedure_ui_clean(item.get("title") or "") or (f"Step {display_no}" if is_en else f"Passaggio {display_no}")
-        instruction = _procedure_ui_complete_excerpt(item.get("instruction") or "", max_chars=1500)
-        safety = _procedure_ui_complete_excerpt(item.get("safety") or "", max_chars=800)
-        lines = [f"{display_no}. {title_line}"]
-        if instruction:
-            lines.append(instruction)
-        if safety:
-            lines.append(("Attention: " if is_en else "Attenzione: ") + safety)
-        step_blocks.append("\n".join(lines))
-    if step_blocks:
-        parts.append(("Procedure" if is_en else "Procedura") + "\n" + "\n\n".join(step_blocks))
-
-    final_blocks: list[str] = []
-    for item in model.get("final_checks") or []:
-        title_line = _procedure_ui_clean(item.get("title") or "")
-        instruction = _procedure_ui_complete_excerpt(item.get("instruction") or "", max_chars=1500)
-        safety = _procedure_ui_complete_excerpt(item.get("safety") or "", max_chars=800)
-        if title_line:
-            final_blocks.append(title_line)
-        if instruction:
-            final_blocks.append(instruction)
-        if safety:
-            final_blocks.append(("Attention: " if is_en else "Attenzione: ") + safety)
-    if final_blocks:
-        parts.append(("Final check" if is_en else "Verifica finale") + "\n" + "\n".join(final_blocks))
-
-    notes = [
-        _procedure_ui_complete_excerpt(x, max_chars=700)
-        for x in (model.get("manual_notes") or [])
-        if _procedure_ui_complete_excerpt(x, max_chars=700)
-    ]
-    if notes:
-        parts.append(("Manual support" if is_en else "Supporto dal manuale") + "\n" + "\n".join(f"- {x}" for x in notes))
-
-    return "\n\n".join(x for x in parts if str(x or "").strip()).strip()
+    return _presentation_responses.procedure_ui_model_to_text(model, response_language=response_language, _runtime=_RESPONSE_PRESENTATION_RUNTIME())
 
 
 def _assistant_ui_escape(value: Any) -> str:
-    return html.escape(str(value or ""), quote=True)
+    return _presentation_responses.assistant_ui_escape(value, _runtime=_RESPONSE_PRESENTATION_RUNTIME())
 
 
 # Rich answer HTML intentionally contains only the answer body.
@@ -11062,99 +10895,7 @@ def _procedure_ui_model_to_html(model: dict, *, links: list[dict], response_lang
     outer border, background or shadow, so the existing Bubble answer container remains
     the only visual frame.
     """
-    if not isinstance(model, dict) or model.get("kind") != "procedure":
-        return ""
-
-    is_en = str(response_language or "it").strip().lower().startswith("en")
-    title = _assistant_ui_escape(model.get("title") or ("Operating procedure" if is_en else "Procedura operativa"))
-    summary = _assistant_ui_escape(model.get("summary") or "")
-
-    chunks: list[str] = [
-        '<article data-mm-answer="procedure" data-mm-render="' + _assistant_ui_escape(ASSISTANT_UI_RENDER_VERSION) + '" '
-        'style="box-sizing:border-box;width:100%;font-family:Inter,-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif;'
-        'font-size:14px;line-height:1.62;color:#1f2937;overflow-wrap:anywhere;padding:2px 2px 1px 2px;">',
-        '<h2 style="margin:0 0 8px 0;font-size:18px;line-height:1.35;font-weight:760;color:#111827;">' + title + '</h2>',
-    ]
-    if summary:
-        chunks.append('<p style="margin:0 0 18px 0;color:#4b5563;">' + summary + '</p>')
-
-    before_items = model.get("before") or []
-    personnel = str(model.get("personnel") or "").strip()
-    safety_level = str(model.get("safety_level") or "").strip()
-    if before_items or personnel or safety_level:
-        heading = "Before starting" if is_en else "Prima di iniziare"
-        chunks.append(
-            '<section style="margin:0 0 20px 0;padding:11px 14px;border-left:3px solid #d97706;background:#fffbeb;border-radius:0 7px 7px 0;">'
-            '<h3 style="margin:0 0 7px 0;font-size:14px;font-weight:760;color:#92400e;">' + _assistant_ui_escape(heading) + '</h3>'
-        )
-        if personnel:
-            chunks.append('<p style="margin:3px 0;color:#78350f;"><strong>' + _assistant_ui_escape("Qualified personnel" if is_en else "Personale qualificato") + ':</strong> ' + _assistant_ui_escape(personnel) + '</p>')
-        if safety_level:
-            chunks.append('<p style="margin:3px 0;color:#991b1b;"><strong>' + _assistant_ui_escape("Safety level" if is_en else "Livello di sicurezza") + ':</strong> ' + _assistant_ui_escape(safety_level) + '</p>')
-        for item in before_items:
-            item_title = _assistant_ui_escape(item.get("title") or "")
-            instruction = _assistant_ui_escape(item.get("instruction") or "")
-            safety = _assistant_ui_escape(item.get("safety") or "")
-            if item_title:
-                chunks.append('<p style="margin:7px 0 2px 0;font-weight:700;color:#78350f;">' + item_title + '</p>')
-            if instruction:
-                chunks.append('<p style="margin:2px 0;color:#78350f;">' + instruction + '</p>')
-            if safety:
-                chunks.append('<p style="margin:6px 0 0 0;color:#991b1b;"><strong>' + _assistant_ui_escape("Attention" if is_en else "Attenzione") + ':</strong> ' + safety + '</p>')
-        chunks.append('</section>')
-
-    steps = model.get("steps") or []
-    if steps:
-        heading = "Procedure" if is_en else "Procedura"
-        chunks.append('<section style="margin:0 0 21px 0;">')
-        chunks.append('<h3 style="margin:0 0 9px 0;font-size:15px;font-weight:760;color:#111827;">' + _assistant_ui_escape(heading) + '</h3>')
-        chunks.append('<ol style="margin:0;padding-left:22px;color:#374151;">')
-        for idx, item in enumerate(steps, start=1):
-            display_no = _safe_int(item.get("display_number"), idx)
-            item_title = _assistant_ui_escape(item.get("title") or (f"Step {display_no}" if is_en else f"Passaggio {display_no}"))
-            instruction = _assistant_ui_escape(item.get("instruction") or "")
-            safety = _assistant_ui_escape(item.get("safety") or "")
-            chunks.append('<li style="margin:0 0 12px 0;padding-left:4px;">')
-            chunks.append('<p style="margin:0 0 3px 0;font-weight:720;color:#111827;">' + item_title + '</p>')
-            if instruction:
-                chunks.append('<p style="margin:0;color:#374151;">' + instruction + '</p>')
-            if safety:
-                chunks.append('<p style="margin:5px 0 0 0;color:#991b1b;"><strong>' + _assistant_ui_escape("Attention" if is_en else "Attenzione") + ':</strong> ' + safety + '</p>')
-            chunks.append('</li>')
-        chunks.append('</ol></section>')
-
-    final_checks = model.get("final_checks") or []
-    if final_checks:
-        heading = "Final check" if is_en else "Verifica finale"
-        chunks.append(
-            '<section style="margin:0 0 19px 0;padding:11px 14px;border-left:3px solid #16a34a;background:#f0fdf4;border-radius:0 7px 7px 0;">'
-            '<h3 style="margin:0 0 7px 0;font-size:14px;font-weight:760;color:#166534;">' + _assistant_ui_escape(heading) + '</h3>'
-        )
-        for item in final_checks:
-            title_line = _assistant_ui_escape(item.get("title") or "")
-            instruction = _assistant_ui_escape(item.get("instruction") or "")
-            safety = _assistant_ui_escape(item.get("safety") or "")
-            if title_line:
-                chunks.append('<p style="margin:4px 0 2px 0;font-weight:700;color:#166534;">' + title_line + '</p>')
-            if instruction:
-                chunks.append('<p style="margin:2px 0;color:#166534;">' + instruction + '</p>')
-            if safety:
-                chunks.append('<p style="margin:6px 0 0 0;color:#991b1b;"><strong>' + _assistant_ui_escape("Attention" if is_en else "Attenzione") + ':</strong> ' + safety + '</p>')
-        chunks.append('</section>')
-
-    notes = [str(x or "").strip() for x in (model.get("manual_notes") or []) if str(x or "").strip()]
-    if notes:
-        heading = "Manual support" if is_en else "Supporto dal manuale"
-        chunks.append('<section style="margin:0 0 8px 0;">')
-        chunks.append('<h3 style="margin:0 0 7px 0;font-size:14px;font-weight:760;color:#111827;">' + _assistant_ui_escape(heading) + '</h3>')
-        chunks.append('<ul style="margin:0;padding-left:20px;color:#4b5563;">')
-        for note in notes[:2]:
-            chunks.append('<li style="margin:0 0 6px 0;padding-left:2px;">' + _assistant_ui_escape(note) + '</li>')
-        chunks.append('</ul></section>')
-
-    chunks.append('</article>')
-    rendered = ''.join(chunks)
-    return rendered if len(rendered) <= ASSISTANT_UI_MAX_HTML_CHARS else ""
+    return _presentation_responses.procedure_ui_model_to_html(model, links=links, response_language=response_language, _runtime=_RESPONSE_PRESENTATION_RUNTIME())
 
 def _assistant_ui_inline_markup(value: Any) -> str:
     """Render a tiny safe subset of Markdown-like inline formatting.
@@ -11162,85 +10903,20 @@ def _assistant_ui_inline_markup(value: Any) -> str:
     All input is escaped first; only bold and inline-code markers are converted.
     The model can therefore never inject arbitrary HTML, scripts or links.
     """
-    escaped = _assistant_ui_escape(value)
-    escaped = re.sub(
-        r"\*\*([^*\n][^*\n]*?)\*\*",
-        lambda m: '<strong style="font-weight:750;color:#111827;">' + m.group(1).strip() + '</strong>',
-        escaped,
-    )
-    escaped = re.sub(
-        r"`([^`\n]+)`",
-        lambda m: '<code style="padding:1px 5px;border-radius:5px;background:#f1f5f9;color:#0f172a;'
-                  'font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;">'
-                  + m.group(1).strip() + '</code>',
-        escaped,
-    )
-    return escaped
+    return _presentation_responses.assistant_ui_inline_markup(value, _runtime=_RESPONSE_PRESENTATION_RUNTIME())
 
 
 def _assistant_ui_section_kind(label: str) -> str:
-    norm = _normalize_unicode_advanced(str(label or "")).lower()
-    norm = re.sub(r"[^a-zà-öø-ÿ0-9]+", " ", norm)
-    norm = re.sub(r"\s+", " ", norm).strip()
-    if not norm:
-        return ""
-
-    if any(x in norm for x in ["verifiche da eseguire", "controlli consigliati", "verifiche", "controlli", "checks to perform", "recommended checks", "checks"]):
-        return "checks"
-    if any(x in norm for x in ["soluzione indicata", "soluzione consigliata", "intervento consigliato", "soluzione", "recommended solution", "solution"]):
-        return "solution"
-    if any(x in norm for x in ["nota tecnica", "note tecniche", "technical note", "technical notes"]):
-        return "technical_note"
-    if any(x in norm for x in ["causa probabile", "causa più probabile", "cause probabili", "probable cause", "likely cause"]):
-        return "cause"
-    if any(x in norm for x in ["problema rilevato", "problema", "sintomo", "problem", "symptom"]):
-        return "problem"
-    if any(x in norm for x in ["attenzione", "avvertenza", "nota di sicurezza", "warning", "safety note", "attention"]):
-        return "safety"
-    if any(x in norm for x in ["in sintesi", "sintesi", "summary", "risposta", "answer"]):
-        return "summary"
-    return ""
+    return _presentation_responses.assistant_ui_section_kind(label, _runtime=_RESPONSE_PRESENTATION_RUNTIME())
 
 
 def _assistant_ui_extract_labeled_line(line: str) -> tuple[str, str, str]:
     """Return (section_kind, visible_label, remainder) for labelled answer lines."""
-    work = str(line or "").strip()
-    work = re.sub(r"^\d{1,3}[.)]\s+", "", work).strip()
-
-    m = re.match(r"^\*\*\s*([^*\n:]{2,90})\s*:\s*\*\*\s*(.*)$", work)
-    if not m:
-        m = re.match(r"^\*\*\s*([^*\n]{2,90})\s*\*\*\s*:\s*(.*)$", work)
-    if not m:
-        # Only accept plain labels when they map to a known semantic section.
-        m_plain = re.match(r"^([^:\n]{2,90})\s*:\s*(.*)$", work)
-        if m_plain and _assistant_ui_section_kind(m_plain.group(1)):
-            m = m_plain
-
-    if not m:
-        return "", "", ""
-
-    label = re.sub(r"\s+", " ", str(m.group(1) or "")).strip()
-    kind = _assistant_ui_section_kind(label)
-    if not kind:
-        return "", "", ""
-    return kind, label, str(m.group(2) or "").strip()
+    return _presentation_responses.assistant_ui_extract_labeled_line(line, _runtime=_RESPONSE_PRESENTATION_RUNTIME())
 
 
 def _assistant_ui_split_inline_numbered(value: str) -> list[str]:
-    text = str(value or "").strip()
-    if not text:
-        return []
-    matches = list(re.finditer(r"(?:^|\s)(\d{1,3})[.)]\s+", text))
-    if not matches:
-        return [text]
-    out: list[str] = []
-    for idx, match in enumerate(matches):
-        start = match.end()
-        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
-        item = text[start:end].strip(" \t\n-•")
-        if item:
-            out.append(item)
-    return out
+    return _presentation_responses.assistant_ui_split_inline_numbered(value, _runtime=_RESPONSE_PRESENTATION_RUNTIME())
 
 
 def _assistant_ui_render_numbered_cards(items: list[str], *, is_en: bool) -> str:
@@ -11249,22 +10925,11 @@ def _assistant_ui_render_numbered_cards(items: list[str], *, is_en: bool) -> str
     This is visually closer to ChatGPT and avoids a second UI framework inside the
     existing Bubble answer container.
     """
-    clean_items = [str(x or "").strip() for x in items if str(x or "").strip()]
-    if not clean_items:
-        return ""
-    chunks = ['<ol style="margin:0;padding-left:22px;color:#374151;">']
-    for item in clean_items:
-        chunks.append(
-            '<li style="margin:0 0 10px 0;padding-left:4px;">'
-            '<p style="margin:0;">' + _assistant_ui_inline_markup(item) + '</p></li>'
-        )
-    chunks.append('</ol>')
-    return ''.join(chunks)
+    return _presentation_responses.assistant_ui_render_numbered_cards(items, is_en=is_en, _runtime=_RESPONSE_PRESENTATION_RUNTIME())
 
 
 def _assistant_ui_sentence_has_any(value: str, markers: list[str]) -> bool:
-    low = _normalize_unicode_advanced(str(value or "")).lower()
-    return any(marker in low for marker in markers)
+    return _presentation_responses.assistant_ui_sentence_has_any(value, markers, _runtime=_RESPONSE_PRESENTATION_RUNTIME())
 
 
 
@@ -11276,461 +10941,25 @@ def _assistant_ui_promote_unlabelled_sections(sections: list[dict]) -> list[dict
     an inferred checks block and silently dropped the real checklist. This function
     is intentionally conservative and lossless.
     """
-    if not sections:
-        return sections
-
-    explicit_kinds = {
-        str(row.get("kind") or "body").strip().lower()
-        for row in sections
-        if isinstance(row, dict)
-    }
-    if any(kind != "body" for kind in explicit_kinds):
-        return sections
-    if any(
-        str(row.get("kind") or "") in {
-            "problem", "cause", "checks", "solution", "technical_note", "safety"
-        }
-        for row in sections
-        if isinstance(row, dict)
-    ):
-        return sections
-
-    body_paragraphs: list[str] = []
-    for row in sections:
-        if not isinstance(row, dict):
-            continue
-        body_paragraphs.extend(
-            str(x or "").strip()
-            for x in (row.get("paragraphs") or [])
-            if str(x or "").strip()
-        )
-
-    candidates = body_paragraphs
-    if len(candidates) < 2:
-        return sections
-
-    cause_markers = [
-        "causa", "probabil", "verosimil", "dovut", "riconduc", "associat", "superat",
-        "likely", "probable", "due to", "caused by", "associated with", "overload",
-    ]
-    solution_markers = [
-        "se i controlli", "se le verifiche", "intervento", "soluzione", "sostitu", "selezionare",
-        "verificare l'idoneità", "verificare l’idoneità", "contattare", "ripristinare", "regolare",
-        "if the checks", "recommended action", "solution", "replace", "select", "contact", "restore", "adjust",
-    ]
-    note_markers = [
-        "nota tecnica", "documento", "manuale", "rapporto", "relazione",
-        "technical note", "the document", "manual",
-    ]
-
-    first_is_cause = _assistant_ui_sentence_has_any(candidates[0], cause_markers)
-    last_is_solution = _assistant_ui_sentence_has_any(candidates[-1], solution_markers)
-    last_is_note = _assistant_ui_sentence_has_any(candidates[-1], note_markers) and not last_is_solution
-
-    out: list[dict] = []
-    left = list(candidates)
-    if first_is_cause:
-        out.append({"kind": "cause", "label": "", "paragraphs": [left.pop(0)], "items": []})
-
-    tail_note = ""
-    tail_solution = ""
-    if left and last_is_note:
-        tail_note = left.pop()
-    elif left and last_is_solution:
-        tail_solution = left.pop()
-
-    if left:
-        if len(left) == 1 and not first_is_cause and not tail_solution and not tail_note:
-            out.append({"kind": "body", "label": "", "paragraphs": left, "items": []})
-        else:
-            out.append({"kind": "checks", "label": "", "paragraphs": [], "items": left})
-    if tail_solution:
-        out.append({"kind": "solution", "label": "", "paragraphs": [tail_solution], "items": []})
-    if tail_note:
-        out.append({"kind": "technical_note", "label": "", "paragraphs": [tail_note], "items": []})
-    return out or sections
+    return _presentation_responses.assistant_ui_promote_unlabelled_sections(sections, _runtime=_RESPONSE_PRESENTATION_RUNTIME())
 
 def _assistant_ui_normalize_markdown_tables(text: str) -> str:
     """Convert Markdown tables to headings/bullets before safe HTML rendering."""
-    lines = str(text or "").replace("\r", "\n").split("\n")
-    out: list[str] = []
-    i = 0
-    while i < len(lines):
-        line = lines[i].strip()
-        if "|" in line and i + 1 < len(lines) and re.match(r"^\s*\|?\s*:?-{3,}", lines[i + 1].strip()):
-            headers = [x.strip() for x in line.strip("|").split("|")]
-            i += 2
-            rows: list[list[str]] = []
-            while i < len(lines) and "|" in lines[i]:
-                rows.append([x.strip() for x in lines[i].strip().strip("|").split("|")])
-                i += 1
-            for row in rows:
-                if not any(row):
-                    continue
-                title = row[0] if row else ""
-                if title:
-                    out.append(f"**{title}**")
-                for idx, value in enumerate(row[1:], start=1):
-                    if not value:
-                        continue
-                    label = headers[idx] if idx < len(headers) and headers[idx] else f"Campo {idx}"
-                    out.append(f"- **{label}:** {value}")
-                out.append("")
-            continue
-        out.append(lines[i])
-        i += 1
-    return "\n".join(out)
+    return _presentation_responses.assistant_ui_normalize_markdown_tables(text, _runtime=_RESPONSE_PRESENTATION_RUNTIME())
 
 
 def _assistant_ui_root_cause_text(resp: dict, *, response_language: str) -> str:
     """Canonical plain-text representation of the same structured Root Cause body."""
-    if not isinstance(resp, dict):
-        return ""
-    is_en = str(response_language or "it").lower().startswith("en")
-    status = str(resp.get("status") or "answered").strip().lower()
-    summary = str(resp.get("problem_summary") or resp.get("symptom") or "").strip()
-    causes = [c for c in (resp.get("possible_causes") or []) if isinstance(c, dict)]
-    recommended = _unique_non_empty_strings(resp.get("recommended_next_checks") or [], limit=10)
-    if status != "answered" or not causes:
-        return summary
-    lines = ["Probable causes" if is_en else "Cause probabili"]
-    if summary:
-        lines += ["", ("Problem: " if is_en else "Problema: ") + summary]
-    used_checks: set[str] = set()
-    for idx, cause in enumerate(causes, start=1):
-        rank = _safe_int(cause.get("rank"), idx)
-        label = ("Most likely cause" if rank == 1 else f"Possible cause {rank}") if is_en else ("Causa più probabile" if rank == 1 else f"Causa possibile {rank}")
-        cause_text = str(cause.get("cause") or "").strip()
-        why = str(cause.get("why") or "").strip()
-        checks = _unique_non_empty_strings(cause.get("checks") or [], limit=6)
-        if not cause_text:
-            continue
-        lines += ["", label, cause_text]
-        if why:
-            lines += [("Why: " if is_en else "Perché: ") + why]
-        if checks:
-            lines += ["Checks" if is_en else "Controlli consigliati"]
-            for n, check in enumerate(checks, start=1):
-                lines.append(f"{n}. {check}")
-                used_checks.add(re.sub(r"\s+", " ", _normalize_unicode_advanced(check).lower()).strip())
-    extra = [x for x in recommended if re.sub(r"\s+", " ", _normalize_unicode_advanced(x).lower()).strip() not in used_checks]
-    if extra:
-        lines += ["", "Additional priority checks" if is_en else "Ulteriori controlli prioritari"]
-        lines += [f"{n}. {x}" for n, x in enumerate(extra[:6], start=1)]
-    return "\n".join(lines).strip()
+    return _presentation_responses.assistant_ui_root_cause_text(resp, response_language=response_language, _runtime=_RESPONSE_PRESENTATION_RUNTIME())
 
-def _assistant_ui_generic_html(answer: str, *, links: list[dict], citations: Optional[list[dict]] = None, response_language: str, status: str = "answered") -> str:
+def _assistant_ui_generic_html(answer: str, *, links: list[dict], citations: Optional[list[dict]]=None, response_language: str, status: str='answered') -> str:
     """Render ASK with the same visual hierarchy used by Root Cause.
 
     This function changes presentation only. The canonical answer text, citations,
     links and Bubble LINK/FONTI sections remain untouched. Every source line is
     escaped before the restrained inline formatting is applied.
     """
-    is_en = str(response_language or "it").strip().lower().startswith("en")
-    clean = _assistant_ui_normalize_markdown_tables(
-        _strip_inline_citation_markers_for_display(str(answer or ""))
-    ).strip()
-    if not clean:
-        return ""
-
-    status_low = str(status or "answered").strip().lower()
-    sections: list[dict] = []
-    current: Optional[dict] = None
-
-    def new_section(kind: str, label: str = "") -> dict:
-        row = {
-            "kind": kind or "body",
-            "label": str(label or "").strip(),
-            "paragraphs": [],
-            "items": [],
-        }
-        sections.append(row)
-        return row
-
-    raw_lines = [x.rstrip() for x in clean.replace("\r", "\n").split("\n")]
-    for raw in raw_lines:
-        line = str(raw or "").strip()
-        if not line:
-            continue
-
-        kind, label, remainder = _assistant_ui_extract_labeled_line(line)
-        if kind:
-            current = new_section(kind, label)
-            if remainder:
-                if kind == "checks":
-                    current["items"].extend(
-                        _assistant_ui_split_inline_numbered(remainder)
-                    )
-                else:
-                    current["paragraphs"].append(remainder)
-            continue
-
-        numbered = re.match(r"^\d{1,3}[.)]\s+(.+)$", line)
-        bullet = re.match(r"^[-•]\s+(.+)$", line)
-        if numbered:
-            value = numbered.group(1).strip()
-            if current is None or current.get("kind") not in {"checks", "list"}:
-                current = new_section("list", "")
-            current["items"].append(value)
-            continue
-        if bullet:
-            value = bullet.group(1).strip()
-            if current is None or current.get("kind") not in {
-                "checks", "list", "bullets"
-            }:
-                current = new_section("bullets", "")
-            current["items"].append(value)
-            continue
-
-        bold_heading = re.match(r"^\*\*([^*\n]{2,90})\*\*\s*$", line)
-        if bold_heading:
-            current = new_section("heading", bold_heading.group(1).strip())
-            continue
-
-        if current is None:
-            current = new_section("body", "")
-        current["paragraphs"].append(line)
-
-    sections = _assistant_ui_promote_unlabelled_sections(sections)
-
-    article: list[str] = [
-        '<article data-mm-answer="generic" data-mm-render="'
-        + _assistant_ui_escape(ASSISTANT_ASK_UI_RENDER_VERSION)
-        + '" data-mm-visual="root-parity-v1" '
-        'style="box-sizing:border-box;width:100%;font-family:Inter,-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif;'
-        'font-size:14px;line-height:1.62;color:#1f2937;overflow-wrap:anywhere;padding:2px 2px 1px 2px;">',
-        '<h2 style="margin:0 0 8px 0;font-size:18px;line-height:1.35;font-weight:760;color:#111827;">'
-        + _assistant_ui_escape("Answer" if is_en else "Risposta")
-        + '</h2>',
-    ]
-
-    if status_low != "answered":
-        if status_low in {"no_sources", "needs_clarification"}:
-            tone, background, border = "#92400e", "#fffbeb", "#d97706"
-        else:
-            tone, background, border = "#991b1b", "#fef2f2", "#dc2626"
-        article.append(
-            '<section style="margin:0 0 18px 0;padding:10px 14px;border-left:3px solid '
-            + border
-            + ';background:'
-            + background
-            + ';border-radius:0 7px 7px 0;color:'
-            + tone
-            + ';">'
-            '<p style="margin:0;font-size:12px;line-height:1.4;font-weight:760;letter-spacing:.02em;text-transform:uppercase;color:'
-            + tone
-            + ';">'
-            + _assistant_ui_escape("Result" if is_en else "Esito")
-            + '</p></section>'
-        )
-
-    first_body = True
-    for section in sections:
-        kind = str(section.get("kind") or "body")
-        label = str(section.get("label") or "").strip()
-        paragraphs = [
-            str(x or "").strip()
-            for x in section.get("paragraphs") or []
-            if str(x or "").strip()
-        ]
-        items = [
-            str(x or "").strip()
-            for x in section.get("items") or []
-            if str(x or "").strip()
-        ]
-
-        if kind == "cause":
-            heading = label or ("Probable cause" if is_en else "Causa probabile")
-            article.append(
-                '<section style="margin:0 0 20px 0;padding-left:14px;border-left:3px solid #2563eb;">'
-                '<p style="margin:0 0 4px 0;font-size:12px;line-height:1.4;font-weight:760;letter-spacing:.02em;text-transform:uppercase;color:#1d4ed8;">'
-                + _assistant_ui_escape(heading)
-                + '</p>'
-            )
-            for idx, p in enumerate(paragraphs):
-                tag = "h3" if idx == 0 else "p"
-                style = (
-                    "margin:0 0 7px 0;font-size:15px;line-height:1.45;font-weight:760;color:#111827;"
-                    if idx == 0
-                    else "margin:0 0 7px 0;color:#4b5563;"
-                )
-                article.append(
-                    f'<{tag} style="{style}">' + _assistant_ui_inline_markup(p) + f'</{tag}>'
-                )
-            article.append('</section>')
-
-        elif kind == "problem":
-            heading = label or ("Context" if is_en else "Contesto")
-            article.append(
-                '<section style="margin:0 0 20px 0;padding-left:14px;border-left:3px solid #cbd5e1;">'
-                '<p style="margin:0 0 5px 0;font-size:12px;line-height:1.4;font-weight:760;letter-spacing:.02em;text-transform:uppercase;color:#475569;">'
-                + _assistant_ui_escape(heading)
-                + '</p>'
-            )
-            for p in paragraphs:
-                article.append(
-                    '<p style="margin:0 0 7px 0;color:#4b5563;">'
-                    + _assistant_ui_inline_markup(p)
-                    + '</p>'
-                )
-            article.append('</section>')
-
-        elif kind == "checks":
-            heading = label or ("Checks to perform" if is_en else "Verifiche da eseguire")
-            article.append(
-                '<section style="margin:0 0 20px 0;padding-left:14px;border-left:3px solid #2563eb;">'
-                '<p style="margin:0 0 7px 0;font-size:12px;line-height:1.4;font-weight:760;letter-spacing:.02em;text-transform:uppercase;color:#1d4ed8;">'
-                + _assistant_ui_escape(heading)
-                + '</p>'
-                + _assistant_ui_render_numbered_cards(items, is_en=is_en)
-            )
-            for p in paragraphs:
-                article.append(
-                    '<p style="margin:8px 0 0 0;color:#4b5563;">'
-                    + _assistant_ui_inline_markup(p)
-                    + '</p>'
-                )
-            article.append('</section>')
-
-        elif kind == "solution":
-            heading = label or ("Recommended action" if is_en else "Intervento consigliato")
-            article.append(
-                '<section style="margin:0 0 18px 0;padding:10px 14px;border-left:3px solid #16a34a;background:#f0fdf4;border-radius:0 7px 7px 0;">'
-                '<p style="margin:0 0 5px 0;font-size:12px;line-height:1.4;font-weight:760;letter-spacing:.02em;text-transform:uppercase;color:#166534;">'
-                + _assistant_ui_escape(heading)
-                + '</p>'
-            )
-            for p in paragraphs:
-                article.append(
-                    '<p style="margin:3px 0;color:#166534;">'
-                    + _assistant_ui_inline_markup(p)
-                    + '</p>'
-                )
-            article.append('</section>')
-
-        elif kind == "technical_note":
-            heading = label or ("Technical note" if is_en else "Nota tecnica")
-            article.append(
-                '<section style="margin:0 0 18px 0;padding-left:14px;border-left:3px solid #cbd5e1;">'
-                '<p style="margin:0 0 5px 0;font-size:12px;line-height:1.4;font-weight:760;letter-spacing:.02em;text-transform:uppercase;color:#475569;">'
-                + _assistant_ui_escape(heading)
-                + '</p>'
-            )
-            for p in paragraphs:
-                article.append(
-                    '<p style="margin:3px 0;color:#4b5563;">'
-                    + _assistant_ui_inline_markup(p)
-                    + '</p>'
-                )
-            article.append('</section>')
-
-        elif kind == "safety":
-            heading = label or ("Attention" if is_en else "Attenzione")
-            article.append(
-                '<section style="margin:0 0 18px 0;padding:10px 14px;border-left:3px solid #dc2626;background:#fef2f2;border-radius:0 7px 7px 0;">'
-                '<p style="margin:0 0 5px 0;font-size:12px;line-height:1.4;font-weight:760;letter-spacing:.02em;text-transform:uppercase;color:#991b1b;">'
-                + _assistant_ui_escape(heading)
-                + '</p>'
-            )
-            for p in paragraphs:
-                article.append(
-                    '<p style="margin:3px 0;color:#991b1b;">'
-                    + _assistant_ui_inline_markup(p)
-                    + '</p>'
-                )
-            article.append('</section>')
-
-        elif kind == "summary":
-            heading = label or ("Summary" if is_en else "In sintesi")
-            article.append(
-                '<section style="margin:0 0 20px 0;padding-left:14px;border-left:3px solid #2563eb;">'
-                '<p style="margin:0 0 5px 0;font-size:12px;line-height:1.4;font-weight:760;letter-spacing:.02em;text-transform:uppercase;color:#1d4ed8;">'
-                + _assistant_ui_escape(heading)
-                + '</p>'
-            )
-            for p in paragraphs:
-                article.append(
-                    '<p style="margin:0 0 7px 0;color:#374151;">'
-                    + _assistant_ui_inline_markup(p)
-                    + '</p>'
-                )
-            article.append('</section>')
-
-        elif kind == "list":
-            heading = label or ("Steps" if is_en else "Passaggi")
-            article.append(
-                '<section style="margin:0 0 20px 0;padding-left:14px;border-left:3px solid #2563eb;">'
-                '<p style="margin:0 0 7px 0;font-size:12px;line-height:1.4;font-weight:760;letter-spacing:.02em;text-transform:uppercase;color:#1d4ed8;">'
-                + _assistant_ui_escape(heading)
-                + '</p>'
-                + _assistant_ui_render_numbered_cards(items, is_en=is_en)
-                + '</section>'
-            )
-
-        elif kind == "bullets":
-            heading = label or ("Key points" if is_en else "Punti principali")
-            article.append(
-                '<section style="margin:0 0 20px 0;padding-left:14px;border-left:3px solid #2563eb;">'
-                '<p style="margin:0 0 7px 0;font-size:12px;line-height:1.4;font-weight:760;letter-spacing:.02em;text-transform:uppercase;color:#1d4ed8;">'
-                + _assistant_ui_escape(heading)
-                + '</p><ul style="margin:0;padding-left:20px;color:#374151;">'
-            )
-            for item in items:
-                article.append(
-                    '<li style="margin:0 0 8px 0;padding-left:2px;">'
-                    + _assistant_ui_inline_markup(item)
-                    + '</li>'
-                )
-            article.append('</ul></section>')
-
-        elif kind == "heading":
-            article.append(
-                '<section style="margin:0 0 20px 0;padding-left:14px;border-left:3px solid #2563eb;">'
-                '<p style="margin:0 0 7px 0;font-size:12px;line-height:1.4;font-weight:760;letter-spacing:.02em;text-transform:uppercase;color:#1d4ed8;">'
-                + _assistant_ui_inline_markup(label)
-                + '</p>'
-            )
-            for p in paragraphs:
-                article.append(
-                    '<p style="margin:0 0 7px 0;color:#374151;">'
-                    + _assistant_ui_inline_markup(p)
-                    + '</p>'
-                )
-            if items:
-                article.append(_assistant_ui_render_numbered_cards(items, is_en=is_en))
-            article.append('</section>')
-
-        else:
-            for idx, p in enumerate(paragraphs):
-                looks_title = (
-                    first_body
-                    and idx == 0
-                    and len(p) <= 105
-                    and not re.search(r"[.!?;]$", p)
-                )
-                if looks_title:
-                    article.append(
-                        '<h3 style="margin:0 0 9px 0;font-size:15px;line-height:1.45;font-weight:760;color:#111827;">'
-                        + _assistant_ui_inline_markup(p)
-                        + '</h3>'
-                    )
-                else:
-                    color = "#4b5563" if first_body and idx == 0 else "#374151"
-                    article.append(
-                        '<p style="margin:0 0 11px 0;color:'
-                        + color
-                        + ';">'
-                        + _assistant_ui_inline_markup(p)
-                        + '</p>'
-                    )
-                first_body = False
-
-        if kind != "heading":
-            first_body = False
-
-    article.append('</article>')
-    rendered = ''.join(article)
-    return rendered if len(rendered) <= ASSISTANT_UI_MAX_HTML_CHARS else ""
+    return _presentation_responses.assistant_ui_generic_html(answer, links=links, citations=citations, response_language=response_language, status=status, _runtime=_RESPONSE_PRESENTATION_RUNTIME())
 
 
 
@@ -11740,116 +10969,11 @@ def _assistant_ui_root_cause_html(resp: dict, *, response_language: str) -> str:
     LINK and FONTI remain separate Bubble sections. This function renders only the
     diagnostic answer body and never adds anchors, source labels or scores.
     """
-    if not isinstance(resp, dict):
-        return ""
-
-    is_en = str(response_language or "it").strip().lower().startswith("en")
-    status = str(resp.get("status") or "answered").strip().lower()
-    summary = str(resp.get("problem_summary") or resp.get("symptom") or "").strip()
-    causes = [c for c in (resp.get("possible_causes") or []) if isinstance(c, dict)]
-    recommended = _unique_non_empty_strings(resp.get("recommended_next_checks") or [], limit=10)
-
-    article: list[str] = [
-        '<article data-mm-answer="root-cause" data-mm-render="' + _assistant_ui_escape(ASSISTANT_UI_RENDER_VERSION) + '" '
-        'style="box-sizing:border-box;width:100%;font-family:Inter,-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif;'
-        'font-size:14px;line-height:1.62;color:#1f2937;overflow-wrap:anywhere;padding:2px 2px 1px 2px;">'
-    ]
-
-    if status != "answered" or not causes:
-        title = "Analysis unavailable" if is_en else "Analisi non disponibile"
-        fallback = summary or (
-            "I cannot find enough machine evidence to propose reliable probable causes."
-            if is_en
-            else "Non trovo evidenze sufficienti della macchina per proporre cause probabili affidabili."
-        )
-        article.append('<h2 style="margin:0 0 9px 0;font-size:18px;line-height:1.35;font-weight:760;color:#111827;">' + _assistant_ui_escape(title) + '</h2>')
-        article.append('<p style="margin:0;color:#4b5563;">' + _assistant_ui_inline_markup(fallback) + '</p>')
-        article.append('</article>')
-        rendered = ''.join(article)
-        return rendered if len(rendered) <= ASSISTANT_UI_MAX_HTML_CHARS else ""
-
-    title = "Probable causes" if is_en else "Cause probabili"
-    article.append('<h2 style="margin:0 0 8px 0;font-size:18px;line-height:1.35;font-weight:760;color:#111827;">' + _assistant_ui_escape(title) + '</h2>')
-    if summary:
-        problem_label = "Problem" if is_en else "Problema"
-        article.append(
-            '<p style="margin:0 0 18px 0;color:#4b5563;"><strong style="color:#111827;">'
-            + _assistant_ui_escape(problem_label) + ':</strong> ' + _assistant_ui_inline_markup(summary) + '</p>'
-        )
-
-    flattened_checks: list[str] = []
-    for idx, cause in enumerate(causes, start=1):
-        rank = _safe_int(cause.get("rank"), idx)
-        cause_text = str(cause.get("cause") or "").strip()
-        why = str(cause.get("why") or "").strip()
-        checks = _unique_non_empty_strings(cause.get("checks") or [], limit=6)
-        flattened_checks.extend(checks)
-        if not cause_text:
-            continue
-
-        if rank == 1:
-            rank_label = "Most likely cause" if is_en else "Causa più probabile"
-            border = "#2563eb"
-            heading_color = "#1d4ed8"
-        else:
-            rank_label = (f"Possible cause {rank}" if is_en else f"Causa possibile {rank}")
-            border = "#cbd5e1"
-            heading_color = "#334155"
-
-        article.append(
-            '<section style="margin:0 0 20px 0;padding-left:14px;border-left:3px solid ' + border + ';">'
-            '<p style="margin:0 0 4px 0;font-size:12px;line-height:1.4;font-weight:760;letter-spacing:.02em;text-transform:uppercase;color:'
-            + heading_color + ';">' + _assistant_ui_escape(rank_label) + '</p>'
-            '<h3 style="margin:0 0 7px 0;font-size:15px;line-height:1.45;font-weight:760;color:#111827;">'
-            + _assistant_ui_inline_markup(cause_text) + '</h3>'
-        )
-        if why:
-            why_label = "Why" if is_en else "Perché"
-            article.append(
-                '<p style="margin:0 0 9px 0;color:#4b5563;"><strong style="color:#374151;">'
-                + _assistant_ui_escape(why_label) + ':</strong> ' + _assistant_ui_inline_markup(why) + '</p>'
-            )
-        if checks:
-            checks_label = "Checks" if is_en else "Controlli consigliati"
-            article.append('<p style="margin:0 0 6px 0;font-weight:720;color:#111827;">' + _assistant_ui_escape(checks_label) + '</p>')
-            article.append('<ol style="margin:0;padding-left:21px;color:#374151;">')
-            for check in checks:
-                article.append('<li style="margin:0 0 7px 0;padding-left:2px;">' + _assistant_ui_inline_markup(check) + '</li>')
-            article.append('</ol>')
-        article.append('</section>')
-
-    # Show a final priority block only for checks not already repeated under causes.
-    seen_checks = {
-        re.sub(r"\s+", " ", _normalize_unicode_advanced(x or "").lower()).strip()
-        for x in flattened_checks
-        if str(x or "").strip()
-    }
-    extra_checks = [
-        x for x in recommended
-        if re.sub(r"\s+", " ", _normalize_unicode_advanced(x or "").lower()).strip() not in seen_checks
-    ]
-    if extra_checks:
-        final_label = "Additional priority checks" if is_en else "Ulteriori controlli prioritari"
-        article.append(
-            '<section style="margin:0 0 18px 0;padding:10px 14px;border-left:3px solid #16a34a;background:#f0fdf4;border-radius:0 7px 7px 0;">'
-            '<h3 style="margin:0 0 7px 0;font-size:14px;font-weight:760;color:#166534;">'
-            + _assistant_ui_escape(final_label) + '</h3><ol style="margin:0;padding-left:21px;color:#166534;">'
-        )
-        for check in extra_checks[:6]:
-            article.append('<li style="margin:0 0 6px 0;padding-left:2px;">' + _assistant_ui_inline_markup(check) + '</li>')
-        article.append('</ol></section>')
-
-    article.append('</article>')
-    rendered = ''.join(article)
-    return rendered if len(rendered) <= ASSISTANT_UI_MAX_HTML_CHARS else ""
+    return _presentation_responses.assistant_ui_root_cause_html(resp, response_language=response_language, _runtime=_RESPONSE_PRESENTATION_RUNTIME())
 
 
 def _assistant_ui_normalize_url_for_key(value: str) -> str:
-    url = str(value or "").strip()
-    if not url:
-        return ""
-    url = re.sub(r"#page=\d+.*$", "", url, flags=re.IGNORECASE)
-    return url.rstrip("/")
+    return _presentation_responses.assistant_ui_normalize_url_for_key(value, _runtime=_RESPONSE_PRESENTATION_RUNTIME())
 
 
 def _assistant_ui_dedupe_links(items: list[dict], *, max_items: int) -> list[dict]:
@@ -11858,307 +10982,40 @@ def _assistant_ui_dedupe_links(items: list[dict], *, max_items: int) -> list[dic
     Documents are unique per file+page; structured sources are unique per Bubble
     object. The first item keeps the existing retrieval priority and display label.
     """
-    out: list[dict] = []
-    seen: set[tuple] = set()
-    for item in items or []:
-        if not isinstance(item, dict):
-            continue
-        bdid = str(item.get("bubble_document_id") or "").strip()
-        source_type = str(item.get("source_type") or _source_type_from_document_id(bdid)).strip().lower()
-        role = str(item.get("evidence_role") or source_type or "document").strip().lower()
-        url = str(item.get("url") or "").strip()
-        base = _assistant_ui_normalize_url_for_key(url)
-        page = _safe_int(item.get("page_from"), 0)
-        is_structured = bool(item.get("is_structured_source")) or source_type in STRUCTURED_SOURCE_TYPES or role in {"procedure", "step", "ps", "md_photo", "md_video", "structured"}
-        if is_structured:
-            key = ("structured", bdid or base or str(item.get("source_id") or "").strip())
-        else:
-            key = ("document", base or bdid, page)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(item)
-        if len(out) >= max(1, int(max_items or 1)):
-            break
-    return out
+    return _presentation_responses.assistant_ui_dedupe_links(items, max_items=max_items, _runtime=_RESPONSE_PRESENTATION_RUNTIME())
 
 
 def _assistant_ui_dedupe_citations(items: list[dict], *, max_items: int) -> list[dict]:
     """Compact the visible FONTI list while preserving the existing data contract."""
-    out: list[dict] = []
-    seen: set[tuple] = set()
-    for item in items or []:
-        if not isinstance(item, dict):
-            continue
-        bdid = str(item.get("bubble_document_id") or "").strip()
-        source_type = str(item.get("source_type") or _source_type_from_document_id(bdid)).strip().lower()
-        role = str(item.get("evidence_role") or source_type or "document").strip().lower()
-        p1 = _safe_int(item.get("page_from"), 0)
-        p2 = _safe_int(item.get("page_to"), p1)
-        is_structured = bool(item.get("is_structured_source")) or source_type in STRUCTURED_SOURCE_TYPES or role in {"procedure", "step", "ps", "md_photo", "md_video", "structured"}
-        key = ("structured", bdid) if is_structured else ("document", bdid, p1, p2)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(item)
-        if len(out) >= max(1, int(max_items or 1)):
-            break
-    return out
+    return _presentation_responses.assistant_ui_dedupe_citations(items, max_items=max_items, _runtime=_RESPONSE_PRESENTATION_RUNTIME())
 
 
 
 def _assistant_ui_visible_text_from_html(value: str) -> str:
-    raw = re.sub(r"(?is)<(?:script|style)\b[^>]*>.*?</(?:script|style)>", " ", str(value or ""))
-    raw = re.sub(r"(?s)<[^>]+>", " ", raw)
-    raw = html.unescape(raw)
-    return re.sub(r"\s+", " ", raw).strip()
+    return _presentation_responses.assistant_ui_visible_text_from_html(value, _runtime=_RESPONSE_PRESENTATION_RUNTIME())
 
 
 def _assistant_ui_canonical_tokens(value: str) -> list[str]:
-    raw = html.unescape(str(value or ""))
-    # Native <ol>/<ul> markers are visual CSS/browser content and do not appear in
-    # stripped HTML text. Exclude only line-prefix list markers from canonicality.
-    raw = re.sub(r"(?m)^\s*\d{1,3}[.)]\s+", " ", raw)
-    raw = re.sub(r"(?m)^\s*[-•☐]\s*", " ", raw)
-    normalized = _normalize_unicode_advanced(raw).casefold()
-    return re.findall(r"[a-z0-9]+(?:[.,][0-9]+)?", normalized)
+    return _presentation_responses.assistant_ui_canonical_tokens(value, _runtime=_RESPONSE_PRESENTATION_RUNTIME())
 
 
 def _assistant_ui_token_coverage(reference: str, candidate: str) -> float:
     """Multiset token recall of the canonical text in the rendered visible text."""
-    from collections import Counter
-    ref = Counter(_assistant_ui_canonical_tokens(reference))
-    if not ref:
-        return 1.0
-    got = Counter(_assistant_ui_canonical_tokens(candidate))
-    matched = sum(min(count, got.get(token, 0)) for token, count in ref.items())
-    return matched / max(1, sum(ref.values()))
+    return _presentation_responses.assistant_ui_token_coverage(reference, candidate, _runtime=_RESPONSE_PRESENTATION_RUNTIME())
 
 
-def _assistant_ui_lossless_html(answer: str, *, response_language: str, status: str = "answered") -> str:
+def _assistant_ui_lossless_html(answer: str, *, response_language: str, status: str='answered') -> str:
     """Lossless ASK fallback using the same visual tokens as Root Cause."""
-    clean = _assistant_ui_normalize_markdown_tables(
-        _strip_inline_citation_markers_for_display(str(answer or ""))
-    ).strip()
-    if not clean:
-        return ""
-
-    is_en = str(response_language or "it").strip().lower().startswith("en")
-    status_low = str(status or "answered").strip().lower()
-    chunks = [
-        '<article data-mm-answer="lossless" data-mm-render="'
-        + _assistant_ui_escape(ASSISTANT_ASK_UI_RENDER_VERSION)
-        + '" data-mm-visual="root-parity-v1" '
-        'style="box-sizing:border-box;width:100%;font-family:Inter,-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif;font-size:14px;line-height:1.62;color:#1f2937;overflow-wrap:anywhere;padding:2px 2px 1px 2px;">',
-        '<h2 style="margin:0 0 8px 0;font-size:18px;line-height:1.35;font-weight:760;color:#111827;">'
-        + _assistant_ui_escape("Answer" if is_en else "Risposta")
-        + '</h2>',
-    ]
-
-    if status_low != "answered":
-        if status_low in {"no_sources", "needs_clarification"}:
-            tone, background, border = "#92400e", "#fffbeb", "#d97706"
-        else:
-            tone, background, border = "#991b1b", "#fef2f2", "#dc2626"
-        chunks.append(
-            '<section style="margin:0 0 18px 0;padding:10px 14px;border-left:3px solid '
-            + border
-            + ';background:'
-            + background
-            + ';border-radius:0 7px 7px 0;color:'
-            + tone
-            + ';"><p style="margin:0;font-size:12px;line-height:1.4;font-weight:760;letter-spacing:.02em;text-transform:uppercase;color:'
-            + tone
-            + ';">'
-            + _assistant_ui_escape("Result" if is_en else "Esito")
-            + '</p></section>'
-        )
-
-    list_kind = ""
-    section_open = False
-
-    def open_section(label: str) -> None:
-        nonlocal section_open
-        if section_open:
-            close_section()
-        chunks.append(
-            '<section style="margin:0 0 20px 0;padding-left:14px;border-left:3px solid #2563eb;">'
-            '<p style="margin:0 0 7px 0;font-size:12px;line-height:1.4;font-weight:760;letter-spacing:.02em;text-transform:uppercase;color:#1d4ed8;">'
-            + _assistant_ui_inline_markup(label)
-            + '</p>'
-        )
-        section_open = True
-
-    def close_list() -> None:
-        nonlocal list_kind
-        if list_kind:
-            chunks.append(f"</{list_kind}>")
-            list_kind = ""
-
-    def close_section() -> None:
-        nonlocal section_open
-        close_list()
-        if section_open:
-            chunks.append('</section>')
-            section_open = False
-
-    for raw in clean.replace("\r", "\n").split("\n"):
-        line = str(raw or "").strip()
-        if not line:
-            close_section()
-            continue
-
-        heading = re.fullmatch(r"\*\*(.+?)\*\*", line)
-        numbered = re.match(r"^\d{1,3}[.)]\s+(.+)$", line)
-        bullet = re.match(r"^[-•]\s+(.+)$", line)
-
-        if heading:
-            open_section(heading.group(1).strip())
-        elif numbered:
-            if not section_open:
-                open_section("Steps" if is_en else "Passaggi")
-            if list_kind != "ol":
-                close_list()
-                list_kind = "ol"
-                chunks.append('<ol style="margin:0;padding-left:21px;color:#374151;">')
-            chunks.append(
-                '<li style="margin:0 0 7px 0;padding-left:2px;">'
-                + _assistant_ui_inline_markup(numbered.group(1).strip())
-                + '</li>'
-            )
-        elif bullet:
-            if not section_open:
-                open_section("Key points" if is_en else "Punti principali")
-            if list_kind != "ul":
-                close_list()
-                list_kind = "ul"
-                chunks.append('<ul style="margin:0;padding-left:20px;color:#374151;">')
-            chunks.append(
-                '<li style="margin:0 0 8px 0;padding-left:2px;">'
-                + _assistant_ui_inline_markup(bullet.group(1).strip())
-                + '</li>'
-            )
-        else:
-            close_list()
-            chunks.append(
-                '<p style="margin:0 0 10px 0;color:#374151;">'
-                + _assistant_ui_inline_markup(line)
-                + '</p>'
-            )
-
-    close_section()
-    chunks.append('</article>')
-    return ''.join(chunks)
+    return _presentation_responses.assistant_ui_lossless_html(answer, response_language=response_language, status=status, _runtime=_RESPONSE_PRESENTATION_RUNTIME())
 
 
 
-def _assistant_ui_finalize_response(resp: dict, *, language: str = "it") -> dict:
+def _assistant_ui_finalize_response(resp: dict, *, language: str='it') -> dict:
     """Create one canonical answer and prove that the rendered body is lossless."""
-    if not isinstance(resp, dict):
-        return resp
-    out = dict(resp)
-    if isinstance(out.get("rg_links"), list):
-        out["rg_links"] = _assistant_ui_dedupe_links(
-            out.get("rg_links") or [],
-            max_items=max(1, int(ASK_UI_STRUCTURED_MAX_LINKS or ASK_UI_MAX_LINKS or 14)),
-        )
-    if isinstance(out.get("citations"), list):
-        out["citations"] = _assistant_ui_dedupe_citations(
-            out.get("citations") or [],
-            max_items=max(1, int(ASK_UI_STRUCTURED_MAX_CITATIONS or ASK_UI_MAX_CITATIONS or 14)),
-        )
+    return _presentation_responses.assistant_ui_finalize_response(resp, language=language, _runtime=_RESPONSE_PRESENTATION_RUNTIME())
 
-    status = str(out.get("status") or "answered").strip().lower()
-    effective_mode = str(out.get("effective_mode") or "").strip().lower()
-    is_native_root_cause = effective_mode == "root_cause" and (
-        isinstance(out.get("possible_causes"), list)
-        or "problem_summary" in out
-        or isinstance(out.get("recommended_next_checks"), list)
-    )
-
-    if is_native_root_cause:
-        canonical_text = _assistant_ui_root_cause_text(out, response_language=language)
-        out["answer"] = canonical_text
-        rendered = _assistant_ui_root_cause_html(out, response_language=language) if canonical_text else ""
-        mode = "root_cause"
-    else:
-        canonical_text = str(out.get("answer") or "").strip()
-        out["answer"] = canonical_text
-        rendered = _assistant_ui_generic_html(
-            canonical_text,
-            links=out.get("rg_links") if isinstance(out.get("rg_links"), list) else [],
-            citations=out.get("citations") if isinstance(out.get("citations"), list) else [],
-            response_language=language,
-            status=status,
-        ) if canonical_text else ""
-        mode = "ask"
-
-    visible = _assistant_ui_visible_text_from_html(rendered)
-    coverage = _assistant_ui_token_coverage(canonical_text, visible) if canonical_text else 1.0
-    renderer_fallback_used = False
-    if canonical_text and coverage < 0.97:
-        lossless = _assistant_ui_lossless_html(
-            canonical_text, response_language=language, status=status
-        )
-        lossless_visible = _assistant_ui_visible_text_from_html(lossless)
-        lossless_coverage = _assistant_ui_token_coverage(canonical_text, lossless_visible)
-        if lossless and lossless_coverage >= coverage:
-            rendered = lossless
-            visible = lossless_visible
-            coverage = lossless_coverage
-            renderer_fallback_used = True
-
-    canonical_passed = bool(not canonical_text or coverage >= 0.97)
-    out.pop("_assistant_ui_model", None)
-    if rendered and canonical_passed:
-        out["answer_html"] = rendered
-        out["answer_format"] = "html"
-    else:
-        # Bubble's existing text fallback is safer than publishing lossy HTML.
-        out.pop("answer_html", None)
-        out["answer_format"] = "text"
-
-    selected_render_version = (
-        ASSISTANT_UI_RENDER_VERSION
-        if mode == "root_cause"
-        else ASSISTANT_ASK_UI_RENDER_VERSION
-    )
-    out["answer_render_version"] = selected_render_version
-    meta = dict(out.get("meta") or {})
-    meta.update({
-        "answer_render_version": selected_render_version,
-        "answer_html_safe_template": True,
-        "answer_html_body_only": True,
-        "answer_html_contains_sources": False,
-        "answer_html_mode": mode,
-        "canonical_final_answer": canonical_passed,
-        "canonical_text_chars": len(canonical_text),
-        "answer_html_token_coverage": round(float(coverage), 6),
-        "answer_html_renderer_fallback_used": renderer_fallback_used,
-    })
-    if not canonical_passed:
-        meta["cacheable"] = False
-        meta["semantic_cacheable"] = False
-        meta["canonical_failure_reason"] = "answer_html_token_coverage_below_0.97"
-    out["meta"] = meta
-    return out
-
-def _format_structured_procedure_answer_for_ui(
-    *,
-    structured_citations: list[dict],
-    manual_support_citations: list[dict],
-    grounded_points: list[dict],
-    response_language: str,
-    q: str = "",
-) -> str:
-    model = _build_structured_procedure_ui_model(
-        structured_citations=structured_citations,
-        manual_support_citations=manual_support_citations,
-        grounded_points=grounded_points,
-        response_language=response_language,
-        q=q,
-    )
-    return _procedure_ui_model_to_text(model, response_language=response_language)
+def _format_structured_procedure_answer_for_ui(*, structured_citations: list[dict], manual_support_citations: list[dict], grounded_points: list[dict], response_language: str, q: str='') -> str:
+    return _presentation_responses.format_structured_procedure_answer_for_ui(structured_citations=structured_citations, manual_support_citations=manual_support_citations, grounded_points=grounded_points, response_language=response_language, q=q, _runtime=_RESPONSE_PRESENTATION_RUNTIME())
 
 
 def _compact_manual_support_snippet_for_display(text: str, *, max_len: int) -> str:

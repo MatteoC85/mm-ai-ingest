@@ -1,0 +1,22 @@
+{
+  "commit_unit": "3B",
+  "mutations": [
+    {
+      "detected": true,
+      "name": "explicit_list_values_removed",
+      "purpose": "proves the repeated-1 numbering regression is pinned"
+    },
+    {
+      "detected": true,
+      "name": "structured_procedure_renderer_disabled",
+      "purpose": "proves the finalizer uses the structured Procedure model"
+    },
+    {
+      "detected": true,
+      "name": "html_escaping_disabled",
+      "purpose": "proves untrusted model text remains escaped"
+    }
+  ],
+  "roadmap_phase": "3",
+  "schema_version": "machinemind-mutation-results-v1"
+}

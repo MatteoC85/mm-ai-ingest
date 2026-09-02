@@ -1,0 +1,749 @@
+{
+  "dedupe_citations": {
+    "error": null,
+    "stdout": [],
+    "value": [
+      {
+        "bubble_document_id": "D1",
+        "citation_id": "C1",
+        "page_from": 3,
+        "page_to": 3,
+        "source_type": "document"
+      },
+      {
+        "bubble_document_id": "D1",
+        "citation_id": "C2",
+        "page_from": 4,
+        "page_to": 4,
+        "source_type": "document"
+      },
+      {
+        "bubble_document_id": "step:S1",
+        "citation_id": "S1",
+        "page_from": 0,
+        "page_to": 0,
+        "source_type": "step"
+      }
+    ]
+  },
+  "dedupe_links": {
+    "error": null,
+    "stdout": [],
+    "value": [
+      {
+        "bubble_document_id": "D1",
+        "page_from": 3,
+        "source_type": "document",
+        "url": "https://x.test/a.pdf#page=3"
+      },
+      {
+        "bubble_document_id": "D1",
+        "page_from": 4,
+        "source_type": "document",
+        "url": "https://x.test/a.pdf#page=4"
+      },
+      {
+        "bubble_document_id": "step:S1",
+        "page_from": 0,
+        "source_type": "step",
+        "url": "https://app.test/step/1"
+      }
+    ]
+  },
+  "escape_untrusted": {
+    "error": null,
+    "stdout": [],
+    "value": "&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt; &amp; &quot;"
+  },
+  "finalize_generic": {
+    "answer": "PROC-001 — Avviamento sicuro\n1. Verificare area e ripari\nAzione operativa: controllare l'area.\nSicurezza: non avviare con anomalie.\n2. Controllare le utenze\nAzione operativa: verificare aria e alimentazione.\nSicurezza: personale qualificato.\n3. Inserire l'alimentazione generale",
+    "answer_format": "html",
+    "answer_html": {
+      "article_kinds": [
+        "lossless"
+      ],
+      "contains_escaped_script": false,
+      "contains_raw_script": false,
+      "contains_sources_heading": false,
+      "length": 1571,
+      "li_values": [
+        1,
+        2,
+        3
+      ],
+      "ordered_list_count": 3,
+      "render_versions": [
+        "assistant-ui-ask-root-parity-v1-20260901-1"
+      ],
+      "sha256": "fd623ad79aea84c1f70a0ff363bb93a08938f3d580f934da23d3019fe547d7fd",
+      "unordered_list_count": 0,
+      "visible_text": "Risposta PROC-001 — Avviamento sicuro Passaggi Verificare area e ripari Azione operativa: controllare l'area. Sicurezza: non avviare con anomalie. Controllare le utenze Azione operativa: verificare aria e alimentazione. Sicurezza: personale qualificato. Inserire l'alimentazione generale"
+    },
+    "answer_render_version": "assistant-ui-ask-root-parity-v1-20260901-1",
+    "citations": [
+      {
+        "bubble_document_id": "D1",
+        "citation_id": "C1",
+        "page_from": 3,
+        "page_to": 3,
+        "source_type": "document"
+      },
+      {
+        "bubble_document_id": "D1",
+        "citation_id": "C2",
+        "page_from": 4,
+        "page_to": 4,
+        "source_type": "document"
+      },
+      {
+        "bubble_document_id": "step:S1",
+        "citation_id": "S1",
+        "page_from": 0,
+        "page_to": 0,
+        "source_type": "step"
+      }
+    ],
+    "language": "it",
+    "meta": {
+      "answer_html_body_only": true,
+      "answer_html_contains_sources": false,
+      "answer_html_mode": "ask",
+      "answer_html_renderer_fallback_used": true,
+      "answer_html_safe_template": true,
+      "answer_html_token_coverage": 1.0,
+      "answer_render_version": "assistant-ui-ask-root-parity-v1-20260901-1",
+      "cacheable": true,
+      "canonical_final_answer": true,
+      "canonical_text_chars": 278
+    },
+    "ok": true,
+    "rg_links": [
+      {
+        "bubble_document_id": "D1",
+        "page_from": 3,
+        "source_type": "document",
+        "url": "https://x.test/a.pdf#page=3"
+      },
+      {
+        "bubble_document_id": "D1",
+        "page_from": 4,
+        "source_type": "document",
+        "url": "https://x.test/a.pdf#page=4"
+      },
+      {
+        "bubble_document_id": "step:S1",
+        "page_from": 0,
+        "source_type": "step",
+        "url": "https://app.test/step/1"
+      }
+    ],
+    "status": "answered"
+  },
+  "finalize_html_limit_fallback": {
+    "answer": "PROC-001 - Avviamento sicuro\n\nSequenza validata di avvio.\n\nPrima di iniziare\nPersonale qualificato: Operatore qualificato.\nLivello di sicurezza: ALTO.\n\nProcedura\n1. Verificare area e ripari\nControllare che l'area sia libera.\nAttenzione: Non avviare in presenza di anomalie.\n\n2. Controllare le utenze\nVerificare collegamento elettrico e pressione 5-6 bar.\nAttenzione: Collegamenti riservati a personale qualificato.\n\n3. Inserire l'alimentazione generale\nAttendere l'avvio di HMI e PLC.\n\nSupporto dal manuale\n- Il manuale richiede un'azione volontaria.",
+    "answer_format": "html",
+    "answer_html": {
+      "article_kinds": [
+        "lossless"
+      ],
+      "contains_escaped_script": false,
+      "contains_raw_script": false,
+      "contains_sources_heading": false,
+      "length": 3018,
+      "li_values": [
+        1,
+        2,
+        3
+      ],
+      "ordered_list_count": 3,
+      "render_versions": [
+        "assistant-ui-ask-root-parity-v1-20260901-1"
+      ],
+      "sha256": "0abc9ffd73442a5c7a98ff8d39d2fdf5ab27994f67c9cc7682a36bbf93e5fb9d",
+      "unordered_list_count": 1,
+      "visible_text": "Risposta PROC-001 - Avviamento sicuro Sequenza validata di avvio. Prima di iniziare Personale qualificato: Operatore qualificato. Livello di sicurezza: ALTO. Procedura Passaggi Verificare area e ripari Controllare che l'area sia libera. Attenzione: Non avviare in presenza di anomalie. Passaggi Controllare le utenze Verificare collegamento elettrico e pressione 5-6 bar. Attenzione: Collegamenti riservati a personale qualificato. Passaggi Inserire l'alimentazione generale Attendere l'avvio di HMI e PLC. Supporto dal manuale Punti principali Il manuale richiede un'azione volontaria."
+    },
+    "answer_render_version": "assistant-ui-ask-root-parity-v1-20260901-1",
+    "citations": [
+      {
+        "bubble_document_id": "D1",
+        "citation_id": "C1",
+        "page_from": 3,
+        "page_to": 3,
+        "source_type": "document"
+      },
+      {
+        "bubble_document_id": "D1",
+        "citation_id": "C2",
+        "page_from": 4,
+        "page_to": 4,
+        "source_type": "document"
+      },
+      {
+        "bubble_document_id": "step:S1",
+        "citation_id": "S1",
+        "page_from": 0,
+        "page_to": 0,
+        "source_type": "step"
+      }
+    ],
+    "language": "it",
+    "meta": {
+      "answer_html_body_only": true,
+      "answer_html_contains_sources": false,
+      "answer_html_mode": "procedure",
+      "answer_html_renderer_fallback_used": true,
+      "answer_html_safe_template": true,
+      "answer_html_token_coverage": 1.0,
+      "answer_render_version": "assistant-ui-ask-root-parity-v1-20260901-1",
+      "cacheable": true,
+      "canonical_final_answer": true,
+      "canonical_text_chars": 550
+    },
+    "ok": true,
+    "rg_links": [
+      {
+        "bubble_document_id": "D1",
+        "page_from": 3,
+        "source_type": "document",
+        "url": "https://x.test/a.pdf#page=3"
+      },
+      {
+        "bubble_document_id": "D1",
+        "page_from": 4,
+        "source_type": "document",
+        "url": "https://x.test/a.pdf#page=4"
+      },
+      {
+        "bubble_document_id": "step:S1",
+        "page_from": 0,
+        "source_type": "step",
+        "url": "https://app.test/step/1"
+      }
+    ],
+    "status": "answered"
+  },
+  "finalize_procedure": {
+    "answer": "PROC-001 - Avviamento sicuro\n\nSequenza validata di avvio.\n\nPrima di iniziare\nPersonale qualificato: Operatore qualificato.\nLivello di sicurezza: ALTO.\n\nProcedura\n1. Verificare area e ripari\nControllare che l'area sia libera.\nAttenzione: Non avviare in presenza di anomalie.\n\n2. Controllare le utenze\nVerificare collegamento elettrico e pressione 5-6 bar.\nAttenzione: Collegamenti riservati a personale qualificato.\n\n3. Inserire l'alimentazione generale\nAttendere l'avvio di HMI e PLC.\n\nSupporto dal manuale\n- Il manuale richiede un'azione volontaria.",
+    "answer_format": "html",
+    "answer_html": {
+      "article_kinds": [
+        "procedure"
+      ],
+      "contains_escaped_script": false,
+      "contains_raw_script": false,
+      "contains_sources_heading": false,
+      "length": 2383,
+      "li_values": [
+        1,
+        2,
+        3
+      ],
+      "ordered_list_count": 1,
+      "render_versions": [
+        "assistant-ui-html-lossless-v10-1-20260806-1"
+      ],
+      "sha256": "d26701ac7090e3d7015c25cd0783ed7abacda8a232eef85172d4840795abf3ae",
+      "unordered_list_count": 1,
+      "visible_text": "PROC-001 — Avviamento sicuro Sequenza validata di avvio. Prima di iniziare Personale qualificato: Operatore qualificato Livello di sicurezza: ALTO Procedura Verificare area e ripari Controllare che l'area sia libera. Attenzione: Non avviare in presenza di anomalie. Controllare le utenze Verificare collegamento elettrico e pressione 5-6 bar. Attenzione: Collegamenti riservati a personale qualificato. Inserire l'alimentazione generale Attendere l'avvio di HMI e PLC. Supporto dal manuale Il manuale richiede un'azione volontaria."
+    },
+    "answer_render_version": "assistant-ui-html-lossless-v10-1-20260806-1",
+    "citations": [
+      {
+        "bubble_document_id": "D1",
+        "citation_id": "C1",
+        "page_from": 3,
+        "page_to": 3,
+        "source_type": "document"
+      },
+      {
+        "bubble_document_id": "D1",
+        "citation_id": "C2",
+        "page_from": 4,
+        "page_to": 4,
+        "source_type": "document"
+      },
+      {
+        "bubble_document_id": "step:S1",
+        "citation_id": "S1",
+        "page_from": 0,
+        "page_to": 0,
+        "source_type": "step"
+      }
+    ],
+    "language": "it",
+    "meta": {
+      "answer_html_body_only": true,
+      "answer_html_contains_sources": false,
+      "answer_html_mode": "procedure",
+      "answer_html_renderer_fallback_used": false,
+      "answer_html_safe_template": true,
+      "answer_html_token_coverage": 1.0,
+      "answer_render_version": "assistant-ui-html-lossless-v10-1-20260806-1",
+      "cacheable": true,
+      "canonical_final_answer": true,
+      "canonical_text_chars": 550
+    },
+    "ok": true,
+    "rg_links": [
+      {
+        "bubble_document_id": "D1",
+        "page_from": 3,
+        "source_type": "document",
+        "url": "https://x.test/a.pdf#page=3"
+      },
+      {
+        "bubble_document_id": "D1",
+        "page_from": 4,
+        "source_type": "document",
+        "url": "https://x.test/a.pdf#page=4"
+      },
+      {
+        "bubble_document_id": "step:S1",
+        "page_from": 0,
+        "source_type": "step",
+        "url": "https://app.test/step/1"
+      }
+    ],
+    "status": "answered"
+  },
+  "finalize_root_cause": {
+    "answer": "Cause probabili\n\nProblema: La macchina non si abilita.\n\nCausa più probabile\nRipristino zone incompleto\nPerché: Ogni zona richiede il proprio reset.\nControlli consigliati\n1. Premere i due reset anteriori\n2. Premere il reset posteriore\n\nCausa possibile 2\nEmergenza ancora attiva\nPerché: L'emergenza ha priorità.\nControlli consigliati\n1. Controllare tutti i funghi\n\nUlteriori controlli prioritari\n1. Verificare HMI",
+    "answer_format": "html",
+    "answer_html": {
+      "article_kinds": [
+        "root-cause"
+      ],
+      "contains_escaped_script": false,
+      "contains_raw_script": false,
+      "contains_sources_heading": false,
+      "length": 2457,
+      "li_values": [],
+      "ordered_list_count": 3,
+      "render_versions": [
+        "assistant-ui-html-lossless-v10-1-20260806-1"
+      ],
+      "sha256": "38515556e4c576ecded8311371df5301e58d7af20cfa1b4a42c8f89f53e66d9a",
+      "unordered_list_count": 0,
+      "visible_text": "Cause probabili Problema: La macchina non si abilita. Causa più probabile Ripristino zone incompleto Perché: Ogni zona richiede il proprio reset. Controlli consigliati Premere i due reset anteriori Premere il reset posteriore Causa possibile 2 Emergenza ancora attiva Perché: L'emergenza ha priorità. Controlli consigliati Controllare tutti i funghi Ulteriori controlli prioritari Verificare HMI"
+    },
+    "answer_render_version": "assistant-ui-html-lossless-v10-1-20260806-1",
+    "citations": [
+      {
+        "bubble_document_id": "D1",
+        "citation_id": "C1",
+        "page_from": 3,
+        "page_to": 3,
+        "source_type": "document"
+      },
+      {
+        "bubble_document_id": "D1",
+        "citation_id": "C2",
+        "page_from": 4,
+        "page_to": 4,
+        "source_type": "document"
+      },
+      {
+        "bubble_document_id": "step:S1",
+        "citation_id": "S1",
+        "page_from": 0,
+        "page_to": 0,
+        "source_type": "step"
+      }
+    ],
+    "effective_mode": "root_cause",
+    "meta": {
+      "answer_html_body_only": true,
+      "answer_html_contains_sources": false,
+      "answer_html_mode": "root_cause",
+      "answer_html_renderer_fallback_used": false,
+      "answer_html_safe_template": true,
+      "answer_html_token_coverage": 1.0,
+      "answer_render_version": "assistant-ui-html-lossless-v10-1-20260806-1",
+      "canonical_final_answer": true,
+      "canonical_text_chars": 411
+    },
+    "ok": true,
+    "possible_causes": [
+      {
+        "cause": "Ripristino zone incompleto",
+        "checks": [
+          "Premere i due reset anteriori",
+          "Premere il reset posteriore"
+        ],
+        "rank": 1,
+        "why": "Ogni zona richiede il proprio reset."
+      },
+      {
+        "cause": "Emergenza ancora attiva",
+        "checks": [
+          "Controllare tutti i funghi"
+        ],
+        "rank": 2,
+        "why": "L'emergenza ha priorità."
+      }
+    ],
+    "problem_summary": "La macchina non si abilita.",
+    "recommended_next_checks": [
+      "Premere i due reset anteriori",
+      "Verificare HMI"
+    ],
+    "rg_links": [
+      {
+        "bubble_document_id": "D1",
+        "page_from": 3,
+        "source_type": "document",
+        "url": "https://x.test/a.pdf#page=3"
+      },
+      {
+        "bubble_document_id": "D1",
+        "page_from": 4,
+        "source_type": "document",
+        "url": "https://x.test/a.pdf#page=4"
+      },
+      {
+        "bubble_document_id": "step:S1",
+        "page_from": 0,
+        "source_type": "step",
+        "url": "https://app.test/step/1"
+      }
+    ],
+    "status": "answered"
+  },
+  "generic_no_sources": {
+    "article_kinds": [
+      "generic"
+    ],
+    "contains_escaped_script": false,
+    "contains_raw_script": false,
+    "contains_sources_heading": false,
+    "length": 826,
+    "li_values": [],
+    "ordered_list_count": 0,
+    "render_versions": [
+      "assistant-ui-ask-root-parity-v1-20260901-1"
+    ],
+    "sha256": "e1bb3c3ec4e4de3f38c02d246f0ceeefb011da38714f0bf49c5e964b381a24af",
+    "unordered_list_count": 0,
+    "visible_text": "Risposta Esito Non trovo informazioni sufficienti."
+  },
+  "generic_numbered_restart": {
+    "article_kinds": [
+      "generic"
+    ],
+    "contains_escaped_script": false,
+    "contains_raw_script": false,
+    "contains_sources_heading": false,
+    "length": 1226,
+    "li_values": [
+      1,
+      2,
+      3
+    ],
+    "ordered_list_count": 1,
+    "render_versions": [
+      "assistant-ui-ask-root-parity-v1-20260901-1"
+    ],
+    "sha256": "b86be5bcde51ca5cd4aef85b9bde18e2a6b82b6d72ff953b0667ea17d8f4e939",
+    "unordered_list_count": 0,
+    "visible_text": "Risposta PROC-001 — Avviamento sicuro Passaggi Verificare area e ripari Controllare le utenze Inserire l'alimentazione generale"
+  },
+  "generic_untrusted": {
+    "article_kinds": [
+      "generic"
+    ],
+    "contains_escaped_script": true,
+    "contains_raw_script": false,
+    "contains_sources_heading": false,
+    "length": 1240,
+    "li_values": [],
+    "ordered_list_count": 0,
+    "render_versions": [
+      "assistant-ui-ask-root-parity-v1-20260901-1"
+    ],
+    "sha256": "650e9050d9fa28d8089308b9f6c4129d4f9edb19fe7e17574f487f980154aac5",
+    "unordered_list_count": 1,
+    "visible_text": "Risposta Risposta <script>alert(1)</script> Punti principali Valore: A-7"
+  },
+  "inline_markup": {
+    "error": null,
+    "stdout": [],
+    "value": "<strong style=\"font-weight:750;color:#111827;\">Bold</strong> and <code style=\"padding:1px 5px;border-radius:5px;background:#f1f5f9;color:#0f172a;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;\">CODE-7</code> &lt;img src=x&gt;"
+  },
+  "labeled_lines": {
+    "**Controlli consigliati:** 1. Verifica A 2. Verifica B": {
+      "error": null,
+      "stdout": [],
+      "value": [
+        "checks",
+        "Controlli consigliati",
+        "1. Verifica A 2. Verifica B"
+      ]
+    },
+    "2. Soluzione: Ripristinare il consenso": {
+      "error": null,
+      "stdout": [],
+      "value": [
+        "solution",
+        "Soluzione",
+        "Ripristinare il consenso"
+      ]
+    },
+    "Testo libero": {
+      "error": null,
+      "stdout": [],
+      "value": [
+        "",
+        "",
+        ""
+      ]
+    }
+  },
+  "late_bound_helpers": {
+    "dedupe": {
+      "error": null,
+      "stdout": [],
+      "value": [
+        {
+          "bubble_document_id": "anything",
+          "page_from": 1,
+          "url": "https://x.test/a"
+        }
+      ]
+    },
+    "procedure_html": {
+      "article_kinds": [
+        "procedure"
+      ],
+      "contains_escaped_script": false,
+      "contains_raw_script": false,
+      "contains_sources_heading": false,
+      "length": 785,
+      "li_values": [
+        77
+      ],
+      "ordered_list_count": 1,
+      "render_versions": [
+        "assistant-ui-html-lossless-v10-1-20260806-1"
+      ],
+      "sha256": "49b0fdb82c138e196d274e2cae4f02073ac1ea643f48b12c22851d6fabb782b6",
+      "unordered_list_count": 0,
+      "visible_text": "Patched Procedura X Y"
+    }
+  },
+  "lossless_numbered_restart": {
+    "article_kinds": [
+      "lossless"
+    ],
+    "contains_escaped_script": false,
+    "contains_raw_script": false,
+    "contains_sources_heading": false,
+    "length": 1556,
+    "li_values": [
+      1,
+      2,
+      3
+    ],
+    "ordered_list_count": 3,
+    "render_versions": [
+      "assistant-ui-ask-root-parity-v1-20260901-1"
+    ],
+    "sha256": "a1eaa74106a42d8e13dae7d895fa04f24c11d4324da3cdd17ac71226d90dd1ad",
+    "unordered_list_count": 0,
+    "visible_text": "Risposta Passaggi Primo Nota Secondo Passaggi Terzo"
+  },
+  "normalize_markdown_table": {
+    "error": null,
+    "stdout": [],
+    "value": "**Pressione**\n- **Valore:** 5 bar\n\n**Corsa**\n- **Valore:** 30 mm\n"
+  },
+  "procedure_html": {
+    "article_kinds": [
+      "procedure"
+    ],
+    "contains_escaped_script": false,
+    "contains_raw_script": false,
+    "contains_sources_heading": false,
+    "length": 2383,
+    "li_values": [
+      1,
+      2,
+      3
+    ],
+    "ordered_list_count": 1,
+    "render_versions": [
+      "assistant-ui-html-lossless-v10-1-20260806-1"
+    ],
+    "sha256": "d26701ac7090e3d7015c25cd0783ed7abacda8a232eef85172d4840795abf3ae",
+    "unordered_list_count": 1,
+    "visible_text": "PROC-001 — Avviamento sicuro Sequenza validata di avvio. Prima di iniziare Personale qualificato: Operatore qualificato Livello di sicurezza: ALTO Procedura Verificare area e ripari Controllare che l'area sia libera. Attenzione: Non avviare in presenza di anomalie. Controllare le utenze Verificare collegamento elettrico e pressione 5-6 bar. Attenzione: Collegamenti riservati a personale qualificato. Inserire l'alimentazione generale Attendere l'avvio di HMI e PLC. Supporto dal manuale Il manuale richiede un'azione volontaria."
+  },
+  "procedure_text": "PROC-001 - Avviamento sicuro\n\nSequenza validata di avvio.\n\nPrima di iniziare\nPersonale qualificato: Operatore qualificato.\nLivello di sicurezza: ALTO.\n\nProcedura\n1. Verificare area e ripari\nControllare che l'area sia libera.\nAttenzione: Non avviare in presenza di anomalie.\n\n2. Controllare le utenze\nVerificare collegamento elettrico e pressione 5-6 bar.\nAttenzione: Collegamenti riservati a personale qualificato.\n\n3. Inserire l'alimentazione generale\nAttendere l'avvio di HMI e PLC.\n\nSupporto dal manuale\n- Il manuale richiede un'azione volontaria.",
+  "root_text": "Cause probabili\n\nProblema: La macchina non si abilita.\n\nCausa più probabile\nRipristino zone incompleto\nPerché: Ogni zona richiede il proprio reset.\nControlli consigliati\n1. Premere i due reset anteriori\n2. Premere il reset posteriore\n\nCausa possibile 2\nEmergenza ancora attiva\nPerché: L'emergenza ha priorità.\nControlli consigliati\n1. Controllare tutti i funghi\n\nUlteriori controlli prioritari\n1. Verificare HMI",
+  "section_kinds": {
+    "Attenzione": {
+      "error": null,
+      "stdout": [],
+      "value": "safety"
+    },
+    "Causa più probabile": {
+      "error": null,
+      "stdout": [],
+      "value": "cause"
+    },
+    "Controlli consigliati": {
+      "error": null,
+      "stdout": [],
+      "value": "checks"
+    },
+    "In sintesi": {
+      "error": null,
+      "stdout": [],
+      "value": "summary"
+    },
+    "Nota tecnica": {
+      "error": null,
+      "stdout": [],
+      "value": "technical_note"
+    },
+    "Problema": {
+      "error": null,
+      "stdout": [],
+      "value": "problem"
+    },
+    "Soluzione": {
+      "error": null,
+      "stdout": [],
+      "value": "solution"
+    },
+    "Unknown": {
+      "error": null,
+      "stdout": [],
+      "value": ""
+    }
+  },
+  "signatures": {
+    "_assistant_ui_canonical_tokens": {
+      "module": "main",
+      "signature": "(value: str) -> list[str]"
+    },
+    "_assistant_ui_dedupe_citations": {
+      "module": "main",
+      "signature": "(items: list[dict], *, max_items: int) -> list[dict]"
+    },
+    "_assistant_ui_dedupe_links": {
+      "module": "main",
+      "signature": "(items: list[dict], *, max_items: int) -> list[dict]"
+    },
+    "_assistant_ui_escape": {
+      "module": "main",
+      "signature": "(value: Any) -> str"
+    },
+    "_assistant_ui_extract_labeled_line": {
+      "module": "main",
+      "signature": "(line: str) -> tuple[str, str, str]"
+    },
+    "_assistant_ui_finalize_response": {
+      "module": "main",
+      "signature": "(resp: dict, *, language: str = 'it') -> dict"
+    },
+    "_assistant_ui_generic_html": {
+      "module": "main",
+      "signature": "(answer: str, *, links: list[dict], citations: Optional[list[dict]] = None, response_language: str, status: str = 'answered') -> str"
+    },
+    "_assistant_ui_inline_markup": {
+      "module": "main",
+      "signature": "(value: Any) -> str"
+    },
+    "_assistant_ui_lossless_html": {
+      "module": "main",
+      "signature": "(answer: str, *, response_language: str, status: str = 'answered') -> str"
+    },
+    "_assistant_ui_normalize_markdown_tables": {
+      "module": "main",
+      "signature": "(text: str) -> str"
+    },
+    "_assistant_ui_normalize_url_for_key": {
+      "module": "main",
+      "signature": "(value: str) -> str"
+    },
+    "_assistant_ui_promote_unlabelled_sections": {
+      "module": "main",
+      "signature": "(sections: list[dict]) -> list[dict]"
+    },
+    "_assistant_ui_render_numbered_cards": {
+      "module": "main",
+      "signature": "(items: list[str], *, is_en: bool) -> str"
+    },
+    "_assistant_ui_root_cause_html": {
+      "module": "main",
+      "signature": "(resp: dict, *, response_language: str) -> str"
+    },
+    "_assistant_ui_root_cause_text": {
+      "module": "main",
+      "signature": "(resp: dict, *, response_language: str) -> str"
+    },
+    "_assistant_ui_section_kind": {
+      "module": "main",
+      "signature": "(label: str) -> str"
+    },
+    "_assistant_ui_sentence_has_any": {
+      "module": "main",
+      "signature": "(value: str, markers: list[str]) -> bool"
+    },
+    "_assistant_ui_split_inline_numbered": {
+      "module": "main",
+      "signature": "(value: str) -> list[str]"
+    },
+    "_assistant_ui_token_coverage": {
+      "module": "main",
+      "signature": "(reference: str, candidate: str) -> float"
+    },
+    "_assistant_ui_visible_text_from_html": {
+      "module": "main",
+      "signature": "(value: str) -> str"
+    },
+    "_build_structured_procedure_ui_model": {
+      "module": "main",
+      "signature": "(*, structured_citations: list[dict], manual_support_citations: list[dict], grounded_points: list[dict], response_language: str, q: str = '') -> dict"
+    },
+    "_format_structured_procedure_answer_for_ui": {
+      "module": "main",
+      "signature": "(*, structured_citations: list[dict], manual_support_citations: list[dict], grounded_points: list[dict], response_language: str, q: str = '') -> str"
+    },
+    "_procedure_ui_model_to_html": {
+      "module": "main",
+      "signature": "(model: dict, *, links: list[dict], response_language: str) -> str"
+    },
+    "_procedure_ui_model_to_text": {
+      "module": "main",
+      "signature": "(model: dict, *, response_language: str) -> str"
+    }
+  },
+  "split_inline_numbered": {
+    "error": null,
+    "stdout": [],
+    "value": [
+      "Primo controllo;",
+      "Secondo controllo",
+      "Terzo controllo"
+    ]
+  },
+  "token_coverage": {
+    "exact": {
+      "error": null,
+      "stdout": [],
+      "value": 1.0
+    },
+    "list_markers_ignored": {
+      "error": null,
+      "stdout": [],
+      "value": 1.0
+    },
+    "partial": {
+      "error": null,
+      "stdout": [],
+      "value": 0.3333333333333333
+    }
+  }
+}

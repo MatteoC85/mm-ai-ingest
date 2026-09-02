@@ -1,0 +1,152 @@
+[
+  {
+    "candidate": 1571,
+    "parent": 1541,
+    "path": "/finalize_generic/answer_html/length"
+  },
+  {
+    "candidate": 3,
+    "parent": 0,
+    "path": "/finalize_generic/answer_html/li_values/len"
+  },
+  {
+    "candidate": "fd623ad79aea84c1f70a0ff363bb93a08938f3d580f934da23d3019fe547d7fd",
+    "parent": "59fb13b197776e1059eddf0ab8fbff7d0f6028437be06cfb7cc1826167377e6e",
+    "path": "/finalize_generic/answer_html/sha256"
+  },
+  {
+    "candidate": 3018,
+    "parent": 2988,
+    "path": "/finalize_html_limit_fallback/answer_html/length"
+  },
+  {
+    "candidate": 3,
+    "parent": 0,
+    "path": "/finalize_html_limit_fallback/answer_html/li_values/len"
+  },
+  {
+    "candidate": "0abc9ffd73442a5c7a98ff8d39d2fdf5ab27994f67c9cc7682a36bbf93e5fb9d",
+    "parent": "24338b0d6ff5f9c92040733784e0192f3e33b5a3af848d41d36cd08f2f118406",
+    "path": "/finalize_html_limit_fallback/answer_html/sha256"
+  },
+  {
+    "candidate": "procedure",
+    "parent": "ask",
+    "path": "/finalize_html_limit_fallback/meta/answer_html_mode"
+  },
+  {
+    "candidate": "procedure",
+    "parent": "lossless",
+    "path": "/finalize_procedure/answer_html/article_kinds/0"
+  },
+  {
+    "candidate": 2383,
+    "parent": 2988,
+    "path": "/finalize_procedure/answer_html/length"
+  },
+  {
+    "candidate": 3,
+    "parent": 0,
+    "path": "/finalize_procedure/answer_html/li_values/len"
+  },
+  {
+    "candidate": 1,
+    "parent": 3,
+    "path": "/finalize_procedure/answer_html/ordered_list_count"
+  },
+  {
+    "candidate": "assistant-ui-html-lossless-v10-1-20260806-1",
+    "parent": "assistant-ui-ask-root-parity-v1-20260901-1",
+    "path": "/finalize_procedure/answer_html/render_versions/0"
+  },
+  {
+    "candidate": "d26701ac7090e3d7015c25cd0783ed7abacda8a232eef85172d4840795abf3ae",
+    "parent": "24338b0d6ff5f9c92040733784e0192f3e33b5a3af848d41d36cd08f2f118406",
+    "path": "/finalize_procedure/answer_html/sha256"
+  },
+  {
+    "candidate": "PROC-001 — Avviamento sicuro Sequenza validata di avvio. Prima di iniziare Personale qualificato: Operatore qualificato Livello di sicurezza: ALTO Procedura Verificare area e ripari Controllare che l'area sia libera. Attenzione: Non avviare in presenza di anomalie. Controllare le utenze Verificare collegamento elettrico e pressione 5-6 bar. Attenzione: Collegamenti riservati a personale qualificato. Inserire l'alimentazione generale Attendere l'avvio di HMI e PLC. Supporto dal manuale Il manuale richiede un'azione volontaria.",
+    "parent": "Risposta PROC-001 - Avviamento sicuro Sequenza validata di avvio. Prima di iniziare Personale qualificato: Operatore qualificato. Livello di sicurezza: ALTO. Procedura Passaggi Verificare area e ripari Controllare che l'area sia libera. Attenzione: Non avviare in presenza di anomalie. Passaggi Controllare le utenze Verificare collegamento elettrico e pressione 5-6 bar. Attenzione: Collegamenti riservati a personale qualificato. Passaggi Inserire l'alimentazione generale Attendere l'avvio di HMI e PLC. Supporto dal manuale Punti principali Il manuale richiede un'azione volontaria.",
+    "path": "/finalize_procedure/answer_html/visible_text"
+  },
+  {
+    "candidate": "assistant-ui-html-lossless-v10-1-20260806-1",
+    "parent": "assistant-ui-ask-root-parity-v1-20260901-1",
+    "path": "/finalize_procedure/answer_render_version"
+  },
+  {
+    "candidate": "procedure",
+    "parent": "ask",
+    "path": "/finalize_procedure/meta/answer_html_mode"
+  },
+  {
+    "candidate": false,
+    "parent": true,
+    "path": "/finalize_procedure/meta/answer_html_renderer_fallback_used"
+  },
+  {
+    "candidate": "assistant-ui-html-lossless-v10-1-20260806-1",
+    "parent": "assistant-ui-ask-root-parity-v1-20260901-1",
+    "path": "/finalize_procedure/meta/answer_render_version"
+  },
+  {
+    "candidate": 1226,
+    "parent": 1196,
+    "path": "/generic_numbered_restart/length"
+  },
+  {
+    "candidate": 3,
+    "parent": 0,
+    "path": "/generic_numbered_restart/li_values/len"
+  },
+  {
+    "candidate": "b86be5bcde51ca5cd4aef85b9bde18e2a6b82b6d72ff953b0667ea17d8f4e939",
+    "parent": "45c44702f9bc5ab67545652a337b270e84d2757e3436b43f4c26267c42a98253",
+    "path": "/generic_numbered_restart/sha256"
+  },
+  {
+    "candidate": 785,
+    "parent": 774,
+    "path": "/late_bound_helpers/procedure_html/length"
+  },
+  {
+    "candidate": 1,
+    "parent": 0,
+    "path": "/late_bound_helpers/procedure_html/li_values/len"
+  },
+  {
+    "candidate": "49b0fdb82c138e196d274e2cae4f02073ac1ea643f48b12c22851d6fabb782b6",
+    "parent": "d756892ca5de00e12fb3748a557af7128215311eb6f88f56a1a5b3ce42c20934",
+    "path": "/late_bound_helpers/procedure_html/sha256"
+  },
+  {
+    "candidate": 1556,
+    "parent": 1526,
+    "path": "/lossless_numbered_restart/length"
+  },
+  {
+    "candidate": 3,
+    "parent": 0,
+    "path": "/lossless_numbered_restart/li_values/len"
+  },
+  {
+    "candidate": "a1eaa74106a42d8e13dae7d895fa04f24c11d4324da3cdd17ac71226d90dd1ad",
+    "parent": "1d6d6c214b9580e30748cbf362e0a6fba76f5199747ec1c3c104601f4b3e4294",
+    "path": "/lossless_numbered_restart/sha256"
+  },
+  {
+    "candidate": 2383,
+    "parent": 2353,
+    "path": "/procedure_html/length"
+  },
+  {
+    "candidate": 3,
+    "parent": 0,
+    "path": "/procedure_html/li_values/len"
+  },
+  {
+    "candidate": "d26701ac7090e3d7015c25cd0783ed7abacda8a232eef85172d4840795abf3ae",
+    "parent": "d0717812b0c6c183a1a5fadfee49f72bfec8c8318887e288922e8f29f79a29f8",
+    "path": "/procedure_html/sha256"
+  }
+]
