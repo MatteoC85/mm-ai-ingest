@@ -134,6 +134,7 @@ from machinemind.infrastructure.cloud_tasks import (
 from machinemind.presentation import citations as _presentation_citations
 from machinemind.presentation import responses as _presentation_responses
 from machinemind.ingest import text_pdf as _ingest_text_pdf
+from machinemind.ingest import pdf_cleaning_chunking as _ingest_pdf_cleaning_chunking
 
 
 _RESPONSE_PRESENTATION_RUNTIME = lambda: _presentation_responses.ResponsePresentationRuntime(
@@ -5963,8 +5964,8 @@ def _dehyphenate_lines_keep_newlines(s: str) -> str:
 def _normalize_text_keep_lines(s: str) -> str:
     return _ingest_text_pdf.normalize_text_keep_lines(
         s,
-        normalize_unicode_fn=_normalize_unicode_advanced,
-        dehyphenate_fn=_dehyphenate_lines_keep_newlines,
+        normalize_unicode=_normalize_unicode_advanced,
+        dehyphenate_lines=_dehyphenate_lines_keep_newlines,
     )
 
 
@@ -5976,8 +5977,8 @@ def _extract_pages_with_layout_blocks(pdf_bytes: bytes) -> list[str]:
     return _ingest_text_pdf.extract_pages_with_layout_blocks(
         pdf_bytes,
         fitz_module=fitz,
-        page_to_text_blocks_fn=_pymupdf_page_to_text_blocks,
-        normalize_text_keep_lines_fn=_normalize_text_keep_lines,
+        page_to_text_blocks=_pymupdf_page_to_text_blocks,
+        normalize_text=_normalize_text_keep_lines,
     )
 
 
@@ -6363,19 +6364,18 @@ def _extract_xlsx_sheets_as_pages(xlsx_bytes: bytes, detected_filename: str = ""
 
 
 def _hf_norm_line(s: str) -> str:
-    s = _normalize_text_keep_lines(s)
-    s = s.lower()
-    s = re.sub(r"\d+", "#", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+    return _ingest_pdf_cleaning_chunking.hf_norm_line(
+        s,
+        normalize_text_keep_lines=_normalize_text_keep_lines,
+    )
 
 
 def _extract_top_bottom_lines(page_text: str, top_n: int = 4, bottom_n: int = 4) -> tuple[list[str], list[str]]:
-    lines = [ln.strip() for ln in (page_text or "").split("\n")]
-    lines = [ln for ln in lines if ln]
-    top = lines[:top_n] if top_n > 0 else []
-    bottom = lines[-bottom_n:] if bottom_n > 0 else []
-    return top, bottom
+    return _ingest_pdf_cleaning_chunking.extract_top_bottom_lines(
+        page_text,
+        top_n=top_n,
+        bottom_n=bottom_n,
+    )
 
 
 def _detect_repeated_headers_footers(
@@ -6386,62 +6386,34 @@ def _detect_repeated_headers_footers(
     min_len: int = 8,
     max_len: int = 140,
 ) -> tuple[set[str], set[str]]:
-    if not pages_text:
-        return set(), set()
-
-    top_counts: dict[str, int] = {}
-    bot_counts: dict[str, int] = {}
-
-    for txt in pages_text:
-        top, bottom = _extract_top_bottom_lines(txt, top_n=top_n, bottom_n=bottom_n)
-        for ln in top:
-            k = _hf_norm_line(ln)
-            if min_len <= len(k) <= max_len:
-                top_counts[k] = top_counts.get(k, 0) + 1
-        for ln in bottom:
-            k = _hf_norm_line(ln)
-            if min_len <= len(k) <= max_len:
-                bot_counts[k] = bot_counts.get(k, 0) + 1
-
-    n_pages = len(pages_text)
-    thr = int(math.ceil(n_pages * min_ratio))
-
-    top_keep = {k for (k, c) in top_counts.items() if c >= thr}
-    bot_keep = {k for (k, c) in bot_counts.items() if c >= thr}
-    return top_keep, bot_keep
+    return _ingest_pdf_cleaning_chunking.detect_repeated_headers_footers(
+        pages_text,
+        top_n=top_n,
+        bottom_n=bottom_n,
+        min_ratio=min_ratio,
+        min_len=min_len,
+        max_len=max_len,
+        extract_top_bottom_lines_fn=_extract_top_bottom_lines,
+        hf_norm_line_fn=_hf_norm_line,
+    )
 
 
-_PAGE_NOISE_RX = re.compile(
-    r"^(?:"
-    r"(?:page|pagina)\s*#?(?:\s*of\s*#?)?"
-    r"|#\s*/\s*#"
-    r")$",
-    re.IGNORECASE,
-)
+_PAGE_NOISE_RX = _ingest_pdf_cleaning_chunking.PAGE_NOISE_RX
 
 
 def _is_page_noise_line(line: str) -> bool:
-    k = _hf_norm_line(line)
-    if not k:
-        return False
-    if len(k) > 40:
-        return False
-    return _PAGE_NOISE_RX.match(k) is not None
+    return _ingest_pdf_cleaning_chunking.is_page_noise_line(
+        line,
+        hf_norm_line_fn=_hf_norm_line,
+        page_noise_rx=_PAGE_NOISE_RX,
+    )
 
 
 def _strip_page_noise_prefix(line: str) -> str:
-    if not line:
-        return line
-
-    line = _normalize_unicode_advanced(line)
-    line = re.sub(
-        r"\b(?:page|pagina)\s*\d+\s*(?:of|di)?\s*\d*\b",
-        "",
+    return _ingest_pdf_cleaning_chunking.strip_page_noise_prefix(
         line,
-        flags=re.IGNORECASE,
+        normalize_unicode_advanced=_normalize_unicode_advanced,
     )
-    line = re.sub(r"\s{2,}", " ", line)
-    return line.strip()
 
 
 def _remove_headers_footers_from_page(
@@ -6451,264 +6423,93 @@ def _remove_headers_footers_from_page(
     top_n: int = 4,
     bottom_n: int = 4,
 ) -> str:
-    lines = [ln.strip() for ln in (page_text or "").split("\n")]
-
-    scan_n = min(12, len(lines))
-    for k in range(scan_n):
-        lines[k] = _strip_page_noise_prefix(lines[k])
-        if _is_page_noise_line(lines[k]):
-            lines[k] = ""
-
-    for i in range(min(top_n, len(lines))):
-        lines[i] = _strip_page_noise_prefix(lines[i])
-        if (_hf_norm_line(lines[i]) in header_norm) or _is_page_noise_line(lines[i]):
-            lines[i] = ""
-
-    for j in range(len(lines) - min(bottom_n, len(lines)), len(lines)):
-        if 0 <= j < len(lines):
-            lines[j] = _strip_page_noise_prefix(lines[j])
-        if 0 <= j < len(lines) and ((_hf_norm_line(lines[j]) in footer_norm) or _is_page_noise_line(lines[j])):
-            lines[j] = ""
-
-    out_lines = []
-    prev_empty = False
-    for ln in lines:
-        ln = ln.strip()
-        if not ln:
-            if prev_empty:
-                continue
-            prev_empty = True
-            out_lines.append("")
-        else:
-            prev_empty = False
-            out_lines.append(ln)
-
-    return "\n".join(out_lines).strip()
+    return _ingest_pdf_cleaning_chunking.remove_headers_footers_from_page(
+        page_text,
+        header_norm,
+        footer_norm,
+        top_n=top_n,
+        bottom_n=bottom_n,
+        strip_page_noise_prefix_fn=_strip_page_noise_prefix,
+        is_page_noise_line_fn=_is_page_noise_line,
+        hf_norm_line_fn=_hf_norm_line,
+    )
 
 
 def _strip_hf_from_chunk_text(chunk_text: str, header_norm: set[str], footer_norm: set[str]) -> str:
-    if not chunk_text:
-        return ""
-
-    lines = [ln.strip() for ln in chunk_text.split("\n")]
-    cleaned = []
-    for ln in lines:
-        if not ln:
-            continue
-
-        k = _hf_norm_line(ln)
-        if (k in header_norm) or (k in footer_norm):
-            continue
-
-        ln2 = _strip_page_noise_prefix(ln)
-        if _is_page_noise_line(ln2):
-            continue
-
-        cleaned.append(ln2)
-
-    return "\n".join(cleaned).strip()
+    return _ingest_pdf_cleaning_chunking.strip_hf_from_chunk_text(
+        chunk_text,
+        header_norm,
+        footer_norm,
+        hf_norm_line_fn=_hf_norm_line,
+        strip_page_noise_prefix_fn=_strip_page_noise_prefix,
+        is_page_noise_line_fn=_is_page_noise_line,
+    )
 
 
 def _looks_like_bullet(line: str) -> bool:
-    s = (line or "").lstrip()
-    if not s:
-        return False
-    if s.startswith(("•", "·", "*", "-")):
-        return True
-    if re.match(r"^\(?\d+\)?[.)]\s+", s):
-        return True
-    if re.match(r"^[a-zA-Z][.)]\s+", s):
-        return True
-    return False
+    return _ingest_pdf_cleaning_chunking.looks_like_bullet(line)
 
 
 def _looks_like_table(line: str) -> bool:
-    if not line:
-        return False
-
-    s = line.rstrip("\n")
-
-    if "|" in s and re.search(r"\S+\s*\|\s*\S+", s):
-        return True
-    if len(re.findall(r"\s{3,}", s)) >= 2:
-        return True
-    if re.search(r"\.{4,}", s):
-        return True
-
-    tokens = re.split(r"\s+", s.strip())
-    if len(tokens) >= 6:
-        if re.search(r"\d", s) and (re.search(r"\b(rpm|bar|mm|cm|kg|°c|v|a|hz)\b", s, re.IGNORECASE) is not None):
-            return True
-
-    if len(tokens) >= 4 and len(re.findall(r"\s{2,}", s)) >= 3:
-        return True
-
-    return False
+    return _ingest_pdf_cleaning_chunking.looks_like_table(line)
 
 
 def _looks_like_title(line: str) -> bool:
-    s = (line or "").strip()
-    if not s:
-        return False
-    letters = re.sub(r"[^A-Za-zÀ-ÖØ-öø-ÿ]+", "", s)
-    if letters and letters.isupper() and len(s) <= 80:
-        return True
-    return False
+    return _ingest_pdf_cleaning_chunking.looks_like_title(line)
 
 
-_SECTION_ENUM_RX = re.compile(r"^\s*\d+(?:\.\d+){0,3}\s+[A-Za-zÀ-ÖØ-öø-ÿ]")
-_SECTION_ALLCAPS_RX = re.compile(r"^[A-ZÀ-ÖØ-Þ][A-ZÀ-ÖØ-Þ0-9\s\-]{3,}$")
+_SECTION_ENUM_RX = _ingest_pdf_cleaning_chunking.SECTION_ENUM_RX
+_SECTION_ALLCAPS_RX = _ingest_pdf_cleaning_chunking.SECTION_ALLCAPS_RX
 
 
 def _looks_like_section_header(line: str) -> bool:
-    s = (line or "").strip()
-    if not s:
-        return False
-
-    if _SECTION_ENUM_RX.match(s) and len(s) <= 120:
-        return True
-    if _SECTION_ALLCAPS_RX.match(s) and len(s.split()) <= 6:
-        return True
-    return False
+    return _ingest_pdf_cleaning_chunking.looks_like_section_header(
+        line,
+        section_enum_rx=_SECTION_ENUM_RX,
+        section_allcaps_rx=_SECTION_ALLCAPS_RX,
+    )
 
 
 def _reflow_paragraphs_conservative(page_text: str) -> str:
-    if not page_text:
-        return ""
-
-    lines = [ln.rstrip() for ln in page_text.split("\n")]
-    out: list[str] = []
-    i = 0
-
-    while i < len(lines):
-        cur = (lines[i] or "").rstrip()
-        if not cur:
-            out.append("")
-            i += 1
-            continue
-
-        if _looks_like_bullet(cur) or _looks_like_table(cur) or _looks_like_title(cur):
-            out.append(cur)
-            i += 1
-            continue
-
-        j = i
-        buf = cur
-
-        while j + 1 < len(lines):
-            nxt = (lines[j + 1] or "").strip()
-            if not nxt:
-                break
-
-            if _looks_like_table(buf) or _looks_like_table(nxt):
-                break
-            if _looks_like_bullet(nxt) or _looks_like_table(nxt) or _looks_like_title(nxt):
-                break
-            if re.search(r"[.;:!?]$", buf):
-                break
-            if not re.match(r"^[a-zà-öø-ÿ]", nxt):
-                break
-
-            buf = buf + " " + nxt
-            j += 1
-
-        out.append(buf)
-        i = j + 1
-
-    cleaned = []
-    prev_empty = False
-    for ln in out:
-        ln = ln.strip()
-        if not ln:
-            if prev_empty:
-                continue
-            prev_empty = True
-            cleaned.append("")
-        else:
-            prev_empty = False
-            cleaned.append(ln)
-
-    return "\n".join(cleaned).strip()
+    return _ingest_pdf_cleaning_chunking.reflow_paragraphs_conservative(
+        page_text,
+        looks_like_bullet_fn=_looks_like_bullet,
+        looks_like_table_fn=_looks_like_table,
+        looks_like_title_fn=_looks_like_title,
+    )
 
 
-_TOC_TITLE_RX = re.compile(r"\b(?:contents|content|indice|index|table of contents)\b", re.IGNORECASE)
+_TOC_TITLE_RX = _ingest_pdf_cleaning_chunking.TOC_TITLE_RX
 
 
 def _looks_like_toc_line(line: str) -> bool:
-    s = (line or "").strip()
-    if not s:
-        return False
-
-    if re.search(r"\.{4,}", s):
-        return True
-    if re.search(r"\b\d+(?:\.\d+){1,}\b", s) and re.search(r"\s\d{1,4}\s*$", s):
-        return True
-    if re.search(r"\s\d{1,4}\s*$", s) and len(s) <= 140 and re.search(r"[A-Za-zÀ-ÖØ-öø-ÿ]", s):
-        return True
-    if len(re.findall(r"\s{3,}", s)) >= 2 and re.search(r"\d{1,4}\s*$", s):
-        return True
-
-    return False
+    return _ingest_pdf_cleaning_chunking.looks_like_toc_line(line)
 
 
 def _strip_toc_lines(page_text: str) -> str:
-    if not page_text:
-        return ""
-
-    lines = [ln.rstrip() for ln in page_text.split("\n")]
-    kept: list[str] = []
-    removed = 0
-
-    for ln in lines:
-        if _looks_like_toc_line(ln):
-            removed += 1
-            continue
-        kept.append(ln)
-
-    out = "\n".join(kept).strip()
-    if removed >= 6 and len(out) < 200:
-        return ""
-    return out
+    return _ingest_pdf_cleaning_chunking.strip_toc_lines(
+        page_text,
+        looks_like_toc_line_fn=_looks_like_toc_line,
+    )
 
 
 def _maybe_remove_toc(page_text: str) -> str:
-    if not page_text:
-        return ""
-
-    if _TOC_TITLE_RX.search(page_text[:800] or ""):
-        return _strip_toc_lines(page_text)
-
-    lines = [ln.strip() for ln in page_text.split("\n") if ln.strip()]
-    if len(lines) < 8:
-        return page_text
-
-    toc_hits = sum(1 for ln in lines[:40] if _looks_like_toc_line(ln))
-    ratio = toc_hits / max(1, min(len(lines), 40))
-    if toc_hits >= 6 and ratio >= 0.30:
-        return _strip_toc_lines(page_text)
-
-    return page_text
+    return _ingest_pdf_cleaning_chunking.maybe_remove_toc(
+        page_text,
+        toc_title_rx=_TOC_TITLE_RX,
+        looks_like_toc_line_fn=_looks_like_toc_line,
+        strip_toc_lines_fn=_strip_toc_lines,
+    )
 
 
-_SENT_SPLIT_RX = re.compile(r"(?<=[\.\!\?])\s+")
+_SENT_SPLIT_RX = _ingest_pdf_cleaning_chunking.SENT_SPLIT_RX
 
 
 def _split_sentences_conservative(text: str) -> list[str]:
-    if not text:
-        return []
-
-    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
-    out: list[str] = []
-
-    for ln in lines:
-        if ln.startswith(("•", "·", "*", "-")) or re.match(r"^\(?\d+\)?[.)]\s+", ln):
-            out.append(ln)
-            continue
-
-        parts = [p.strip() for p in _SENT_SPLIT_RX.split(ln) if p.strip()]
-        out.extend(parts)
-
-    return out
+    return _ingest_pdf_cleaning_chunking.split_sentences_conservative(
+        text,
+        sent_split_rx=_SENT_SPLIT_RX,
+    )
 
 
 def _chunk_sentences_with_pages(
@@ -6717,92 +6518,14 @@ def _chunk_sentences_with_pages(
     overlap_chars: int,
     min_chars: int,
 ) -> list[dict]:
-    seq: list[tuple[int, str, Optional[str]]] = []
-    current_section: Optional[str] = None
-
-    for pn, txt in pages:
-        for s in _split_sentences_conservative(txt or ""):
-            s_clean = s.strip()
-            if _looks_like_section_header(s_clean):
-                current_section = s_clean
-            seq.append((int(pn), s_clean, current_section))
-
-    if not seq:
-        return []
-
-    chunks: list[dict] = []
-    i = 0
-    chunk_index = 1
-
-    while i < len(seq):
-        buf: list[str] = []
-        pages_in_chunk: list[int] = []
-
-        total = 0
-        j = i
-        chunk_section: Optional[str] = seq[i][2]
-
-        while j < len(seq):
-            pn, s, sent_section = seq[j]
-            add = s + " "
-
-            # Non attraversare il cambio di sezione
-            if buf and sent_section != chunk_section:
-                break
-
-            if total + len(add) > target_chars and total >= min_chars:
-                break
-
-            buf.append(s)
-            pages_in_chunk.append(pn)
-            total += len(add)
-
-            if chunk_section is None and sent_section is not None:
-                chunk_section = sent_section
-
-            j += 1
-
-        if not buf:
-            pn, s, sent_section = seq[i]
-            buf = [s]
-            pages_in_chunk = [pn]
-            chunk_section = sent_section
-            j = i + 1
-
-        page_from = min(pages_in_chunk)
-        page_to = max(pages_in_chunk)
-        chunk_text = "\n".join(buf).strip()
-
-        if chunk_section:
-            chunk_text = f"SECTION: {chunk_section}\n" + chunk_text
-
-        chunks.append(
-            {
-                "chunk_index": chunk_index,
-                "page_from": page_from,
-                "page_to": page_to,
-                "chunk_text": chunk_text,
-            }
-        )
-        chunk_index += 1
-
-        if overlap_chars > 0:
-            carry = []
-            carry_len = 0
-            k = j - 1
-            while k >= i and carry_len < overlap_chars:
-                pn, s, sent_section = seq[k]
-                if sent_section != chunk_section:
-                    break
-                carry.insert(0, (pn, s))
-                carry_len += len(s) + 1
-                k -= 1
-            i = max(i + 1, j - len(carry))
-        else:
-            i = j
-
-    return [c for c in chunks if c.get("chunk_text")]
-
+    return _ingest_pdf_cleaning_chunking.chunk_sentences_with_pages(
+        pages,
+        target_chars,
+        overlap_chars,
+        min_chars,
+        split_sentences_fn=_split_sentences_conservative,
+        looks_like_section_header_fn=_looks_like_section_header,
+    )
 
 def _openai_embed_texts(texts: list[str], *, timeout: int = 60) -> list[list[float]]:
     return _openai_transport.embed_texts(
