@@ -1,4 +1,4 @@
-# GitHub operation — Phase 2 Commit 5
+# GitHub operation — Phase 3 Commit 1
 
 Remain on the existing branch:
 
@@ -6,26 +6,25 @@ Remain on the existing branch:
 
 Extract the ZIP and copy the complete contents of the extracted folder over the current repository. Preserve the hidden `.git` directory and choose **Replace files in the destination** for matching files.
 
-Expected source changes:
+Expected production changes:
 
 - `main.py`;
-- new `machinemind/infrastructure/document_transport.py`;
-- new `machinemind/infrastructure/cloud_tasks.py`;
-- Phase 2E probe, gate, manifests and documentation;
-- `PHASE2_COMMIT5_VALIDATION.json`;
-- `README.md`, `GITHUB_COMMIT.md` and `SHA256SUMS.txt`.
+- new `machinemind/presentation/__init__.py`;
+- new `machinemind/presentation/citations.py`.
 
-These production files/modules must remain unchanged from Commit 4:
+Expected verification/documentation additions:
+
+- `tools/presentation_contract_probe.py`;
+- `tools/run_phase3a_gate.py`;
+- `tests/phase3a_expected_presentation_contract.json`;
+- `tests/phase3a_structure_manifest.json`;
+- `PHASE3_COMMIT1_VALIDATION.json`;
+- Phase 3 documentation, `README.md`, `GITHUB_COMMIT.md` and `SHA256SUMS.txt`.
+
+These production files/modules must remain unchanged from Phase 2 Commit 5:
 
 - `assistant_core_v2.py`;
-- `machinemind/infrastructure/database.py`;
-- `machinemind/infrastructure/openai_transport.py`;
-- `machinemind/infrastructure/request_budget.py`;
-- `machinemind/infrastructure/execution.py`;
-- `machinemind/infrastructure/semantic_cache.py`;
-- all `machinemind/config/` modules;
-- `machinemind/api/contracts.py`;
-- `machinemind/core/scope.py`;
+- every module under `machinemind/api/`, `machinemind/config/`, `machinemind/core/` and `machinemind/infrastructure/`;
 - `Dockerfile`;
 - `cloudbuild.yaml`;
 - `requirements.txt`;
@@ -33,8 +32,8 @@ These production files/modules must remain unchanged from Commit 4:
 
 Commit message:
 
-`refactor: extract external document transport and Cloud Tasks dispatch`
+`refactor: extract citation presentation and resource links`
 
 Then use **Commit e push**. The configured trigger should build and deploy from `refactor-phase1`.
 
-After deployment, use `docs/LIVE_GATE_PHASE2_COMMIT5.md`. Phase 2 is not formally closed until that live gate passes.
+After deployment, apply `docs/LIVE_GATE_PHASE3_COMMIT1.md`. Do not start Commit 2 until the exact revision passes that live gate.

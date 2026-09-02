@@ -1,0 +1,659 @@
+{
+  "citation_notes_empty": {
+    "error": null,
+    "stdout": [],
+    "value": ""
+  },
+  "citation_notes_en_limit2": {
+    "error": null,
+    "stdout": [],
+    "value": "Evidence used:\n- Manuale - pag. 2 — Primo dettaglio\n- C3 — Secondo dettaglio"
+  },
+  "citation_notes_it": {
+    "error": null,
+    "stdout": [],
+    "value": "Fonti utilizzate:\n- Manuale - pag. 2 — Primo dettaglio\n- C3 — Secondo dettaglio\n- Procedura"
+  },
+  "citation_notes_late_bound_clean": {
+    "error": null,
+    "stdout": [],
+    "value": "Fonti utilizzate:\n- NOTE<A>:160 — NOTE<B>:260"
+  },
+  "clean_edge_punctuation": {
+    "error": null,
+    "stdout": [],
+    "value": "Test value"
+  },
+  "clean_five_char_limit": {
+    "error": null,
+    "stdout": [],
+    "value": "abcd…"
+  },
+  "clean_no_limit": {
+    "error": null,
+    "stdout": [],
+    "value": "abcdef"
+  },
+  "clean_none": {
+    "error": null,
+    "stdout": [],
+    "value": ""
+  },
+  "clean_numeric": {
+    "error": null,
+    "stdout": [],
+    "value": "12345"
+  },
+  "clean_one_char_limit": {
+    "error": null,
+    "stdout": [],
+    "value": "…"
+  },
+  "clean_only_punctuation": {
+    "error": null,
+    "stdout": [],
+    "value": ""
+  },
+  "clean_unicode": {
+    "error": null,
+    "stdout": [],
+    "value": "Pressione ≥ 5 bar"
+  },
+  "clean_whitespace": {
+    "error": null,
+    "stdout": [],
+    "value": "A B C"
+  },
+  "looks_xlsx_empty": {
+    "error": null,
+    "stdout": [],
+    "value": false
+  },
+  "looks_xlsx_extraction_mode": {
+    "error": null,
+    "stdout": [],
+    "value": true
+  },
+  "looks_xlsx_file_type": {
+    "error": null,
+    "stdout": [],
+    "value": true
+  },
+  "looks_xlsx_kind": {
+    "error": null,
+    "stdout": [],
+    "value": true
+  },
+  "looks_xlsx_lowercase": {
+    "error": null,
+    "stdout": [],
+    "value": false
+  },
+  "looks_xlsx_ordinary": {
+    "error": null,
+    "stdout": [],
+    "value": false
+  },
+  "meta_document_page": {
+    "error": null,
+    "stdout": [],
+    "value": {
+      "display_label": "Existing title - pag. 3",
+      "display_location": "pag. 3",
+      "display_title": "Existing title",
+      "is_structured_source": false,
+      "source_id": "D1",
+      "source_type": "document"
+    }
+  },
+  "meta_document_range_from_url": {
+    "error": null,
+    "stdout": [],
+    "value": {
+      "display_label": "Capacity Table - pag. 4/6",
+      "display_location": "pag. 4/6",
+      "display_title": "Capacity Table",
+      "is_structured_source": false,
+      "source_id": "D2",
+      "source_type": "document"
+    }
+  },
+  "meta_empty_document": {
+    "error": null,
+    "stdout": [],
+    "value": {
+      "display_label": "Documento",
+      "display_location": "",
+      "display_title": "Documento",
+      "is_structured_source": false,
+      "source_id": "",
+      "source_type": "document"
+    }
+  },
+  "meta_late_bound_helpers": {
+    "error": null,
+    "stdout": [],
+    "value": {
+      "display_label": "META<Procedura: META<Patched title>:90>:160",
+      "display_location": "META<>:60",
+      "display_title": "META<META<Patched title>:90>:100",
+      "is_structured_source": true,
+      "source_id": "x",
+      "source_type": "procedure"
+    }
+  },
+  "meta_photo": {
+    "error": null,
+    "stdout": [],
+    "value": {
+      "display_label": "Foto: Sensore ingresso",
+      "display_location": "",
+      "display_title": "Sensore ingresso",
+      "is_structured_source": true,
+      "source_id": "photo-1",
+      "source_type": "md_photo"
+    }
+  },
+  "meta_procedure": {
+    "error": null,
+    "stdout": [],
+    "value": {
+      "display_label": "Procedura: Cambio formato",
+      "display_location": "",
+      "display_title": "Cambio formato",
+      "is_structured_source": true,
+      "source_id": "proc-1",
+      "source_type": "procedure"
+    }
+  },
+  "meta_ps": {
+    "error": null,
+    "stdout": [],
+    "value": {
+      "display_label": "P&S: Asse non parte — Categoria: Assi",
+      "display_location": "",
+      "display_title": "Asse non parte",
+      "is_structured_source": true,
+      "source_id": "ps-1",
+      "source_type": "ps"
+    }
+  },
+  "meta_ps_alias_problem_solution": {
+    "error": null,
+    "stdout": [],
+    "value": {
+      "display_label": "P&S: Pressa ferma — Categoria: Sicurezze",
+      "display_location": "",
+      "display_title": "Pressa ferma",
+      "is_structured_source": true,
+      "source_id": "ps-2",
+      "source_type": "ps"
+    }
+  },
+  "meta_step": {
+    "error": null,
+    "stdout": [],
+    "value": {
+      "display_label": "Step 2: Bloccare energia",
+      "display_location": "Step 2",
+      "display_title": "Bloccare energia",
+      "is_structured_source": true,
+      "source_id": "step-1",
+      "source_type": "step"
+    }
+  },
+  "meta_step_no_number": {
+    "error": null,
+    "stdout": [],
+    "value": {
+      "display_label": "Step: Verifica finale",
+      "display_location": "Step",
+      "display_title": "Verifica finale",
+      "is_structured_source": true,
+      "source_id": "step-2",
+      "source_type": "step"
+    }
+  },
+  "meta_video": {
+    "error": null,
+    "stdout": [],
+    "value": {
+      "display_label": "Video: Regolazione guidata",
+      "display_location": "",
+      "display_title": "Regolazione guidata",
+      "is_structured_source": true,
+      "source_id": "video-1",
+      "source_type": "md_video"
+    }
+  },
+  "parse_fields_late_bound_clean": {
+    "error": null,
+    "stdout": [],
+    "value": {
+      "description": "FIELD<Starts line>:240",
+      "title": "FIELD<Pump>:240"
+    }
+  },
+  "parse_structured_fields": {
+    "error": null,
+    "stdout": [],
+    "value": {
+      "description": "Open valve: slowly",
+      "source_type": "step",
+      "step_number": "7",
+      "title": "First title"
+    }
+  },
+  "rg_links": {
+    "error": null,
+    "stdout": [],
+    "value": [
+      {
+        "ask_manual_support_kind": "",
+        "ask_structured_manual_support": false,
+        "bubble_document_id": "D1",
+        "citation_id": "D1:p3",
+        "display_label": "Manuale - pag. 3/4",
+        "display_location": "pag. 3/4",
+        "display_title": "Manuale",
+        "evidence_role": "document",
+        "is_structured_source": false,
+        "page_from": 3,
+        "page_to": 4,
+        "source_id": "D1",
+        "source_type": "document",
+        "url": "https://files.test/manual.pdf#page=3"
+      },
+      {
+        "ask_manual_support_kind": "",
+        "ask_structured_manual_support": false,
+        "bubble_document_id": "procedure:proc-1",
+        "citation_id": "P1",
+        "display_label": "Procedura: Cambio formato",
+        "display_location": "",
+        "display_title": "Cambio formato",
+        "evidence_role": "procedure",
+        "is_structured_source": true,
+        "page_from": 0,
+        "page_to": 0,
+        "source_id": "proc-1",
+        "source_type": "procedure",
+        "url": "https://app.test/procedure/1"
+      },
+      {
+        "ask_manual_support_kind": "safety",
+        "ask_structured_manual_support": true,
+        "bubble_document_id": "step:step-1",
+        "citation_id": "S1",
+        "display_label": "Step 1: Sicurezza",
+        "display_location": "Step 1",
+        "display_title": "Sicurezza",
+        "evidence_role": "manual_support",
+        "is_structured_source": true,
+        "page_from": -2,
+        "page_to": 1,
+        "source_id": "step-1",
+        "source_type": "step",
+        "url": "https://app.test/step/1"
+      },
+      {
+        "ask_manual_support_kind": "",
+        "ask_structured_manual_support": false,
+        "bubble_document_id": "ps:ps-1",
+        "citation_id": "PS1",
+        "display_label": "P&S: Allarme",
+        "display_location": "",
+        "display_title": "Allarme",
+        "evidence_role": "custom",
+        "is_structured_source": true,
+        "page_from": 1,
+        "page_to": 1,
+        "source_id": "ps-1",
+        "source_type": "ps",
+        "url": "https://app.test/ps/1"
+      }
+    ]
+  },
+  "rg_links_file_map_error": {
+    "error": {
+      "detail": null,
+      "message": "file map failed",
+      "status_code": null,
+      "type": "RuntimeError"
+    },
+    "stdout": [],
+    "value": null
+  },
+  "rg_links_late_bound_helpers": {
+    "error": null,
+    "stdout": [],
+    "value": [
+      {
+        "ask_manual_support_kind": "",
+        "ask_structured_manual_support": false,
+        "bubble_document_id": "D",
+        "citation_id": "C",
+        "display_label": "label",
+        "display_location": "location",
+        "display_title": "title",
+        "evidence_role": "patched",
+        "is_structured_source": false,
+        "page_from": 7,
+        "page_to": 7,
+        "source_id": "id",
+        "source_type": "patched",
+        "url": "https://x.test/d.pdf#page=7"
+      }
+    ]
+  },
+  "sanitize_citations": {
+    "error": null,
+    "stdout": [],
+    "value": [
+      {
+        "ask_structured_direct": false,
+        "ask_structured_manual_support": false,
+        "bubble_document_id": "D1",
+        "citation_id": "D1:p2",
+        "display_label": "Maintenance Manual - pag. 2",
+        "display_location": "pag. 2",
+        "display_title": "Maintenance Manual",
+        "is_structured_source": false,
+        "page_from": 2,
+        "page_to": 2,
+        "similarity": 0.88,
+        "snippet": "SECTION: Maintenance\nCheck oil level every 500 h.",
+        "snippet_clean": "Check oil level every 500 h.",
+        "source_id": "D1",
+        "source_type": "document"
+      },
+      {
+        "ask_structured_direct": false,
+        "ask_structured_manual_support": false,
+        "bubble_document_id": "X1",
+        "citation_id": "X1:p1",
+        "display_label": "Capacity - pag. 1",
+        "display_location": "pag. 1",
+        "display_title": "Capacity",
+        "is_structured_source": false,
+        "page_from": 1,
+        "page_to": 1,
+        "similarity": 0.77,
+        "snippet": "DOCUMENT_FILE_TYPE: XLSX\nDOCUMENT_KIND: Excel file\nDOCUMENT_FORMAT_HINTS: x\nEXTRACTION_MODE: XLSX\nDOCUMENT_TITLE: Capacity register\nSHEET_INDEX: 1\nSHEET_NAME: Data\nSHEET: Manutenzione\nSHEET_PART: 1\nDETECTED_HEADER_ROW: 2\nHEADER ROW 2: Code | Interval | Action\nROW 3: CAL-003 | 500 h | Check filter",
+        "snippet_clean": "Documento Excel: Capacity register — Foglio: Manutenzione — Intestazioni: Code | Interval | Action — ROW 3: CAL-003 | 500 h | Check filter",
+        "source_id": "X1",
+        "source_type": "document"
+      },
+      {
+        "ask_structured_direct": true,
+        "ask_structured_manual_support": false,
+        "bubble_document_id": "procedure:proc-1",
+        "citation_id": "P1",
+        "display_label": "Procedura: Cambio formato",
+        "display_location": "",
+        "display_title": "Cambio formato",
+        "is_structured_source": true,
+        "page_from": 0,
+        "page_to": 0,
+        "similarity": 0.0,
+        "snippet": "SOURCE_TYPE: procedure\nTITLE: Cambio formato\nSHORT_DESCRIPTION: Sequenza completa",
+        "snippet_clean": "Procedura: Cambio formato — Descrizione: Sequenza completa",
+        "source_id": "proc-1",
+        "source_type": "procedure"
+      },
+      {
+        "ask_structured_direct": false,
+        "ask_structured_manual_support": false,
+        "bubble_document_id": "step:step-1",
+        "citation_id": "S1",
+        "display_label": "Step 1: Isolare energia",
+        "display_location": "Step 1",
+        "display_title": "Isolare energia",
+        "is_structured_source": true,
+        "page_from": 0,
+        "page_to": 0,
+        "similarity": 0.0,
+        "snippet": "SOURCE_TYPE: step\nSTEP_NUMBER: 1\nTITLE: Isolare energia\nDESCRIPTION: Applicare LOTO",
+        "snippet_clean": "Step 1: Isolare energia — Applicare LOTO",
+        "source_id": "step-1",
+        "source_type": "step"
+      },
+      {
+        "ask_structured_direct": false,
+        "ask_structured_manual_support": true,
+        "bubble_document_id": "M1",
+        "citation_id": "M1",
+        "display_label": "Support",
+        "display_location": "",
+        "display_title": "Support",
+        "is_structured_source": false,
+        "page_from": 0,
+        "page_to": 0,
+        "similarity": 0.0,
+        "snippet": "SECTION: Safety\nLong manual support text for a structured answer.",
+        "snippet_clean": "COMPACT<Long manual support text for a structured answer.>:260",
+        "source_id": "M1",
+        "source_type": "document"
+      }
+    ]
+  },
+  "sanitize_file_map_fail_open": {
+    "error": null,
+    "stdout": [
+      "CITATION_FILE_MAP_FAIL db unavailable"
+    ],
+    "value": [
+      {
+        "ask_structured_direct": false,
+        "ask_structured_manual_support": false,
+        "bubble_document_id": "D1",
+        "citation_id": "D1:p2",
+        "display_label": "Documento - pag. 2",
+        "display_location": "pag. 2",
+        "display_title": "Documento",
+        "is_structured_source": false,
+        "page_from": 2,
+        "page_to": 2,
+        "similarity": 0.88,
+        "snippet": "SECTION: Maintenance\nCheck oil level every 500 h.",
+        "snippet_clean": "Check oil level every 500 h.",
+        "source_id": "D1",
+        "source_type": "document"
+      }
+    ]
+  },
+  "sanitize_late_bound_helpers": {
+    "error": null,
+    "stdout": [],
+    "value": [
+      {
+        "ask_structured_direct": false,
+        "ask_structured_manual_support": true,
+        "bubble_document_id": "D",
+        "citation_id": "C",
+        "display_label": "patched",
+        "display_location": "patched",
+        "display_title": "patched",
+        "is_structured_source": false,
+        "page_from": 8,
+        "page_to": 8,
+        "similarity": 0.0,
+        "snippet": "SECTION: X\nBody",
+        "snippet_clean": "MANUAL<Body>:260",
+        "source_id": "patched",
+        "source_type": "document"
+      }
+    ]
+  },
+  "signatures": {
+    "_build_rg_links": {
+      "module": "main",
+      "signature": "(company_id: str, citations: list[dict]) -> list[dict]"
+    },
+    "_build_sources_block_from_citations": {
+      "module": "main",
+      "signature": "(citations: list[dict], *, max_context_chars: int = 9000, prefer_chunk_full: bool = False) -> str"
+    },
+    "_clean_display_text": {
+      "module": "main",
+      "signature": "(value: Any, max_len: int = 140) -> str"
+    },
+    "_clean_xlsx_snippet_for_display": {
+      "module": "main",
+      "signature": "(text: str, *, max_len: int = 520) -> str"
+    },
+    "_format_citation_note_lines": {
+      "module": "main",
+      "signature": "(citations: list[dict], *, language: str = 'it', max_items: int = 6) -> str"
+    },
+    "_looks_like_xlsx_indexed_text": {
+      "module": "main",
+      "signature": "(text: str) -> bool"
+    },
+    "_parse_structured_source_fields": {
+      "module": "main",
+      "signature": "(text: str) -> dict[str, str]"
+    },
+    "_sanitize_citations_for_response": {
+      "module": "main",
+      "signature": "(citations: list[dict], company_id: Optional[str] = None) -> list[dict]"
+    },
+    "_source_display_meta_for_citation": {
+      "module": "main",
+      "signature": "(c: dict, file_url: str = '') -> dict"
+    },
+    "_structured_source_snippet_for_display": {
+      "module": "main",
+      "signature": "(c: dict, *, max_len: int = 520) -> str"
+    },
+    "_title_from_file_url": {
+      "module": "main",
+      "signature": "(file_url: str) -> str"
+    }
+  },
+  "sources_block_below_first_limit": {
+    "error": null,
+    "stdout": [],
+    "value": ""
+  },
+  "sources_block_default": {
+    "error": null,
+    "stdout": [],
+    "value": "[C1] (doc=D1, p1-2)\nshort one\n\n[C2] (doc=D2, p3-3)\nshort two"
+  },
+  "sources_block_empty": {
+    "error": null,
+    "stdout": [],
+    "value": ""
+  },
+  "sources_block_exact_first_limit": {
+    "error": null,
+    "stdout": [],
+    "value": "[C1] (doc=D1, p1-2)\nshort one"
+  },
+  "sources_block_full": {
+    "error": null,
+    "stdout": [],
+    "value": "[C1] (doc=D1, p1-2)\nfull one\n\n[C2] (doc=D2, p3-3)\nfull two"
+  },
+  "sources_block_missing_key": {
+    "error": {
+      "detail": null,
+      "message": "'page_to'",
+      "status_code": null,
+      "type": "KeyError"
+    },
+    "stdout": [],
+    "value": null
+  },
+  "structured_snippet_late_bound_helpers": {
+    "error": null,
+    "stdout": [],
+    "value": "SNIP<Step SNIP<8>:20: SNIP<Patched>:90 — SNIP<Detail>:320>:77"
+  },
+  "structured_snippet_long": {
+    "error": null,
+    "stdout": [],
+    "value": "Step 10: Long title Long title Long title Long title Long title Long title Long…"
+  },
+  "structured_snippet_manual": {
+    "error": null,
+    "stdout": [],
+    "value": ""
+  },
+  "structured_snippet_photo": {
+    "error": null,
+    "stdout": [],
+    "value": "Foto: Sensore ingresso — Posizione del sensore"
+  },
+  "structured_snippet_procedure": {
+    "error": null,
+    "stdout": [],
+    "value": "Procedura: Cambio formato — Descrizione: Sequenza completa"
+  },
+  "structured_snippet_ps": {
+    "error": null,
+    "stdout": [],
+    "value": "P&S: Asse non parte — Categoria: Assi — Problema: Nessun movimento — Soluzione: Ripristinare consenso — Note: Verificare cablaggio"
+  },
+  "structured_snippet_step": {
+    "error": null,
+    "stdout": [],
+    "value": "Step 2: Bloccare energia — Applicare LOTO"
+  },
+  "structured_snippet_video": {
+    "error": null,
+    "stdout": [],
+    "value": "Video: Video — Regolazione guidata"
+  },
+  "title_empty": {
+    "error": null,
+    "stdout": [],
+    "value": ""
+  },
+  "title_image": {
+    "error": null,
+    "stdout": [],
+    "value": "product photo"
+  },
+  "title_late_bound_helpers": {
+    "error": null,
+    "stdout": [],
+    "value": "CLEAN<Encoded Name>:90"
+  },
+  "title_no_extension": {
+    "error": null,
+    "stdout": [],
+    "value": "drive unit"
+  },
+  "title_pdf_query_fragment": {
+    "error": null,
+    "stdout": [],
+    "value": "My Manual v2"
+  },
+  "title_trailing_slash": {
+    "error": null,
+    "stdout": [],
+    "value": "folder"
+  },
+  "title_xlsx_encoded": {
+    "error": null,
+    "stdout": [],
+    "value": "Capacity Table"
+  },
+  "xlsx_clean": {
+    "error": null,
+    "stdout": [],
+    "value": "Documento Excel: Capacity register — Foglio: Manutenzione — Intestazioni: Code | Interval | Action — ROW 3: CAL-003 | 500 h | Check filter"
+  },
+  "xlsx_clean_late_bound_clean": {
+    "error": null,
+    "stdout": [],
+    "value": "Documento Excel: XLSX<T>:120 — Foglio: XLSX<S>:90 — Intestazioni: XLSX<H>:260 — ROW 2: V"
+  },
+  "xlsx_clean_short": {
+    "error": null,
+    "stdout": [],
+    "value": "Documento Excel: Capacity register — Foglio: Manutenzione — Intestazioni:…"
+  }
+}

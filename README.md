@@ -1,26 +1,26 @@
 # MachineMind behavior-preserving modularization
-## Roadmap Phase 2 — Commit 5 / Infrastructure closure candidate
+## Roadmap Phase 3 — Commit 1 / Citation presentation boundary
 
-This package is a complete repository snapshot based exactly on the deployed Phase 2 Commit 4 parent:
+This is a complete repository snapshot based on the exact Phase 2 Commit 5 artifact.
 
-- branch: `refactor-phase1`;
-- parent commit: `f13f8dda3bbe3be58aaa2bb86459e83403ebbcb3b`;
-- parent revision: `mm-ai-ingest-prod-00053-rfv`.
+It extracts citation labels, structured/XLSX display cleanup, model-facing source blocks and Bubble resource-link construction into:
 
-It extracts external document loading and Google Cloud Tasks dispatch into normal importable infrastructure modules while preserving the current production behavior and public API surface.
+`machinemind/presentation/citations.py`
+
+It does not change retrieval, evidence selection, source priorities, prompts, model policy, ASK, Root Cause, Smart Diagnostic, ingest parsing, cache, budget or public APIs.
 
 Status: **OFFLINE_VERIFIED**
 
 Primary review documents:
 
-- `docs/PHASE2_COMMIT5.md`;
-- `docs/LIVE_GATE_PHASE2_COMMIT5.md`;
-- `docs/PHASE2_COMPLETION.md`;
-- `PHASE2_COMMIT5_VALIDATION.json`;
+- `docs/PHASE3_COMMIT1.md`;
+- `docs/LIVE_GATE_PHASE3_COMMIT1.md`;
+- `docs/PHASE3_PLAN.md`;
+- `PHASE3_COMMIT1_VALIDATION.json`;
 - `GITHUB_COMMIT.md`.
 
 Offline gate:
 
-`python tools/run_phase2e_gate.py`
+`python tools/run_phase3a_gate.py`
 
-The user workflow does not require running this command locally; the package contains the recorded validation result. Exact-commit build, live document ingest, real Cloud Tasks dispatch and application smoke verification remain required before Phase 2 is formally declared complete.
+The user workflow does not require running this command locally. Exact-commit build, live citation/link checks and application smoke verification remain required before Commit 1 is formally complete.

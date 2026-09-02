@@ -131,6 +131,7 @@ from machinemind.infrastructure.document_transport import (
 from machinemind.infrastructure.cloud_tasks import (
     enqueue_document_index_task as _infra_enqueue_document_index_task,
 )
+from machinemind.presentation import citations as _presentation_citations
 
 def _fetch_dense_chunk_candidates(
     *,
@@ -1167,302 +1168,76 @@ def _safe_int(value: Any, default: int = 0) -> int:
 
 
 def _clean_display_text(value: Any, max_len: int = 140) -> str:
-    text = re.sub(r"\s+", " ", str(value or "").strip())
-    text = text.strip(" -–—:;,.\t\n")
-    if max_len and len(text) > max_len:
-        text = text[: max_len - 1].rstrip() + "…"
-    return text
+    return _presentation_citations.clean_display_text(value, max_len=max_len)
+
 
 
 def _title_from_file_url(file_url: str) -> str:
-    file_url = str(file_url or "").strip()
-    if not file_url:
-        return ""
+    return _presentation_citations.title_from_file_url(
+        file_url,
+        urlparse_fn=urlparse,
+        unquote_fn=unquote,
+        clean_text_fn=_clean_display_text,
+    )
 
-    try:
-        parsed = urlparse(file_url.split("#", 1)[0].split("?", 1)[0])
-        name = unquote((parsed.path or "").rstrip("/").split("/")[-1])
-    except Exception:
-        name = ""
-
-    name = re.sub(r"[_-]+", " ", name or "")
-    name = re.sub(r"\.(pdf|docx?|xlsx?|pptx?|txt|png|jpe?g|webp|mp4|mov|avi)$", "", name, flags=re.IGNORECASE)
-    return _clean_display_text(name, max_len=90)
 
 
 def _parse_structured_source_fields(text: str) -> dict[str, str]:
-    fields: dict[str, str] = {}
-    for raw_line in str(text or "").replace("\r", "\n").split("\n"):
-        line = raw_line.strip()
-        if not line or ":" not in line:
-            continue
-        key, value = line.split(":", 1)
-        key = re.sub(r"\s+", "_", key.strip().lower())
-        value = _clean_display_text(value, max_len=240)
-        if key and value and key not in fields:
-            fields[key] = value
-    return fields
+    return _presentation_citations.parse_structured_source_fields(
+        text,
+        clean_text_fn=_clean_display_text,
+    )
+
 
 
 def _source_display_meta_for_citation(c: dict, file_url: str = "") -> dict:
-    c = c or {}
-    bdid = str(c.get("bubble_document_id") or "").strip()
-    source_kind = _source_type_from_document_id(bdid)
-    raw_prefix = bdid.split(":", 1)[0].strip().lower() if ":" in bdid else ""
-    if source_kind == "manual" and raw_prefix in {"problem_solution", "problemsolution"}:
-        source_kind = "ps"
-    source_id = bdid.split(":", 1)[1].strip() if ":" in bdid else bdid
-
-    snippet_for_meta = (
-        c.get("chunk_full")
-        or c.get("snippet")
-        or c.get("snippet_clean")
-        or ""
+    return _presentation_citations.source_display_meta_for_citation(
+        c,
+        file_url=file_url,
+        source_type_fn=_source_type_from_document_id,
+        structured_key_fn=_is_structured_source_key,
+        structured_source_types=STRUCTURED_SOURCE_TYPES,
+        parse_fields_fn=_parse_structured_source_fields,
+        clean_text_fn=_clean_display_text,
+        title_from_url_fn=_title_from_file_url,
+        safe_int_fn=_safe_int,
     )
-    fields = _parse_structured_source_fields(snippet_for_meta)
 
-    page_from = _safe_int(c.get("page_from"), 0)
-    page_to = _safe_int(c.get("page_to"), page_from)
-
-    display_title = ""
-    display_location = ""
-    display_label = ""
-
-    if source_kind == "procedure":
-        title = _clean_display_text(fields.get("title") or fields.get("short_description") or "Procedura", max_len=90)
-        display_title = title
-        display_label = f"Procedura: {title}" if title else "Procedura"
-
-    elif source_kind == "step":
-        title = _clean_display_text(fields.get("title") or fields.get("description") or "Step", max_len=90)
-        step_no = _clean_display_text(fields.get("step_number") or "", max_len=20)
-        display_title = title
-        display_location = f"Step {step_no}" if step_no else "Step"
-        if step_no and title and title.lower() != "step":
-            display_label = f"Step {step_no}: {title}"
-        elif title and title.lower() != "step":
-            display_label = f"Step: {title}"
-        else:
-            display_label = display_location
-
-    elif source_kind == "ps":
-        title = _clean_display_text(fields.get("title") or fields.get("category") or fields.get("description") or "P&S", max_len=90)
-        category = _clean_display_text(fields.get("category") or "", max_len=60)
-        display_title = title
-        if category and category.lower() not in title.lower():
-            display_label = f"P&S: {title} — Categoria: {category}"
-        else:
-            display_label = f"P&S: {title}" if title else "P&S"
-
-    elif source_kind == "md_photo":
-        title = _clean_display_text(fields.get("title") or fields.get("description") or "Foto", max_len=90)
-        display_title = title
-        display_label = f"Foto: {title}" if title and title.lower() != "foto" else "Foto"
-
-    elif source_kind == "md_video":
-        title = _clean_display_text(fields.get("title") or fields.get("description") or "Video", max_len=90)
-        display_title = title
-        display_label = f"Video: {title}" if title and title.lower() != "video" else "Video"
-
-    else:
-        source_kind = "document"
-        title = (
-            _clean_display_text(str(c.get("display_title") or ""), max_len=90)
-            or _title_from_file_url(file_url)
-            or "Documento"
-        )
-        display_title = title
-        if page_from > 0 and page_to > page_from:
-            display_location = f"pag. {page_from}/{page_to}"
-        elif page_from > 0:
-            display_location = f"pag. {page_from}"
-        else:
-            display_location = ""
-        display_label = f"{display_title} - {display_location}" if display_location else display_title
-
-    display_title = _clean_display_text(display_title, max_len=100)
-    display_location = _clean_display_text(display_location, max_len=60)
-    display_label = _clean_display_text(display_label or display_title or bdid, max_len=160)
-
-    return {
-        "source_type": source_kind,
-        "source_id": source_id,
-        "is_structured_source": bool(_is_structured_source_key(bdid) or source_kind in STRUCTURED_SOURCE_TYPES),
-        "display_title": display_title,
-        "display_location": display_location,
-        "display_label": display_label,
-    }
 
 
 
 
 def _structured_source_snippet_for_display(c: dict, *, max_len: int = 520) -> str:
-    """Human-readable snippet for Bubble structured sources.
+    return _presentation_citations.structured_source_snippet_for_display(
+        c,
+        max_len=max_len,
+        source_type_fn=_source_type_from_document_id,
+        parse_fields_fn=_parse_structured_source_fields,
+        clean_text_fn=_clean_display_text,
+    )
 
-    Structured records are indexed with machine-readable labels such as
-    SOURCE_TYPE, STEP_NUMBER, DESCRIPTION. Those are useful for retrieval, but
-    they must not be shown raw in the customer UI.
-    """
-    c = c or {}
-    bdid = str(c.get("bubble_document_id") or "").strip()
-    source_kind = _source_type_from_document_id(bdid)
-    raw_text = str(c.get("chunk_full") or c.get("snippet") or c.get("snippet_clean") or "")
-    fields = _parse_structured_source_fields(raw_text)
-
-    def val(*keys: str, limit: int = 240) -> str:
-        for k in keys:
-            v = _clean_display_text(fields.get(k) or "", max_len=limit)
-            if v:
-                return v
-        return ""
-
-    lines: list[str] = []
-    if source_kind == "procedure":
-        title = val("title", limit=90) or "Procedura"
-        ptype = val("procedure_type", limit=80)
-        desc = val("short_description", "description", limit=260)
-        lines.append(f"Procedura: {title}")
-        if ptype:
-            lines.append(f"Tipo: {ptype}")
-        if desc:
-            lines.append(f"Descrizione: {desc}")
-
-    elif source_kind == "step":
-        step_no = val("step_number", limit=20)
-        title = val("title", limit=90) or "Step"
-        desc = val("description", limit=320)
-        prefix = f"Step {step_no}:" if step_no else "Step:"
-        lines.append(f"{prefix} {title}")
-        if desc and desc.lower() not in title.lower():
-            lines.append(desc)
-
-    elif source_kind == "ps":
-        title = val("title", limit=100) or "Problema/Soluzione"
-        category = val("category", limit=70)
-        desc = val("description", limit=300)
-        sol = val("solution", limit=300)
-        notes = val("notes", limit=220)
-        lines.append(f"P&S: {title}")
-        if category:
-            lines.append(f"Categoria: {category}")
-        if desc:
-            lines.append(f"Problema: {desc}")
-        if sol:
-            lines.append(f"Soluzione: {sol}")
-        if notes:
-            lines.append(f"Note: {notes}")
-
-    elif source_kind == "md_photo":
-        title = val("title", limit=100) or "Foto"
-        desc = val("description", limit=320)
-        lines.append(f"Foto: {title}")
-        if desc and desc.lower() not in title.lower():
-            lines.append(desc)
-
-    elif source_kind == "md_video":
-        title = val("title", limit=100) or "Video"
-        desc = val("description", limit=320)
-        lines.append(f"Video: {title}")
-        if desc and desc.lower() not in title.lower():
-            lines.append(desc)
-
-    else:
-        return ""
-
-    text = " — ".join([x for x in lines if x]).strip()
-    text = re.sub(r"\bSOURCE_TYPE\s*:\s*[^—]+", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"\s+", " ", text).strip(" -–—")
-    return _clean_display_text(text, max_len=max_len)
 
 
 def _format_citation_note_lines(citations: list[dict], *, language: str = "it", max_items: int = 6) -> str:
-    citations = [c for c in (citations or []) if isinstance(c, dict)]
-    if not citations:
-        return ""
+    return _presentation_citations.format_citation_note_lines(
+        citations,
+        language=language,
+        max_items=max_items,
+        clean_text_fn=_clean_display_text,
+    )
 
-    header = "Evidence used:" if str(language or "").lower().startswith("en") else "Fonti utilizzate:"
-    lines = [header]
-    seen = set()
-
-    for c in citations:
-        label = _clean_display_text(c.get("display_label") or c.get("citation_id") or "Fonte", max_len=160)
-        if not label or label in seen:
-            continue
-        seen.add(label)
-
-        snippet = _clean_display_text(c.get("snippet_clean") or c.get("snippet") or "", max_len=260)
-        if snippet:
-            lines.append(f"- {label} — {snippet}")
-        else:
-            lines.append(f"- {label}")
-
-        if len(lines) - 1 >= max_items:
-            break
-
-    return "\n".join(lines).strip()
 
 
 
 def _build_rg_links(company_id: str, citations: list[dict]) -> list[dict]:
-    if not citations:
-        return []
-
-    doc_ids = sorted(
-        {
-            str(c.get("bubble_document_id") or "").strip()
-            for c in citations
-            if isinstance(c, dict) and c.get("bubble_document_id")
-        }
+    return _presentation_citations.build_rg_links(
+        company_id,
+        citations,
+        fetch_file_map_fn=_fetch_document_file_map,
+        safe_int_fn=_safe_int,
+        source_meta_fn=_source_display_meta_for_citation,
     )
-    if not doc_ids:
-        return []
 
-    file_map = _fetch_document_file_map(company_id, doc_ids)
-
-    out: list[dict] = []
-    for c in citations:
-        if not isinstance(c, dict):
-            continue
-        bdid = str(c.get("bubble_document_id") or "").strip()
-        if not bdid:
-            continue
-
-        file_url = file_map.get(bdid)
-        if not file_url:
-            continue
-
-        base = file_url.split("#", 1)[0]
-        page_from = _safe_int(c.get("page_from"), 1)
-        if page_from < 1:
-            page_from = 1
-
-        meta = _source_display_meta_for_citation(c, file_url=file_url)
-        is_structured = bool(meta.get("is_structured_source"))
-        final_url = file_url if is_structured else f"{base}#page={page_from}"
-
-        source_type = str(meta.get("source_type") or c.get("source_type") or "document").strip().lower()
-        if bool(c.get("ask_structured_manual_support")):
-            evidence_role = "manual_support"
-        elif bool(c.get("ask_structured_direct")):
-            evidence_role = source_type or "structured"
-        else:
-            evidence_role = str(c.get("evidence_role") or source_type or "document").strip().lower()
-
-        out.append(
-            {
-                "citation_id": c.get("citation_id"),
-                "bubble_document_id": bdid,
-                "page_from": _safe_int(c.get("page_from"), page_from),
-                "page_to": _safe_int(c.get("page_to"), page_from),
-                "url": final_url,
-                "evidence_role": evidence_role,
-                "ask_structured_manual_support": bool(c.get("ask_structured_manual_support")),
-                "ask_manual_support_kind": str(c.get("ask_manual_support_kind") or ""),
-                **meta,
-            }
-        )
-
-    return out
 
 
 def _normalize_structured_source_type(source_type: str) -> str:
@@ -8338,138 +8113,36 @@ def _diagnostic_evidence_pipeline(
 
 
 def _looks_like_xlsx_indexed_text(text: str) -> bool:
-    t = str(text or "")
-    return (
-        "DOCUMENT_FILE_TYPE: XLSX" in t
-        or "EXTRACTION_MODE: XLSX" in t
-        or "DOCUMENT_KIND: Excel file" in t
-    )
+    return _presentation_citations.looks_like_xlsx_indexed_text(text)
+
 
 
 def _clean_xlsx_snippet_for_display(text: str, *, max_len: int = 520) -> str:
-    lines: list[str] = []
+    return _presentation_citations.clean_xlsx_snippet_for_display(
+        text,
+        max_len=max_len,
+        clean_text_fn=_clean_display_text,
+    )
 
-    for raw_line in str(text or "").replace("\r", "\n").split("\n"):
-        line = re.sub(r"\s+", " ", raw_line).strip()
-        if not line:
-            continue
-
-        if re.match(
-            r"^(?:DOCUMENT_FILE_TYPE|DOCUMENT_KIND|DOCUMENT_FORMAT_HINTS|EXTRACTION_MODE|SHEET_INDEX|SHEET_NAME|SHEET_PART|DETECTED_HEADER_ROW)\s*:",
-            line,
-            flags=re.IGNORECASE,
-        ):
-            continue
-
-        m = re.match(r"^DOCUMENT_TITLE\s*:\s*(.+)$", line, flags=re.IGNORECASE)
-        if m:
-            title = _clean_display_text(m.group(1), max_len=120)
-            if title:
-                lines.append(f"Documento Excel: {title}")
-            continue
-
-        m = re.match(r"^SHEET\s*:\s*(.+)$", line, flags=re.IGNORECASE)
-        if m:
-            sheet = _clean_display_text(m.group(1), max_len=90)
-            if sheet:
-                lines.append(f"Foglio: {sheet}")
-            continue
-
-        m = re.match(r"^HEADER ROW\s+\d+\s*:\s*(.+)$", line, flags=re.IGNORECASE)
-        if m:
-            header = _clean_display_text(m.group(1), max_len=260)
-            if header:
-                lines.append(f"Intestazioni: {header}")
-            continue
-
-        lines.append(line)
-
-    clean = " — ".join(lines)
-    clean = re.sub(r"\s+", " ", clean).strip(" -–—")
-    if len(clean) > max_len:
-        clean = clean[: max_len - 1].rsplit(" ", 1)[0].strip() + "…"
-    return clean
 
 
 def _sanitize_citations_for_response(citations: list[dict], company_id: Optional[str] = None) -> list[dict]:
-    out: list[dict] = []
-
-    doc_ids = sorted(
-        {
-            str(c.get("bubble_document_id") or "").strip()
-            for c in citations or []
-            if isinstance(c, dict) and c.get("bubble_document_id")
-        }
+    return _presentation_citations.sanitize_citations_for_response(
+        citations,
+        company_id=company_id,
+        fetch_file_map_fn=_fetch_document_file_map,
+        safe_int_fn=_safe_int,
+        source_meta_fn=_source_display_meta_for_citation,
+        structured_snippet_fn=_structured_source_snippet_for_display,
+        xlsx_predicate_fn=_looks_like_xlsx_indexed_text,
+        xlsx_snippet_fn=_clean_xlsx_snippet_for_display,
+        compact_manual_snippet_fn=_compact_manual_support_snippet_for_display,
+        clean_text_fn=_clean_display_text,
+        max_snippet_clean_chars=int(ASK_UI_MAX_SNIPPET_CLEAN_CHARS or 520),
+        manual_support_snippet_chars=int(ASK_UI_MANUAL_SUPPORT_SNIPPET_CHARS or 260),
+        log_fn=print,
     )
 
-    file_map: dict[str, str] = {}
-    if company_id and doc_ids:
-        try:
-            file_map = _fetch_document_file_map(company_id, doc_ids)
-        except Exception as e:
-            print("CITATION_FILE_MAP_FAIL", str(e))
-            file_map = {}
-
-    for c in citations or []:
-        if not isinstance(c, dict):
-            continue
-
-        cid = str(c.get("citation_id") or "").strip()
-        bdid = str(c.get("bubble_document_id") or "").strip()
-
-        if not cid or not bdid:
-            continue
-
-        raw_snippet = (c.get("snippet") or c.get("chunk_full") or "").strip()
-
-        base_for_meta = {
-            **c,
-            "citation_id": cid,
-            "bubble_document_id": bdid,
-            "page_from": _safe_int(c.get("page_from"), 0),
-            "page_to": _safe_int(c.get("page_to"), 0),
-            "snippet": raw_snippet,
-        }
-        meta = _source_display_meta_for_citation(base_for_meta, file_url=file_map.get(bdid, ""))
-
-        if bool(meta.get("is_structured_source")):
-            clean_snippet = _structured_source_snippet_for_display(base_for_meta, max_len=int(ASK_UI_MAX_SNIPPET_CLEAN_CHARS or 520))
-            if not clean_snippet:
-                clean_snippet = re.sub(r"\b(?:SOURCE_TYPE|TITLE|STEP_NUMBER|PROCEDURE_TYPE|SHORT_DESCRIPTION|DESCRIPTION|SOLUTION|NOTES|CATEGORY)\s*:\s*", "", raw_snippet, flags=re.IGNORECASE)
-                clean_snippet = re.sub(r"\s*\n\s*", " — ", clean_snippet)
-                clean_snippet = re.sub(r"\s+", " ", clean_snippet).strip(" -–—")
-                clean_snippet = _clean_display_text(clean_snippet, max_len=int(ASK_UI_MAX_SNIPPET_CLEAN_CHARS or 520))
-        else:
-            if _looks_like_xlsx_indexed_text(raw_snippet):
-                clean_snippet = _clean_xlsx_snippet_for_display(
-                    raw_snippet,
-                    max_len=int(ASK_UI_MAX_SNIPPET_CLEAN_CHARS or 520),
-                )
-            else:
-                clean_snippet = re.sub(r"^SECTION:\s*[^\n]+\n?", "", raw_snippet, flags=re.IGNORECASE).strip()
-                clean_snippet = re.sub(r"\s*\n\s*", " ", clean_snippet)
-                clean_snippet = re.sub(r"\s+", " ", clean_snippet).strip()
-                if bool(c.get("ask_structured_manual_support")):
-                    clean_snippet = _compact_manual_support_snippet_for_display(
-                        clean_snippet,
-                        max_len=max(180, int(ASK_UI_MANUAL_SUPPORT_SNIPPET_CHARS or 260)),
-                    )
-
-        base = {
-            "citation_id": cid,
-            "bubble_document_id": bdid,
-            "page_from": _safe_int(c.get("page_from"), 0),
-            "page_to": _safe_int(c.get("page_to"), 0),
-            "snippet": raw_snippet,
-            "snippet_clean": clean_snippet,
-            "similarity": float(c.get("similarity") or c.get("retrieval_score") or 0.0),
-            "ask_structured_manual_support": bool(c.get("ask_structured_manual_support")),
-            "ask_structured_direct": bool(c.get("ask_structured_direct")),
-        }
-        base.update(meta)
-        out.append(base)
-
-    return out
 
 def _build_sources_block_from_citations(
     citations: list[dict],
@@ -8477,29 +8150,12 @@ def _build_sources_block_from_citations(
     max_context_chars: int = ASK_MAX_CONTEXT_CHARS,
     prefer_chunk_full: bool = False,
 ) -> str:
-    ctx_parts: List[str] = []
-    total_chars = 0
+    return _presentation_citations.build_sources_block_from_citations(
+        citations,
+        max_context_chars=max_context_chars,
+        prefer_chunk_full=prefer_chunk_full,
+    )
 
-    for c in citations or []:
-        body = ""
-        if prefer_chunk_full:
-            body = (c.get("chunk_full") or c.get("snippet") or "").strip()
-        else:
-            body = (c.get("snippet") or c.get("chunk_full") or "").strip()
-
-        part = (
-            f"[{c['citation_id']}] "
-            f"(doc={c['bubble_document_id']}, p{c['page_from']}-{c['page_to']})\n"
-            f"{body}\n"
-        )
-
-        if total_chars + len(part) > max_context_chars:
-            break
-
-        ctx_parts.append(part)
-        total_chars += len(part)
-
-    return "\n".join(ctx_parts).strip()
 
 # -----------------------------------------------------------------------------
 # ASK generic evidence compiler (query-agnostic, multilingual, non-hardcoded)

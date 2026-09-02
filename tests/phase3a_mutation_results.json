@@ -1,0 +1,22 @@
+{
+  "schema_version": "machinemind-mutation-results-v1",
+  "roadmap_phase": "3",
+  "commit_unit": "3A",
+  "results": [
+    {
+      "name": "document_page_fragment_changed",
+      "detected": true,
+      "mutation": "PDF link fragment changed from #page= to #p="
+    },
+    {
+      "name": "xlsx_sheet_label_changed",
+      "detected": true,
+      "mutation": "XLSX display label changed from Foglio: to Sheet:"
+    },
+    {
+      "name": "source_block_boundary_changed",
+      "detected": true,
+      "mutation": "source-block context boundary changed from > to >="
+    }
+  ]
+}

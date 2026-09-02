@@ -1,0 +1,133 @@
+{
+  "candidate": {
+    "assistant_core_sha256": "dca19aba41becaffb7c0623f52dee22863c527dbbb7dc8ee965a724a25efd00d",
+    "main_lines": 35120,
+    "main_net_line_reduction": 344,
+    "main_sha256": "d77dc2938d8cfbb6557b24230bb6936b545e39fdf945e94d76224a3e200ef05a",
+    "top_level_definition_inventory_candidate": 669,
+    "top_level_definition_inventory_parent": 669
+  },
+  "commit_in_phase": 1,
+  "commit_title": "refactor: extract citation presentation and resource links",
+  "commit_unit": "3A",
+  "compatibility_surface": [
+    "_clean_display_text",
+    "_title_from_file_url",
+    "_parse_structured_source_fields",
+    "_source_display_meta_for_citation",
+    "_structured_source_snippet_for_display",
+    "_format_citation_note_lines",
+    "_build_rg_links",
+    "_looks_like_xlsx_indexed_text",
+    "_clean_xlsx_snippet_for_display",
+    "_sanitize_citations_for_response",
+    "_build_sources_block_from_citations"
+  ],
+  "created_date": "2026-09-02",
+  "explicit_non_changes": [
+    "API routes and Pydantic request contracts",
+    "assistant_core_v2.py",
+    "runtime configuration and all Phase 2 infrastructure modules",
+    "prompts, model policy and semantic reasoning",
+    "retrieval, ranking, evidence admission and source priorities",
+    "ASK, Root Cause and Smart Diagnostic behavior",
+    "PDF/XLSX extraction and ingest persistence/metering",
+    "semantic cache, request budgets and external I/O",
+    "Dockerfile, cloudbuild.yaml, requirements.txt and mm_promotion_gate.py"
+  ],
+  "extracted_modules": [
+    {
+      "bytes": 21068,
+      "lines": 617,
+      "path": "machinemind/presentation/citations.py",
+      "responsibilities": [
+        "display-text normalization and URL-derived titles",
+        "structured source field parsing and display metadata",
+        "Procedure/Step/P&S/Photo/Video human-readable snippets",
+        "citation note rendering",
+        "PDF page and structured-source resource links",
+        "XLSX indexed-text detection and display cleanup",
+        "public citation sanitization",
+        "model-facing source blocks"
+      ],
+      "sha256": "9a124df9b0876f8f447a2ed7ff3e3536df2e03d8b8d9e752a2f01da11a664926"
+    }
+  ],
+  "limitations": [
+    "No real Cloud Build or Cloud Run startup was executed by this offline artifact.",
+    "No live ASK, Root Cause or Smart Diagnostic call was made against the candidate revision.",
+    "No live PDF, structured source or XLSX resource link was opened.",
+    "This gate proves the covered extraction contract, not complete semantic answer correctness.",
+    "The exact Git parent commit must be verified when the package is applied because the offline artifact is keyed to the complete Phase 2 Commit 5 repository snapshot."
+  ],
+  "live_exit_criteria": [
+    "Successful Cloud Build from the exact refactor-phase1 commit.",
+    "Healthy newest Cloud Run revision at 100 percent traffic.",
+    "/version commit_sha equals the Cloud Build Git commit and engine markers are unchanged.",
+    "Known PDF-backed ASK citation and #page link remain valid.",
+    "Known structured Procedure/Step labels and links remain human-readable and ordered.",
+    "Known XLSX snippet hides indexing envelope labels and retains the valid workbook link.",
+    "Known Root Cause and Smart Diagnostic START smoke paths retain citations/links and valid envelopes.",
+    "No new presentation import, NameError, citation serialization or resource-link errors appear in logs."
+  ],
+  "mutation_checks": [
+    {
+      "change": "#page= changed to #p=",
+      "detected": true,
+      "name": "document_page_fragment_changed"
+    },
+    {
+      "change": "Foglio: changed to Sheet:",
+      "detected": true,
+      "name": "xlsx_sheet_label_changed"
+    },
+    {
+      "change": "context boundary > changed to >=",
+      "detected": true,
+      "name": "source_block_boundary_changed"
+    }
+  ],
+  "next_commit_after_live_pass": "Roadmap Phase 3 Commit 2 — response finalization and HTML/UI rendering",
+  "offline_results": {
+    "gate_output": [
+      "PASS: syntax",
+      "PASS: prior_behavior_contracts",
+      "PASS: static_extraction",
+      "PASS: presentation_contract",
+      "PASS: mutation_sensitivity",
+      "PHASE 3A OFFLINE GATE: PASS — citation metadata, structured/XLSX display sanitization, prompt source blocks and Bubble resource links were extracted without changing the frozen Phase 2 Commit 5 behavior covered here."
+    ],
+    "historical_helper_signatures": 11,
+    "presentation_captured_scenarios": 62,
+    "presentation_parent_candidate_exact_parity": "PASS",
+    "prior_extracted_modules_byte_unchanged": "PASS",
+    "prior_phase_behavior_contracts": "PASS",
+    "self_contained_phase3a_gate": "PASS",
+    "syntax_compile": "PASS",
+    "top_level_definition_inventory_preserved": "PASS",
+    "unexpected_definition_changes": 0
+  },
+  "parent": {
+    "artifact": "MachineMind_Modularization_Phase2_Commit5_External_IO",
+    "artifact_sha256": "ff4704fa65d8b48307d84c1cf7305695545f5c69cea8508589b4bad8aebd7b06",
+    "assistant_core_sha256": "dca19aba41becaffb7c0623f52dee22863c527dbbb7dc8ee965a724a25efd00d",
+    "branch": "refactor-phase1",
+    "git_commit": "verify the applied Phase 2 Commit 5 commit in GitHub/Cloud Build",
+    "main_lines": 35464,
+    "main_sha256": "87778093aa95c256a00ed2aa2e58cafdbfdf1b9b98d8b8c49e9e1ccd1fb6d678"
+  },
+  "purpose": "Behavior-preserving extraction of citation metadata, structured/XLSX display cleanup, model-facing source blocks and Bubble resource-link construction from the production composition root.",
+  "roadmap_phase": "3",
+  "schema_version": "machinemind-modularization-validation-v1",
+  "static_guard": {
+    "candidate_hash_frozen": true,
+    "historical_main_function_names_and_signatures_preserved": true,
+    "module_hash_frozen": true,
+    "new_module_has_infrastructure_imports": false,
+    "new_module_imports_main": false,
+    "parent_definition_hashes_frozen": true,
+    "presentation_implementation_removed_from_main": true
+  },
+  "status": "OFFLINE_VERIFIED",
+  "title": "Citation presentation and resource links"
+}
