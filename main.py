@@ -5964,8 +5964,8 @@ def _dehyphenate_lines_keep_newlines(s: str) -> str:
 def _normalize_text_keep_lines(s: str) -> str:
     return _ingest_text_pdf.normalize_text_keep_lines(
         s,
-        normalize_unicode=_normalize_unicode_advanced,
-        dehyphenate_lines=_dehyphenate_lines_keep_newlines,
+        normalize_unicode_fn=_normalize_unicode_advanced,
+        dehyphenate_fn=_dehyphenate_lines_keep_newlines,
     )
 
 
@@ -5977,8 +5977,8 @@ def _extract_pages_with_layout_blocks(pdf_bytes: bytes) -> list[str]:
     return _ingest_text_pdf.extract_pages_with_layout_blocks(
         pdf_bytes,
         fitz_module=fitz,
-        page_to_text_blocks=_pymupdf_page_to_text_blocks,
-        normalize_text=_normalize_text_keep_lines,
+        page_to_text_blocks_fn=_pymupdf_page_to_text_blocks,
+        normalize_text_keep_lines_fn=_normalize_text_keep_lines,
     )
 
 
