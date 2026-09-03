@@ -135,6 +135,8 @@ from machinemind.presentation import citations as _presentation_citations
 from machinemind.presentation import responses as _presentation_responses
 from machinemind.ingest import text_pdf as _ingest_text_pdf
 from machinemind.ingest import pdf_cleaning_chunking as _ingest_pdf_cleaning_chunking
+from machinemind.ingest import xlsx as _ingest_xlsx
+from machinemind.ingest import dispatch as _ingest_dispatch
 
 
 _RESPONSE_PRESENTATION_RUNTIME = lambda: _presentation_responses.ResponsePresentationRuntime(
@@ -5990,197 +5992,105 @@ class XlsxIngestError(Exception):
         self.detail = detail or {}
 
 
+_XLSX_RUNTIME = lambda: _ingest_xlsx.XlsxRuntime(
+    normalize_unicode_advanced=_normalize_unicode_advanced,
+    clean_display_text=_clean_display_text,
+    openpyxl_module=openpyxl,
+    basename_fn=os.path.basename,
+    error_cls=XlsxIngestError,
+    datetime_type=datetime,
+    date_type=date,
+    time_type=time,
+    isfinite_fn=math.isfinite,
+    max_xlsx_bytes=MAX_XLSX_BYTES,
+    max_sheets=XLSX_MAX_SHEETS,
+    max_rows_per_sheet=XLSX_MAX_ROWS_PER_SHEET,
+    max_cols_per_sheet=XLSX_MAX_COLS_PER_SHEET,
+    max_cells_total=XLSX_MAX_CELLS_TOTAL,
+    max_text_chars=XLSX_MAX_TEXT_CHARS,
+    page_target_chars=XLSX_PAGE_TARGET_CHARS,
+    max_cell_chars=XLSX_MAX_CELL_CHARS,
+    max_row_chars=XLSX_MAX_ROW_CHARS,
+    include_hidden_sheets=XLSX_INCLUDE_HIDDEN_SHEETS,
+)
+
+
 def _xlsx_zip_has_expected_structure(xlsx_bytes: bytes) -> bool:
-    try:
-        with zipfile.ZipFile(io.BytesIO(xlsx_bytes)) as zf:
-            names = set(zf.namelist())
-            if "xl/vbaProject.bin" in names:
-                # This is macro-enabled content. Keep v1 strictly .xlsx-only.
-                return False
-            return "[Content_Types].xml" in names and "xl/workbook.xml" in names
-    except Exception:
-        return False
+    return _ingest_xlsx.xlsx_zip_has_expected_structure(
+        xlsx_bytes,
+        zipfile_module=zipfile,
+        bytes_io_fn=io.BytesIO,
+    )
 
 
 def _looks_like_xlsx_document(xlsx_bytes: bytes, detected_extension: str, content_type: str) -> bool:
-    ext = str(detected_extension or "").strip().lower()
-    ctype = str(content_type or "").strip().lower()
-
-    if ext in {".xls", ".xlsm", ".xlsb"}:
-        return False
-
-    xlsx_content_types = {
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        "application/octet-stream",
-        "binary/octet-stream",
-        "application/zip",
-    }
-
-    has_xlsx_hint = ext == ".xlsx" or ctype in xlsx_content_types
-    if not has_xlsx_hint and not (xlsx_bytes or b"")[:2] == b"PK":
-        return False
-
-    return _xlsx_zip_has_expected_structure(xlsx_bytes)
+    return _ingest_xlsx.looks_like_xlsx_document(
+        xlsx_bytes,
+        detected_extension,
+        content_type,
+        structure_predicate=_xlsx_zip_has_expected_structure,
+    )
 
 
 def _xlsx_document_title_from_filename(filename: str) -> str:
-    name = os.path.basename(str(filename or "").strip())
-    name = re.sub(r"\.xlsx$", "", name, flags=re.IGNORECASE)
-    name = re.sub(r"[_-]+", " ", name)
-    return _clean_display_text(name, max_len=120)
+    return _ingest_xlsx.xlsx_document_title_from_filename(
+        filename,
+        runtime=_XLSX_RUNTIME(),
+    )
 
 
 def _xlsx_clean_cell_text(value: str, max_len: Optional[int] = None) -> str:
-    s = _normalize_unicode_advanced(str(value or ""))
-    s = s.replace("\r\n", "\n").replace("\r", "\n")
-    s = re.sub(r"[ \t]+", " ", s)
-    s = re.sub(r"\n{3,}", "\n\n", s)
-    s = s.strip()
-    if max_len and len(s) > max_len:
-        cut = s[: max_len - 1].rsplit(" ", 1)[0].strip() or s[: max_len - 1].strip()
-        return cut + "…"
-    return s
+    return _ingest_xlsx.xlsx_clean_cell_text(
+        value,
+        max_len=max_len,
+        runtime=_XLSX_RUNTIME(),
+    )
 
 
 def _xlsx_cell_to_text(cell: Any) -> str:
-    try:
-        value = cell.value
-    except Exception:
-        value = cell
-
-    if value is None:
-        return ""
-
-    if isinstance(value, bool):
-        return "TRUE" if value else "FALSE"
-
-    if isinstance(value, datetime):
-        # Preserve date and time without noisy seconds when not needed.
-        if value.second or value.microsecond:
-            return value.isoformat(sep=" ", timespec="seconds")
-        return value.isoformat(sep=" ", timespec="minutes")
-
-    if isinstance(value, date):
-        return value.isoformat()
-
-    if isinstance(value, time):
-        if value.second or value.microsecond:
-            return value.isoformat(timespec="seconds")
-        return value.isoformat(timespec="minutes")
-
-    if isinstance(value, int):
-        return str(value)
-
-    if isinstance(value, float):
-        if math.isfinite(value):
-            if value.is_integer():
-                return str(int(value))
-            return f"{value:.12g}"
-        return ""
-
-    return _xlsx_clean_cell_text(str(value), max_len=XLSX_MAX_CELL_CHARS)
+    return _ingest_xlsx.xlsx_cell_to_text(
+        cell,
+        runtime=_XLSX_RUNTIME(),
+        clean_cell_text_fn=_xlsx_clean_cell_text,
+    )
 
 
 def _xlsx_trim_trailing_empty(values: list[str]) -> list[str]:
-    vals = list(values or [])
-    while vals and not str(vals[-1] or "").strip():
-        vals.pop()
-    return vals
+    return _ingest_xlsx.xlsx_trim_trailing_empty(values)
 
 
 def _xlsx_value_looks_numeric(value: str) -> bool:
-    s = str(value or "").strip()
-    if not s:
-        return False
-    return re.fullmatch(r"[-+]?\d+(?:[.,]\d+)?(?:\s*[%€$£]|\s*[a-zA-Z]{1,6})?", s) is not None
+    return _ingest_xlsx.xlsx_value_looks_numeric(value)
 
 
 def _xlsx_detect_header_index(rows: list[dict]) -> Optional[int]:
-    if not rows:
-        return None
-
-    best_idx: Optional[int] = None
-    best_score = 0.0
-
-    for idx, row in enumerate(rows[: min(20, len(rows))]):
-        vals = [str(v or "").strip() for v in row.get("values") or []]
-        non_empty = [v for v in vals if v]
-        if len(non_empty) < 2:
-            continue
-
-        textish = sum(1 for v in non_empty if not _xlsx_value_looks_numeric(v))
-        if textish < max(1, math.ceil(len(non_empty) * 0.45)):
-            continue
-
-        next_rows = rows[idx + 1: idx + 6]
-        next_non_empty_avg = 0.0
-        if next_rows:
-            next_non_empty_avg = sum(
-                len([v for v in (r.get("values") or []) if str(v or "").strip()])
-                for r in next_rows
-            ) / max(1, len(next_rows))
-
-        score = float(len(non_empty)) + 0.75 * float(textish) + 0.35 * min(float(len(non_empty)), next_non_empty_avg) - 0.05 * idx
-        if score > best_score:
-            best_score = score
-            best_idx = idx
-
-    return best_idx if best_score >= 3.0 else None
+    return _ingest_xlsx.xlsx_detect_header_index(
+        rows,
+        value_looks_numeric_fn=_xlsx_value_looks_numeric,
+    )
 
 
 def _xlsx_make_unique_headers(header_values: list[str], max_cols: int) -> list[str]:
-    headers: list[str] = []
-    seen: dict[str, int] = {}
-
-    for col_idx in range(1, max_cols + 1):
-        raw = header_values[col_idx - 1] if col_idx - 1 < len(header_values) else ""
-        label = _clean_display_text(raw, max_len=90) if raw else ""
-        if not label:
-            label = f"COL {openpyxl.utils.get_column_letter(col_idx) if openpyxl else col_idx}"
-
-        key = label.lower()
-        seen[key] = seen.get(key, 0) + 1
-        if seen[key] > 1:
-            label = f"{label} ({seen[key]})"
-        headers.append(label)
-
-    return headers
+    return _ingest_xlsx.xlsx_make_unique_headers(
+        header_values,
+        max_cols,
+        runtime=_XLSX_RUNTIME(),
+    )
 
 
 def _xlsx_row_to_line(row_number: int, values: list[str], headers: Optional[list[str]], is_header_row: bool) -> str:
-    values = list(values or [])
-    if not values:
-        return ""
-
-    parts: list[str] = []
-    for col_idx, value in enumerate(values, start=1):
-        value = _xlsx_clean_cell_text(value, max_len=XLSX_MAX_CELL_CHARS)
-        if not value:
-            continue
-
-        col_label = openpyxl.utils.get_column_letter(col_idx) if openpyxl else str(col_idx)
-        if headers and not is_header_row:
-            label = headers[col_idx - 1] if col_idx - 1 < len(headers) else f"COL {col_label}"
-            parts.append(f"{label}: {value}")
-        else:
-            parts.append(f"{col_label}: {value}")
-
-    if not parts:
-        return ""
-
-    prefix = f"HEADER ROW {row_number}:" if is_header_row else f"ROW {row_number}:"
-    line = prefix + " " + " | ".join(parts)
-    if len(line) > XLSX_MAX_ROW_CHARS:
-        line = line[: XLSX_MAX_ROW_CHARS - 1].rsplit(" ", 1)[0].strip() + "…"
-    return line
+    return _ingest_xlsx.xlsx_row_to_line(
+        row_number,
+        values,
+        headers,
+        is_header_row,
+        runtime=_XLSX_RUNTIME(),
+        clean_cell_text_fn=_xlsx_clean_cell_text,
+    )
 
 
 def _xlsx_append_page(pages: list[str], base_header: list[str], body_lines: list[str]) -> None:
-    if not body_lines:
-        return
-    text = "\n".join(base_header + body_lines).strip()
-    if text:
-        pages.append(text)
+    return _ingest_xlsx.xlsx_append_page(pages, base_header, body_lines)
 
 
 def _xlsx_sheet_rows_to_pages(
@@ -6189,178 +6099,30 @@ def _xlsx_sheet_rows_to_pages(
     sheet_index: int,
     document_title: str = "",
 ) -> list[str]:
-    if not rows:
-        return []
-
-    max_cols = max((len(r.get("values") or []) for r in rows), default=0)
-    header_idx = _xlsx_detect_header_index(rows)
-    headers = None
-    header_row_number = None
-    if header_idx is not None:
-        header_values = list(rows[header_idx].get("values") or [])
-        headers = _xlsx_make_unique_headers(header_values, max_cols=max_cols)
-        header_row_number = int(rows[header_idx].get("row_number") or 0)
-
-    document_title = _clean_display_text(document_title, max_len=120)
-    base_header = [
-        "DOCUMENT_FILE_TYPE: XLSX",
-        "DOCUMENT_KIND: Excel file; file Excel; foglio di calcolo; spreadsheet; workbook",
-        "DOCUMENT_FORMAT_HINTS: xlsx excel spreadsheet workbook worksheet sheet table tabella righe colonne fogli",
-    ]
-    if document_title:
-        base_header.append(f"DOCUMENT_TITLE: {document_title}")
-    base_header.extend([
-        f"SHEET: {sheet_name}",
-        f"SHEET_NAME: {sheet_name}",
-        f"SHEET_INDEX: {sheet_index}",
-        "EXTRACTION_MODE: XLSX values converted to structured text for AI retrieval",
-    ])
-    if header_row_number:
-        base_header.append(f"DETECTED_HEADER_ROW: {header_row_number}")
-
-    pages: list[str] = []
-    current_lines: list[str] = []
-    current_chars = sum(len(x) + 1 for x in base_header)
-    part_no = 1
-
-    def flush() -> None:
-        nonlocal current_lines, current_chars, part_no
-        if not current_lines:
-            return
-        header = list(base_header)
-        header.append(f"SHEET_PART: {part_no}")
-        _xlsx_append_page(pages, header, current_lines)
-        part_no += 1
-        current_lines = []
-        current_chars = sum(len(x) + 1 for x in base_header)
-
-    for idx, row in enumerate(rows):
-        row_number = int(row.get("row_number") or 0)
-        vals = list(row.get("values") or [])
-        line = _xlsx_row_to_line(
-            row_number=row_number,
-            values=vals,
-            headers=headers,
-            is_header_row=(header_idx is not None and idx == header_idx),
-        )
-        if not line:
-            continue
-
-        if current_lines and current_chars + len(line) + 1 > max(2000, XLSX_PAGE_TARGET_CHARS):
-            flush()
-
-        current_lines.append(line)
-        current_chars += len(line) + 1
-
-    flush()
-    return pages
+    return _ingest_xlsx.xlsx_sheet_rows_to_pages(
+        sheet_name,
+        rows,
+        sheet_index,
+        document_title=document_title,
+        runtime=_XLSX_RUNTIME(),
+        detect_header_index_fn=_xlsx_detect_header_index,
+        make_unique_headers_fn=_xlsx_make_unique_headers,
+        row_to_line_fn=_xlsx_row_to_line,
+        append_page_fn=_xlsx_append_page,
+    )
 
 
 def _extract_xlsx_sheets_as_pages(xlsx_bytes: bytes, detected_filename: str = "") -> list[str]:
-    if openpyxl is None:
-        raise XlsxIngestError(
-            "XLSX_DEPENDENCY_MISSING",
-            "Documento non indicizzabile: supporto XLSX non installato nel backend.",
-        )
-
-    if len(xlsx_bytes or b"") > MAX_XLSX_BYTES:
-        raise XlsxIngestError(
-            "XLSX_FILE_TOO_LARGE",
-            "Documento non indicizzabile: file XLSX troppo grande per l'ingest.",
-            {"max_xlsx_bytes": MAX_XLSX_BYTES, "actual_bytes": len(xlsx_bytes or b"")},
-        )
-
-    try:
-        workbook = openpyxl.load_workbook(
-            filename=io.BytesIO(xlsx_bytes),
-            read_only=True,
-            data_only=True,
-        )
-    except Exception as e:
-        raise XlsxIngestError(
-            "XLSX_PARSE_FAILED",
-            "Documento non indicizzabile: impossibile leggere il file XLSX.",
-            {"detail": str(e)[:300]},
-        )
-
-    pages: list[str] = []
-    total_cells = 0
-    total_text_chars = 0
-    processed_sheets = 0
-    document_title = _xlsx_document_title_from_filename(detected_filename)
-
-    try:
-        for ws in workbook.worksheets:
-            if processed_sheets >= max(1, XLSX_MAX_SHEETS):
-                break
-
-            if not XLSX_INCLUDE_HIDDEN_SHEETS and str(getattr(ws, "sheet_state", "visible") or "visible") != "visible":
-                continue
-
-            processed_sheets += 1
-            sheet_name = _clean_display_text(getattr(ws, "title", "Sheet"), max_len=90) or f"Sheet {processed_sheets}"
-
-            sheet_rows: list[dict] = []
-            max_rows = max(1, XLSX_MAX_ROWS_PER_SHEET)
-            max_cols = max(1, XLSX_MAX_COLS_PER_SHEET)
-
-            for row in ws.iter_rows(max_row=max_rows, max_col=max_cols):
-                values = [_xlsx_cell_to_text(cell) for cell in row]
-                values = _xlsx_trim_trailing_empty(values)
-                if not any(str(v or "").strip() for v in values):
-                    continue
-
-                row_number = int(getattr(row[0], "row", len(sheet_rows) + 1) or len(sheet_rows) + 1) if row else len(sheet_rows) + 1
-                non_empty_cells = sum(1 for v in values if str(v or "").strip())
-                total_cells += non_empty_cells
-                if total_cells > max(1, XLSX_MAX_CELLS_TOTAL):
-                    raise XlsxIngestError(
-                        "XLSX_TOO_MANY_CELLS",
-                        "Documento non indicizzabile: file XLSX troppo grande o troppo denso di celle.",
-                        {"max_cells_total": XLSX_MAX_CELLS_TOTAL},
-                    )
-
-                row_text_chars = sum(len(str(v or "")) for v in values)
-                total_text_chars += row_text_chars
-                if total_text_chars > max(1000, XLSX_MAX_TEXT_CHARS):
-                    raise XlsxIngestError(
-                        "XLSX_TEXT_TOO_LARGE",
-                        "Documento non indicizzabile: testo estratto da XLSX troppo grande per l'ingest sicuro.",
-                        {"max_text_chars": XLSX_MAX_TEXT_CHARS},
-                    )
-
-                sheet_rows.append({"row_number": row_number, "values": values})
-
-            new_pages = _xlsx_sheet_rows_to_pages(
-                sheet_name,
-                sheet_rows,
-                processed_sheets,
-                document_title=document_title,
-            )
-            pages.extend(new_pages)
-
-            converted_text_chars = sum(len(p or "") for p in pages)
-            if converted_text_chars > max(2000, XLSX_MAX_TEXT_CHARS * 2):
-                raise XlsxIngestError(
-                    "XLSX_TEXT_TOO_LARGE",
-                    "Documento non indicizzabile: testo strutturato da XLSX troppo grande per l'ingest sicuro.",
-                    {"max_structured_text_chars": XLSX_MAX_TEXT_CHARS * 2},
-                )
-
-    finally:
-        try:
-            workbook.close()
-        except Exception:
-            pass
-
-    pages = [p for p in pages if str(p or "").strip()]
-    if not pages:
-        raise XlsxIngestError(
-            "XLSX_NO_READABLE_TEXT",
-            "Documento non indicizzabile: nessun testo leggibile trovato nel file XLSX.",
-        )
-
-    return pages
+    return _ingest_xlsx.extract_xlsx_sheets_as_pages(
+        xlsx_bytes,
+        detected_filename=detected_filename,
+        runtime=_XLSX_RUNTIME(),
+        bytes_io_fn=io.BytesIO,
+        document_title_fn=_xlsx_document_title_from_filename,
+        cell_to_text_fn=_xlsx_cell_to_text,
+        trim_trailing_empty_fn=_xlsx_trim_trailing_empty,
+        sheet_rows_to_pages_fn=_xlsx_sheet_rows_to_pages,
+    )
 
 
 def _hf_norm_line(s: str) -> str:
@@ -14257,15 +14019,14 @@ def ingest_document(
     if url:
         _db_upsert_document_file(company_id, bubble_document_id, url)
 
-    pdf_magic = b"%PDF" in data[:1024]
-    looks_like_pdf = (
-        pdf_magic
-        or detected_extension == ".pdf"
-        or content_type == "application/pdf"
+    source_file_type = _ingest_dispatch.detect_ingest_source_file_type(
+        data,
+        detected_extension,
+        content_type,
+        looks_like_xlsx_fn=_looks_like_xlsx_document,
     )
-    looks_like_xlsx = _looks_like_xlsx_document(data, detected_extension, content_type)
 
-    if not looks_like_pdf and not looks_like_xlsx:
+    if not source_file_type:
         return {
             "ok": False,
             "error": {
@@ -14282,9 +14043,7 @@ def ingest_document(
     pages_total = 0
     pages_with_text = 0
     text_chars = 0
-    source_file_type = "pdf" if looks_like_pdf else "xlsx"
-
-    if looks_like_pdf:
+    if source_file_type == "pdf":
         if len(data) > MAX_PDF_BYTES:
             raise HTTPException(status_code=413, detail="PDF too large")
 
