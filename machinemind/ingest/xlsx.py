@@ -360,6 +360,52 @@ def xlsx_sheet_rows_to_pages(
     return pages
 
 
+def is_xlsx_page_text(text: str) -> bool:
+    """Return whether an indexed page is an XLSX structured-text page."""
+    normalized = str(text or "").lstrip()
+    return normalized.startswith("DOCUMENT_FILE_TYPE: XLSX")
+
+
+def chunk_xlsx_pages(
+    pages: list[tuple[int, str]],
+    target_chars: int,
+    min_chars: int,
+    *,
+    chunk_page_fn: Callable[..., list[dict]],
+) -> list[dict]:
+    """Chunk XLSX pages independently so sheet/part boundaries never merge.
+
+    Each extracted XLSX page represents one worksheet part and repeats its own
+    sheet metadata.  Passing all pages to the generic PDF chunker can merge the
+    first rows of several worksheets into one chunk.  That makes exact identifiers
+    beyond the leading snippet invisible to retrieval and can substitute evidence
+    from the first sheet.  Chunking one physical XLSX page at a time preserves the
+    historical text while enforcing the worksheet boundary deterministically.
+    """
+    chunks: list[dict] = []
+    next_chunk_index = 1
+
+    for page_number, page_text in pages or []:
+        page_chunks = chunk_page_fn(
+            pages=[(int(page_number), str(page_text or ""))],
+            target_chars=target_chars,
+            # XLSX rows are already self-contained structured records.  Reusing the
+            # PDF overlap here would duplicate nearly the whole of short worksheets
+            # into many suffix chunks.  Keep overlap inside the generic PDF path only.
+            overlap_chars=0,
+            min_chars=min_chars,
+        )
+        for chunk in page_chunks or []:
+            item = dict(chunk)
+            item["chunk_index"] = next_chunk_index
+            item["page_from"] = int(page_number)
+            item["page_to"] = int(page_number)
+            chunks.append(item)
+            next_chunk_index += 1
+
+    return chunks
+
+
 def extract_xlsx_sheets_as_pages(
     xlsx_bytes: bytes,
     detected_filename: str = "",

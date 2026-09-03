@@ -14532,12 +14532,20 @@ def index_document(
                 }
 
             pages = [(int(pn), txt or "") for (pn, txt) in page_rows]
-            chunks = _chunk_sentences_with_pages(
-                pages=pages,
-                target_chars=CHUNK_TARGET_CHARS,
-                overlap_chars=CHUNK_OVERLAP_CHARS,
-                min_chars=CHUNK_MIN_CHARS,
-            )
+            if pages and all(_ingest_xlsx.is_xlsx_page_text(text) for _, text in pages):
+                chunks = _ingest_xlsx.chunk_xlsx_pages(
+                    pages=pages,
+                    target_chars=CHUNK_TARGET_CHARS,
+                    min_chars=CHUNK_MIN_CHARS,
+                    chunk_page_fn=_chunk_sentences_with_pages,
+                )
+            else:
+                chunks = _chunk_sentences_with_pages(
+                    pages=pages,
+                    target_chars=CHUNK_TARGET_CHARS,
+                    overlap_chars=CHUNK_OVERLAP_CHARS,
+                    min_chars=CHUNK_MIN_CHARS,
+                )
 
             source_is_structured = _is_structured_source_key(bubble_document_id)
             if source_is_structured:
