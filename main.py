@@ -5605,251 +5605,6 @@ def _pick_entity_from_citations(q: str, citations: list[dict]) -> Optional[tuple
     return None
 
 
-def _xlsx_exact_identifier_context_terms(q: str, token: str) -> list[str]:
-    """Return meaningful non-identifier terms used to validate an exact XLSX row.
-
-    Exact occurrence of a code proves source identity but not that the row answers
-    the requested property.  These terms exclude the identifier itself and common
-    source/navigation wording, leaving property words such as ``pressione``,
-    ``riferimento``, ``tolleranza`` or ``nominale``.  The rule is multilingual and
-    structural; it does not contain machine- or customer-specific vocabulary.
-    """
-    normalized_query = _normalize_unicode_advanced(q or "")
-    query_terms = set(_content_term_set(normalized_query, limit=100))
-    token_terms = set(_content_term_set(token or "", limit=30))
-    source_location_terms: set[str] = set()
-    for match in re.finditer(
-        r"\b(?:foglio|sheet|worksheet|tab|documento|document|workbook|file)\b"
-        r"\s+[\"'«»]*([^,;:?\n]+)",
-        normalized_query,
-        flags=re.IGNORECASE,
-    ):
-        location_text = re.split(
-            r"\b(?:qual(?:e|i)?|what|which|dimmi|indica|riporta|tell|show)\b",
-            str(match.group(1) or ""),
-            maxsplit=1,
-            flags=re.IGNORECASE,
-        )[0]
-        source_location_terms.update(_content_term_set(location_text, limit=12))
-    generic_terms = {
-        # Italian source/navigation words.
-        "nel", "nello", "nella", "nelle", "sul", "sulla", "foglio",
-        "documento", "excel", "tabella", "riga", "row", "codice", "test",
-        "qual", "quale", "quali", "associato", "associata", "associati",
-        "associata", "indicato", "indicata", "specificato", "specificata",
-        "valore", "dato", "certificazione",
-        # English source/navigation words.
-        "in", "on", "the", "sheet", "document", "workbook", "table",
-        "code", "which", "what", "associated", "specified", "value", "data",
-        # Request/reporting verbs do not identify the technical property.
-        "risulta", "risultano", "riporta", "riportato", "riportata",
-        "mostra", "mostrato", "mostrata", "fornisce", "fornito", "fornita",
-        "trova", "trovare", "dimmi", "indica", "indicare",
-        "report", "reported", "reports", "show", "shown", "tell",
-        "state", "states", "stated", "provide", "provided", "find", "listed",
-        # Source-selection wording constrains where evidence may come from; it is
-        # not part of the technical property that must occur in the matched row.
-        "solo", "soltanto", "esclusivamente", "unicamente", "esclusivo",
-        "esclusiva", "esclusivi", "esclusive", "senza", "usare", "usa",
-        "utilizzare", "utilizza", "considerare", "considera", "basarsi",
-        "basati", "basata", "basato", "limitarsi", "limitati",
-        "altre", "altri", "altra", "altro", "fonti", "fonte",
-        "documenti", "contenuti", "contenuto",
-        "only", "exclusively", "solely", "without", "using", "use",
-        "other", "others", "sources", "source", "documents", "content",
-    }
-    return sorted(
-        term
-        for term in query_terms
-        if term not in token_terms
-        and term not in generic_terms
-        and term not in source_location_terms
-        and (len(term) >= 4 or any(ch.isdigit() for ch in term))
-    )[:24]
-
-
-def _focus_xlsx_chunk_on_identifier(full_text: str, token: str) -> dict:
-    """Build a faithful virtual citation containing the matching XLSX row.
-
-    Ingest chunks can contain several sheets and many rows, and a cell may contain
-    embedded line breaks.  The exact-row view therefore works on complete ROW
-    records (from one ``ROW N:`` marker to the next), not on single physical lines.
-    It keeps metadata/header lines from the same XLSX envelope plus only the
-    matching row record.  It never searches outside the already authorized chunk.
-    """
-    source = str(full_text or "").replace("\r\n", "\n").replace("\r", "\n")
-    needle = str(token or "").strip()
-    if not source or not needle or "DOCUMENT_FILE_TYPE: XLSX" not in source:
-        return {}
-
-    lines = [line.strip() for line in source.split("\n") if line.strip()]
-    if not lines:
-        return {}
-
-    row_rx = re.compile(r"^ROW\s+(\d+)\s*:\s*(.*)$", flags=re.IGNORECASE)
-    token_rx = re.compile(
-        r"(?<![A-Za-z0-9_.\-/])" + re.escape(needle) + r"(?![A-Za-z0-9_.\-/])",
-        flags=re.IGNORECASE,
-    )
-    normalized_needle = _normalize_unicode_advanced(needle).casefold().strip()
-
-    # Build complete row records. Continuation lines belong to the preceding ROW
-    # until the next ROW marker or XLSX envelope begins.
-    row_starts = [index for index, line in enumerate(lines) if row_rx.match(line)]
-    row_records: list[tuple[int, int, str]] = []
-    for position, row_start in enumerate(row_starts):
-        row_match = row_rx.match(lines[row_start])
-        if not row_match:
-            continue
-        row_end = row_starts[position + 1] if position + 1 < len(row_starts) else len(lines)
-        for index in range(row_start + 1, row_end):
-            if lines[index].upper().startswith("DOCUMENT_FILE_TYPE: XLSX"):
-                row_end = index
-                break
-        record_text = "\n".join(lines[row_start:row_end]).strip()
-        row_records.append((row_start, int(row_match.group(1)), record_text))
-
-    boundary_rows: list[tuple[int, int, str]] = []
-    exact_cell_rows: list[tuple[int, int, str]] = []
-    row_property_contexts: dict[tuple[int, int, str], str] = {}
-    narrative_label_terms = {
-        "nota", "note", "descrizione", "description",
-        "commento", "comment", "comments", "osservazioni", "remarks",
-        "testo", "text", "problema", "problem", "soluzione", "solution",
-    }
-
-    for row_start, row_number, record_text in row_records:
-        if not token_rx.search(record_text):
-            continue
-        boundary_rows.append((row_start, row_number, record_text))
-        first_line, *continuation = record_text.splitlines()
-        first_match = row_rx.match(first_line)
-        body = str(first_match.group(2) if first_match else first_line)
-        if continuation:
-            body += "\n" + "\n".join(continuation)
-        descriptor_parts: list[str] = []
-        exact_identity_found = False
-        generic_result_label_terms = {
-            "valore", "value", "values", "unità", "unita", "unit", "units",
-            "uom", "misura", "measure", "quantity", "quantità", "quantita",
-        }
-        annotation_label_terms = {
-            "nota", "note", "commento", "comment", "comments",
-            "osservazioni", "remarks",
-        }
-        for cell in re.split(r"\s*\|\s*", body):
-            if ":" not in cell:
-                continue
-            raw_label, raw_value = cell.split(":", 1)
-            clean_label = _normalize_unicode_advanced(raw_label).strip()
-            clean_value = _normalize_unicode_advanced(raw_value).strip()
-            normalized_label = clean_label.casefold()
-            label_terms = set(re.findall(r"[a-zà-öø-ÿ]+", normalized_label))
-            normalized_value = clean_value.casefold().strip(
-                " \t\r\n.,;:()[]{}<>\"'"
-            )
-            is_narrative_identity = bool(label_terms.intersection(narrative_label_terms))
-            is_exact_identity = bool(
-                normalized_value == normalized_needle
-                and not is_narrative_identity
-            )
-            if is_exact_identity:
-                exact_identity_found = True
-                continue
-
-            # Build field-aware property context. Pure result/unit cells and note
-            # columns cannot satisfy a requested property merely because their
-            # number happens to equal a qualifier in the question. Descriptive
-            # fields (including a Description column) remain available.
-            if not label_terms.intersection(generic_result_label_terms | annotation_label_terms):
-                descriptor_parts.append(clean_label)
-            if label_terms.intersection(annotation_label_terms):
-                continue
-            if (
-                clean_value
-                and any(ch.isalpha() for ch in clean_value)
-                and not label_terms.intersection(generic_result_label_terms)
-            ):
-                descriptor_parts.append(clean_value)
-
-        row_key = (row_start, row_number, record_text)
-        row_property_contexts[row_key] = "\n".join(
-            _dedup_text_values(descriptor_parts, limit=40)
-        ).strip()
-        if exact_identity_found:
-            exact_cell_rows.append(row_key)
-
-    chosen_rows = exact_cell_rows or boundary_rows
-    if not chosen_rows:
-        return {}
-    match_quality = "cell_exact" if exact_cell_rows else "boundary"
-    first_index = chosen_rows[0][0]
-
-    block_start = 0
-    for index in range(first_index, -1, -1):
-        if lines[index].upper().startswith("DOCUMENT_FILE_TYPE: XLSX"):
-            block_start = index
-            break
-
-    metadata_prefixes = (
-        "DOCUMENT_FILE_TYPE:",
-        "DOCUMENT_TITLE:",
-        "SHEET:",
-        "SHEET_NAME:",
-        "SHEET_INDEX:",
-        "SHEET_PART:",
-        "DETECTED_HEADER_ROW:",
-        "HEADER ROW ",
-    )
-    metadata: list[str] = []
-    seen_metadata: set[str] = set()
-    for line in lines[block_start:first_index]:
-        upper = line.upper()
-        if not any(upper.startswith(prefix) for prefix in metadata_prefixes):
-            continue
-        key = re.sub(r"\s+", " ", line).casefold()
-        if key in seen_metadata:
-            continue
-        seen_metadata.add(key)
-        metadata.append(line)
-
-    chosen_rows_limited = chosen_rows[:4]
-    focused_rows = [(number, record) for _, number, record in chosen_rows_limited]
-    focused_property_texts = [
-        row_property_contexts.get((start, number, record), "")
-        for start, number, record in chosen_rows_limited
-    ]
-    focused_lines = metadata + [record for _, record in focused_rows]
-    focused_text = "\n".join(focused_lines).strip()
-    if not focused_text:
-        return {}
-
-    return {
-        "text": focused_text,
-        "row_numbers": [number for number, _ in focused_rows],
-        "row_texts": [record for _, record in focused_rows],
-        "property_texts": focused_property_texts,
-        "match_quality": match_quality,
-        "match_count": len(chosen_rows),
-    }
-
-def _merge_exact_identifier_focus_text(left: str, right: str) -> str:
-    """Merge two focused XLSX views without duplicating metadata or rows."""
-    lines: list[str] = []
-    seen: set[str] = set()
-    for text in (left, right):
-        for raw_line in str(text or "").splitlines():
-            line = re.sub(r"\s+", " ", raw_line).strip()
-            if not line:
-                continue
-            key = line.casefold()
-            if key in seen:
-                continue
-            seen.add(key)
-            lines.append(line)
-    return "\n".join(lines).strip()
-
-
 def _db_find_token_chunk(
     company_id: str,
     machine_id: str,
@@ -5880,97 +5635,35 @@ def _db_find_token_chunk(
                 params.append(machine_id)
 
             where_sql = " AND ".join(where)
+
             cur.execute(
                 f"""
                 SELECT bubble_document_id, chunk_index, page_from, page_to,
-                       chunk_text
+                       left(chunk_text, %s) AS snippet
                 FROM public.document_chunks
                 WHERE {where_sql}
                   AND chunk_text ILIKE %s
                 ORDER BY bubble_document_id, page_from, chunk_index
                 LIMIT 1;
                 """,
-                [*params, f"%{token}%"],
+                [ASK_SNIPPET_CHARS, *params, f"%{token}%"],
             )
             row = cur.fetchone()
             if not row:
                 return None
 
-            bdid, chunk_index, page_from, page_to, chunk_text = row
-            full_text = str(chunk_text or "").strip()
-            focused = _focus_xlsx_chunk_on_identifier(full_text, token)
-            match_quality = str(focused.get("match_quality") or "")
-            is_xlsx = bool(
-                "DOCUMENT_FILE_TYPE: XLSX" in full_text
-                or "EXTRACTION_MODE: XLSX" in full_text
-                or "DOCUMENT_KIND: Excel file" in full_text
-            )
-            boundary_rx = re.compile(
-                r"(?<![A-Za-z0-9_.\-/])" + re.escape(token) + r"(?![A-Za-z0-9_.\-/])",
-                flags=re.IGNORECASE,
-            )
-            boundary_match = bool(boundary_rx.search(full_text))
-            # A token mentioned only in a note is not the row identifier. Keep the
-            # normal full-chunk semantic path, but do not promote it to an exact-row
-            # rescue. For non-XLSX documents the historical exact occurrence rule
-            # remains unchanged.
-            exact_focus = bool(
-                str(focused.get("text") or "").strip()
-                and match_quality == "cell_exact"
-            )
-            focused_text = str(focused.get("text") or "").strip() if exact_focus else ""
-
-            # For an exact XLSX identifier, synthesis and presentation receive the
-            # same isolated row.  The original authorized chunk is retained only as
-            # internal provenance; it is not used as the model-facing body because
-            # adjacent rows can contain different values for the same column.
-            model_text = focused_text or full_text
-            snippet_limit = max(240, int(ASK_SNIPPET_CHARS or 700))
-            snippet = model_text
-            if len(snippet) > snippet_limit:
-                token_match = re.search(re.escape(token), model_text, flags=re.IGNORECASE)
-                match_at = token_match.start() if token_match else -1
-                if match_at >= 0:
-                    before_chars = min(220, max(80, snippet_limit // 3))
-                    start = max(0, match_at - before_chars)
-                    end = min(len(model_text), start + snippet_limit)
-                    if end - start < snippet_limit:
-                        start = max(0, end - snippet_limit)
-                    snippet = model_text[start:end].strip()
-                else:
-                    snippet = model_text[:snippet_limit].strip()
-
+            bdid, chunk_index, page_from, page_to, snippet = row
             citation_id = f"{bdid}:p{int(page_from)}-{int(page_to)}:c{int(chunk_index)}"
             return {
                 "citation_id": citation_id,
                 "bubble_document_id": str(bdid),
                 "page_from": int(page_from),
                 "page_to": int(page_to),
-                "snippet": snippet,
-                "chunk_full": model_text,
-                "source_chunk_full": full_text if exact_focus else "",
+                "snippet": (snippet or "").strip(),
                 "similarity": 0.0,
-                "exact_identifier_focus": exact_focus,
-                "exact_identifier_row_numbers": list(focused.get("row_numbers") or []),
-                "exact_identifier_row_texts": list(focused.get("row_texts") or []),
-                "exact_identifier_property_texts": list(focused.get("property_texts") or []),
-                "exact_identifier_match_quality": match_quality,
-                "exact_identifier_match_count": int(focused.get("match_count") or 0),
-                "exact_identifier_unique_row": bool(
-                    exact_focus and int(focused.get("match_count") or 0) == 1
-                ),
-                "exact_identifier_ambiguous": bool(
-                    exact_focus and int(focused.get("match_count") or 0) > 1
-                ),
-                "exact_identifier_boundary_match": boundary_match,
-                "exact_identifier_is_xlsx": is_xlsx,
-                "exact_identifier_identity_verified": bool(
-                    boundary_match and (not is_xlsx or match_quality == "cell_exact")
-                ),
             }
     finally:
         conn.close()
-
 
 
 def _db_find_entity_chunk(
@@ -7896,24 +7589,8 @@ def _clean_xlsx_snippet_for_display(text: str, *, max_len: int = 520) -> str:
 
 
 def _sanitize_citations_for_response(citations: list[dict], company_id: Optional[str] = None) -> list[dict]:
-    prepared_citations: list[dict] = []
-    for raw in citations or []:
-        if not isinstance(raw, dict):
-            continue
-        citation = dict(raw)
-        exact_context = str(citation.get("exact_identifier_context") or "").strip()
-        if not exact_context and bool(citation.get("exact_identifier_focus")):
-            exact_context = str(
-                citation.get("chunk_full") or citation.get("snippet") or ""
-            ).strip()
-        if exact_context:
-            # Public grounding for an exact XLSX lookup must show the same row that
-            # the model saw. Do not fall back to an adjacent-row chunk prefix.
-            citation["snippet"] = exact_context
-            citation["chunk_full"] = exact_context
-        prepared_citations.append(citation)
     return _presentation_citations.sanitize_citations_for_response(
-        prepared_citations,
+        citations,
         company_id=company_id,
         fetch_file_map_fn=_fetch_document_file_map,
         safe_int_fn=_safe_int,
@@ -11819,11 +11496,6 @@ def _ask_has_explicit_xlsx_source_phrase(q_low: str) -> bool:
         r"\b(?:in|from|according\s+to)\s+(?:the\s+)?(?:excel|xlsx|spreadsheet|workbook|worksheet)\b",
         r"\b(?:excel|xlsx|spreadsheet|workbook|worksheet)\s+(?:file|document|source|table|sheet)\b",
         r"\b(?:righe|row|rows|colonne|columns|sheet|sheets|fogli)\b.{0,60}\b(?:excel|xlsx|spreadsheet|workbook)\b",
-        # A named worksheet is an explicit spreadsheet source even when the user
-        # does not repeat the words Excel/XLSX. Require a quoted name or a
-        # technical identifier shape so ordinary uses of “foglio/sheet” are not
-        # promoted accidentally.
-        r"\b(?:foglio|worksheet|sheet)\s+(?:[\"'«][^\"'»\n]{1,80}[\"'»]|[A-Za-z0-9]+(?:[_-][A-Za-z0-9]+)+)\b",
     ]
     return _ask_regex_any(q_low, patterns)
 
@@ -18203,39 +17875,6 @@ def _v13_query_source_signature(q: str) -> tuple[str, str]:
 
 
 def _v13_semantic_cache_compatible(mode: str, current_q: str, cached_q: str) -> bool:
-    # The infrastructure cache checks codes, numbers, polarity, source preference
-    # and lexical anchors. For exact-identifier ASK lookups, generic wording can
-    # dominate that overlap and incorrectly reuse a cached value for a different
-    # property (for example pressure -> temperature). Bind cache compatibility to
-    # the property signature as well; a mismatch becomes a safe cache miss.
-    if str(mode or "").strip().lower() == "ask":
-        def _strong_code_map(query: str) -> dict[str, str]:
-            out: dict[str, str] = {}
-            for raw in _extract_code_tokens(query or ""):
-                token = str(raw or "").strip()
-                if not token or not any(ch.isalpha() for ch in token) or not any(ch.isdigit() for ch in token):
-                    continue
-                key = _v13_normalize_query(token)
-                if key and key not in out:
-                    out[key] = token
-            return out
-
-        current_codes = _strong_code_map(current_q)
-        cached_codes = _strong_code_map(cached_q)
-        common_codes = sorted(set(current_codes).intersection(cached_codes))
-        if common_codes:
-            # Use every shared technical identifier. Exact equality is deliberate:
-            # uncertain synonyms should recompute rather than reuse the wrong answer.
-            for key in common_codes:
-                current_property = set(
-                    _xlsx_exact_identifier_context_terms(current_q, current_codes[key])
-                )
-                cached_property = set(
-                    _xlsx_exact_identifier_context_terms(cached_q, cached_codes[key])
-                )
-                if current_property != cached_property:
-                    return False
-
     return _semantic_cache.semantic_cache_compatible(
         mode, current_q, cached_q, globals()
     )
@@ -18501,11 +18140,6 @@ def _v13_gate_candidate_signals(q: str, candidate: dict) -> dict:
         if _v13_normalize_query(x)
     ]
     exact_code_hit = any(code and code in normalized_text for code in codes)
-    if c.get("exact_identifier_is_xlsx") and "exact_identifier_identity_verified" in c:
-        # For an exact XLSX lookup, a code mentioned only inside notes or as a
-        # substring is not the row identity. Respect the field-level verification
-        # performed by the exact-row retriever instead of recreating a broad text hit.
-        exact_code_hit = bool(c.get("exact_identifier_identity_verified"))
     return {
         "similarity": similarity,
         "overlap": max(0.0, min(1.0, float(overlap or 0.0))),
@@ -18587,18 +18221,9 @@ def _v13_deterministic_evidence_state(
     token_count = int(summary["query_token_count"] or 0)
     meaningful_term_count = int(summary.get("query_meaningful_term_count") or 0)
     if int(summary["exact_code_count"] or 0) > 0:
-        # Exact occurrence alone proves source identity, not task support.  An
-        # isolated XLSX ROW is stronger: the exact identifier and at least one
-        # meaningful requested property term occur in the same authorized row.
-        # That is direct tabular evidence and may be admitted deterministically.
-        exact_tabular_rows = [
-            c for c in (summary.get("candidates") or [])
-            if bool(c.get("exact_identifier_tabular_support"))
-            and bool(c.get("gate_exact_code_hit"))
-        ]
-        if exact_tabular_rows:
-            summary["exact_tabular_row_count"] = len(exact_tabular_rows)
-            return "supported", summary
+        # Exact occurrence proves source identity, not task support. Only a request
+        # made solely of identifiers may be admitted deterministically. Contextual
+        # requests containing an identifier must still pass semantic sufficiency.
         if _v13_is_identifier_only_request(q):
             return "supported", summary
         return "borderline", summary
@@ -20282,14 +19907,7 @@ def _v13_plan_retrieval(*, q: str, mode: str, company_id: str) -> dict:
 
 
 def _v13_candidate_text(c: dict) -> str:
-    return str(
-        c.get("exact_identifier_context")
-        or c.get("chunk_full")
-        or c.get("snippet")
-        or c.get("snippet_clean")
-        or ""
-    ).strip()
-
+    return str(c.get("chunk_full") or c.get("snippet") or c.get("snippet_clean") or "").strip()
 
 
 def _v13_merge_candidates(candidate_lists: list[list[dict]]) -> list[dict]:
@@ -20308,59 +19926,26 @@ def _v13_merge_candidates(candidate_lists: list[list[dict]]) -> list[dict]:
                 continue
 
             merged = dict(prev)
-            prev_focus = bool(prev.get("exact_identifier_focus"))
-            new_focus = bool(c.get("exact_identifier_focus"))
-
-            # Merge scoring/provenance normally, but an exact XLSX-row view must
-            # remain the model-facing text even when a longer dense/page candidate
-            # for the same underlying chunk arrives later.  Longer is not better
-            # when it introduces adjacent rows with different values.
             for key, value in c.items():
-                if value in (None, "", [], {}):
-                    continue
-                if key in {
-                    "similarity", "semantic_similarity", "retrieval_score", "v13_score",
-                    "ask_evidence_score", "structured_direct_score",
-                    "structured_title_match_score", "structured_title_coverage",
-                    "structured_title_strict_coverage", "structured_title_description_support",
-                    "structured_title_matched_terms", "structured_title_term_count",
-                }:
-                    try:
-                        merged[key] = max(float(merged.get(key) or 0.0), float(value or 0.0))
-                    except Exception:
+                if value not in (None, "", [], {}):
+                    if key in {
+                        "similarity", "semantic_similarity", "retrieval_score", "v13_score",
+                        "ask_evidence_score", "structured_direct_score",
+                        "structured_title_match_score", "structured_title_coverage",
+                        "structured_title_strict_coverage", "structured_title_description_support",
+                        "structured_title_matched_terms", "structured_title_term_count",
+                    }:
+                        try:
+                            merged[key] = max(float(merged.get(key) or 0.0), float(value or 0.0))
+                        except Exception:
+                            merged[key] = value
+                    elif key in {"chunk_full", "snippet", "snippet_clean"}:
+                        if len(str(value or "")) > len(str(merged.get(key) or "")):
+                            merged[key] = value
+                    else:
                         merged[key] = value
-                elif key in {"snippet", "snippet_clean", "chunk_full"}:
-                    if prev_focus and not new_focus:
-                        continue
-                    if new_focus and not prev_focus:
-                        merged[key] = value
-                    elif prev_focus and new_focus:
-                        combined = _merge_exact_identifier_focus_text(
-                            str(merged.get(key) or ""), str(value or "")
-                        )
-                        if combined:
-                            merged[key] = combined
-                    elif len(str(value or "")) > len(str(merged.get(key) or "")):
-                        merged[key] = value
-                elif key in {"exact_identifier_tokens", "exact_identifier_row_numbers", "exact_identifier_row_texts"}:
-                    old_values = list(merged.get(key) or [])
-                    new_values = list(value or [])
-                    combined_values: list[Any] = []
-                    seen_values: set[str] = set()
-                    for item in old_values + new_values:
-                        marker = str(item).casefold()
-                        if marker in seen_values:
-                            continue
-                        seen_values.add(marker)
-                        combined_values.append(item)
-                    merged[key] = combined_values
-                else:
-                    merged[key] = value
-
-            merged["exact_identifier_focus"] = bool(prev_focus or new_focus)
             by_id[cid] = merged
     return list(by_id.values())
-
 
 
 def _v13_score_candidates(q: str, candidates: list[dict]) -> list[dict]:
@@ -23436,7 +23021,6 @@ def _v13_generate_root_cause_response(
     return resp
 
 
-
 def _v13_exact_identifier_candidates(
     *,
     q: str,
@@ -23446,25 +23030,9 @@ def _v13_exact_identifier_candidates(
     bubble_document_id: Optional[str],
 ) -> list[dict]:
     """Retrieve exact identifier evidence without answering before the shared gate."""
-    by_id: dict[str, dict] = {}
-    order: list[str] = []
-
-    # Prefer mixed letter/digit identifiers over broad source labels.  Exact XLSX
-    # matches are represented as a focused virtual row while retaining the normal
-    # citation id/page link of the underlying authorized chunk.
-    tokens = _dedup_text_values(_extract_code_tokens(q), limit=8)
-    tokens = sorted(
-        tokens,
-        key=lambda value: (
-            bool(any(ch.isalpha() for ch in str(value)) and any(ch.isdigit() for ch in str(value))),
-            bool(any(ch.isdigit() for ch in str(value))),
-            bool(any(sep in str(value) for sep in ("-", "_", "/", "."))),
-            min(len(str(value)), 64),
-        ),
-        reverse=True,
-    )
-
-    for token in tokens:
+    out: list[dict] = []
+    seen: set[str] = set()
+    for token in _dedup_text_values(_extract_code_tokens(q), limit=8):
         hit = _db_find_token_chunk(
             company_id=company_id,
             machine_id=machine_id,
@@ -23476,181 +23044,21 @@ def _v13_exact_identifier_candidates(
             continue
         item = dict(hit)
         cid = str(item.get("citation_id") or "").strip()
-        if not cid:
+        if not cid or cid in seen:
             continue
-
+        seen.add(cid)
+        item["chunk_full"] = str(item.get("snippet") or "")
+        item["snippet_clean"] = str(item.get("snippet") or "")
         item["source_type"] = _source_type_from_document_id(item.get("bubble_document_id") or "")
-        item["exact_code_hit"] = bool(
-            item.get("exact_identifier_identity_verified", True)
-        )
-        item["exact_identifier_identity_mismatch"] = bool(
-            item.get("exact_identifier_is_xlsx")
-            and not item.get("exact_identifier_identity_verified")
-        )
+        item["exact_code_hit"] = True
         item["exact_identifier_token"] = str(token)
-        item["exact_identifier_tokens"] = [str(token)]
-        item["identifier_retrieval_v13"] = bool(item.get("exact_code_hit"))
+        item["identifier_retrieval_v13"] = True
+        # Do not fake semantic similarity. Exact identity is recorded separately and
+        # contextual requests are validated by the semantic sufficiency gate.
         item["similarity"] = float(item.get("similarity") or 0.0)
-        if item.get("exact_code_hit"):
-            item["retrieval_score"] = max(float(item.get("retrieval_score") or 0.0), 0.25)
-
-        if bool(item.get("exact_identifier_focus")):
-            context_terms = _xlsx_exact_identifier_context_terms(q, token)
-            row_text = "\n".join(
-                str(value or "")
-                for value in (
-                    item.get("exact_identifier_property_texts")
-                    or item.get("exact_identifier_row_texts")
-                    or []
-                )
-            ).strip() or str(item.get("chunk_full") or item.get("snippet") or "")
-            focused_terms = _content_term_set(row_text, limit=160)
-
-            def _term_matches(term: str) -> bool:
-                normalized = _normalize_unicode_advanced(str(term or "")).casefold().strip()
-                if not normalized:
-                    return False
-                if normalized in focused_terms:
-                    return True
-                # Conservative singular/plural and short inflection tolerance.
-                # This is used only to admit a deterministic exact-row rescue; a
-                # miss still falls back to the normal semantic evidence gate.
-                for candidate_term in focused_terms:
-                    other = _normalize_unicode_advanced(str(candidate_term or "")).casefold().strip()
-                    if not other:
-                        continue
-                    if min(len(normalized), len(other)) >= 5:
-                        if normalized[:-1] == other[:-1]:
-                            return True
-                        shorter, longer = sorted((normalized, other), key=len)
-                        if longer.startswith(shorter) and len(longer) - len(shorter) <= 3:
-                            return True
-                return False
-
-            matched_context = [term for term in context_terms if _term_matches(term)]
-            context_coverage = (
-                len(matched_context) / max(1, len(context_terms))
-                if context_terms else 0.0
-            )
-            query_language = _simple_query_language(q)
-            row_language = _simple_query_language(row_text)
-            same_language = bool(
-                query_language in {"it", "en"}
-                and row_language in {"it", "en"}
-                and query_language == row_language
-            )
-            property_state = (
-                "unspecified"
-                if not context_terms else
-                "supported"
-                if context_coverage >= 1.0 else
-                "mismatch"
-                if same_language else
-                "unknown"
-            )
-            has_row = bool(
-                re.search(
-                    r"^ROW\s+\d+\s*:",
-                    str(item.get("chunk_full") or ""),
-                    flags=re.IGNORECASE | re.MULTILINE,
-                )
-            )
-            item["exact_identifier_context_terms"] = context_terms
-            item["exact_identifier_matched_context_terms"] = matched_context
-            item["exact_identifier_context_coverage"] = round(context_coverage, 6)
-            item["exact_identifier_query_language"] = query_language
-            item["exact_identifier_row_language"] = row_language
-            item["exact_identifier_property_state"] = property_state
-            item["exact_identifier_property_supported"] = property_state == "supported"
-            item["exact_identifier_property_mismatch"] = property_state == "mismatch"
-            exact_cell_match = (
-                str(item.get("exact_identifier_match_quality") or "") == "cell_exact"
-            )
-            unique_row = bool(item.get("exact_identifier_unique_row"))
-            item["exact_identifier_context_match"] = property_state == "supported"
-            item["exact_identifier_cell_exact"] = exact_cell_match
-            item["exact_identifier_tabular_support"] = bool(
-                has_row
-                and exact_cell_match
-                and unique_row
-                and property_state == "supported"
-            )
-
-        previous = by_id.get(cid)
-        if previous is None:
-            by_id[cid] = item
-            order.append(cid)
-            continue
-
-        # Never let a broad sheet/title token replace a precise exact-row match.
-        if bool(previous.get("exact_identifier_focus")) and not bool(item.get("exact_identifier_focus")):
-            continue
-        if bool(item.get("exact_identifier_focus")) and not bool(previous.get("exact_identifier_focus")):
-            by_id[cid] = item
-            continue
-
-        merged = _v13_merge_candidates([[previous], [item]])
-        by_id[cid] = merged[0] if merged else previous
-        tokens_merged = _dedup_text_values(
-            list(previous.get("exact_identifier_tokens") or []) + [str(token)],
-            limit=8,
-        )
-        by_id[cid]["exact_identifier_tokens"] = tokens_merged
-        by_id[cid]["exact_identifier_token"] = str(tokens_merged[0] if tokens_merged else token)
-        context_merged = _dedup_text_values(
-            list(previous.get("exact_identifier_matched_context_terms") or [])
-            + list(item.get("exact_identifier_matched_context_terms") or []),
-            limit=24,
-        )
-        by_id[cid]["exact_identifier_matched_context_terms"] = context_merged
-        property_texts_merged = _dedup_text_values(
-            list(previous.get("exact_identifier_property_texts") or [])
-            + list(item.get("exact_identifier_property_texts") or []),
-            limit=8,
-        )
-        by_id[cid]["exact_identifier_property_texts"] = property_texts_merged
-        states = {
-            str(previous.get("exact_identifier_property_state") or ""),
-            str(item.get("exact_identifier_property_state") or ""),
-        }
-        merged_state = (
-            "supported" if "supported" in states else
-            "mismatch" if "mismatch" in states else
-            "unknown" if "unknown" in states else
-            "unspecified"
-        )
-        by_id[cid]["exact_identifier_property_state"] = merged_state
-        by_id[cid]["exact_identifier_property_supported"] = merged_state == "supported"
-        by_id[cid]["exact_identifier_property_mismatch"] = merged_state == "mismatch"
-        by_id[cid]["exact_identifier_context_match"] = merged_state == "supported"
-        row_numbers = list(by_id[cid].get("exact_identifier_row_numbers") or [])
-        unique_row = len({str(value) for value in row_numbers}) == 1
-        cell_exact = bool(
-            previous.get("exact_identifier_cell_exact")
-            or item.get("exact_identifier_cell_exact")
-            or str(by_id[cid].get("exact_identifier_match_quality") or "") == "cell_exact"
-        )
-        ambiguous = bool(
-            previous.get("exact_identifier_ambiguous")
-            or item.get("exact_identifier_ambiguous")
-            or not unique_row
-        )
-        by_id[cid]["exact_identifier_cell_exact"] = cell_exact
-        by_id[cid]["exact_identifier_unique_row"] = bool(unique_row and not ambiguous)
-        by_id[cid]["exact_identifier_ambiguous"] = ambiguous
-        by_id[cid]["exact_identifier_tabular_support"] = bool(
-            merged_state == "supported"
-            and cell_exact
-            and unique_row
-            and not ambiguous
-            and (
-                previous.get("exact_identifier_tabular_support")
-                or item.get("exact_identifier_tabular_support")
-            )
-        )
-
-    return [by_id[cid] for cid in order if cid in by_id]
-
+        item["retrieval_score"] = max(float(item.get("retrieval_score") or 0.0), 0.25)
+        out.append(item)
+    return out
 
 
 
@@ -24598,16 +24006,9 @@ def _assistant_core_numeric_signal(text: str) -> dict:
         r"(?:kg|g|t|ton|lb|mm|cm|m|m/s|m/s2|m/s²|rpm|min\-?1|1/min|hz|khz|kw|w|v|a|bar|mpa|pa|nm|n|kn|°c|celsius|%|ms|s|sec|min|h|hour|hours)\b",
         value,
     )
-    xlsx_unit_matches = []
-    xlsx_rx = globals().get("_ASSISTANT_CORE_XLSX_VALUE_UNIT_RE")
-    if xlsx_rx is not None:
-        try:
-            xlsx_unit_matches = list(xlsx_rx.finditer(value))
-        except Exception:
-            xlsx_unit_matches = []
     return {
         "has_number": bool(number_matches),
-        "has_number_with_unit": bool(unit_matches or xlsx_unit_matches),
+        "has_number_with_unit": bool(unit_matches),
         "numbers": number_matches[:12],
     }
 
@@ -26688,27 +26089,12 @@ def _assistant_core_prepare_evidence(
             task_contract_bonus += min(0.12, facet_coverage * 0.12)
         if source_type == "ps" and not substantive_ps:
             task_contract_bonus -= 0.35
-        exact_identifier_conflict = bool(
-            cc.get("exact_identifier_identity_mismatch")
-            or (
-                cc.get("exact_identifier_focus")
-                and (
-                    cc.get("exact_identifier_property_mismatch")
-                    or cc.get("exact_identifier_ambiguous")
-                )
-            )
-        )
         router_id_bonus = 0.16 if cid and cid in relevant_ids else 0.0
-        exact_bonus = 0.0 if exact_identifier_conflict else 0.18 if bool(
+        exact_bonus = 0.18 if bool(
             cc.get("exact_code_hit")
             or cc.get("gate_exact_code_hit")
             or cc.get("exact_identifier_token")
         ) else 0.0
-        if needs_numeric and exact_identifier_conflict:
-            # The identifier is real but the requested property is not present in
-            # that same-language row. An optimistic router id must not turn an
-            # unrelated row value into a grounded numeric answer.
-            task_contract_bonus -= 0.60
         title_bonus = min(0.16, max(0.0, float(cc.get("structured_title_match_score") or 0.0)) * 0.20)
         lexical_bonus = min(0.16, max(0.0, overlap) * 0.24)
         facet_retrieval_bonus = min(
@@ -26748,14 +26134,6 @@ def _assistant_core_prepare_evidence(
         cc["assistant_core_missing_diagnostic_clues"] = list(diagnostic_priority.get("missing") or [])
         cc["assistant_core_diagnostic_priority"] = dict(diagnostic_priority)
         cc["assistant_core_numeric_signal"] = dict(numeric_signal)
-        cc["assistant_core_exact_identifier_conflict"] = bool(exact_identifier_conflict)
-        cc["assistant_core_exact_property_mismatch"] = bool(
-            cc.get("exact_identifier_focus")
-            and (
-                cc.get("exact_identifier_property_mismatch")
-                or cc.get("exact_identifier_ambiguous")
-            )
-        )
         cc["assistant_core_interface_signal"] = bool(interface_signal)
         cc["assistant_core_sequence_signal"] = bool(sequence_signal)
         cc["assistant_core_ps_substantive"] = bool(substantive_ps)
@@ -26832,153 +26210,6 @@ def _assistant_core_prepare_evidence(
     fts_hits = int(deterministic_signals.get("fts_overlap_count") or 0)
     exact_hits = int(deterministic_signals.get("exact_code_count") or 0)
 
-    requested_code_tokens = [
-        str(value or "").strip()
-        for value in _extract_code_tokens(request.query)
-        if str(value or "").strip()
-        and any(ch.isalpha() for ch in str(value))
-        and any(ch.isdigit() for ch in str(value))
-    ]
-    contextual_code_tokens: list[str] = []
-    normalized_request_query = _normalize_unicode_advanced(request.query or "")
-    for token in requested_code_tokens:
-        if re.search(
-            r"(?:\b(?:codice|code|identifier|identificatore|id|seriale|serial|modello|model)\b|"
-            r"\bpart\s+number\b|\bp/n\b)\s*(?:[:#=\-]\s*)?[\"'«»]*"
-            + re.escape(token),
-            normalized_request_query,
-            flags=re.IGNORECASE,
-        ):
-            contextual_code_tokens.append(token)
-    if contextual_code_tokens:
-        requested_precision_identifiers = _dedup_text_values(contextual_code_tokens, limit=6)
-    elif requested_code_tokens:
-        # A lone technical identifier (for example PDF-QA-3107 or BBX-300/40T)
-        # remains a hard precision constraint even without the word "code".
-        requested_precision_identifiers = _dedup_text_values(
-            sorted(
-                requested_code_tokens,
-                key=lambda value: (
-                    bool(any(sep in value for sep in ("-", "_", "/", "."))),
-                    min(len(value), 64),
-                ),
-                reverse=True,
-            )[:1],
-            limit=1,
-        )
-    else:
-        requested_precision_identifiers = []
-
-    def _candidate_has_requested_identifier(candidate: dict, token: str) -> bool:
-        normalized_token = _v13_normalize_query(token)
-        if not normalized_token:
-            return False
-        candidate_tokens = {
-            _v13_normalize_query(value)
-            for value in (
-                list(candidate.get("exact_identifier_tokens") or [])
-                + [candidate.get("exact_identifier_token")]
-            )
-            if _v13_normalize_query(value)
-        }
-        text = _v13_candidate_text(candidate)
-        is_xlsx = bool(
-            candidate.get("exact_identifier_is_xlsx")
-            or "DOCUMENT_FILE_TYPE: XLSX" in text
-            or "EXTRACTION_MODE: XLSX" in text
-        )
-        if is_xlsx:
-            return bool(
-                normalized_token in candidate_tokens
-                and candidate.get("exact_code_hit")
-                and not candidate.get("exact_identifier_identity_mismatch")
-            )
-        searchable_text = "\n".join(
-            str(value or "")
-            for value in (
-                candidate.get("display_title"),
-                candidate.get("display_label"),
-                text,
-            )
-            if str(value or "").strip()
-        )
-        candidate_identifiers = {
-            _v13_normalize_query(value)
-            for value in (
-                _extract_code_tokens(searchable_text)
-                + _v13_structural_identifier_tokens(searchable_text)
-            )
-            if _v13_normalize_query(value)
-        }
-        return normalized_token in candidate_identifiers
-
-    requested_identifier_hits = {
-        token: any(_candidate_has_requested_identifier(candidate, token) for candidate in top_candidates)
-        for token in requested_precision_identifiers
-    }
-    missing_requested_identifiers = [
-        token for token, found in requested_identifier_hits.items() if not found
-    ]
-    precision_identifier_gate = bool(
-        not needs_numeric
-        or not requested_precision_identifiers
-        or not missing_requested_identifiers
-    )
-
-    required_facet_keys_for_exact = {
-        str(value or "").strip().casefold()
-        for value in must_cover_facets
-        if str(value or "").strip()
-    }
-
-    def _exact_identifier_property_viable(candidate: dict) -> bool:
-        """Require evidence for the property, not merely for the exact code.
-
-        Same-language exact rows are checked deterministically. When query and
-        row are in different languages, lexical comparison is intentionally
-        inconclusive; in that case the independent facet-retrieval path must
-        confirm both the requested facet and the numeric answer type.
-        """
-        if bool(candidate.get("exact_identifier_identity_mismatch")):
-            return False
-        if not bool(candidate.get("exact_identifier_focus")):
-            return True
-        if bool(
-            candidate.get("exact_identifier_property_mismatch")
-            or candidate.get("exact_identifier_ambiguous")
-        ):
-            return False
-        state = str(candidate.get("exact_identifier_property_state") or "").strip().lower()
-        if state in {"", "supported", "unspecified"}:
-            return True
-        if state != "unknown":
-            return False
-        confirmed_facets = {
-            str(value or "").strip().casefold()
-            for value in (
-                list(candidate.get("assistant_core_facet_hits") or [])
-                + list(candidate.get("assistant_core_covered_facets") or [])
-            )
-            if str(value or "").strip()
-        }
-        confirmed_types = {
-            str(value or "").strip().lower()
-            for value in (candidate.get("assistant_core_facet_answer_types") or [])
-            if str(value or "").strip()
-        }
-        facet_confirmed = bool(
-            required_facet_keys_for_exact
-            and required_facet_keys_for_exact.intersection(confirmed_facets)
-        )
-        return bool(facet_confirmed and REQ_NUMERIC_VALUE in confirmed_types)
-
-    exact_viable_hits = sum(
-        1
-        for c in top_candidates
-        if bool(c.get("exact_code_hit") or c.get("gate_exact_code_hit"))
-        and _exact_identifier_property_viable(c)
-    )
-
     def _contract_semantic(candidate: dict) -> float:
         return float(
             candidate.get(
@@ -26991,7 +26222,6 @@ def _assistant_core_prepare_evidence(
     numeric_viable = [
         c for c in top_candidates
         if bool((c.get("assistant_core_numeric_signal") or {}).get("has_number"))
-        and _exact_identifier_property_viable(c)
         and (
             float(c.get("assistant_core_facet_coverage") or 0.0) >= 0.20
             or float(c.get("assistant_core_router_id_bonus") or 0.0) > 0.0
@@ -27007,20 +26237,6 @@ def _assistant_core_prepare_evidence(
             or _contract_semantic(c) >= 0.46
         )
     ]
-    exact_identifier_numeric_viable = [
-        c for c in numeric_viable
-        if bool(c.get("exact_identifier_focus"))
-        and bool(c.get("exact_identifier_tabular_support"))
-        and str(c.get("exact_identifier_token") or "").strip()
-        and bool((c.get("assistant_core_numeric_signal") or {}).get("has_number"))
-    ]
-    exact_identifier_precision_override = bool(
-        needs_numeric
-        and exact_identifier_numeric_viable
-        and decision.effective_mode == MODE_ASK
-        and decision.request_kind not in {KIND_FAULT_DIAGNOSTIC, KIND_GUIDED_DIAGNOSTIC}
-    )
-
     interface_viable = [
         c for c in top_candidates
         if bool(c.get("assistant_core_interface_signal"))
@@ -27080,7 +26296,7 @@ def _assistant_core_prepare_evidence(
         or top_similarity >= 0.34
         or top_overlap >= 0.035
         or fts_hits > 0
-        or exact_viable_hits > 0
+        or exact_hits > 0
         or (decision.request_kind == KIND_PROCEDURE and has_procedure_sources)
     )
     supported = False
@@ -27090,14 +26306,6 @@ def _assistant_core_prepare_evidence(
         elif decision.evidence_state in {EVIDENCE_SUPPORTED, EVIDENCE_PARTIAL, EVIDENCE_REFINE} and independent_signal:
             supported = True
 
-    # An exact identifier bound to one XLSX row is stronger than a probabilistic
-    # router rejection for a numeric lookup.  Admit it only when the focused row
-    # independently covers the requested facet (or has strong non-code overlap)
-    # and contains a numeric value.  This avoids both cross-row answers and random
-    # no_sources for later rows in the same worksheet chunk.
-    if exact_identifier_precision_override:
-        supported = True
-
     # Every mandatory output shape must have independently viable evidence.
     if needs_ordered_actions:
         supported = supported and (
@@ -27106,7 +26314,7 @@ def _assistant_core_prepare_evidence(
             or (top_similarity >= 0.32 and top_overlap >= 0.05)
         )
     if needs_numeric:
-        supported = supported and bool(numeric_viable) and precision_identifier_gate
+        supported = supported and bool(numeric_viable)
     if needs_interface:
         supported = supported and bool(interface_viable)
     if needs_sequence:
@@ -27133,10 +26341,7 @@ def _assistant_core_prepare_evidence(
         # but its lexical/annotation coverage is not ground truth: cross-language
         # wording and distributed procedure evidence can under-report coverage.
         minimum_facet_coverage = 0.70 if len(must_cover_facets) >= 4 else 0.80
-        facet_threshold_pass = (
-            facet_evidence_coverage >= minimum_facet_coverage
-            or exact_identifier_precision_override
-        )
+        facet_threshold_pass = facet_evidence_coverage >= minimum_facet_coverage
         supported = supported and facet_threshold_pass
         if covered_answer_types:
             missing_precision_types = precision_requirements - covered_answer_types
@@ -27186,11 +26391,11 @@ def _assistant_core_prepare_evidence(
                     )
                 )
                 or (fts_hits > 0 and top_overlap >= 0.03)
-                or exact_viable_hits > 0
+                or exact_hits > 0
             )
         )
         baseline_contract_viable = bool(
-            (not needs_numeric or (numeric_viable and precision_identifier_gate))
+            (not needs_numeric or numeric_viable)
             and (not needs_interface or interface_viable)
             and (not needs_sequence or sequence_viable)
             and (
@@ -27266,19 +26471,6 @@ def _assistant_core_prepare_evidence(
         )
     else:
         selected = selected_pool[:limit] if supported else []
-    if needs_numeric and selected:
-        selected = [
-            c for c in selected
-            if _exact_identifier_property_viable(c)
-            and (
-                not requested_precision_identifiers
-                or any(
-                    _candidate_has_requested_identifier(c, token)
-                    for token in requested_precision_identifiers
-                )
-            )
-        ]
-        supported = bool(supported and selected)
     if supported and overview_catalog_requested and overview_catalog_candidates:
         # Enumeration is a recall task: low lexical similarity must not erase an
         # explicitly indexed assembly or auxiliary system from the machine catalog.
@@ -27338,28 +26530,6 @@ def _assistant_core_prepare_evidence(
             "deterministic_signals": deterministic_signals,
             "independent_signal": independent_signal,
             "numeric_viable_count": len(numeric_viable),
-            "exact_identifier_numeric_viable_count": len(exact_identifier_numeric_viable),
-            "exact_identifier_precision_override": bool(exact_identifier_precision_override),
-            "exact_identifier_viable_hit_count": int(exact_viable_hits),
-            "exact_identifier_property_mismatch_count": sum(
-                1
-                for c in top_candidates
-                if bool(c.get("exact_identifier_property_mismatch"))
-            ),
-            "exact_identifier_identity_mismatch_count": sum(
-                1
-                for c in top_candidates
-                if bool(c.get("exact_identifier_identity_mismatch"))
-            ),
-            "exact_identifier_ambiguous_count": sum(
-                1
-                for c in top_candidates
-                if bool(c.get("exact_identifier_ambiguous"))
-            ),
-            "requested_precision_identifiers": list(requested_precision_identifiers),
-            "requested_identifier_hits": dict(requested_identifier_hits),
-            "missing_requested_identifiers": list(missing_requested_identifiers),
-            "precision_identifier_gate": bool(precision_identifier_gate),
             "interface_viable_count": len(interface_viable),
             "sequence_viable_count": len(sequence_viable),
             "root_viable_count": len(root_viable),
@@ -28077,7 +27247,7 @@ def _assistant_core_build_safety_refusal(
     }
 
 
-_ASSISTANT_CORE_UNIT_TOKEN = r"(?:mm(?:²|2|³|3)?|cm|kg|bar|k\s*pa|m\s*pa|pa|k\s*hz|hz|k\s*w|k\s*n|n\s*(?:[·*x]\s*)?m|nm|rpm|giri\s*/?\s*min(?:uto)?|min\s*(?:-?1|⁻¹)|1\s*/\s*min|milliseconds?|millisecondi?|seconds?|secondi?|sec(?:ondi?)?|minutes?|minuti?|hours?|ora|ore|ms|°\s*c|°|cst|db\s*\(?a\)?|cycles?|cicli|pieces?|pezzi|occurrences?|occorrenze|%|v|a|w|m|g|s|h)"
+_ASSISTANT_CORE_UNIT_TOKEN = r"(?:mm(?:²|2|³|3)?|cm|kg|bar|k\s*pa|m\s*pa|pa|k\s*hz|hz|k\s*w|k\s*n|n\s*(?:[·*x]\s*)?m|nm|rpm|giri\s*/?\s*min(?:uto)?|min\s*(?:-?1|⁻¹)|1\s*/\s*min|ms|°\s*c|°|cst|db\s*\(?a\)?|cycles?|cicli|pieces?|pezzi|occurrences?|occorrenze|%|v|a|w|m|g|s|h)"
 _ASSISTANT_CORE_TECH_UNIT_AFTER_RE = re.compile(
     rf"^\s*(?:(?:circa|about|approx(?:imately)?|ca\.?|~)\s*)?(?P<unit>{_ASSISTANT_CORE_UNIT_TOKEN})(?=$|[\s,.;:/)\]])",
     re.IGNORECASE,
@@ -28097,18 +27267,6 @@ _ASSISTANT_CORE_TECH_UNIT_BEFORE_RE = re.compile(
 _ASSISTANT_CORE_NUMBER_ATOM = r"[-+]?(?:\d{1,3}(?:[ .]\d{3})+|\d+)(?:[.,]\d+)?"
 _ASSISTANT_CORE_NUMBER_RE = re.compile(
     rf"(?<![\w]){_ASSISTANT_CORE_NUMBER_ATOM}"
-)
-_ASSISTANT_CORE_XLSX_VALUE_UNIT_RE = re.compile(
-    # XLSX ingest renders cells as ``Label: value | UnitLabel: unit``.  The
-    # generic prose parser cannot associate the separated unit with the numeric
-    # value, which made a grounded answer such as ``17,6 bar`` look unsupported
-    # even though the exact row contained ``Valore: 17.6 | Unità: bar``.  Accept
-    # only an immediately adjacent technical-unit field on the same rendered row;
-    # this cannot borrow a unit from another row or worksheet.
-    rf"(?:^|\|)\s*[^|\n:]{{1,90}}\s*:\s*(?P<value>{_ASSISTANT_CORE_NUMBER_ATOM})\s*\|\s*"
-    rf"(?:unit(?:à|a)?|unit|uom|u\.m\.|unit\s+of\s+measure)\s*:\s*"
-    rf"(?P<unit>{_ASSISTANT_CORE_UNIT_TOKEN})(?=$|[\s|,.;:/)\]])",
-    re.IGNORECASE | re.MULTILINE,
 )
 _ASSISTANT_CORE_DIMENSION_CHAIN_RE = re.compile(
     rf"(?P<values>{_ASSISTANT_CORE_NUMBER_ATOM}(?:\s*[x×]\s*{_ASSISTANT_CORE_NUMBER_ATOM})+)\s*(?P<unit>mm(?:²|2|³|3)?|cm|m)(?=$|[\s,.;:/)\]])",
@@ -28141,23 +27299,6 @@ def _assistant_core_normalize_unit(value: str) -> str:
         "db(a)": "dba",
         "dba": "dba",
         "°c": "degc",
-        "millisecond": "ms",
-        "milliseconds": "ms",
-        "millisecondo": "ms",
-        "millisecondi": "ms",
-        "second": "s",
-        "seconds": "s",
-        "secondo": "s",
-        "secondi": "s",
-        "sec": "s",
-        "minute": "min",
-        "minutes": "min",
-        "minuto": "min",
-        "minuti": "min",
-        "hour": "h",
-        "hours": "h",
-        "ora": "h",
-        "ore": "h",
         "cicli": "cycle",
         "cycle": "cycle",
         "cycles": "cycle",
@@ -28206,10 +27347,6 @@ def _assistant_core_is_list_marker(value: str, start: int, end: int, raw: str) -
 def _assistant_core_claims(text: str) -> list[dict]:
     value = str(text or "")
     claims: list[dict] = []
-    xlsx_value_unit_spans = [
-        (m.start("value"), m.end("value"), str(m.group("unit") or ""))
-        for m in _ASSISTANT_CORE_XLSX_VALUE_UNIT_RE.finditer(value)
-    ]
     dimension_spans = [
         (m.start("values"), m.end("values"), str(m.group("unit") or ""))
         for pattern in (
@@ -28246,11 +27383,6 @@ def _assistant_core_claims(text: str) -> list[dict]:
         before_unit_match = None if (unit_match or range_unit_match) else _ASSISTANT_CORE_TECH_UNIT_BEFORE_RE.search(before)
         matched_unit = unit_match or range_unit_match or before_unit_match
         unit = str(matched_unit.group("unit") if matched_unit else "")
-        if not unit:
-            for span_start, span_end, span_unit in xlsx_value_unit_spans:
-                if span_start <= match.start() and match.end() <= span_end:
-                    unit = span_unit
-                    break
         if not unit:
             for span_start, span_end, span_unit in dimension_spans:
                 if span_start <= match.start() and match.end() <= span_end:
@@ -28438,19 +27570,11 @@ def _assistant_core_recover_citations(
         selected.append(candidate)
 
     by_id = {str(c.get("citation_id") or "").strip(): c for c in selected}
-    existing_ids_in_order = _dedup_text_values(
-        [
-            str(c.get("citation_id") or "").strip()
-            for c in (response.get("citations") or [])
-            if isinstance(c, dict)
-            and str(c.get("citation_id") or "").strip() in by_id
-        ],
-        limit=32,
-    )
-    # Response citations may already be sanitized and therefore lack internal
-    # exact-row metadata. Rehydrate by id from the selected raw evidence so a later
-    # validation pass cannot regress an XLSX citation back to the chunk prefix.
-    existing = [dict(by_id[cid]) for cid in existing_ids_in_order if cid in by_id]
+    existing = [
+        dict(c)
+        for c in (response.get("citations") or [])
+        if isinstance(c, dict) and str(c.get("citation_id") or "").strip() in by_id
+    ]
 
     # For a deterministic structured procedure response, preserve the exact
     # manifest used to build answer/answer_html. Do not re-rank it against the
