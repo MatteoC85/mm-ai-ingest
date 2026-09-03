@@ -137,6 +137,9 @@ from machinemind.ingest import text_pdf as _ingest_text_pdf
 from machinemind.ingest import pdf_cleaning_chunking as _ingest_pdf_cleaning_chunking
 from machinemind.ingest import xlsx as _ingest_xlsx
 from machinemind.ingest import dispatch as _ingest_dispatch
+from machinemind.ingest import persistence as _ingest_persistence
+from machinemind.ingest import metering as _ingest_metering
+from machinemind.ingest import orchestration as _ingest_orchestration
 
 
 _RESPONSE_PRESENTATION_RUNTIME = lambda: _presentation_responses.ResponsePresentationRuntime(
@@ -167,6 +170,133 @@ _RESPONSE_PRESENTATION_RUNTIME = lambda: _presentation_responses.ResponsePresent
     ask_ui_structured_max_citations=ASK_UI_STRUCTURED_MAX_CITATIONS,
     ask_ui_structured_max_links=ASK_UI_STRUCTURED_MAX_LINKS,
 )
+
+_INGEST_PERSISTENCE_RUNTIME = lambda: _ingest_persistence.IngestPersistenceRuntime(
+    connect_db=_db_conn,
+    dumps_json=json.dumps,
+    loads_json=json.loads,
+)
+
+
+_INGEST_METERING_RUNTIME = lambda: _ingest_metering.IngestMeteringRuntime(
+    connect_db=_db_conn,
+    state_globals=globals(),
+    ledger_auto_ddl=INGEST_LEDGER_AUTO_DDL,
+    processing_stale_seconds=INGEST_PROCESSING_STALE_SECONDS,
+    credits_per_usd=INGEST_CREDITS_PER_USD,
+    embed_input_price_usd_per_million=INGEST_PRICE_EMBED_INPUT_USD_PER_MILLION,
+    embed_model=OPENAI_EMBED_MODEL,
+    pricing_version=INGEST_PRICING_VERSION,
+    metering_version=INGEST_METERING_VERSION,
+    ai_internal_secret=AI_INTERNAL_SECRET,
+    normalize_month_key_fn=_normalize_ingest_month_key,
+    credits_for_cost_fn=_ingest_credits_for_cost,
+    ledger_bootstrap_fn=_ingest_ledger_bootstrap,
+    event_snapshot_fn=_ingest_event_snapshot,
+    build_usage_event_id_fn=_build_ingest_usage_event_id,
+    prepare_event_fn=_ingest_prepare_event,
+    claim_event_fn=_ingest_claim_event,
+    finalize_event_fn=_ingest_finalize_event,
+    month_usage_fn=_ingest_month_usage,
+    public_fields_fn=_ingest_public_fields,
+    json_dumps_fn=json.dumps,
+    log_fn=globals().get("print", print),
+)
+
+
+_DOCUMENT_INGEST_RUNTIME = lambda: _ingest_orchestration.DocumentIngestRuntime(
+    ai_internal_secret=AI_INTERNAL_SECRET,
+    http_exception_cls=HTTPException,
+    normalize_ai_scope=_normalize_ai_scope,
+    normalize_month_key=_normalize_ingest_month_key,
+    decimal_value=_ingest_decimal,
+    month_usage=_ingest_month_usage,
+    load_document_file=_load_ingest_document_file,
+    effective_request_key=_effective_ingest_request_key,
+    build_usage_event_id=_build_ingest_usage_event_id,
+    upsert_document_file=_db_upsert_document_file,
+    detect_source_file_type=_ingest_dispatch.detect_ingest_source_file_type,
+    looks_like_xlsx_document=_looks_like_xlsx_document,
+    extract_pdf_pages=_extract_pages_with_layout_blocks,
+    detect_repeated_headers_footers=_detect_repeated_headers_footers,
+    upsert_cleaning_meta=_db_upsert_cleaning_meta,
+    remove_headers_footers_from_page=_remove_headers_footers_from_page,
+    reflow_paragraphs=_reflow_paragraphs_conservative,
+    maybe_remove_toc=_maybe_remove_toc,
+    extract_xlsx_pages=_extract_xlsx_sheets_as_pages,
+    xlsx_error_cls=XlsxIngestError,
+    replace_document_pages=lambda **kwargs: _ingest_persistence.replace_document_pages(
+        **kwargs,
+        schema_qualified=False,
+        runtime=_INGEST_PERSISTENCE_RUNTIME(),
+    ),
+    invalidate_company_knowledge=_v13_invalidate_company_knowledge,
+    prepare_event=_ingest_prepare_event,
+    enqueue_index_task=_enqueue_document_index_task,
+    max_pdf_bytes=MAX_PDF_BYTES,
+    max_xlsx_bytes=MAX_XLSX_BYTES,
+    min_page_chars=MIN_PAGE_CHARS,
+    min_text_chars_short=MIN_TEXT_CHARS_SHORT,
+    min_text_chars=MIN_TEXT_CHARS,
+    min_pages_with_text_abs=MIN_PAGES_WITH_TEXT_ABS,
+    min_pages_with_text_pct=MIN_PAGES_WITH_TEXT_PCT,
+    xlsx_ingest_enabled=XLSX_INGEST_ENABLED,
+    xlsx_min_text_chars=XLSX_MIN_TEXT_CHARS,
+    chunk_target_chars=CHUNK_TARGET_CHARS,
+    chunk_overlap_chars=CHUNK_OVERLAP_CHARS,
+    pricing_version=INGEST_PRICING_VERSION,
+    metering_version=INGEST_METERING_VERSION,
+    sha256_fn=hashlib.sha256,
+    ceil_fn=math.ceil,
+    log_fn=globals().get("print", print),
+)
+
+
+_STRUCTURED_INGEST_RUNTIME = lambda: _ingest_orchestration.StructuredIngestRuntime(
+    ai_internal_secret=AI_INTERNAL_SECRET,
+    http_exception_cls=HTTPException,
+    normalize_source_type=_normalize_structured_source_type,
+    build_source_key=_build_structured_source_key,
+    compose_source_text=_compose_structured_source_text,
+    estimate_storage_bytes=_estimate_index_storage_bytes_for_text,
+    get_index_usage=_db_get_index_usage,
+    replace_document_pages=lambda **kwargs: _ingest_persistence.replace_document_pages(
+        **kwargs,
+        schema_qualified=True,
+        runtime=_INGEST_PERSISTENCE_RUNTIME(),
+    ),
+    invalidate_company_knowledge=_v13_invalidate_company_knowledge,
+    upsert_document_file=_db_upsert_document_file,
+    index_request_cls=IndexDocumentRequest,
+    index_document=index_document,
+    parent_procedure_source_key=_parent_procedure_source_key,
+    upsert_structured_relation=_db_upsert_structured_source_relation,
+)
+
+
+_INDEX_DOCUMENT_RUNTIME = lambda: _ingest_orchestration.IndexDocumentRuntime(
+    ai_internal_secret=AI_INTERNAL_SECRET,
+    http_exception_cls=HTTPException,
+    normalize_ai_scope=_normalize_ai_scope,
+    get_cleaning_meta=_db_get_cleaning_meta,
+    connect_db=_db_conn,
+    is_xlsx_page_text=_ingest_xlsx.is_xlsx_page_text,
+    chunk_xlsx_pages=_ingest_xlsx.chunk_xlsx_pages,
+    chunk_sentences_with_pages=_chunk_sentences_with_pages,
+    is_structured_source_key=_is_structured_source_key,
+    collapse_structured_chunks=_collapse_structured_chunks,
+    strip_hf_from_chunk_text=_strip_hf_from_chunk_text,
+    get_table_columns=_get_table_columns,
+    embed_texts=_openai_embed_texts,
+    vector_literal=_vector_literal,
+    invalidate_company_knowledge=_v13_invalidate_company_knowledge,
+    chunk_target_chars=CHUNK_TARGET_CHARS,
+    chunk_overlap_chars=CHUNK_OVERLAP_CHARS,
+    chunk_min_chars=CHUNK_MIN_CHARS,
+    embed_model=OPENAI_EMBED_MODEL,
+    search_text_fn=re.search,
+)
+
 
 def _fetch_dense_chunk_candidates(
     *,
@@ -386,27 +516,12 @@ def _get_table_columns(cur, table_name: str) -> set[str]:
 
 
 def _db_upsert_document_file(company_id: str, bubble_document_id: str, file_url: str) -> None:
-    company_id = (company_id or "").strip()
-    bubble_document_id = (bubble_document_id or "").strip()
-    file_url = (file_url or "").strip()
-    if not (company_id and bubble_document_id and file_url):
-        return
-
-    conn = _db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO public.document_files(company_id, bubble_document_id, file_url, updated_at)
-                VALUES (%s, %s, %s, NOW())
-                ON CONFLICT (company_id, bubble_document_id)
-                DO UPDATE SET file_url = EXCLUDED.file_url, updated_at = NOW();
-                """,
-                (company_id, bubble_document_id, file_url),
-            )
-        conn.commit()
-    finally:
-        conn.close()
+    return _ingest_persistence.upsert_document_file(
+        company_id,
+        bubble_document_id,
+        file_url,
+        runtime=_INGEST_PERSISTENCE_RUNTIME(),
+    )
 
 
 def _db_upsert_cleaning_meta(
@@ -415,133 +530,28 @@ def _db_upsert_cleaning_meta(
     header_norm: set[str],
     footer_norm: set[str],
 ) -> None:
-    company_id = (company_id or "").strip()
-    bubble_document_id = (bubble_document_id or "").strip()
-    if not (company_id and bubble_document_id):
-        return
-
-    header_list = sorted([x for x in (header_norm or set()) if x])
-    footer_list = sorted([x for x in (footer_norm or set()) if x])
-
-    conn = _db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO public.document_cleaning_meta(company_id, bubble_document_id, header_norm, footer_norm, updated_at)
-                VALUES (%s, %s, %s::jsonb, %s::jsonb, NOW())
-                ON CONFLICT (company_id, bubble_document_id)
-                DO UPDATE SET header_norm = EXCLUDED.header_norm,
-                              footer_norm = EXCLUDED.footer_norm,
-                              updated_at = NOW();
-                """,
-                (company_id, bubble_document_id, json.dumps(header_list), json.dumps(footer_list)),
-            )
-        conn.commit()
-    finally:
-        conn.close()
+    return _ingest_persistence.upsert_cleaning_meta(
+        company_id,
+        bubble_document_id,
+        header_norm,
+        footer_norm,
+        runtime=_INGEST_PERSISTENCE_RUNTIME(),
+    )
 
 
 def _db_get_cleaning_meta(company_id: str, bubble_document_id: str) -> tuple[set[str], set[str]]:
-    company_id = (company_id or "").strip()
-    bubble_document_id = (bubble_document_id or "").strip()
-    if not (company_id and bubble_document_id):
-        return set(), set()
-
-    conn = _db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT header_norm, footer_norm
-                FROM public.document_cleaning_meta
-                WHERE company_id=%s AND bubble_document_id=%s
-                LIMIT 1;
-                """,
-                (company_id, bubble_document_id),
-            )
-            row = cur.fetchone()
-            if not row:
-                return set(), set()
-
-            h, f = row
-            if isinstance(h, str):
-                h = json.loads(h or "[]")
-            if isinstance(f, str):
-                f = json.loads(f or "[]")
-
-            header_set = {str(x) for x in (h or []) if x}
-            footer_set = {str(x) for x in (f or []) if x}
-            return header_set, footer_set
-    finally:
-        conn.close()
+    return _ingest_persistence.get_cleaning_meta(
+        company_id,
+        bubble_document_id,
+        runtime=_INGEST_PERSISTENCE_RUNTIME(),
+    )
 
 def _db_get_index_usage(company_id: str, bubble_document_id: Optional[str] = None) -> dict:
-    company_id = (company_id or "").strip()
-    bubble_document_id = (bubble_document_id or "").strip() if bubble_document_id else None
-
-    if not company_id:
-        return {
-            "text_chars": 0,
-            "chunk_count": 0,
-            "est_storage_bytes": 0,
-        }
-
-    conn = _db_conn()
-    try:
-        with conn.cursor() as cur:
-            if bubble_document_id:
-                cur.execute(
-                    """
-                    SELECT COALESCE(SUM(text_chars), 0)
-                    FROM public.document_pages
-                    WHERE company_id=%s
-                      AND bubble_document_id=%s;
-                    """,
-                    (company_id, bubble_document_id),
-                )
-                text_chars = int(cur.fetchone()[0] or 0)
-
-                cur.execute(
-                    """
-                    SELECT COUNT(*)
-                    FROM public.document_chunks
-                    WHERE company_id=%s
-                      AND bubble_document_id=%s;
-                    """,
-                    (company_id, bubble_document_id),
-                )
-                chunk_count = int(cur.fetchone()[0] or 0)
-            else:
-                cur.execute(
-                    """
-                    SELECT COALESCE(SUM(text_chars), 0)
-                    FROM public.document_pages
-                    WHERE company_id=%s;
-                    """,
-                    (company_id,),
-                )
-                text_chars = int(cur.fetchone()[0] or 0)
-
-                cur.execute(
-                    """
-                    SELECT COUNT(*)
-                    FROM public.document_chunks
-                    WHERE company_id=%s;
-                    """,
-                    (company_id,),
-                )
-                chunk_count = int(cur.fetchone()[0] or 0)
-
-        est_storage_bytes = int(text_chars * 3 + chunk_count * 2000)
-
-        return {
-            "text_chars": text_chars,
-            "chunk_count": chunk_count,
-            "est_storage_bytes": est_storage_bytes,
-        }
-    finally:
-        conn.close()
+    return _ingest_persistence.get_index_usage(
+        company_id,
+        bubble_document_id,
+        runtime=_INGEST_PERSISTENCE_RUNTIME(),
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -555,17 +565,11 @@ _INGEST_METER_CTX = contextvars.ContextVar("machinemind_ingest_meter", default=N
 
 
 def _ingest_decimal(value: Any, default: str = "0") -> Decimal:
-    try:
-        return Decimal(str(value if value is not None else default))
-    except (InvalidOperation, ValueError, TypeError):
-        return Decimal(default)
+    return _ingest_metering.ingest_decimal(value, default)
 
 
 def _normalize_ingest_month_key(value: Any) -> str:
-    raw = str(value or "").strip()
-    if re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", raw):
-        return raw
-    return datetime.now(timezone.utc).strftime("%Y-%m")
+    return _ingest_metering.normalize_ingest_month_key(value)
 
 
 def _effective_ingest_request_key(
@@ -575,97 +579,33 @@ def _effective_ingest_request_key(
     requested_key: Any,
     file_sha256: str = "",
 ) -> str:
-    base = str(requested_key or "").strip() or str(bubble_document_id or "").strip()
-    if file_sha256:
-        # Same Document + same file is idempotent; changing the file creates a new event.
-        base = f"{base}:{file_sha256[:24]}"
-    return base or hashlib.sha256(str(company_id or "").encode("utf-8")).hexdigest()[:24]
+    return _ingest_metering.effective_ingest_request_key(
+        company_id=company_id,
+        bubble_document_id=bubble_document_id,
+        requested_key=requested_key,
+        file_sha256=file_sha256,
+    )
 
 
 def _build_ingest_usage_event_id(company_id: str, month_key: str, request_key: str) -> str:
-    raw = f"{company_id}\n{month_key}\n{request_key}".encode("utf-8")
-    return "ingest_" + hashlib.sha256(raw).hexdigest()[:32]
+    return _ingest_metering.build_ingest_usage_event_id(
+        company_id,
+        month_key,
+        request_key,
+    )
 
 
 def _ingest_credits_for_cost(cost_usd: Decimal) -> Decimal:
-    credits = max(Decimal("0"), cost_usd) * max(Decimal("0"), INGEST_CREDITS_PER_USD)
-    return credits.quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
+    return _ingest_metering.ingest_credits_for_cost(
+        cost_usd,
+        runtime=_INGEST_METERING_RUNTIME(),
+    )
 
 
 def _ingest_ledger_bootstrap() -> bool:
-    global _INGEST_LEDGER_READY, _INGEST_LEDGER_ERROR
-
-    if _INGEST_LEDGER_READY is True:
-        return True
-
-    with _INGEST_LEDGER_LOCK:
-        if _INGEST_LEDGER_READY is True:
-            return True
-        if not INGEST_LEDGER_AUTO_DDL:
-            _INGEST_LEDGER_READY = True
-            return True
-
-        conn = None
-        try:
-            conn = _db_conn()
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS public.mm_ingest_usage_events (
-                        usage_event_id TEXT PRIMARY KEY,
-                        request_key TEXT NOT NULL,
-                        company_id TEXT NOT NULL,
-                        bubble_document_id TEXT NOT NULL,
-                        month_key TEXT NOT NULL,
-                        status TEXT NOT NULL DEFAULT 'queued',
-                        embedding_model TEXT NOT NULL DEFAULT '',
-                        embedding_calls BIGINT NOT NULL DEFAULT 0,
-                        embedding_input_tokens BIGINT NOT NULL DEFAULT 0,
-                        actual_cost_usd NUMERIC(20, 10) NOT NULL DEFAULT 0,
-                        ingest_credits NUMERIC(20, 6) NOT NULL DEFAULT 0,
-                        pricing_version TEXT NOT NULL DEFAULT '',
-                        metering_version TEXT NOT NULL DEFAULT '',
-                        usage_json JSONB NOT NULL DEFAULT '{}'::jsonb,
-                        attempt_count INTEGER NOT NULL DEFAULT 0,
-                        last_error TEXT NOT NULL DEFAULT '',
-                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                        completed_at TIMESTAMPTZ
-                    );
-                    """
-                )
-                cur.execute(
-                    """
-                    CREATE INDEX IF NOT EXISTS idx_mm_ingest_usage_company_month
-                    ON public.mm_ingest_usage_events(company_id, month_key, updated_at);
-                    """
-                )
-                cur.execute(
-                    """
-                    CREATE UNIQUE INDEX IF NOT EXISTS uq_mm_ingest_usage_request_month
-                    ON public.mm_ingest_usage_events(company_id, month_key, request_key);
-                    """
-                )
-            conn.commit()
-            _INGEST_LEDGER_READY = True
-            _INGEST_LEDGER_ERROR = ""
-            return True
-        except Exception as exc:
-            if conn is not None:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-            _INGEST_LEDGER_READY = False
-            _INGEST_LEDGER_ERROR = str(exc)[:1000]
-            print("INGEST_LEDGER_BOOTSTRAP_FAIL_OPEN", _INGEST_LEDGER_ERROR)
-            return False
-        finally:
-            if conn is not None:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+    return _ingest_metering.ledger_bootstrap(
+        runtime=_INGEST_METERING_RUNTIME(),
+    )
 
 
 def _ingest_prepare_event(
@@ -676,150 +616,28 @@ def _ingest_prepare_event(
     bubble_document_id: str,
     month_key: str,
 ) -> bool:
-    if not _ingest_ledger_bootstrap():
-        return False
-    conn = None
-    try:
-        conn = _db_conn()
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO public.mm_ingest_usage_events(
-                    usage_event_id, request_key, company_id, bubble_document_id,
-                    month_key, status, pricing_version, metering_version
-                )
-                VALUES (%s, %s, %s, %s, %s, 'queued', %s, %s)
-                ON CONFLICT (usage_event_id) DO NOTHING;
-                """,
-                (
-                    usage_event_id,
-                    request_key,
-                    company_id,
-                    bubble_document_id,
-                    month_key,
-                    INGEST_PRICING_VERSION,
-                    INGEST_METERING_VERSION,
-                ),
-            )
-        conn.commit()
-        return True
-    except Exception as exc:
-        if conn is not None:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-        print("INGEST_LEDGER_PREPARE_FAIL_OPEN", str(exc)[:700])
-        return False
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
+    return _ingest_metering.prepare_event(
+        usage_event_id=usage_event_id,
+        request_key=request_key,
+        company_id=company_id,
+        bubble_document_id=bubble_document_id,
+        month_key=month_key,
+        runtime=_INGEST_METERING_RUNTIME(),
+    )
 
 
 def _ingest_event_snapshot(usage_event_id: str) -> Optional[dict]:
-    if not usage_event_id or not _ingest_ledger_bootstrap():
-        return None
-    conn = None
-    try:
-        conn = _db_conn()
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT status, embedding_model, embedding_calls,
-                       embedding_input_tokens, actual_cost_usd, ingest_credits,
-                       pricing_version, metering_version, usage_json,
-                       request_key, company_id, bubble_document_id, month_key,
-                       attempt_count, updated_at
-                FROM public.mm_ingest_usage_events
-                WHERE usage_event_id=%s
-                LIMIT 1;
-                """,
-                (usage_event_id,),
-            )
-            row = cur.fetchone()
-        if not row:
-            return None
-        return {
-            "usage_event_id": usage_event_id,
-            "status": str(row[0] or ""),
-            "embedding_model": str(row[1] or ""),
-            "embedding_calls": int(row[2] or 0),
-            "embedding_input_tokens": int(row[3] or 0),
-            "actual_cost_usd": float(row[4] or 0),
-            "ingest_credits": float(row[5] or 0),
-            "pricing_version": str(row[6] or ""),
-            "metering_version": str(row[7] or ""),
-            "usage_json": row[8] if isinstance(row[8], dict) else {},
-            "request_key": str(row[9] or ""),
-            "company_id": str(row[10] or ""),
-            "bubble_document_id": str(row[11] or ""),
-            "month_key": str(row[12] or ""),
-            "attempt_count": int(row[13] or 0),
-            "updated_at": row[14],
-        }
-    except Exception as exc:
-        print("INGEST_LEDGER_SNAPSHOT_FAIL_OPEN", str(exc)[:700])
-        return None
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
+    return _ingest_metering.event_snapshot(
+        usage_event_id,
+        runtime=_INGEST_METERING_RUNTIME(),
+    )
 
 
 def _ingest_claim_event(usage_event_id: str) -> tuple[str, Optional[dict]]:
-    """Return claimed/completed/processing/unavailable and the current snapshot."""
-    if not usage_event_id or not _ingest_ledger_bootstrap():
-        return "unavailable", None
-    conn = None
-    try:
-        conn = _db_conn()
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE public.mm_ingest_usage_events
-                SET status='processing',
-                    attempt_count=attempt_count + 1,
-                    updated_at=NOW(),
-                    last_error=''
-                WHERE usage_event_id=%s
-                  AND status <> 'completed'
-                  AND (
-                      status <> 'processing'
-                      OR updated_at < NOW() - (%s * INTERVAL '1 second')
-                  )
-                RETURNING usage_event_id;
-                """,
-                (usage_event_id, int(INGEST_PROCESSING_STALE_SECONDS)),
-            )
-            claimed = cur.fetchone()
-        conn.commit()
-        if claimed:
-            return "claimed", _ingest_event_snapshot(usage_event_id)
-        snap = _ingest_event_snapshot(usage_event_id)
-        if snap and snap.get("status") == "completed":
-            return "completed", snap
-        if snap and snap.get("status") == "processing":
-            return "processing", snap
-        return "unavailable", snap
-    except Exception as exc:
-        if conn is not None:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-        print("INGEST_LEDGER_CLAIM_FAIL_OPEN", str(exc)[:700])
-        return "unavailable", None
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
+    return _ingest_metering.claim_event(
+        usage_event_id,
+        runtime=_INGEST_METERING_RUNTIME(),
+    )
 
 
 class _IngestUsageMeter:
@@ -832,53 +650,38 @@ class _IngestUsageMeter:
         bubble_document_id: str,
         month_key: str,
     ):
-        self.usage_event_id = usage_event_id
-        self.request_key = request_key
-        self.company_id = company_id
-        self.bubble_document_id = bubble_document_id
-        self.month_key = month_key
-        self.embedding_calls = 0
-        self.embedding_input_tokens = 0
-        self.embedding_cost_usd = Decimal("0")
-        self.provider_usage_calls = 0
-        self.fallback_usage_calls = 0
+        _ingest_metering.initialize_meter_state(
+            self,
+            usage_event_id=usage_event_id,
+            request_key=request_key,
+            company_id=company_id,
+            bubble_document_id=bubble_document_id,
+            month_key=month_key,
+        )
 
     def record_embedding(self, *, input_tokens: int, usage_source: str) -> None:
-        tokens = max(0, int(input_tokens or 0))
-        self.embedding_calls += 1
-        self.embedding_input_tokens += tokens
-        if usage_source == "provider_usage":
-            self.provider_usage_calls += 1
-        else:
-            self.fallback_usage_calls += 1
-        self.embedding_cost_usd += (
-            Decimal(tokens) * INGEST_PRICE_EMBED_INPUT_USD_PER_MILLION
-        ) / Decimal("1000000")
+        return _ingest_metering.record_meter_embedding(
+            self,
+            input_tokens=input_tokens,
+            usage_source=usage_source,
+            runtime=_INGEST_METERING_RUNTIME(),
+        )
 
     def usage_dict(self) -> dict:
-        cost = self.embedding_cost_usd.quantize(Decimal("0.0000000001"), rounding=ROUND_HALF_UP)
-        credits = _ingest_credits_for_cost(cost)
-        return {
-            "embedding_model": OPENAI_EMBED_MODEL,
-            "embedding_calls": self.embedding_calls,
-            "embedding_input_tokens": self.embedding_input_tokens,
-            "provider_usage_calls": self.provider_usage_calls,
-            "fallback_usage_calls": self.fallback_usage_calls,
-            "embedding_cost_usd": float(cost),
-            "ingest_credits": float(credits),
-        }
+        return _ingest_metering.meter_usage_dict(
+            self,
+            runtime=_INGEST_METERING_RUNTIME(),
+        )
 
     def metering_status(self) -> str:
-        if self.embedding_calls <= 0:
-            return "measured_zero_cost"
-        if self.fallback_usage_calls > 0:
-            return "estimated_partial"
-        return "measured"
+        return _ingest_metering.meter_status(self)
 
 
 def _current_ingest_meter() -> Optional[_IngestUsageMeter]:
-    value = _INGEST_METER_CTX.get()
-    return value if isinstance(value, _IngestUsageMeter) else None
+    return _ingest_metering.current_ingest_meter(
+        runtime=_INGEST_METERING_RUNTIME(),
+        meter_type=_IngestUsageMeter,
+    )
 
 
 def _ingest_finalize_event(
@@ -887,117 +690,20 @@ def _ingest_finalize_event(
     status: str,
     error_text: str = "",
 ) -> Optional[dict]:
-    usage = meter.usage_dict()
-    if not _ingest_ledger_bootstrap():
-        return None
-
-    attempt_cost = _ingest_decimal(usage.get("embedding_cost_usd"))
-    attempt_credits = _ingest_decimal(usage.get("ingest_credits"))
-    conn = None
-    try:
-        conn = _db_conn()
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE public.mm_ingest_usage_events
-                SET status=%s,
-                    embedding_model=%s,
-                    embedding_calls=embedding_calls + %s,
-                    embedding_input_tokens=embedding_input_tokens + %s,
-                    actual_cost_usd=actual_cost_usd + %s,
-                    ingest_credits=ingest_credits + %s,
-                    pricing_version=%s,
-                    metering_version=%s,
-                    usage_json=%s::jsonb,
-                    last_error=%s,
-                    updated_at=NOW(),
-                    completed_at=CASE WHEN %s='completed' THEN NOW() ELSE completed_at END
-                WHERE usage_event_id=%s;
-                """,
-                (
-                    status,
-                    OPENAI_EMBED_MODEL,
-                    int(usage.get("embedding_calls") or 0),
-                    int(usage.get("embedding_input_tokens") or 0),
-                    str(attempt_cost),
-                    str(attempt_credits),
-                    INGEST_PRICING_VERSION,
-                    INGEST_METERING_VERSION,
-                    json.dumps(usage, ensure_ascii=False),
-                    str(error_text or "")[:1800],
-                    status,
-                    meter.usage_event_id,
-                ),
-            )
-        conn.commit()
-        return _ingest_event_snapshot(meter.usage_event_id)
-    except Exception as exc:
-        if conn is not None:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-        print("INGEST_LEDGER_FINALIZE_FAIL_OPEN", str(exc)[:700])
-        return None
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
+    return _ingest_metering.finalize_event(
+        meter,
+        status=status,
+        error_text=error_text,
+        runtime=_INGEST_METERING_RUNTIME(),
+    )
 
 
 def _ingest_month_usage(company_id: str, month_key: str) -> dict:
-    month_key = _normalize_ingest_month_key(month_key)
-    if not _ingest_ledger_bootstrap():
-        return {
-            "company_id": company_id,
-            "month_key": month_key,
-            "ingest_credits_used_month": 0.0,
-            "embedding_input_tokens_total": 0,
-            "ledger_available": False,
-            "ledger_error": _INGEST_LEDGER_ERROR,
-        }
-    conn = None
-    try:
-        conn = _db_conn()
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT COALESCE(SUM(ingest_credits), 0),
-                       COALESCE(SUM(embedding_input_tokens), 0),
-                       MAX(updated_at)
-                FROM public.mm_ingest_usage_events
-                WHERE company_id=%s AND month_key=%s;
-                """,
-                (company_id, month_key),
-            )
-            row = cur.fetchone() or (0, 0, None)
-        return {
-            "company_id": company_id,
-            "month_key": month_key,
-            "ingest_credits_used_month": float(row[0] or 0),
-            "embedding_input_tokens_total": int(row[1] or 0),
-            "updated_at": row[2].isoformat() if row[2] is not None else None,
-            "ledger_available": True,
-            "ledger_error": "",
-        }
-    except Exception as exc:
-        print("INGEST_LEDGER_MONTH_FAIL_OPEN", str(exc)[:700])
-        return {
-            "company_id": company_id,
-            "month_key": month_key,
-            "ingest_credits_used_month": 0.0,
-            "embedding_input_tokens_total": 0,
-            "ledger_available": False,
-            "ledger_error": str(exc)[:700],
-        }
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
+    return _ingest_metering.month_usage(
+        company_id,
+        month_key,
+        runtime=_INGEST_METERING_RUNTIME(),
+    )
 
 
 def _ingest_public_fields(
@@ -1007,166 +713,21 @@ def _ingest_public_fields(
     month_usage: Optional[dict],
     status_override: str = "",
 ) -> dict:
-    snap = event_snapshot or {}
-    usage = dict(snap.get("usage_json") or {})
-    if meter is not None and not usage:
-        usage = meter.usage_dict()
-
-    actual_credits = float(
-        snap.get("ingest_credits")
-        if snap.get("ingest_credits") is not None
-        else usage.get("ingest_credits") or 0
+    return _ingest_metering.public_fields(
+        meter=meter,
+        event_snapshot=event_snapshot,
+        month_usage_value=month_usage,
+        status_override=status_override,
+        runtime=_INGEST_METERING_RUNTIME(),
     )
-    status = status_override or (
-        meter.metering_status() if meter is not None else str(snap.get("status") or "unknown")
-    )
-    return {
-        "request_key": str(snap.get("request_key") or (meter.request_key if meter else "")),
-        "ingest_request_key": str(snap.get("request_key") or (meter.request_key if meter else "")),
-        "ingest_usage_event_id": str(
-            (meter.usage_event_id if meter else "") or snap.get("usage_event_id") or ""
-        ),
-        "ingest_month_key": str(snap.get("month_key") or (meter.month_key if meter else "")),
-        "ingest_credits_actual": actual_credits,
-        "ingest_credits_used_month": float(
-            (month_usage or {}).get("ingest_credits_used_month") or 0
-        ),
-        "ingest_pricing_version": str(snap.get("pricing_version") or INGEST_PRICING_VERSION),
-        "ingest_metering_status": status,
-        "ingest_metering_version": INGEST_METERING_VERSION,
-        "ingest_usage": usage,
-    }
 
 
 def _meter_index_document(func):
-    @functools.wraps(func)
-    def wrapped(
-        payload: IndexDocumentRequest,
-        x_ai_internal_secret: Optional[str] = Header(default=None),
-    ):
-        # Structured Bubble sources (procedures, steps, P&S, photos/videos) also reuse
-        # /index/document, but the new monthly quota applies only to uploaded Documents.
-        if not bool(payload.ingest_metering_enabled):
-            return func(payload, x_ai_internal_secret)
-
-        # Authentication remains owned by the original route. Do not create usage rows
-        # for unauthenticated calls.
-        if not AI_INTERNAL_SECRET or (x_ai_internal_secret or "").strip() != AI_INTERNAL_SECRET:
-            return func(payload, x_ai_internal_secret)
-
-        company_id = str(payload.company_id or "").strip()
-        bubble_document_id = str(payload.bubble_document_id or "").strip()
-        month_key = _normalize_ingest_month_key(payload.ingest_month_key)
-        request_key = str(
-            payload.ingest_request_key or payload.trace_id or bubble_document_id
-        ).strip()
-        usage_event_id = str(payload.ingest_usage_event_id or "").strip() or (
-            _build_ingest_usage_event_id(company_id, month_key, request_key)
-        )
-
-        _ingest_prepare_event(
-            usage_event_id=usage_event_id,
-            request_key=request_key,
-            company_id=company_id,
-            bubble_document_id=bubble_document_id,
-            month_key=month_key,
-        )
-        claim_status, existing = _ingest_claim_event(usage_event_id)
-
-        if claim_status == "completed":
-            month_usage = _ingest_month_usage(company_id, month_key)
-            return {
-                "ok": True,
-                "status": "indexed",
-                "company_id": company_id,
-                "machine_id": str(payload.machine_id or ""),
-                "bubble_document_id": bubble_document_id,
-                "trace_id": payload.trace_id,
-                "deduplicated": True,
-                **_ingest_public_fields(
-                    meter=None,
-                    event_snapshot=existing,
-                    month_usage=month_usage,
-                    status_override="measured_deduplicated",
-                ),
-            }
-
-        if claim_status == "processing":
-            month_usage = _ingest_month_usage(company_id, month_key)
-            return {
-                "ok": True,
-                "status": "processing",
-                "company_id": company_id,
-                "machine_id": str(payload.machine_id or ""),
-                "bubble_document_id": bubble_document_id,
-                "trace_id": payload.trace_id,
-                "deduplicated": True,
-                **_ingest_public_fields(
-                    meter=None,
-                    event_snapshot=existing,
-                    month_usage=month_usage,
-                    status_override="already_processing",
-                ),
-            }
-
-        meter = _IngestUsageMeter(
-            usage_event_id=usage_event_id,
-            request_key=request_key,
-            company_id=company_id,
-            bubble_document_id=bubble_document_id,
-            month_key=month_key,
-        )
-        ctx_token = _INGEST_METER_CTX.set(meter)
-
-        try:
-            result = func(payload, x_ai_internal_secret)
-        except Exception as exc:
-            _INGEST_METER_CTX.reset(ctx_token)
-            snapshot = _ingest_finalize_event(meter, status="error", error_text=str(exc))
-            month_usage = _ingest_month_usage(company_id, month_key)
-            print(
-                "INGEST_METER_FINAL_ERROR",
-                json.dumps(
-                    _ingest_public_fields(
-                        meter=meter,
-                        event_snapshot=snapshot,
-                        month_usage=month_usage,
-                    ),
-                    ensure_ascii=False,
-                ),
-            )
-            raise
-
-        _INGEST_METER_CTX.reset(ctx_token)
-        final_status = "completed" if isinstance(result, dict) and result.get("ok") is True else "error"
-        snapshot = _ingest_finalize_event(
-            meter,
-            status=final_status,
-            error_text="" if final_status == "completed" else str((result or {}).get("error") or "index failed"),
-        )
-        month_usage = _ingest_month_usage(company_id, month_key)
-        if isinstance(result, dict):
-            result.update(
-                _ingest_public_fields(
-                    meter=meter,
-                    event_snapshot=snapshot,
-                    month_usage=month_usage,
-                )
-            )
-        print(
-            "INGEST_METER_FINAL",
-            json.dumps(
-                _ingest_public_fields(
-                    meter=meter,
-                    event_snapshot=snapshot,
-                    month_usage=month_usage,
-                ),
-                ensure_ascii=False,
-            ),
-        )
-        return result
-
-    return wrapped
+    return _ingest_metering.meter_index_document(
+        func,
+        runtime_factory=_INGEST_METERING_RUNTIME,
+        meter_cls=_IngestUsageMeter,
+    )
 
 
 def _fetch_document_file_map(company_id: str, doc_ids: list[str]) -> dict[str, str]:
@@ -13716,26 +13277,12 @@ def ingest_usage_month(
     payload: IngestUsageMonthRequest,
     x_ai_internal_secret: Optional[str] = Header(default=None),
 ):
-    if not AI_INTERNAL_SECRET:
-        raise HTTPException(status_code=500, detail="AI_INTERNAL_SECRET missing")
-    if (x_ai_internal_secret or "").strip() != AI_INTERNAL_SECRET:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    company_id = str(payload.company_id or "").strip()
-    if not company_id:
-        raise HTTPException(status_code=400, detail="Missing company_id")
-
-    usage = _ingest_month_usage(
-        company_id=company_id,
-        month_key=_normalize_ingest_month_key(payload.month_key),
+    return _ingest_metering.usage_month_endpoint(
+        payload,
+        x_ai_internal_secret,
+        runtime=_INGEST_METERING_RUNTIME(),
+        http_exception_cls=HTTPException,
     )
-    return {
-        "ok": True,
-        "status": "ok",
-        **usage,
-        "ingest_pricing_version": INGEST_PRICING_VERSION,
-        "ingest_metering_version": INGEST_METERING_VERSION,
-    }
 
 
 @app.get("/version")
@@ -13931,374 +13478,11 @@ def ingest_document(
     payload: IngestRequest,
     x_ai_internal_secret: Optional[str] = Header(default=None),
 ):
-    if not AI_INTERNAL_SECRET:
-        raise HTTPException(status_code=500, detail="AI_INTERNAL_SECRET missing")
-    if (x_ai_internal_secret or "").strip() != AI_INTERNAL_SECRET:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    company_id = (payload.company_id or "").strip()
-    machine_id = (payload.machine_id or "").strip()
-    bubble_document_id = (payload.bubble_document_id or "").strip()
-
-    ingest_scope = _normalize_ai_scope(payload.ai_scope)
-    if ingest_scope == "document_ids":
-        ingest_scope = "machine_all"
-
-    if ingest_scope == "company_general":
-        machine_id = ""
-    elif not machine_id:
-        raise HTTPException(status_code=400, detail="Missing machine_id")
-
-    if not (company_id and bubble_document_id):
-        raise HTTPException(status_code=400, detail="Missing company_id/bubble_document_id")
-
-    # Authoritative post-threshold rule. The current document is admitted whenever the
-    # completed monthly total is still below the plan limit; it may push the total over.
-    # Once the stored total is already at/over the limit, the next document is rejected
-    # before parsing, chunking or any paid OpenAI call.
-    ingest_month_key_pre = _normalize_ingest_month_key(payload.ingest_month_key)
-    ingest_limit = max(Decimal("0"), _ingest_decimal(payload.ingest_credits_limit_month))
-    ingest_enforced = bool(payload.ingest_credits_enforced)
-    ingest_already_admitted = bool(payload.ingest_request_already_admitted)
-    if ingest_enforced and ingest_limit > 0 and not ingest_already_admitted:
-        usage_before = _ingest_month_usage(company_id, ingest_month_key_pre)
-        used_before = _ingest_decimal(usage_before.get("ingest_credits_used_month"))
-        if bool(usage_before.get("ledger_available")) and used_before >= ingest_limit:
-            request_key_pre = str(
-                payload.ingest_request_key or bubble_document_id
-            ).strip()
-            return {
-                "ok": False,
-                "status": "limit_exceeded",
-                "reason": "PLAN_INGEST_CREDITS_LIMIT_EXCEEDED",
-                "error_code": "PLAN_INGEST_CREDITS_LIMIT_EXCEEDED",
-                "ai_quota_exceeded": True,
-                "error": {
-                    "code": "PLAN_INGEST_CREDITS_LIMIT_EXCEEDED",
-                    "message": (
-                        "Limite mensile di elaborazione AI documenti già raggiunto. "
-                        "Il documento resta salvato in Bubble ma non viene indicizzato."
-                    ),
-                },
-                "request_key": request_key_pre,
-                "ingest_request_key": request_key_pre,
-                "ingest_usage_event_id": "",
-                "ingest_month_key": ingest_month_key_pre,
-                "ingest_credits_actual": 0,
-                "ingest_credits_used_month": float(used_before),
-                "ingest_credits_limit_month": float(ingest_limit),
-                "ingest_credits_remaining": 0,
-                "ingest_pricing_version": INGEST_PRICING_VERSION,
-                "ingest_metering_status": "not_started_quota_blocked",
-                "ingest_metering_version": INGEST_METERING_VERSION,
-                "ingest_usage": {},
-            }
-
-    loaded_file = _load_ingest_document_file(payload, bubble_document_id)
-
-    data = loaded_file["data"]
-    url = loaded_file["url"]
-    content_type = loaded_file["content_type"]
-    content_disposition = loaded_file["content_disposition"]
-    detected_filename = loaded_file["detected_filename"]
-    detected_extension = loaded_file["detected_extension"]
-    source_mode = loaded_file["source_mode"]
-
-    file_sha256 = hashlib.sha256(data).hexdigest()
-    ingest_month_key = _normalize_ingest_month_key(payload.ingest_month_key)
-    ingest_request_key = _effective_ingest_request_key(
-        company_id=company_id,
-        bubble_document_id=bubble_document_id,
-        requested_key=payload.ingest_request_key,
-        file_sha256=file_sha256,
+    return _ingest_orchestration.ingest_document(
+        payload,
+        x_ai_internal_secret,
+        runtime=_DOCUMENT_INGEST_RUNTIME(),
     )
-    ingest_usage_event_id = _build_ingest_usage_event_id(
-        company_id, ingest_month_key, ingest_request_key
-    )
-
-    if url:
-        _db_upsert_document_file(company_id, bubble_document_id, url)
-
-    source_file_type = _ingest_dispatch.detect_ingest_source_file_type(
-        data,
-        detected_extension,
-        content_type,
-        looks_like_xlsx_fn=_looks_like_xlsx_document,
-    )
-
-    if not source_file_type:
-        return {
-            "ok": False,
-            "error": {
-                "code": "NOT_INDEXABLE",
-                "message": "Documento non indicizzabile: formato file non supportato per ingest.",
-            },
-            "reason": "UNSUPPORTED_FILE_TYPE",
-            "detected_content_type": content_type or None,
-            "detected_filename": detected_filename or None,
-            "detected_extension": detected_extension or None,
-        }
-
-    pages_text: list[str] = []
-    pages_total = 0
-    pages_with_text = 0
-    text_chars = 0
-    if source_file_type == "pdf":
-        if len(data) > MAX_PDF_BYTES:
-            raise HTTPException(status_code=413, detail="PDF too large")
-
-        try:
-            raw_pages = _extract_pages_with_layout_blocks(data)
-            pages_total = len(raw_pages)
-
-            header_norm, footer_norm = _detect_repeated_headers_footers(raw_pages)
-
-            try:
-                _db_upsert_cleaning_meta(company_id, bubble_document_id, header_norm, footer_norm)
-            except Exception as e:
-                print("CLEANING_META_UPSERT_FAIL", str(e))
-
-            for t in raw_pages:
-                cleaned = _remove_headers_footers_from_page(t, header_norm, footer_norm)
-                cleaned = _reflow_paragraphs_conservative(cleaned)
-                cleaned = _maybe_remove_toc(cleaned)
-                pages_text.append(cleaned)
-                text_chars += len(cleaned)
-                if len(cleaned) >= MIN_PAGE_CHARS:
-                    pages_with_text += 1
-        except Exception:
-            raise HTTPException(status_code=422, detail="PDF parse failed")
-
-    else:
-        if not XLSX_INGEST_ENABLED:
-            return {
-                "ok": False,
-                "error": {
-                    "code": "NOT_INDEXABLE",
-                    "message": "Documento non indicizzabile: supporto XLSX non ancora abilitato nel backend.",
-                },
-                "reason": "XLSX_INGEST_DISABLED",
-                "detected_content_type": content_type or None,
-                "detected_filename": detected_filename or None,
-                "detected_extension": detected_extension or None,
-            }
-
-        if len(data) > MAX_XLSX_BYTES:
-            raise HTTPException(status_code=413, detail="XLSX too large")
-
-        try:
-            pages_text = _extract_xlsx_sheets_as_pages(data, detected_filename=detected_filename)
-            pages_total = len(pages_text)
-            text_chars = sum(len(t or "") for t in pages_text)
-            pages_with_text = sum(1 for t in pages_text if len(t or "") >= MIN_PAGE_CHARS)
-        except XlsxIngestError as e:
-            return {
-                "ok": False,
-                "error": {
-                    "code": "NOT_INDEXABLE",
-                    "message": e.message,
-                    "detail": e.detail or {},
-                },
-                "reason": e.reason,
-                "detected_content_type": content_type or None,
-                "detected_filename": detected_filename or None,
-                "detected_extension": detected_extension or None,
-            }
-        except Exception as e:
-            raise HTTPException(status_code=422, detail=f"XLSX parse failed: {str(e)[:200]}")
-
-    if source_file_type == "xlsx":
-        if pages_with_text < 1 or text_chars < max(1, XLSX_MIN_TEXT_CHARS):
-            reason = "LOW_TEXT_COVERAGE" if pages_with_text < 1 else "LOW_TEXT_CHARS"
-            return {
-                "ok": False,
-                "error": {
-                    "code": "NOT_INDEXABLE",
-                    "message": "Documento XLSX non indicizzabile: testo leggibile insufficiente.",
-                },
-                "reason": reason,
-                "pages_total": pages_total,
-                "pages_with_text": pages_with_text,
-                "pages_detected": pages_total,
-                "text_chars": text_chars,
-                "source_file_type": source_file_type,
-            }
-    elif pages_total <= 2:
-        if pages_with_text < 1 or text_chars < MIN_TEXT_CHARS_SHORT:
-            reason = "LOW_TEXT_COVERAGE" if pages_with_text < 1 else "LOW_TEXT_CHARS"
-            return {
-                "ok": False,
-                "error": {
-                    "code": "NOT_INDEXABLE",
-                    "message": f"Documento non indicizzabile: troppo poco testo per {pages_total} pagina/e.",
-                },
-                "reason": reason,
-                "pages_total": pages_total,
-                "pages_with_text": pages_with_text,
-                "pages_detected": pages_total,
-                "text_chars": text_chars,
-            }
-    else:
-        min_pages_required = max(
-            MIN_PAGES_WITH_TEXT_ABS,
-            int(math.ceil(pages_total * MIN_PAGES_WITH_TEXT_PCT)),
-        )
-        if text_chars < MIN_TEXT_CHARS or pages_with_text < min_pages_required:
-            reason = "LOW_TEXT_CHARS" if text_chars < MIN_TEXT_CHARS else "LOW_TEXT_COVERAGE"
-            return {
-                "ok": False,
-                "error": {
-                    "code": "NOT_INDEXABLE",
-                    "message": "Documento non indicizzabile: testo insufficiente o troppo poco distribuito sulle pagine.",
-                },
-                "reason": reason,
-                "pages_total": pages_total,
-                "pages_with_text": pages_with_text,
-                "pages_detected": pages_total,
-                "text_chars": text_chars,
-            }
-
-    plan_chars_limit = int(payload.plan_embed_chars_limit_total or 0)
-    plan_storage_limit = int(payload.plan_index_storage_limit_bytes or 0)
-
-    effective_step = max(1, CHUNK_TARGET_CHARS - min(CHUNK_OVERLAP_CHARS, CHUNK_TARGET_CHARS - 1))
-    est_chunks = int(math.ceil(max(1, text_chars) / effective_step))
-
-    BYTES_PER_CHAR = 3
-    BYTES_PER_CHUNK = 2000
-    est_storage_bytes = int(text_chars * BYTES_PER_CHAR + est_chunks * BYTES_PER_CHUNK)
-
-    if plan_chars_limit > 0 and text_chars > plan_chars_limit:
-        return {
-            "ok": False,
-            "error": {
-                "code": "LIMIT_EXCEEDED",
-                "message": "Documento troppo grande per il piano (limite caratteri indicizzabili).",
-            },
-            "reason": "PLAN_EMBED_CHARS_LIMIT_EXCEEDED",
-            "text_chars": text_chars,
-            "limit_chars": plan_chars_limit,
-        }
-
-    if plan_storage_limit > 0 and est_storage_bytes > plan_storage_limit:
-        return {
-            "ok": False,
-            "error": {
-                "code": "LIMIT_EXCEEDED",
-                "message": "Documento troppo grande per il piano (limite storage AI indicizzato).",
-            },
-            "reason": "PLAN_INDEX_STORAGE_LIMIT_EXCEEDED",
-            "text_chars": text_chars,
-            "est_storage_bytes": est_storage_bytes,
-            "limit_storage_bytes": plan_storage_limit,
-        }
-
-    used_chars_total = int(payload.embed_chars_used_total or 0)
-    used_storage_total = int(payload.index_storage_used_total or 0)
-    prev_doc_chars = int(payload.doc_prev_embed_chars or 0)
-    prev_doc_storage = int(payload.doc_prev_index_storage_bytes or 0)
-
-    new_total_chars = used_chars_total - prev_doc_chars + int(text_chars)
-    new_total_storage = used_storage_total - prev_doc_storage + int(est_storage_bytes)
-
-    if plan_chars_limit > 0 and new_total_chars > plan_chars_limit:
-        return {
-            "ok": False,
-            "error": {
-                "code": "LIMIT_EXCEEDED",
-                "message": "Limite totale caratteri AI superato per questa Company (used - prev + new).",
-            },
-            "reason": "PLAN_EMBED_CHARS_LIMIT_EXCEEDED",
-            "text_chars": text_chars,
-            "limit_chars": plan_chars_limit,
-            "used_chars_total": used_chars_total,
-            "doc_prev_chars": prev_doc_chars,
-            "new_total_chars": new_total_chars,
-        }
-
-    if plan_storage_limit > 0 and new_total_storage > plan_storage_limit:
-        return {
-            "ok": False,
-            "error": {
-                "code": "LIMIT_EXCEEDED",
-                "message": "Limite totale storage AI superato per questa Company (used - prev + new).",
-            },
-            "reason": "PLAN_INDEX_STORAGE_LIMIT_EXCEEDED",
-            "text_chars": text_chars,
-            "est_storage_bytes": est_storage_bytes,
-            "limit_storage_bytes": plan_storage_limit,
-            "used_storage_total": used_storage_total,
-            "doc_prev_storage_bytes": prev_doc_storage,
-            "new_total_storage_bytes": new_total_storage,
-        }
-
-    conn = _db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "DELETE FROM document_pages WHERE company_id=%s AND bubble_document_id=%s;",
-                (company_id, bubble_document_id),
-            )
-            for i, t in enumerate(pages_text, start=1):
-                cur.execute(
-                    """
-                    INSERT INTO document_pages(company_id, machine_id, bubble_document_id, page_number, text, text_chars)
-                    VALUES (%s, %s, %s, %s, %s, %s);
-                    """,
-                    (company_id, machine_id, bubble_document_id, i, t, len(t)),
-                )
-        conn.commit()
-    finally:
-        conn.close()
-
-    _v13_invalidate_company_knowledge(company_id)
-
-    ledger_prepared = _ingest_prepare_event(
-        usage_event_id=ingest_usage_event_id,
-        request_key=ingest_request_key,
-        company_id=company_id,
-        bubble_document_id=bubble_document_id,
-        month_key=ingest_month_key,
-    )
-
-    _enqueue_document_index_task(
-        company_id=company_id,
-        machine_id=machine_id,
-        bubble_document_id=bubble_document_id,
-        ingest_scope=ingest_scope,
-        ingest_request_key=ingest_request_key,
-        ingest_month_key=ingest_month_key,
-        ingest_usage_event_id=ingest_usage_event_id,
-    )
-
-    month_usage_before = _ingest_month_usage(company_id, ingest_month_key)
-    return {
-        "ok": True,
-        "pages_total": pages_total,
-        "pages_with_text": pages_with_text,
-        "pages_detected": pages_total,
-        "text_chars": text_chars,
-        "est_storage_bytes": est_storage_bytes,
-        "source_file_type": source_file_type,
-        "request_key": ingest_request_key,
-        "ingest_request_key": ingest_request_key,
-        "ingest_usage_event_id": ingest_usage_event_id,
-        "ingest_month_key": ingest_month_key,
-        "ingest_credits_actual": 0,
-        "ingest_credits_used_month": float(
-            month_usage_before.get("ingest_credits_used_month") or 0
-        ),
-        "ingest_pricing_version": INGEST_PRICING_VERSION,
-        "ingest_metering_status": (
-            "pending_async_index" if ledger_prepared else "pending_async_ledger_unavailable"
-        ),
-        "ingest_metering_version": INGEST_METERING_VERSION,
-        "ingest_usage": {
-            "source_file_type": source_file_type,
-            "file_sha256": file_sha256,
-            "status": "queued",
-        },
-    }
 
 
 @app.post("/v1/ai/ingest/source")
@@ -14306,174 +13490,11 @@ def ingest_structured_source(
     payload: StructuredSourceIngestRequest,
     x_ai_internal_secret: Optional[str] = Header(default=None),
 ):
-    if not AI_INTERNAL_SECRET:
-        raise HTTPException(status_code=500, detail="AI_INTERNAL_SECRET missing")
-    if (x_ai_internal_secret or "").strip() != AI_INTERNAL_SECRET:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    company_id = (payload.company_id or "").strip()
-    machine_id = (payload.machine_id or "").strip()
-    source_id = (payload.source_id or "").strip()
-
-    if not (company_id and machine_id and source_id):
-        raise HTTPException(status_code=400, detail="Missing company_id/machine_id/source_id")
-
-    source_type = _normalize_structured_source_type(payload.source_type)
-    source_key = _build_structured_source_key(source_type, source_id)
-
-    text = _compose_structured_source_text(payload)
-    text_chars = len(text)
-
-    if text_chars <= 0:
-        raise HTTPException(status_code=400, detail="Structured source text is empty")
-
-    source_url = (payload.source_url or "").strip()
-    if source_url.startswith("//"):
-        source_url = "https:" + source_url
-
-    est_storage_bytes = _estimate_index_storage_bytes_for_text(text_chars)
-
-    plan_chars_limit = int(payload.plan_embed_chars_limit_total or 0)
-    plan_storage_limit = int(payload.plan_index_storage_limit_bytes or 0)
-
-    prev_usage = _db_get_index_usage(company_id=company_id, bubble_document_id=source_key)
-    company_usage = _db_get_index_usage(company_id=company_id)
-
-    new_total_chars = int(company_usage["text_chars"]) - int(prev_usage["text_chars"]) + int(text_chars)
-    new_total_storage = int(company_usage["est_storage_bytes"]) - int(prev_usage["est_storage_bytes"]) + int(est_storage_bytes)
-
-    if plan_chars_limit > 0 and text_chars > plan_chars_limit:
-        return {
-            "ok": False,
-            "error": {
-                "code": "LIMIT_EXCEEDED",
-                "message": "Fonte testuale troppo grande per il piano (limite caratteri indicizzabili).",
-            },
-            "reason": "PLAN_EMBED_CHARS_LIMIT_EXCEEDED",
-            "text_chars": text_chars,
-            "limit_chars": plan_chars_limit,
-        }
-
-    if plan_storage_limit > 0 and est_storage_bytes > plan_storage_limit:
-        return {
-            "ok": False,
-            "error": {
-                "code": "LIMIT_EXCEEDED",
-                "message": "Fonte testuale troppo grande per il piano (limite storage AI indicizzato).",
-            },
-            "reason": "PLAN_INDEX_STORAGE_LIMIT_EXCEEDED",
-            "text_chars": text_chars,
-            "est_storage_bytes": est_storage_bytes,
-            "limit_storage_bytes": plan_storage_limit,
-        }
-
-    if plan_chars_limit > 0 and new_total_chars > plan_chars_limit:
-        return {
-            "ok": False,
-            "error": {
-                "code": "LIMIT_EXCEEDED",
-                "message": "Limite totale caratteri AI superato per questa Company.",
-            },
-            "reason": "PLAN_EMBED_CHARS_LIMIT_EXCEEDED",
-            "text_chars": text_chars,
-            "limit_chars": plan_chars_limit,
-            "new_total_chars": new_total_chars,
-            "prev_source_chars": int(prev_usage["text_chars"]),
-            "company_chars_before": int(company_usage["text_chars"]),
-        }
-
-    if plan_storage_limit > 0 and new_total_storage > plan_storage_limit:
-        return {
-            "ok": False,
-            "error": {
-                "code": "LIMIT_EXCEEDED",
-                "message": "Limite totale storage AI superato per questa Company.",
-            },
-            "reason": "PLAN_INDEX_STORAGE_LIMIT_EXCEEDED",
-            "text_chars": text_chars,
-            "est_storage_bytes": est_storage_bytes,
-            "limit_storage_bytes": plan_storage_limit,
-            "new_total_storage_bytes": new_total_storage,
-            "prev_source_storage_bytes": int(prev_usage["est_storage_bytes"]),
-            "company_storage_before": int(company_usage["est_storage_bytes"]),
-        }
-
-    conn = _db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                DELETE FROM public.document_pages
-                WHERE company_id=%s AND bubble_document_id=%s;
-                """,
-                (company_id, source_key),
-            )
-
-            cur.execute(
-                """
-                INSERT INTO public.document_pages(
-                    company_id,
-                    machine_id,
-                    bubble_document_id,
-                    page_number,
-                    text,
-                    text_chars
-                )
-                VALUES (%s, %s, %s, %s, %s, %s);
-                """,
-                (company_id, machine_id, source_key, 1, text, text_chars),
-            )
-        conn.commit()
-    finally:
-        conn.close()
-
-    _v13_invalidate_company_knowledge(company_id)
-
-    if source_url:
-        _db_upsert_document_file(company_id, source_key, source_url)
-
-    index_result = index_document(
-        IndexDocumentRequest(
-            company_id=company_id,
-            machine_id=machine_id,
-            bubble_document_id=source_key,
-            trace_id="structured_ingest",
-        ),
-        x_ai_internal_secret=AI_INTERNAL_SECRET,
+    return _ingest_orchestration.ingest_structured_source(
+        payload,
+        x_ai_internal_secret,
+        runtime=_STRUCTURED_INGEST_RUNTIME(),
     )
-
-    parent_source_key = ""
-    relation_written = False
-    if source_type == "step":
-        parent_source_key = _parent_procedure_source_key(payload)
-        if parent_source_key:
-            relation_written = _db_upsert_structured_source_relation(
-                company_id=company_id,
-                machine_id=machine_id,
-                child_source_key=source_key,
-                parent_source_key=parent_source_key,
-                ordinal=payload.step_number,
-                relation_source="bubble_ingest",
-                metadata={
-                    "parent_procedure_code": str(payload.parent_procedure_code or ""),
-                    "parent_procedure_title": str(payload.parent_procedure_title or ""),
-                },
-            )
-
-    return {
-        "ok": True,
-        "status": "indexed",
-        "source_type": source_type,
-        "source_key": source_key,
-        "pages_total": 1,
-        "pages_with_text": 1,
-        "pages_detected": 1,
-        "text_chars": text_chars,
-        "est_storage_bytes": est_storage_bytes,
-        "chunks_written": int(index_result.get("chunks_written") or 0),
-        "parent_source_key": parent_source_key,
-        "structured_relation_written": bool(relation_written),
-    }
 
 @app.post("/v1/ai/index/document")
 @_meter_index_document
@@ -14481,208 +13502,11 @@ def index_document(
     payload: IndexDocumentRequest,
     x_ai_internal_secret: Optional[str] = Header(default=None),
 ):
-    if not AI_INTERNAL_SECRET:
-        raise HTTPException(status_code=500, detail="AI_INTERNAL_SECRET missing")
-    if (x_ai_internal_secret or "").strip() != AI_INTERNAL_SECRET:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    company_id = (payload.company_id or "").strip()
-    machine_id = (payload.machine_id or "").strip()
-    bubble_document_id = (payload.bubble_document_id or "").strip()
-    trace_id = (payload.trace_id or "").strip() or None
-
-    index_scope = _normalize_ai_scope(payload.ai_scope)
-    if index_scope == "document_ids":
-        index_scope = "machine_all"
-
-    if index_scope == "company_general":
-        machine_id = ""
-    elif not machine_id:
-        raise HTTPException(status_code=400, detail="Missing machine_id")
-
-    if not (company_id and bubble_document_id):
-        raise HTTPException(status_code=400, detail="Missing company_id/bubble_document_id")
-
-    header_norm, footer_norm = _db_get_cleaning_meta(company_id, bubble_document_id)
-
-    conn = _db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT page_number, text
-                FROM document_pages
-                WHERE company_id=%s AND bubble_document_id=%s
-                ORDER BY page_number;
-                """,
-                (company_id, bubble_document_id),
-            )
-            page_rows = cur.fetchall()
-            if not page_rows:
-                return {
-                    "ok": True,
-                    "status": "indexed",
-                    "company_id": company_id,
-                    "machine_id": machine_id,
-                    "bubble_document_id": bubble_document_id,
-                    "trace_id": trace_id,
-                    "chunks_written": 0,
-                    "pages_detected": 0,
-                    "note": "No pages found in document_pages for given ids",
-                }
-
-            pages = [(int(pn), txt or "") for (pn, txt) in page_rows]
-            if pages and all(_ingest_xlsx.is_xlsx_page_text(text) for _, text in pages):
-                chunks = _ingest_xlsx.chunk_xlsx_pages(
-                    pages=pages,
-                    target_chars=CHUNK_TARGET_CHARS,
-                    min_chars=CHUNK_MIN_CHARS,
-                    chunk_page_fn=_chunk_sentences_with_pages,
-                )
-            else:
-                chunks = _chunk_sentences_with_pages(
-                    pages=pages,
-                    target_chars=CHUNK_TARGET_CHARS,
-                    overlap_chars=CHUNK_OVERLAP_CHARS,
-                    min_chars=CHUNK_MIN_CHARS,
-                )
-
-            source_is_structured = _is_structured_source_key(bubble_document_id)
-            if source_is_structured:
-                chunks = _collapse_structured_chunks(chunks)
-
-            filtered_chunks = []
-            for c in chunks:
-                txt = (c.get("chunk_text") or "").strip()
-
-                if source_is_structured:
-                    if len(txt) < 20:
-                        continue
-                else:
-                    if len(txt) < 120:
-                        continue
-
-                if not re.search(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9]", txt):
-                    continue
-                if len(txt.split()) <= 4 and txt.isupper():
-                    continue
-
-                filtered_chunks.append(c)
-
-            chunks = filtered_chunks
-
-            for c in chunks:
-                c["chunk_text"] = _strip_hf_from_chunk_text(c.get("chunk_text", ""), header_norm, footer_norm)
-
-            chunks = [c for c in chunks if (c.get("chunk_text") or "").strip()]
-
-            chunk_cols = _get_table_columns(cur, "document_chunks")
-            required = {
-                "company_id",
-                "machine_id",
-                "bubble_document_id",
-                "chunk_index",
-                "page_from",
-                "page_to",
-                "chunk_text",
-            }
-            missing = sorted(list(required - set(chunk_cols)))
-            if missing:
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"document_chunks missing columns: {missing}. Found: {sorted(chunk_cols)}",
-                )
-
-            cur.execute(
-                "DELETE FROM document_chunks WHERE company_id=%s AND bubble_document_id=%s;",
-                (company_id, bubble_document_id),
-            )
-
-            insert_q = """
-                INSERT INTO document_chunks(
-                    company_id, machine_id, bubble_document_id,
-                    chunk_index, page_from, page_to,
-                    chunk_text
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s);
-            """
-
-            for c in chunks:
-                cur.execute(
-                    insert_q,
-                    (
-                        company_id,
-                        machine_id,
-                        bubble_document_id,
-                        int(c["chunk_index"]),
-                        int(c["page_from"]),
-                        int(c["page_to"]),
-                        c["chunk_text"],
-                    ),
-                )
-
-            BATCH_SIZE = 32
-            chunk_texts = [c["chunk_text"] for c in chunks]
-
-            for batch_start in range(0, len(chunks), BATCH_SIZE):
-                batch_texts = chunk_texts[batch_start: batch_start + BATCH_SIZE]
-
-                try:
-                    vectors = _openai_embed_texts(batch_texts)
-                except Exception as e:
-                    for j in range(len(batch_texts)):
-                        idx = batch_start + j
-                        cur.execute(
-                            """
-                            UPDATE document_chunks
-                            SET embedding_error=%s, embedding_model=%s, embedded_at=NOW()
-                            WHERE company_id=%s AND bubble_document_id=%s AND chunk_index=%s;
-                            """,
-                            (
-                                str(e),
-                                OPENAI_EMBED_MODEL,
-                                company_id,
-                                bubble_document_id,
-                                int(chunks[idx]["chunk_index"]),
-                            ),
-                        )
-                    continue
-
-                for j, vec in enumerate(vectors):
-                    idx = batch_start + j
-                    chunk_idx = int(chunks[idx]["chunk_index"])
-                    vec_literal = _vector_literal(vec)
-
-                    cur.execute(
-                        """
-                        UPDATE document_chunks
-                        SET embedding = %s::vector,
-                            embedding_model = %s,
-                            embedded_at = NOW(),
-                            embedding_error = NULL
-                        WHERE company_id=%s AND bubble_document_id=%s AND chunk_index=%s;
-                        """,
-                        (vec_literal, OPENAI_EMBED_MODEL, company_id, bubble_document_id, chunk_idx),
-                    )
-
-        conn.commit()
-    finally:
-        conn.close()
-
-    _v13_invalidate_company_knowledge(company_id)
-
-    return {
-        "ok": True,
-        "status": "indexed",
-        "company_id": company_id,
-        "machine_id": machine_id,
-        "bubble_document_id": bubble_document_id,
-        "trace_id": trace_id,
-        "chunks_written": len(chunks),
-        "pages_detected": len(pages),
-        "chunk_target_chars": CHUNK_TARGET_CHARS,
-        "chunk_overlap_chars": CHUNK_OVERLAP_CHARS,
-    }
+    return _ingest_orchestration.index_document(
+        payload,
+        x_ai_internal_secret,
+        runtime=_INDEX_DOCUMENT_RUNTIME(),
+    )
 
 
 @app.post("/v1/ai/search")
