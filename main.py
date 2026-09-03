@@ -24014,9 +24014,10 @@ def _assistant_core_numeric_signal(text: str) -> dict:
         r"(?:kg|g|t|ton|lb|mm|cm|m|m/s|m/s2|m/s²|rpm|min\-?1|1/min|hz|khz|kw|w|v|a|bar|mpa|pa|nm|n|kn|°c|celsius|%|ms|s|sec|min|h|hour|hours)\b",
         value,
     )
+    labeled_value_unit_matches = list(_ASSISTANT_CORE_LABELED_VALUE_UNIT_RE.finditer(value))
     return {
         "has_number": bool(number_matches),
-        "has_number_with_unit": bool(unit_matches),
+        "has_number_with_unit": bool(unit_matches or labeled_value_unit_matches),
         "numbers": number_matches[:12],
     }
 
@@ -27276,6 +27277,15 @@ _ASSISTANT_CORE_NUMBER_ATOM = r"[-+]?(?:\d{1,3}(?:[ .]\d{3})+|\d+)(?:[.,]\d+)?"
 _ASSISTANT_CORE_NUMBER_RE = re.compile(
     rf"(?<![\w]){_ASSISTANT_CORE_NUMBER_ATOM}"
 )
+# XLSX structured rows keep values and units in adjacent labeled fields, e.g.
+# ``Valore: 17.6 | Unità: bar``.  Recognize that bounded representation as one
+# technical claim without changing ordinary prose parsing.
+_ASSISTANT_CORE_LABELED_VALUE_UNIT_RE = re.compile(
+    rf"\b(?:valore|value)\s*:\s*(?P<value>{_ASSISTANT_CORE_NUMBER_ATOM})"
+    rf"\s*\|\s*(?:unità|unita|unit)\s*:\s*(?P<unit>{_ASSISTANT_CORE_UNIT_TOKEN})"
+    rf"(?=$|[\s|,.;:/)\]])",
+    re.IGNORECASE,
+)
 _ASSISTANT_CORE_DIMENSION_CHAIN_RE = re.compile(
     rf"(?P<values>{_ASSISTANT_CORE_NUMBER_ATOM}(?:\s*[x×]\s*{_ASSISTANT_CORE_NUMBER_ATOM})+)\s*(?P<unit>mm(?:²|2|³|3)?|cm|m)(?=$|[\s,.;:/)\]])",
     re.IGNORECASE,
@@ -27355,6 +27365,23 @@ def _assistant_core_is_list_marker(value: str, start: int, end: int, raw: str) -
 def _assistant_core_claims(text: str) -> list[dict]:
     value = str(text or "")
     claims: list[dict] = []
+    labeled_value_spans: list[tuple[int, int]] = []
+    for labeled_match in _ASSISTANT_CORE_LABELED_VALUE_UNIT_RE.finditer(value):
+        raw_value = str(labeled_match.group("value") or "").strip()
+        raw_unit = str(labeled_match.group("unit") or "").strip()
+        if not raw_value or not raw_unit:
+            continue
+        labeled_value_spans.append(
+            (labeled_match.start("value"), labeled_match.end("value"))
+        )
+        claims.append(
+            {
+                "kind": "number",
+                "raw": raw_value,
+                "variants": _assistant_core_numeric_variants(raw_value),
+                "unit": _assistant_core_normalize_unit(raw_unit),
+            }
+        )
     dimension_spans = [
         (m.start("values"), m.end("values"), str(m.group("unit") or ""))
         for pattern in (
@@ -27365,6 +27392,11 @@ def _assistant_core_claims(text: str) -> list[dict]:
     ]
     for match in _ASSISTANT_CORE_NUMBER_RE.finditer(value):
         raw = match.group(0)
+        if any(
+            span_start <= match.start() and match.end() <= span_end
+            for span_start, span_end in labeled_value_spans
+        ):
+            continue
         if _assistant_core_is_list_marker(value, match.start(), match.end(), raw):
             continue
         # A number embedded in an alphanumeric designation (for example the
