@@ -5636,30 +5636,52 @@ def _db_find_token_chunk(
 
             where_sql = " AND ".join(where)
 
+            # Exact-token retrieval must preserve the text around the actual match.
+            # Returning only LEFT(chunk_text, N) made identifiers located after the
+            # prefix disappear even though PostgreSQL had matched them in the full
+            # chunk.  Fetch the bounded ingest chunk, then derive a display snippet
+            # centred on the token while retaining the complete chunk for grounding.
             cur.execute(
                 f"""
                 SELECT bubble_document_id, chunk_index, page_from, page_to,
-                       left(chunk_text, %s) AS snippet
+                       chunk_text
                 FROM public.document_chunks
                 WHERE {where_sql}
                   AND chunk_text ILIKE %s
                 ORDER BY bubble_document_id, page_from, chunk_index
                 LIMIT 1;
                 """,
-                [ASK_SNIPPET_CHARS, *params, f"%{token}%"],
+                [*params, f"%{token}%"],
             )
             row = cur.fetchone()
             if not row:
                 return None
 
-            bdid, chunk_index, page_from, page_to, snippet = row
+            bdid, chunk_index, page_from, page_to, chunk_text = row
+            full_text = str(chunk_text or "").strip()
+            snippet_limit = max(240, int(ASK_SNIPPET_CHARS or 700))
+            snippet = full_text
+            if len(snippet) > snippet_limit:
+                token_match = re.search(re.escape(token), full_text, flags=re.IGNORECASE)
+                match_at = token_match.start() if token_match else -1
+                if match_at >= 0:
+                    before_chars = min(220, max(80, snippet_limit // 3))
+                    start = max(0, match_at - before_chars)
+                    end = min(len(full_text), start + snippet_limit)
+                    if end - start < snippet_limit:
+                        start = max(0, end - snippet_limit)
+                    snippet = full_text[start:end].strip()
+                else:
+                    snippet = full_text[:snippet_limit].strip()
+
             citation_id = f"{bdid}:p{int(page_from)}-{int(page_to)}:c{int(chunk_index)}"
             return {
                 "citation_id": citation_id,
                 "bubble_document_id": str(bdid),
                 "page_from": int(page_from),
                 "page_to": int(page_to),
-                "snippet": (snippet or "").strip(),
+                "snippet": snippet,
+                "chunk_full": full_text,
                 "similarity": 0.0,
             }
     finally:
@@ -23032,7 +23054,24 @@ def _v13_exact_identifier_candidates(
     """Retrieve exact identifier evidence without answering before the shared gate."""
     out: list[dict] = []
     seen: set[str] = set()
-    for token in _dedup_text_values(_extract_code_tokens(q), limit=8):
+
+    # Prefer mixed letter/digit identifiers (for example X3E-QA-8842) over
+    # broader separator-bearing labels (for example QA_Certificazione).  When both
+    # occur in the same chunk, citation de-duplication must retain the precise row
+    # identifier rather than whichever token happened to appear first in the query.
+    tokens = _dedup_text_values(_extract_code_tokens(q), limit=8)
+    tokens = sorted(
+        tokens,
+        key=lambda value: (
+            bool(any(ch.isalpha() for ch in str(value)) and any(ch.isdigit() for ch in str(value))),
+            bool(any(ch.isdigit() for ch in str(value))),
+            bool(any(sep in str(value) for sep in ("-", "_", "/", "."))),
+            min(len(str(value)), 64),
+        ),
+        reverse=True,
+    )
+
+    for token in tokens:
         hit = _db_find_token_chunk(
             company_id=company_id,
             machine_id=machine_id,
@@ -23047,7 +23086,7 @@ def _v13_exact_identifier_candidates(
         if not cid or cid in seen:
             continue
         seen.add(cid)
-        item["chunk_full"] = str(item.get("snippet") or "")
+        item["chunk_full"] = str(item.get("chunk_full") or item.get("snippet") or "")
         item["snippet_clean"] = str(item.get("snippet") or "")
         item["source_type"] = _source_type_from_document_id(item.get("bubble_document_id") or "")
         item["exact_code_hit"] = True
