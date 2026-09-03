@@ -5647,6 +5647,16 @@ def _xlsx_exact_identifier_context_terms(q: str, token: str) -> list[str]:
         "trova", "trovare", "dimmi", "indica", "indicare",
         "report", "reported", "reports", "show", "shown", "tell",
         "state", "states", "stated", "provide", "provided", "find", "listed",
+        # Source-selection wording constrains where evidence may come from; it is
+        # not part of the technical property that must occur in the matched row.
+        "solo", "soltanto", "esclusivamente", "unicamente", "esclusivo",
+        "esclusiva", "esclusivi", "esclusive", "senza", "usare", "usa",
+        "utilizzare", "utilizza", "considerare", "considera", "basarsi",
+        "basati", "basata", "basato", "limitarsi", "limitati",
+        "altre", "altri", "altra", "altro", "fonti", "fonte",
+        "documenti", "contenuti", "contenuto",
+        "only", "exclusively", "solely", "without", "using", "use",
+        "other", "others", "sources", "source", "documents", "content",
     }
     return sorted(
         term
@@ -11809,6 +11819,11 @@ def _ask_has_explicit_xlsx_source_phrase(q_low: str) -> bool:
         r"\b(?:in|from|according\s+to)\s+(?:the\s+)?(?:excel|xlsx|spreadsheet|workbook|worksheet)\b",
         r"\b(?:excel|xlsx|spreadsheet|workbook|worksheet)\s+(?:file|document|source|table|sheet)\b",
         r"\b(?:righe|row|rows|colonne|columns|sheet|sheets|fogli)\b.{0,60}\b(?:excel|xlsx|spreadsheet|workbook)\b",
+        # A named worksheet is an explicit spreadsheet source even when the user
+        # does not repeat the words Excel/XLSX. Require a quoted name or a
+        # technical identifier shape so ordinary uses of “foglio/sheet” are not
+        # promoted accidentally.
+        r"\b(?:foglio|worksheet|sheet)\s+(?:[\"'«][^\"'»\n]{1,80}[\"'»]|[A-Za-z0-9]+(?:[_-][A-Za-z0-9]+)+)\b",
     ]
     return _ask_regex_any(q_low, patterns)
 
