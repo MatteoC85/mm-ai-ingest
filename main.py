@@ -140,6 +140,7 @@ from machinemind.ingest import dispatch as _ingest_dispatch
 from machinemind.ingest import persistence as _ingest_persistence
 from machinemind.ingest import metering as _ingest_metering
 from machinemind.ingest import orchestration as _ingest_orchestration
+from machinemind.retrieval import diagnostic_sources as _retrieval_diagnostic_sources
 from machinemind.retrieval import precision_facts as _retrieval_precision_facts
 
 
@@ -150,6 +151,13 @@ _PRECISION_FACT_RUNTIME = lambda: _retrieval_precision_facts.PrecisionFactRuntim
     company_general_machine_sentinel=COMPANY_GENERAL_MACHINE_SENTINEL,
     page_text_chars=max(12000, int(V13_PAGE_TEXT_CHARS or 12000)),
     page_scan_limit=max(80, min(900, int(V13_PAGE_SCAN_LIMIT or 500))),
+)
+
+
+_DIAGNOSTIC_SOURCE_RUNTIME = lambda: _retrieval_diagnostic_sources.DiagnosticSourceRuntime(
+    source_type=_assistant_core_candidate_source_type,
+    stable_key=_assistant_core_candidate_stable_key,
+    family_key=_root_cause_evidence_family_key,
 )
 
 
@@ -24686,81 +24694,32 @@ def _assistant_core_root_diagnostic_evidence_assurance(
             },
         }
 
+def _assistant_core_root_source_selection(
+    candidates: list[dict],
+    *,
+    limit: int,
+) -> _retrieval_diagnostic_sources.DiagnosticSelectionResult:
+    """Build the final Root Cause pack through the modular relevance gate."""
+    return _retrieval_diagnostic_sources.select_root_cause_candidates(
+        candidates,
+        limit=limit,
+        runtime=_DIAGNOSTIC_SOURCE_RUNTIME(),
+    )
+
+
 def _assistant_core_root_source_page_diversity(
     candidates: list[dict],
     *,
     limit: int,
 ) -> list[dict]:
-    """Preserve Root Cause relevance while preventing one long manual from saturating the pack.
+    """Compatibility adapter for the historical Root Cause selector name.
 
-    Retrieval produces overlapping chunks by design. A large manual can therefore
-    occupy most evidence slots even when a component datasheet, P&S, Procedure or
-    Step is more discriminative. Candidates arrive already sorted by the existing
-    viability/diagnostic score. This selector is monotonic with respect to relevance:
-    it first keeps the best candidate from each stable source, then fills remaining
-    slots in the original order with a conservative per-source cap. It never changes
-    Company/Machine scope, never invents source preference, and is used only for
-    Root Cause final evidence selection.
+    Source diversity is now a saturation guard inside the retrieval
+    module.  It no longer grants admission to one candidate from
+    every source regardless of diagnostic relevance.
     """
-    if not candidates or limit <= 0:
-        return []
-
-    ordered = [dict(c) for c in candidates if isinstance(c, dict)]
-    out: list[dict] = []
-    selected_ids: set[str] = set()
-    seen_sources: set[str] = set()
-    seen_source_pages: set[tuple[str, int, int]] = set()
-    source_counts: dict[str, int] = {}
-
-    def source_key(candidate: dict) -> str:
-        source_type = _assistant_core_candidate_source_type(candidate)
-        bdid = str(candidate.get("bubble_document_id") or "").strip()
-        return f"{source_type}|{bdid or str(candidate.get('citation_id') or '').strip()}"
-
-    def page_key(candidate: dict) -> tuple[str, int, int]:
-        key = source_key(candidate)
-        page_from = _safe_int(candidate.get("page_from"), 0)
-        page_to = _safe_int(candidate.get("page_to"), page_from)
-        return key, page_from, page_to
-
-    def candidate_id(candidate: dict) -> str:
-        return _assistant_core_candidate_stable_key(candidate)
-
-    # Pass 1: retain the highest-ranked item from each source. This guarantees that
-    # a dedicated datasheet/Step/Procedure can coexist with a large general manual.
-    for candidate in ordered:
-        cid = candidate_id(candidate)
-        skey = source_key(candidate)
-        pkey = page_key(candidate)
-        if not cid or cid in selected_ids or skey in seen_sources or pkey in seen_source_pages:
-            continue
-        out.append(candidate)
-        selected_ids.add(cid)
-        seen_sources.add(skey)
-        seen_source_pages.add(pkey)
-        source_counts[skey] = 1
-        if len(out) >= limit:
-            return out
-
-    # Pass 2: add further high-ranked passages, but cap each source so overlapping
-    # chunks from a single manual cannot crowd out the remaining evidence.
-    per_source_cap = 3
-    for candidate in ordered:
-        cid = candidate_id(candidate)
-        skey = source_key(candidate)
-        pkey = page_key(candidate)
-        if not cid or cid in selected_ids or pkey in seen_source_pages:
-            continue
-        if source_counts.get(skey, 0) >= per_source_cap:
-            continue
-        out.append(candidate)
-        selected_ids.add(cid)
-        seen_source_pages.add(pkey)
-        source_counts[skey] = source_counts.get(skey, 0) + 1
-        if len(out) >= limit:
-            break
-
-    return out
+    result = _assistant_core_root_source_selection(candidates, limit=limit)
+    return list(result.candidates)
 
 def _assistant_core_prepare_evidence(
     request: AssistantCoreRequest,
@@ -25268,14 +25227,17 @@ def _assistant_core_prepare_evidence(
         baseline_fallback_used = False
         baseline_fallback_reason = ""
 
+    root_source_selection_summary: dict = {}
     if diagnostic_mode:
         limit = V13_MAX_EVIDENCE_ITEMS_ROOT_CAUSE
         selected_pool = root_viable
         if decision.effective_mode == MODE_ROOT_CAUSE:
-            selected_pool = _assistant_core_root_source_page_diversity(
+            root_source_selection = _assistant_core_root_source_selection(
                 root_viable,
-                limit=max(limit * 2, 12),
+                limit=limit,
             )
+            selected_pool = list(root_source_selection.candidates)
+            root_source_selection_summary = dict(root_source_selection.summary)
     else:
         limit = max(
             V13_MAX_EVIDENCE_ITEMS_ASK,
@@ -25382,6 +25344,7 @@ def _assistant_core_prepare_evidence(
                 if decision.effective_mode == MODE_ROOT_CAUSE
                 else len(root_viable)
             ),
+            "root_source_selection": root_source_selection_summary,
             "facet_evidence_coverage": facet_evidence_coverage,
             "minimum_facet_coverage": minimum_facet_coverage,
             "facet_threshold_pass": facet_threshold_pass,
