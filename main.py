@@ -23063,13 +23063,11 @@ def _assistant_core_root_candidate_viable(
         and candidate_subsystems
         and not (query_subsystems & candidate_subsystems)
     )
-    safety_control_targets = {"safety_installation", "electrical_control"}
-    safety_control_mismatch = bool(
-        subsystem_mismatch
-        and (query_subsystems & safety_control_targets)
-        and not (candidate_subsystems & safety_control_targets)
-    )
-    if safety_control_mismatch and not strongly_corroborated_crosslingual:
+    # A candidate from a known but different subsystem is not causal evidence
+    # merely because it is semantically nearby.  Apply the same mismatch guard to
+    # every identified subsystem; strong cross-language corroboration remains the
+    # only bounded exception.
+    if subsystem_mismatch and not strongly_corroborated_crosslingual:
         return False
     if (
         diagnostic_contract_present
@@ -28421,7 +28419,7 @@ def _root_cause_v13_sync(
 
     budget = _V13RequestBudget("root_cause")
     token = _V13_BUDGET_CTX.set(budget)
-    response_language = _select_response_language(q, preferred=payload.language)
+    response_language = _select_response_language(q)
     top_k = max(1, min(int(payload.top_k or 8), ASK_MAX_TOP_K))
     max_causes = max(1, min(int(payload.max_causes or 3), 3))
     try:

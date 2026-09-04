@@ -358,11 +358,12 @@ def select_root_cause_candidates(
     """Return a relevance-gated, source-capped Root Cause evidence pack.
 
     Candidates are expected to be pre-sorted by the existing retrieval/ranking
-    path and to have passed ``assistant_core_root_viable``.  The first valid
-    candidate is retained as the anchor.  Every subsequent candidate must be a
-    close-quality peer, a corroborated documented case, or add genuinely new
-    diagnostic evidence above a lower quality floor.  A new source alone is not
-    enough.
+    path and to have passed ``assistant_core_root_viable``.  No candidate is
+    retained merely because it is ranked first: the initial evidence must satisfy
+    an absolute diagnostic admission contract.  Later candidates may be a
+    close-quality peer only after a valid pack has been seeded, or may enter as a
+    corroborated documented case / genuinely new supported diagnostic signal.
+    A new source alone is never enough.
     """
     policy = policy or DiagnosticSelectionPolicy()
     limit = max(0, int(limit or 0))
@@ -452,10 +453,23 @@ def select_root_cause_candidates(
         return ""
 
     def add(assessed: DiagnosticCandidateAssessment, reason: str) -> bool:
+        # Relative/fallback evidence may enrich a valid pack, but it must never
+        # manufacture the first cause.  This allows an intentionally empty pack
+        # when every retrieved candidate is too weak or ambiguous.
+        strong_seed_reasons = {
+            "corroborated_documented_case",
+            "new_supported_signal",
+            "core_mechanism",
+        }
+        if not selected and reason not in strong_seed_reasons:
+            rejection_reasons.setdefault(assessed.stable_key, "insufficient_absolute_evidence")
+            return False
         blocked = capacity_reason(assessed)
         if blocked:
             rejection_reasons.setdefault(assessed.stable_key, blocked)
             return False
+        if not selected and assessed is assessments[0]:
+            reason = "anchor"
         selected_rank = len(selected) + 1
         selected.append(
             _annotated_candidate(
@@ -524,15 +538,11 @@ def select_root_cause_candidates(
         )
         return documented_case, novel_supported, core_mechanism, close_peer
 
-    # The strongest pre-ranked candidate remains the anchor.  This preserves the
-    # existing retrieval order and prevents the compactor from manufacturing a new
-    # top cause merely through its bounded quality summary.
-    add(assessments[0], "anchor")
-
-    # Coverage pass: consider every remaining candidate before filling close-peer
-    # slots.  A later, independently supported facet/mechanism therefore cannot be
-    # crowded out by several near-duplicate high-ranked pages from the same source.
-    for assessed in assessments[1:]:
+    # Coverage pass: every candidate, including rank 1, must pass an absolute
+    # diagnostic admission contract.  The first admitted rank-1 candidate keeps
+    # the public ``anchor`` label, but ranking alone never grants admission.
+    # This also permits a zero-evidence result for underspecified symptoms.
+    for assessed in assessments:
         if len(selected) >= limit:
             break
         (
@@ -550,8 +560,13 @@ def select_root_cause_candidates(
 
     # Relevance-fill pass: add only close-quality peers.  Different source identity
     # is intentionally absent from this admission decision.
-    for assessed in assessments[1:]:
+    for assessed in assessments:
         if assessed.stable_key in selected_ids:
+            continue
+        if not selected:
+            rejection_reasons.setdefault(
+                assessed.stable_key, "insufficient_absolute_evidence"
+            )
             continue
         if len(selected) >= limit:
             rejection_reasons.setdefault(assessed.stable_key, "limit")
