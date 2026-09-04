@@ -470,6 +470,112 @@ def clean_xlsx_snippet_for_display(
     return clean
 
 
+def _xlsx_focus_anchors(citation: dict) -> list[str]:
+    """Return exact row anchors already carried by the admitted citation.
+
+    XLSX chunks intentionally contain several adjacent rows so the model can use
+    the table context.  The short SQL ``snippet`` is, however, a left-prefix of the
+    chunk and can stop before the row that actually matched the request.  Retrieval
+    already records the exact identifier and/or the dense query on the candidate;
+    use only those admitted fields to choose the visible row.  This is presentation
+    alignment, not a new retrieval or reasoning rule.
+    """
+    raw_values: list[str] = []
+    exact_identifier = str(citation.get("exact_identifier_token") or "").strip()
+    if exact_identifier:
+        raw_values.append(exact_identifier)
+
+    for key in (
+        "query_used",
+        "source_retrieval_query",
+        "retrieval_query",
+        "matched_query",
+    ):
+        value = str(citation.get(key) or "").strip()
+        if value:
+            raw_values.append(value)
+
+    anchors: list[str] = []
+    seen: set[str] = set()
+
+    def add(value: str) -> None:
+        value = re.sub(r"\s+", " ", str(value or "").strip(" \t\r\n.,;:()[]{}<>\"'"))
+        if len(value) < 3:
+            return
+        key = value.casefold()
+        if key in seen:
+            return
+        seen.add(key)
+        anchors.append(value)
+
+    if exact_identifier:
+        add(exact_identifier)
+
+    mixed_identifier_rx = re.compile(
+        r"(?<![A-Za-z0-9])"
+        r"(?=[A-Za-z0-9_.\-/]*[A-Za-z])"
+        r"(?=[A-Za-z0-9_.\-/]*\d)"
+        r"[A-Za-z0-9][A-Za-z0-9_.\-/]{2,}"
+        r"(?![A-Za-z0-9])"
+    )
+    for value in raw_values:
+        for token in mixed_identifier_rx.findall(value):
+            add(token)
+
+    return anchors[:12]
+
+
+def _xlsx_source_focused_on_admitted_row(text: str, citation: dict) -> str:
+    """Keep XLSX metadata plus the row(s) matching admitted exact anchors.
+
+    If no exact anchor is available or no row contains it, return an empty string
+    so the caller preserves the historical short-snippet display.  A weak semantic
+    word overlap is deliberately insufficient: the presentation layer must never
+    guess which table row supported an answer.
+    """
+    anchors = _xlsx_focus_anchors(citation)
+    if not anchors:
+        return ""
+
+    lines = [
+        re.sub(r"\s+", " ", raw_line).strip()
+        for raw_line in str(text or "").replace("\r", "\n").split("\n")
+        if str(raw_line or "").strip()
+    ]
+    if not lines:
+        return ""
+
+    metadata: list[str] = []
+    rows: list[str] = []
+
+    for line in lines:
+        if re.match(r"^ROW\s+\d+\s*:", line, flags=re.IGNORECASE):
+            rows.append(line)
+        else:
+            metadata.append(line)
+
+    exact_identifier = str(citation.get("exact_identifier_token") or "").strip()
+    matched_rows: list[str] = []
+    if exact_identifier:
+        exact_folded = exact_identifier.casefold()
+        matched_rows = [row for row in rows if exact_folded in row.casefold()]
+
+    if not matched_rows:
+        folded_anchors = [anchor.casefold() for anchor in anchors]
+        matched_rows = [
+            row
+            for row in rows
+            if any(anchor in row.casefold() for anchor in folded_anchors)
+        ]
+
+    if not matched_rows:
+        return ""
+
+    # Preserve original workbook order and cap the visible selection.  Multiple
+    # rows are retained only when the request itself contains multiple exact IDs.
+    return "\n".join(metadata + matched_rows[: max(1, min(4, len(anchors)))])
+
+
 def sanitize_citations_for_response(
     citations: list[dict],
     company_id: Optional[str] = None,
@@ -509,9 +615,9 @@ def sanitize_citations_for_response(
         document_id = str(citation.get("bubble_document_id") or "").strip()
         if not citation_id or not document_id:
             continue
-        raw_snippet = (
-            citation.get("snippet") or citation.get("chunk_full") or ""
-        ).strip()
+        short_snippet = str(citation.get("snippet") or "").strip()
+        full_snippet = str(citation.get("chunk_full") or "").strip()
+        raw_snippet = (short_snippet or full_snippet).strip()
         base_for_meta = {
             **citation,
             "citation_id": citation_id,
@@ -543,9 +649,14 @@ def sanitize_citations_for_response(
                     max_len=int(max_snippet_clean_chars or 520),
                 )
         else:
-            if xlsx_predicate_fn(raw_snippet):
+            xlsx_source = full_snippet or raw_snippet
+            if xlsx_predicate_fn(raw_snippet) or xlsx_predicate_fn(xlsx_source):
+                focused_xlsx_source = _xlsx_source_focused_on_admitted_row(
+                    xlsx_source,
+                    citation,
+                )
                 clean_snippet = xlsx_snippet_fn(
-                    raw_snippet,
+                    focused_xlsx_source or raw_snippet,
                     max_len=int(max_snippet_clean_chars or 520),
                 )
             else:
@@ -572,10 +683,13 @@ def sanitize_citations_for_response(
             "page_to": safe_int_fn(citation.get("page_to"), 0),
             "snippet": raw_snippet,
             "snippet_clean": clean_snippet,
-            "similarity": float(
-                citation.get("similarity")
-                or citation.get("retrieval_score")
-                or 0.0
+            "similarity": min(
+                1.0,
+                float(
+                    citation.get("similarity")
+                    or citation.get("retrieval_score")
+                    or 0.0
+                ),
             ),
             "ask_structured_manual_support": bool(
                 citation.get("ask_structured_manual_support")
