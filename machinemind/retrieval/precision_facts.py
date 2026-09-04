@@ -632,8 +632,8 @@ def _fetch_scoped_pages(
             WHERE {where_sql}
               AND text IS NOT NULL
               AND length(text) > 20
-              AND COALESCE(text, '') NOT ILIKE 'DOCUMENT_FILE_TYPE: XLSX%'
-              AND COALESCE(text, '') NOT ILIKE 'SOURCE_TYPE:%'
+              AND COALESCE(text, '') NOT ILIKE 'DOCUMENT_FILE_TYPE: XLSX%%'
+              AND COALESCE(text, '') NOT ILIKE 'SOURCE_TYPE:%%'
               AND ({predicate})
             ORDER BY CASE WHEN machine_id = %s THEN 0 ELSE 1 END,
                      bubble_document_id, page_number
