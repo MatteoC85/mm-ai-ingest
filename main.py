@@ -140,6 +140,17 @@ from machinemind.ingest import dispatch as _ingest_dispatch
 from machinemind.ingest import persistence as _ingest_persistence
 from machinemind.ingest import metering as _ingest_metering
 from machinemind.ingest import orchestration as _ingest_orchestration
+from machinemind.retrieval import precision_facts as _retrieval_precision_facts
+
+
+_PRECISION_FACT_RUNTIME = lambda: _retrieval_precision_facts.PrecisionFactRuntime(
+    connect_db=_db_conn,
+    build_scope_where=_ask_evidence_scope_where,
+    fetch_file_map=_fetch_document_file_map,
+    company_general_machine_sentinel=COMPANY_GENERAL_MACHINE_SENTINEL,
+    page_text_chars=max(12000, int(V13_PAGE_TEXT_CHARS or 12000)),
+    page_scan_limit=max(80, min(900, int(V13_PAGE_SCAN_LIMIT or 500))),
+)
 
 
 _RESPONSE_PRESENTATION_RUNTIME = lambda: _presentation_responses.ResponsePresentationRuntime(
@@ -27704,6 +27715,103 @@ def _assistant_core_technical_error(
     return _assistant_core_attach_runtime_meta(response, budget, debug=False)
 
 
+
+def _assistant_core_precision_fact_rescue(
+    *,
+    q: str,
+    company_id: str,
+    machine_id: str,
+    doc_ids: Optional[list[str]],
+    bubble_document_id: Optional[str],
+    response_language: str,
+    top_k: int,
+) -> Optional[dict]:
+    """Recover one unambiguous scalar fact after ASK has already failed closed.
+
+    Safety, scope and semantic routing run first in Assistant Core.  This rescue is
+    deliberately unavailable to Root Cause/Smart Diagnostic and never replaces an
+    existing successful answer.  It reads only authorized ``document_pages`` and
+    requires a same-label numeric value with an engineering unit.
+    """
+    if (
+        (not str(machine_id or "").strip()
+         or str(machine_id or "").strip() == COMPANY_GENERAL_MACHINE_SENTINEL)
+        and not doc_ids
+        and not str(bubble_document_id or "").strip()
+    ):
+        return None
+    try:
+        resolution = _retrieval_precision_facts.resolve_precision_fact(
+            query=q,
+            company_id=company_id,
+            machine_id=machine_id,
+            doc_ids=doc_ids,
+            bubble_document_id=str(bubble_document_id or "").strip() or None,
+            runtime=_PRECISION_FACT_RUNTIME(),
+        )
+    except Exception as exc:
+        print("PRECISION_FACT_RESCUE_FAIL", type(exc).__name__, str(exc)[:500])
+        return None
+    if resolution is None:
+        return None
+
+    raw_citation = _retrieval_precision_facts.resolution_to_candidate(resolution)
+    try:
+        citations = _sanitize_citations_for_response(
+            [raw_citation], company_id=company_id
+        )
+    except Exception as exc:
+        print("PRECISION_FACT_CITATION_FAIL", type(exc).__name__, str(exc)[:500])
+        return None
+    if not citations:
+        return None
+    try:
+        rg_links = _build_rg_links(company_id, citations)
+    except Exception as exc:
+        print("PRECISION_FACT_LINK_FAIL", type(exc).__name__, str(exc)[:500])
+        return None
+    if not rg_links:
+        return None
+
+    is_en = str(response_language or "").lower().startswith("en")
+    answer = (
+        f"The requested value is {resolution.value}."
+        if is_en
+        else f"{resolution.label}: {resolution.value}."
+    )
+    return {
+        "ok": True,
+        "status": "answered",
+        "result_code": "ANSWERED",
+        "requested_mode": MODE_ASK,
+        "effective_mode": MODE_ASK,
+        "routed": False,
+        "request_kind": KIND_FACTUAL,
+        "information_task": INFO_NUMERIC_SPECIFICATION,
+        "required_answer_types": [REQ_NUMERIC_VALUE],
+        "evidence_state": EVIDENCE_SUPPORTED,
+        "evidence_policy": POLICY_MACHINE_REQUIRED,
+        "grounding": "indexed_machine_sources",
+        "answer": answer,
+        "language": response_language,
+        "citations": citations,
+        "rg_links": rg_links,
+        "top_k": max(1, int(top_k or 1)),
+        "similarity_max": None,
+        "chat_model": "deterministic_precision_fact_rescue_v1",
+        "meta": {
+            "cacheable": True,
+            "semantic_cacheable": False,
+            "precision_fact_rescue": {
+                "version": "precision-fact-v1",
+                "page": int(resolution.page_number),
+                "supporting_pages": list(resolution.supporting_pages),
+                "property_terms": list(resolution.property_terms),
+                "score": round(float(resolution.score), 6),
+            },
+        },
+    }
+
 def _assistant_core_sync(payload: Union[AskRequest, RootCauseRequest], x_ai_internal_secret: Optional[str], *, requested_mode: str) -> dict:
     if not AI_INTERNAL_SECRET:
         raise HTTPException(status_code=500, detail="AI_INTERNAL_SECRET missing")
@@ -27746,6 +27854,27 @@ def _assistant_core_sync(payload: Union[AskRequest, RootCauseRequest], x_ai_inte
             debug=bool(payload.debug),
         )
         if cached is not None:
+            if (
+                requested_mode == MODE_ASK
+                and str(cached.get("status") or "").strip().lower() == "no_sources"
+            ):
+                rescued = _assistant_core_precision_fact_rescue(
+                    q=q,
+                    company_id=company_id,
+                    machine_id=machine_id,
+                    doc_ids=doc_ids,
+                    bubble_document_id=bubble_document_id,
+                    response_language=response_language,
+                    top_k=top_k,
+                )
+                if rescued is not None:
+                    budget.route = "assistant_core_precision_fact_cache_rescue"
+                    rescued = _assistant_ui_finalize_response(
+                        rescued, language=response_language
+                    )
+                    return _assistant_core_attach_runtime_meta(
+                        rescued, budget, debug=bool(payload.debug)
+                    )
             budget.route = "assistant_core_semantic_cache"
             cached = _assistant_ui_finalize_response(cached, language=response_language)
             return _assistant_core_attach_runtime_meta(cached, budget, debug=bool(payload.debug))
@@ -27767,14 +27896,33 @@ def _assistant_core_sync(payload: Union[AskRequest, RootCauseRequest], x_ai_inte
                 "bubble_document_id": bubble_document_id,
             },
         )
+        precision_rescued = False
         final = _ASSISTANT_CORE_ENGINE.run(request)
+        if (
+            requested_mode == MODE_ASK
+            and str(final.get("status") or "").strip().lower() == "no_sources"
+        ):
+            rescued = _assistant_core_precision_fact_rescue(
+                q=q,
+                company_id=company_id,
+                machine_id=machine_id,
+                doc_ids=doc_ids,
+                bubble_document_id=bubble_document_id,
+                response_language=response_language,
+                top_k=top_k,
+            )
+            if rescued is not None:
+                final = rescued
+                precision_rescued = True
+                budget.route = "assistant_core_precision_fact_rescue"
         final = _assistant_ui_finalize_response(final, language=response_language)
         effective_mode = str(final.get("effective_mode") or requested_mode)
         routed = bool(final.get("routed"))
-        budget.route = (
-            f"assistant_core_{requested_mode}_to_{effective_mode}"
-            if routed else f"assistant_core_{effective_mode}"
-        )
+        if not precision_rescued:
+            budget.route = (
+                f"assistant_core_{requested_mode}_to_{effective_mode}"
+                if routed else f"assistant_core_{effective_mode}"
+            )
         final = _assistant_core_attach_runtime_meta(final, budget, debug=bool(payload.debug))
         _v13_cache_store(
             mode=requested_mode,
