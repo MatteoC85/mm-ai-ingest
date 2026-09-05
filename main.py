@@ -27964,6 +27964,85 @@ def _assistant_core_precision_fact_rescue(
         },
     }
 
+def _assistant_core_root_cause_epistemic_fast_response(
+    payload: RootCauseRequest,
+) -> Optional[dict]:
+    """Return a Bubble-compatible zero-cause answer before streaming/retrieval.
+
+    This path is intentionally limited to Root Cause requests for which the
+    deterministic diagnostic-query contract proves that no cause-discriminating
+    observation is available.  It performs no DB, cache, retrieval or LLM work.
+    The public ``status`` remains ``answered`` because Bubble's existing Root
+    Cause workflow predates ``needs_clarification``; the semantic state is carried
+    by ``result_code`` and metadata instead of introducing a new UI contract.
+    """
+    q = str(payload.query or "").strip()
+    if not q:
+        return None
+    response_language = _select_response_language(q, preferred=payload.language)
+    profile = _retrieval_diagnostic_query.analyze_diagnostic_query(
+        q, response_language=response_language
+    )
+    if not profile.force_clarification:
+        return None
+
+    # Preserve the existing API scope validation even though this fast path does
+    # not read tenant data.  resolve_query_scope is pure and performs no I/O.
+    _resolve_query_scope(
+        company_id=payload.company_id,
+        machine_id=payload.machine_id,
+        bubble_document_id=payload.bubble_document_id,
+        document_ids=payload.document_ids,
+        ai_scope=payload.ai_scope,
+    )
+
+    question = str(profile.clarification_question or "").strip()
+    if not question:
+        question = (
+            "No cause is demonstrated by the observations currently available. "
+            "Collect the missing diagnostic observations before ranking causes."
+            if response_language.lower().startswith("en")
+            else "Nessuna causa è dimostrata dalle osservazioni attualmente disponibili. "
+            "Raccogli le osservazioni diagnostiche mancanti prima di ordinare le cause per probabilità."
+        )
+    top_k = max(1, min(int(payload.top_k or 8), ASK_MAX_TOP_K))
+    response = {
+        "ok": True,
+        "status": "answered",
+        "result_code": RESULT_NEEDS_CLARIFICATION,
+        "requested_mode": MODE_ROOT_CAUSE,
+        "effective_mode": MODE_ROOT_CAUSE,
+        "routed": False,
+        "request_kind": KIND_FAULT_DIAGNOSTIC,
+        "information_task": INFO_FAULT_DIAGNOSTIC,
+        "required_answer_types": [REQ_DIAGNOSTIC_CAUSES, REQ_CHECKLIST],
+        "evidence_state": EVIDENCE_CLARIFY,
+        "evidence_policy": POLICY_MACHINE_REQUIRED,
+        "grounding": "diagnostic_observation_state",
+        "language": response_language,
+        "symptom": q,
+        "problem_summary": question,
+        "possible_causes": [],
+        "recommended_next_checks": list(profile.missing_information)[:8],
+        "citations": [],
+        "rg_links": [],
+        "top_k": top_k,
+        "similarity_max": None,
+        "chat_model": "deterministic_epistemic_fast_path_v1",
+        "meta": {
+            "cacheable": False,
+            "semantic_cacheable": False,
+            "diagnostic_state": "needs_clarification",
+            "assistant_core_fast_path": "root_diagnostic_epistemic_clarification",
+            "assistant_core_diagnostic_query_state": profile.public_summary(),
+            "llm_calls": 0,
+            "retrieval_skipped": True,
+            "semantic_cache": "bypass_diagnostic_query_state",
+        },
+    }
+    return _assistant_ui_finalize_response(response, language=response_language)
+
+
 def _assistant_core_sync(payload: Union[AskRequest, RootCauseRequest], x_ai_internal_secret: Optional[str], *, requested_mode: str) -> dict:
     if not AI_INTERNAL_SECRET:
         raise HTTPException(status_code=500, detail="AI_INTERNAL_SECRET missing")
@@ -28857,6 +28936,15 @@ async def root_cause_v1(
         raise HTTPException(status_code=401, detail="Unauthorized")
     if not str(payload.query or "").strip():
         raise HTTPException(status_code=400, detail="Missing query")
+
+    # Epistemic stop conditions must not enter the streaming/heartbeat wrapper.
+    # Returning a normal JSON object here keeps the existing Bubble contract and
+    # guarantees that an information-insufficient Root Cause request cannot wait
+    # on cache, retrieval, DB or LLM work.
+    if ASSISTANT_CORE_V2_ENABLED:
+        fast_response = _assistant_core_root_cause_epistemic_fast_response(payload)
+        if fast_response is not None:
+            return fast_response
 
     sync_func = _assistant_core_root_cause_sync if ASSISTANT_CORE_V2_ENABLED else _root_cause_v13_sync
     if not V13_STREAM_HEARTBEAT_ENABLED:

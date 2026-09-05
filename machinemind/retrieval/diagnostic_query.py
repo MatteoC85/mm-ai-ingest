@@ -77,6 +77,7 @@ _MISSING_MARKER_PATTERNS = tuple(
         r"\b(?:do|does|did)\s+not\s+(?:have|know)\s+(?:any\s+)?(?:data|information|reading|readings|measurement|measurements|result|results|log|history|message|messages)\b",
         r"\b(?:don't|doesn't|didn't)\s+(?:have|know)\s+(?:any\s+)?(?:data|information|reading|readings|measurement|measurements|result|results|log|history|message|messages)\b",
         r"\b(?:no|not\s+any)\s+(?:diagnostic\s+)?(?:data|information|readings?|measurements?|results?|observations?|logs?|history|messages?)\s+(?:is|are|was|were)\s+available\b",
+        r"\bno\s+(?=[^.!?]{0,280}\b(?:data|information|readings?|measurements?|status|states|feedback|history|checks?|inspections?|tests?|messages?|observations?)\b)[^.!?]{2,320}\s+(?:was|were)\s+(?:collected|acquired|obtained|taken|performed|carried\s+out)\b",
         r"\b(?:data|information|readings?|measurements?|results?|observations?|logs?|history|messages?)\s+(?:is|are|was|were)\s+not\s+available\b",
         r"\b(?:status|value|result|reading)\s+(?:is|was|remains?)\s+unknown\b",
         r"\b(?:nothing|none)\s+(?:has\s+been|was)\s+(?:checked|measured|observed|recorded|collected|verified|inspected|tested)\b",
@@ -98,6 +99,7 @@ _GLOBAL_ABSENCE_PATTERNS = tuple(
         r"\b(?:nessun[oa]?|alcun[oa]?)\s+(?:controllo|verifica|misura|lettura|test|ispezione)\s+(?:e|è|risulta)?\s*stat[oaie]\s+(?:effettuat[oaie]|eseguit[oaie]|fatt[oaie])\b",
         r"\bnon\s+(?:ho|abbiamo|ha|hanno)\s+controllato\s+nulla\b",
         r"\bno\s+(?:diagnostic\s+)?(?:data|information|observations?|readings?|measurements?|checks?|results?)\s+(?:has|have|had|was|were)\s+(?:been\s+)?(?:collected|recorded|acquired|made|performed|available)\b",
+        r"\bno\s+(?=[^.!?]{0,280}\b(?:data|information|readings?|measurements?|status|states|feedback|history|checks?|inspections?|tests?|messages?|observations?)\b)[^.!?]{2,320}\s+(?:was|were)\s+(?:collected|acquired|obtained|taken|performed|carried\s+out)\b",
         r"\b(?:no|not\s+any)\s+(?:diagnostic\s+)?(?:data|information|observations?|readings?|measurements?|results?)\s+(?:is|are|was|were)\s+available\b",
         r"\b(?:nothing|none)\s+(?:has\s+been|was)\s+(?:checked|measured|observed|recorded|collected|verified|inspected|tested)\b",
         r"\b(?:we|i)\s+(?:have\s+)?not\s+checked\s+anything\b",
@@ -127,6 +129,8 @@ _GENERIC_EFFECT_PATTERNS = tuple(
     for pattern in (
         r"\b(?:macchina|machine|impianto|linea|line)\b.*\b(?:si\s+ferma|ferma|arresta|non\s+riparte|non\s+parte|stops?|stopped|does\s+not\s+restart|won't\s+restart|does\s+not\s+start)\b",
         r"\b(?:ha\s+ripreso|riprende|riparte|resumed?|restarts?)\b",
+        r"\b(?:dopo\s+un(?:a)?\s+)?(?:fermo|arresto|interruzione)\s+(?:intermittente|saltuari[oa]|occasionale)\b",
+        r"\b(?:after\s+an?\s+)?(?:intermittent|occasional)\s+(?:stop|stoppage|shutdown|interruption)\b",
         r"\b(?:intermittente|intermittently|a\s+volte|sometimes|occasional(?:ly)?)\b",
     )
 )
@@ -403,6 +407,17 @@ def _strip_epistemic_prefix(value: str) -> str:
     )
     text = re.sub(
         r"\s+(?:e|è|risulta)?\s*stat[oaie]\s+(?:effettuat[oaie]|eseguit[oaie]|fatt[oaie])$",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    # Coordinated English missing-information lists often use the compact form
+    # "no HMI message, pressure reading, guard status ... was collected". Once
+    # the enclosing span has already been classified as epistemically missing,
+    # remove only the grammatical wrapper and preserve the listed variables.
+    text = re.sub(r"^(?:but|and)?\s*no\s+", "", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"\s+(?:was|were)\s+(?:collected|acquired|obtained|taken|performed|carried\s+out)$",
         "",
         text,
         flags=re.IGNORECASE,
