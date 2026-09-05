@@ -18,7 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence, Mapping
 import re
 import unicodedata
 
@@ -230,6 +230,49 @@ def extract_property_query(query: str) -> Optional[PropertyQuery]:
         property_terms=tuple(terms),
         property_phrase=" ".join(terms),
         code_tokens=code_tokens,
+    )
+
+
+def property_query_from_answer_contract(
+    original_query: str, contract: Optional[Mapping[str, Any]]
+) -> Optional[PropertyQuery]:
+    """Use one scalar facet already resolved by the semantic router.
+
+    This is not a new semantic parser or a property-synonym dictionary. It lets
+    the existing router separate conversational framing/inflection from a scalar
+    property. Source-only instructions, original model/code restrictions and the
+    exact label/value ambiguity gate remain authoritative. Multi-part tasks and
+    competing facets deliberately stay outside this optional rescue.
+    """
+    if not isinstance(contract, Mapping) or _is_non_scalar_request(original_query):
+        return None
+    if contract.get("effective_mode") != "ask" or contract.get("information_task") != "numeric_specification":
+        return None
+    if contract.get("router_degraded") or contract.get("evidence_policy") != "machine_sources_required":
+        return None
+    if contract.get("source_type_policy") == "require":
+        return None
+    requirements = set(contract.get("required_answer_types") or [])
+    if "numeric_value" not in requirements or requirements - {"numeric_value", "explanation"}:
+        return None
+    facets = contract.get("facet_queries")
+    if not isinstance(facets, (list, tuple)) or len(facets) != 1:
+        return None
+    facet = facets[0]
+    if not isinstance(facet, Mapping) or facet.get("answer_type") != "numeric_value" or facet.get("must_cover") is not True:
+        return None
+    canonical = extract_property_query(str(facet.get("facet") or ""))
+    if canonical is None:
+        return None
+    original_codes = tuple(dict.fromkeys(m.group(0) for m in _CODE_RE.finditer(_normalize_text(original_query))))
+    original_keys = {_identifier_key(c) for c in original_codes}
+    if any(_identifier_key(c) not in original_keys for c in canonical.code_tokens):
+        return None
+    return PropertyQuery(
+        normalized=_strip_accents(_normalize_text(original_query)).casefold(),
+        property_terms=canonical.property_terms,
+        property_phrase=canonical.property_phrase,
+        code_tokens=original_codes,
     )
 
 
@@ -570,15 +613,9 @@ def _source_matches_query_codes(
     return bool(haystack) and all(code in haystack for code in required)
 
 
-def resolve_precision_fact_from_pages(
-    *,
-    query: str,
-    pages: Sequence[dict[str, Any]],
-    target_machine_id: str = "",
-) -> Optional[PrecisionFactResolution]:
-    property_query = extract_property_query(query)
-    if property_query is None:
-        return None
+def _matching_scoped_fact_pairs(
+    pages: Sequence[dict[str, Any]], property_query: PropertyQuery, target_machine_id: str
+) -> list[FactPair]:
     pairs: list[FactPair] = []
     for page in pages or []:
         if not isinstance(page, dict):
@@ -586,21 +623,31 @@ def resolve_precision_fact_from_pages(
         page_text = str(page.get("text") or page.get("page_text") or "")
         if not _ordinary_document_page(page_text):
             continue
-        pairs.extend(
-            extract_fact_pairs(
-                page_text=page_text,
-                page_number=int(page.get("page_number") or page.get("page_from") or 1),
-                bubble_document_id=str(page.get("bubble_document_id") or ""),
-                machine_id=str(page.get("machine_id") or ""),
-                query=property_query,
-            )
-        )
+        pairs.extend(extract_fact_pairs(
+            page_text=page_text,
+            page_number=int(page.get("page_number") or page.get("page_from") or 1),
+            bubble_document_id=str(page.get("bubble_document_id") or ""),
+            machine_id=str(page.get("machine_id") or ""),
+            query=property_query,
+        ))
     target = str(target_machine_id or "").strip()
     if target:
-        exact_machine_pairs = [pair for pair in pairs if str(pair.machine_id or "").strip() == target]
-        if exact_machine_pairs:
-            pairs = exact_machine_pairs
-    return choose_unambiguous_fact(pairs, property_query)
+        exact = [pair for pair in pairs if str(pair.machine_id or "").strip() == target]
+        if exact:
+            pairs = exact
+    return pairs
+
+
+def resolve_precision_fact_from_pages(
+    *, query: str, pages: Sequence[dict[str, Any]], target_machine_id: str = "",
+    property_query: Optional[PropertyQuery] = None,
+) -> Optional[PrecisionFactResolution]:
+    property_query = property_query or extract_property_query(query)
+    if property_query is None:
+        return None
+    return choose_unambiguous_fact(
+        _matching_scoped_fact_pairs(pages, property_query, target_machine_id), property_query
+    )
 
 
 def _fetch_scoped_pages(
@@ -677,48 +724,49 @@ def resolve_precision_fact(
     doc_ids: Optional[list[str]],
     bubble_document_id: Optional[str],
     runtime: PrecisionFactRuntime,
+    answer_contract: Optional[Mapping[str, Any]] = None,
 ) -> Optional[PrecisionFactResolution]:
-    property_query = extract_property_query(query)
-    if property_query is None:
-        return None
-    pages = _fetch_scoped_pages(
-        runtime=runtime,
-        property_query=property_query,
-        company_id=company_id,
-        machine_id=machine_id,
-        doc_ids=doc_ids,
-        bubble_document_id=bubble_document_id,
-    )
-    required_codes = _strong_query_codes(property_query)
-    if required_codes:
-        if runtime.fetch_file_map is None:
-            return None
-        document_ids = sorted({
-            str(page.get("bubble_document_id") or "").strip()
-            for page in pages
-            if isinstance(page, dict) and str(page.get("bubble_document_id") or "").strip()
-        })
-        try:
-            file_map = runtime.fetch_file_map(company_id, document_ids) or {}
-        except Exception:
-            return None
-        pages = [
-            page
-            for page in pages
-            if _source_matches_query_codes(
+    # Preserve the historical literal resolver first. Only absence of matching
+    # literal facts permits one router-normalized scalar facet to be attempted.
+    # A literal conflict is terminal: a semantic rewrite must not hide it.
+    literal = extract_property_query(query)
+    canonical = property_query_from_answer_contract(query, answer_contract)
+    queries = [pq for pq in (literal, canonical) if pq is not None]
+    seen: set[tuple[str, ...]] = set()
+    for property_query in queries:
+        if property_query.property_terms in seen:
+            continue
+        seen.add(property_query.property_terms)
+        pages = _fetch_scoped_pages(
+            runtime=runtime,
+            property_query=property_query,
+            company_id=company_id,
+            machine_id=machine_id,
+            doc_ids=doc_ids,
+            bubble_document_id=bubble_document_id,
+        )
+        required_codes = _strong_query_codes(property_query)
+        if required_codes:
+            if runtime.fetch_file_map is None:
+                return None
+            document_ids = sorted({
+                str(page.get("bubble_document_id") or "").strip()
+                for page in pages
+                if isinstance(page, dict) and str(page.get("bubble_document_id") or "").strip()
+            })
+            try:
+                file_map = runtime.fetch_file_map(company_id, document_ids) or {}
+            except Exception:
+                return None
+            pages = [page for page in pages if _source_matches_query_codes(
                 query=property_query,
                 source_hint=str(file_map.get(str(page.get("bubble_document_id") or "")) or ""),
                 page_text=str(page.get("text") or page.get("page_text") or ""),
-            )
-        ]
-        if not pages:
-            return None
-
-    return resolve_precision_fact_from_pages(
-        query=query,
-        pages=pages,
-        target_machine_id=machine_id,
-    )
+            )]
+        pairs = _matching_scoped_fact_pairs(pages, property_query, machine_id)
+        if pairs:
+            return choose_unambiguous_fact(pairs, property_query)
+    return None
 
 
 def resolution_to_candidate(resolution: PrecisionFactResolution) -> dict[str, Any]:

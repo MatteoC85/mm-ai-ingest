@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Sequence
 import re
 import unicodedata
+import copy
+import hashlib
 
 
 POLICY_VERSION = "root-diagnostic-query-state-v1"
@@ -30,18 +32,21 @@ _IT_EPISTEMIC_PARTICIPLES = (
     r"lett[oaie]", r"controllat[oaie]", r"verificat[oaie]", r"misurat[oaie]",
     r"rilevat[oaie]", r"osservat[oaie]", r"registrat[oaie]", r"raccolt[oaie]",
     r"acquisit[oaie]", r"annotat[oaie]", r"ispezionat[oaie]", r"testat[oaie]",
-    r"accertat[oaie]", r"monitorat[oaie]",
+    r"accertat[oaie]", r"monitorat[oaie]", r"consultat[oaie]",
+    r"identificat[oaie]", r"determinat[oaie]",
 )
 _IT_EPISTEMIC_INFINITIVES = (
     r"leggere", r"controllare", r"verificare", r"misurare", r"rilevare",
     r"osservare", r"registrare", r"raccogliere", r"acquisire", r"annotare",
     r"ispezionare", r"testare", r"accertare", r"monitorare",
+    r"consultare", r"identificare", r"determinare",
 )
 _EN_EPISTEMIC_VERBS = (
     r"read", r"check(?:ed)?", r"verif(?:y|ied)", r"measur(?:e|ed)",
     r"observ(?:e|ed)", r"record(?:ed)?", r"collect(?:ed)?", r"acquir(?:e|ed)",
     r"inspect(?:ed)?", r"test(?:ed)?", r"confirm(?:ed)?", r"monitor(?:ed)?",
-    r"log(?:ged)?", r"review(?:ed)?",
+    r"log(?:ged)?", r"review(?:ed)?", r"consult(?:ed)?",
+    r"identif(?:y|ied)", r"determin(?:e|ed)",
 )
 
 _IT_PART = "(?:" + "|".join(_IT_EPISTEMIC_PARTICIPLES) + ")"
@@ -417,7 +422,7 @@ def _strip_epistemic_prefix(value: str) -> str:
     # remove only the grammatical wrapper and preserve the listed variables.
     text = re.sub(r"^(?:but|and)?\s*no\s+", "", text, flags=re.IGNORECASE)
     text = re.sub(
-        r"\s+(?:was|were)\s+(?:collected|acquired|obtained|taken|performed|carried\s+out)$",
+        r"\s+(?:was|were)\s+(?:collected|recorded|acquired|obtained|taken|performed|carried\s+out)$",
         "",
         text,
         flags=re.IGNORECASE,
@@ -437,12 +442,12 @@ def _extract_missing_items(spans_text: Sequence[str]) -> tuple[str, ...]:
         # nessun/no.  Splitting is only for clarification/debug; it never affects
         # the retrieval query, which is removed by exact character spans above.
         chunks = re.split(
-            r"\s*(?:,|;|\bné\b|\bne\s+tantomeno\b|\bnor\b|\be\s+(?=nessun)|\band\s+(?=no\b)|\be\s+(?=non\s+(?:ho|ha|abbiamo|hanno)\b)|\band\s+(?=(?:have|has|had)\s+not\b)|\bor\s+(?=(?:checked|measured|read|verified|observed|recorded)\b)|\bo\s+(?=(?:controllato|misurato|letto|verificato|osservato|registrato)\b))\s*",
+            r"\s*(?:,|;|\bné\b|\bne\s+tantomeno\b|\bnor\b|\be\s+(?=nessun)|\band\s+(?=no\b)|\be\s+(?=non\s+(?:ho|hai|ha|abbiamo|avete|hanno|e|è|sono|era|erano)\b)|\band\s+(?=(?:have|has|had)\s+not\b)|\bor\s+(?=(?:checked|measured|read|verified|observed|recorded)\b)|\bo\s+(?=(?:controllato|misurato|letto|verificato|osservato|registrato)\b))\s*",
             cleaned,
             flags=re.IGNORECASE,
         )
         for chunk in chunks:
-            item = _normalize(chunk).strip(" ,;:.-–—")
+            item = _strip_epistemic_prefix(chunk).strip(" ,;:.-–—")
             item = re.sub(
                 r"^(?:nessun[oa]?|alcun[oa]?|no|not\s+any)\s+",
                 "",
@@ -842,4 +847,171 @@ def sanitize_router_payload(
     }
     out["diagnostic_query_state"] = profile.public_summary()
     out["diagnostic_query_sanitization"] = summary
+    return RouterSanitizationResult(payload=out, summary=summary)
+
+
+# Observation adequacy is a semantic judgement, separate from document relevance.
+# It is requested in the existing Root Cause router call; no new model call or
+# machine vocabulary is introduced here. The deterministic boundary enforces the
+# judgement and requires verbatim support in the current user's observations.
+DIAGNOSTIC_BASIS_POLICY = "root-observation-admission-v1"
+BASIS_METADATA_KEY = "root_diagnostic_basis"
+
+DIAGNOSTIC_BASIS_INSTRUCTION = (
+    "ROOT CAUSE OBSERVATION ADMISSION: Fill diagnostic_basis independently of source "
+    "availability. A relevant historical document does not establish a current observation. "
+    "Choose sufficient only when the CURRENT user describes at least one discriminating "
+    "observation, measured state, observed negative condition, or relevant operation "
+    "explicitly not performed, sufficient to prioritize a documented mechanism as a hypothesis. "
+    "A confirmed root cause is NOT required. A bare stop, restart, vague malfunction or "
+    "intermittence without distinguishing conditions is NOT sufficient, however similar "
+    "a retrieved historical case may appear. Choose needs_observations in that situation. "
+    "Choose needs_target_identity when the user explicitly has not identified the affected "
+    "component/model and that identity is necessary for the requested model-specific oil, "
+    "maintenance, operating or other prescriptions. Never resolve identity from the first "
+    "retrieved model. Requests for information needed before applying prescriptions to an explicitly "
+    "unidentified target also use needs_target_identity, not the not_diagnostic exemption. "
+    "A serial number is NOT required for all diagnoses; a clearly identified "
+    "subsystem and relevant observations can be sufficient for qualitative checks. "
+    "support_quotes must be short, complete, contiguous VERBATIM clauses from USER_REQUEST "
+    "describing current observed facts or a relevant operation not performed. Preserve negation "
+    "and uncertainty; never extract a noun from inside an unread/unmeasured/unknown clause. "
+    "Do not use a question, a historical source, a requested check, or your own inference as "
+    "a support quote. For an explicitly unresolved target, identity_gap_quotes must quote "
+    "the user's statement of that gap. For sufficient, identity_gap_quotes must be empty. "
+    "For non-diagnostic factual/procedural questions routed to ASK, return not_diagnostic "
+    "and empty quote arrays. Refusals and out-of-scope handling keep priority. "
+    "When the basis is insufficient or identity-dependent, provide clarification_question "
+    "and missing_information in RESPONSE_LANGUAGE, do not rank causes and do not supply "
+    "model-specific quantities or prescriptions even as a conditional example. "
+)
+
+
+def router_schema_with_diagnostic_basis(schema: Mapping[str, Any]) -> dict[str, Any]:
+    """Extend a private Root Cause router schema without changing shared/API contracts."""
+    out = copy.deepcopy(dict(schema))
+    out["name"] = "machinemind_root_observation_router_v1"
+    body = out["schema"]
+    body["properties"]["diagnostic_basis"] = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "state": {"type": "string", "enum": [
+                "sufficient", "needs_observations", "needs_target_identity", "not_diagnostic"
+            ]},
+            "support_quotes": {"type": "array", "items": {"type": "string"}, "maxItems": 4},
+            "identity_gap_quotes": {"type": "array", "items": {"type": "string"}, "maxItems": 3},
+        },
+        "required": ["state", "support_quotes", "identity_gap_quotes"],
+    }
+    body["required"] = list(body["required"]) + ["diagnostic_basis"]
+    return out
+
+
+def query_fingerprint(query: str) -> str:
+    # Do not case-fold technical codes or strip negation/values for cache reuse.
+    return hashlib.sha256(_normalize(query).encode("utf-8")).hexdigest()
+
+
+def _grounded_quotes(values: Any, text: str, *, limit: int) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    normalized = _normalize(text)
+    out: list[str] = []
+    for value in values[:limit]:
+        if not isinstance(value, str):
+            continue
+        quote = _normalize(value)
+        if len(quote) < 2 or len(quote) > 600 or quote not in normalized:
+            continue
+        if quote not in out:
+            out.append(quote)
+    return out
+
+
+def enforce_diagnostic_basis(
+    raw: Mapping[str, Any], profile: DiagnosticQueryProfile
+) -> RouterSanitizationResult:
+    """Admit diagnosis only with a validated current-observation basis.
+
+    Text meaning is assessed by the existing semantic router, not by adding fault
+    keywords. This function checks structural validity, quote provenance and the
+    declared state, then makes the decision binding before evidence preparation.
+    """
+    out = dict(raw)
+    basis = out.get("diagnostic_basis")
+    basis = basis if isinstance(basis, Mapping) else {}
+    state = str(basis.get("state") or "").strip()
+    supplied = _grounded_quotes(basis.get("support_quotes"), profile.original_query, limit=4)
+    observed = _normalize(profile.observed_text)
+    support = [q for q in supplied if q in observed and not _missing_spans(q)[0]]
+    gaps = _grounded_quotes(basis.get("identity_gap_quotes"), profile.original_query, limit=3)
+    kind = str(out.get("request_kind") or "").strip().lower()
+    mode = str(out.get("effective_mode") or "").strip().lower()
+    exempt = kind in {"unsafe_request", "out_of_scope"} or (
+        mode == "ask" and state == "not_diagnostic"
+        and kind not in {"fault_diagnostic", "guided_diagnostic"}
+        and str(out.get("information_task") or "") != "fault_diagnostic"
+        and "diagnostic_causes" not in (out.get("required_answer_types") or [])
+    )
+    reason = "validated_observation_basis"
+    admitted = bool(state == "sufficient" and support and not gaps)
+    if exempt:
+        reason = "non_root_diagnosis_or_priority_refusal"
+    elif state == "needs_observations":
+        reason = "insufficient_current_observations"
+    elif state == "needs_target_identity" and gaps:
+        reason = "target_identity_required"
+    elif gaps:
+        reason = "unresolved_target_identity"
+    elif not admitted:
+        reason = "unvalidated_observation_basis"
+
+    summary = {
+        "policy_version": DIAGNOSTIC_BASIS_POLICY,
+        "query_sha256": query_fingerprint(profile.original_query),
+        "state": state,
+        "admitted": admitted and not exempt,
+        "applicable": not exempt,
+        "reason": reason,
+        "support_quotes": support,
+        "identity_gap_quotes": gaps,
+    }
+    if not exempt and not admitted:
+        is_en = profile.response_language.lower().startswith("en")
+        if reason in {"target_identity_required", "unresolved_target_identity"}:
+            question = (
+                "Identify the affected assembly and its nameplate/model before applying "
+                "model-specific prescriptions. Report the location, measured condition "
+                "and operating circumstances; no specific cause or model is established yet."
+                if is_en else
+                "Identifica il gruppo interessato e la sua targhetta/modello prima di applicare "
+                "prescrizioni specifiche. Riporta posizione, condizione misurata e circostanze "
+                "di funzionamento; non è ancora accertata una causa né l'applicabilità di un modello."
+            )
+        elif reason == "unvalidated_observation_basis":
+            question = (
+                "I could not validate a sufficient observation basis to rank causes reliably. "
+                "No cause has been assigned. Provide the exact observed state, affected assembly "
+                "and operating circumstances."
+                if is_en else
+                "Non è stato possibile validare una base di osservazioni sufficiente per ordinare "
+                "le cause in modo affidabile. Non è stata attribuita alcuna causa. Riporta lo stato "
+                "osservato, il gruppo interessato e le circostanze di funzionamento."
+            )
+        else:
+            question = _clarification_question([], profile.response_language)
+        out["effective_mode"] = "root_cause"
+        out["evidence_state"] = "clarify"
+        out["clarification_question"] = question
+        # Fail closed independently of contradictory source-based router fields.
+        for key in (
+            "relevant_evidence_ids", "dense_queries", "lexical_queries", "exact_terms",
+            "required_facets", "facet_queries", "preferred_source_types",
+            "diagnostic_subsystems", "diagnostic_observables", "diagnostic_discriminants",
+            "diagnostic_operating_conditions", "diagnostic_exclusions",
+        ):
+            out[key] = []
+        out["source_type_policy"] = "none"
+        out["rationale"] = reason
     return RouterSanitizationResult(payload=out, summary=summary)
