@@ -556,9 +556,12 @@ def analyze_diagnostic_query(
 
     # A global, explicit absence of diagnostic data is an epistemic stop condition
     # only when no separate cause-discriminating observation survives removal.
-    # Multiple unobserved clauses plus no concrete observation is treated the same.
+    # A missing item is not proof that no useful observation was supplied.
+    # This heuristic count is only a hint; a zero count must not veto a mixed
+    # request before the semantic observation-admission contract can assess it.
+    # Keep the existing inexpensive path ONLY for explicit global absence.
     force = bool(
-        spans and concrete_observation_count <= 0
+        spans and explicit_global and concrete_observation_count <= 0
     )
     reason = ""
     if force:
@@ -854,7 +857,7 @@ def sanitize_router_payload(
 # It is requested in the existing Root Cause router call; no new model call or
 # machine vocabulary is introduced here. The deterministic boundary enforces the
 # judgement and requires verbatim support in the current user's observations.
-DIAGNOSTIC_BASIS_POLICY = "root-observation-admission-v1"
+DIAGNOSTIC_BASIS_POLICY = "root-observation-admission-v2"
 BASIS_METADATA_KEY = "root_diagnostic_basis"
 
 DIAGNOSTIC_BASIS_INSTRUCTION = (

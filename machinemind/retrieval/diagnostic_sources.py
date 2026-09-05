@@ -14,6 +14,9 @@ but it is never an admission criterion on its own.
 
 The boundary is Root Cause only.  ASK and Smart Diagnostic keep their existing
 selection paths.
+
+A separate pure claim validator binds adjudicator outputs to literal observation
+and source spans. It does not replace semantic judgement with lexical ranking.
 """
 
 from __future__ import annotations
@@ -624,3 +627,147 @@ def select_root_cause_candidates(
         ],
     }
     return DiagnosticSelectionResult(candidates=tuple(selected), summary=summary)
+
+# Claim-level evidence admission is separate from candidate ranking. A highly
+# ranked excerpt is not proof that it describes the component in the question.
+CAUSAL_GROUNDING_POLICY = "root-causal-applicability-v1"
+CAUSAL_GROUNDING_INSTRUCTION = (
+    " You must validate every retained hypothesis against both the CURRENT "
+    "observations and the applicability of its cited passage. Retrieval rank, "
+    "score, shared vocabulary and membership in the same machine are NOT proof. "
+    "SOURCES is a JSON list of records. text is the selected excerpt. "
+    "ownership_context contains ordered neighbouring pages from the SAME "
+    "authorized document, only to determine the governing heading, model or "
+    "component. Follow the nearest governing heading at the excerpt's position; "
+    "a different heading earlier/later on the page must not change its owner. "
+    "Context is not a new selectable citation and must not supply extra claims. "
+    "For each cause return support proofs with verbatim observation_quote, "
+    "source_quote, and target_quote. The observation quote must come only from "
+    "OBSERVED_SYMPTOM; source_quote from that citation's text; target_quote from "
+    "its text or ownership_context and establish why it applies to the affected "
+    "component. Do not infer the owner of a fragment when it is not established. "
+    "A checklist mentioning multiple utilities or components proves only that "
+    "they are to be checked; it does NOT prove that one utility controls another "
+    "component's ready/permissive signal. Cross-component causes need an explicit "
+    "documented dependency, not juxtaposition. Unknown/not measured variables "
+    "are NOT symptoms. A missing measurement alone cannot promote a cause. "
+    "A general instruction to record comparable measurements is not a competing "
+    "physical cause. Unsupported hypotheses, target transfers, and checklist-only "
+    "associations must be omitted, even if labelled conditional or cautious. "
+    "Keep a valid leading hypothesis and other independently supported mechanisms; "
+    "do not fill the maximum number of slots. A bounded inference is allowed only "
+    "from an applicable mechanism/check plus the actual observations and must "
+    "state its uncertainty. Return cause-specific citations equal to the proof "
+    "citation IDs. Never invent a literal quote to satisfy the schema. "
+    "All strings except verbatim quotes/citation IDs must use RESPONSE_LANGUAGE."
+)
+
+
+def causal_grounding_schema(base_schema: Mapping[str, Any]) -> dict[str, Any]:
+    """Extend an internal LLM schema without changing public response schemas."""
+    import copy
+    schema = copy.deepcopy(dict(base_schema))
+    schema["name"] = "machinemind_root_causal_applicability_v1"
+    item = schema["schema"]["properties"]["possible_causes"]["items"]
+    item["properties"]["support"] = {
+        "type": "array", "minItems": 1, "maxItems": 3,
+        "items": {
+            "type": "object", "additionalProperties": False,
+            "properties": {
+                "citation_id": {"type": "string"},
+                "observation_quote": {"type": "string"},
+                "source_quote": {"type": "string"},
+                "target_quote": {"type": "string"},
+                "applicability": {"type": "string", "enum": [
+                    "same_target", "documented_dependency", "unknown", "different_target"]},
+                "support_type": {"type": "string", "enum": [
+                    "documented_mechanism", "bounded_inference", "checklist_only"]},
+            },
+            "required": ["citation_id", "observation_quote", "source_quote",
+                         "target_quote", "applicability", "support_type"],
+        },
+    }
+    item["required"] = list(item["required"]) + ["support"]
+    return schema
+
+
+def _quote_normalized(value: Any) -> str:
+    return re.sub(r"\s+", " ", unicodedata.normalize("NFKC", str(value or ""))).strip().casefold()
+
+
+def _literal_quote_in(quote: Any, body: Any, minimum: int = 8) -> bool:
+    value = _quote_normalized(quote)
+    return bool(minimum <= len(value) <= 1000 and value in _quote_normalized(body))
+
+
+def validate_causal_grounding(
+    *, parsed: Mapping[str, Any], observed_query: str,
+    records: Sequence[Mapping[str, Any]], max_causes: int = 3,
+) -> dict[str, Any]:
+    """Bind model assessments to actual source/query spans; fail closed on error.
+
+    Literal checks establish provenance, NOT entailment. Applicability judgement
+    remains semantic and must be evaluated on live model outputs as well.
+    """
+    by_id = {str(r.get("citation_id") or ""): r for r in records
+             if isinstance(r, Mapping) and r.get("citation_id")}
+    raw_causes = parsed.get("possible_causes")
+    if not isinstance(raw_causes, list):
+        raw_causes = []
+    accepted: list[dict[str, Any]] = []
+    verdicts: list[dict[str, Any]] = []
+    limit = max(1, min(3, int(max_causes)))
+    for index, cause in enumerate(raw_causes[:limit]):
+        reason = "accepted"
+        proofs = cause.get("support") if isinstance(cause, Mapping) else None
+        valid_ids: list[str] = []
+        if not isinstance(cause, Mapping) or not isinstance(proofs, list) or not 1 <= len(proofs) <= 3:
+            reason = "missing_cause_support"
+        else:
+            for proof in proofs:
+                if not isinstance(proof, Mapping):
+                    reason = "malformed_support"; break
+                cid = str(proof.get("citation_id") or "")
+                record = by_id.get(cid)
+                if record is None:
+                    reason = "unknown_citation"; break
+                if proof.get("applicability") not in {"same_target", "documented_dependency"}:
+                    reason = "target_applicability_not_established"; break
+                if proof.get("support_type") not in {"documented_mechanism", "bounded_inference"}:
+                    reason = "checklist_is_not_causal_evidence"; break
+                if not _literal_quote_in(proof.get("observation_quote"), observed_query):
+                    reason = "observation_not_in_current_request"; break
+                if not _literal_quote_in(proof.get("source_quote"), record.get("text"), 16):
+                    reason = "source_quote_not_in_cited_excerpt"; break
+                owner_text = str(record.get("text") or "") + "\n" + str(record.get("ownership_context") or "")
+                if not _literal_quote_in(proof.get("target_quote"), owner_text):
+                    reason = "target_quote_not_in_cited_context"; break
+                if cid not in valid_ids:
+                    valid_ids.append(cid)
+            raw_ids = cause.get("citations")
+            if reason == "accepted" and (
+                not isinstance(raw_ids, list) or set(map(str, raw_ids)) != set(valid_ids)
+            ):
+                reason = "citations_not_bound_to_support"
+            if reason == "accepted" and (not str(cause.get("cause") or "").strip()
+                                        or not str(cause.get("why") or "").strip()
+                                        or not isinstance(cause.get("checks"), list)):
+                reason = "incomplete_cause"
+        verdicts.append({"input_index": index, "accepted": reason == "accepted", "reason": reason})
+        if reason == "accepted":
+            accepted.append({
+                "rank": len(accepted) + 1, "cause": str(cause["cause"]),
+                "why": str(cause["why"]),
+                "checks": [str(c) for c in cause["checks"][:5] if str(c).strip()],
+                "citations": valid_ids,
+            })
+    used = list(dict.fromkeys(cid for cause in accepted for cid in cause["citations"]))
+    return {
+        "causes": accepted, "citation_ids": used,
+        "summary": {"policy_version": CAUSAL_GROUNDING_POLICY,
+                    "input_causes": len(raw_causes), "accepted_causes": len(accepted),
+                    "rejected_causes": len(verdicts) - len(accepted), "verdicts": verdicts,
+                    "support_proofs": [dict(p) for c in raw_causes[:limit]
+                                       if isinstance(c, Mapping) for p in (c.get("support") or [])
+                                       if isinstance(p, Mapping)][:9]},
+    }

@@ -20,6 +20,8 @@ from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
 from typing import Any, Callable, Optional, Sequence, Mapping
 import re
+import copy
+import hashlib
 import unicodedata
 
 
@@ -231,6 +233,110 @@ def extract_property_query(query: str) -> Optional[PropertyQuery]:
         property_phrase=" ".join(terms),
         code_tokens=code_tokens,
     )
+
+
+# Kept outside AssistantCoreDecision to avoid changing public/core contracts.
+SCALAR_TARGET_KEY = "precision_scalar_target"
+SCALAR_TARGET_POLICY = "scalar-target-label-v1"
+SCALAR_TARGET_INSTRUCTION = (
+    " For ASK only, also return SCALAR_TARGET. Set state=single_scalar only when "
+    "the user requests one scalar numerical property. property_labels must be "
+    "short equivalent source-label phrases, not sentences or retrieval queries. "
+    "Keep the affected entity kind (whole machine versus a component) and every "
+    "requested qualifier such as maximum/nominal/net/gross. Do not add unrequested "
+    "transport, accessories or other alternative contexts. Up to four faithful "
+    "Italian/English labels may be used for the SAME property. No model codes, "
+    "values or units inside a label. query_quote must be copied verbatim from "
+    "the part of USER_REQUEST asking for that property. For multiple properties, "
+    "tables, spreadsheet rows, procedures, diagnosis or unknown intent, return "
+    "state=not_applicable, property_labels=[], query_quote=''."
+)
+
+
+def router_schema_with_scalar_target(schema: Mapping[str, Any]) -> dict[str, Any]:
+    out = copy.deepcopy(dict(schema))
+    body = out["schema"]
+    body["properties"]["scalar_target"] = {
+        "type": "object", "additionalProperties": False,
+        "properties": {
+            "state": {"type": "string", "enum": ["single_scalar", "not_applicable"]},
+            "property_labels": {"type": "array", "items": {"type": "string"}, "maxItems": 4},
+            "query_quote": {"type": "string"},
+        },
+        "required": ["state", "property_labels", "query_quote"],
+    }
+    body["required"] = list(body.get("required") or []) + ["scalar_target"]
+    return out
+
+
+def scalar_target_from_router(query: str, router: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate provenance of a label proposal; never accept a value from a model."""
+    proposed = router.get("scalar_target")
+    if (not isinstance(proposed, Mapping)
+        or router.get("effective_mode") != "ask"
+        or router.get("information_task") != "numeric_specification"
+        or router.get("router_degraded")
+        or proposed.get("state") != "single_scalar"
+        or _is_non_scalar_request(query)):
+        return {}
+    quote = _normalize_text(str(proposed.get("query_quote") or ""))
+    if len(quote) < 5 or quote.casefold() not in _normalize_text(query).casefold():
+        return {}
+    labels = proposed.get("property_labels")
+    if not isinstance(labels, list) or not 1 <= len(labels) <= 4:
+        return {}
+    clean: list[str] = []
+    for raw in labels:
+        if not isinstance(raw, str) or len(raw) > 120 or re.search(r"[\d?!;]", raw):
+            return {}
+        candidate = extract_property_query(raw)
+        if candidate is None or candidate.code_tokens or len(candidate.property_terms) > 6:
+            return {}
+        if raw not in clean:
+            clean.append(raw)
+    return {
+        "policy_version": SCALAR_TARGET_POLICY,
+        "query_sha256": hashlib.sha256(_normalize_text(query).casefold().encode()).hexdigest(),
+        "property_labels": clean,
+        "query_quote": quote,
+    }
+
+
+def property_queries_from_scalar_target(
+    original_query: str, contract: Optional[Mapping[str, Any]]
+) -> tuple[PropertyQuery, ...]:
+    if not isinstance(contract, Mapping) or _is_non_scalar_request(original_query):
+        return ()
+    if (contract.get("effective_mode") != "ask"
+        or contract.get("information_task") != "numeric_specification"
+        or contract.get("router_degraded")
+        or contract.get("evidence_policy") != "machine_sources_required"
+        or contract.get("source_type_policy") == "require"):
+        return ()
+    requirements = set(contract.get("required_answer_types") or [])
+    if "numeric_value" not in requirements or requirements - {"numeric_value", "explanation"}:
+        return ()
+    target = contract.get(SCALAR_TARGET_KEY)
+    if not isinstance(target, Mapping) or target.get("policy_version") != SCALAR_TARGET_POLICY:
+        return ()
+    fingerprint = hashlib.sha256(_normalize_text(original_query).casefold().encode()).hexdigest()
+    if target.get("query_sha256") != fingerprint:
+        return ()
+    validated = scalar_target_from_router(original_query, {
+        "effective_mode": "ask", "information_task": "numeric_specification",
+        "scalar_target": {"state": "single_scalar", "property_labels": target.get("property_labels"),
+                          "query_quote": target.get("query_quote")},
+    })
+    if not validated:
+        return ()
+    codes = tuple(dict.fromkeys(m.group(0) for m in _CODE_RE.finditer(_normalize_text(original_query))))
+    out: list[PropertyQuery] = []
+    for label in validated["property_labels"]:
+        prop = extract_property_query(label)
+        if prop is not None:
+            out.append(PropertyQuery(_strip_accents(_normalize_text(original_query)).casefold(),
+                                     prop.property_terms, prop.property_phrase, codes))
+    return tuple(out)
 
 
 def property_query_from_answer_contract(
@@ -717,56 +823,67 @@ def _fetch_scoped_pages(
 
 
 def resolve_precision_fact(
-    *,
-    query: str,
-    company_id: str,
-    machine_id: str,
-    doc_ids: Optional[list[str]],
-    bubble_document_id: Optional[str],
-    runtime: PrecisionFactRuntime,
-    answer_contract: Optional[Mapping[str, Any]] = None,
+    *, query: str, company_id: str, machine_id: str,
+    doc_ids: Optional[list[str]], bubble_document_id: Optional[str],
+    runtime: PrecisionFactRuntime, answer_contract: Optional[Mapping[str, Any]] = None,
 ) -> Optional[PrecisionFactResolution]:
-    # Preserve the historical literal resolver first. Only absence of matching
-    # literal facts permits one router-normalized scalar facet to be attempted.
-    # A literal conflict is terminal: a semantic rewrite must not hide it.
-    literal = extract_property_query(query)
-    canonical = property_query_from_answer_contract(query, answer_contract)
-    queries = [pq for pq in (literal, canonical) if pq is not None]
-    seen: set[tuple[str, ...]] = set()
-    for property_query in queries:
-        if property_query.property_terms in seen:
-            continue
-        seen.add(property_query.property_terms)
+    def fetch_pairs(property_query: PropertyQuery) -> Optional[list[FactPair]]:
         pages = _fetch_scoped_pages(
-            runtime=runtime,
-            property_query=property_query,
-            company_id=company_id,
-            machine_id=machine_id,
-            doc_ids=doc_ids,
-            bubble_document_id=bubble_document_id,
+            runtime=runtime, property_query=property_query, company_id=company_id,
+            machine_id=machine_id, doc_ids=doc_ids, bubble_document_id=bubble_document_id,
         )
-        required_codes = _strong_query_codes(property_query)
-        if required_codes:
+        # A capped scan cannot establish the absence of a conflicting value.
+        if len(pages) >= max(20, int(runtime.page_scan_limit or 220)):
+            return None
+        if _strong_query_codes(property_query):
             if runtime.fetch_file_map is None:
                 return None
-            document_ids = sorted({
-                str(page.get("bubble_document_id") or "").strip()
-                for page in pages
-                if isinstance(page, dict) and str(page.get("bubble_document_id") or "").strip()
-            })
+            document_ids = sorted({str(p.get("bubble_document_id") or "").strip()
+                                   for p in pages if str(p.get("bubble_document_id") or "").strip()})
             try:
                 file_map = runtime.fetch_file_map(company_id, document_ids) or {}
             except Exception:
                 return None
-            pages = [page for page in pages if _source_matches_query_codes(
+            pages = [p for p in pages if _source_matches_query_codes(
                 query=property_query,
-                source_hint=str(file_map.get(str(page.get("bubble_document_id") or "")) or ""),
-                page_text=str(page.get("text") or page.get("page_text") or ""),
+                source_hint=str(file_map.get(str(p.get("bubble_document_id") or "")) or ""),
+                page_text=str(p.get("text") or p.get("page_text") or ""),
             )]
-        pairs = _matching_scoped_fact_pairs(pages, property_query, machine_id)
+        return _matching_scoped_fact_pairs(pages, property_query, machine_id)
+
+    seen: set[tuple[str, ...]] = set()
+    for prop in (extract_property_query(query), property_query_from_answer_contract(query, answer_contract)):
+        if prop is None or prop.property_terms in seen:
+            continue
+        seen.add(prop.property_terms)
+        pairs = fetch_pairs(prop)
+        if pairs is None:
+            return None
         if pairs:
-            return choose_unambiguous_fact(pairs, property_query)
-    return None
+            # Includes a terminal None for conflicting literal values.
+            return choose_unambiguous_fact(pairs, prop)
+
+    resolutions: list[PrecisionFactResolution] = []
+    for prop in property_queries_from_scalar_target(query, answer_contract):
+        if prop.property_terms in seen:
+            continue
+        seen.add(prop.property_terms)
+        pairs = fetch_pairs(prop)
+        if pairs is None:
+            return None
+        if not pairs:
+            continue
+        resolved = choose_unambiguous_fact(pairs, prop)
+        if resolved is None:
+            return None
+        resolutions.append(resolved)
+    if not resolutions:
+        return None
+    values = {(r.canonical_number, r.canonical_unit) for r in resolutions}
+    if len(values) != 1:
+        return None
+    # All matched equivalent labels agree. Deterministic best source selection.
+    return sorted(resolutions, key=lambda r: (-r.score, r.bubble_document_id, r.page_number))[0]
 
 
 def resolution_to_candidate(resolution: PrecisionFactResolution) -> dict[str, Any]:
