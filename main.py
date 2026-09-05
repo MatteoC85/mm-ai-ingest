@@ -1848,6 +1848,57 @@ def _select_response_language(
 
     return _simple_query_language(q)
 
+def _root_cause_response_language(
+    q: str,
+    planner: Optional[dict] = None,
+    preferred: Optional[str] = None,
+) -> str:
+    """Select Root Cause output language from the current user's own request.
+
+    Policy: an explicit IT/EN reply instruction wins, then a clearly dominant
+    query language, then the existing UI/planner fallback. Source-language text
+    is never an input. Quoted/code excerpts do not vote for the query language.
+    This selector is deliberately separate from ASK/Smart's legacy policy.
+    It performs no I/O, translation, retrieval, or model call.
+    """
+    prose = _normalize_unicode_advanced(str(q or ""))
+    prose = re.sub(r"```[\s\S]*?```|`[^`]*`|\"[^\"]*\"|«[^»]*»|“[^”]*”", " ", prose)
+    # Match only affirmative instructions at a sentence boundary, not e.g.
+    # "do not reply in English" or an instruction inside a quoted manual.
+    instructions = list(re.finditer(
+        r"(?:^|[.!?;\n])\s*"
+        r"(?:(?:please|per\s+favore|per\s+cortesia)[,\s]+)?"
+        r"(?:(?:can|could|would)\s+you\s+|(?:puoi|potresti)\s+)?"
+        r"(?:answer|reply|respond|write|rispondi|rispondere|scrivi|scrivere)\s+"
+        r"(?:in\s+)?(?:lingua\s+)?(?P<language>english|italian|inglese|italiano)\b",
+        prose, flags=re.IGNORECASE,
+    ))
+    if instructions:
+        language = instructions[-1].group("language").lower()
+        return "en" if language in {"english", "inglese"} else "it"
+
+    # Existing general language markers; require both support and a margin.
+    # Short technical labels and mixed/ambiguous text keep the UI fallback.
+    tokens = set(re.findall(r"[a-zà-öø-ÿ']{2,}", prose.lower()))
+    marker_text = " ".join(sorted(tokens))
+    # Auxiliary verbs and interrogatives complement the legacy article markers.
+    # Count distinct forms so repetition of one label cannot imply confidence.
+    grammatical_markers = {
+        "it": {"ho", "hai", "ha", "hanno", "abbiamo", "avete", "sono", "era", "erano",
+               "quale", "quali", "cosa", "devo", "deve", "senza", "ancora"},
+        "en": {"has", "have", "had", "was", "were", "been", "what", "which", "where",
+               "why", "how", "could", "please", "without", "yet"},
+    }
+    scores = {
+        language: _language_marker_score(marker_text, language)
+        + len(tokens & grammatical_markers[language])
+        for language in ("it", "en")
+    }
+    for language, other in (("en", "it"), ("it", "en")):
+        if scores[language] >= 3 and scores[language] >= scores[other] + 2:
+            return language
+    return _select_response_language(prose, planner=planner, preferred=preferred)
+
 
 def _localized_no_sources(language: str) -> str:
     return (
@@ -27979,7 +28030,7 @@ def _assistant_core_root_cause_epistemic_fast_response(
     q = str(payload.query or "").strip()
     if not q:
         return None
-    response_language = _select_response_language(q, preferred=payload.language)
+    response_language = _root_cause_response_language(q, preferred=payload.language)
     profile = _retrieval_diagnostic_query.analyze_diagnostic_query(
         q, response_language=response_language
     )
@@ -28052,7 +28103,11 @@ def _assistant_core_sync(payload: Union[AskRequest, RootCauseRequest], x_ai_inte
     if not q:
         raise HTTPException(status_code=400, detail="Missing query")
 
-    response_language = _select_response_language(q, preferred=payload.language)
+    response_language = (
+        _root_cause_response_language(q, preferred=payload.language)
+        if requested_mode == MODE_ROOT_CAUSE
+        else _select_response_language(q, preferred=payload.language)
+    )
     root_query_profile = (
         _retrieval_diagnostic_query.analyze_diagnostic_query(
             q, response_language=response_language
@@ -28865,7 +28920,11 @@ async def _v13_stream_json_response(
         heartbeat_seconds=V13_STREAM_HEARTBEAT_SECONDS,
         heartbeat_bytes=V13_STREAM_HEARTBEAT_BYTES,
         timeout_result_code=RESULT_TIMEOUT,
-        select_response_language=_select_response_language,
+        select_response_language=(
+            _root_cause_response_language
+            if mode == MODE_ROOT_CAUSE and ASSISTANT_CORE_V2_ENABLED
+            else _select_response_language
+        ),
         error_payload=_v13_stream_error_payload,
     )
 
@@ -28886,7 +28945,11 @@ async def _assistant_core_json_with_hard_timeout(
         hard_timeout_seconds=hard_timeout_seconds,
         timeout_result_code=RESULT_TIMEOUT,
         root_cause_mode=MODE_ROOT_CAUSE,
-        select_response_language=_select_response_language,
+        select_response_language=(
+            _root_cause_response_language
+            if mode == MODE_ROOT_CAUSE and ASSISTANT_CORE_V2_ENABLED
+            else _select_response_language
+        ),
         error_payload=_v13_stream_error_payload,
     )
 
