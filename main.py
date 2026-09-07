@@ -35,6 +35,7 @@ from google.cloud import tasks_v2
 from urllib.parse import urlparse, unquote
 
 from assistant_core_v2 import (
+    response_has_rejected_answer,
     AssistantCoreDecision,
     AssistantCoreFacetQuery,
     AssistantCoreHooks,
@@ -28432,6 +28433,15 @@ def _assistant_core_sync(payload: Union[AskRequest, RootCauseRequest], x_ai_inte
             ):
                 cached = None
                 budget.semantic_cache = "bypass_unvalidated_observation_basis"
+        if (
+            cached is not None
+            and requested_mode == MODE_ASK
+            and response_has_rejected_answer(cached)
+        ):
+            # Reject old cache entries containing a draft vetoed by validation.
+            # This does not flush valid entries, alter Worker cache, or change cost caps.
+            cached = None
+            budget.semantic_cache = "bypass_rejected_answer_contract"
         if cached is not None and str(cached.get("status") or "").strip().lower() == "no_sources":
             cached = None
             budget.semantic_cache = "bypass_negative_answer"

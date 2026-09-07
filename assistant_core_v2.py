@@ -857,26 +857,116 @@ def _response_quality_tuple(response: Mapping[str, Any]) -> tuple:
     return (1 if answered else 0, 1 if passed else 0, 1 if citations else 0, -missing, min(len(body), 4000))
 
 
+REPAIR_SELECTION_POLICY = "validated-repair-selection-v1"
+
+
+def response_has_rejected_answer(response: Mapping[str, Any]) -> bool:
+    """Read the current validation result, not historical repair diagnostics.
+
+    A populated citation list is not a substitute for an accepted answer contract.
+    This predicate is also used at the ASK cache boundary to reject old entries
+    that retained a failed answer. It never interprets the user's language/content.
+    """
+    if not isinstance(response, Mapping):
+        return False
+    meta = response.get("meta") if isinstance(response.get("meta"), Mapping) else {}
+    validation = meta.get("assistant_core_validation")
+    validation = validation if isinstance(validation, Mapping) else {}
+    contract = validation.get("answer_contract")
+    contract = contract if isinstance(contract, Mapping) else {}
+    return bool(
+        contract.get("passed") is False
+        or response.get("_assistant_core_repair_needed")
+        or response.get("_assistant_core_semantic_rejection")
+    )
+
+
+def _repair_answer_accepted(response: Mapping[str, Any]) -> bool:
+    """Require explicit current acceptance for an answer in the repair branch.
+
+    Unknown/malformed validation is not success. An accepted partial answer can
+    still qualify: its validator sets passed=True. Earlier rejected drafts in
+    meta.assistant_core_repair must not veto a newly validated replacement.
+    """
+    if not isinstance(response, Mapping):
+        return False
+    meta = response.get("meta") if isinstance(response.get("meta"), Mapping) else {}
+    validation = meta.get("assistant_core_validation")
+    validation = validation if isinstance(validation, Mapping) else {}
+    contract = validation.get("answer_contract")
+    contract = contract if isinstance(contract, Mapping) else {}
+    return bool(
+        _clean_text(response.get("status"), 40).lower() == "answered"
+        and contract.get("passed") is True
+        and bool(_clean_text(response.get("answer"), 4000))
+        and not response_has_rejected_answer(response)
+    )
+
+
 def _choose_monotonic_response(baseline: Mapping[str, Any], candidate: Mapping[str, Any]) -> dict:
-    base = dict(baseline or {})
-    cand = dict(candidate or {})
-    if not base:
-        return cand
-    if not cand:
-        return base
-    bq = _response_quality_tuple(base)
-    cq = _response_quality_tuple(cand)
-    # Never permit a timeout/error/no_sources repair to erase an answered baseline.
-    if bq[0] and not cq[0]:
-        out = base
-        meta = dict(out.get("meta") or {})
-        meta["monotonic_repair"] = {"selected": "baseline", "baseline_quality": list(bq), "candidate_quality": list(cq)}
-        out["meta"] = meta
-        return out
-    out = cand if cq > bq else base
+    """Preserve quality only *between accepted answers*.
+
+    A rejected/unvalidated draft cannot outrank an abstention merely because its
+    status still says answered. No model call or new retrieval is performed here.
+    """
+    base = dict(baseline) if isinstance(baseline, Mapping) else {}
+    cand = dict(candidate) if isinstance(candidate, Mapping) else {}
+    bq, cq = _response_quality_tuple(base), _response_quality_tuple(cand)
+    ba, ca = _repair_answer_accepted(base), _repair_answer_accepted(cand)
+    if ba and ca:
+        selected = "candidate" if cq > bq else "baseline"
+        reason = "compare_accepted_answers"
+    elif ca:
+        selected, reason = "candidate", "candidate_accepted"
+    elif ba:
+        selected, reason = "baseline", "preserve_accepted_baseline"
+    elif cand and _clean_text(cand.get("status"), 40).lower() not in {"", "answered"}:
+        selected, reason = "candidate", "no_accepted_answer_keep_nonanswer"
+    elif base and _clean_text(base.get("status"), 40).lower() not in {"", "answered"}:
+        selected, reason = "baseline", "no_accepted_answer_keep_nonanswer"
+    else:
+        # Caller uses its existing localized no-evidence builder. Never return an
+        # unvalidated answer when the repair is empty, malformed, or incomplete.
+        selected, reason = "none", "no_accepted_answer"
+    out = dict(cand if selected == "candidate" else base if selected == "baseline" else {})
     meta = dict(out.get("meta") or {})
-    meta["monotonic_repair"] = {"selected": "candidate" if out is cand else "baseline", "baseline_quality": list(bq), "candidate_quality": list(cq)}
+    meta["monotonic_repair"] = {
+        "policy_version": REPAIR_SELECTION_POLICY,
+        "selected": selected,
+        "reason": reason,
+        "baseline_accepted": ba,
+        "candidate_accepted": ca,
+        "baseline_quality": list(bq),
+        "candidate_quality": list(cq),
+    }
     out["meta"] = meta
+    return out
+
+
+def _finish_ask_validation(response: Mapping[str, Any]) -> dict:
+    """Remove transient repair fields; keep one consistent abstention envelope."""
+    out = dict(response or {})
+    for key in tuple(out):
+        if key.startswith("_assistant_core_"):
+            out.pop(key, None)
+    if _clean_text(out.get("status"), 40).lower() != "answered":
+        out["citations"] = []
+        out["rg_links"] = []
+        out["possible_causes"] = []
+        out["recommended_next_checks"] = []
+        out.pop("answer_html", None)
+        out.pop("_assistant_ui_model", None)
+        out["grounding"] = "none"
+        # The failed draft may have left a summary next to the new answer.
+        out["problem_summary"] = str(out.get("answer") or "")
+        meta = dict(out.get("meta") or {})
+        meta["cacheable"] = False
+        meta["semantic_cacheable"] = False
+        out["meta"] = meta
+    elif (out.get("meta") or {}).get("monotonic_repair"):
+        out["problem_summary"] = str(out.get("answer") or "")
+        out.pop("answer_html", None)
+        out.pop("_assistant_ui_model", None)
     return out
 
 class AssistantCoreV2:
@@ -1023,5 +1113,27 @@ class AssistantCoreV2:
                     dict(response or {}), request, prepared_retrieval, decision
                 )
             response = _choose_monotonic_response(validated_baseline, dict(response or {}))
+
+        if decision.effective_mode == MODE_ASK:
+            if (
+                not isinstance(response, Mapping)
+                or not _clean_text(response.get("status"), 40)
+                or (
+                    _clean_text(response.get("status"), 40).lower() == "answered"
+                    and response_has_rejected_answer(response)
+                )
+            ):
+                selection_meta = dict(response.get("meta") or {}) if isinstance(response, Mapping) else {}
+                response = dict(self.hooks.build_no_evidence(
+                    request, decision, prepared_retrieval
+                ) or {})
+                response["meta"] = {
+                    **selection_meta, **dict(response.get("meta") or {}),
+                    "answer_acceptance_guard": {
+                        "policy_version": REPAIR_SELECTION_POLICY,
+                        "reason": "no_accepted_answer_after_validation",
+                    },
+                }
+            response = _finish_ask_validation(response)
 
         return decorate_response(response, request, decision)
