@@ -635,16 +635,17 @@ CAUSAL_GROUNDING_INSTRUCTION = (
     " You must validate every retained hypothesis against both the CURRENT "
     "observations and the applicability of its cited passage. Retrieval rank, "
     "score, shared vocabulary and membership in the same machine are NOT proof. "
-    "SOURCES is a JSON list of records. text is the selected excerpt. "
-    "ownership_context contains ordered neighbouring pages from the SAME "
-    "authorized document, only to determine the governing heading, model or "
+    "SOURCES means REVIEW_PACKET.sources; text is the selected excerpt. "
+    "context_ids reference literal fragments of ordered neighbouring pages "
+    "in REVIEW_PACKET.document_contexts from the SAME authorized document, "
+    "only to determine the governing heading, model or "
     "component. Follow the nearest governing heading at the excerpt's position; "
     "a different heading earlier/later on the page must not change its owner. "
     "Context is not a new selectable citation and must not supply extra claims. "
     "For each cause return support proofs with verbatim observation_quote, "
     "source_quote, and target_quote. The observation quote must come only from "
     "OBSERVED_SYMPTOM; source_quote from that citation's text; target_quote from "
-    "its text or ownership_context and establish why it applies to the affected "
+    "its text or ONE referenced context fragment and establish why it applies to the affected "
     "component. Do not infer the owner of a fragment when it is not established. "
     "A checklist mentioning multiple utilities or components proves only that "
     "they are to be checked; it does NOT prove that one utility controls another "
@@ -739,8 +740,15 @@ def validate_causal_grounding(
                     reason = "observation_not_in_current_request"; break
                 if not _literal_quote_in(proof.get("source_quote"), record.get("text"), 16):
                     reason = "source_quote_not_in_cited_excerpt"; break
-                owner_text = str(record.get("text") or "") + "\n" + str(record.get("ownership_context") or "")
-                if not _literal_quote_in(proof.get("target_quote"), owner_text):
+                # Context fragments are discontinuous original spans. A quote
+                # cannot cross an omitted passage or a page boundary.
+                fragments = record.get("ownership_fragments")
+                if isinstance(fragments, list):
+                    owner_parts = [str(record.get("text") or "")] + [
+                        value for value in fragments if isinstance(value, str)]
+                else:
+                    owner_parts = [str(record.get("text") or "") + "\n" + str(record.get("ownership_context") or "")]
+                if not any(_literal_quote_in(proof.get("target_quote"), part) for part in owner_parts):
                     reason = "target_quote_not_in_cited_context"; break
                 if cid not in valid_ids:
                     valid_ids.append(cid)
