@@ -147,6 +147,7 @@ from machinemind.retrieval import diagnostic_sources as _retrieval_diagnostic_so
 from machinemind.retrieval import precision_facts as _retrieval_precision_facts
 from machinemind.retrieval import review_packet as _retrieval_review_packet
 from machinemind.retrieval import review_decisions as _retrieval_review_decisions
+from machinemind.retrieval import review_references as _retrieval_review_references
 
 
 _PRECISION_FACT_RUNTIME = lambda: _retrieval_precision_facts.PrecisionFactRuntime(
@@ -13402,7 +13403,7 @@ def version():
         "assistant_core_v2_router_timeout_seconds": ASSISTANT_CORE_ROUTER_TIMEOUT_SECONDS,
         "assistant_core_root_observation_query_policy": _retrieval_diagnostic_query.POLICY_VERSION,
         "assistant_core_root_observation_basis_policy": _retrieval_diagnostic_query.DIAGNOSTIC_BASIS_POLICY,
-        "assistant_core_root_review_decision_policy": _retrieval_review_decisions.POLICY_VERSION,
+        "assistant_core_root_review_decision_policy": _retrieval_review_references.POLICY_VERSION,
         "assistant_core_root_review_packet_policy": _retrieval_review_packet.POLICY_VERSION,
         "assistant_core_root_review_packet_limit": _retrieval_review_packet.MAX_EVIDENCE_CHARS,
         "assistant_core_root_router_call_policy": _retrieval_diagnostic_query.ROUTER_CALL_POLICY,
@@ -25948,7 +25949,7 @@ def _assistant_core_adjudicate_root_cause_grounded(
     review_execution: dict = {"stage": "root_adjudicator", "outcome": "not_started",
                              "attempt_limit": 1, "timeout_seconds": min(20, V13_FAST_TIMEOUT_SECONDS),
                              "provider_response_received": False,
-                             "decision_policy": _retrieval_review_decisions.POLICY_VERSION}
+                             "decision_policy": _retrieval_review_references.POLICY_VERSION}
 
     def unavailable(reason: str, timed_out: bool = False) -> dict:
         out = dict(response)
@@ -25966,7 +25967,7 @@ def _assistant_core_adjudicate_root_cause_grounded(
         out["meta"] = {**dict(out.get("meta") or {}), "cacheable": False,
                        "semantic_cacheable": False,
                        "root_review_packet": dict(review_meta),
-                       "root_review_decisions": {"policy_version": _retrieval_review_decisions.POLICY_VERSION, "validation_error": reason},
+                       "root_review_decisions": {"policy_version": _retrieval_review_references.POLICY_VERSION, "validation_error": reason},
                        "root_review_execution": {**review_execution, "outcome": "timeout" if timed_out else "error",
                                                  "validation_error": reason},
                        "root_causal_applicability": {"policy_version": _retrieval_diagnostic_sources.CAUSAL_GROUNDING_POLICY,
@@ -26003,20 +26004,27 @@ def _assistant_core_adjudicate_root_cause_grounded(
             current, records, max_causes=max(1, min(3, int(request.max_causes))))
     except _retrieval_review_decisions.ReviewDecisionError as exc:
         return unavailable(str(exc))
-    system_msg = (
-        "You are MachineMind's independent Root Cause evidence adjudicator. "
-        "Use only the authorized evidence and the actual reported observations. "
-        "Validate proposals as hypotheses, not confirmed diagnoses. Never bypass safety devices. "
-    ) + _retrieval_review_decisions.INSTRUCTION + _retrieval_diagnostic_query.REASONING_INSTRUCTION + _retrieval_review_packet.INSTRUCTION
+    try:
+        references = _retrieval_review_references.prepare(
+            packet=packed["model_packet"], proposal_manifest=frozen, records=records,
+            original_query=request.query, observed_query=observed,
+        )
+    except _retrieval_review_references.ReferenceError as exc:
+        return unavailable("review_references_" + str(exc))
+    proposal_manifest = frozen
+    frozen = references["frozen"]
+    review_meta["references"] = references["summary"]
+    system_msg = _retrieval_review_references.INSTRUCTION
     user_msg = (
         f"RESPONSE_LANGUAGE: {request.response_language}\n\n"
         f"OBSERVED_SYMPTOM:\n{observed}\n\n"
         f"REQUEST_OBSERVATIONS:\n{json.dumps(_retrieval_diagnostic_query.reasoning_packet(_assistant_core_diagnostic_query_profile(request)), ensure_ascii=False)}\n\n"
         f"MISSING_INFORMATION: {json.dumps(list(decision.missing_information), ensure_ascii=False)}\n\n"
         f"PROPOSALS (unvalidated, immutable):\n{json.dumps(frozen['proposals'], ensure_ascii=False, separators=(',', ':'))}\n\n"
-        f"SOURCE_INDEX:\n{json.dumps(frozen['sources'], ensure_ascii=False, separators=(',', ':'))}\n\n"
-        f"REVIEW_PACKET:\n{packed['model_json']}\n\n"
-        "Return decisions only, without rewriting any proposal text."
+        f"SOURCE_INDEX:\n{json.dumps(proposal_manifest['sources'], ensure_ascii=False, separators=(',', ':'))}\n"
+        f"\nOBSERVED_UNITS:\n{_retrieval_review_references.canonical(references['observed_units'])}"
+        f"\nREVIEW_PACKET:\n{references['model_json']}"
+        "\nReturn decisions only, using unit IDs; never rewrite any proposal."
     )
     review_started = time_module.monotonic()
     review_call_start = len(getattr(budget, "call_log", []))
@@ -26025,7 +26033,7 @@ def _assistant_core_adjudicate_root_cause_grounded(
         parsed, model_used = _v13_json_models(
             [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
             models=[V13_FAST_MODEL],
-            json_schema=_retrieval_review_decisions.schema(),
+            json_schema=_retrieval_review_references.schema(),
             effort=V13_FAST_EFFORT, reasoning_mode="",
             timeout=min(20, V13_FAST_TIMEOUT_SECONDS),
             max_output_tokens=min(3400, V13_FAST_MAX_OUTPUT_TOKENS),
@@ -26050,9 +26058,9 @@ def _assistant_core_adjudicate_root_cause_grounded(
     review_execution.update({"outcome": "completed", "provider_response_received": True,
                              "elapsed_seconds": round(time_module.monotonic() - review_started, 3)})
     try:
-        result = _retrieval_review_decisions.validate(
+        result = _retrieval_review_references.validate(
             parsed=parsed, frozen=frozen, records=records, observed_query=observed)
-    except _retrieval_review_decisions.ReviewDecisionError as exc:
+    except _retrieval_review_references.ReferenceError as exc:
         # Provider usage remains settled even if its semantic payload is unusable.
         return unavailable("review_decision_" + str(exc))
     review_execution["decision_validated"] = True
@@ -26068,7 +26076,8 @@ def _assistant_core_adjudicate_root_cause_grounded(
     if request.debug:
         meta["root_causal_applicability"]["source_records"] = records
         meta["root_review_decisions"]["proposals"] = frozen["proposals"]
-        meta["root_review_decisions"]["source_index"] = frozen["sources"]
+        meta["root_review_decisions"]["source_index"] = frozen["source_manifest"]
+        meta["root_review_decisions"]["reference_registry"] = frozen
     if not result["causes"]:
         out = _assistant_core_build_no_evidence(request, decision, retrieval)
         out["meta"] = {**meta, "cacheable": False, "semantic_cacheable": False}
@@ -28345,7 +28354,7 @@ def _assistant_core_sync(payload: Union[AskRequest, RootCauseRequest], x_ai_inte
         if requested_mode == MODE_ROOT_CAUSE:
             cache_scope["_root_observation_policy"] = _retrieval_diagnostic_query.DIAGNOSTIC_BASIS_POLICY
             cache_scope["_root_review_packet_policy"] = _retrieval_review_packet.POLICY_VERSION
-            cache_scope["_root_review_decision_policy"] = _retrieval_review_decisions.POLICY_VERSION
+            cache_scope["_root_review_decision_policy"] = _retrieval_review_references.POLICY_VERSION
 
         # Reuse only an exact request with a complete current-policy interpretation.
         cached = _v13_cache_lookup(
@@ -28365,7 +28374,7 @@ def _assistant_core_sync(payload: Union[AskRequest, RootCauseRequest], x_ai_inte
                     != _retrieval_review_packet.POLICY_VERSION)
                 or (requested_mode == MODE_ROOT_CAUSE and cached.get("possible_causes") and
                     ((cached.get("meta") or {}).get("root_review_decisions") or {}).get("policy_version")
-                    != _retrieval_review_decisions.POLICY_VERSION)
+                    != _retrieval_review_references.POLICY_VERSION)
             ):
                 cached = None
                 budget.semantic_cache = "bypass_unvalidated_observation_basis"
