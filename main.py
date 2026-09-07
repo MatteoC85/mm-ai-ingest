@@ -13398,6 +13398,13 @@ def version():
         "assistant_core_v2_smart_model": ASSISTANT_CORE_SMART_MODEL,
         "assistant_core_v2_smart_effort": ASSISTANT_CORE_SMART_EFFORT,
         "assistant_core_v2_router_timeout_seconds": ASSISTANT_CORE_ROUTER_TIMEOUT_SECONDS,
+        "assistant_core_root_observation_query_policy": _retrieval_diagnostic_query.POLICY_VERSION,
+        "assistant_core_root_observation_basis_policy": _retrieval_diagnostic_query.DIAGNOSTIC_BASIS_POLICY,
+        "assistant_core_root_router_call_policy": _retrieval_diagnostic_query.ROUTER_CALL_POLICY,
+        "assistant_core_root_router_attempt_plan": _retrieval_diagnostic_query.router_attempt_plan(
+            [ASSISTANT_CORE_ROUTER_MODEL, ASSISTANT_CORE_ROUTER_FALLBACK_MODEL],
+            int(ASSISTANT_CORE_ROUTER_TIMEOUT_SECONDS),
+        ),
         "assistant_core_v2_ask_deadline_seconds": ASSISTANT_CORE_ASK_DEADLINE_SECONDS,
         "assistant_core_v2_root_cause_deadline_seconds": ASSISTANT_CORE_ROOT_CAUSE_DEADLINE_SECONDS,
         "assistant_core_v2_smart_start_deadline_seconds": ASSISTANT_CORE_SMART_START_DEADLINE_SECONDS,
@@ -22380,15 +22387,13 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
         "Do not invent components, facts, alarms, values, steps, causes, or evidence IDs. relevant_evidence_ids may contain only IDs shown in INDEXED_EVIDENCE."
     )
     if is_root_cause:
-        # The original request has not been lexically classified or filtered.
+        # Factual arrays are constructed from the verified partition, not generated
+        # a second time with potentially different wording.
         system_msg = system_msg.replace(
-            "DIAGNOSTIC_OBSERVED_CONTEXT below is the only text allowed to steer causal retrieval; DIAGNOSTIC_UNOBSERVED_INFORMATION is only a checklist for clarification. ",
-            "The complete USER_REQUEST is authoritative; classify its epistemic roles in diagnostic_basis before preparing diagnostic fields. ",
+            'For fault_diagnostic or guided_diagnostic, populate DIAGNOSTIC_SUBSYSTEMS, DIAGNOSTIC_OBSERVABLES, DIAGNOSTIC_OPERATING_CONDITIONS, DIAGNOSTIC_DISCRIMINANTS and DIAGNOSTIC_EXCLUSIONS from explicit user information only. Put recent changes, visible traces, stable/unstable states and explicitly mentioned design features in diagnostic_discriminants because they must influence cause priority. Put absent alarms, stable values or ruled-out conditions in diagnostic_exclusions; they down-rank conflicting causes but do not prove a different cause. A variable that the user explicitly says was not read, checked, measured, observed, recorded or made available is MISSING_INFORMATION, not an observation and not an exclusion. Never copy such a variable into diagnostic arrays, required facets, dense/lexical queries, exact terms or relevant evidence selections. DIAGNOSTIC_OBSERVED_CONTEXT below is the only text allowed to steer causal retrieval; DIAGNOSTIC_UNOBSERVED_INFORMATION is only a checklist for clarification. Also create facet queries for the subsystem, symptom, operating condition and each high-value discriminant so retrieval can find exact documented cases. For non-diagnostic requests return empty diagnostic arrays. ',
+            'For fault_diagnostic or guided_diagnostic, classify every part of USER_REQUEST first. The server derives diagnostic_observables, diagnostic_exclusions, diagnostic_operating_conditions and diagnostic_discriminants from the checked partition; do not emit those arrays in this JSON. Populate diagnostic_subsystems and query variants from the classified facts and known target identity. Unknown information, requested checks and hypotheses are not observed facts. Normal measurements and actual inspections with negative results remain observations. Operational omissions remain facts. Preserve technical identifiers, units, comparisons and qualifiers. Do not require a source to repeat every observation to support a mechanism. Produce short faithful facet queries for the required subsystem, symptom and discriminating conditions, avoiding redundant copies. General safety guidance is not a reported fault. ',
         )
-        system_msg = system_msg.replace(
-            "A variable that the user explicitly says was not read, checked, measured, observed, recorded or made available is MISSING_INFORMATION, not an observation and not an exclusion. ",
-            "Information semantically declared unknown belongs in MISSING_INFORMATION. An inspection with a negative result or a measured normal state is an observation, not missing information; an operational action explicitly not performed is also a fact. ",
-        )
+        # Original text and the same semantic call remain authoritative.
         system_msg += _retrieval_diagnostic_query.DIAGNOSTIC_BASIS_INSTRUCTION
     elif request.requested_mode == MODE_ASK:
         system_msg += _retrieval_precision_facts.SCALAR_TARGET_INSTRUCTION
@@ -22405,13 +22410,26 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
         f"INDEXED_EVIDENCE:\n{evidence_block}\n\n"
         "Return only the required JSON. Empty safety_reason and out_of_scope_reason unless the corresponding request_kind is selected."
     )
+    router_models = _dedup_text_values(
+        [ASSISTANT_CORE_ROUTER_MODEL, ASSISTANT_CORE_ROUTER_FALLBACK_MODEL], limit=2,
+    )
+    router_timeout = ASSISTANT_CORE_ROUTER_TIMEOUT_SECONDS
+    router_execution = None
+    if is_root_cause:
+        plan = _retrieval_diagnostic_query.router_attempt_plan(router_models, int(router_timeout))
+        router_models = list(plan["models"])
+        router_timeout = int(plan["timeout_seconds"])
+        router_execution = {
+            **plan, "outcome": "started", "provider_response_received": False,
+            "max_output_tokens": ASSISTANT_CORE_ROUTER_MAX_OUTPUT_TOKENS,
+        }
+        if isinstance(request.metadata, dict):
+            request.metadata[_retrieval_diagnostic_query.ROUTER_EXECUTION_KEY] = router_execution
+    router_started = time_module.monotonic()
     try:
         parsed, model_used = _v13_json_models(
             [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
-            models=_dedup_text_values(
-                [ASSISTANT_CORE_ROUTER_MODEL, ASSISTANT_CORE_ROUTER_FALLBACK_MODEL],
-                limit=2,
-            ),
+            models=router_models,
             json_schema=(
                 _retrieval_diagnostic_query.router_schema_with_diagnostic_basis(
                     build_router_schema(allowed_modes)
@@ -22422,11 +22440,17 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
             ),
             effort=ASSISTANT_CORE_ROUTER_EFFORT,
             reasoning_mode="",
-            timeout=ASSISTANT_CORE_ROUTER_TIMEOUT_SECONDS,
+            timeout=router_timeout,
             max_output_tokens=ASSISTANT_CORE_ROUTER_MAX_OUTPUT_TOKENS,
             company_id=request.company_id,
             purpose="assistant_core_v2_semantic_router",
         )
+        if router_execution is not None:
+            router_execution.update(
+                outcome="response_received", provider_response_received=True,
+                model_used=model_used,
+                elapsed_seconds=round(time_module.monotonic() - router_started, 3),
+            )
         out = dict(parsed or {})
         if profile is not None:
             profile = _retrieval_diagnostic_query.profile_from_router(out, profile)
@@ -22441,12 +22465,18 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
         out = _assistant_core_relax_diagnostic_router_contract(out, request)
         out["router_model"] = model_used
     except Exception as exc:
+        if router_execution is not None:
+            router_execution.update(
+                outcome=("processing_error" if router_execution["provider_response_received"] else "provider_error"),
+                exception_type=type(exc).__name__,
+                elapsed_seconds=round(time_module.monotonic() - router_started, 3),
+            )
         print("ASSISTANT_CORE_ROUTER_DETERMINISTIC_FALLBACK", str(exc)[:700])
         fallback = _assistant_core_deterministic_router_fallback(
             request, retrieval, exc
         )
         if profile is not None:
-            profile = _retrieval_diagnostic_query.profile_from_router({}, profile)
+            profile = _retrieval_diagnostic_query.unavailable_profile(profile)
             if isinstance(request.metadata, dict):
                 request.metadata[_ROOT_DIAGNOSTIC_QUERY_PROFILE_KEY] = profile.to_dict()
             fallback = dict(
@@ -22487,6 +22517,12 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
     if profile is not None:
         basis_result = _retrieval_diagnostic_query.enforce_diagnostic_basis(out, profile)
         out = dict(basis_result.payload)
+        if router_execution is not None:
+            invalid = bool(basis_result.summary.get("validation_error")) or basis_result.summary.get("reason") == "unvalidated_observation_basis"
+            router_execution.update(
+                outcome="contract_invalid" if invalid else "completed",
+                validation_error=basis_result.summary.get("validation_error", ""),
+            )
         if isinstance(request.metadata, dict):
             request.metadata[_retrieval_diagnostic_query.BASIS_METADATA_KEY] = basis_result.summary
     if request.requested_mode == MODE_ASK and isinstance(request.metadata, dict):
@@ -28348,6 +28384,16 @@ def _assistant_core_sync(payload: Union[AskRequest, RootCauseRequest], x_ai_inte
                     _retrieval_diagnostic_query.BASIS_METADATA_KEY: dict(basis_summary),
                     "assistant_core_diagnostic_query_state": _assistant_core_diagnostic_query_profile(request).public_summary(),
                 }}
+            router_execution = request.metadata.get(_retrieval_diagnostic_query.ROUTER_EXECUTION_KEY)
+            if isinstance(router_execution, dict):
+                final_meta = dict(final.get("meta") or {})
+                final_meta[_retrieval_diagnostic_query.ROUTER_EXECUTION_KEY] = dict(router_execution)
+                core_meta = dict(final_meta.get("assistant_core_v2") or {})
+                if router_execution.get("outcome") != "completed":
+                    core_meta["router_degraded"] = True
+                    core_meta["router_degraded_reason"] = str(router_execution.get("outcome") or "router_unavailable")
+                final_meta["assistant_core_v2"] = core_meta
+                final = {**dict(final), "meta": final_meta}
         if requested_mode == MODE_ASK:
             scalar_target = request.metadata.get(_retrieval_precision_facts.SCALAR_TARGET_KEY)
             if isinstance(scalar_target, dict):

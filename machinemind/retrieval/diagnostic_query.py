@@ -17,10 +17,19 @@ import copy
 import hashlib
 import re
 
-POLICY_VERSION = "root-request-preservation-v2"
-DIAGNOSTIC_BASIS_POLICY = "root-observation-admission-v3"
+POLICY_VERSION = "root-request-preservation-v3"
+DIAGNOSTIC_BASIS_POLICY = "root-observation-admission-v4"
 BASIS_METADATA_KEY = "root_diagnostic_basis"
 MAX_PARTS = 32
+BASIS_USES = ("context", "support", "identity_gap")
+ROUTER_EXECUTION_KEY = "root_observation_router_execution"
+ROUTER_CALL_POLICY = "root-router-single-attempt-v1"
+# These values already come from the checked partition. Asking the provider to
+# produce them a second time wastes output and can create contradicting copies.
+DERIVED_DIAGNOSTIC_FIELDS = (
+    "diagnostic_observables", "diagnostic_exclusions",
+    "diagnostic_operating_conditions", "diagnostic_discriminants",
+)
 ROLES = (
     "observation", "observed_negative", "action_performed", "action_not_performed",
     "target_identity", "unknown", "target_identity_unknown", "hypothesis",
@@ -47,9 +56,11 @@ class RequestPart:
     quote: str
     start: int
     end: int
+    basis_use: str = "context"
 
     def to_dict(self) -> dict[str, Any]:
-        return {"role": self.role, "quote": self.quote, "start": self.start, "end": self.end}
+        return {"role": self.role, "quote": self.quote, "start": self.start,
+                "end": self.end, "basis_use": self.basis_use}
 
 
 @dataclass(frozen=True)
@@ -93,7 +104,10 @@ class DiagnosticQueryProfile:
 
     @property
     def clarification_question(self) -> str:
-        return _clarification_question(self.response_language, invalid=bool(self.error))
+        return _clarification_question(
+            self.response_language, invalid=bool(self.error),
+            unavailable=self.error == "router_response_unavailable",
+        )
 
     @property
     def reason(self) -> str:
@@ -147,8 +161,19 @@ def analyze_diagnostic_query(query: str, *, response_language: str = "") -> Diag
     )
 
 
-def _clarification_question(language: str, *, invalid: bool = False, identity: bool = False) -> str:
+def _clarification_question(language: str, *, invalid: bool = False, identity: bool = False,
+                            unavailable: bool = False) -> str:
     en = str(language or "").lower().startswith("en")
+    if unavailable:
+        return (
+            "The request could not be completed because the interpretation service did not "
+            "return a usable response. No cause has been assigned. This is a technical "
+            "failure, not a finding that your observations are insufficient."
+            if en else
+            "La richiesta non è stata completata perché il servizio di interpretazione "
+            "non ha restituito una risposta utilizzabile. Non è stata attribuita alcuna "
+            "causa. È un problema tecnico, non un giudizio di insufficienza delle osservazioni."
+        )
     if invalid:
         return (
             "I could not validate a complete interpretation of your request. No cause has been assigned. "
@@ -187,11 +212,14 @@ def _partition(value: Any, original: str) -> tuple[tuple[RequestPart, ...], str]
     cursor = 0
     parts: list[RequestPart] = []
     for item in value:
-        if not isinstance(item, Mapping) or set(item) - {"role", "quote", "start", "end"}:
+        if not isinstance(item, Mapping) or set(item) - {"role", "quote", "start", "end", "basis_use"}:
             return (), "invalid_request_part_shape"
         role, quote = item.get("role"), item.get("quote")
         if not isinstance(role, str) or role not in ROLES or not isinstance(quote, str):
             return (), "invalid_request_part_type"
+        basis_use = item.get("basis_use")
+        if not isinstance(basis_use, str) or basis_use not in BASIS_USES:
+            return (), "missing_or_invalid_basis_use"
         quote = _space(quote)
         if not quote:
             return (), "empty_request_part"
@@ -203,7 +231,7 @@ def _partition(value: Any, original: str) -> tuple[tuple[RequestPart, ...], str]
         # Do not infer word/clause boundaries from spaces or character classes:
         # many writing systems do not separate semantic units with whitespace.
         # Whether the role covers a complete meaningful clause is a model judgement.
-        parts.append(RequestPart(role, source[cursor:end], cursor, end))
+        parts.append(RequestPart(role, source[cursor:end], cursor, end, basis_use))
         cursor = end
     if source[cursor:].strip():
         return (), "request_partition_coverage_incomplete"
@@ -218,6 +246,37 @@ def profile_from_router(raw: Mapping[str, Any], profile: DiagnosticQueryProfile)
     return replace(profile, parts=parts, error=error,
                    interpretation_status="invalid" if error else "valid",
                    diagnostic_projection=not factual_route)
+
+
+
+def unavailable_profile(profile: DiagnosticQueryProfile) -> DiagnosticQueryProfile:
+    """A provider failure is not an empty semantic partition supplied by the user."""
+    return replace(profile, parts=(), interpretation_status="invalid",
+                   error="router_response_unavailable")
+
+
+def router_attempt_plan(models: Sequence[str], per_attempt_timeout: int) -> dict[str, Any]:
+    """One root-router dispatch within the OLD total stage time allowance.
+
+    Reallocate the former primary+fallback wait to the primary request instead of
+    starting a second paid request after an unknown outcome. This is not a global
+    request timeout change and does not alter the transport/budget contract.
+    """
+    if isinstance(models, (str, bytes)):
+        raise ValueError("models must be a sequence, not a string")
+    candidates = list(dict.fromkeys(str(m).strip() for m in models if str(m).strip()))[:2]
+    if not candidates:
+        raise ValueError("root router primary model is missing")
+    if isinstance(per_attempt_timeout, bool) or not isinstance(per_attempt_timeout, int) or per_attempt_timeout < 1:
+        raise ValueError("router timeout must be a positive integer")
+    return {
+        "policy_version": ROUTER_CALL_POLICY,
+        "models": candidates[:1],
+        "timeout_seconds": min(30, per_attempt_timeout * len(candidates)),
+        "previous_stage_allowance_seconds": per_attempt_timeout * len(candidates),
+        "attempt_limit": 1,
+        "automatic_fallback": False,
+    }
 
 
 def profile_from_mapping(value: Any, *, fallback_query: str = "", response_language: str = "") -> DiagnosticQueryProfile:
@@ -322,11 +381,18 @@ DIAGNOSTIC_BASIS_INSTRUCTION = (
     "a bare stop/restart or intermittence alone requires needs_observations. "
     "needs_target_identity applies when an explicitly unknown identity is necessary for the "
     "requested model-specific prescriptions; do not choose the first model found in a source. "
-    "support_quotes must exactly repeat complete factual request_parts (observation, "
-    "observed_negative, action_performed, action_not_performed); short identifiers are valid "
-    "observations but their diagnostic sufficiency still needs evidence. identity_gap_quotes "
-    "must repeat complete target_identity_unknown parts. sufficient needs at least one "
-    "support_quote and no required identity gap. For genuinely nondiagnostic requests routed "
+    "Each request_part has basis_use: context, support, or identity_gap. Assign support "
+    "ON the factual part that justifies diagnostic admission (observation, observed_negative, "
+    "action_performed, action_not_performed); this is a relevance judgement, not a claim "
+    "that a cause is certain. Assign identity_gap only to a target_identity_unknown part "
+    "whose identity is required for the requested prescriptions. All other parts use context. "
+    "Do not produce support_quotes or identity_gap_quotes: the server derives references "
+    "from these annotated parts, never from a second copy of their text. Short identifiers "
+    "are valid observations but their sufficiency still needs evidence. sufficient needs "
+    "at least one support part and no required identity_gap part. The server derives the "
+    "four factual diagnostic arrays from the partition; do not generate them again. "
+    "Keep remaining query variants concise and do not repeat the entire request in every field. "
+    "For genuinely nondiagnostic requests routed "
     "to ASK choose not_diagnostic; identity-dependent diagnostic prescriptions are not exempt. "
     "Unsafe or out-of-scope requests retain priority. Missing or unknown variables may be "
     "used as clarification questions, not positive or negative facts or asserted causes. "
@@ -340,36 +406,58 @@ DIAGNOSTIC_BASIS_INSTRUCTION = (
 
 def router_schema_with_diagnostic_basis(schema: Mapping[str, Any]) -> dict[str, Any]:
     out = copy.deepcopy(dict(schema))
-    out["name"] = "machinemind_root_observation_router_v2"
+    out["name"] = "machinemind_root_observation_router_v3"
     body = out["schema"]
-    body["properties"]["diagnostic_basis"] = {
+    for field in DERIVED_DIAGNOSTIC_FIELDS:
+        body["properties"].pop(field, None)
+    basis = {
         "type": "object", "additionalProperties": False,
         "properties": {
-            "state": {"type": "string", "enum": ["sufficient", "needs_observations", "needs_target_identity", "not_diagnostic"]},
-            "support_quotes": {"type": "array", "items": {"type": "string"}, "maxItems": 4},
-            "identity_gap_quotes": {"type": "array", "items": {"type": "string"}, "maxItems": 3},
+            # Generate the partition before the global judgement. A supporting
+            # reference is attached to its owner; there are no repeated quotes.
             "request_parts": {"type": "array", "minItems": 1, "maxItems": MAX_PARTS, "items": {
                 "type": "object", "additionalProperties": False,
-                "properties": {"role": {"type": "string", "enum": list(ROLES)}, "quote": {"type": "string"}},
-                "required": ["role", "quote"],
+                "properties": {
+                    "role": {"type": "string", "enum": list(ROLES)},
+                    "quote": {"type": "string"},
+                    "basis_use": {"type": "string", "enum": list(BASIS_USES)},
+                },
+                "required": ["role", "quote", "basis_use"],
             }},
-        }, "required": ["state", "support_quotes", "identity_gap_quotes", "request_parts"],
+            "state": {"type": "string", "enum": [
+                "sufficient", "needs_observations", "needs_target_identity", "not_diagnostic"
+            ]},
+        }, "required": ["request_parts", "state"],
     }
-    body["required"] = [x for x in body["required"] if x != "diagnostic_basis"] + ["diagnostic_basis"]
+    body["properties"] = {"diagnostic_basis": basis, **{
+        k: v for k, v in body["properties"].items() if k != "diagnostic_basis"
+    }}
+    body["required"] = ["diagnostic_basis"] + [
+        x for x in body["required"] if x != "diagnostic_basis" and x not in DERIVED_DIAGNOSTIC_FIELDS
+    ]
     return out
 
 
-def _part_quotes(values: Any, profile: DiagnosticQueryProfile, roles: frozenset[str], limit: int) -> tuple[list[str], bool]:
-    if not isinstance(values, list) or len(values) > limit:
-        return [], False
-    allowed = {p.quote for p in profile.parts if p.role in roles}
-    out: list[str] = []
-    for v in values:
-        if not isinstance(v, str) or _space(v) not in allowed:
-            return [], False
-        if _space(v) not in out:
-            out.append(_space(v))
-    return out, True
+def _basis_parts(profile: DiagnosticQueryProfile) -> tuple[list[str], list[str], str]:
+    """Validate inline labels, then derive exact references from original spans.
+
+    No fuzzy matching, case folding or semantic decision occurs here.
+    """
+    support, gaps = [], []
+    for part in profile.parts:
+        if part.basis_use == "support":
+            if part.role not in FACT_ROLES:
+                return [], [], "support_attached_to_nonfactual_part"
+            if part.quote not in support:
+                support.append(part.quote)
+        elif part.basis_use == "identity_gap":
+            if part.role != "target_identity_unknown":
+                return [], [], "identity_gap_attached_to_wrong_role"
+            if part.quote not in gaps:
+                gaps.append(part.quote)
+        elif part.basis_use != "context":
+            return [], [], "invalid_basis_use"
+    return support, gaps, ""
 
 
 def enforce_diagnostic_basis(raw: Mapping[str, Any], profile: DiagnosticQueryProfile) -> RouterSanitizationResult:
@@ -377,9 +465,16 @@ def enforce_diagnostic_basis(raw: Mapping[str, Any], profile: DiagnosticQueryPro
     basis = out.get("diagnostic_basis")
     basis = basis if isinstance(basis, Mapping) else {}
     state = str(basis.get("state") or "")
-    support, support_ok = _part_quotes(basis.get("support_quotes"), profile, FACT_ROLES, 4)
-    gaps, gaps_ok = _part_quotes(basis.get("identity_gap_quotes"), profile, frozenset({"target_identity_unknown"}), 3)
-    valid = profile.interpretation_status == "valid" and support_ok and gaps_ok
+    support, gaps, basis_error = _basis_parts(profile)
+    if profile.interpretation_status == "valid":
+        bound_parts, binding_error = _partition(basis.get("request_parts"), profile.original_query)
+        if binding_error or bound_parts != profile.parts:
+            basis_error = "basis_partition_binding_mismatch"
+    # Reject legacy/extra proof fields, not silently accept two conflicting copies.
+    if set(basis) - {"state", "request_parts"}:
+        basis_error = "unexpected_basis_fields"
+    valid = profile.interpretation_status == "valid" and not basis_error
+    execution_failed = profile.error == "router_response_unavailable"
     kind, mode = str(out.get("request_kind") or "").lower(), str(out.get("effective_mode") or "").lower()
     priority = kind in {"unsafe_request", "out_of_scope"}
     nondiagnostic = (
@@ -392,6 +487,8 @@ def enforce_diagnostic_basis(raw: Mapping[str, Any], profile: DiagnosticQueryPro
     admitted = bool(valid and state == "sufficient" and support and not gaps and not exempt)
     if priority:
         reason = "priority_refusal_or_out_of_scope"
+    elif execution_failed:
+        reason = "router_execution_failed"
     elif not valid:
         reason = "invalid_observation_contract"
     elif nondiagnostic:
@@ -411,14 +508,18 @@ def enforce_diagnostic_basis(raw: Mapping[str, Any], profile: DiagnosticQueryPro
         "state": state, "admitted": admitted, "applicable": not exempt,
         "reason": reason, "interpretation_status": profile.interpretation_status,
         "coverage_complete": profile.interpretation_status == "valid",
-        "validation_error": profile.error or ("invalid_basis_references" if not (support_ok and gaps_ok) else ""),
+        "validation_error": profile.error or basis_error,
+        "basis_reference_mode": "inline_part_annotations",
         "support_quotes": support, "identity_gap_quotes": gaps,
         "request_parts": [p.to_dict() for p in profile.parts],
         "offset_reference": "whitespace-normalized original request; no Unicode/case/punctuation folding",
     }
     if not exempt and not admitted:
-        invalid = reason in {"invalid_observation_contract", "unvalidated_observation_basis"}
-        question = _clarification_question(profile.response_language, invalid=invalid, identity=reason == "target_identity_required")
+        invalid = reason in {"invalid_observation_contract", "unvalidated_observation_basis", "router_execution_failed"}
+        question = _clarification_question(
+            profile.response_language, invalid=invalid,
+            identity=reason == "target_identity_required", unavailable=execution_failed,
+        )
         # Use the router's localized clarification only for a valid insufficiency
         # decision, never to conceal an interpretation/schema failure.
         model_question = out.get("clarification_question")
