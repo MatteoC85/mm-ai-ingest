@@ -15,6 +15,17 @@ from collections.abc import Callable
 from typing import Any, Optional
 
 from fastapi.responses import StreamingResponse
+from machinemind.infrastructure.request_budget import _RequestControl, _REQUEST_CONTROL_CTX
+
+
+def _controlled_call(control, func, payload, secret):
+    """The same event is visible to the waiting task and the synchronous worker."""
+    token = _REQUEST_CONTROL_CTX.set(control)
+    try:
+        return func(payload, secret)
+    finally:
+        _REQUEST_CONTROL_CTX.reset(token)
+
 
 
 async def stream_json_response(
@@ -31,8 +42,9 @@ async def stream_json_response(
     error_payload: Callable[[str, Exception], dict],
 ):
     """Run blocking work in a thread and stream JSON whitespace heartbeats."""
-    result_task = asyncio.create_task(
-        asyncio.to_thread(sync_func, payload, x_ai_internal_secret)
+    control = _RequestControl(
+        float(hard_timeout_seconds) if hard_timeout_seconds is not None else 86400.0,
+        parent=_REQUEST_CONTROL_CTX.get(),
     )
     stream_started = time_module.monotonic()
     stream_query = str(
@@ -46,85 +58,97 @@ async def stream_json_response(
     )
 
     async def stream_json():
-        heartbeat = (" " * int(heartbeat_bytes)) + "\n"
-        yield heartbeat
-        while True:
-            hard_remaining = None
-            if hard_timeout_seconds is not None:
-                hard_remaining = max(
-                    0.0,
-                    float(hard_timeout_seconds)
-                    - (time_module.monotonic() - stream_started),
-                )
-                if hard_remaining <= 0.0:
-                    timeout_message = (
-                        "Maximum response time exceeded."
-                        if str(stream_language or "").lower().startswith("en")
-                        else "Tempo massimo di risposta superato."
+        result_task = asyncio.create_task(
+            asyncio.to_thread(_controlled_call, control, sync_func, payload, x_ai_internal_secret)
+        )
+        try:
+            heartbeat = (" " * int(heartbeat_bytes)) + "\n"
+            yield heartbeat
+            while True:
+                hard_remaining = None
+                if hard_timeout_seconds is not None:
+                    hard_remaining = max(
+                        0.0,
+                        float(hard_timeout_seconds)
+                        - (time_module.monotonic() - stream_started),
                     )
+                    if hard_remaining <= 0.0:
+                        timeout_message = (
+                            "Maximum response time exceeded."
+                            if str(stream_language or "").lower().startswith("en")
+                            else "Tempo massimo di risposta superato."
+                        )
+                        result = {
+                            "ok": True,
+                            "status": "timeout",
+                            "result_code": timeout_result_code,
+                            "requested_mode": mode,
+                            "effective_mode": mode,
+                            "routed": False,
+                            "language": stream_language,
+                            "answer": timeout_message,
+                            "problem_summary": timeout_message,
+                            "possible_causes": [],
+                            "recommended_next_checks": [],
+                            "citations": [],
+                            "rg_links": [],
+                            "meta": {
+                                "cacheable": False,
+                                "semantic_cacheable": False,
+                                "hard_timeout": True,
+                            },
+                        }
+                        control.cancel()
+                        try:
+                            result_task.cancel()
+                        except Exception:
+                            pass
+                        yield json.dumps(
+                            result,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                        break
+                wait_seconds = float(heartbeat_seconds)
+                if hard_remaining is not None:
+                    wait_seconds = max(
+                        0.25,
+                        min(wait_seconds, hard_remaining),
+                    )
+                try:
+                    result = await asyncio.wait_for(
+                        asyncio.shield(result_task),
+                        timeout=wait_seconds,
+                    )
+                except asyncio.TimeoutError:
+                    yield heartbeat
+                    continue
+                except Exception as exc:
+                    result = error_payload(mode, exc)
+    
+                if not isinstance(result, dict):
                     result = {
-                        "ok": True,
-                        "status": "timeout",
-                        "result_code": timeout_result_code,
-                        "requested_mode": mode,
-                        "effective_mode": mode,
-                        "routed": False,
-                        "language": stream_language,
-                        "answer": timeout_message,
-                        "problem_summary": timeout_message,
-                        "possible_causes": [],
-                        "recommended_next_checks": [],
-                        "citations": [],
-                        "rg_links": [],
-                        "meta": {
-                            "cacheable": False,
-                            "semantic_cacheable": False,
-                            "hard_timeout": True,
+                        "ok": False,
+                        "status": "error",
+                        "error": {
+                            "code": f"{mode.upper()}_FAILED",
+                            "message": "Invalid backend payload",
+                            "detail": str(type(result)),
                         },
                     }
-                    try:
-                        result_task.cancel()
-                    except Exception:
-                        pass
-                    yield json.dumps(
-                        result,
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    )
-                    break
-            wait_seconds = float(heartbeat_seconds)
-            if hard_remaining is not None:
-                wait_seconds = max(
-                    0.25,
-                    min(wait_seconds, hard_remaining),
+                yield json.dumps(
+                    result,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
                 )
-            try:
-                result = await asyncio.wait_for(
-                    asyncio.shield(result_task),
-                    timeout=wait_seconds,
-                )
-            except asyncio.TimeoutError:
-                yield heartbeat
-                continue
-            except Exception as exc:
-                result = error_payload(mode, exc)
-
-            if not isinstance(result, dict):
-                result = {
-                    "ok": False,
-                    "status": "error",
-                    "error": {
-                        "code": f"{mode.upper()}_FAILED",
-                        "message": "Invalid backend payload",
-                        "detail": str(type(result)),
-                    },
-                }
-            yield json.dumps(
-                result,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-            break
+                break
+        finally:
+            # Cancelling a Future cannot kill an in-flight provider call. It does
+            # stop any subsequent dispatch from that worker context. Keep its cost
+            # reservation until usage is reconciled, rather than assuming zero.
+            control.cancel()
+            if not result_task.done():
+                result_task.cancel()
 
     return StreamingResponse(
         stream_json(),
@@ -159,9 +183,10 @@ async def json_with_hard_timeout(
         query,
         preferred=getattr(payload, "language", None),
     )
+    control = _RequestControl(float(hard_timeout_seconds), parent=_REQUEST_CONTROL_CTX.get())
     try:
         result = await asyncio.wait_for(
-            asyncio.to_thread(sync_func, payload, x_ai_internal_secret),
+            asyncio.to_thread(_controlled_call, control, sync_func, payload, x_ai_internal_secret),
             timeout=max(1.0, float(hard_timeout_seconds)),
         )
         if isinstance(result, dict):
@@ -204,6 +229,8 @@ async def json_with_hard_timeout(
         return common
     except Exception as exc:
         return error_payload(mode, exc)
+    finally:
+        control.cancel()
 
 
 def run_sync_with_hard_timeout(
@@ -217,6 +244,7 @@ def run_sync_with_hard_timeout(
 ):
     """Run a synchronous callable in a copied ContextVar context with a hard wait cap."""
     timeout = max(0.01, float(hard_timeout_seconds))
+    control = _RequestControl(timeout, parent=_REQUEST_CONTROL_CTX.get())
     ctx = contextvars.copy_context()
     executor = concurrent.futures.ThreadPoolExecutor(
         max_workers=1,
@@ -224,6 +252,8 @@ def run_sync_with_hard_timeout(
     )
     future = executor.submit(
         ctx.run,
+        _controlled_call,
+        control,
         func,
         payload,
         x_ai_internal_secret,
@@ -234,4 +264,5 @@ def run_sync_with_hard_timeout(
         future.cancel()
         return on_timeout(payload, timeout)
     finally:
+        control.cancel()
         executor.shutdown(wait=False, cancel_futures=True)

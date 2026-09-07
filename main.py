@@ -5949,6 +5949,7 @@ def _openai_chat(
         default_model=OPENAI_CHAT_MODEL,
         url=OPENAI_CHAT_URL,
         post_fn=requests.post,
+        current_budget_fn=_v13_current_budget,
     )
 
 
@@ -6001,6 +6002,8 @@ def _openai_chat_json(
     model: Optional[str] = None,
     json_schema: Optional[dict] = None,
     timeout: int = 60,
+    max_output_tokens: Optional[int] = None,
+    purpose: str = "legacy_chat_json",
 ) -> dict:
     return _openai_transport.chat_json(
         messages,
@@ -6011,6 +6014,9 @@ def _openai_chat_json(
         default_model=OPENAI_CHAT_MODEL,
         url=OPENAI_CHAT_URL,
         post_fn=requests.post,
+        current_budget_fn=_v13_current_budget,
+        max_output_tokens=max_output_tokens,
+        purpose=purpose,
     )
 
 
@@ -13456,6 +13462,7 @@ def version():
         "v13_root_cause_deadline_seconds": V13_ROOT_CAUSE_DEADLINE_SECONDS,
         "v13_max_llm_calls_ask": V13_MAX_LLM_CALLS_ASK,
         "v13_max_llm_calls_root_cause": V13_MAX_LLM_CALLS_ROOT_CAUSE,
+        "v13_budget_policy_version": V13_BUDGET_POLICY_VERSION,
         "v13_max_estimated_cost_ask_usd": V13_MAX_ESTIMATED_COST_ASK_USD,
         "v13_max_estimated_cost_root_cause_usd": V13_MAX_ESTIMATED_COST_ROOT_CAUSE_USD,
         "v13_planner_timeout_seconds": V13_PLANNER_TIMEOUT_SECONDS,
@@ -16633,6 +16640,8 @@ from machinemind.config.assistant_runtime import *  # noqa: F401,F403
 
 from machinemind.infrastructure.request_budget import (
     configure_request_budget_runtime as _configure_request_budget_runtime,
+    _v13_push_operation_limits,
+    _v13_pop_operation_limits,
     _V13BudgetExceeded,
     _V13RequestBudget,
     _V13_BUDGET_CTX,
@@ -28593,6 +28602,10 @@ def _v13_attach_runtime_meta(response: dict, budget: _V13RequestBudget, *, debug
     meta["v13_elapsed_seconds"] = runtime_meta["elapsed_seconds"]
     meta["v13_llm_calls"] = runtime_meta["llm_calls"]
     meta["v13_estimated_cost_usd"] = runtime_meta["estimated_cost_usd"]
+    meta["v13_budget_policy_version"] = runtime_meta["budget_policy_version"]
+    meta["v13_committed_cost_usd"] = runtime_meta["committed_cost_usd"]
+    meta["v13_uncertain_cost_usd"] = runtime_meta["uncertain_cost_usd"]
+    meta["v13_accounting_complete"] = runtime_meta["accounting_complete"]
     if debug:
         meta["v13_runtime"] = runtime_meta
     response["meta"] = meta
@@ -28610,6 +28623,10 @@ def _v13_attach_runtime_meta(response: dict, budget: _V13RequestBudget, *, debug
                     "elapsed_seconds": runtime_meta["elapsed_seconds"],
                     "llm_calls": runtime_meta["llm_calls"],
                     "estimated_cost_usd": runtime_meta["estimated_cost_usd"],
+                    "budget_policy_version": runtime_meta["budget_policy_version"],
+                    "committed_cost_usd": runtime_meta["committed_cost_usd"],
+                    "uncertain_cost_usd": runtime_meta["uncertain_cost_usd"],
+                    "accounting_complete": runtime_meta["accounting_complete"],
                     "semantic_cache": budget.semantic_cache,
                     "evidence_gate_decision": str((budget.evidence_gate or {}).get("decision") or ""),
                     "evidence_gate_used": bool((budget.evidence_gate or {}).get("semantic_gate_used")),
@@ -31248,11 +31265,12 @@ def _sd_run_retrieval_assurance(
     if not SMART_DIAGNOSTIC_RETRIEVAL_ASSURANCE_ENABLED:
         return bool(gate.get("accepted") and seed), seed, {"enabled": False, "attempted": False, "adopted": False}
 
-    temp_budget = _V13RequestBudget("root_cause")
-    temp_budget.deadline_seconds = max(2, int(max_seconds or 2) + 1)
-    temp_budget.deadline_monotonic = time_module.monotonic() + float(temp_budget.deadline_seconds)
-    temp_budget.max_llm_calls = 0
+    # Share the active turn's cost ledger; only the local time/LLM permission changes.
+    temp_budget = _v13_current_budget() or _V13RequestBudget("root_cause")
     token = _V13_BUDGET_CTX.set(temp_budget)
+    _local_control, _local_token = _v13_push_operation_limits(
+        seconds=max(2, int(max_seconds or 2) + 1), allow_llm=False,
+    )
     try:
         enhanced, assurance = _v13_apply_retrieval_assurance(
             q=symptom_text,
@@ -31273,6 +31291,7 @@ def _sd_run_retrieval_assurance(
         print("SMART_DIAGNOSTIC_RETRIEVAL_ASSURANCE_FAIL", str(exc)[:500])
         enhanced, assurance = retrieval, {"enabled": True, "attempted": True, "adopted": False, "reason": "assurance_failed"}
     finally:
+        _v13_pop_operation_limits(_local_token)
         _V13_BUDGET_CTX.reset(token)
 
     final_citations = [dict(c) for c in (enhanced.get("citations") or seed) if isinstance(c, dict)]
@@ -31402,11 +31421,13 @@ def _sd_enrich_state_evidence_from_answer(
         "metrics": _v13_evidence_metrics(base),
         "source_profile": {},
     }
-    temp_budget = _V13RequestBudget("root_cause")
-    temp_budget.deadline_seconds = SMART_DIAGNOSTIC_RETRIEVAL_ASSURANCE_MAX_SECONDS_ANSWER + 1
-    temp_budget.deadline_monotonic = time_module.monotonic() + float(temp_budget.deadline_seconds)
-    temp_budget.max_llm_calls = 0
+    # Evidence enrichment spends from the same Smart turn, not a fresh budget.
+    temp_budget = _v13_current_budget() or _V13RequestBudget("root_cause")
     token = _V13_BUDGET_CTX.set(temp_budget)
+    _local_control, _local_token = _v13_push_operation_limits(
+        seconds=SMART_DIAGNOSTIC_RETRIEVAL_ASSURANCE_MAX_SECONDS_ANSWER + 1,
+        allow_llm=False,
+    )
     try:
         enhanced, assurance = _v13_apply_retrieval_assurance(
             q=query,
@@ -31427,6 +31448,7 @@ def _sd_enrich_state_evidence_from_answer(
         print("SMART_DIAGNOSTIC_ANSWER_ASSURANCE_FAIL", str(exc)[:500])
         return state
     finally:
+        _v13_pop_operation_limits(_local_token)
         _V13_BUDGET_CTX.reset(token)
     if not bool((assurance or {}).get("adopted")):
         return state

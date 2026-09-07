@@ -2,14 +2,27 @@
 
 The assignments below are mechanically extracted from the certified production
 monolith. Defaults, clamps, markers, release identifiers and engine-key generation
-are intentionally unchanged.
+remain unchanged except for explicit reservation accounting and honoring lower cost limits.
 """
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 
+V13_BUDGET_POLICY_VERSION = "request-reservation-v1"
+
+
+def _configured_cost_limit(name: str, default: str) -> float:
+    """Honor even a low/zero limit; never silently raise a commercial ceiling."""
+    value = float(os.environ.get(name, default))
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"{name} must be a finite non-negative USD amount")
+    return value
+
+
 __all__ = [
+    "V13_BUDGET_POLICY_VERSION",
     "V13_ENABLED",
     "V13_ASK_ENABLED",
     "V13_ROOT_CAUSE_ENABLED",
@@ -225,10 +238,10 @@ ASSISTANT_CORE_MAX_LLM_CALLS_ASK = max(3, min(4, int(os.environ.get("MM_ASSISTAN
 ASSISTANT_CORE_MAX_LLM_CALLS_ROOT_CAUSE = max(3, min(4, int(os.environ.get("MM_ASSISTANT_CORE_MAX_LLM_CALLS_ROOT_CAUSE", "4"))))
 ASSISTANT_CORE_MAX_LLM_CALLS_SMART_START = max(3, min(4, int(os.environ.get("MM_ASSISTANT_CORE_MAX_LLM_CALLS_SMART_START", "4"))))
 ASSISTANT_CORE_MAX_LLM_CALLS_SMART_TURN = max(2, min(3, int(os.environ.get("MM_ASSISTANT_CORE_MAX_LLM_CALLS_SMART_TURN", "3"))))
-ASSISTANT_CORE_MAX_COST_ASK_USD = max(0.08, float(os.environ.get("MM_ASSISTANT_CORE_MAX_COST_ASK_USD", "0.25")))
-ASSISTANT_CORE_MAX_COST_ROOT_CAUSE_USD = max(0.12, float(os.environ.get("MM_ASSISTANT_CORE_MAX_COST_ROOT_CAUSE_USD", "0.40")))
-ASSISTANT_CORE_MAX_COST_SMART_START_USD = max(0.12, float(os.environ.get("MM_ASSISTANT_CORE_MAX_COST_SMART_START_USD", "0.35")))
-ASSISTANT_CORE_MAX_COST_SMART_TURN_USD = max(0.08, float(os.environ.get("MM_ASSISTANT_CORE_MAX_COST_SMART_TURN_USD", "0.25")))
+ASSISTANT_CORE_MAX_COST_ASK_USD = _configured_cost_limit("MM_ASSISTANT_CORE_MAX_COST_ASK_USD", "0.25")
+ASSISTANT_CORE_MAX_COST_ROOT_CAUSE_USD = _configured_cost_limit("MM_ASSISTANT_CORE_MAX_COST_ROOT_CAUSE_USD", "0.40")
+ASSISTANT_CORE_MAX_COST_SMART_START_USD = _configured_cost_limit("MM_ASSISTANT_CORE_MAX_COST_SMART_START_USD", "0.35")
+ASSISTANT_CORE_MAX_COST_SMART_TURN_USD = _configured_cost_limit("MM_ASSISTANT_CORE_MAX_COST_SMART_TURN_USD", "0.25")
 ASSISTANT_CORE_GENERAL_MAX_OUTPUT_TOKENS = max(1200, min(4200, int(os.environ.get("MM_ASSISTANT_CORE_GENERAL_MAX_OUTPUT_TOKENS", "2600"))))
 ASSISTANT_CORE_SMART_MAX_OUTPUT_TOKENS = max(2400, min(7000, int(os.environ.get("MM_ASSISTANT_CORE_SMART_MAX_OUTPUT_TOKENS", "5200"))))
 
@@ -237,8 +250,8 @@ V13_ASK_DEADLINE_SECONDS = max(20, min(58, int(os.environ.get("MM_V13_ASK_DEADLI
 V13_ROOT_CAUSE_DEADLINE_SECONDS = max(25, min(58, int(os.environ.get("MM_V13_ROOT_CAUSE_DEADLINE_SECONDS", "55"))))
 V13_MAX_LLM_CALLS_ASK = max(1, min(2, int(os.environ.get("MM_V13_MAX_LLM_CALLS_ASK", "2"))))
 V13_MAX_LLM_CALLS_ROOT_CAUSE = max(1, min(2, int(os.environ.get("MM_V13_MAX_LLM_CALLS_ROOT_CAUSE", "2"))))
-V13_MAX_ESTIMATED_COST_ASK_USD = max(0.05, float(os.environ.get("MM_V13_MAX_ESTIMATED_COST_ASK_USD", "0.30")))
-V13_MAX_ESTIMATED_COST_ROOT_CAUSE_USD = max(0.08, float(os.environ.get("MM_V13_MAX_ESTIMATED_COST_ROOT_CAUSE_USD", "0.45")))
+V13_MAX_ESTIMATED_COST_ASK_USD = _configured_cost_limit("MM_V13_MAX_ESTIMATED_COST_ASK_USD", "0.30")
+V13_MAX_ESTIMATED_COST_ROOT_CAUSE_USD = _configured_cost_limit("MM_V13_MAX_ESTIMATED_COST_ROOT_CAUSE_USD", "0.45")
 V13_PLANNER_TIMEOUT_SECONDS = max(6, min(15, int(os.environ.get("MM_V13_PLANNER_TIMEOUT_SECONDS", "10"))))
 V13_EVIDENCE_GATE_TIMEOUT_SECONDS = max(6, min(18, int(os.environ.get("MM_V13_EVIDENCE_GATE_TIMEOUT_SECONDS", "14"))))
 V13_EVIDENCE_GATE_MAX_OUTPUT_TOKENS = max(900, min(2200, int(os.environ.get("MM_V13_EVIDENCE_GATE_MAX_OUTPUT_TOKENS", "1400"))))
@@ -355,6 +368,7 @@ V13_ENGINE_KEY = hashlib.sha256(
     "|".join(
         [
             V13_CODE_MARKER,
+            V13_BUDGET_POLICY_VERSION,
             V13_RELEASE_ID,
             ASSISTANT_CORE_V2_CODE_MARKER if ASSISTANT_CORE_V2_ENABLED else "assistant-core-v2-off",
             ASSISTANT_CORE_V2_RELEASE_ID,
