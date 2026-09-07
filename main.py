@@ -13404,6 +13404,7 @@ def version():
         "assistant_core_root_observation_query_policy": _retrieval_diagnostic_query.POLICY_VERSION,
         "assistant_core_root_observation_basis_policy": _retrieval_diagnostic_query.DIAGNOSTIC_BASIS_POLICY,
         "assistant_core_root_review_decision_policy": _retrieval_review_references.POLICY_VERSION,
+        "assistant_core_root_review_capture_policy": "root-review-capture-v1",
         "assistant_core_root_review_packet_policy": _retrieval_review_packet.POLICY_VERSION,
         "assistant_core_root_review_packet_limit": _retrieval_review_packet.MAX_EVIDENCE_CHARS,
         "assistant_core_root_router_call_policy": _retrieval_diagnostic_query.ROUTER_CALL_POLICY,
@@ -16697,6 +16698,12 @@ def _v13_responses_json(
     company_id: str,
     purpose: str,
 ) -> dict:
+    # Capture is request-local and active only in the authorized Root Cause
+    # debug review. All other requests keep the original transport unchanged.
+    post_fn = requests.post
+    if purpose == "assistant_core_root_cause_adjudicator":
+        from machinemind.infrastructure.review_capture import observe_post
+        post_fn = observe_post(post_fn, purpose=purpose)
     return _openai_transport.responses_json(
         messages,
         model=model,
@@ -16709,7 +16716,7 @@ def _v13_responses_json(
         purpose=purpose,
         api_key=OPENAI_API_KEY,
         url=OPENAI_RESPONSES_URL,
-        post_fn=requests.post,
+        post_fn=post_fn,
         current_budget_fn=_v13_current_budget,
         response_text_fn=_v13_response_text,
         safety_identifier_fn=_v13_safety_identifier,
@@ -25944,6 +25951,9 @@ def _assistant_core_adjudicate_root_cause_grounded(
     retrieval: dict, response: dict,
 ) -> dict:
     """Independent review selects immutable proposals, never rewrites the answer."""
+    from machinemind.infrastructure import review_capture as _review_capture
+    capture_handle = None
+    capture_token = None
     budget = _v13_current_budget()
     review_meta: dict = {"policy_version": _retrieval_review_packet.POLICY_VERSION}
     review_execution: dict = {"stage": "root_adjudicator", "outcome": "not_started",
@@ -25972,6 +25982,8 @@ def _assistant_core_adjudicate_root_cause_grounded(
                                                  "validation_error": reason},
                        "root_causal_applicability": {"policy_version": _retrieval_diagnostic_sources.CAUSAL_GROUNDING_POLICY,
                                                      "validation_error": reason}}
+        if request.debug and capture_handle is not None:
+            out["meta"]["root_review_capture"] = _review_capture.snapshot(capture_handle)
         return out
 
     if budget is None or budget.llm_calls >= budget.max_llm_calls or budget.remaining() < 10.0:
@@ -26029,6 +26041,17 @@ def _assistant_core_adjudicate_root_cause_grounded(
     review_started = time_module.monotonic()
     review_call_start = len(getattr(budget, "call_log", []))
     review_execution["outcome"] = "dispatched"
+    capture_handle, capture_token = _review_capture.begin(
+        enabled=bool(request.debug),
+        fixture={
+            "request_scope": {"company_id": request.company_id, "machine_id": request.machine_id,
+                              "ai_scope": request.ai_scope},
+            "original_query": request.query, "observed_query": observed,
+            "response_language": request.response_language,
+            "frozen": frozen, "validator_records": records,
+            "review_packet_summary": review_meta,
+        } if request.debug else {},
+    )
     try:
         parsed, model_used = _v13_json_models(
             [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
@@ -26055,6 +26078,8 @@ def _assistant_core_adjudicate_root_cause_grounded(
                                  "provider_attempts": len(stage_calls)})
         return unavailable("adjudicator_" + original_error,
                            original_error in {"ReadTimeout", "ConnectTimeout", "Timeout", "TimeoutError"})
+    finally:
+        _review_capture.end(capture_token)
     review_execution.update({"outcome": "completed", "provider_response_received": True,
                              "elapsed_seconds": round(time_module.monotonic() - review_started, 3)})
     try:
@@ -26074,6 +26099,7 @@ def _assistant_core_adjudicate_root_cause_grounded(
                 "policy_version": _retrieval_diagnostic_sources.CAUSAL_GROUNDING_POLICY,
             }}
     if request.debug:
+        meta["root_review_capture"] = _review_capture.snapshot(capture_handle)
         meta["root_causal_applicability"]["source_records"] = records
         meta["root_review_decisions"]["proposals"] = frozen["proposals"]
         meta["root_review_decisions"]["source_index"] = frozen["source_manifest"]
