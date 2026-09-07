@@ -142,6 +142,8 @@ from machinemind.ingest import dispatch as _ingest_dispatch
 from machinemind.ingest import persistence as _ingest_persistence
 from machinemind.ingest import metering as _ingest_metering
 from machinemind.ingest import orchestration as _ingest_orchestration
+from machinemind.retrieval import dense as _retrieval_dense
+from machinemind.retrieval import lexical as _retrieval_lexical
 from machinemind.retrieval import diagnostic_query as _retrieval_diagnostic_query
 from machinemind.retrieval import diagnostic_sources as _retrieval_diagnostic_sources
 from machinemind.retrieval import precision_facts as _retrieval_precision_facts
@@ -333,184 +335,19 @@ def _fetch_dense_chunk_candidates(
     bubble_document_id: Optional[str] = None,
     debug: bool = False,
 ) -> tuple[Optional[int], list[tuple]]:
-    chunks_matching_filter = None
-
-    conn = _db_conn()
-    try:
-        with conn.cursor() as cur:
-            if doc_ids:
-                if debug:
-                    cur.execute(
-                        """
-                        SELECT COUNT(*)
-                        FROM public.document_chunks
-                        WHERE company_id=%s
-                          AND bubble_document_id = ANY(%s)
-                          AND embedding IS NOT NULL;
-                        """,
-                        (company_id, doc_ids),
-                    )
-                    chunks_matching_filter = int(cur.fetchone()[0] or 0)
-
-                cur.execute(
-                    """
-                    SELECT bubble_document_id, chunk_index, page_from, page_to,
-                           left(chunk_text, %s) AS snippet,
-                           left(chunk_text, 2000) AS chunk_full,
-                           1 - (embedding <=> %s::vector) AS similarity,
-                           embedding,
-                           CASE WHEN machine_id = %s THEN TRUE ELSE FALSE END AS exact_machine_scope
-                    FROM public.document_chunks
-                    WHERE company_id = %s
-                      AND bubble_document_id = ANY(%s)
-                      AND embedding IS NOT NULL
-                    ORDER BY embedding <=> %s::vector, bubble_document_id, page_from, chunk_index
-                    LIMIT %s;
-                    """,
-                    (ASK_SNIPPET_CHARS, q_vec_lit, machine_id, company_id, doc_ids, q_vec_lit, candidate_k),
-                )
-
-            elif bubble_document_id:
-                bdid = bubble_document_id
-
-                if debug:
-                    cur.execute(
-                        """
-                        SELECT COUNT(*)
-                        FROM public.document_chunks
-                        WHERE company_id=%s
-                          AND bubble_document_id=%s
-                          AND embedding IS NOT NULL
-                          AND (machine_id=%s OR machine_id IS NULL OR machine_id = '');
-                        """,
-                        (company_id, bdid, machine_id),
-                    )
-                    chunks_matching_filter = int(cur.fetchone()[0] or 0)
-
-                cur.execute(
-                    """
-                    SELECT bubble_document_id, chunk_index, page_from, page_to,
-                           left(chunk_text, %s) AS snippet,
-                           left(chunk_text, 2000) AS chunk_full,
-                           1 - (embedding <=> %s::vector) AS similarity,
-                           embedding,
-                           CASE WHEN machine_id = %s THEN TRUE ELSE FALSE END AS exact_machine_scope
-                    FROM public.document_chunks
-                    WHERE company_id = %s
-                      AND bubble_document_id = %s
-                      AND embedding IS NOT NULL
-                      AND (machine_id = %s OR machine_id IS NULL OR machine_id = '')
-                    ORDER BY embedding <=> %s::vector, bubble_document_id, page_from, chunk_index
-                    LIMIT %s;
-                    """,
-                    (ASK_SNIPPET_CHARS, q_vec_lit, machine_id, company_id, bdid, machine_id, q_vec_lit, candidate_k),
-                )
-
-            else:
-                if debug:
-                    cur.execute(
-                        """
-                        SELECT COUNT(*)
-                        FROM public.document_chunks
-                        WHERE company_id=%s
-                          AND embedding IS NOT NULL
-                          AND (machine_id=%s OR machine_id IS NULL OR machine_id = '');
-                        """,
-                        (company_id, machine_id),
-                    )
-                    chunks_matching_filter = int(cur.fetchone()[0] or 0)
-
-                cur.execute(
-                    """
-                    SELECT bubble_document_id, chunk_index, page_from, page_to,
-                           left(chunk_text, %s) AS snippet,
-                           left(chunk_text, 2000) AS chunk_full,
-                           1 - (embedding <=> %s::vector) AS similarity,
-                           embedding,
-                           CASE WHEN machine_id = %s THEN TRUE ELSE FALSE END AS exact_machine_scope
-                    FROM public.document_chunks
-                    WHERE company_id = %s
-                      AND embedding IS NOT NULL
-                      AND (machine_id = %s OR machine_id IS NULL OR machine_id = '')
-                    ORDER BY embedding <=> %s::vector, bubble_document_id, page_from, chunk_index
-                    LIMIT %s;
-                    """,
-                    (ASK_SNIPPET_CHARS, q_vec_lit, machine_id, company_id, machine_id, q_vec_lit, candidate_k),
-                )
-
-            raw_rows = cur.fetchall()
-            return chunks_matching_filter, raw_rows
-    finally:
-        conn.close()
+    return _retrieval_dense.fetch_dense_chunk_candidates(
+        company_id=company_id, machine_id=machine_id, q_vec_lit=q_vec_lit,
+        candidate_k=candidate_k, doc_ids=doc_ids,
+        bubble_document_id=bubble_document_id, debug=debug,
+        runtime=_retrieval_dense.DenseRuntime(_db_conn, ASK_SNIPPET_CHARS),
+    )
 
 def _raw_rows_to_dense_candidates(
     raw_rows: list[tuple],
     *,
     query_used: Optional[str] = None,
 ) -> list[dict]:
-    candidates: list[dict] = []
-
-    for row in raw_rows:
-        if len(row) == 9:
-            (
-                bdid,
-                chunk_index,
-                page_from,
-                page_to,
-                snippet,
-                chunk_full,
-                similarity,
-                embedding,
-                exact_machine_scope,
-            ) = row
-        elif len(row) == 8:
-            # Backward-compatible for tests or old fixtures.
-            (
-                bdid,
-                chunk_index,
-                page_from,
-                page_to,
-                snippet,
-                chunk_full,
-                similarity,
-                embedding,
-            ) = row
-            exact_machine_scope = False
-        else:
-            raise ValueError(f"Unexpected dense candidate row width: {len(row)}")
-
-        if embedding is None:
-            emb_list = None
-        elif isinstance(embedding, list):
-            emb_list = embedding
-        else:
-            value = str(embedding).strip().strip("[]")
-            emb_list = [float(x) for x in value.split(",") if x.strip()]
-
-        item = {
-            "citation_id": f"{bdid}:p{int(page_from)}-{int(page_to)}:c{int(chunk_index)}",
-            "bubble_document_id": str(bdid),
-            "chunk_index": int(chunk_index),
-            "page_from": int(page_from),
-            "page_to": int(page_to),
-            "snippet": (snippet or "").strip(),
-            "chunk_full": (chunk_full or "").strip(),
-            # Keep the raw cosine similarity separate from later routing/ranking
-            # scores. Deterministic page/structured helpers also expose a field named
-            # ``similarity`` but those values are synthetic and must never prove
-            # evidence sufficiency.
-            "similarity": float(similarity),
-            "semantic_similarity": float(similarity),
-            "embedding_list": emb_list or [],
-            "exact_machine_scope": bool(exact_machine_scope),
-        }
-
-        if query_used is not None:
-            item["query_used"] = query_used
-
-        candidates.append(item)
-
-    return candidates
+    return _retrieval_dense.raw_rows_to_dense_candidates(raw_rows, query_used=query_used)
 
 from machinemind.infrastructure.database import (
     connect_database as _infrastructure_connect_database,
@@ -3265,35 +3102,9 @@ def _effective_similarity_threshold(
 
 
 def _build_prefix_tsquery_from_texts(texts: list[str], limit: int = 10) -> Optional[str]:
-    stopwords = {
-        "the", "and", "for", "with", "when", "while", "during", "after", "before", "from",
-        "this", "that", "these", "those", "into", "onto", "about", "question",
-        "machine", "system", "document", "documents", "manual", "answer", "issue", "problem",
-        "il", "lo", "la", "i", "gli", "le", "con", "per", "quando", "durante", "dopo", "prima",
-        "questo", "questa", "questi", "queste", "domanda", "documento", "documenti",
-        "macchina", "sistema", "problema", "guasto", "risposta",
-    }
-
-    toks: list[str] = []
-    seen = set()
-
-    for text in texts or []:
-        for tok in re.findall(r"[a-zà-öø-ÿ0-9]{3,}", _normalize_unicode_advanced(text or "").lower()):
-            if tok in stopwords:
-                continue
-            if tok in seen:
-                continue
-            seen.add(tok)
-            toks.append(tok)
-            if len(toks) >= limit:
-                break
-        if len(toks) >= limit:
-            break
-
-    if not toks:
-        return None
-
-    return " | ".join(f"{tok}:*" for tok in toks)
+    return _retrieval_lexical.build_prefix_tsquery_from_texts(
+        texts, limit, normalize_unicode=_normalize_unicode_advanced,
+    )
 
 
 def _fts_search_chunks_prefix(
@@ -3304,65 +3115,11 @@ def _fts_search_chunks_prefix(
     doc_ids: Optional[list[str]] = None,
     bubble_document_id: Optional[str] = None,
 ) -> list[dict]:
-    ts_query = _build_prefix_tsquery_from_texts(texts, limit=10)
-    if not ts_query:
-        return []
-
-    conn = _db_conn()
-    try:
-        with conn.cursor() as cur:
-            where = ["company_id = %s"]
-            params: list[Any] = [company_id]
-
-            if doc_ids:
-                where.append("bubble_document_id = ANY(%s)")
-                params.append(doc_ids)
-            elif bubble_document_id:
-                where.append("bubble_document_id = %s")
-                params.append(bubble_document_id)
-                where.append("(machine_id = %s OR machine_id IS NULL OR machine_id = '')")
-                params.append(machine_id)
-            else:
-                where.append("(machine_id = %s OR machine_id IS NULL OR machine_id = '')")
-                params.append(machine_id)
-
-            where_sql = " AND ".join(where)
-
-            cur.execute(
-                f"""
-                SELECT bubble_document_id, chunk_index, page_from, page_to,
-                       left(chunk_text, %s) AS snippet,
-                       ts_rank_cd(
-                           to_tsvector('simple', chunk_text),
-                           to_tsquery('simple', %s)
-                       ) AS rank
-                FROM public.document_chunks
-                WHERE {where_sql}
-                  AND to_tsvector('simple', chunk_text) @@ to_tsquery('simple', %s)
-                ORDER BY rank DESC, bubble_document_id, page_from, chunk_index
-                LIMIT %s;
-                """,
-                [ASK_SNIPPET_CHARS, ts_query, *params, ts_query, top_k],
-            )
-            rows = cur.fetchall()
-
-        out: list[dict] = []
-        for (bdid, chunk_index, page_from, page_to, snippet, _rank) in rows:
-            citation_id = f"{bdid}:p{int(page_from)}-{int(page_to)}:c{int(chunk_index)}"
-            out.append(
-                {
-                    "citation_id": citation_id,
-                    "bubble_document_id": str(bdid),
-                    "chunk_index": int(chunk_index),
-                    "page_from": int(page_from),
-                    "page_to": int(page_to),
-                    "snippet": (snippet or "").strip(),
-                    "similarity": 0.0,
-                }
-            )
-        return out
-    finally:
-        conn.close()
+    return _retrieval_lexical.fts_search_chunks_prefix(
+        company_id, machine_id, texts, top_k, doc_ids, bubble_document_id,
+        runtime=_retrieval_lexical.LexicalRuntime(_db_conn, ASK_SNIPPET_CHARS),
+        build_prefix_query=_build_prefix_tsquery_from_texts,
+    )
 
 
 def _fts_search_chunks_multi(
@@ -3373,21 +3130,15 @@ def _fts_search_chunks_multi(
     doc_ids: Optional[list[str]] = None,
     bubble_document_id: Optional[str] = None,
 ) -> list[dict]:
-    merged: list[dict] = []
-
-    for q in _dedup_text_values(queries, limit=max(1, SEMANTIC_MAX_LEXICAL_QUERIES + 1)):
-        merged.extend(
-            _fts_search_chunks(
-                company_id=company_id,
-                machine_id=machine_id,
-                q=q,
-                top_k=top_k,
-                doc_ids=doc_ids,
-                bubble_document_id=bubble_document_id,
-            )
-        )
-
-    return _dedup_citations_by_snippet(merged, max_items=top_k)
+    return _retrieval_lexical.fts_search_chunks_multi(
+        company_id, machine_id, queries, top_k, doc_ids, bubble_document_id,
+        runtime=_retrieval_lexical.LexicalMultiQueryRuntime(
+            dedup_text_values=_dedup_text_values,
+            max_lexical_queries=SEMANTIC_MAX_LEXICAL_QUERIES,
+            search_chunks=_fts_search_chunks,
+            dedup_citations=_dedup_citations_by_snippet,
+        ),
+    )
 
 
 def _structured_rescue_query_intent(q: str, planner: Optional[dict] = None) -> bool:
@@ -3656,38 +3407,19 @@ def _dense_candidates_multi_query(
     bubble_document_id: Optional[str] = None,
     debug: bool = False,
 ) -> tuple[Optional[int], list[dict], dict[str, list[float]]]:
-    cleaned_queries = _dedup_text_values(query_texts, limit=max(1, SEMANTIC_MAX_DENSE_QUERIES + 2))
-    if not cleaned_queries:
-        return None, [], {}
-
-    vectors = _openai_embed_texts(cleaned_queries)
-    query_vectors: dict[str, list[float]] = {}
-    dense_ranked_lists: list[list[dict]] = []
-    chunks_matching_filter = None
-
-    for qq, vec in zip(cleaned_queries, vectors):
-        query_vectors[qq] = vec
-        q_vec_lit = _vector_literal(vec)
-
-        current_chunks_matching_filter, raw_rows = _fetch_dense_chunk_candidates(
-            company_id=company_id,
-            machine_id=machine_id,
-            q_vec_lit=q_vec_lit,
-            candidate_k=candidate_k,
-            doc_ids=doc_ids,
-            bubble_document_id=bubble_document_id,
-            debug=debug,
-        )
-
-        if chunks_matching_filter is None:
-            chunks_matching_filter = current_chunks_matching_filter
-
-        ranked = _raw_rows_to_dense_candidates(raw_rows, query_used=qq)
-        if ranked:
-            dense_ranked_lists.append(ranked)
-
-    merged = _rrf_merge_candidates(dense_ranked_lists, k=60)
-    return chunks_matching_filter, merged, query_vectors
+    return _retrieval_dense.dense_candidates_multi_query(
+        query_texts=query_texts, company_id=company_id, machine_id=machine_id,
+        candidate_k=candidate_k, doc_ids=doc_ids,
+        bubble_document_id=bubble_document_id, debug=debug,
+        runtime=_retrieval_dense.DenseMultiQueryRuntime(
+            dedup_text_values=_dedup_text_values,
+            max_dense_queries=SEMANTIC_MAX_DENSE_QUERIES,
+            embed_texts=_openai_embed_texts, vector_literal=_vector_literal,
+            fetch_candidates=_fetch_dense_chunk_candidates,
+            rows_to_candidates=_raw_rows_to_dense_candidates,
+            merge_ranked_lists=_rrf_merge_candidates,
+        ),
+    )
 
 
 def _candidate_order_key(item: dict) -> tuple:
@@ -5531,65 +5263,10 @@ def _fts_search_chunks(
     doc_ids: Optional[list[str]] = None,
     bubble_document_id: Optional[str] = None,
 ) -> list[dict]:
-    q = (q or "").strip()
-    if not q:
-        return []
-
-    conn = _db_conn()
-    try:
-        with conn.cursor() as cur:
-            where = ["company_id = %s"]
-            params: list[Any] = [company_id]
-
-            if doc_ids:
-                where.append("bubble_document_id = ANY(%s)")
-                params.append(doc_ids)
-            elif bubble_document_id:
-                where.append("bubble_document_id = %s")
-                params.append(bubble_document_id)
-                where.append("(machine_id = %s OR machine_id IS NULL OR machine_id = '')")
-                params.append(machine_id)
-            else:
-                where.append("(machine_id = %s OR machine_id IS NULL OR machine_id = '')")
-                params.append(machine_id)
-
-            where_sql = " AND ".join(where)
-
-            cur.execute(
-                f"""
-                SELECT bubble_document_id, chunk_index, page_from, page_to,
-                       left(chunk_text, %s) AS snippet,
-                       ts_rank_cd(
-                           to_tsvector('simple', chunk_text),
-                           plainto_tsquery('simple', %s)
-                       ) AS rank
-                FROM public.document_chunks
-                WHERE {where_sql}
-                  AND to_tsvector('simple', chunk_text) @@ plainto_tsquery('simple', %s)
-                ORDER BY rank DESC, bubble_document_id, page_from, chunk_index
-                LIMIT %s;
-                """,
-                [ASK_SNIPPET_CHARS, q, *params, q, top_k],
-            )
-            rows = cur.fetchall()
-
-            out: list[dict] = []
-            for (bdid, chunk_index, page_from, page_to, snippet, _rank) in rows:
-                citation_id = f"{bdid}:p{int(page_from)}-{int(page_to)}:c{int(chunk_index)}"
-                out.append(
-                    {
-                        "citation_id": citation_id,
-                        "bubble_document_id": bdid,
-                        "chunk_index": int(chunk_index),
-                        "page_from": int(page_from),
-                        "page_to": int(page_to),
-                        "snippet": (snippet or "").strip(),
-                        "similarity": 0.0,
-                    }
-                )
-            return out
-    finally:
-        conn.close()
+    return _retrieval_lexical.fts_search_chunks(
+        company_id, machine_id, q, top_k, doc_ids, bubble_document_id,
+        runtime=_retrieval_lexical.LexicalRuntime(_db_conn, ASK_SNIPPET_CHARS),
+    )
 
 
 def _normalize_unicode_advanced(s: str) -> str:
@@ -13627,75 +13304,11 @@ def search_chunks(
     q_vec = _openai_embed_texts([q])[0]
     q_vec_lit = _vector_literal(q_vec)
 
-    conn = _db_conn()
-    try:
-        with conn.cursor() as cur:
-            if payload.bubble_document_id:
-                bubble_document_id = payload.bubble_document_id.strip()
-                cur.execute(
-                    """
-                    SELECT bubble_document_id, chunk_index, page_from, page_to, left(chunk_text, 400) AS preview,
-                           1 - (embedding <=> %s::vector) AS similarity
-                    FROM public.document_chunks
-                    WHERE company_id = %s
-                      AND bubble_document_id = %s
-                      AND embedding IS NOT NULL
-                    ORDER BY embedding <=> %s::vector, bubble_document_id, page_from, chunk_index
-                    LIMIT %s;
-                    """,
-                    (q_vec_lit, company_id, bubble_document_id, q_vec_lit, top_k),
-                )
-                rows = cur.fetchall()
-
-                results = []
-                for (bdid, chunk_index, page_from, page_to, preview, similarity) in rows:
-                    citation_id = f"{bdid}:p{int(page_from)}-{int(page_to)}:c{int(chunk_index)}"
-                    results.append(
-                        {
-                            "citation_id": citation_id,
-                            "bubble_document_id": bdid,
-                            "chunk_index": int(chunk_index),
-                            "page_from": int(page_from),
-                            "page_to": int(page_to),
-                            "similarity": float(similarity),
-                            "preview": preview,
-                        }
-                    )
-
-                return {"ok": True, "top_k": top_k, "results": results}
-
-            cur.execute(
-                """
-                SELECT bubble_document_id, chunk_index, page_from, page_to, left(chunk_text, 400) AS preview,
-                       1 - (embedding <=> %s::vector) AS similarity
-                FROM public.document_chunks
-                WHERE company_id = %s
-                  AND embedding IS NOT NULL
-                ORDER BY embedding <=> %s::vector, bubble_document_id, page_from, chunk_index
-                LIMIT %s;
-                """,
-                (q_vec_lit, company_id, q_vec_lit, top_k),
-            )
-            rows = cur.fetchall()
-
-            results = []
-            for (bubble_document_id, chunk_index, page_from, page_to, preview, similarity) in rows:
-                citation_id = f"{bubble_document_id}:p{int(page_from)}-{int(page_to)}:c{int(chunk_index)}"
-                results.append(
-                    {
-                        "citation_id": citation_id,
-                        "bubble_document_id": bubble_document_id,
-                        "chunk_index": int(chunk_index),
-                        "page_from": int(page_from),
-                        "page_to": int(page_to),
-                        "similarity": float(similarity),
-                        "preview": preview,
-                    }
-                )
-
-            return {"ok": True, "top_k": top_k, "results": results}
-    finally:
-        conn.close()
+    return _retrieval_dense.search_chunk_previews(
+        company_id=company_id, q_vec_lit=q_vec_lit, top_k=top_k,
+        bubble_document_id=payload.bubble_document_id,
+        runtime=_retrieval_dense.DenseRuntime(_db_conn, ASK_SNIPPET_CHARS),
+    )
 
 
 
