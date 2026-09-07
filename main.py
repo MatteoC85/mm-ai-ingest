@@ -143,6 +143,8 @@ from machinemind.ingest import persistence as _ingest_persistence
 from machinemind.ingest import metering as _ingest_metering
 from machinemind.ingest import orchestration as _ingest_orchestration
 from machinemind.retrieval import dense as _retrieval_dense
+from machinemind.retrieval import structured as _retrieval_structured
+from machinemind.retrieval import candidate_ranking as _retrieval_candidate_ranking
 from machinemind.retrieval import lexical as _retrieval_lexical
 from machinemind.retrieval import diagnostic_query as _retrieval_diagnostic_query
 from machinemind.retrieval import diagnostic_sources as _retrieval_diagnostic_sources
@@ -831,55 +833,16 @@ def _db_fetch_related_step_pages(
     parent_source_key: str,
     text_chars: int,
 ) -> list[tuple]:
-    """Return canonical Step children in Bubble order without semantic guessing."""
-    if not (company_id and machine_id and parent_source_key):
-        return []
-
-    conn = None
-    try:
-        conn = _db_conn()
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT
-                    r.child_source_key,
-                    r.ordinal,
-                    p.machine_id,
-                    p.page_number,
-                    LEFT(COALESCE(p.text, ''), %s) AS page_text
-                FROM public.structured_source_relations AS r
-                JOIN public.document_pages AS p
-                  ON p.company_id = r.company_id
-                 AND p.bubble_document_id = r.child_source_key
-                WHERE r.company_id = %s
-                  AND r.machine_id = %s
-                  AND r.parent_source_key = %s
-                  AND r.relation_type = %s
-                  AND p.text IS NOT NULL
-                  AND length(p.text) > 10
-                ORDER BY
-                    r.ordinal NULLS LAST,
-                    r.child_source_key,
-                    p.page_number;
-                """,
-                (
-                    int(text_chars),
-                    company_id,
-                    machine_id,
-                    parent_source_key,
-                    STRUCTURED_RELATION_PROCEDURE_STEP,
-                ),
-            )
-            return list(cur.fetchall())
-    except Exception as exc:
-        print("STRUCTURED_RELATION_READ_FALLBACK", str(exc)[:700])
-        return []
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
+    return _retrieval_structured.db_fetch_related_step_pages(
+        company_id=company_id,
+        machine_id=machine_id,
+        parent_source_key=parent_source_key,
+        text_chars=text_chars,
+        runtime=_retrieval_structured.DbFetchRelatedStepPagesRuntime(
+            STRUCTURED_RELATION_PROCEDURE_STEP=STRUCTURED_RELATION_PROCEDURE_STEP,
+            _db_conn=_db_conn,
+        ),
+    )
 
 
 
@@ -1539,40 +1502,10 @@ def _rrf_merge_candidates(
     ranked_lists: list[list[dict]],
     k: int = 60,
 ) -> list[dict]:
-    scores: dict[str, float] = {}
-    best_item: dict[str, dict] = {}
-
-    for ranked in ranked_lists:
-        for idx, item in enumerate(ranked):
-            cid = str(item.get("citation_id") or "").strip()
-            if not cid:
-                continue
-
-            score = 1.0 / float(k + idx + 1)
-            scores[cid] = scores.get(cid, 0.0) + score
-
-            prev = best_item.get(cid)
-            if prev is None or float(item.get("similarity", 0.0)) > float(prev.get("similarity", 0.0)):
-                best_item[cid] = item
-
-    out = []
-    for cid, item in best_item.items():
-        merged = dict(item)
-        merged["rrf_score"] = scores.get(cid, 0.0)
-        out.append(merged)
-
-    out.sort(
-        key=lambda x: (
-            -float(x.get("rrf_score", 0.0)),
-            -float(x.get("similarity", 0.0)),
-            str(x.get("bubble_document_id") or ""),
-            int(x.get("page_from") or 0),
-            int(x.get("page_to") or 0),
-            int(x.get("chunk_index") or 0),
-            str(x.get("citation_id") or ""),
-        ),
+    return _retrieval_candidate_ranking.rrf_merge_candidates(
+        ranked_lists,
+        k,
     )
-    return out
 
 
 def _collect_candidate_keywords(q: str, inferred_components: list[str]) -> list[str]:
@@ -3142,106 +3075,35 @@ def _fts_search_chunks_multi(
 
 
 def _structured_rescue_query_intent(q: str, planner: Optional[dict] = None) -> bool:
-    """Return True when a user query should explicitly consider structured sources.
-
-    Dense retrieval can prefer long PDF manual chunks. For questions about procedures,
-    steps, P&S, photos/videos, or practical how-to requests, structured Bubble records
-    are first-class evidence and must be allowed into the final citation set.
-    """
-    text_parts = [str(q or "")]
-    if isinstance(planner, dict):
-        text_parts.append(str(planner.get("normalized_query") or ""))
-        text_parts.extend(str(x or "") for x in (planner.get("lexical_queries") or []))
-        text_parts.extend(str(x or "") for x in (planner.get("dense_queries") or []))
-
-    low = _normalize_unicode_advanced(" ".join(text_parts)).lower()
-    low = re.sub(r"\s+", " ", low).strip()
-    if not low:
-        return False
-
-    strong_markers = [
-        "procedur", "procedure", "step", "passagg", "istruzion", "operativ",
-        "p&s", "problem solution", "problema", "problematic", "soluzione", "solution",
-        "foto", "photo", "immagin", "image", "video", "media",
-    ]
-    if any(m in low for m in strong_markers):
-        return True
-
-    howto_markers = [
-        "come faccio", "come fare", "come posso", "cosa devo fare", "cosa devo controllare",
-        "how to", "how do i", "what should i do", "esiste", "conosci", "conosci sulla macchina",
-        "hai info", "hai informazioni", "quali altre informazioni",
-    ]
-    # Generic Italian how-to form: "come si <verbo/azione> ...".
-    # This is not operation-specific; it prevents practical questions such as
-    # "come si raddrizza il filo?" from falling back to long PDF manuals only.
-    generic_howto = bool(re.search(r"\bcome\s+si\s+[a-zà-öø-ÿ0-9][a-zà-öø-ÿ0-9_\-/]{2,}", low))
-    return (any(m in low for m in howto_markers) or generic_howto) and _count_query_tokens(low) >= 3
+    return _retrieval_structured.structured_rescue_query_intent(
+        q,
+        planner,
+        runtime=_retrieval_structured.StructuredRescueQueryIntentRuntime(
+            _count_query_tokens=_count_query_tokens,
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+        ),
+    )
 
 
 def _structured_rescue_prefixes_for_query(q: str, planner: Optional[dict] = None) -> list[str]:
-    text_parts = [str(q or "")]
-    if isinstance(planner, dict):
-        text_parts.append(str(planner.get("normalized_query") or ""))
-    low = _normalize_unicode_advanced(" ".join(text_parts)).lower()
-
-    prefixes: list[str] = []
-    def add(prefix: str) -> None:
-        if prefix not in prefixes:
-            prefixes.append(prefix)
-
-    if any(x in low for x in ["procedur", "procedure", "operativ", "istruzion"]):
-        add("procedure")
-        add("step")
-    if any(x in low for x in ["step", "passagg", "fase"]):
-        add("step")
-        add("procedure")
-    if any(x in low for x in ["p&s", "problem solution", "problema", "problematic", "soluzione", "solution"]):
-        add("ps")
-    if any(x in low for x in ["foto", "photo", "immagin", "image"]):
-        add("md_photo")
-    if "video" in low:
-        add("md_video")
-
-    if not prefixes:
-        prefixes = ["procedure", "step", "ps", "md_photo", "md_video"]
-
-    return prefixes
+    return _retrieval_structured.structured_rescue_prefixes_for_query(
+        q,
+        planner,
+        runtime=_retrieval_structured.StructuredRescuePrefixesForQueryRuntime(
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+        ),
+    )
 
 
 def _structured_rescue_terms(q: str, planner: Optional[dict] = None, limit: int = 10) -> list[str]:
-    texts = [str(q or "")]
-    if isinstance(planner, dict):
-        texts.append(str(planner.get("normalized_query") or ""))
-        texts.extend(str(x or "") for x in (planner.get("lexical_queries") or []))
-        texts.extend(str(x or "") for x in (planner.get("dense_queries") or []))
-
-    raw = _normalize_unicode_advanced(" ".join(texts)).lower()
-    raw = re.sub(r"[^a-z0-9à-öø-ÿ]+", " ", raw)
-
-    stop = {
-        "the", "and", "for", "with", "when", "while", "during", "after", "before", "from",
-        "this", "that", "these", "those", "question", "answer", "issue", "problem", "machine",
-        "document", "documents", "manual", "what", "should", "how", "does", "there", "exist",
-        "il", "lo", "la", "i", "gli", "le", "con", "per", "quando", "durante", "mentre", "dopo", "prima",
-        "questo", "questa", "questi", "queste", "domanda", "risposta", "documenti", "documento",
-        "macchina", "sistema", "esiste", "conosci", "info", "informazioni", "quali", "altre", "questa",
-        "come", "faccio", "fare", "posso", "devo", "cosa", "controllare", "hai", "sulla", "sul",
-        # Do not use source-type words as content terms; prefixes handle them.
-        "procedura", "procedure", "step", "passaggio", "passaggi", "problema", "soluzione", "foto", "video",
-    }
-
-    terms: list[str] = []
-    seen = set()
-    for tok in raw.split():
-        tok = tok.strip()
-        if len(tok) < 3 or tok in stop or tok in seen:
-            continue
-        seen.add(tok)
-        terms.append(tok)
-        if len(terms) >= limit:
-            break
-    return terms
+    return _retrieval_structured.structured_rescue_terms(
+        q,
+        planner,
+        limit,
+        runtime=_retrieval_structured.StructuredRescueTermsRuntime(
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+        ),
+    )
 
 
 def _fetch_structured_rescue_candidates(
@@ -3254,115 +3116,28 @@ def _fetch_structured_rescue_candidates(
     doc_ids: Optional[list[str]] = None,
     bubble_document_id: Optional[str] = None,
 ) -> list[dict]:
-    if not STRUCTURED_RESCUE_ENABLED:
-        return []
-    if doc_ids or bubble_document_id:
-        return []
-    if not _structured_rescue_query_intent(q, planner):
-        return []
-
-    prefixes = _structured_rescue_prefixes_for_query(q, planner)
-    terms = _structured_rescue_terms(q, planner)
-
-    like_clauses = " OR ".join(["bubble_document_id LIKE %s" for _ in prefixes])
-    params: list[Any] = [ASK_SNIPPET_CHARS]
-    params.extend([f"{p}:%" for p in prefixes])
-    params.extend([company_id, machine_id, STRUCTURED_RESCUE_SCAN_LIMIT])
-
-    conn = _db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                SELECT bubble_document_id, chunk_index, page_from, page_to,
-                       left(chunk_text, %s) AS snippet,
-                       left(chunk_text, 2000) AS chunk_full
-                FROM public.document_chunks
-                WHERE ({like_clauses})
-                  AND company_id = %s
-                  AND embedding IS NOT NULL
-                  AND (machine_id = %s OR machine_id IS NULL OR machine_id = '')
-                ORDER BY bubble_document_id, chunk_index
-                LIMIT %s;
-                """,
-                params,
-            )
-            rows = cur.fetchall()
-    finally:
-        conn.close()
-
-    if not rows:
-        return []
-
-    low_q = _normalize_unicode_advanced(str(q or "")).lower()
-    scored: list[dict] = []
-
-    for (bdid, chunk_index, page_from, page_to, snippet, chunk_full) in rows:
-        bdid_s = str(bdid or "")
-        st = _source_type_from_document_id(bdid_s)
-        text = _normalize_unicode_advanced((chunk_full or snippet or "")).lower()
-
-        term_hits = sum(1 for t in terms if t in text)
-        phrase_bonus = 0.0
-        if len(terms) >= 2:
-            for i in range(len(terms) - 1):
-                if f"{terms[i]} {terms[i + 1]}" in text:
-                    phrase_bonus += 1.25
-
-        source_bonus = 0.0
-        if st == "procedure" and any(x in low_q for x in ["procedur", "procedure", "operativ", "istruzion"]):
-            source_bonus += 1.20
-        if st == "step" and any(x in low_q for x in ["step", "passagg", "fase"]):
-            source_bonus += 1.00
-        if st == "ps" and any(x in low_q for x in ["p&s", "problem", "problema", "soluzione", "solution"]):
-            source_bonus += 1.00
-        if st == "md_photo" and any(x in low_q for x in ["foto", "photo", "immagin", "image"]):
-            source_bonus += 1.00
-        if st == "md_video" and "video" in low_q:
-            source_bonus += 1.00
-
-        # If the query has content terms, require at least one content hit.
-        # If it has no content terms but is a pure listing query, source_bonus/source type is enough.
-        if terms and term_hits <= 0:
-            continue
-
-        score = float(term_hits) + phrase_bonus + source_bonus
-        if score <= 0:
-            continue
-
-        similarity = min(0.84, 0.58 + 0.045 * term_hits + 0.045 * phrase_bonus + 0.04 * source_bonus)
-        retrieval_score = min(0.92, similarity + 0.09)
-        citation_id = f"{bdid_s}:p{int(page_from)}-{int(page_to)}:c{int(chunk_index)}"
-
-        scored.append(
-            {
-                "citation_id": citation_id,
-                "bubble_document_id": bdid_s,
-                "chunk_index": int(chunk_index),
-                "page_from": int(page_from),
-                "page_to": int(page_to),
-                "snippet": (snippet or "").strip(),
-                "chunk_full": (chunk_full or "").strip(),
-                "similarity": float(similarity),
-                "retrieval_score": float(retrieval_score),
-                "source_type": st,
-                "structured_rescue": True,
-                "structured_rescue_score": float(score),
-                "overlap_score": min(1.0, 0.18 * term_hits + 0.10 * phrase_bonus),
-                "specificity_score": 0.08,
-                "embedding_list": [],
-            }
-        )
-
-    scored.sort(
-        key=lambda x: (
-            -float(x.get("structured_rescue_score") or 0.0),
-            0 if str(x.get("source_type")) == "procedure" else 1,
-            str(x.get("bubble_document_id") or ""),
-            int(x.get("chunk_index") or 0),
-        )
+    return _retrieval_structured.fetch_structured_rescue_candidates(
+        company_id=company_id,
+        machine_id=machine_id,
+        q=q,
+        planner=planner,
+        top_k=top_k,
+        doc_ids=doc_ids,
+        bubble_document_id=bubble_document_id,
+        runtime=_retrieval_structured.FetchStructuredRescueCandidatesRuntime(
+            ASK_SNIPPET_CHARS=ASK_SNIPPET_CHARS,
+            STRUCTURED_RESCUE_ENABLED=STRUCTURED_RESCUE_ENABLED,
+            STRUCTURED_RESCUE_MAX_HITS=STRUCTURED_RESCUE_MAX_HITS,
+            STRUCTURED_RESCUE_SCAN_LIMIT=STRUCTURED_RESCUE_SCAN_LIMIT,
+            _db_conn=_db_conn,
+            _dedup_citations_by_snippet=_dedup_citations_by_snippet,
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+            _source_type_from_document_id=_source_type_from_document_id,
+            _structured_rescue_prefixes_for_query=_structured_rescue_prefixes_for_query,
+            _structured_rescue_query_intent=_structured_rescue_query_intent,
+            _structured_rescue_terms=_structured_rescue_terms,
+        ),
     )
-    return _dedup_citations_by_snippet(scored, max_items=max(1, min(top_k, STRUCTURED_RESCUE_MAX_HITS)))
 
 
 def _promote_structured_rescue_hits(
@@ -3370,31 +3145,15 @@ def _promote_structured_rescue_hits(
     structured_hits: list[dict],
     top_k: int,
 ) -> list[dict]:
-    if not structured_hits:
-        return selected_citations or []
-
-    out: list[dict] = []
-    used: set[str] = set()
-
-    for h in structured_hits:
-        cid = str(h.get("citation_id") or "").strip()
-        if not cid or cid in used:
-            continue
-        out.append(h)
-        used.add(cid)
-        if len(out) >= min(STRUCTURED_RESCUE_MAX_HITS, top_k):
-            break
-
-    for c in selected_citations or []:
-        cid = str(c.get("citation_id") or "").strip()
-        if not cid or cid in used:
-            continue
-        out.append(c)
-        used.add(cid)
-        if len(out) >= top_k:
-            break
-
-    return _dedup_citations_by_snippet(out, max_items=top_k)
+    return _retrieval_candidate_ranking.promote_structured_rescue_hits(
+        selected_citations,
+        structured_hits,
+        top_k,
+        runtime=_retrieval_candidate_ranking.PromoteStructuredRescueHitsRuntime(
+            STRUCTURED_RESCUE_MAX_HITS=STRUCTURED_RESCUE_MAX_HITS,
+            _dedup_citations_by_snippet=_dedup_citations_by_snippet,
+        ),
+    )
 
 
 def _dense_candidates_multi_query(
@@ -5110,94 +4869,20 @@ def _db_find_entity_chunk(
 
 
 def _dedup_citations_by_snippet(citations: list[dict], max_items: int) -> list[dict]:
-    def norm(s: str) -> str:
-        s = _normalize_unicode_advanced(s or "")
-        s = re.sub(r"^SECTION:\s*[^\n]+\n?", "", s, flags=re.IGNORECASE).strip()
-
-        lines = [ln.strip() for ln in s.split("\n") if ln.strip()]
-        cleaned = []
-        seen_lines = set()
-
-        for ln in lines:
-            ln_low = re.sub(r"\s+", " ", ln.lower()).strip()
-
-            if re.fullmatch(r"\d+", ln_low):
-                continue
-
-            if ln_low in seen_lines:
-                continue
-
-            seen_lines.add(ln_low)
-            cleaned.append(ln_low)
-
-        s = " ".join(cleaned)
-        s = re.sub(r"\s+", " ", s).strip()
-        return s[:500]
-
-    def priority(c: dict) -> tuple[float, float, float]:
-        return (
-            float(c.get("retrieval_score", c.get("similarity", 0.0)) or 0.0),
-            float(c.get("similarity", 0.0) or 0.0),
-            float(c.get("rrf_score", 0.0) or 0.0),
-        )
-
-    best = {}
-    for c in citations:
-        k = norm(c.get("snippet", ""))
-        if k:
-            k = (
-                f"{str(c.get('bubble_document_id') or '').strip()}"
-                f"|{int(c.get('page_from') or 0)}"
-                f"|{int(c.get('page_to') or 0)}"
-                f"|{k[:220]}"
-            )
-        else:
-            k = str(c.get("citation_id") or "").strip()
-
-        prev = best.get(k)
-        if prev is None or priority(c) > priority(prev):
-            best[k] = c
-
-    out = list(best.values())
-    out.sort(
-        key=lambda x: (
-            -priority(x)[0],
-            -priority(x)[1],
-            -priority(x)[2],
-            0 if bool(x.get("exact_machine_scope")) else 1,
-            str(x.get("bubble_document_id") or ""),
-            int(x.get("page_from") or 0),
-            int(x.get("page_to") or 0),
-            int(x.get("chunk_index") or 0),
-            str(x.get("citation_id") or ""),
-        )
+    return _retrieval_candidate_ranking.dedup_citations_by_snippet(
+        citations,
+        max_items,
+        runtime=_retrieval_candidate_ranking.DedupCitationsBySnippetRuntime(
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+        ),
     )
-    return out[:max_items]
 
 
 def _dedup_citations_preserve_order(citations: list[dict], max_items: int) -> list[dict]:
-    """Deduplicate citations while preserving supplied priority order.
-
-    Used for structured answers where procedure/step records must remain before
-    secondary manual support, regardless of similarity/debug score.
-    """
-    out: list[dict] = []
-    seen: set[tuple[str, int, int, str]] = set()
-    for c in citations or []:
-        if not isinstance(c, dict):
-            continue
-        bdid = str(c.get("bubble_document_id") or "").strip()
-        pf = int(c.get("page_from") or 0)
-        pt = int(c.get("page_to") or 0)
-        cid = str(c.get("citation_id") or "").strip()
-        key = (bdid, pf, pt, cid or str(c.get("snippet") or "")[:120])
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(c)
-        if len(out) >= max_items:
-            break
-    return out
+    return _retrieval_candidate_ranking.dedup_citations_preserve_order(
+        citations,
+        max_items,
+    )
 
 
 def _cosine_sim(a: list[float], b: list[float]) -> float:
@@ -5223,36 +4908,15 @@ def _mmr_select(
     top_k: int,
     lambda_mult: float = 0.85,
 ) -> list[dict]:
-    if not candidates:
-        return []
-
-    selected: list[dict] = []
-    remaining = candidates[:]
-
-    remaining.sort(key=lambda x: float(x.get("similarity", 0.0)), reverse=True)
-    selected.append(remaining.pop(0))
-
-    while remaining and len(selected) < top_k:
-        best_idx = -1
-        best_score = -1e9
-
-        for i, cand in enumerate(remaining):
-            sim_q = float(cand.get("similarity", 0.0))
-
-            max_sim_sel = 0.0
-            ce = cand.get("embedding_list") or []
-            for s in selected:
-                se = s.get("embedding_list") or []
-                max_sim_sel = max(max_sim_sel, _cosine_sim(ce, se))
-
-            score = lambda_mult * sim_q - (1.0 - lambda_mult) * max_sim_sel
-            if score > best_score:
-                best_score = score
-                best_idx = i
-
-        selected.append(remaining.pop(best_idx))
-
-    return selected
+    return _retrieval_candidate_ranking.mmr_select(
+        q_vec,
+        candidates,
+        top_k,
+        lambda_mult,
+        runtime=_retrieval_candidate_ranking.MmrSelectRuntime(
+            _cosine_sim=_cosine_sim,
+        ),
+    )
 
 
 def _fts_search_chunks(
@@ -5729,122 +5393,21 @@ def _llm_rerank_citations(
     top_k: int,
     diagnostic_mode: bool = False,
 ) -> list[str]:
-    q = (q or "").strip()
-    if not q or not candidates:
-        return []
-
-    requested_k = max(1, min(int(top_k or 1), ASK_MAX_TOP_K))
-    max_candidates = max(1, min(int(RERANK_MAX_CANDIDATES), len(candidates)))
-
-    items = []
-    seen = set()
-
-    for c in candidates[:max_candidates]:
-        cid = str(c.get("citation_id") or "").strip()
-        if not cid or cid in seen:
-            continue
-        seen.add(cid)
-
-        full_text = (c.get("chunk_full") or c.get("snippet") or "").strip()
-        section = _extract_section_from_text(full_text)
-
-        snippet = (c.get("snippet") or "").strip()
-        snippet = re.sub(r"^SECTION:\s*[^\n]+\n?", "", snippet).strip()
-
-        items.append(
-            {
-                "citation_id": cid,
-                "section": section,
-                "page_from": int(c.get("page_from") or 0),
-                "page_to": int(c.get("page_to") or 0),
-                "similarity": round(float(c.get("similarity", 0.0)), 4),
-                "snippet": snippet[:RERANK_SNIPPET_CHARS],
-            }
-        )
-
-    if not items:
-        return []
-
-    schema = {
-        "name": "citation_rerank",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "selected_ids": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                }
-            },
-            "required": ["selected_ids"],
-        },
-    }
-
-    if diagnostic_mode:
-        system_msg = (
-            "Selezioni le citazioni più utili per diagnosticare un problema tecnico su una macchina industriale. "
-            "Regole obbligatorie: "
-            "1) tieni solo fonti che parlano del fenomeno o dei componenti coinvolti; "
-            "2) scarta fonti generiche di manutenzione, sicurezza, installazione o lubrificazione se non sono direttamente legate al sintomo; "
-            "3) preferisci fonti che descrivono componenti, regolazioni, giochi meccanici, allineamenti o anomalie operative; "
-            "4) overview, caratteristiche generali, safety, acoustic, installation, start-up e sezioni simili sono bassa priorità, salvo che il sintomo riguardi esplicitamente quei temi; "
-            "5) se una fonte è soprattutto boilerplate e solo marginalmente correlata, scartala; "
-            "6) se due fonti sono simili, tieni la più specifica; "
-            "7) non collassare tutto su una sola fonte se 2-3 fonti specifiche coprono aree causali diverse; "
-            "8) restituisci il minor numero possibile di citation_id davvero utili."
-        )
-        
-    else:
-        system_msg = (
-            "Selezioni le citazioni minime e più precise per rispondere a una domanda tecnica industriale. "
-            "Obiettivo: tenere solo le fonti strettamente necessarie e scartare quelle solo vagamente correlate. "
-            "Regole obbligatorie: "
-            "1) seleziona il minor numero possibile di citation_id utili; "
-            "2) preferisci chunk che contengono direttamente la risposta; "
-            "3) scarta chunk generici di manutenzione o contesto se non aggiungono informazione utile; "
-            "4) se due chunk sono simili, tieni solo il più specifico."
-        )
-
-    user_msg = (
-        f"DOMANDA:\n{q}\n\n"
-        f"TOP_K_DESIDERATO: {requested_k}\n\n"
-        "CANDIDATI_JSON:\n"
-        f"{json.dumps(items, ensure_ascii=False)}\n\n"
-        "Restituisci JSON valido con questa forma:\n"
-        '{"selected_ids":["id1","id2"]}\n'
-        "Ordina selected_ids dal migliore al meno rilevante. "
-        "Non includere più di TOP_K_DESIDERATO elementi."
+    return _retrieval_candidate_ranking.llm_rerank_citations(
+        q,
+        candidates,
+        top_k,
+        diagnostic_mode,
+        runtime=_retrieval_candidate_ranking.LlmRerankCitationsRuntime(
+            ASK_MAX_TOP_K=ASK_MAX_TOP_K,
+            OPENAI_RERANK_MODEL=OPENAI_RERANK_MODEL,
+            RERANK_MAX_CANDIDATES=RERANK_MAX_CANDIDATES,
+            RERANK_SNIPPET_CHARS=RERANK_SNIPPET_CHARS,
+            RERANK_TIMEOUT=RERANK_TIMEOUT,
+            _extract_section_from_text=_extract_section_from_text,
+            _openai_chat_json=_openai_chat_json,
+        ),
     )
-
-    parsed = _openai_chat_json(
-        [
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": user_msg},
-        ],
-        model=OPENAI_RERANK_MODEL,
-        json_schema=schema,
-        timeout=RERANK_TIMEOUT,
-    )
-
-    selected = parsed.get("selected_ids") or []
-    if not isinstance(selected, list):
-        return []
-
-    allowed = {item["citation_id"] for item in items}
-    out = []
-    used = set()
-
-    for cid in selected:
-        cid = str(cid or "").strip()
-        if not cid or cid not in allowed or cid in used:
-            continue
-        used.add(cid)
-        out.append(cid)
-        if len(out) >= requested_k:
-            break
-
-    return out
 
 
 def _llm_filter_diagnostic_chunks(
@@ -6069,34 +5632,19 @@ def _should_use_reranker(
     sim_max: float,
     top_k: int,
 ) -> bool:
-    if not RERANK_ENABLED:
-        return False
-    if not q or not candidates:
-        return False
-    if len(candidates) < max(2, RERANK_MIN_CANDIDATES):
-        return False
-    if sim_max is None:
-        return False
-    if sim_max < RERANK_MIN_SIM_MAX:
-        return False
-    if sim_max > RERANK_MAX_SIM_MAX:
-        return False
-
-    ordered = sorted(
+    return _retrieval_candidate_ranking.should_use_reranker(
+        q,
         candidates,
-        key=lambda x: float(x.get("similarity", 0.0)),
-        reverse=True,
+        sim_max,
+        top_k,
+        runtime=_retrieval_candidate_ranking.ShouldUseRerankerRuntime(
+            RERANK_ENABLED=RERANK_ENABLED,
+            RERANK_MAX_SIM_MAX=RERANK_MAX_SIM_MAX,
+            RERANK_MAX_SPREAD=RERANK_MAX_SPREAD,
+            RERANK_MIN_CANDIDATES=RERANK_MIN_CANDIDATES,
+            RERANK_MIN_SIM_MAX=RERANK_MIN_SIM_MAX,
+        ),
     )
-    if len(ordered) < 2:
-        return False
-
-    spread = float(ordered[0].get("similarity", 0.0)) - float(
-        ordered[min(len(ordered) - 1, top_k - 1)].get("similarity", 0.0)
-    )
-    if spread > RERANK_MAX_SPREAD:
-        return False
-
-    return True
 
 
 def _unique_non_empty_strings(items: list[Any], limit: Optional[int] = None) -> list[str]:
@@ -7420,121 +6968,32 @@ def _ask_full_context_query_has_secret_intent(q: str) -> bool:
 
 
 def _ask_structured_direct_stopwords() -> set[str]:
-    return {
-        "the", "and", "for", "with", "when", "while", "during", "after", "before", "from", "into",
-        "this", "that", "these", "those", "what", "which", "how", "does", "there", "exist", "exists",
-        "machine", "manual", "document", "documents", "source", "sources", "content", "contents",
-        "procedure", "procedures", "step", "steps", "photo", "photos", "image", "images", "video", "videos",
-        "problem", "problems", "solution", "solutions", "issue", "issues", "fault", "faults",
-        "il", "lo", "la", "i", "gli", "le", "un", "una", "di", "del", "della", "dei", "delle",
-        "con", "per", "quando", "durante", "mentre", "dopo", "prima", "come", "cosa", "quali", "quale",
-        "questa", "questo", "queste", "questi", "macchina", "manuale", "documento", "documenti",
-        "fonte", "fonti", "contenuto", "contenuti", "informazioni", "info", "conosci", "presenti",
-        "procedura", "procedure", "step", "passaggio", "passaggi", "fase", "fasi", "foto", "immagine", "immagini",
-        "video", "problema", "problemi", "soluzione", "soluzioni", "errore", "errori", "operativo", "operativi",
-        "extra", "oltre", "riassumi", "fammi", "dimmi", "hai", "c'è", "sono",
-        # Generic action words: useful for routing but not for lexical matching.
-        "fare", "faccio", "fai", "fa", "eseguire", "eseguo", "esegui", "esegue",
-        "operazione", "operazioni", "attività", "attivita", "intervento", "interventi",
-        "task", "activity", "activities", "operation", "operations", "execute", "perform",
-    }
+    return _retrieval_structured.ask_structured_direct_stopwords(
+    )
 
 
 def _ask_structured_direct_terms(q: str, planner: Optional[dict] = None, limit: int = 16) -> list[str]:
-    texts = [str(q or "")]
-    if isinstance(planner, dict):
-        texts.append(str(planner.get("normalized_query") or ""))
-        texts.extend(str(x or "") for x in (planner.get("lexical_queries") or []))
-        texts.extend(str(x or "") for x in (planner.get("dense_queries") or []))
-
-    raw = _normalize_unicode_advanced(" ".join(texts)).lower()
-    tokens = re.findall(r"[a-zà-öø-ÿ0-9][a-zà-öø-ÿ0-9_\-/]{2,}", raw)
-    stop = _ask_structured_direct_stopwords()
-    out: list[str] = []
-    seen: set[str] = set()
-    for tok in tokens:
-        tok = tok.strip("_-/")
-        if len(tok) < 3 or tok in stop or tok in seen:
-            continue
-        seen.add(tok)
-        out.append(tok)
-        if len(out) >= limit:
-            break
-    return out
+    return _retrieval_structured.ask_structured_direct_terms(
+        q,
+        planner,
+        limit,
+        runtime=_retrieval_structured.AskStructuredDirectTermsRuntime(
+            _ask_structured_direct_stopwords=_ask_structured_direct_stopwords,
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+        ),
+    )
 
 
 def _ask_structured_direct_intent(q: str, planner: Optional[dict] = None) -> dict:
-    """Generic routing profile for Bubble structured sources.
-
-    This does not know benchmark questions or object ids. It only detects whether the
-    user is asking for first-class structured records (procedures, steps, P&S, photos,
-    videos) rather than broad manual reading.
-    """
-    parts = [str(q or "")]
-    if isinstance(planner, dict):
-        parts.append(str(planner.get("normalized_query") or ""))
-        parts.extend(str(x or "") for x in (planner.get("lexical_queries") or []))
-    low = _normalize_unicode_advanced(" ".join(parts)).lower()
-    low = re.sub(r"\s+", " ", low).strip()
-
-    prefixes: list[str] = []
-
-    def add_many(values: list[str]) -> None:
-        for v in values:
-            if v not in prefixes:
-                prefixes.append(v)
-
-    # Explicit source-type requests.
-    if any(x in low for x in ["procedur", "procedure", "istruzion", "instruction", "operativ", "operating sequence", "sequenza", "operazione", "operation"]):
-        add_many(["procedure", "step"])
-    if any(x in low for x in ["step", "passagg", "fase", "fasi", "passo", "passi"]):
-        add_many(["step", "procedure"])
-    if any(x in low for x in ["p&s", "problem solution", "problema", "problemi", "problematic", "soluzione", "solution", "errore", "error", "fault", "issue", "reset"]):
-        add_many(["ps"])
-    if any(x in low for x in ["foto", "photo", "immagin", "image", "picture", "visual"]):
-        add_many(["md_photo"])
-    if "video" in low or "filmato" in low or "recording" in low:
-        add_many(["md_video"])
-
-    # Practical/how-to and operation-execution requests should consider operational
-    # records before manuals. This is generic source hierarchy, not test-specific:
-    # user-authored procedures/steps/P&S are more authoritative than a manual for
-    # "how do I perform this operation?" questions.
-    how_to_markers = [
-        "come faccio", "come fare", "come si fa", "come si esegue", "come eseguire",
-        "come posso", "in che modo", "cosa devo fare", "cosa fare",
-        "how to", "how do i", "how can i", "how should i", "how is", "what should i do",
-        "procedere", "eseguire", "esecuzione", "operazione", "operazioni",
-        "sequenza", "sequenza operativa", "intervento", "attività", "attivita",
-        "operation", "operations", "operational sequence", "task", "workflow",
-        "sostituire", "sostituzione", "cambiare", "cambio", "change", "replacement",
-        "installare", "install", "montare", "montaggio", "smontare", "smontaggio",
-        "rimuovere", "remove", "togliere", "mettere",
-    ]
-    generic_howto = bool(re.search(r"\bcome\s+si\s+[a-zà-öø-ÿ0-9][a-zà-öø-ÿ0-9_\-/]{2,}", low))
-    if any(x in low for x in how_to_markers) or generic_howto:
-        add_many(["procedure", "step", "ps"])
-
-    # Machine knowledge overview, especially when the user asks for non-manual content.
-    overview_markers = [
-        "extra manuale", "oltre al manuale", "non manuale", "contenuti operativi", "fonti operative",
-        "procedure, problemi", "procedure problemi", "immagini e video", "foto e video", "riassumi procedure",
-        "operational content", "beyond the manual", "outside the manual",
-    ]
-    broad_overview = any(x in low for x in overview_markers)
-    if broad_overview:
-        add_many(["procedure", "step", "ps", "md_photo", "md_video"])
-
-    # Existence/listing questions with a content term should prefer structured records.
-    if any(x in low for x in ["esiste", "ci sono", "hai un", "hai una", "do you have", "are there", "is there"]):
-        if not prefixes:
-            add_many(["procedure", "step", "ps", "md_photo", "md_video"])
-
-    terms = _ask_structured_direct_terms(q, planner=planner)
-    # Do not require many query tokens: a short request such as "coil change" or
-    # "reset error" can be a valid structured-source request if it has content terms.
-    enabled = bool(prefixes) and (_count_query_tokens(q) >= 2 or bool(terms))
-    return {"enabled": enabled, "prefixes": prefixes, "terms": terms, "broad_overview": broad_overview, "query_text": low}
+    return _retrieval_structured.ask_structured_direct_intent(
+        q,
+        planner,
+        runtime=_retrieval_structured.AskStructuredDirectIntentRuntime(
+            _ask_structured_direct_terms=_ask_structured_direct_terms,
+            _count_query_tokens=_count_query_tokens,
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+        ),
+    )
 
 
 def _ask_structured_direct_score(
@@ -7545,34 +7004,16 @@ def _ask_structured_direct_score(
     terms: list[str],
     broad_overview: bool,
 ) -> float:
-    low_text = _normalize_unicode_advanced(text or "").lower()
-    low_q = _normalize_unicode_advanced(q or "").lower()
-    if not low_text:
-        return 0.0
-
-    term_hits = sum(1 for t in terms if t and t in low_text)
-    score = float(term_hits) * 2.0
-
-    if len(terms) >= 2:
-        for i in range(len(terms) - 1):
-            phrase = f"{terms[i]} {terms[i+1]}"
-            if phrase in low_text:
-                score += 1.25
-
-    # Generic source-type affinity; this does not encode object-specific facts.
-    if source_type in {"procedure", "step"} and any(x in low_q for x in ["procedur", "step", "passagg", "come", "how", "operativ", "istruzion", "operazione", "operation", "cambio", "change", "sostitu", "replace", "montar", "smontar", "rimuov", "remove", "togliere", "mettere"]):
-        score += 2.0
-    if source_type == "ps" and any(x in low_q for x in ["problema", "problem", "soluzione", "solution", "errore", "error", "fault", "reset"]):
-        score += 2.0
-    if source_type == "md_photo" and any(x in low_q for x in ["foto", "photo", "immagin", "image", "picture", "mostra", "show"]):
-        score += 2.0
-    if source_type == "md_video" and any(x in low_q for x in ["video", "filmato", "recording"]):
-        score += 2.0
-
-    if broad_overview:
-        score += 1.5
-
-    return score
+    return _retrieval_structured.ask_structured_direct_score(
+        q=q,
+        text=text,
+        source_type=source_type,
+        terms=terms,
+        broad_overview=broad_overview,
+        runtime=_retrieval_structured.AskStructuredDirectScoreRuntime(
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+        ),
+    )
 
 
 def _ask_structured_direct_fetch_sources(
@@ -7583,174 +7024,29 @@ def _ask_structured_direct_fetch_sources(
     planner: Optional[dict],
     top_k: int,
 ) -> list[dict]:
-    if not ASK_STRUCTURED_DIRECT_ENABLED:
-        return []
-    if not machine_id or str(machine_id).strip() == COMPANY_GENERAL_MACHINE_SENTINEL:
-        return []
-
-    intent = _ask_structured_direct_intent(q, planner=planner)
-    if not intent.get("enabled"):
-        return []
-
-    prefixes = list(intent.get("prefixes") or [])
-    if not prefixes:
-        return []
-
-    terms = _dedup_text_values(list(intent.get("terms") or []), limit=18)
-    broad_overview = bool(intent.get("broad_overview"))
-    text_chars = max(800, int(ASK_STRUCTURED_DIRECT_TEXT_CHARS or 5000))
-    scan_limit = max(
-        100,
-        int(ASK_STRUCTURED_DIRECT_SCAN_LIMIT or 1200),
-        int(ASK_STRUCTURED_DIRECT_MAX_ITEMS or 12) * 20,
+    return _retrieval_structured.ask_structured_direct_fetch_sources(
+        company_id=company_id,
+        machine_id=machine_id,
+        q=q,
+        planner=planner,
+        top_k=top_k,
+        runtime=_retrieval_structured.AskStructuredDirectFetchSourcesRuntime(
+            ASK_SNIPPET_CHARS=ASK_SNIPPET_CHARS,
+            ASK_STRUCTURED_DIRECT_ENABLED=ASK_STRUCTURED_DIRECT_ENABLED,
+            ASK_STRUCTURED_DIRECT_MAX_ITEMS=ASK_STRUCTURED_DIRECT_MAX_ITEMS,
+            ASK_STRUCTURED_DIRECT_SCAN_LIMIT=ASK_STRUCTURED_DIRECT_SCAN_LIMIT,
+            ASK_STRUCTURED_DIRECT_TEXT_CHARS=ASK_STRUCTURED_DIRECT_TEXT_CHARS,
+            COMPANY_GENERAL_MACHINE_SENTINEL=COMPANY_GENERAL_MACHINE_SENTINEL,
+            _ask_structured_direct_intent=_ask_structured_direct_intent,
+            _ask_structured_direct_score=_ask_structured_direct_score,
+            _db_conn=_db_conn,
+            _dedup_citations_by_snippet=_dedup_citations_by_snippet,
+            _dedup_text_values=_dedup_text_values,
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+            _safe_int=_safe_int,
+            _source_type_from_document_id=_source_type_from_document_id,
+        ),
     )
-    like_clauses = " OR ".join(["bubble_document_id LIKE %s" for _ in prefixes])
-
-    def fetch_rows(*, require_term_match: bool) -> list[tuple]:
-        term_clauses = ""
-        term_params: list[Any] = []
-        if require_term_match and terms:
-            term_clauses = " AND (" + " OR ".join(
-                ["LOWER(COALESCE(text, '')) LIKE %s" for _ in terms]
-            ) + ")"
-            term_params = [f"%{_normalize_unicode_advanced(t).lower()}%" for t in terms]
-
-        params: list[Any] = [text_chars, company_id]
-        params.extend([f"{p}:%" for p in prefixes])
-        params.append(machine_id)
-        params.extend(term_params)
-        params.append(scan_limit)
-
-        conn = _db_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    f"""
-                    SELECT bubble_document_id, machine_id, page_number,
-                           LEFT(COALESCE(text, ''), %s) AS page_text
-                    FROM public.document_pages
-                    WHERE company_id = %s
-                      AND ({like_clauses})
-                      AND (machine_id = %s OR machine_id IS NULL OR machine_id = '')
-                      AND text IS NOT NULL
-                      AND length(text) > 10
-                      {term_clauses}
-                    ORDER BY
-                      CASE WHEN machine_id = %s THEN 0 ELSE 1 END,
-                      bubble_document_id,
-                      page_number
-                    LIMIT %s;
-                    """,
-                    params[:-1] + [machine_id, params[-1]],
-                )
-                return cur.fetchall()
-        finally:
-            conn.close()
-
-    # Narrow queries first ask PostgreSQL only for pages containing at least one
-    # semantic/planner term, so relevant records cannot be pushed out by alphabetical
-    # ordering. If inflection/translation prevents a lexical hit, fall back to the
-    # bounded full structured scan and score in Python.
-    rows = fetch_rows(require_term_match=bool(terms and not broad_overview))
-    if not rows and terms and not broad_overview:
-        rows = fetch_rows(require_term_match=False)
-
-    if not rows:
-        return []
-
-    scored: list[dict] = []
-    for idx, (bdid, mid, page_number, page_text) in enumerate(rows, start=1):
-        bdid_s = str(bdid or "").strip()
-        st = _source_type_from_document_id(bdid_s)
-        txt = str(page_text or "").strip()
-        if not bdid_s or not txt:
-            continue
-
-        score = _ask_structured_direct_score(
-            q=q,
-            text=txt,
-            source_type=st,
-            terms=terms,
-            broad_overview=broad_overview,
-        )
-        if score <= 0.0:
-            continue
-        if terms and not broad_overview and not any(
-            t in _normalize_unicode_advanced(txt).lower() for t in terms
-        ):
-            continue
-
-        exact_machine_scope = str(mid or "").strip() == str(machine_id or "").strip()
-        if exact_machine_scope:
-            score += 0.75
-
-        page_no = _safe_int(page_number, 1)
-        similarity = min(0.95, 0.62 + 0.045 * score)
-        citation_id = f"{bdid_s}:p{page_no}-{page_no}:structured:{idx}"
-        scored.append(
-            {
-                "citation_id": citation_id,
-                "bubble_document_id": bdid_s,
-                "chunk_index": 1,
-                "page_from": page_no,
-                "page_to": page_no,
-                "snippet": txt[: int(ASK_SNIPPET_CHARS or 900)],
-                "snippet_clean": txt[: int(ASK_SNIPPET_CHARS or 900)],
-                "chunk_full": txt,
-                "similarity": float(similarity),
-                "retrieval_score": float(similarity + 0.06),
-                "source_type": st,
-                "ask_structured_direct": True,
-                "structured_direct_score": float(score),
-                "exact_machine_scope": bool(exact_machine_scope),
-                "embedding_list": [],
-            }
-        )
-
-    if not scored:
-        return []
-
-    scored.sort(
-        key=lambda x: (
-            -float(x.get("structured_direct_score") or 0.0),
-            0 if bool(x.get("exact_machine_scope")) else 1,
-            str(x.get("source_type") or ""),
-            str(x.get("bubble_document_id") or ""),
-        )
-    )
-
-    max_items = max(1, int(ASK_STRUCTURED_DIRECT_MAX_ITEMS or 12))
-    if broad_overview:
-        out: list[dict] = []
-        used_ids: set[str] = set()
-        desired_order = ["procedure", "step", "ps", "md_photo", "md_video"]
-        for st in desired_order:
-            added_for_type = 0
-            for row in scored:
-                if str(row.get("source_type") or "") != st:
-                    continue
-                cid = str(row.get("citation_id") or "")
-                if cid in used_ids:
-                    continue
-                out.append(row)
-                used_ids.add(cid)
-                added_for_type += 1
-                if added_for_type >= (2 if st in {"procedure", "step"} else 1):
-                    break
-                if len(out) >= max_items:
-                    break
-            if len(out) >= max_items:
-                break
-        for row in scored:
-            if len(out) >= max_items:
-                break
-            cid = str(row.get("citation_id") or "")
-            if cid not in used_ids:
-                out.append(row)
-                used_ids.add(cid)
-        return out[:max_items]
-
-    return _dedup_citations_by_snippet(scored, max_items=max_items)
 
 
 
@@ -8605,12 +7901,9 @@ def _v12_step_matches_procedure(step: dict, procedure: dict) -> Optional[bool]:
 
 
 def _v12_structured_rank(c: dict, used_ids: set[str]) -> tuple:
-    cid = str(c.get("citation_id") or "")
-    return (
-        0 if cid in used_ids else 1,
-        0 if bool(c.get("exact_machine_scope")) else 1,
-        -float(c.get("structured_direct_score") or c.get("retrieval_score") or c.get("similarity") or 0.0),
-        str(c.get("bubble_document_id") or ""),
+    return _retrieval_candidate_ranking.v12_structured_rank(
+        c,
+        used_ids,
     )
 
 
@@ -8637,218 +7930,45 @@ def _v12_expand_primary_procedure_steps(
     procedure: dict,
     existing_steps: list[dict],
 ) -> list[dict]:
-    """Load all Step children deterministically; text parsing is compatibility only."""
-    matched: list[dict] = []
-    parent_source_key = str((procedure or {}).get("bubble_document_id") or "").strip()
-    for c in existing_steps or []:
-        exact_parent = str(
-            (c or {}).get("_v10_5_parent_source_key")
-            or (c or {}).get("parent_source_key")
-            or ""
-        ).strip()
-        relation = (exact_parent == parent_source_key) if exact_parent else _v12_step_matches_procedure(c, procedure)
-        if relation is True:
-            cc = dict(c)
-            cc.setdefault("structured_relation_source", "indexed_parent_metadata")
-            if parent_source_key:
-                cc["parent_source_key"] = parent_source_key
-                cc["_v10_5_parent_source_key"] = parent_source_key
-            matched.append(cc)
-
-    text_chars = max(800, int(ASK_STRUCTURED_DIRECT_TEXT_CHARS or 5000))
-
-    def make_candidate(
-        *,
-        bdid: str,
-        mid: Any,
-        page_number: Any,
-        page_text: Any,
-        idx: int,
-        ordinal: Optional[int],
-        relation_source: str,
-    ) -> dict:
-        bdid_s = str(bdid or "").strip()
-        txt = str(page_text or "").strip()
-        page_no = _safe_int(page_number, 1)
-        candidate = {
-            "citation_id": f"{bdid_s}:p{page_no}-{page_no}:structured:v12:{idx}",
-            "bubble_document_id": bdid_s,
-            "chunk_index": 1,
-            "page_from": page_no,
-            "page_to": page_no,
-            "snippet": txt[: int(ASK_SNIPPET_CHARS or 900)],
-            "snippet_clean": txt[: int(ASK_SNIPPET_CHARS or 900)],
-            "chunk_full": txt,
-            "similarity": 0.94,
-            "retrieval_score": 0.94,
-            "source_type": "step",
-            "evidence_role": "step",
-            "ask_structured_direct": True,
-            "structured_direct_score": 10.0,
-            "exact_machine_scope": str(mid or "").strip() == str(machine_id or "").strip(),
-            "embedding_list": [],
-            "structured_relation_source": relation_source,
-            "parent_source_key": parent_source_key,
-            "_v10_5_parent_source_key": parent_source_key,
-        }
-        if ordinal is not None:
-            candidate["structured_relation_ordinal"] = int(ordinal)
-        return candidate
-
-    # Preferred path: exact Bubble Step -> Procedure relation stored in Cloud SQL.
-    relation_rows = _db_fetch_related_step_pages(
+    return _retrieval_structured.v12_expand_primary_procedure_steps(
         company_id=company_id,
         machine_id=machine_id,
-        parent_source_key=parent_source_key,
-        text_chars=text_chars,
+        procedure=procedure,
+        existing_steps=existing_steps,
+        runtime=_retrieval_structured.V12ExpandPrimaryProcedureStepsRuntime(
+            ASK_SNIPPET_CHARS=ASK_SNIPPET_CHARS,
+            ASK_STRUCTURED_DIRECT_SCAN_LIMIT=ASK_STRUCTURED_DIRECT_SCAN_LIMIT,
+            ASK_STRUCTURED_DIRECT_TEXT_CHARS=ASK_STRUCTURED_DIRECT_TEXT_CHARS,
+            _db_conn=_db_conn,
+            _db_fetch_related_step_pages=_db_fetch_related_step_pages,
+            _safe_int=_safe_int,
+            _v12_step_matches_procedure=_v12_step_matches_procedure,
+            _v12_step_sort_key=_v12_step_sort_key,
+            _v12_structured_rank=_v12_structured_rank,
+        ),
     )
-    for idx, (bdid, ordinal, mid, page_number, page_text) in enumerate(relation_rows, start=1):
-        candidate = make_candidate(
-            bdid=bdid,
-            mid=mid,
-            page_number=page_number,
-            page_text=page_text,
-            idx=idx,
-            ordinal=_safe_int(ordinal, 0) or None,
-            relation_source="structured_source_relations",
-        )
-        if candidate.get("bubble_document_id") and candidate.get("chunk_full"):
-            matched.append(candidate)
-
-    # Compatibility path for already-indexed sources: no reindex is required.
-    # It reads the legacy "PROCEDURA/PROCEDURE: PROC-xxx" prefix from Step text.
-    if not relation_rows:
-        scan_limit = max(500, int(ASK_STRUCTURED_DIRECT_SCAN_LIMIT or 1200))
-        rows: list[tuple] = []
-        try:
-            conn = _db_conn()
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        SELECT bubble_document_id, machine_id, page_number,
-                               LEFT(COALESCE(text, ''), %s) AS page_text
-                        FROM public.document_pages
-                        WHERE company_id = %s
-                          AND bubble_document_id LIKE 'step:%%'
-                          AND (machine_id = %s OR machine_id IS NULL OR machine_id = '')
-                          AND text IS NOT NULL
-                          AND length(text) > 10
-                        ORDER BY
-                          CASE WHEN machine_id = %s THEN 0 ELSE 1 END,
-                          bubble_document_id,
-                          page_number
-                        LIMIT %s;
-                        """,
-                        (text_chars, company_id, machine_id, machine_id, scan_limit),
-                    )
-                    rows = cur.fetchall()
-            finally:
-                conn.close()
-        except Exception as exc:
-            print("ASK_V12_STEP_EXPANSION_FAIL", str(exc)[:500])
-            rows = []
-
-        for idx, (bdid, mid, page_number, page_text) in enumerate(rows, start=1):
-            candidate = make_candidate(
-                bdid=str(bdid or ""),
-                mid=mid,
-                page_number=page_number,
-                page_text=page_text,
-                idx=idx,
-                ordinal=None,
-                relation_source="legacy_parent_text",
-            )
-            if (
-                candidate.get("bubble_document_id")
-                and candidate.get("chunk_full")
-                and _v12_step_matches_procedure(candidate, procedure) is True
-            ):
-                matched.append(candidate)
-
-    best_by_doc: dict[str, dict] = {}
-    for c in matched:
-        bdid = str(c.get("bubble_document_id") or "").strip()
-        if not bdid:
-            continue
-        prev = best_by_doc.get(bdid)
-        if prev is None or _v12_structured_rank(c, set()) < _v12_structured_rank(prev, set()):
-            best_by_doc[bdid] = c
-    return sorted(best_by_doc.values(), key=_v12_step_sort_key)
 
 
 
 def _v12_merge_candidate_metadata(preferred: dict, secondary: dict) -> dict:
-    """Preserve semantic/facet annotations while keeping the better source body."""
-    out = dict(secondary or {})
-    out.update(dict(preferred or {}))
-    for key in (
-        "assistant_core_facet_hits",
-        "assistant_core_covered_facets",
-        "matched_subsystems",
-    ):
-        merged = _dedup_text_values(
-            list((preferred or {}).get(key) or []) + list((secondary or {}).get(key) or []),
-            limit=24,
-        )
-        if merged:
-            out[key] = merged
-    for key in (
-        "v13_score",
-        "retrieval_score",
-        "similarity",
-        "semantic_similarity",
-        "assistant_core_facet_coverage",
-    ):
-        values = []
-        for source in (preferred or {}, secondary or {}):
-            try:
-                values.append(float(source.get(key) or 0.0))
-            except Exception:
-                pass
-        if values:
-            out[key] = max(values)
-    return out
+    return _retrieval_candidate_ranking.v12_merge_candidate_metadata(
+        preferred,
+        secondary,
+        runtime=_retrieval_candidate_ranking.V12MergeCandidateMetadataRuntime(
+            _dedup_text_values=_dedup_text_values,
+        ),
+    )
 
 
 def _v12_dedupe_family_steps(steps: list[dict]) -> list[dict]:
-    """Deduplicate Step representations and conflicting duplicate ordinals."""
-    best_by_doc: dict[str, dict] = {}
-    for candidate in steps or []:
-        if not isinstance(candidate, dict):
-            continue
-        bdid = str(candidate.get("bubble_document_id") or "").strip()
-        if not bdid:
-            continue
-        current = best_by_doc.get(bdid)
-        if current is None:
-            best_by_doc[bdid] = dict(candidate)
-            continue
-        if _v12_structured_rank(candidate, set()) < _v12_structured_rank(current, set()):
-            best_by_doc[bdid] = _v12_merge_candidate_metadata(candidate, current)
-        else:
-            best_by_doc[bdid] = _v12_merge_candidate_metadata(current, candidate)
-
-    best_by_number: dict[tuple[int, str], dict] = {}
-    for candidate in best_by_doc.values():
-        number = _v12_step_sort_key(candidate)[0]
-        key = (number, "") if 0 < number < 9999 else (number, str(candidate.get("bubble_document_id") or ""))
-        current = best_by_number.get(key)
-        if current is None:
-            best_by_number[key] = candidate
-            continue
-        current_relation = str(current.get("structured_relation_source") or "")
-        new_relation = str(candidate.get("structured_relation_source") or "")
-        current_priority = 0 if current_relation == "structured_source_relations" else 1
-        new_priority = 0 if new_relation == "structured_source_relations" else 1
-        if (new_priority, _v12_structured_rank(candidate, set())) < (
-            current_priority,
-            _v12_structured_rank(current, set()),
-        ):
-            best_by_number[key] = _v12_merge_candidate_metadata(candidate, current)
-        else:
-            best_by_number[key] = _v12_merge_candidate_metadata(current, candidate)
-    return sorted(best_by_number.values(), key=_v12_step_sort_key)
+    return _retrieval_candidate_ranking.v12_dedupe_family_steps(
+        steps,
+        runtime=_retrieval_candidate_ranking.V12DedupeFamilyStepsRuntime(
+            _v12_merge_candidate_metadata=_v12_merge_candidate_metadata,
+            _v12_step_sort_key=_v12_step_sort_key,
+            _v12_structured_rank=_v12_structured_rank,
+        ),
+    )
 
 
 def _v12_family_facet_queries(planner: Optional[dict]) -> list[dict]:
@@ -18462,207 +17582,54 @@ def _v13_candidate_text(c: dict) -> str:
 
 
 def _v13_merge_candidates(candidate_lists: list[list[dict]]) -> list[dict]:
-    by_id: dict[str, dict] = {}
-    for candidates in candidate_lists or []:
-        for raw in candidates or []:
-            if not isinstance(raw, dict):
-                continue
-            c = dict(raw)
-            cid = str(c.get("citation_id") or "").strip()
-            if not cid:
-                continue
-            prev = by_id.get(cid)
-            if prev is None:
-                by_id[cid] = c
-                continue
-
-            merged = dict(prev)
-            for key, value in c.items():
-                if value not in (None, "", [], {}):
-                    if key in {
-                        "similarity", "semantic_similarity", "retrieval_score", "v13_score",
-                        "ask_evidence_score", "structured_direct_score",
-                        "structured_title_match_score", "structured_title_coverage",
-                        "structured_title_strict_coverage", "structured_title_description_support",
-                        "structured_title_matched_terms", "structured_title_term_count",
-                    }:
-                        try:
-                            merged[key] = max(float(merged.get(key) or 0.0), float(value or 0.0))
-                        except Exception:
-                            merged[key] = value
-                    elif key in {"chunk_full", "snippet", "snippet_clean"}:
-                        if len(str(value or "")) > len(str(merged.get(key) or "")):
-                            merged[key] = value
-                    else:
-                        merged[key] = value
-            by_id[cid] = merged
-    return list(by_id.values())
+    return _retrieval_candidate_ranking.v13_merge_candidates(
+        candidate_lists,
+    )
 
 
 def _v13_score_candidates(q: str, candidates: list[dict]) -> list[dict]:
-    query_terms = _content_term_set(q, limit=70)
-    query_style = "telegraphic" if _count_query_tokens(q) <= 6 else "natural"
-    token_count = _count_query_tokens(q)
-    codes = {str(x).lower() for x in _extract_code_tokens(q)}
-
-    out: list[dict] = []
-    for raw in candidates or []:
-        if not isinstance(raw, dict):
-            continue
-        c = dict(raw)
-        text = _v13_candidate_text(c)
-        text_terms = _content_term_set(text, limit=120)
-        overlap = _term_overlap_score(query_terms, text_terms)
-        source_bias, source_meta = _candidate_source_bias(
-            c,
-            query_terms,
-            query_style=query_style,
-            query_token_count=token_count,
-        )
-        specificity = _candidate_specificity_score(c)
-        routing_similarity = max(0.0, float(c.get("similarity") or 0.0))
-        semantic_similarity = _v13_real_semantic_similarity(c)
-        source_type = str(
-            c.get("source_type") or _source_type_from_document_id(c.get("bubble_document_id") or "")
-        )
-
-        normalized_candidate_text = _normalize_unicode_advanced(text).lower()
-        exact_code_hit = any(code and code in normalized_candidate_text for code in codes)
-
-        # Start from true cosine similarity only. Synthetic page/structured scores may
-        # help order candidates *after* an independent lexical or identifier signal,
-        # but they can never create relevance by themselves.
-        base = semantic_similarity
-        title_match_score = max(0.0, min(1.0, float(c.get("structured_title_match_score") or 0.0)))
-        title_match_terms = int(c.get("structured_title_matched_terms") or 0)
-        title_support = bool(
-            c.get("structured_title_match")
-            and title_match_terms >= 2
-            and title_match_score >= V13_SOURCE_RETRIEVAL_MIN_TITLE_SCORE
-        )
-        has_real_support_signal = bool(
-            exact_code_hit
-            or semantic_similarity >= 0.18
-            or overlap >= 0.02
-            or title_support
-            or (bool(c.get("fts_v13")) and overlap > 0.0)
-        )
-        if has_real_support_signal and (exact_code_hit or overlap > 0.0):
-            base = max(base, min(0.70, routing_similarity))
-        if c.get("ask_evidence_score") is not None and has_real_support_signal:
-            base = max(base, min(0.88, 0.44 + float(c.get("ask_evidence_score") or 0.0) / 180.0))
-        if bool(c.get("ask_structured_direct")) and has_real_support_signal:
-            base = max(base, min(0.82, 0.46 + 0.018 * float(c.get("structured_direct_score") or 0.0)))
-        if title_support:
-            # A strong title/description match is direct source evidence, not a generic
-            # source-type bonus. It may rank a source candidate but still cannot bypass
-            # the semantic ASK task/evidence gate.
-            base = max(base, min(0.90, title_match_score))
-        if bool(c.get("fts_v13")) and overlap > 0.0:
-            base = max(base, 0.42 + min(0.18, 0.50 * overlap))
-
-        if exact_code_hit:
-            base += 0.12
-
-        v13_score = (
-            base
-            + 0.16 * overlap
-            + 0.55 * specificity
-            + 0.55 * source_bias
-            + (0.04 if bool(c.get("exact_machine_scope")) else 0.0)
-        )
-        c.update(source_meta)
-        c["source_type"] = source_type
-        c["semantic_similarity"] = semantic_similarity
-        c["routing_similarity"] = routing_similarity
-        c["specificity_score"] = specificity
-        c["overlap_score"] = overlap
-        c["exact_code_hit"] = exact_code_hit
-        c["structured_title_support"] = title_support
-        c["v13_score"] = float(v13_score)
-        c["retrieval_score"] = float(v13_score)
-        out.append(c)
-
-    out.sort(
-        key=lambda c: (
-            -float(c.get("v13_score") or 0.0),
-            -float(c.get("semantic_similarity") or 0.0),
-            -float(c.get("overlap_score") or 0.0),
-            0 if bool(c.get("exact_machine_scope")) else 1,
-            str(c.get("bubble_document_id") or ""),
-            int(c.get("page_from") or 0),
-            int(c.get("chunk_index") or 0),
-        )
+    return _retrieval_candidate_ranking.v13_score_candidates(
+        q,
+        candidates,
+        runtime=_retrieval_candidate_ranking.V13ScoreCandidatesRuntime(
+            V13_SOURCE_RETRIEVAL_MIN_TITLE_SCORE=V13_SOURCE_RETRIEVAL_MIN_TITLE_SCORE,
+            _candidate_source_bias=_candidate_source_bias,
+            _candidate_specificity_score=_candidate_specificity_score,
+            _content_term_set=_content_term_set,
+            _count_query_tokens=_count_query_tokens,
+            _dedup_citations_by_snippet=_dedup_citations_by_snippet,
+            _extract_code_tokens=_extract_code_tokens,
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+            _source_type_from_document_id=_source_type_from_document_id,
+            _term_overlap_score=_term_overlap_score,
+            _v13_candidate_text=_v13_candidate_text,
+            _v13_real_semantic_similarity=_v13_real_semantic_similarity,
+        ),
     )
-    return _dedup_citations_by_snippet(out, max_items=max(20, len(out)))
 
 
 def _v13_rescore_root_candidates(q: str, candidates: list[dict]) -> list[dict]:
-    diagnostic_keywords = _collect_candidate_keywords(q, [])
-    target_subsystems = _root_cause_target_subsystems(q, [])
-    symptom_profile = _query_symptom_profile(q)
-
-    rescored: list[dict] = []
-    for raw in candidates or []:
-        c = dict(raw)
-        text = _v13_candidate_text(c)
-        semantic = _score_root_cause_chunk_semantic(q, text, diagnostic_keywords)
-        causal = _score_root_cause_causal_strength(q, text, diagnostic_keywords)
-        subsystem = _score_root_cause_subsystem_alignment(q, text, target_subsystems)
-        context_fit = _score_root_cause_context_fit(
-            q=q,
-            chunk_text=text,
-            diagnostic_keywords=diagnostic_keywords,
-            symptom_profile=symptom_profile,
-            matched_subsystems=subsystem.get("matched_subsystems") or [],
-        )
-        generic_downranked = _should_downrank_generic_root_cause_chunk(q, text, diagnostic_keywords)
-        hard_excluded = _should_hard_exclude_root_cause_chunk(q, text, diagnostic_keywords)
-        role = _classify_diagnostic_role_from_text(
-            q=q,
-            chunk_text=text,
-            symptom_profile=symptom_profile,
-            diagnostic_keywords=diagnostic_keywords,
-            target_subsystems=target_subsystems,
-        )
-
-        score = float(c.get("v13_score", c.get("retrieval_score", c.get("similarity", 0.0))) or 0.0)
-        score += float(semantic.get("semantic_score") or 0.0)
-        score += float(causal.get("causal_strength_score") or 0.0)
-        score += float(subsystem.get("subsystem_score") or 0.0)
-        score += float(context_fit.get("context_fit_score") or 0.0)
-        score += float(role.get("role_adjustment") or 0.0)
-        if generic_downranked:
-            score -= ROOT_CAUSE_GENERIC_DOWNRANK_PENALTY
-        if hard_excluded:
-            score -= ROOT_CAUSE_HARD_EXCLUDE_PENALTY
-
-        c.update(semantic)
-        c.update(causal)
-        c.update(subsystem)
-        c.update(context_fit)
-        c.update(role)
-        c["generic_downranked"] = bool(generic_downranked)
-        c["hard_excluded"] = bool(hard_excluded)
-        c["v13_score"] = float(score)
-        c["retrieval_score"] = float(score)
-        rescored.append(c)
-
-    rescored.sort(
-        key=lambda c: (
-            1 if bool(c.get("hard_excluded")) else 0,
-            0 if str(c.get("role_group") or "") == "core" else 1,
-            -float(c.get("v13_score") or 0.0),
-            -float(c.get("similarity") or 0.0),
-            str(c.get("bubble_document_id") or ""),
-            int(c.get("page_from") or 0),
-        )
+    return _retrieval_candidate_ranking.v13_rescore_root_candidates(
+        q,
+        candidates,
+        runtime=_retrieval_candidate_ranking.V13RescoreRootCandidatesRuntime(
+            ROOT_CAUSE_GENERIC_DOWNRANK_PENALTY=ROOT_CAUSE_GENERIC_DOWNRANK_PENALTY,
+            ROOT_CAUSE_HARD_EXCLUDE_PENALTY=ROOT_CAUSE_HARD_EXCLUDE_PENALTY,
+            _classify_diagnostic_role_from_text=_classify_diagnostic_role_from_text,
+            _collect_candidate_keywords=_collect_candidate_keywords,
+            _dedup_root_cause_candidates_semantic=_dedup_root_cause_candidates_semantic,
+            _prioritize_root_cause_coverage=_prioritize_root_cause_coverage,
+            _query_symptom_profile=_query_symptom_profile,
+            _root_cause_target_subsystems=_root_cause_target_subsystems,
+            _score_root_cause_causal_strength=_score_root_cause_causal_strength,
+            _score_root_cause_chunk_semantic=_score_root_cause_chunk_semantic,
+            _score_root_cause_context_fit=_score_root_cause_context_fit,
+            _score_root_cause_subsystem_alignment=_score_root_cause_subsystem_alignment,
+            _should_downrank_generic_root_cause_chunk=_should_downrank_generic_root_cause_chunk,
+            _should_hard_exclude_root_cause_chunk=_should_hard_exclude_root_cause_chunk,
+            _v13_candidate_text=_v13_candidate_text,
+        ),
     )
-    non_excluded = [c for c in rescored if not bool(c.get("hard_excluded"))]
-    pool = non_excluded if len(non_excluded) >= 4 else rescored
-    pool = _dedup_root_cause_candidates_semantic(pool, max_items=24)
-    pool = _prioritize_root_cause_coverage(pool, max_items=20)
-    return pool
 
 
 def _v13_evidence_metrics(candidates: list[dict]) -> dict:
@@ -19119,71 +18086,24 @@ def _v13_fetch_structured_dense_candidates(
     query_vectors: list[tuple[str, list[float]]],
     top_k: int = 18,
 ) -> list[dict]:
-    """Semantic structured-source retrieval without keyword-gating or extra LLM calls."""
-    if not company_id or not machine_id or machine_id == COMPANY_GENERAL_MACHINE_SENTINEL:
-        return []
-    if not query_vectors:
-        return []
-
-    patterns = [f"{prefix}:%" for prefix in sorted(STRUCTURED_SOURCE_TYPES)]
-    ranked_lists: list[list[dict]] = []
-    per_query_k = max(8, min(24, int(top_k or 18)))
-
-    for query_text, vector in query_vectors[:V13_DENSE_QUERY_LIMIT]:
-        if not vector:
-            continue
-        conn = _db_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT bubble_document_id, chunk_index, page_from, page_to,
-                           LEFT(chunk_text, %s) AS snippet,
-                           LEFT(chunk_text, 2400) AS chunk_full,
-                           1 - (embedding <=> %s::vector) AS similarity,
-                           embedding,
-                           CASE WHEN machine_id = %s THEN TRUE ELSE FALSE END AS exact_machine_scope
-                    FROM public.document_chunks
-                    WHERE company_id = %s
-                      AND bubble_document_id LIKE ANY(%s)
-                      AND embedding IS NOT NULL
-                      AND (machine_id = %s OR machine_id IS NULL OR machine_id = '')
-                    ORDER BY embedding <=> %s::vector,
-                             CASE WHEN machine_id = %s THEN 0 ELSE 1 END,
-                             bubble_document_id, page_from, chunk_index
-                    LIMIT %s;
-                    """,
-                    (
-                        ASK_SNIPPET_CHARS,
-                        _vector_literal(vector),
-                        machine_id,
-                        company_id,
-                        patterns,
-                        machine_id,
-                        _vector_literal(vector),
-                        machine_id,
-                        per_query_k,
-                    ),
-                )
-                rows = cur.fetchall()
-        finally:
-            conn.close()
-
-        ranked = _raw_rows_to_dense_candidates(rows, query_used=query_text)
-        for c in ranked:
-            source_type = _source_type_from_document_id(c.get("bubble_document_id") or "")
-            c["source_type"] = source_type
-            c["structured_semantic_v13"] = True
-            c["ask_structured_direct"] = True
-            c["structured_direct_score"] = max(
-                float(c.get("structured_direct_score") or 0.0),
-                10.0 * float(c.get("similarity") or 0.0),
-            )
-        if ranked:
-            ranked_lists.append(ranked)
-
-    merged = _rrf_merge_candidates(ranked_lists, k=40) if ranked_lists else []
-    return _dedup_citations_by_snippet(merged, max_items=max(1, int(top_k or 18)))
+    return _retrieval_structured.v13_fetch_structured_dense_candidates(
+        company_id=company_id,
+        machine_id=machine_id,
+        query_vectors=query_vectors,
+        top_k=top_k,
+        runtime=_retrieval_structured.V13FetchStructuredDenseCandidatesRuntime(
+            ASK_SNIPPET_CHARS=ASK_SNIPPET_CHARS,
+            COMPANY_GENERAL_MACHINE_SENTINEL=COMPANY_GENERAL_MACHINE_SENTINEL,
+            STRUCTURED_SOURCE_TYPES=STRUCTURED_SOURCE_TYPES,
+            V13_DENSE_QUERY_LIMIT=V13_DENSE_QUERY_LIMIT,
+            _db_conn=_db_conn,
+            _dedup_citations_by_snippet=_dedup_citations_by_snippet,
+            _raw_rows_to_dense_candidates=_raw_rows_to_dense_candidates,
+            _rrf_merge_candidates=_rrf_merge_candidates,
+            _source_type_from_document_id=_source_type_from_document_id,
+            _vector_literal=_vector_literal,
+        ),
+    )
 
 
 
@@ -19427,191 +18347,50 @@ def _v13_fetch_structured_title_candidates(
     doc_ids: Optional[list[str]],
     bubble_document_id: Optional[str],
 ) -> list[dict]:
-    """Bounded cross-type title/description retrieval, independent of source keywords.
-
-    It runs only for machine-wide ASK and only returns strong content-title matches. The
-    returned rows are candidates; they never bypass the shared semantic evidence gate.
-    """
-    if not V13_SOURCE_RETRIEVAL_ENABLED:
-        return []
-    if ai_scope != "machine_all" or doc_ids or bubble_document_id:
-        return []
-    if not company_id or not machine_id or machine_id == COMPANY_GENERAL_MACHINE_SENTINEL:
-        return []
-    if _count_query_tokens(q) > V13_SOURCE_RETRIEVAL_MAX_QUERY_TOKENS:
-        return []
-
-    query_tokens = _v13_source_title_tokens(q, limit=18)
-    if len(query_tokens) < 2:
-        return []
-
-    # Longest terms are the most selective. Each term also receives conservative
-    # singular/plural inflection patterns. SQL is only a bounded prefilter; final
-    # title ranking remains in Python and every returned candidate still requires the
-    # shared semantic gate before a direct response.
-    search_terms = sorted(query_tokens, key=lambda token: (-len(token), token))[:10]
-    term_groups = [
-        (term, _v13_source_sql_match_patterns(term))
-        for term in search_terms
-    ]
-    term_groups = [(term, variants) for term, variants in term_groups if variants]
-    patterns = [f"{prefix}:%" for prefix in sorted(STRUCTURED_SOURCE_TYPES)]
-    term_match_expression = " + ".join(
-        [
-            "CASE WHEN (" + " OR ".join(
-                ["LOWER(COALESCE(text, '')) LIKE %s" for _ in variants]
-            ) + ") THEN 1 ELSE 0 END"
-            for _term, variants in term_groups
-        ]
+    return _retrieval_structured.v13_fetch_structured_title_candidates(
+        q=q,
+        company_id=company_id,
+        machine_id=machine_id,
+        ai_scope=ai_scope,
+        doc_ids=doc_ids,
+        bubble_document_id=bubble_document_id,
+        runtime=_retrieval_structured.V13FetchStructuredTitleCandidatesRuntime(
+            ASK_SNIPPET_CHARS=ASK_SNIPPET_CHARS,
+            ASK_STRUCTURED_DIRECT_TEXT_CHARS=ASK_STRUCTURED_DIRECT_TEXT_CHARS,
+            COMPANY_GENERAL_MACHINE_SENTINEL=COMPANY_GENERAL_MACHINE_SENTINEL,
+            STRUCTURED_SOURCE_TYPES=STRUCTURED_SOURCE_TYPES,
+            V13_SOURCE_RETRIEVAL_ENABLED=V13_SOURCE_RETRIEVAL_ENABLED,
+            V13_SOURCE_RETRIEVAL_MAX_CANDIDATES=V13_SOURCE_RETRIEVAL_MAX_CANDIDATES,
+            V13_SOURCE_RETRIEVAL_MAX_QUERY_TOKENS=V13_SOURCE_RETRIEVAL_MAX_QUERY_TOKENS,
+            V13_SOURCE_RETRIEVAL_MIN_TITLE_SCORE=V13_SOURCE_RETRIEVAL_MIN_TITLE_SCORE,
+            V13_SOURCE_RETRIEVAL_SCAN_LIMIT=V13_SOURCE_RETRIEVAL_SCAN_LIMIT,
+            _clean_display_text=_clean_display_text,
+            _count_query_tokens=_count_query_tokens,
+            _db_conn=_db_conn,
+            _dedup_citations_by_snippet=_dedup_citations_by_snippet,
+            _parse_structured_source_fields=_parse_structured_source_fields,
+            _safe_int=_safe_int,
+            _source_type_from_document_id=_source_type_from_document_id,
+            _v13_source_sql_match_patterns=_v13_source_sql_match_patterns,
+            _v13_source_title_match_metrics=_v13_source_title_match_metrics,
+            _v13_source_title_tokens=_v13_source_title_tokens,
+        ),
     )
-    if not term_match_expression:
-        return []
-    min_term_matches = 2 if len(term_groups) >= 4 else 1
-    term_pattern_params = [
-        f"%{variant}%"
-        for _term, variants in term_groups
-        for variant in variants
-    ]
-
-    rows: list[tuple] = []
-    conn = None
-    try:
-        conn = _db_conn()
-        with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                SELECT bubble_document_id, machine_id, page_number,
-                       LEFT(COALESCE(text, ''), %s) AS source_text
-                FROM public.document_pages
-                WHERE company_id=%s
-                  AND bubble_document_id LIKE ANY(%s)
-                  AND (machine_id=%s OR machine_id IS NULL OR machine_id='')
-                  AND text IS NOT NULL
-                  AND length(text) > 10
-                  AND ({term_match_expression}) >= %s
-                ORDER BY CASE WHEN machine_id=%s THEN 0 ELSE 1 END,
-                         bubble_document_id, page_number
-                LIMIT %s;
-                """,
-                [
-                    ASK_STRUCTURED_DIRECT_TEXT_CHARS,
-                    company_id,
-                    patterns,
-                    machine_id,
-                    *term_pattern_params,
-                    min_term_matches,
-                    machine_id,
-                    V13_SOURCE_RETRIEVAL_SCAN_LIMIT,
-                ],
-            )
-            rows = cur.fetchall()
-    except Exception as exc:
-        print("V13_SOURCE_TITLE_SCAN_FAIL", str(exc)[:500])
-        return []
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-    out: list[dict] = []
-    for bdid, mid, page_number, source_text in rows or []:
-        bdid_s = str(bdid or "").strip()
-        text = str(source_text or "").strip()
-        if not bdid_s or not text:
-            continue
-        fields = _parse_structured_source_fields(text)
-        title = _clean_display_text(
-            fields.get("title")
-            or fields.get("short_description")
-            or fields.get("description")
-            or "",
-            max_len=180,
-        )
-        description = _clean_display_text(fields.get("description") or "", max_len=700)
-        if not title:
-            continue
-        metrics = _v13_source_title_match_metrics(q, title, description)
-        score = float(metrics.get("score") or 0.0)
-        matched_terms = int(metrics.get("matched_title_terms") or 0)
-        title_term_count = int(metrics.get("title_term_count") or 0)
-        if score < V13_SOURCE_RETRIEVAL_MIN_TITLE_SCORE:
-            continue
-        if matched_terms < 2 and not (title_term_count == 1 and score >= 0.90):
-            continue
-
-        page = _safe_int(page_number, 1)
-        source_type = _source_type_from_document_id(bdid_s)
-        out.append(
-            {
-                "citation_id": f"{bdid_s}:p{page}-{page}:c1",
-                "bubble_document_id": bdid_s,
-                "chunk_index": 1,
-                "page_from": page,
-                "page_to": page,
-                "snippet": text[: int(ASK_SNIPPET_CHARS or 900)],
-                "snippet_clean": text[: int(ASK_SNIPPET_CHARS or 900)],
-                "chunk_full": text,
-                "similarity": 0.0,
-                "semantic_similarity": 0.0,
-                "retrieval_score": score,
-                "v13_score": score,
-                "source_type": source_type,
-                "exact_machine_scope": str(mid or "").strip() == str(machine_id or "").strip(),
-                "ask_structured_direct": True,
-                "structured_direct_score": 10.0 * score,
-                "structured_title_match": True,
-                "structured_title_match_score": score,
-                "structured_title_coverage": float(metrics.get("title_coverage") or 0.0),
-                "structured_title_query_coverage": float(metrics.get("query_coverage") or 0.0),
-                "structured_title_strict_coverage": float(metrics.get("strict_coverage") or 0.0),
-                "structured_title_strict_query_coverage": float(metrics.get("strict_query_coverage") or 0.0),
-                "structured_title_matched_terms": matched_terms,
-                "structured_title_matched_query_terms": int(metrics.get("matched_query_terms") or 0),
-                "structured_title_term_count": title_term_count,
-                "structured_title_description_support": float(metrics.get("description_support") or 0.0),
-                "structured_title": title,
-                "structured_description": description,
-                "embedding_list": [],
-            }
-        )
-
-    out.sort(
-        key=lambda c: (
-            -float(c.get("structured_title_match_score") or 0.0),
-            -float(c.get("structured_title_coverage") or 0.0),
-            -int(c.get("structured_title_matched_terms") or 0),
-            0 if bool(c.get("exact_machine_scope")) else 1,
-            str(c.get("bubble_document_id") or ""),
-        )
-    )
-    return _dedup_citations_by_snippet(out, max_items=V13_SOURCE_RETRIEVAL_MAX_CANDIDATES)
 
 
 def _v13_merge_source_title_candidates(q: str, retrieval: dict, title_candidates: list[dict]) -> dict:
-    if not title_candidates:
-        return dict(retrieval or {})
-    original = dict(retrieval or {})
-    merged = _v13_merge_candidates(
-        [list(original.get("candidates") or []), list(title_candidates or [])]
+    return _retrieval_candidate_ranking.v13_merge_source_title_candidates(
+        q,
+        retrieval,
+        title_candidates,
+        runtime=_retrieval_candidate_ranking.V13MergeSourceTitleCandidatesRuntime(
+            V13_MAX_EVIDENCE_ITEMS_ASK=V13_MAX_EVIDENCE_ITEMS_ASK,
+            V13_SOURCE_RETRIEVAL_MAX_CANDIDATES=V13_SOURCE_RETRIEVAL_MAX_CANDIDATES,
+            _v13_evidence_metrics=_v13_evidence_metrics,
+            _v13_merge_candidates=_v13_merge_candidates,
+            _v13_score_candidates=_v13_score_candidates,
+        ),
     )
-    scored = _v13_score_candidates(q, merged)
-    out = dict(original)
-    out["candidates"] = scored
-    out["citations"] = scored[:V13_MAX_EVIDENCE_ITEMS_ASK]
-    out["metrics"] = _v13_evidence_metrics(scored)
-    out["source_title_candidates"] = [
-        {
-            "citation_id": str(c.get("citation_id") or ""),
-            "bubble_document_id": str(c.get("bubble_document_id") or ""),
-            "source_type": str(c.get("source_type") or ""),
-            "title": str(c.get("structured_title") or ""),
-            "score": round(float(c.get("structured_title_match_score") or 0.0), 6),
-        }
-        for c in title_candidates[:V13_SOURCE_RETRIEVAL_MAX_CANDIDATES]
-    ]
-    return out
 
 
 def _v13_promote_existing_source_candidates(
@@ -19704,35 +18483,13 @@ def _v13_promote_existing_source_candidates(
 
 
 def _v13_merge_source_probe_candidates(*groups: list[dict]) -> list[dict]:
-    by_doc: dict[str, dict] = {}
-    for group in groups:
-        for raw in group or []:
-            if not isinstance(raw, dict):
-                continue
-            c = dict(raw)
-            bdid = str(c.get("bubble_document_id") or "").strip()
-            if not bdid:
-                continue
-            c.setdefault(
-                "source_retrieval_probe_score",
-                max(
-                    float(c.get("structured_title_match_score") or 0.0),
-                    0.92 * _v13_real_semantic_similarity(c),
-                ),
-            )
-            previous = by_doc.get(bdid)
-            if previous is None or float(c.get("source_retrieval_probe_score") or 0.0) > float(previous.get("source_retrieval_probe_score") or 0.0):
-                by_doc[bdid] = c
-    ordered = sorted(
-        by_doc.values(),
-        key=lambda c: (
-            -float(c.get("source_retrieval_probe_score") or 0.0),
-            -float(c.get("structured_title_match_score") or 0.0),
-            -_v13_real_semantic_similarity(c),
-            str(c.get("bubble_document_id") or ""),
+    return _retrieval_candidate_ranking.v13_merge_source_probe_candidates(
+        *groups,
+        runtime=_retrieval_candidate_ranking.V13MergeSourceProbeCandidatesRuntime(
+            V13_SOURCE_RETRIEVAL_MAX_CANDIDATES=V13_SOURCE_RETRIEVAL_MAX_CANDIDATES,
+            _v13_real_semantic_similarity=_v13_real_semantic_similarity,
         ),
     )
-    return ordered[:V13_SOURCE_RETRIEVAL_MAX_CANDIDATES]
 
 
 def _v13_should_force_source_task_gate(q: str, title_candidates: list[dict]) -> bool:
@@ -22222,55 +20979,14 @@ def _assistant_core_candidate_stable_key(candidate: dict) -> str:
 
 
 def _assistant_core_merge_facet_candidates(candidate_lists: list[list[dict]]) -> list[dict]:
-    """Merge candidates while preserving all facet annotations across searches."""
-    merged = _v13_merge_candidates(candidate_lists)
-    annotations: dict[str, dict] = {}
-    for candidates in candidate_lists or []:
-        for raw in candidates or []:
-            if not isinstance(raw, dict):
-                continue
-            key = _assistant_core_candidate_stable_key(raw)
-            if not key:
-                continue
-            item = annotations.setdefault(
-                key,
-                {
-                    "facets": [],
-                    "types": [],
-                    "preferred": [],
-                    "must_cover": [],
-                    "score": 0.0,
-                    "score_map": {},
-                },
-            )
-            item["facets"].extend(raw.get("assistant_core_facet_hits") or [])
-            item["types"].extend(raw.get("assistant_core_facet_answer_types") or [])
-            item["preferred"].extend(raw.get("assistant_core_facet_preferred_source_types") or [])
-            item["must_cover"].extend(raw.get("assistant_core_facet_must_cover") or [])
-            item["score"] = max(
-                float(item.get("score") or 0.0),
-                float(raw.get("assistant_core_facet_retrieval_score") or 0.0),
-            )
-            for facet_name, facet_score in dict(raw.get("assistant_core_facet_score_map") or {}).items():
-                name = str(facet_name or "").strip()
-                if not name:
-                    continue
-                item["score_map"][name] = max(
-                    float(item["score_map"].get(name) or 0.0), float(facet_score or 0.0)
-                )
-
-    out: list[dict] = []
-    for raw in merged:
-        c = dict(raw)
-        item = annotations.get(_assistant_core_candidate_stable_key(c)) or {}
-        c["assistant_core_facet_hits"] = _dedup_text_values(item.get("facets") or [], limit=12)
-        c["assistant_core_facet_answer_types"] = _dedup_text_values(item.get("types") or [], limit=10)
-        c["assistant_core_facet_preferred_source_types"] = _dedup_text_values(item.get("preferred") or [], limit=8)
-        c["assistant_core_facet_must_cover"] = _dedup_text_values(item.get("must_cover") or [], limit=12)
-        c["assistant_core_facet_retrieval_score"] = float(item.get("score") or 0.0)
-        c["assistant_core_facet_score_map"] = dict(item.get("score_map") or {})
-        out.append(c)
-    return out
+    return _retrieval_candidate_ranking.assistant_core_merge_facet_candidates(
+        candidate_lists,
+        runtime=_retrieval_candidate_ranking.AssistantCoreMergeFacetCandidatesRuntime(
+            _assistant_core_candidate_stable_key=_assistant_core_candidate_stable_key,
+            _dedup_text_values=_dedup_text_values,
+            _v13_merge_candidates=_v13_merge_candidates,
+        ),
+    )
 
 
 def _assistant_core_facet_candidate_confidence(
