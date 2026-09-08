@@ -144,6 +144,7 @@ from machinemind.ingest import metering as _ingest_metering
 from machinemind.ingest import orchestration as _ingest_orchestration
 from machinemind.retrieval import dense as _retrieval_dense
 from machinemind.retrieval import structured as _retrieval_structured
+from machinemind.retrieval import document_readers as _retrieval_document_readers
 from machinemind.retrieval import source_management as _retrieval_source_management
 from machinemind.retrieval import evidence_assurance as _retrieval_evidence_assurance
 from machinemind.retrieval import evidence_orchestration as _retrieval_evidence_orchestration
@@ -598,27 +599,13 @@ def _meter_index_document(func):
 
 
 def _fetch_document_file_map(company_id: str, doc_ids: list[str]) -> dict[str, str]:
-    company_id = (company_id or "").strip()
-    doc_ids = sorted({str(x or "").strip() for x in (doc_ids or []) if str(x or "").strip()})
-    if not company_id or not doc_ids:
-        return {}
-
-    conn = _db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT bubble_document_id, file_url
-                FROM public.document_files
-                WHERE company_id = %s
-                  AND bubble_document_id = ANY(%s);
-                """,
-                (company_id, doc_ids),
-            )
-            rows = cur.fetchall()
-            return {str(bdid): (url or "").strip() for (bdid, url) in rows if bdid and url}
-    finally:
-        conn.close()
+    return _retrieval_document_readers.fetch_document_file_map(
+        company_id,
+        doc_ids,
+        runtime=_retrieval_document_readers.FetchDocumentFileMapRuntime(
+            _db_conn=_db_conn,
+        ),
+    )
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
@@ -862,83 +849,18 @@ def _db_fetch_parent_procedure_pages_for_steps(
     the relation usable even when the Procedure page is temporarily unavailable; the
     caller can then build a minimal parent placeholder and fall back safely.
     """
-    child_keys = _dedup_text_values(
-        [str(value or "").strip() for value in (child_source_keys or [])],
-        limit=500,
+    return _retrieval_document_readers.db_fetch_parent_procedure_pages_for_steps(
+        company_id=company_id,
+        machine_id=machine_id,
+        child_source_keys=child_source_keys,
+        text_chars=text_chars,
+        runtime=_retrieval_document_readers.DbFetchParentProcedurePagesForStepsRuntime(
+            STRUCTURED_RELATION_PROCEDURE_STEP=STRUCTURED_RELATION_PROCEDURE_STEP,
+            _db_conn=_db_conn,
+            _dedup_text_values=_dedup_text_values,
+            _safe_int=_safe_int,
+        ),
     )
-    if not (company_id and machine_id and child_keys):
-        return []
-
-    conn = None
-    try:
-        conn = _db_conn()
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT
-                    r.child_source_key,
-                    r.parent_source_key,
-                    r.ordinal,
-                    p.machine_id,
-                    p.page_number,
-                    LEFT(COALESCE(p.text, ''), %s) AS parent_text
-                FROM public.structured_source_relations AS r
-                LEFT JOIN public.document_pages AS p
-                  ON p.company_id = r.company_id
-                 AND p.bubble_document_id = r.parent_source_key
-                 AND (p.machine_id = r.machine_id OR p.machine_id IS NULL OR p.machine_id = '')
-                WHERE r.company_id = %s
-                  AND r.machine_id = %s
-                  AND r.child_source_key = ANY(%s)
-                  AND r.relation_type = %s
-                ORDER BY
-                    r.child_source_key,
-                    r.ordinal NULLS LAST,
-                    CASE WHEN p.machine_id = %s THEN 0 ELSE 1 END,
-                    p.page_number NULLS LAST;
-                """,
-                (
-                    int(text_chars),
-                    company_id,
-                    machine_id,
-                    child_keys,
-                    STRUCTURED_RELATION_PROCEDURE_STEP,
-                    machine_id,
-                ),
-            )
-            rows = cur.fetchall()
-    except Exception as exc:
-        print("STRUCTURED_RELATION_PARENT_READ_FALLBACK", str(exc)[:700])
-        return []
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-    out: list[dict] = []
-    seen: set[tuple[str, str]] = set()
-    for child_key, parent_key, ordinal, parent_mid, page_number, parent_text in rows:
-        child = str(child_key or "").strip()
-        parent = str(parent_key or "").strip()
-        if not child or not parent:
-            continue
-        key = (child, parent)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(
-            {
-                "child_source_key": child,
-                "parent_source_key": parent,
-                "ordinal": _safe_int(ordinal, 0) or None,
-                "machine_id": str(parent_mid or "").strip(),
-                "page_number": _safe_int(page_number, 1),
-                "parent_text": str(parent_text or "").strip(),
-            }
-        )
-    return out
 
 
 def _v12_relation_procedure_candidate(
@@ -950,31 +872,18 @@ def _v12_relation_procedure_candidate(
     fallback_title: str = "",
 ) -> dict:
     """Build a normal structured Procedure candidate from a relation row."""
-    parent_key = str(parent_source_key or "").strip()
-    page_no = max(1, _safe_int(page_number, 1))
-    title = _clean_display_text(fallback_title, max_len=140)
-    body = str(parent_text or "").strip()
-    if not body:
-        body = "SOURCE_TYPE: procedure\nTITLE: " + (title or "Procedura")
-    return {
-        "citation_id": f"{parent_key}:p{page_no}-{page_no}:procedure-family:v10_5",
-        "bubble_document_id": parent_key,
-        "chunk_index": 1,
-        "page_from": page_no,
-        "page_to": page_no,
-        "snippet": body[: int(ASK_SNIPPET_CHARS or 900)],
-        "snippet_clean": body[: int(ASK_SNIPPET_CHARS or 900)],
-        "chunk_full": body,
-        "similarity": 0.96,
-        "retrieval_score": 0.96,
-        "source_type": "procedure",
-        "evidence_role": "procedure",
-        "ask_structured_direct": True,
-        "structured_direct_score": 12.0,
-        "exact_machine_scope": bool(machine_id),
-        "embedding_list": [],
-        "structured_relation_source": "structured_source_relations_parent_recovery",
-    }
+    return _retrieval_document_readers.v12_relation_procedure_candidate(
+        parent_source_key=parent_source_key,
+        machine_id=machine_id,
+        page_number=page_number,
+        parent_text=parent_text,
+        fallback_title=fallback_title,
+        runtime=_retrieval_document_readers.V12RelationProcedureCandidateRuntime(
+            ASK_SNIPPET_CHARS=ASK_SNIPPET_CHARS,
+            _clean_display_text=_clean_display_text,
+            _safe_int=_safe_int,
+        ),
+    )
 
 def _db_delete_structured_relations_for_source(company_id: str, source_key: str) -> int:
     if not (company_id and source_key):
@@ -4404,58 +4313,17 @@ def _db_find_token_chunk(
     doc_ids: Optional[list[str]] = None,
     bubble_document_id: Optional[str] = None,
 ) -> Optional[dict]:
-    token = (token or "").strip()
-    if not token:
-        return None
-
-    conn = _db_conn()
-    try:
-        with conn.cursor() as cur:
-            where = ["company_id = %s"]
-            params: list[Any] = [company_id]
-
-            if doc_ids:
-                where.append("bubble_document_id = ANY(%s)")
-                params.append(doc_ids)
-            elif bubble_document_id:
-                where.append("bubble_document_id = %s")
-                params.append(bubble_document_id)
-                where.append("(machine_id = %s OR machine_id IS NULL OR machine_id = '')")
-                params.append(machine_id)
-            else:
-                where.append("(machine_id = %s OR machine_id IS NULL OR machine_id = '')")
-                params.append(machine_id)
-
-            where_sql = " AND ".join(where)
-
-            cur.execute(
-                f"""
-                SELECT bubble_document_id, chunk_index, page_from, page_to,
-                       left(chunk_text, %s) AS snippet
-                FROM public.document_chunks
-                WHERE {where_sql}
-                  AND chunk_text ILIKE %s
-                ORDER BY bubble_document_id, page_from, chunk_index
-                LIMIT 1;
-                """,
-                [ASK_SNIPPET_CHARS, *params, f"%{token}%"],
-            )
-            row = cur.fetchone()
-            if not row:
-                return None
-
-            bdid, chunk_index, page_from, page_to, snippet = row
-            citation_id = f"{bdid}:p{int(page_from)}-{int(page_to)}:c{int(chunk_index)}"
-            return {
-                "citation_id": citation_id,
-                "bubble_document_id": str(bdid),
-                "page_from": int(page_from),
-                "page_to": int(page_to),
-                "snippet": (snippet or "").strip(),
-                "similarity": 0.0,
-            }
-    finally:
-        conn.close()
+    return _retrieval_document_readers.db_find_token_chunk(
+        company_id,
+        machine_id,
+        token,
+        doc_ids,
+        bubble_document_id,
+        runtime=_retrieval_document_readers.DbFindTokenChunkRuntime(
+            ASK_SNIPPET_CHARS=ASK_SNIPPET_CHARS,
+            _db_conn=_db_conn,
+        ),
+    )
 
 
 def _db_find_entity_chunk(
@@ -4465,71 +4333,21 @@ def _db_find_entity_chunk(
     doc_ids: Optional[list[str]] = None,
     bubble_document_id: Optional[str] = None,
 ) -> Optional[dict]:
-    if kind == "url":
-        pattern = r"(https?://|www\.)"
-        rx = URL_REGEX
-    elif kind == "email":
-        pattern = r"@[A-Z0-9.-]+\.[A-Z]{2,}"
-        rx = EMAIL_REGEX
-    elif kind == "phone":
-        pattern = r"\+?\d[\d\s().-]{7,}\d"
-        rx = PHONE_REGEX
-    else:
-        return None
-
-    conn = _db_conn()
-    try:
-        with conn.cursor() as cur:
-            where = ["company_id = %s"]
-            params: list[Any] = [company_id]
-
-            if doc_ids:
-                where.append("bubble_document_id = ANY(%s)")
-                params.append(doc_ids)
-            elif bubble_document_id:
-                where.append("bubble_document_id = %s")
-                params.append(bubble_document_id)
-                where.append("(machine_id = %s OR machine_id IS NULL OR machine_id = '')")
-                params.append(machine_id)
-            else:
-                where.append("(machine_id = %s OR machine_id IS NULL OR machine_id = '')")
-                params.append(machine_id)
-
-            where_sql = " AND ".join(where)
-
-            cur.execute(
-                f"""
-                SELECT bubble_document_id, chunk_index, page_from, page_to,
-                       left(chunk_text, %s) AS snippet
-                FROM public.document_chunks
-                WHERE {where_sql}
-                  AND chunk_text ~* %s
-                ORDER BY bubble_document_id, page_from, chunk_index
-                LIMIT 1;
-                """,
-                [ASK_SNIPPET_CHARS, *params, pattern],
-            )
-            row = cur.fetchone()
-            if not row:
-                return None
-
-            bdid, chunk_index, page_from, page_to, snippet = row
-            snippet = (snippet or "").strip()
-            value = _extract_first(rx, snippet)
-            if not value:
-                return None
-
-            citation_id = f"{bdid}:p{int(page_from)}-{int(page_to)}:c{int(chunk_index)}"
-            return {
-                "citation_id": citation_id,
-                "bubble_document_id": str(bdid),
-                "page_from": int(page_from),
-                "page_to": int(page_to),
-                "snippet": snippet,
-                "value": value,
-            }
-    finally:
-        conn.close()
+    return _retrieval_document_readers.db_find_entity_chunk(
+        company_id,
+        machine_id,
+        kind,
+        doc_ids,
+        bubble_document_id,
+        runtime=_retrieval_document_readers.DbFindEntityChunkRuntime(
+            ASK_SNIPPET_CHARS=ASK_SNIPPET_CHARS,
+            EMAIL_REGEX=EMAIL_REGEX,
+            PHONE_REGEX=PHONE_REGEX,
+            URL_REGEX=URL_REGEX,
+            _db_conn=_db_conn,
+            _extract_first=_extract_first,
+        ),
+    )
 
 
 def _dedup_citations_by_snippet(citations: list[dict], max_items: int) -> list[dict]:
@@ -6294,20 +6112,14 @@ def _ask_evidence_scope_where(
     doc_ids: Optional[list[str]] = None,
     bubble_document_id: Optional[str] = None,
 ) -> tuple[str, list[Any]]:
-    where = ["company_id = %s"]
-    params: list[Any] = [company_id]
-    if doc_ids:
-        where.append("bubble_document_id = ANY(%s)")
-        params.append(doc_ids)
-    elif bubble_document_id:
-        where.append("bubble_document_id = %s")
-        params.append(bubble_document_id)
-        where.append("(machine_id = %s OR machine_id IS NULL OR machine_id = '')")
-        params.append(machine_id)
-    else:
-        where.append("(machine_id = %s OR machine_id IS NULL OR machine_id = '')")
-        params.append(machine_id)
-    return " AND ".join(where), params
+    return _retrieval_document_readers.ask_evidence_scope_where(
+        company_id=company_id,
+        machine_id=machine_id,
+        doc_ids=doc_ids,
+        bubble_document_id=bubble_document_id,
+        runtime=_retrieval_document_readers.AskEvidenceScopeWhereRuntime(
+        ),
+    )
 
 
 def _ask_evidence_score_text(q: str, text: str, profile: dict) -> float:
@@ -6383,123 +6195,33 @@ def _ask_evidence_fetch_pages(
     large machine/company knowledge base from excluding the correct document merely
     because its Bubble id sorts after the first N pages.
     """
-    limit = max(50, int(ASK_EVIDENCE_SCOPE_PAGE_LIMIT or 900))
-    top_pages = max(3, min(int(top_pages or ASK_EVIDENCE_TOP_PAGES or 10), 16))
-    where_sql, base_params = _ask_evidence_scope_where(
+    return _retrieval_document_readers.ask_evidence_fetch_pages(
+        q=q,
+        profile=profile,
         company_id=company_id,
         machine_id=machine_id,
         doc_ids=doc_ids,
         bubble_document_id=bubble_document_id,
+        top_pages=top_pages,
+        runtime=_retrieval_document_readers.AskEvidenceFetchPagesRuntime(
+            ASK_EVIDENCE_MAX_PAGE_CHARS=ASK_EVIDENCE_MAX_PAGE_CHARS,
+            ASK_EVIDENCE_MIN_PAGE_SCORE=ASK_EVIDENCE_MIN_PAGE_SCORE,
+            ASK_EVIDENCE_SCOPE_PAGE_LIMIT=ASK_EVIDENCE_SCOPE_PAGE_LIMIT,
+            ASK_EVIDENCE_TOP_PAGES=ASK_EVIDENCE_TOP_PAGES,
+            ASK_SNIPPET_CHARS=ASK_SNIPPET_CHARS,
+            COMPANY_GENERAL_MACHINE_SENTINEL=COMPANY_GENERAL_MACHINE_SENTINEL,
+            _ask_evidence_code_tokens=_ask_evidence_code_tokens,
+            _ask_evidence_number_tokens=_ask_evidence_number_tokens,
+            _ask_evidence_scope_where=_ask_evidence_scope_where,
+            _ask_evidence_score_text=_ask_evidence_score_text,
+            _ask_evidence_tokenize=_ask_evidence_tokenize,
+            _db_conn=_db_conn,
+            _dedup_citations_by_snippet=_dedup_citations_by_snippet,
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+            _safe_int=_safe_int,
+            re=re,
+        ),
     )
-
-    raw_terms: list[str] = []
-    for key in (
-        "search_phrases",
-        "search_terms_it",
-        "search_terms_en",
-        "required_information",
-        "important_codes_or_numbers",
-    ):
-        raw_terms.extend(str(x or "") for x in (profile.get(key) or []))
-    raw_terms.extend(_ask_evidence_tokenize(q))
-    raw_terms.extend(_ask_evidence_code_tokens(q))
-    raw_terms.extend(_ask_evidence_number_tokens(q))
-
-    search_terms: list[str] = []
-    seen_terms = set()
-    for raw in raw_terms:
-        term = _normalize_unicode_advanced(str(raw or "")).lower().strip(" -–—:;,.()[]{}")
-        term = re.sub(r"\s+", " ", term).strip()
-        if len(term) < 2 or term in seen_terms:
-            continue
-        seen_terms.add(term)
-        search_terms.append(term)
-        if len(search_terms) >= 30:
-            break
-
-    def fetch_rows(*, require_term_match: bool) -> list[tuple]:
-        term_sql = ""
-        term_params: list[Any] = []
-        if require_term_match and search_terms:
-            term_sql = " AND (" + " OR ".join(
-                ["LOWER(COALESCE(text, '')) LIKE %s" for _ in search_terms]
-            ) + ")"
-            term_params = [f"%{term}%" for term in search_terms]
-
-        conn = _db_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    f"""
-                    SELECT bubble_document_id, machine_id, page_number,
-                           LEFT(COALESCE(text, ''), %s) AS page_text
-                    FROM public.document_pages
-                    WHERE {where_sql}
-                      AND text IS NOT NULL
-                      AND length(text) > 20
-                      {term_sql}
-                    ORDER BY
-                      CASE WHEN machine_id = %s THEN 0 ELSE 1 END,
-                      bubble_document_id,
-                      page_number
-                    LIMIT %s;
-                    """,
-                    [
-                        int(ASK_EVIDENCE_MAX_PAGE_CHARS or 12000),
-                        *base_params,
-                        *term_params,
-                        machine_id,
-                        limit,
-                    ],
-                )
-                return cur.fetchall()
-        finally:
-            conn.close()
-
-    rows = fetch_rows(require_term_match=bool(search_terms))
-    if not rows and search_terms:
-        rows = fetch_rows(require_term_match=False)
-
-    scored: list[dict] = []
-    for (bdid, mid, page_number, page_text) in rows:
-        txt = str(page_text or "").strip()
-        if not txt:
-            continue
-
-        score = _ask_evidence_score_text(q, txt, profile)
-        exact_machine_scope = str(mid or "").strip() == str(machine_id or "").strip()
-        if exact_machine_scope and str(machine_id or "").strip() != COMPANY_GENERAL_MACHINE_SENTINEL:
-            score += 4.0
-
-        if score < float(ASK_EVIDENCE_MIN_PAGE_SCORE or 0.0):
-            continue
-
-        page = _safe_int(page_number, 1)
-        scored.append(
-            {
-                "citation_id": f"{bdid}:p{page}-{page}:c0",
-                "bubble_document_id": str(bdid),
-                "chunk_index": 0,
-                "page_from": page,
-                "page_to": page,
-                "snippet": txt[:ASK_SNIPPET_CHARS],
-                "chunk_full": txt[: int(ASK_EVIDENCE_MAX_PAGE_CHARS or 12000)],
-                "similarity": min(0.99, 0.50 + score / 100.0),
-                "retrieval_score": score,
-                "ask_evidence_score": score,
-                "exact_machine_scope": bool(exact_machine_scope),
-            }
-        )
-
-    scored.sort(
-        key=lambda c: (
-            -float(c.get("ask_evidence_score") or 0.0),
-            0 if bool(c.get("exact_machine_scope")) else 1,
-            str(c.get("bubble_document_id") or ""),
-            int(c.get("page_from") or 0),
-        )
-    )
-    return _dedup_citations_by_snippet(scored, max_items=top_pages)
 
 
 def _ask_evidence_answer_schema() -> dict:
@@ -7060,153 +6782,31 @@ def _ask_structured_direct_fetch_manual_support(
     source, or when it provides directly applicable safety/prerequisite context.
     Generic safety pages and adjacent processes are rejected.
     """
-    if not ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_ENABLED:
-        return []
-    if not structured_citations or not machine_id or str(machine_id).strip() == COMPANY_GENERAL_MACHINE_SENTINEL:
-        return []
-
-    text_chars = max(1200, int(ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_TEXT_CHARS or 4200))
-    scan_limit = max(20, int(ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_SCAN_LIMIT or 180))
-
-    conn = _db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT bubble_document_id, machine_id, page_number,
-                       LEFT(COALESCE(text, ''), %s) AS page_text
-                FROM public.document_pages
-                WHERE company_id = %s
-                  AND (machine_id = %s OR machine_id IS NULL OR machine_id = '')
-                  AND text IS NOT NULL
-                  AND length(text) > 40
-                  AND bubble_document_id NOT LIKE 'procedure:%%'
-                  AND bubble_document_id NOT LIKE 'step:%%'
-                  AND bubble_document_id NOT LIKE 'ps:%%'
-                  AND bubble_document_id NOT LIKE 'md_photo:%%'
-                  AND bubble_document_id NOT LIKE 'md_video:%%'
-                ORDER BY bubble_document_id, page_number
-                LIMIT %s;
-                """,
-                (text_chars, company_id, machine_id, scan_limit),
-            )
-            rows = cur.fetchall()
-    finally:
-        conn.close()
-
-    candidates: list[dict] = []
-    for idx, (bdid, mid, page_number, page_text) in enumerate(rows or [], start=1):
-        bdid_s = str(bdid or "").strip()
-        txt = str(page_text or "").strip()
-        if not bdid_s or not txt:
-            continue
-        page_no = _safe_int(page_number, 1)
-        similarity = 0.58
-        c = {
-            "selector_index": idx,
-            "citation_id": f"{bdid_s}:p{page_no}-{page_no}:manualsupport:{idx}",
-            "bubble_document_id": bdid_s,
-            "chunk_index": 1,
-            "page_from": page_no,
-            "page_to": page_no,
-            "snippet": txt[: int(ASK_SNIPPET_CHARS or 900)],
-            "snippet_clean": txt[: int(ASK_SNIPPET_CHARS or 900)],
-            "chunk_full": txt,
-            "similarity": float(similarity),
-            "retrieval_score": float(similarity),
-            "source_type": "document",
-            "ask_structured_manual_support": True,
-            "structured_manual_support_score": float(similarity),
-            "structured_manual_operation_score": 0.0,
-            "structured_manual_safety_score": 0.0,
-            "embedding_list": [],
-        }
-        # Provide a readable label to the selector and to debug traces.
-        try:
-            label_meta = _source_display_metadata_from_citation(c, company_id=company_id)
-            c["display_label"] = str(label_meta.get("display_label") or "")
-        except Exception:
-            c["display_label"] = f"Manuale - pag. {page_no}"
-        candidates.append(c)
-
-    if not candidates:
-        return []
-
-    profile_terms = _ask_structured_manual_support_search_terms_with_llm(
+    return _retrieval_document_readers.ask_structured_direct_fetch_manual_support(
+        company_id=company_id,
+        machine_id=machine_id,
         q=q,
-        response_language=response_language,
+        planner=planner,
         structured_citations=structured_citations,
-    )
-    fallback_terms = _ask_structured_manual_support_terms(q, planner, structured_citations)
-    for c in candidates:
-        txt = str(c.get("chunk_full") or c.get("snippet") or "")
-        cand_score = _ask_structured_manual_support_candidate_score(txt, profile_terms, fallback_terms)
-        c["manual_support_candidate_score"] = float(cand_score)
-
-    # Do not send the whole manual to the selector: it dilutes attention and can
-    # cause it to miss the relevant manual phase. Use the LLM-inferred search
-    # profile to shortlist pages, then let the selector make the final semantic
-    # decision. This is still reasoning-based; it is not a hard-coded answer map.
-    candidates.sort(key=lambda x: (-float(x.get("manual_support_candidate_score") or 0.0), str(x.get("bubble_document_id") or ""), _safe_int(x.get("page_from"), 0)))
-    selector_limit = max(8, min(16, int(os.getenv("MM_ASK_STRUCTURED_MANUAL_SELECTOR_CANDIDATES", "12") or "12")))
-    if float(candidates[0].get("manual_support_candidate_score") or 0.0) > 0.0:
-        candidates = candidates[:selector_limit]
-    else:
-        candidates = candidates[:min(len(candidates), selector_limit)]
-
-    for idx, c in enumerate(candidates, start=1):
-        c["selector_index"] = idx
-
-    # Let the model reason about direct relevance on the shortlisted manual pages.
-    # If the selector is unsure, manual support is omitted rather than wrong.
-    selected_meta = _ask_structured_manual_support_select_with_llm(
-        q=q,
         response_language=response_language,
-        structured_citations=structured_citations,
-        candidates=candidates,
+        runtime=_retrieval_document_readers.AskStructuredDirectFetchManualSupportRuntime(
+            ASK_SNIPPET_CHARS=ASK_SNIPPET_CHARS,
+            ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_ENABLED=ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_ENABLED,
+            ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_MAX_ITEMS=ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_MAX_ITEMS,
+            ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_SCAN_LIMIT=ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_SCAN_LIMIT,
+            ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_TEXT_CHARS=ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_TEXT_CHARS,
+            COMPANY_GENERAL_MACHINE_SENTINEL=COMPANY_GENERAL_MACHINE_SENTINEL,
+            _ask_structured_manual_support_candidate_score=_ask_structured_manual_support_candidate_score,
+            _ask_structured_manual_support_search_terms_with_llm=_ask_structured_manual_support_search_terms_with_llm,
+            _ask_structured_manual_support_select_with_llm=_ask_structured_manual_support_select_with_llm,
+            _ask_structured_manual_support_terms=_ask_structured_manual_support_terms,
+            _clean_display_text=_clean_display_text,
+            _db_conn=_db_conn,
+            _safe_int=_safe_int,
+            _source_display_metadata_from_citation=_source_display_metadata_from_citation,
+            os=os,
+        ),
     )
-
-    op_indices = {int(x) for x in (selected_meta.get("operation_support_indices") or []) if str(x).strip().lstrip("-").isdigit()}
-    safety_indices = {int(x) for x in (selected_meta.get("safety_support_indices") or []) if str(x).strip().lstrip("-").isdigit()}
-    if not op_indices and not safety_indices:
-        return []
-
-    max_items = max(0, int(ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_MAX_ITEMS or 2))
-    if max_items <= 0:
-        return []
-
-    operation_note = _clean_display_text(str(selected_meta.get("operation_note") or ""), max_len=360)
-    safety_note = _clean_display_text(str(selected_meta.get("safety_note") or ""), max_len=320)
-
-    by_idx = {int(c.get("selector_index") or 0): c for c in candidates}
-    selected: list[dict] = []
-    used: set[int] = set()
-
-    def add_selected(idx: int, kind: str) -> None:
-        if len(selected) >= max_items or idx in used:
-            return
-        c = dict(by_idx.get(idx) or {})
-        if not c:
-            return
-        used.add(idx)
-        c["ask_manual_support_kind"] = kind
-        c["structured_manual_operation_score"] = 10.0 if kind == "operation" else 0.0
-        c["structured_manual_safety_score"] = 10.0 if kind == "safety" else 0.0
-        c["structured_manual_support_score"] = 10.0
-        c["similarity"] = 0.86 if kind == "operation" else 0.82
-        c["retrieval_score"] = float(c["similarity"])
-        if kind == "operation" and operation_note:
-            c["llm_operation_note"] = operation_note
-        if kind == "safety" and safety_note:
-            c["llm_safety_note"] = safety_note
-        selected.append(c)
-
-    for idx in sorted(op_indices):
-        add_selected(idx, "operation")
-    for idx in sorted(safety_indices):
-        add_selected(idx, "safety")
-
-    return selected[:max_items]
 
 
 def _ask_structured_field_value(c: dict, *keys: str, limit: int = 240) -> str:
@@ -9440,22 +9040,15 @@ def _ask_full_context_seed_doc_ids(
     seed_citations: Optional[list[dict]],
 ) -> Optional[list[str]]:
     """Pick document/source ids to read fully, without using benchmark-specific ids."""
-    if doc_ids:
-        return _dedup_text_values([str(x or "").strip() for x in doc_ids if str(x or "").strip()], limit=ASK_FULL_CONTEXT_MAX_DOCS)
-    if bubble_document_id:
-        return [str(bubble_document_id).strip()]
-
-    out: list[str] = []
-    seen = set()
-    for c in seed_citations or []:
-        bdid = str((c or {}).get("bubble_document_id") or "").strip()
-        if not bdid or bdid in seen:
-            continue
-        seen.add(bdid)
-        out.append(bdid)
-        if len(out) >= int(ASK_FULL_CONTEXT_MAX_DOCS or 3):
-            break
-    return out or None
+    return _retrieval_document_readers.ask_full_context_seed_doc_ids(
+        doc_ids=doc_ids,
+        bubble_document_id=bubble_document_id,
+        seed_citations=seed_citations,
+        runtime=_retrieval_document_readers.AskFullContextSeedDocIdsRuntime(
+            ASK_FULL_CONTEXT_MAX_DOCS=ASK_FULL_CONTEXT_MAX_DOCS,
+            _dedup_text_values=_dedup_text_values,
+        ),
+    )
 
 
 def _ask_full_context_fetch_pages(
@@ -9472,67 +9065,23 @@ def _ask_full_context_fetch_pages(
     document id, product code or component. It simply reads the authorized document pages
     when the scope is narrow enough to fit in the model context.
     """
-    target_doc_ids = _ask_full_context_seed_doc_ids(
+    return _retrieval_document_readers.ask_full_context_fetch_pages(
+        company_id=company_id,
+        machine_id=machine_id,
         doc_ids=doc_ids,
         bubble_document_id=bubble_document_id,
         seed_citations=seed_citations,
+        runtime=_retrieval_document_readers.AskFullContextFetchPagesRuntime(
+            ASK_FULL_CONTEXT_MAX_CHARS=ASK_FULL_CONTEXT_MAX_CHARS,
+            ASK_FULL_CONTEXT_MAX_DOCS=ASK_FULL_CONTEXT_MAX_DOCS,
+            ASK_FULL_CONTEXT_MAX_PAGES=ASK_FULL_CONTEXT_MAX_PAGES,
+            ASK_FULL_CONTEXT_PAGE_CHARS=ASK_FULL_CONTEXT_PAGE_CHARS,
+            ASK_SNIPPET_CHARS=ASK_SNIPPET_CHARS,
+            _ask_full_context_seed_doc_ids=_ask_full_context_seed_doc_ids,
+            _db_conn=_db_conn,
+            _safe_int=_safe_int,
+        ),
     )
-    if not target_doc_ids:
-        return []
-
-    target_doc_ids = target_doc_ids[: max(1, int(ASK_FULL_CONTEXT_MAX_DOCS or 3))]
-    page_limit = max(10, int(ASK_FULL_CONTEXT_MAX_PAGES or 140))
-    page_chars = max(1200, int(ASK_FULL_CONTEXT_PAGE_CHARS or 6500))
-
-    conn = _db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT bubble_document_id, machine_id, page_number, LEFT(COALESCE(text, ''), %s) AS page_text
-                FROM public.document_pages
-                WHERE company_id = %s
-                  AND bubble_document_id = ANY(%s)
-                  AND text IS NOT NULL
-                  AND length(text) > 20
-                ORDER BY bubble_document_id, page_number
-                LIMIT %s;
-                """,
-                [page_chars, company_id, target_doc_ids, page_limit],
-            )
-            rows = cur.fetchall()
-    finally:
-        conn.close()
-
-    citations: list[dict] = []
-    total_chars = 0
-    max_chars = max(20000, int(ASK_FULL_CONTEXT_MAX_CHARS or 120000))
-    for (bdid, mid, page_number, page_text) in rows:
-        txt = str(page_text or "").strip()
-        if not txt:
-            continue
-        page = _safe_int(page_number, 1)
-        # Keep whole pages until the budget is exhausted. This avoids fragment-only answers.
-        if total_chars + len(txt) > max_chars and citations:
-            break
-        if len(txt) > max_chars and not citations:
-            txt = txt[:max_chars]
-        citations.append(
-            {
-                "citation_id": f"{bdid}:p{page}-{page}:full",
-                "bubble_document_id": str(bdid),
-                "chunk_index": 0,
-                "page_from": page,
-                "page_to": page,
-                "snippet": txt[:ASK_SNIPPET_CHARS],
-                "chunk_full": txt,
-                "similarity": 0.99,
-                "retrieval_score": 99.0,
-                "ask_full_context": True,
-            }
-        )
-        total_chars += len(txt)
-    return citations
 
 
 def _ask_full_context_sources_block(citations: list[dict], *, max_context_chars: int) -> str:
@@ -9938,217 +9487,35 @@ def _ask_fetch_preferred_source_pages(
     source_kind="manual" fetches ordinary document/manual/PDF pages, excluding
     Bubble structured records and XLSX-generated pages.
     """
-    if source_kind not in {"xlsx", "manual"}:
-        return []
-
-    profile = _ask_evidence_query_profile(q, response_language)
-    where_sql, params = _ask_evidence_scope_where(
+    return _retrieval_document_readers.ask_fetch_preferred_source_pages(
+        q=q,
         company_id=company_id,
         machine_id=machine_id,
         doc_ids=doc_ids,
         bubble_document_id=bubble_document_id,
+        response_language=response_language,
+        top_k=top_k,
+        source_kind=source_kind,
+        runtime=_retrieval_document_readers.AskFetchPreferredSourcePagesRuntime(
+            ASK_EVIDENCE_SCOPE_PAGE_LIMIT=ASK_EVIDENCE_SCOPE_PAGE_LIMIT,
+            ASK_FULL_CONTEXT_PAGE_CHARS=ASK_FULL_CONTEXT_PAGE_CHARS,
+            ASK_SNIPPET_CHARS=ASK_SNIPPET_CHARS,
+            COMPANY_GENERAL_MACHINE_SENTINEL=COMPANY_GENERAL_MACHINE_SENTINEL,
+            _ask_evidence_query_profile=_ask_evidence_query_profile,
+            _ask_evidence_scope_where=_ask_evidence_scope_where,
+            _ask_evidence_score_text=_ask_evidence_score_text,
+            _ask_manual_priority_page_has_real_maintenance_content=_ask_manual_priority_page_has_real_maintenance_content,
+            _ask_manual_priority_page_is_meta_or_index=_ask_manual_priority_page_is_meta_or_index,
+            _ask_manual_priority_page_score=_ask_manual_priority_page_score,
+            _ask_manual_priority_query_is_maintenance=_ask_manual_priority_query_is_maintenance,
+            _db_conn=_db_conn,
+            _dedup_citations_by_snippet=_dedup_citations_by_snippet,
+            _is_structured_source_key=_is_structured_source_key,
+            _is_xlsx_indexed_page_text=_is_xlsx_indexed_page_text,
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+            _safe_int=_safe_int,
+        ),
     )
-
-    page_chars = max(1200, int(ASK_FULL_CONTEXT_PAGE_CHARS or 6500))
-    scan_limit = max(80, int(ASK_EVIDENCE_SCOPE_PAGE_LIMIT or 900))
-
-    conn = _db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                SELECT bubble_document_id, machine_id, page_number, LEFT(COALESCE(text, ''), %s) AS page_text
-                FROM public.document_pages
-                WHERE {where_sql}
-                  AND text IS NOT NULL
-                  AND length(text) > 20
-                ORDER BY bubble_document_id, page_number
-                LIMIT %s;
-                """,
-                [page_chars, *params, scan_limit],
-            )
-            rows = cur.fetchall()
-    finally:
-        conn.close()
-
-    # Targeted supplement for explicit manual maintenance/check questions.
-    # The broad scan can be diluted by cover pages, indexes or company-general manuals.
-    # This pass pulls table/frequency/maintenance pages from the same authorized scope,
-    # then the normal scorer still decides the order. It is a supplement, not a hard filter.
-    if source_kind == "manual" and _ask_manual_priority_query_is_maintenance(q):
-        targeted_patterns = [
-            "%tabella per manutenzione%",
-            "%tabella generale di manutenzione%",
-            "%ore di funzionamento%",
-            "%componenti%ore di%",
-            "%tipo di lubrificante%",
-            "%controllare il livello%",
-            "%cambio olio%",
-            "%pulizia dei filtri%",
-            "%sostituzione completa dei filtri%",
-            "%scarico della condensa%",
-            "%verifica integrità%",
-            "%verifica integrita%",
-            "%verifica corretto funzionamento%",
-            "%impianto elettrico%",
-            "%impianto pneumatico%",
-            "%raddrizzatura%",
-            "%lubrificazione%",
-            "%ogni 50 ore%",
-            "%ogni 300 ore%",
-            "%ogni 1000 ore%",
-            "%ogni 3000 ore%",
-            "%ogni giorno%",
-            "%mensilmente%",
-            "%settiman%",
-            "%annualmente%",
-        ]
-        targeted_clauses = " OR ".join(["LOWER(COALESCE(text, '')) LIKE %s" for _ in targeted_patterns])
-        target_limit = max(80, min(260, int(scan_limit // 2)))
-        try:
-            conn = _db_conn()
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        f"""
-                        SELECT bubble_document_id, machine_id, page_number, LEFT(COALESCE(text, ''), %s) AS page_text
-                        FROM public.document_pages
-                        WHERE {where_sql}
-                          AND text IS NOT NULL
-                          AND length(text) > 20
-                          AND ({targeted_clauses})
-                        ORDER BY
-                          CASE
-                            WHEN machine_id = %s THEN 0
-                            WHEN machine_id IS NULL OR machine_id = '' THEN 1
-                            ELSE 2
-                          END,
-                          bubble_document_id,
-                          page_number
-                        LIMIT %s;
-                        """,
-                        [page_chars, *params, *targeted_patterns, machine_id, target_limit],
-                    )
-                    targeted_rows = cur.fetchall()
-            finally:
-                conn.close()
-        except Exception as e:
-            print("ASK_MANUAL_TARGETED_SCAN_FAIL", str(e)[:300])
-            targeted_rows = []
-
-        if targeted_rows:
-            rows = list(rows or [])
-            seen_pages = {
-                (str(r[0] or ""), _safe_int(r[2], 0))
-                for r in rows
-            }
-            for r in targeted_rows:
-                key = (str(r[0] or ""), _safe_int(r[2], 0))
-                if key not in seen_pages:
-                    rows.append(r)
-                    seen_pages.add(key)
-
-    scored: list[dict] = []
-    q_low = _normalize_unicode_advanced(q or "").lower()
-
-    for idx, (bdid, mid, page_number, page_text) in enumerate(rows or [], start=1):
-        bdid_s = str(bdid or "").strip()
-        txt = str(page_text or "").strip()
-        if not bdid_s or not txt:
-            continue
-
-        is_xlsx = _is_xlsx_indexed_page_text(txt)
-        is_structured = _is_structured_source_key(bdid_s)
-
-        if source_kind == "xlsx" and not is_xlsx:
-            continue
-        if source_kind == "manual" and (is_xlsx or is_structured):
-            continue
-
-        score = float(_ask_evidence_score_text(q, txt, profile))
-        # Source preference is a ranking boost, not an exclusive evidence rule.
-        score += 35.0 if source_kind == "xlsx" else 28.0
-        if source_kind == "xlsx" and any(x in q_low for x in ["excel", "xlsx", "foglio", "spreadsheet"]):
-            score += 8.0
-        if source_kind == "manual" and any(x in q_low for x in ["manual", "manuale", "pdf", "documentazione"]):
-            score += 8.0
-
-        t_low = _normalize_unicode_advanced(txt).lower()
-        for marker, bonus in [
-            ("manutenz", 8.0), ("maintenance", 8.0), ("controll", 6.0),
-            ("periodic", 5.0), ("frequenza", 5.0), ("frequency", 5.0),
-            ("lubr", 4.0), ("olio", 4.0), ("oil", 4.0),
-        ]:
-            if marker in q_low and marker in t_low:
-                score += bonus
-
-        exact_machine_page = False
-        real_maintenance_page = False
-        weak_meta_page = False
-        if source_kind == "manual":
-            row_mid = str(mid or "").strip()
-            exact_machine_page = bool(machine_id and machine_id != COMPANY_GENERAL_MACHINE_SENTINEL and row_mid == str(machine_id or "").strip())
-            real_maintenance_page = _ask_manual_priority_page_has_real_maintenance_content(txt)
-            weak_meta_page = _ask_manual_priority_page_is_meta_or_index(txt)
-            score = _ask_manual_priority_page_score(
-                q=q,
-                page_text=txt,
-                base_score=score,
-                row_machine_id=row_mid,
-                requested_machine_id=machine_id,
-            )
-
-        page = _safe_int(page_number, 1)
-        row_obj = {
-            "citation_id": f"{bdid_s}:p{page}-{page}:{source_kind}priority:{idx}",
-            "bubble_document_id": bdid_s,
-            "chunk_index": 0,
-            "page_from": page,
-            "page_to": page,
-            "snippet": txt[:ASK_SNIPPET_CHARS],
-            "chunk_full": txt,
-            "similarity": min(0.99, 0.74 + score / 200.0),
-            "retrieval_score": score,
-            "ask_source_priority": True,
-            "ask_source_priority_kind": source_kind,
-        }
-        if source_kind == "manual":
-            row_obj["manual_priority_exact_machine"] = bool(exact_machine_page)
-            row_obj["manual_priority_real_maintenance"] = bool(real_maintenance_page)
-            row_obj["manual_priority_weak_meta"] = bool(weak_meta_page)
-        scored.append(row_obj)
-
-    scored.sort(
-        key=lambda c: (
-            -float(c.get("retrieval_score") or 0.0),
-            str(c.get("bubble_document_id") or ""),
-            _safe_int(c.get("page_from"), 0),
-        )
-    )
-
-    max_items = max(1, min(max(top_k, 6), 12))
-    if source_kind == "manual" and _ask_manual_priority_query_is_maintenance(q):
-        exact_strong = [
-            c for c in scored
-            if bool(c.get("manual_priority_exact_machine"))
-            and bool(c.get("manual_priority_real_maintenance"))
-            and not bool(c.get("manual_priority_weak_meta"))
-        ]
-        other_strong = [
-            c for c in scored
-            if c not in exact_strong
-            and bool(c.get("manual_priority_real_maintenance"))
-            and not bool(c.get("manual_priority_weak_meta"))
-        ]
-        weak = [c for c in scored if c not in exact_strong and c not in other_strong]
-        if exact_strong:
-            ordered = exact_strong[:min(6, max_items)] + other_strong[:max(0, max_items - min(6, len(exact_strong)))] + weak[:max_items]
-            return _dedup_citations_by_snippet(ordered, max_items=max_items)
-        if other_strong:
-            ordered = other_strong[:max_items] + weak[:max_items]
-            return _dedup_citations_by_snippet(ordered, max_items=max_items)
-
-    return _dedup_citations_by_snippet(scored, max_items=max_items)
 
 
 def _ask_secondary_support_citations(
@@ -10195,142 +9562,30 @@ def _ask_fetch_manual_maintenance_target_pages(
     IDs or answers: it scans authorized manual/PDF pages for real maintenance
     evidence and keeps document-specific pages whenever they are available.
     """
-    where_sql, params = _ask_evidence_scope_where(
+    return _retrieval_document_readers.ask_fetch_manual_maintenance_target_pages(
+        q=q,
         company_id=company_id,
         machine_id=machine_id,
         doc_ids=doc_ids,
         bubble_document_id=bubble_document_id,
+        top_k=top_k,
+        runtime=_retrieval_document_readers.AskFetchManualMaintenanceTargetPagesRuntime(
+            ASK_FULL_CONTEXT_PAGE_CHARS=ASK_FULL_CONTEXT_PAGE_CHARS,
+            ASK_SNIPPET_CHARS=ASK_SNIPPET_CHARS,
+            COMPANY_GENERAL_MACHINE_SENTINEL=COMPANY_GENERAL_MACHINE_SENTINEL,
+            _ask_evidence_fallback_profile=_ask_evidence_fallback_profile,
+            _ask_evidence_scope_where=_ask_evidence_scope_where,
+            _ask_evidence_score_text=_ask_evidence_score_text,
+            _ask_manual_priority_page_has_real_maintenance_content=_ask_manual_priority_page_has_real_maintenance_content,
+            _ask_manual_priority_page_is_meta_or_index=_ask_manual_priority_page_is_meta_or_index,
+            _ask_manual_priority_page_score=_ask_manual_priority_page_score,
+            _db_conn=_db_conn,
+            _is_structured_source_key=_is_structured_source_key,
+            _is_xlsx_indexed_page_text=_is_xlsx_indexed_page_text,
+            _safe_int=_safe_int,
+            _simple_query_language=_simple_query_language,
+        ),
     )
-    page_chars = max(1200, int(ASK_FULL_CONTEXT_PAGE_CHARS or 6500))
-    patterns = [
-        "%tabella per manutenzione%",
-        "%tabella generale di manutenzione%",
-        "%ore di%funzionamento%",
-        "%componenti%ore di%",
-        "%tipo di lubrificante%",
-        "%controllare il livello%",
-        "%cambio olio%",
-        "%pulizia dei filtri%",
-        "%sostituzione completa dei filtri%",
-        "%scarico della condensa%",
-        "%verifica integrità%",
-        "%verifica integrita%",
-        "%verifica corretto funzionamento%",
-        "%impianto elettrico%",
-        "%impianto pneumatico%",
-        "%raddrizzatura%",
-        "%lubrificazione%",
-        "%ogni 50 ore%",
-        "%ogni 300 ore%",
-        "%ogni 1000 ore%",
-        "%ogni 3000 ore%",
-        "%ogni giorno%",
-        "%mensilmente%",
-        "%settiman%",
-        "%annualmente%",
-    ]
-    clauses = " OR ".join(["LOWER(COALESCE(text, '')) LIKE %s" for _ in patterns])
-
-    rows = []
-    try:
-        conn = _db_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    f"""
-                    SELECT bubble_document_id, machine_id, page_number, LEFT(COALESCE(text, ''), %s) AS page_text
-                    FROM public.document_pages
-                    WHERE {where_sql}
-                      AND text IS NOT NULL
-                      AND length(text) > 20
-                      AND ({clauses})
-                    ORDER BY
-                      CASE
-                        WHEN machine_id = %s THEN 0
-                        WHEN machine_id IS NULL OR machine_id = '' THEN 1
-                        ELSE 2
-                      END,
-                      bubble_document_id,
-                      page_number
-                    LIMIT %s;
-                    """,
-                    [page_chars, *params, *patterns, machine_id, 240],
-                )
-                rows = cur.fetchall()
-        finally:
-            conn.close()
-    except Exception as e:
-        print("ASK_MANUAL_MAINTENANCE_DIRECT_FETCH_FAIL", str(e)[:300])
-        return []
-
-    scored: list[dict] = []
-    for idx, (bdid, mid, page_number, page_text) in enumerate(rows or [], start=1):
-        bdid_s = str(bdid or "").strip()
-        txt = str(page_text or "").strip()
-        if not bdid_s or not txt:
-            continue
-        if _is_structured_source_key(bdid_s) or _is_xlsx_indexed_page_text(txt):
-            continue
-        if not _ask_manual_priority_page_has_real_maintenance_content(txt):
-            continue
-        if _ask_manual_priority_page_is_meta_or_index(txt):
-            continue
-
-        row_mid = str(mid or "").strip()
-        exact_machine = bool(machine_id and machine_id != COMPANY_GENERAL_MACHINE_SENTINEL and row_mid == str(machine_id or "").strip())
-        base_score = float(_ask_evidence_score_text(q, txt, _ask_evidence_fallback_profile(q, _simple_query_language(q))))
-        score = _ask_manual_priority_page_score(
-            q=q,
-            page_text=txt,
-            base_score=base_score + 80.0,
-            row_machine_id=row_mid,
-            requested_machine_id=machine_id,
-        )
-        if exact_machine:
-            score += 80.0
-
-        page = _safe_int(page_number, 1)
-        scored.append(
-            {
-                "citation_id": f"{bdid_s}:p{page}-{page}:manualmaint:{idx}",
-                "bubble_document_id": bdid_s,
-                "chunk_index": 0,
-                "page_from": page,
-                "page_to": page,
-                "snippet": txt[:ASK_SNIPPET_CHARS],
-                "chunk_full": txt,
-                "similarity": min(0.99, 0.80 + score / 300.0),
-                "retrieval_score": score,
-                "ask_manual_maintenance_direct": True,
-                "manual_priority_exact_machine": exact_machine,
-                "manual_priority_real_maintenance": True,
-                "manual_priority_weak_meta": False,
-            }
-        )
-
-    scored.sort(
-        key=lambda c: (
-            0 if bool(c.get("manual_priority_exact_machine")) else 1,
-            -float(c.get("retrieval_score") or 0.0),
-            str(c.get("bubble_document_id") or ""),
-            _safe_int(c.get("page_from"), 0),
-        )
-    )
-
-    # Preserve duplicate-looking pages from different documents when one is a
-    # machine-specific manual; normal snippet dedupe can otherwise keep the company
-    # copy and drop the machine copy.
-    out: list[dict] = []
-    seen_pages: set[tuple[str, int]] = set()
-    for c in scored:
-        key = (str(c.get("bubble_document_id") or ""), _safe_int(c.get("page_from"), 0))
-        if key in seen_pages:
-            continue
-        seen_pages.add(key)
-        out.append(c)
-        if len(out) >= max(1, min(max(top_k, 8), 12)):
-            break
-    return out
 
 
 def _ask_manual_maintenance_direct_answer(
@@ -16150,116 +15405,32 @@ def _v13_fetch_scored_pages(
     top_pages: int,
 ) -> list[dict]:
     """Bounded full-page rescue with SQL relevance predicates before LIMIT."""
-    where_sql, base_params = _ask_evidence_scope_where(
+    return _retrieval_document_readers.v13_fetch_scored_pages(
+        q=q,
+        profile=profile,
         company_id=company_id,
         machine_id=machine_id,
         doc_ids=doc_ids,
         bubble_document_id=bubble_document_id,
+        top_pages=top_pages,
+        runtime=_retrieval_document_readers.V13FetchScoredPagesRuntime(
+            ASK_EVIDENCE_MIN_PAGE_SCORE=ASK_EVIDENCE_MIN_PAGE_SCORE,
+            ASK_SNIPPET_CHARS=ASK_SNIPPET_CHARS,
+            COMPANY_GENERAL_MACHINE_SENTINEL=COMPANY_GENERAL_MACHINE_SENTINEL,
+            V13_PAGE_SCAN_LIMIT=V13_PAGE_SCAN_LIMIT,
+            V13_PAGE_TEXT_CHARS=V13_PAGE_TEXT_CHARS,
+            _ask_evidence_code_tokens=_ask_evidence_code_tokens,
+            _ask_evidence_number_tokens=_ask_evidence_number_tokens,
+            _ask_evidence_scope_where=_ask_evidence_scope_where,
+            _ask_evidence_score_text=_ask_evidence_score_text,
+            _ask_evidence_tokenize=_ask_evidence_tokenize,
+            _db_conn=_db_conn,
+            _dedup_citations_by_snippet=_dedup_citations_by_snippet,
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+            _safe_int=_safe_int,
+            re=re,
+        ),
     )
-
-    raw_terms: list[str] = []
-    for key in (
-        "search_phrases", "search_terms_it", "search_terms_en",
-        "required_information", "important_codes_or_numbers",
-    ):
-        raw_terms.extend(str(x or "") for x in (profile.get(key) or []))
-    raw_terms.extend(_ask_evidence_tokenize(q))
-    raw_terms.extend(_ask_evidence_code_tokens(q))
-    raw_terms.extend(_ask_evidence_number_tokens(q))
-
-    search_terms: list[str] = []
-    seen_terms = set()
-    for raw in raw_terms:
-        term = _normalize_unicode_advanced(str(raw or "")).lower().strip(" -–—:;,.()[]{}")
-        term = re.sub(r"\s+", " ", term).strip()
-        if len(term) < 2 or term in seen_terms:
-            continue
-        seen_terms.add(term)
-        search_terms.append(term)
-        if len(search_terms) >= 24:
-            break
-
-    def fetch_rows(require_term_match: bool) -> list[tuple]:
-        term_sql = ""
-        term_params: list[Any] = []
-        if require_term_match and search_terms:
-            term_sql = " AND (" + " OR ".join(
-                ["LOWER(COALESCE(text, '')) LIKE %s" for _ in search_terms]
-            ) + ")"
-            term_params = [f"%{term}%" for term in search_terms]
-
-        conn = _db_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    f"""
-                    SELECT bubble_document_id, machine_id, page_number,
-                           LEFT(COALESCE(text, ''), %s) AS page_text
-                    FROM public.document_pages
-                    WHERE {where_sql}
-                      AND text IS NOT NULL
-                      AND length(text) > 20
-                      {term_sql}
-                    ORDER BY CASE WHEN machine_id=%s THEN 0 ELSE 1 END,
-                             bubble_document_id, page_number
-                    LIMIT %s;
-                    """,
-                    [
-                        V13_PAGE_TEXT_CHARS,
-                        *base_params,
-                        *term_params,
-                        machine_id,
-                        V13_PAGE_SCAN_LIMIT,
-                    ],
-                )
-                return cur.fetchall()
-        finally:
-            conn.close()
-
-    rows = fetch_rows(bool(search_terms))
-    if not rows and search_terms:
-        rows = fetch_rows(False)
-
-    scored: list[dict] = []
-    for bdid, mid, page_number, page_text in rows:
-        text = str(page_text or "").strip()
-        if not text:
-            continue
-        score = float(_ask_evidence_score_text(q, text, profile))
-        exact_machine = (
-            str(mid or "").strip() == str(machine_id or "").strip()
-            and str(machine_id or "").strip() != COMPANY_GENERAL_MACHINE_SENTINEL
-        )
-        if exact_machine:
-            score += 4.0
-        if score < float(ASK_EVIDENCE_MIN_PAGE_SCORE or 0.0):
-            continue
-        page = _safe_int(page_number, 1)
-        scored.append(
-            {
-                "citation_id": f"{bdid}:p{page}-{page}:v13page",
-                "bubble_document_id": str(bdid),
-                "chunk_index": 0,
-                "page_from": page,
-                "page_to": page,
-                "snippet": text[:ASK_SNIPPET_CHARS],
-                "chunk_full": text[:V13_PAGE_TEXT_CHARS],
-                "similarity": min(0.99, 0.50 + score / 100.0),
-                "retrieval_score": score,
-                "ask_evidence_score": score,
-                "exact_machine_scope": bool(exact_machine),
-            }
-        )
-
-    scored.sort(
-        key=lambda c: (
-            -float(c.get("ask_evidence_score") or 0.0),
-            0 if bool(c.get("exact_machine_scope")) else 1,
-            str(c.get("bubble_document_id") or ""),
-            int(c.get("page_from") or 0),
-        )
-    )
-    return _dedup_citations_by_snippet(scored, max_items=max(3, min(int(top_pages or 8), 14)))
 
 def _v13_fetch_preferred_source_pages(
     *,
@@ -16279,217 +15450,37 @@ def _v13_fetch_preferred_source_pages(
     source_kind="manual" fetches ordinary document/manual/PDF pages, excluding
     Bubble structured records and XLSX-generated pages.
     """
-    if source_kind not in {"xlsx", "manual"}:
-        return []
-
-    profile = _v13_build_profile_from_plan(q, response_language, plan)
-    where_sql, params = _ask_evidence_scope_where(
+    return _retrieval_document_readers.v13_fetch_preferred_source_pages(
+        q=q,
         company_id=company_id,
         machine_id=machine_id,
         doc_ids=doc_ids,
         bubble_document_id=bubble_document_id,
+        response_language=response_language,
+        top_k=top_k,
+        plan=plan,
+        source_kind=source_kind,
+        runtime=_retrieval_document_readers.V13FetchPreferredSourcePagesRuntime(
+            ASK_FULL_CONTEXT_PAGE_CHARS=ASK_FULL_CONTEXT_PAGE_CHARS,
+            ASK_SNIPPET_CHARS=ASK_SNIPPET_CHARS,
+            COMPANY_GENERAL_MACHINE_SENTINEL=COMPANY_GENERAL_MACHINE_SENTINEL,
+            V13_PAGE_TEXT_CHARS=V13_PAGE_TEXT_CHARS,
+            V13_PREFERRED_PAGE_SCAN_LIMIT=V13_PREFERRED_PAGE_SCAN_LIMIT,
+            _ask_evidence_scope_where=_ask_evidence_scope_where,
+            _ask_evidence_score_text=_ask_evidence_score_text,
+            _ask_manual_priority_page_has_real_maintenance_content=_ask_manual_priority_page_has_real_maintenance_content,
+            _ask_manual_priority_page_is_meta_or_index=_ask_manual_priority_page_is_meta_or_index,
+            _ask_manual_priority_page_score=_ask_manual_priority_page_score,
+            _ask_manual_priority_query_is_maintenance=_ask_manual_priority_query_is_maintenance,
+            _db_conn=_db_conn,
+            _dedup_citations_by_snippet=_dedup_citations_by_snippet,
+            _is_structured_source_key=_is_structured_source_key,
+            _is_xlsx_indexed_page_text=_is_xlsx_indexed_page_text,
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+            _safe_int=_safe_int,
+            _v13_build_profile_from_plan=_v13_build_profile_from_plan,
+        ),
     )
-
-    page_chars = min(V13_PAGE_TEXT_CHARS, max(1200, int(ASK_FULL_CONTEXT_PAGE_CHARS or 6500)))
-    scan_limit = V13_PREFERRED_PAGE_SCAN_LIMIT
-
-    conn = _db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                SELECT bubble_document_id, machine_id, page_number, LEFT(COALESCE(text, ''), %s) AS page_text
-                FROM public.document_pages
-                WHERE {where_sql}
-                  AND text IS NOT NULL
-                  AND length(text) > 20
-                ORDER BY bubble_document_id, page_number
-                LIMIT %s;
-                """,
-                [page_chars, *params, scan_limit],
-            )
-            rows = cur.fetchall()
-    finally:
-        conn.close()
-
-    # Targeted supplement for explicit manual maintenance/check questions.
-    # The broad scan can be diluted by cover pages, indexes or company-general manuals.
-    # This pass pulls table/frequency/maintenance pages from the same authorized scope,
-    # then the normal scorer still decides the order. It is a supplement, not a hard filter.
-    if source_kind == "manual" and _ask_manual_priority_query_is_maintenance(q):
-        targeted_patterns = [
-            "%tabella per manutenzione%",
-            "%tabella generale di manutenzione%",
-            "%ore di funzionamento%",
-            "%componenti%ore di%",
-            "%tipo di lubrificante%",
-            "%controllare il livello%",
-            "%cambio olio%",
-            "%pulizia dei filtri%",
-            "%sostituzione completa dei filtri%",
-            "%scarico della condensa%",
-            "%verifica integrità%",
-            "%verifica integrita%",
-            "%verifica corretto funzionamento%",
-            "%impianto elettrico%",
-            "%impianto pneumatico%",
-            "%raddrizzatura%",
-            "%lubrificazione%",
-            "%ogni 50 ore%",
-            "%ogni 300 ore%",
-            "%ogni 1000 ore%",
-            "%ogni 3000 ore%",
-            "%ogni giorno%",
-            "%mensilmente%",
-            "%settiman%",
-            "%annualmente%",
-        ]
-        targeted_clauses = " OR ".join(["LOWER(COALESCE(text, '')) LIKE %s" for _ in targeted_patterns])
-        target_limit = max(80, min(260, int(scan_limit // 2)))
-        try:
-            conn = _db_conn()
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        f"""
-                        SELECT bubble_document_id, machine_id, page_number, LEFT(COALESCE(text, ''), %s) AS page_text
-                        FROM public.document_pages
-                        WHERE {where_sql}
-                          AND text IS NOT NULL
-                          AND length(text) > 20
-                          AND ({targeted_clauses})
-                        ORDER BY
-                          CASE
-                            WHEN machine_id = %s THEN 0
-                            WHEN machine_id IS NULL OR machine_id = '' THEN 1
-                            ELSE 2
-                          END,
-                          bubble_document_id,
-                          page_number
-                        LIMIT %s;
-                        """,
-                        [page_chars, *params, *targeted_patterns, machine_id, target_limit],
-                    )
-                    targeted_rows = cur.fetchall()
-            finally:
-                conn.close()
-        except Exception as e:
-            print("V13_MANUAL_TARGETED_SCAN_FAIL", str(e)[:300])
-            targeted_rows = []
-
-        if targeted_rows:
-            rows = list(rows or [])
-            seen_pages = {
-                (str(r[0] or ""), _safe_int(r[2], 0))
-                for r in rows
-            }
-            for r in targeted_rows:
-                key = (str(r[0] or ""), _safe_int(r[2], 0))
-                if key not in seen_pages:
-                    rows.append(r)
-                    seen_pages.add(key)
-
-    scored: list[dict] = []
-    q_low = _normalize_unicode_advanced(q or "").lower()
-
-    for idx, (bdid, mid, page_number, page_text) in enumerate(rows or [], start=1):
-        bdid_s = str(bdid or "").strip()
-        txt = str(page_text or "").strip()
-        if not bdid_s or not txt:
-            continue
-
-        is_xlsx = _is_xlsx_indexed_page_text(txt)
-        is_structured = _is_structured_source_key(bdid_s)
-
-        if source_kind == "xlsx" and not is_xlsx:
-            continue
-        if source_kind == "manual" and (is_xlsx or is_structured):
-            continue
-
-        score = float(_ask_evidence_score_text(q, txt, profile))
-        # Source preference is a ranking boost, not an exclusive evidence rule.
-        score += 35.0 if source_kind == "xlsx" else 28.0
-        if source_kind == "xlsx" and any(x in q_low for x in ["excel", "xlsx", "foglio", "spreadsheet"]):
-            score += 8.0
-        if source_kind == "manual" and any(x in q_low for x in ["manual", "manuale", "pdf", "documentazione"]):
-            score += 8.0
-
-        t_low = _normalize_unicode_advanced(txt).lower()
-        for marker, bonus in [
-            ("manutenz", 8.0), ("maintenance", 8.0), ("controll", 6.0),
-            ("periodic", 5.0), ("frequenza", 5.0), ("frequency", 5.0),
-            ("lubr", 4.0), ("olio", 4.0), ("oil", 4.0),
-        ]:
-            if marker in q_low and marker in t_low:
-                score += bonus
-
-        exact_machine_page = False
-        real_maintenance_page = False
-        weak_meta_page = False
-        if source_kind == "manual":
-            row_mid = str(mid or "").strip()
-            exact_machine_page = bool(machine_id and machine_id != COMPANY_GENERAL_MACHINE_SENTINEL and row_mid == str(machine_id or "").strip())
-            real_maintenance_page = _ask_manual_priority_page_has_real_maintenance_content(txt)
-            weak_meta_page = _ask_manual_priority_page_is_meta_or_index(txt)
-            score = _ask_manual_priority_page_score(
-                q=q,
-                page_text=txt,
-                base_score=score,
-                row_machine_id=row_mid,
-                requested_machine_id=machine_id,
-            )
-
-        page = _safe_int(page_number, 1)
-        row_obj = {
-            "citation_id": f"{bdid_s}:p{page}-{page}:{source_kind}priority:{idx}",
-            "bubble_document_id": bdid_s,
-            "chunk_index": 0,
-            "page_from": page,
-            "page_to": page,
-            "snippet": txt[:ASK_SNIPPET_CHARS],
-            "chunk_full": txt,
-            "similarity": min(0.99, 0.74 + score / 200.0),
-            "retrieval_score": score,
-            "ask_source_priority": True,
-            "ask_source_priority_kind": source_kind,
-        }
-        if source_kind == "manual":
-            row_obj["manual_priority_exact_machine"] = bool(exact_machine_page)
-            row_obj["manual_priority_real_maintenance"] = bool(real_maintenance_page)
-            row_obj["manual_priority_weak_meta"] = bool(weak_meta_page)
-        scored.append(row_obj)
-
-    scored.sort(
-        key=lambda c: (
-            -float(c.get("retrieval_score") or 0.0),
-            str(c.get("bubble_document_id") or ""),
-            _safe_int(c.get("page_from"), 0),
-        )
-    )
-
-    max_items = max(1, min(max(top_k, 6), 12))
-    if source_kind == "manual" and _ask_manual_priority_query_is_maintenance(q):
-        exact_strong = [
-            c for c in scored
-            if bool(c.get("manual_priority_exact_machine"))
-            and bool(c.get("manual_priority_real_maintenance"))
-            and not bool(c.get("manual_priority_weak_meta"))
-        ]
-        other_strong = [
-            c for c in scored
-            if c not in exact_strong
-            and bool(c.get("manual_priority_real_maintenance"))
-            and not bool(c.get("manual_priority_weak_meta"))
-        ]
-        weak = [c for c in scored if c not in exact_strong and c not in other_strong]
-        if exact_strong:
-            ordered = exact_strong[:min(6, max_items)] + other_strong[:max(0, max_items - min(6, len(exact_strong)))] + weak[:max_items]
-            return _dedup_citations_by_snippet(ordered, max_items=max_items)
-        if other_strong:
-            ordered = other_strong[:max_items] + weak[:max_items]
-            return _dedup_citations_by_snippet(ordered, max_items=max_items)
-
-    return _dedup_citations_by_snippet(scored, max_items=max_items)
 
 
 
@@ -17246,100 +16237,27 @@ def _v13_fetch_manual_support_deterministic(
     planner: dict,
     structured_citations: list[dict],
 ) -> list[dict]:
-    if not ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_ENABLED:
-        return []
-    if not structured_citations or not machine_id or machine_id == COMPANY_GENERAL_MACHINE_SENTINEL:
-        return []
-
-    terms = _ask_structured_manual_support_terms(q, planner, structured_citations)
-    if not terms:
-        return []
-
-    text_chars = max(1200, int(ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_TEXT_CHARS or 4200))
-    scan_limit = max(40, min(300, int(ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_SCAN_LIMIT or 180)))
-    rows: list[tuple] = []
-    try:
-        conn = _db_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT bubble_document_id, machine_id, page_number,
-                           LEFT(COALESCE(text, ''), %s) AS page_text
-                    FROM public.document_pages
-                    WHERE company_id=%s
-                      AND (machine_id=%s OR machine_id IS NULL OR machine_id='')
-                      AND text IS NOT NULL
-                      AND length(text) > 40
-                      AND bubble_document_id NOT LIKE 'procedure:%%'
-                      AND bubble_document_id NOT LIKE 'step:%%'
-                      AND bubble_document_id NOT LIKE 'ps:%%'
-                      AND bubble_document_id NOT LIKE 'md_photo:%%'
-                      AND bubble_document_id NOT LIKE 'md_video:%%'
-                    ORDER BY CASE WHEN machine_id=%s THEN 0 ELSE 1 END,
-                             bubble_document_id, page_number
-                    LIMIT %s;
-                    """,
-                    (text_chars, company_id, machine_id, machine_id, scan_limit),
-                )
-                rows = cur.fetchall()
-        finally:
-            conn.close()
-    except Exception as exc:
-        print("V13_MANUAL_SUPPORT_SCAN_FAIL", str(exc)[:500])
-        return []
-
-    scored: list[dict] = []
-    for idx, (bdid, mid, page_number, page_text) in enumerate(rows, start=1):
-        text = str(page_text or "").strip()
-        if not text:
-            continue
-        details = _ask_structured_manual_support_score_details(text, terms)
-        operation_score = float(details.get("operation_score") or 0.0)
-        safety_score = float(details.get("safety_score") or 0.0)
-        total_score = float(details.get("total_score") or 0.0)
-        # Generic safety by itself is not sufficient. At least one operation term must match.
-        if operation_score < 1.0 or total_score < 3.0:
-            continue
-        page = _safe_int(page_number, 1)
-        exact_machine = str(mid or "").strip() == str(machine_id or "").strip()
-        scored.append(
-            {
-                "citation_id": f"{bdid}:p{page}-{page}:manualsupport:v13:{idx}",
-                "bubble_document_id": str(bdid),
-                "chunk_index": 1,
-                "page_from": page,
-                "page_to": page,
-                "snippet": text[: int(ASK_SNIPPET_CHARS or 900)],
-                "snippet_clean": text[: int(ASK_SNIPPET_CHARS or 900)],
-                "chunk_full": text,
-                "similarity": min(0.94, 0.70 + min(0.20, total_score / 100.0)),
-                "retrieval_score": total_score,
-                "v13_score": total_score,
-                "source_type": "document",
-                "evidence_role": "manual_support",
-                "ask_structured_manual_support": True,
-                "ask_manual_support_kind": "operation" if operation_score >= safety_score else "safety",
-                "structured_manual_operation_score": operation_score,
-                "structured_manual_safety_score": safety_score,
-                "structured_manual_support_score": total_score,
-                "exact_machine_scope": exact_machine,
-            }
-        )
-
-    scored.sort(
-        key=lambda c: (
-            0 if bool(c.get("exact_machine_scope")) else 1,
-            -float(c.get("structured_manual_operation_score") or 0.0),
-            -float(c.get("structured_manual_support_score") or 0.0),
-            str(c.get("bubble_document_id") or ""),
-            int(c.get("page_from") or 0),
-        )
+    return _retrieval_document_readers.v13_fetch_manual_support_deterministic(
+        company_id=company_id,
+        machine_id=machine_id,
+        q=q,
+        planner=planner,
+        structured_citations=structured_citations,
+        runtime=_retrieval_document_readers.V13FetchManualSupportDeterministicRuntime(
+            ASK_SNIPPET_CHARS=ASK_SNIPPET_CHARS,
+            ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_ENABLED=ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_ENABLED,
+            ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_MAX_ITEMS=ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_MAX_ITEMS,
+            ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_SCAN_LIMIT=ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_SCAN_LIMIT,
+            ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_TEXT_CHARS=ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_TEXT_CHARS,
+            COMPANY_GENERAL_MACHINE_SENTINEL=COMPANY_GENERAL_MACHINE_SENTINEL,
+            _ask_structured_manual_support_score_details=_ask_structured_manual_support_score_details,
+            _ask_structured_manual_support_terms=_ask_structured_manual_support_terms,
+            _db_conn=_db_conn,
+            _safe_int=_safe_int,
+            _v12_filter_linkable_manual_support=_v12_filter_linkable_manual_support,
+            _v12_mark_manual_support=_v12_mark_manual_support,
+        ),
     )
-    max_items = max(0, int(ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_MAX_ITEMS or 2))
-    selected = scored[:max_items]
-    selected = _v12_filter_linkable_manual_support(company_id, selected)
-    return _v12_mark_manual_support(selected)
 
 
 def _v13_structured_ask(
@@ -19696,67 +18614,20 @@ def _assistant_core_machine_catalog_candidates(
     max_rows: int = 48,
 ) -> list[dict]:
     """Compact machine-wide structured digest for exhaustive overview requests."""
-    if not request.machine_id:
-        return []
-    out: list[dict] = []
-    conn = None
-    try:
-        conn = _db_conn()
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT bubble_document_id, page_number, LEFT(COALESCE(text, ''), 4500)
-                FROM public.document_pages
-                WHERE company_id=%s AND machine_id=%s
-                  AND page_number=1
-                  AND (
-                    bubble_document_id LIKE 'procedure:%%'
-                    OR bubble_document_id LIKE 'md_photo:%%'
-                    OR bubble_document_id LIKE 'md_video:%%'
-                    OR bubble_document_id LIKE 'photo:%%'
-                    OR bubble_document_id LIKE 'video:%%'
-                  )
-                  AND text IS NOT NULL AND length(text) > 20
-                ORDER BY bubble_document_id
-                LIMIT %s;
-                """,
-                (request.company_id, request.machine_id, max_rows),
-            )
-            for bdid, page_number, page_text in cur.fetchall():
-                text = str(page_text or "").strip()
-                if not text:
-                    continue
-                st = _source_type_from_document_id(str(bdid or ""))
-                score = float(_ask_evidence_score_text(request.query, text, _ask_evidence_fallback_profile(request.query, request.response_language)))
-                out.append({
-                    "citation_id": f"{bdid}:p1-1:assistant-core:catalog",
-                    "bubble_document_id": str(bdid or ""),
-                    "page_from": _safe_int(page_number, 1),
-                    "page_to": _safe_int(page_number, 1),
-                    "snippet": text[:ASK_SNIPPET_CHARS],
-                    "snippet_clean": text[:ASK_SNIPPET_CHARS],
-                    "chunk_full": text[:4500],
-                    "similarity": min(0.92, max(0.0, 0.50 + score / 100.0)),
-                    "semantic_similarity": 0.0,
-                    "retrieval_score": score,
-                    "v13_score": score,
-                    "exact_machine_scope": True,
-                    "source_type": st,
-                    "assistant_core_catalog_candidate": True,
-                })
-    except Exception as exc:
-        print("ASSISTANT_CORE_CATALOG_FAIL", str(exc)[:500])
-    finally:
-        if conn is not None:
-            try: conn.close()
-            except Exception: pass
-    # Keep every photo/video and the strongest procedure descriptions.
-    media = [c for c in out if _assistant_core_candidate_source_type(c) in {"md_photo", "md_video", "photo", "video"}]
-    procedures = sorted(
-        [c for c in out if _assistant_core_candidate_source_type(c) == "procedure"],
-        key=lambda c: -float(c.get("v13_score") or 0.0),
-    )[:12]
-    return _v13_merge_candidates([media[:8], procedures])
+    return _retrieval_document_readers.assistant_core_machine_catalog_candidates(
+        request,
+        max_rows=max_rows,
+        runtime=_retrieval_document_readers.AssistantCoreMachineCatalogCandidatesRuntime(
+            ASK_SNIPPET_CHARS=ASK_SNIPPET_CHARS,
+            _ask_evidence_fallback_profile=_ask_evidence_fallback_profile,
+            _ask_evidence_score_text=_ask_evidence_score_text,
+            _assistant_core_candidate_source_type=_assistant_core_candidate_source_type,
+            _db_conn=_db_conn,
+            _safe_int=_safe_int,
+            _source_type_from_document_id=_source_type_from_document_id,
+            _v13_merge_candidates=_v13_merge_candidates,
+        ),
+    )
 
 def _assistant_core_machine_overview_schema() -> dict:
     """Strict schema for one exhaustive, source-accounted machine overview.
