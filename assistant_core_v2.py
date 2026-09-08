@@ -20,6 +20,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, MutableMapping, Optional, Sequence
 
+from machinemind.evidence.ask_input import (
+    AskEvidenceAdmission, apply_ask_evidence_input, ask_request_key,
+)
+
 
 MODE_ASK = "ask"
 MODE_ROOT_CAUSE = "root_cause"
@@ -284,6 +288,12 @@ class AssistantCoreHooks:
     ] = None
     repair_response: Optional[
         Callable[[dict, AssistantCoreRequest, dict, AssistantCoreDecision], dict]
+    ] = None
+    # P6-A: typed opt-in boundary. Main does not configure this hook yet.
+    # Only the explicitly requested ASK/ASK path may invoke it. Live provider
+    # bindings, cache/rescue and repair integration are a separate activation gate.
+    prepare_ask_evidence: Optional[
+        Callable[[AssistantCoreRequest, dict, AssistantCoreDecision], AskEvidenceAdmission]
     ] = None
 
 
@@ -1076,6 +1086,21 @@ class AssistantCoreV2:
                 request, prepared_retrieval, decision
             )
         else:
+            if (
+                request.requested_mode == MODE_ASK
+                and decision.effective_mode == MODE_ASK
+                and self.hooks.prepare_ask_evidence is not None
+            ):
+                # Technical conversion/scope errors propagate. Never silently
+                # reuse unvalidated raw records or label them "no_sources" here.
+                admission = self.hooks.prepare_ask_evidence(
+                    request, prepared_retrieval, decision
+                )
+                prepared_retrieval = apply_ask_evidence_input(
+                    prepared_retrieval,
+                    request_key=ask_request_key(request),
+                    admission=admission,
+                )
             response = self.hooks.synthesize_ask(
                 request, prepared_retrieval, decision
             )
