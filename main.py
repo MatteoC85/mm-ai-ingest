@@ -144,6 +144,8 @@ from machinemind.ingest import metering as _ingest_metering
 from machinemind.ingest import orchestration as _ingest_orchestration
 from machinemind.retrieval import dense as _retrieval_dense
 from machinemind.retrieval import structured as _retrieval_structured
+from machinemind.retrieval import query_planning as _retrieval_query_planning
+from machinemind.retrieval import candidate_assessment as _retrieval_candidate_assessment
 from machinemind.retrieval import retrieval_policy as _retrieval_policy
 from machinemind.retrieval import legacy_retrieval as _retrieval_legacy_retrieval
 from machinemind.retrieval import document_readers as _retrieval_document_readers
@@ -2143,54 +2145,24 @@ def _translate_text_preserving_citations(text: str, target_language: str) -> str
 
 
 def _query_translation_schema() -> dict:
-    return {
-        "name": "query_translation_for_retrieval_v1",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "text": {"type": "string"},
-            },
-            "required": ["text"],
-        },
-    }
+    return _retrieval_query_planning.query_translation_schema(
+        runtime=_retrieval_query_planning.QueryTranslationSchemaRuntime(
+        ),
+    )
 
 
 def _translate_query_for_retrieval(text: str, target_language: str) -> str:
-    text = re.sub(r"\s+", " ", _normalize_unicode_advanced(text or "")).strip()
-    target_language = str(target_language or "").strip().lower()
-    if not text or target_language not in {"it", "en"}:
-        return text
-
-    system_msg = (
-        "Translate the user's technical query for document retrieval. "
-        "Preserve meaning exactly, keep it short, do not add explanations, "
-        "do not assume a domain, and preserve codes, identifiers, and proper names exactly. "
-        "Prefer natural industrial wording. For symptoms, use physically plausible verbs like "
-        "'vibrates', 'makes noise', 'jams', 'stops', 'does not start', 'automatic mode', "
-        "'vibra', 'fa rumore', 'si blocca', 'si inceppa', 'non parte', 'in automatico'. "
-        "Avoid software-like or colloquial mistranslations such as 'freezes' for a machine stop."
+    return _retrieval_query_planning.translate_query_for_retrieval(
+        text,
+        target_language,
+        runtime=_retrieval_query_planning.TranslateQueryForRetrievalRuntime(
+            SEMANTIC_QUERY_PLANNER_MODEL=SEMANTIC_QUERY_PLANNER_MODEL,
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+            _openai_chat_json=_openai_chat_json,
+            _query_translation_schema=_query_translation_schema,
+            re=re,
+        ),
     )
-    user_msg = (
-        f"TARGET_LANGUAGE: {target_language}\n\n"
-        f"QUERY:\n{text}"
-    )
-
-    try:
-        parsed = _openai_chat_json(
-            [
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_msg},
-            ],
-            model=SEMANTIC_QUERY_PLANNER_MODEL,
-            json_schema=_query_translation_schema(),
-            timeout=20,
-        )
-        translated = re.sub(r"\s+", " ", str((parsed or {}).get("text") or "")).strip()
-        return translated or text
-    except Exception:
-        return text
 
 
 def _query_symptom_profile(q: str) -> dict:
@@ -2205,108 +2177,31 @@ def _query_symptom_profile(q: str) -> dict:
 
 
 def _symptom_crosslingual_expansions(q: str, source_language: str) -> list[str]:
-    if not ROOT_CAUSE_USE_DETERMINISTIC_CROSSLINGUAL:
-        return []
-
-    source_language = str(source_language or "").strip().lower()
-    if source_language not in {"it", "en"}:
-        return []
-
-    profile = _query_symptom_profile(q)
-    classes = set(profile.get("classes") or [])
-    out: list[str] = []
-
-    def add(x: str):
-        x = re.sub(r"\s+", " ", str(x or "").strip())
-        if x:
-            out.append(x)
-
-    if source_language == "it":
-        if "vibration" in classes:
-            if profile.get("has_bending_anchor"):
-                add("the machine vibrates during bending")
-            elif profile.get("has_feed_anchor"):
-                add("the machine vibrates during feed")
-            else:
-                add("the machine vibrates")
-        if "noise" in classes:
-            if profile.get("has_bending_anchor"):
-                add("the machine makes noise during bending")
-            elif profile.get("has_feed_anchor"):
-                add("the machine makes noise during feed")
-            else:
-                add("the machine makes noise")
-        if "jam" in classes:
-            if profile.get("has_feed_anchor"):
-                add("the machine jams during feed")
-                add("the machine stops during feed")
-            else:
-                add("the machine jams")
-                add("the machine stops unexpectedly")
-        if "no_start" in classes:
-            if profile.get("automatic_mode"):
-                add("the machine does not start in automatic mode")
-                add("the machine does not start in automatic cycle")
-            else:
-                add("the machine does not start")
-    else:
-        if "vibration" in classes:
-            if profile.get("has_bending_anchor"):
-                add("la macchina vibra durante la piegatura")
-            elif profile.get("has_feed_anchor"):
-                add("la macchina vibra durante l'avanzamento")
-            else:
-                add("la macchina vibra")
-        if "noise" in classes:
-            if profile.get("has_bending_anchor"):
-                add("la macchina fa rumore durante la piegatura")
-            elif profile.get("has_feed_anchor"):
-                add("la macchina fa rumore durante l'avanzamento")
-            else:
-                add("la macchina fa rumore")
-        if "jam" in classes:
-            if profile.get("has_feed_anchor"):
-                add("la macchina si inceppa durante l'avanzamento")
-                add("la macchina si blocca durante l'avanzamento")
-            else:
-                add("la macchina si blocca")
-                add("la macchina si inceppa")
-        if "no_start" in classes:
-            if profile.get("automatic_mode"):
-                add("la macchina non parte in automatico")
-                add("la macchina non si avvia in ciclo automatico")
-            else:
-                add("la macchina non parte")
-                add("la macchina non si avvia")
-
-    return _dedup_text_values(out, limit=3)
+    return _retrieval_query_planning.symptom_crosslingual_expansions(
+        q,
+        source_language,
+        runtime=_retrieval_query_planning.SymptomCrosslingualExpansionsRuntime(
+            ROOT_CAUSE_USE_DETERMINISTIC_CROSSLINGUAL=ROOT_CAUSE_USE_DETERMINISTIC_CROSSLINGUAL,
+            _dedup_text_values=_dedup_text_values,
+            _query_symptom_profile=_query_symptom_profile,
+            re=re,
+        ),
+    )
 
 
 def _augment_crosslingual_query_plan(q: str, planner: Optional[dict]) -> dict:
-    planner = dict(planner or {})
-    q_norm = re.sub(r"\s+", " ", _normalize_unicode_advanced(q or "")).strip()
-    query_language = str(planner.get("query_language") or _simple_query_language(q_norm)).strip().lower()
-
-    planner["crosslingual_dense_queries"] = []
-    planner["crosslingual_lexical_queries"] = []
-
-    if not q_norm or query_language not in {"it", "en"}:
-        return planner
-
-    target_language = "en" if query_language == "it" else "it"
-    base_text = re.sub(r"\s+", " ", str(planner.get("normalized_query") or q_norm)).strip() or q_norm
-    translated = _translate_query_for_retrieval(base_text, target_language)
-    deterministic = _symptom_crosslingual_expansions(base_text, query_language)
-
-    cross_texts = []
-    if translated and translated.lower() != base_text.lower():
-        cross_texts.append(translated)
-    cross_texts.extend(deterministic)
-
-    planner["crosslingual_dense_queries"] = _dedup_text_values(cross_texts, limit=3)
-    planner["crosslingual_lexical_queries"] = _dedup_text_values(cross_texts, limit=3)
-
-    return planner
+    return _retrieval_query_planning.augment_crosslingual_query_plan(
+        q,
+        planner,
+        runtime=_retrieval_query_planning.AugmentCrosslingualQueryPlanRuntime(
+            _dedup_text_values=_dedup_text_values,
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+            _simple_query_language=_simple_query_language,
+            _symptom_crosslingual_expansions=_symptom_crosslingual_expansions,
+            _translate_query_for_retrieval=_translate_query_for_retrieval,
+            re=re,
+        ),
+    )
 
 
 def _ask_rescue_response_schema() -> dict:
@@ -2626,118 +2521,22 @@ def _ground_citations_to_ids(citation_ids: list[str], citations: list[dict]) -> 
 
 
 def _semantic_query_plan(q: str, *, mode: str = "ask") -> dict:
-    q_norm = re.sub(r"\s+", " ", _normalize_unicode_advanced(q or "")).strip()
-    fallback_style = "telegraphic" if _count_query_tokens(q_norm) <= 6 else "natural"
-    fallback = {
-        "normalized_query": q_norm,
-        "dense_queries": [q_norm] if q_norm else [],
-        "lexical_queries": [q_norm] if q_norm else [],
-        "query_style": fallback_style,
-        "query_language": _simple_query_language(q_norm),
-    }
-
-    if not q_norm:
-        return fallback
-
-    schema = {
-        "name": "semantic_query_plan_v1",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "normalized_query": {"type": "string"},
-                "dense_queries": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "maxItems": max(1, SEMANTIC_MAX_DENSE_QUERIES),
-                },
-                "lexical_queries": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "maxItems": max(1, SEMANTIC_MAX_LEXICAL_QUERIES),
-                },
-                "query_style": {
-                    "type": "string",
-                    "enum": [
-                        "telegraphic",
-                        "natural",
-                        "identifier_lookup",
-                        "contact_lookup",
-                    ],
-                },
-                "query_language": {
-                    "type": "string",
-                    "enum": ["it", "en", "mixed", "other"],
-                },
-            },
-            "required": [
-                "normalized_query",
-                "dense_queries",
-                "lexical_queries",
-                "query_style",
-                "query_language",
-            ],
-        },
-    }
-
-    system_msg = (
-        "You prepare retrieval plans for a technical documentation assistant that must work across different machine sectors. "
-        "Queries and documents may be in Italian or English. "
-        "Work semantically and domain-agnostically. "
-        "Preserve the user's meaning exactly. "
-        "Do not inject unsupported components, causes, sectors, or jargon. "
-        "Produce a small set of retrieval-ready rewrites: "
-        "dense_queries for semantic embedding recall, lexical_queries for keyword/FTS rescue. "
-        "You may include one careful translation between Italian and English if it improves mixed-language recall, "
-        "but do not broaden the meaning. "
-        "query_style should describe the surface form of the query, not the machine domain."
+    return _retrieval_query_planning.semantic_query_plan(
+        q,
+        mode=mode,
+        runtime=_retrieval_query_planning.SemanticQueryPlanRuntime(
+            SEMANTIC_MAX_DENSE_QUERIES=SEMANTIC_MAX_DENSE_QUERIES,
+            SEMANTIC_MAX_LEXICAL_QUERIES=SEMANTIC_MAX_LEXICAL_QUERIES,
+            SEMANTIC_QUERY_PLANNER_MODEL=SEMANTIC_QUERY_PLANNER_MODEL,
+            SEMANTIC_QUERY_PLANNER_TIMEOUT=SEMANTIC_QUERY_PLANNER_TIMEOUT,
+            _count_query_tokens=_count_query_tokens,
+            _dedup_text_values=_dedup_text_values,
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+            _openai_chat_json=_openai_chat_json,
+            _simple_query_language=_simple_query_language,
+            re=re,
+        ),
     )
-
-    user_msg = (
-        f"MODE: {mode}\n"
-        f"QUERY:\n{q_norm}"
-    )
-
-    try:
-        parsed = _openai_chat_json(
-            [
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_msg},
-            ],
-            model=SEMANTIC_QUERY_PLANNER_MODEL,
-            json_schema=schema,
-            timeout=SEMANTIC_QUERY_PLANNER_TIMEOUT,
-        )
-        if not isinstance(parsed, dict):
-            return fallback
-
-        normalized_query = re.sub(r"\s+", " ", str(parsed.get("normalized_query") or q_norm)).strip() or q_norm
-        dense_queries = _dedup_text_values(
-            [q_norm, normalized_query] + list(parsed.get("dense_queries") or []),
-            limit=max(2, SEMANTIC_MAX_DENSE_QUERIES + 1),
-        )
-        lexical_queries = _dedup_text_values(
-            [q_norm, normalized_query] + list(parsed.get("lexical_queries") or []),
-            limit=max(2, SEMANTIC_MAX_LEXICAL_QUERIES + 1),
-        )
-        query_style = str(parsed.get("query_style") or fallback_style).strip().lower()
-        if query_style not in {"telegraphic", "natural", "identifier_lookup", "contact_lookup"}:
-            query_style = fallback_style
-
-        query_language = str(parsed.get("query_language") or fallback["query_language"]).strip().lower()
-        if query_language not in {"it", "en", "mixed", "other"}:
-            query_language = fallback["query_language"]
-
-        return {
-            "normalized_query": normalized_query,
-            "dense_queries": dense_queries or [q_norm],
-            "lexical_queries": lexical_queries or [q_norm],
-            "query_style": query_style,
-            "query_language": query_language,
-        }
-    except Exception:
-        return fallback
 
 
 def _effective_similarity_threshold(
@@ -4812,135 +4611,79 @@ def _build_sources_block_from_citations(
 # -----------------------------------------------------------------------------
 
 def _ask_evidence_stopwords() -> set[str]:
-    return {
-        # IT
-        "che", "cosa", "come", "quale", "quali", "quanto", "quanti", "quando", "dove", "perche", "perché",
-        "sono", "devo", "deve", "fare", "faccio", "indica", "indicati", "indicate", "della", "delle", "degli",
-        "dell", "alla", "allo", "alle", "con", "per", "sul", "sulla", "sulle", "nel", "nella", "nelle",
-        "documento", "documenti", "macchina", "manuale", "principali", "richiesti", "richieste", "alcune",
-        # EN
-        "what", "which", "how", "when", "where", "why", "does", "must", "should", "with", "from", "about",
-        "document", "documents", "machine", "manual", "main", "required", "requirements", "some",
-    }
+    return _retrieval_query_planning.ask_evidence_stopwords(
+        runtime=_retrieval_query_planning.AskEvidenceStopwordsRuntime(
+        ),
+    )
 
 
 def _ask_evidence_tokenize(text: str) -> list[str]:
-    t = _normalize_unicode_advanced(text or "").lower()
-    toks = re.findall(r"[a-z0-9à-öø-ÿ_+\-.,/°²≤>=]+", t)
-    stop = _ask_evidence_stopwords()
-    out = []
-    for tok in toks:
-        tok = tok.strip(".,;:!?()[]{}\"'")
-        if not tok or tok in stop:
-            continue
-        if len(tok) < 2 and not tok.isdigit():
-            continue
-        out.append(tok)
-    return out
+    return _retrieval_query_planning.ask_evidence_tokenize(
+        text,
+        runtime=_retrieval_query_planning.AskEvidenceTokenizeRuntime(
+            _ask_evidence_stopwords=_ask_evidence_stopwords,
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+            re=re,
+        ),
+    )
 
 
 def _ask_evidence_code_tokens(text: str) -> list[str]:
-    raw = _normalize_unicode_advanced(text or "")
-    # Codes/part numbers often include hyphens, digits, commas and letters.
-    candidates = re.findall(r"\b[A-Z0-9][A-Z0-9_+./,\-]{4,}[A-Z0-9]\b", raw.upper())
-    out = []
-    seen = set()
-    for x in candidates:
-        x = x.strip(".,;:!?()[]{}")
-        if x and x not in seen:
-            seen.add(x)
-            out.append(x)
-    return out[:24]
+    return _retrieval_query_planning.ask_evidence_code_tokens(
+        text,
+        runtime=_retrieval_query_planning.AskEvidenceCodeTokensRuntime(
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+            re=re,
+        ),
+    )
 
 
 def _ask_evidence_number_tokens(text: str) -> list[str]:
-    raw = _normalize_unicode_advanced(text or "")
-    vals = re.findall(r"(?<!\w)[+\-]?(?:\d{1,4}(?:[.,]\d{1,6})?|\d{2,})(?:\s?(?:mm|cm|m/s²|m/s2|m/s|bar|n|kn|s|ore|hours|hz|kw|v|a|arcmin|°c|°))?", raw.lower())
-    out = []
-    seen = set()
-    for v in vals:
-        v = re.sub(r"\s+", " ", v.strip())
-        if v and v not in seen:
-            seen.add(v)
-            out.append(v)
-    return out[:30]
+    return _retrieval_query_planning.ask_evidence_number_tokens(
+        text,
+        runtime=_retrieval_query_planning.AskEvidenceNumberTokensRuntime(
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+            re=re,
+        ),
+    )
 
 
 def _ask_evidence_query_schema() -> dict:
-    return {
-        "name": "ask_evidence_query_profile_v1",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "question_language": {"type": "string", "enum": ["it", "en", "other"]},
-                "answer_type": {
-                    "type": "string",
-                    "enum": ["factual", "procedural", "list", "table", "component_spec", "diagnostic", "comparison", "no_answer_check", "general"],
-                },
-                "search_phrases": {"type": "array", "items": {"type": "string"}, "maxItems": 18},
-                "search_terms_it": {"type": "array", "items": {"type": "string"}, "maxItems": 24},
-                "search_terms_en": {"type": "array", "items": {"type": "string"}, "maxItems": 24},
-                "required_information": {"type": "array", "items": {"type": "string"}, "maxItems": 18},
-                "important_codes_or_numbers": {"type": "array", "items": {"type": "string"}, "maxItems": 18},
-            },
-            "required": ["question_language", "answer_type", "search_phrases", "search_terms_it", "search_terms_en", "required_information", "important_codes_or_numbers"],
-        },
-    }
+    return _retrieval_query_planning.ask_evidence_query_schema(
+        runtime=_retrieval_query_planning.AskEvidenceQuerySchemaRuntime(
+        ),
+    )
 
 
 def _ask_evidence_fallback_profile(q: str, response_language: str = "it") -> dict:
-    toks = _ask_evidence_tokenize(q)
-    codes = _ask_evidence_code_tokens(q)
-    nums = _ask_evidence_number_tokens(q)
-    return {
-        "question_language": response_language if response_language in {"it", "en"} else "it",
-        "answer_type": "general",
-        "search_phrases": _dedup_text_values([q] + codes + nums, limit=18),
-        "search_terms_it": _dedup_text_values(toks + codes + nums, limit=24),
-        "search_terms_en": _dedup_text_values(toks + codes + nums, limit=24),
-        "required_information": _dedup_text_values(toks[:12], limit=18),
-        "important_codes_or_numbers": _dedup_text_values(codes + nums, limit=18),
-    }
+    return _retrieval_query_planning.ask_evidence_fallback_profile(
+        q,
+        response_language,
+        runtime=_retrieval_query_planning.AskEvidenceFallbackProfileRuntime(
+            _ask_evidence_code_tokens=_ask_evidence_code_tokens,
+            _ask_evidence_number_tokens=_ask_evidence_number_tokens,
+            _ask_evidence_tokenize=_ask_evidence_tokenize,
+            _dedup_text_values=_dedup_text_values,
+        ),
+    )
 
 
 def _ask_evidence_query_profile(q: str, response_language: str) -> dict:
     """Extract query needs without using any document-specific or benchmark-specific facts."""
-    fallback = _ask_evidence_fallback_profile(q, response_language)
-    if not OPENAI_API_KEY:
-        return fallback
-
-    system_msg = (
-        "You analyze industrial-document questions for retrieval. Do not answer the question. "
-        "Extract generic search phrases, bilingual Italian/English terms, requested attributes, codes and numbers. "
-        "Do not add facts that are not in the user question. Do not use any hidden benchmark knowledge."
+    return _retrieval_query_planning.ask_evidence_query_profile(
+        q,
+        response_language,
+        runtime=_retrieval_query_planning.AskEvidenceQueryProfileRuntime(
+            ASK_EVIDENCE_ANALYZER_MODEL=ASK_EVIDENCE_ANALYZER_MODEL,
+            OPENAI_API_KEY=OPENAI_API_KEY,
+            OPENAI_CHAT_MODEL=OPENAI_CHAT_MODEL,
+            OPENAI_RERANK_MODEL=OPENAI_RERANK_MODEL,
+            _ask_evidence_fallback_profile=_ask_evidence_fallback_profile,
+            _ask_evidence_query_schema=_ask_evidence_query_schema,
+            _dedup_text_values=_dedup_text_values,
+            _openai_chat_json_models=_openai_chat_json_models,
+        ),
     )
-    user_msg = (
-        f"QUESTION:\n{q}\n\n"
-        "Return a retrieval profile. Include both Italian and English equivalents when useful, because documents and questions may be in either language. "
-        "For technical/specification questions, include component names, attribute labels, units, table labels and code-like tokens found in the question."
-    )
-    try:
-        parsed = _openai_chat_json_models(
-            [
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_msg},
-            ],
-            models=[ASK_EVIDENCE_ANALYZER_MODEL, OPENAI_RERANK_MODEL, OPENAI_CHAT_MODEL],
-            json_schema=_ask_evidence_query_schema(),
-            timeout=35,
-        )
-        if isinstance(parsed, dict):
-            # Merge deterministic tokens so exact codes/numbers from the question cannot be lost.
-            parsed["search_phrases"] = _dedup_text_values(list(parsed.get("search_phrases") or []) + fallback["search_phrases"], limit=24)
-            parsed["search_terms_it"] = _dedup_text_values(list(parsed.get("search_terms_it") or []) + fallback["search_terms_it"], limit=32)
-            parsed["search_terms_en"] = _dedup_text_values(list(parsed.get("search_terms_en") or []) + fallback["search_terms_en"], limit=32)
-            parsed["important_codes_or_numbers"] = _dedup_text_values(list(parsed.get("important_codes_or_numbers") or []) + fallback["important_codes_or_numbers"], limit=24)
-            return parsed
-    except Exception as e:
-        print("ASK_EVIDENCE_PROFILE_FAIL", str(e)[:300])
-    return fallback
 
 
 def _ask_evidence_scope_where(
@@ -4961,60 +4704,20 @@ def _ask_evidence_scope_where(
 
 
 def _ask_evidence_score_text(q: str, text: str, profile: dict) -> float:
-    if not text:
-        return 0.0
-    tn = _normalize_unicode_advanced(text).lower()
-    qn = _normalize_unicode_advanced(q or "").lower()
-
-    q_tokens = [t for t in _ask_evidence_tokenize(qn) if len(t) >= 3]
-    terms = []
-    for key in ["search_phrases", "search_terms_it", "search_terms_en", "required_information", "important_codes_or_numbers"]:
-        terms.extend([str(x or "").strip() for x in (profile.get(key) or [])])
-    terms.extend(q_tokens)
-    terms.extend(_ask_evidence_code_tokens(q))
-    terms.extend(_ask_evidence_number_tokens(q))
-    terms = _dedup_text_values(terms, limit=90)
-
-    score = 0.0
-    hit_terms = 0
-    for term in terms:
-        norm = _normalize_unicode_advanced(term).lower().strip()
-        if not norm or norm in _ask_evidence_stopwords():
-            continue
-        if norm in tn:
-            hit_terms += 1
-            # Phrases, codes and numeric/unit values matter more than isolated generic words.
-            if len(norm) >= 12 or re.search(r"\d", norm):
-                score += 5.0
-            elif len(norm) >= 6:
-                score += 2.2
-            else:
-                score += 1.0
-
-    # Token-level recall from the original question.
-    q_unique = _dedup_text_values(q_tokens, limit=40)
-    if q_unique:
-        matched = sum(1 for t in q_unique if t in tn)
-        score += 10.0 * (matched / max(1, len(q_unique)))
-        if matched >= 2:
-            score += 2.0
-
-    # Exact code/number tokens from the question are strong anchors.
-    for x in _ask_evidence_code_tokens(q) + _ask_evidence_number_tokens(q):
-        xn = _normalize_unicode_advanced(x).lower()
-        if xn and xn in tn:
-            score += 8.0
-
-    # Prefer pages/records that are information dense and contain multiple query anchors.
-    if hit_terms >= 4:
-        score += min(8.0, hit_terms * 0.8)
-
-    # Penalize very generic safety/intro pages unless the question itself asks about them.
-    generic_markers = ["informazioni generali", "general information", "proprietà delle informazioni", "all rights reserved"]
-    if any(x in tn for x in generic_markers) and hit_terms < 3:
-        score -= 3.0
-
-    return max(0.0, score)
+    return _retrieval_candidate_assessment.ask_evidence_score_text(
+        q,
+        text,
+        profile,
+        runtime=_retrieval_candidate_assessment.AskEvidenceScoreTextRuntime(
+            _ask_evidence_code_tokens=_ask_evidence_code_tokens,
+            _ask_evidence_number_tokens=_ask_evidence_number_tokens,
+            _ask_evidence_stopwords=_ask_evidence_stopwords,
+            _ask_evidence_tokenize=_ask_evidence_tokenize,
+            _dedup_text_values=_dedup_text_values,
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+            re=re,
+        ),
+    )
 
 
 def _ask_evidence_fetch_pages(
@@ -5283,97 +4986,45 @@ def _ask_structured_manual_support_terms(q: str, planner: Optional[dict], struct
     expansions for common industrial verbs/nouns. No document ids, expected test
     answers or machine-specific values are encoded here.
     """
-    raw_terms = list(_ask_structured_direct_terms(q, planner=planner, limit=22))
-    structured_text = "\n".join(str(c.get("chunk_full") or c.get("snippet") or "") for c in (structured_citations or []))
-    raw_terms.extend(list(_content_term_set(structured_text, limit=24)))
-
-    joined = _normalize_unicode_advanced((q or "") + "\n" + structured_text).lower()
-    expansions: list[str] = []
-    bilingual_groups = [
-        (["coil", "bobina", "bobine"], ["coil", "bobina", "bobine"]),
-        (["change", "cambio", "cambiare", "sostitu", "replacement", "replace"], ["change", "cambio", "cambiare", "sostituzione", "sostituire", "replacement", "replace"]),
-        (["old", "vecchio", "vecchia", "remove", "rimuovere", "togliere"], ["old", "vecchio", "vecchia", "remove", "rimuovere", "togliere"]),
-        (["new", "nuovo", "nuova", "insert", "inserire", "mettere", "install"], ["new", "nuovo", "nuova", "insert", "inserire", "mettere", "installare", "montare"]),
-        (["procedure", "procedura", "procedimento", "sequence", "sequenza"], ["procedure", "procedura", "procedimento", "sequence", "sequenza"]),
-        (["step", "passo", "fase"], ["step", "passo", "fase"]),
-        (["operation", "operazione", "operativo", "operativa"], ["operation", "operazione", "operativo", "operativa"]),
-    ]
-    for triggers, adds in bilingual_groups:
-        if any(t in joined for t in triggers):
-            expansions.extend(adds)
-
-    # Keep only terms that help find the same operation in the manual. Generic
-    # safety words are handled separately so they cannot outrank operational pages.
-    generic_safety = {
-        "sicurezza", "safety", "manuale", "manual", "manutenzione", "maintenance",
-        "operatore", "operator", "qualificato", "qualified", "dpi", "ppe",
-        "guanti", "gloves", "occhiali", "goggles", "protezione", "protection",
-        "elettrica", "electrical", "pneumatica", "pneumatic", "sezionatore",
-        "disconnect", "interruttore", "switch", "lucchetto", "lock", "blocco", "lockout",
-    }
-    out: list[str] = []
-    seen: set[str] = set()
-    stop = _ask_structured_direct_stopwords()
-    for raw in list(raw_terms) + expansions:
-        t = _normalize_unicode_advanced(str(raw or "")).lower().strip(" -–—:;,.")
-        if len(t) < 3 or t in stop or t in generic_safety or t in seen:
-            continue
-        seen.add(t)
-        out.append(t)
-        if len(out) >= 44:
-            break
-    return out
+    return _retrieval_query_planning.ask_structured_manual_support_terms(
+        q,
+        planner,
+        structured_citations,
+        runtime=_retrieval_query_planning.AskStructuredManualSupportTermsRuntime(
+            _ask_structured_direct_stopwords=_ask_structured_direct_stopwords,
+            _ask_structured_direct_terms=_ask_structured_direct_terms,
+            _content_term_set=_content_term_set,
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+        ),
+    )
 
 
 def _ask_structured_manual_support_safety_terms() -> list[str]:
-    return [
-        "sicurezza", "safety", "messa a punto", "operatore qualificato", "qualified operator",
-        "dpi", "ppe", "guanti", "gloves", "occhiali", "goggles", "protezione", "protection",
-        "alimentazione elettrica", "electrical", "alimentazione pneumatica", "pneumatic",
-        "sezionatore", "interruttore generale", "lucchetto", "lockout", "disconnect",
-    ]
+    return _retrieval_candidate_assessment.ask_structured_manual_support_safety_terms(
+        runtime=_retrieval_candidate_assessment.AskStructuredManualSupportSafetyTermsRuntime(
+        ),
+    )
 
 
 def _ask_structured_manual_support_score_details(text: str, terms: list[str]) -> dict:
-    low = _normalize_unicode_advanced(text or "").lower()
-    if not low:
-        return {"operation_score": 0.0, "safety_score": 0.0, "total_score": 0.0}
-
-    operation_score = 0.0
-    matched_terms = 0
-    for t in terms:
-        if t and t in low:
-            matched_terms += 1
-            operation_score += 1.0
-
-    # Phrase synergy: if an operation noun and operation verb both appear, prefer
-    # that page over generic safety pages.
-    change_words = ["change", "cambio", "cambiare", "sostituzione", "sostituire", "replacement", "replace"]
-    coil_words = ["coil", "bobina", "bobine"]
-    if any(w in low for w in change_words) and any(w in low for w in coil_words):
-        operation_score += 5.0
-    if any(w in low for w in ["procedura", "procedure", "sequenza", "sequence", "operazione", "operation"]):
-        operation_score += 1.2
-
-    safety_score = 0.0
-    for marker in _ask_structured_manual_support_safety_terms():
-        if marker in low:
-            safety_score += 1.0
-
-    # Operational relevance dominates. Safety is still useful, but it cannot be
-    # the only reason a manual page is selected when the user asked how to perform
-    # an operation.
-    total_score = (operation_score * 3.0) + (safety_score * 0.35)
-    return {
-        "operation_score": float(operation_score),
-        "safety_score": float(safety_score),
-        "total_score": float(total_score),
-        "matched_operation_terms": int(matched_terms),
-    }
+    return _retrieval_candidate_assessment.ask_structured_manual_support_score_details(
+        text,
+        terms,
+        runtime=_retrieval_candidate_assessment.AskStructuredManualSupportScoreDetailsRuntime(
+            _ask_structured_manual_support_safety_terms=_ask_structured_manual_support_safety_terms,
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+        ),
+    )
 
 
 def _ask_structured_manual_support_score(text: str, terms: list[str]) -> float:
-    return float(_ask_structured_manual_support_score_details(text, terms).get("total_score") or 0.0)
+    return _retrieval_candidate_assessment.ask_structured_manual_support_score(
+        text,
+        terms,
+        runtime=_retrieval_candidate_assessment.AskStructuredManualSupportScoreRuntime(
+            _ask_structured_manual_support_score_details=_ask_structured_manual_support_score_details,
+        ),
+    )
 
 
 def _ask_structured_manual_support_selector_schema() -> dict:
@@ -5404,20 +5055,10 @@ def _ask_structured_manual_support_selector_schema() -> dict:
 
 
 def _ask_structured_manual_support_search_schema() -> dict:
-    return {
-        "name": "ask_structured_manual_support_search_v1",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "manual_search_terms": {"type": "array", "items": {"type": "string"}, "maxItems": 18},
-                "manual_search_concepts": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
-                "reason": {"type": "string"},
-            },
-            "required": ["manual_search_terms", "manual_search_concepts", "reason"],
-        },
-    }
+    return _retrieval_query_planning.ask_structured_manual_support_search_schema(
+        runtime=_retrieval_query_planning.AskStructuredManualSupportSearchSchemaRuntime(
+        ),
+    )
 
 
 def _ask_structured_manual_support_search_terms_with_llm(
@@ -5434,77 +5075,37 @@ def _ask_structured_manual_support_search_terms_with_llm(
     prerequisite, or its immediate continuation. This is needed because shop-floor
     structured procedures can use shorthand while manuals use formal wording.
     """
-    if not OPENAI_API_KEY or not structured_citations:
-        return []
-
-    structured_block = _ask_full_context_sources_block(
-        structured_citations,
-        max_context_chars=7000,
+    return _retrieval_query_planning.ask_structured_manual_support_search_terms_with_llm(
+        q=q,
+        response_language=response_language,
+        structured_citations=structured_citations,
+        runtime=_retrieval_query_planning.AskStructuredManualSupportSearchTermsWithLlmRuntime(
+            ASK_EVIDENCE_ANALYZER_MODEL=ASK_EVIDENCE_ANALYZER_MODEL,
+            ASK_STRUCTURED_DIRECT_MODEL=ASK_STRUCTURED_DIRECT_MODEL,
+            ASK_STRUCTURED_DIRECT_TIMEOUT=ASK_STRUCTURED_DIRECT_TIMEOUT,
+            OPENAI_API_KEY=OPENAI_API_KEY,
+            OPENAI_CHAT_MODEL=OPENAI_CHAT_MODEL,
+            OPENAI_RERANK_MODEL=OPENAI_RERANK_MODEL,
+            _ask_full_context_sources_block=_ask_full_context_sources_block,
+            _ask_structured_direct_stopwords=_ask_structured_direct_stopwords,
+            _ask_structured_manual_support_search_schema=_ask_structured_manual_support_search_schema,
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+            _openai_chat_json_models=_openai_chat_json_models,
+            re=re,
+        ),
     )
-    system_msg = (
-        "You prepare search terms for an industrial machine manual. You are not answering the user. "
-        "Given a user question and primary structured procedure/step records, infer the formal wording the official manual may use for: "
-        "the same operation, an immediate prerequisite, or an immediate continuation needed to complete that operation. "
-        "Use semantic reasoning, not fixed keywords. Include terms in the user's language and likely manual language when useful. "
-        "Do not invent values, ids, page numbers, or facts. Do not add broad generic safety unless it is necessary to find directly applicable prerequisites."
-    )
-    user_msg = (
-        f"QUESTION:\n{q}\n\n"
-        f"RESPONSE_LANGUAGE:\n{response_language}\n\n"
-        f"PRIMARY STRUCTURED SOURCES:\n{structured_block}\n\n"
-        "Return concise search terms/concepts only. Prefer manual phrasing, component names, actions, materials, and immediate before/after operations. "
-        "If a structured procedure uses workshop shorthand, infer plausible formal manual terms without asserting they exist."
-    )
-    try:
-        parsed = _openai_chat_json_models(
-            [
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_msg},
-            ],
-            models=[ASK_STRUCTURED_DIRECT_MODEL, ASK_EVIDENCE_ANALYZER_MODEL, OPENAI_RERANK_MODEL, OPENAI_CHAT_MODEL],
-            json_schema=_ask_structured_manual_support_search_schema(),
-            timeout=min(int(ASK_STRUCTURED_DIRECT_TIMEOUT or 60), 45),
-        )
-    except Exception as e:
-        print("ASK_STRUCTURED_MANUAL_SEARCH_TERMS_FAIL", str(e)[:700])
-        return []
-
-    if not isinstance(parsed, dict):
-        return []
-
-    out: list[str] = []
-    seen: set[str] = set()
-    raw_items = list(parsed.get("manual_search_terms") or []) + list(parsed.get("manual_search_concepts") or [])
-    stop = _ask_structured_direct_stopwords()
-    for raw in raw_items:
-        t = _normalize_unicode_advanced(str(raw or "")).lower().strip(" -–—:;,.()[]{}")
-        t = re.sub(r"\s+", " ", t).strip()
-        if len(t) < 3 or t in stop or t in seen:
-            continue
-        seen.add(t)
-        out.append(t)
-        if len(out) >= 26:
-            break
-    return out
 
 
 def _ask_structured_manual_support_candidate_score(text: str, profile_terms: list[str], fallback_terms: list[str]) -> float:
-    low = _normalize_unicode_advanced(text or "").lower()
-    if not low:
-        return 0.0
-    score = 0.0
-    for t in profile_terms or []:
-        tt = _normalize_unicode_advanced(str(t or "")).lower().strip()
-        if len(tt) < 3:
-            continue
-        if tt in low:
-            # Multi-word concepts are stronger because they usually reflect a
-            # reasoned manual phrase rather than a generic single term.
-            score += 2.5 if " " in tt else 1.2
-    # Fallback terms are useful but must not dominate the LLM-inferred manual profile.
-    details = _ask_structured_manual_support_score_details(text, fallback_terms or [])
-    score += float(details.get("total_score") or 0.0) * 0.18
-    return float(score)
+    return _retrieval_candidate_assessment.ask_structured_manual_support_candidate_score(
+        text,
+        profile_terms,
+        fallback_terms,
+        runtime=_retrieval_candidate_assessment.AskStructuredManualSupportCandidateScoreRuntime(
+            _ask_structured_manual_support_score_details=_ask_structured_manual_support_score_details,
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+        ),
+    )
 
 
 def _ask_structured_manual_support_select_with_llm(
@@ -6069,24 +5670,12 @@ def _v12_dedupe_family_steps(steps: list[dict]) -> list[dict]:
 
 
 def _v12_family_facet_queries(planner: Optional[dict]) -> list[dict]:
-    rows: list[dict] = []
-    for raw in list((planner or {}).get("facet_queries") or []):
-        if not isinstance(raw, dict):
-            continue
-        facet = str(raw.get("facet") or "").strip()
-        if not facet:
-            continue
-        rows.append(
-            {
-                "facet": facet,
-                "answer_type": str(raw.get("answer_type") or "").strip().lower(),
-                "must_cover": bool(raw.get("must_cover", True)),
-                "dense_queries": _dedup_text_values(raw.get("dense_queries") or [], limit=8),
-                "lexical_queries": _dedup_text_values(raw.get("lexical_queries") or [], limit=8),
-                "exact_terms": _dedup_text_values(raw.get("exact_terms") or [], limit=10),
-            }
-        )
-    return rows
+    return _retrieval_query_planning.v12_family_facet_queries(
+        planner,
+        runtime=_retrieval_query_planning.V12FamilyFacetQueriesRuntime(
+            _dedup_text_values=_dedup_text_values,
+        ),
+    )
 
 
 def _v12_family_score(
@@ -6098,71 +5687,22 @@ def _v12_family_score(
     complete_steps: list[dict],
     raw_procedure_present: bool,
 ) -> dict:
-    facets = _dedup_text_values((planner or {}).get("required_facets") or [], limit=12)
-    complete_text = "\n".join(
-        _v13_candidate_text(candidate)
-        for candidate in [procedure] + list(complete_steps or [])
-        if isinstance(candidate, dict)
+    return _retrieval_candidate_assessment.v12_family_score(
+        q=q,
+        planner=planner,
+        procedure=procedure,
+        seed_steps=seed_steps,
+        complete_steps=complete_steps,
+        raw_procedure_present=raw_procedure_present,
+        runtime=_retrieval_candidate_assessment.V12FamilyScoreRuntime(
+            _assistant_core_required_facet_metrics=_assistant_core_required_facet_metrics,
+            _content_term_set=_content_term_set,
+            _dedup_text_values=_dedup_text_values,
+            _term_overlap_score=_term_overlap_score,
+            _v12_step_direct_query_score=_v12_step_direct_query_score,
+            _v13_candidate_text=_v13_candidate_text,
+        ),
     )
-    seed_text = "\n".join(
-        _v13_candidate_text(candidate)
-        for candidate in list(seed_steps or [])
-        if isinstance(candidate, dict)
-    )
-    complete_metrics = _assistant_core_required_facet_metrics(complete_text, facets)
-    seed_metrics = _assistant_core_required_facet_metrics(seed_text, facets)
-    direct_scores = [
-        _v12_step_direct_query_score(step, q)
-        for step in (complete_steps or [])
-        if isinstance(step, dict)
-    ]
-    procedure_terms = _content_term_set(_v13_candidate_text(procedure), limit=160)
-    query_terms = _content_term_set(q, limit=80)
-    procedure_overlap = (
-        _term_overlap_score(query_terms, procedure_terms)
-        if query_terms and procedure_terms else 0.0
-    )
-    seed_quality = max(
-        [
-            float(step.get("v13_score", step.get("retrieval_score", step.get("similarity", 0.0))) or 0.0)
-            for step in (seed_steps or [])
-        ]
-        or [0.0]
-    )
-    relation_seed_count = sum(
-        1
-        for step in (seed_steps or [])
-        if str(step.get("_v10_5_parent_source_key") or "").strip()
-    )
-    exact_machine = any(bool(step.get("exact_machine_scope")) for step in (seed_steps or []))
-    complete_coverage = float(complete_metrics.get("coverage") or 0.0)
-    seed_coverage = float(seed_metrics.get("coverage") or 0.0)
-    max_direct = max(direct_scores or [0.0])
-    seed_count = len({str(step.get("bubble_document_id") or "") for step in (seed_steps or []) if str(step.get("bubble_document_id") or "")})
-    score = (
-        4.0 * complete_coverage
-        + 2.2 * seed_coverage
-        + 0.38 * min(seed_count, 6)
-        + 1.30 * max_direct
-        + 0.70 * procedure_overlap
-        + 0.28 * min(relation_seed_count, 4)
-        + 0.18 * min(1.0, seed_quality)
-        + (0.12 if exact_machine else 0.0)
-        + (0.08 if raw_procedure_present else 0.0)
-    )
-    return {
-        "score": float(score),
-        "facet_coverage": complete_coverage,
-        "seed_facet_coverage": seed_coverage,
-        "covered_facets": list(complete_metrics.get("covered") or []),
-        "missing_facets": list(complete_metrics.get("missing") or []),
-        "seed_count": seed_count,
-        "relation_seed_count": relation_seed_count,
-        "max_direct_step_score": float(max_direct),
-        "procedure_overlap": float(procedure_overlap),
-        "seed_quality": float(seed_quality),
-        "raw_procedure_present": bool(raw_procedure_present),
-    }
 
 
 def _v12_choose_primary_procedure_family(
@@ -7103,21 +6643,16 @@ def _v12_query_requires_step_sequence(q: str, profile: Optional[dict]) -> bool:
 
 
 def _v12_step_direct_query_score(step: dict, q: str) -> float:
-    q_terms = _content_term_set(q, limit=80)
-    if not q_terms:
-        return 0.0
-    fields = _procedure_ui_fields(step)
-    sections = _procedure_ui_sections(fields.get("description") or "")
-    # Score the Step's own title and operational action. Parent Procedure labels
-    # and repeated technical-reference boilerplate are present in every Step and
-    # would otherwise make a component name appear relevant to the whole family.
-    text = " ".join(
-        [
-            str(fields.get("title") or ""),
-            str(sections.get("instruction") or sections.get("body") or ""),
-        ]
+    return _retrieval_candidate_assessment.v12_step_direct_query_score(
+        step,
+        q,
+        runtime=_retrieval_candidate_assessment.V12StepDirectQueryScoreRuntime(
+            _content_term_set=_content_term_set,
+            _procedure_ui_fields=_procedure_ui_fields,
+            _procedure_ui_sections=_procedure_ui_sections,
+            _term_overlap_score=_term_overlap_score,
+        ),
     )
-    return _term_overlap_score(q_terms, _content_term_set(text, limit=180))
 
 
 def _v12_step_is_closing_or_verification(step: dict) -> bool:
@@ -7160,23 +6695,17 @@ def _v12_query_range_anchors(q: str) -> tuple[str, str]:
 
 
 def _v12_step_phrase_score(step: dict, phrase: str) -> float:
-    phrase_terms = _content_term_set(phrase, limit=40)
-    if not phrase_terms:
-        return 0.0
-    fields = _procedure_ui_fields(step)
-    sections = _procedure_ui_sections(fields.get("description") or "")
-    step_text = _normalize_unicode_advanced(
-        " ".join(
-            [
-                str(fields.get("title") or ""),
-                str(sections.get("instruction") or sections.get("body") or ""),
-            ]
-        )
-    ).lower()
-    step_terms = _content_term_set(step_text, limit=180)
-    overlap = _term_overlap_score(phrase_terms, step_terms)
-    exact_hits = sum(1 for term in phrase_terms if term in step_text)
-    return float(overlap + 0.08 * exact_hits)
+    return _retrieval_candidate_assessment.v12_step_phrase_score(
+        step,
+        phrase,
+        runtime=_retrieval_candidate_assessment.V12StepPhraseScoreRuntime(
+            _content_term_set=_content_term_set,
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+            _procedure_ui_fields=_procedure_ui_fields,
+            _procedure_ui_sections=_procedure_ui_sections,
+            _term_overlap_score=_term_overlap_score,
+        ),
+    )
 
 
 def _v12_range_anchor_span(steps: list[dict], q: str) -> tuple[int, int] | None:
@@ -7267,54 +6796,21 @@ def _v12_step_contract_text(step: dict) -> str:
 
 
 def _v12_step_facet_score(step: dict, facet_query: dict, q: str) -> dict:
-    text = _normalize_unicode_advanced(_v12_step_contract_text(step)).lower()
-    text_terms = _content_term_set(text, limit=220)
-    values = _dedup_text_values(
-        [facet_query.get("facet")]
-        + list(facet_query.get("dense_queries") or [])
-        + list(facet_query.get("lexical_queries") or []),
-        limit=20,
+    return _retrieval_candidate_assessment.v12_step_facet_score(
+        step,
+        facet_query,
+        q,
+        runtime=_retrieval_candidate_assessment.V12StepFacetScoreRuntime(
+            _assistant_core_required_facet_metrics=_assistant_core_required_facet_metrics,
+            _content_term_set=_content_term_set,
+            _dedup_text_values=_dedup_text_values,
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+            _term_overlap_score=_term_overlap_score,
+            _v12_step_contract_text=_v12_step_contract_text,
+            _v12_step_direct_query_score=_v12_step_direct_query_score,
+            re=re,
+        ),
     )
-    phrase_score = 0.0
-    for value in values:
-        terms = _content_term_set(value, limit=45)
-        if not terms or not text_terms:
-            continue
-        overlap = _term_overlap_score(terms, text_terms)
-        exact_hits = sum(1 for term in terms if term in text)
-        phrase_score = max(phrase_score, float(overlap + 0.06 * exact_hits))
-
-    exact_terms = _dedup_text_values(facet_query.get("exact_terms") or [], limit=12)
-    matched_exact: list[str] = []
-    for term in exact_terms:
-        normalized = re.sub(
-            r"\s+", " ", _normalize_unicode_advanced(str(term or "")).lower()
-        ).strip()
-        if normalized and normalized in text:
-            matched_exact.append(term)
-            continue
-        term_set = _content_term_set(normalized, limit=20)
-        if term_set and len(term_set & text_terms) / max(1, len(term_set)) >= 0.67:
-            matched_exact.append(term)
-
-    facet = str(facet_query.get("facet") or "").strip()
-    facet_coverage = float(
-        _assistant_core_required_facet_metrics(text, [facet]).get("coverage") or 0.0
-    ) if facet else 0.0
-    direct = _v12_step_direct_query_score(step, q)
-    score = (
-        phrase_score
-        + 0.15 * min(len(matched_exact), 4)
-        + 0.22 * facet_coverage
-        + 0.14 * direct
-    )
-    return {
-        "score": float(score),
-        "phrase_score": float(phrase_score),
-        "facet_coverage": facet_coverage,
-        "matched_exact_terms": matched_exact,
-        "direct_query_score": float(direct),
-    }
 
 
 def _v12_select_sparse_ordered_steps(
@@ -9200,60 +8696,15 @@ def _select_prompt_citations_from_matrix(
     *,
     max_prompt: int,
 ) -> list[dict]:
-    if not rescored_candidates:
-        return []
-
-    by_id = {
-        str(c.get("citation_id") or "").strip(): c
-        for c in rescored_candidates
-        if c.get("citation_id")
-    }
-
-    out: list[dict] = []
-    used_ids = set()
-    used_families = set()
-
-    def try_add(cid: str, prefer_new_family: bool = True) -> bool:
-        cid = str(cid or "").strip()
-        if not cid or cid not in by_id or cid in used_ids:
-            return False
-
-        item = by_id[cid]
-        fam = _root_cause_evidence_family_key(item)
-
-        if prefer_new_family and fam in used_families:
-            return False
-
-        used_ids.add(cid)
-        used_families.add(fam)
-        out.append(item)
-        return True
-
-    for row in (diagnostic_matrix or {}).get("cause_hypotheses") or []:
-        per_cause = 0
-        for cid in row.get("evidence_ids") or []:
-            added = try_add(cid, prefer_new_family=True)
-            if not added:
-                added = try_add(cid, prefer_new_family=False)
-            if added:
-                per_cause += 1
-            if per_cause >= max(1, ROOT_CAUSE_MATRIX_PROMPT_CAUSE_QUOTA):
-                break
-        if len(out) >= max_prompt:
-            return out[:max_prompt]
-
-    for cid in (diagnostic_matrix or {}).get("keep_ids") or []:
-        if try_add(cid, prefer_new_family=True) or try_add(cid, prefer_new_family=False):
-            if len(out) >= max_prompt:
-                return out[:max_prompt]
-
-    for item in rescored_candidates:
-        cid = str(item.get("citation_id") or "").strip()
-        if try_add(cid, prefer_new_family=True) or try_add(cid, prefer_new_family=False):
-            if len(out) >= max_prompt:
-                break
-
-    return out[:max_prompt]
+    return _retrieval_candidate_assessment.select_prompt_citations_from_matrix(
+        rescored_candidates,
+        diagnostic_matrix,
+        max_prompt=max_prompt,
+        runtime=_retrieval_candidate_assessment.SelectPromptCitationsFromMatrixRuntime(
+            ROOT_CAUSE_MATRIX_PROMPT_CAUSE_QUOTA=ROOT_CAUSE_MATRIX_PROMPT_CAUSE_QUOTA,
+            _root_cause_evidence_family_key=_root_cause_evidence_family_key,
+        ),
+    )
 
 
 def _merge_matrix_supported_causes(
@@ -13682,31 +13133,10 @@ def _v13_no_sources_for_insufficient_evidence(*, q: str, response_language: str,
     }
 
 def _v13_query_plan_schema() -> dict:
-    return {
-        "name": "machinemind_v13_retrieval_plan",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "intent": {
-                    "type": "string",
-                    "enum": ["factual", "procedural", "diagnostic", "listing", "comparison", "explanation", "other"],
-                },
-                "normalized_query": {"type": "string"},
-                "query_language": {"type": "string", "enum": ["it", "en", "mixed", "other"]},
-                "dense_queries": {"type": "array", "items": {"type": "string"}, "maxItems": 6},
-                "lexical_queries": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
-                "exact_terms": {"type": "array", "items": {"type": "string"}, "maxItems": 16},
-                "required_facets": {"type": "array", "items": {"type": "string"}, "maxItems": 10},
-                "ambiguities": {"type": "array", "items": {"type": "string"}, "maxItems": 6},
-            },
-            "required": [
-                "intent", "normalized_query", "query_language", "dense_queries",
-                "lexical_queries", "exact_terms", "required_facets", "ambiguities"
-            ],
-        },
-    }
+    return _retrieval_query_planning.v13_query_plan_schema(
+        runtime=_retrieval_query_planning.V13QueryPlanSchemaRuntime(
+        ),
+    )
 
 
 def _v13_plan_retrieval(*, q: str, mode: str, company_id: str) -> dict:
@@ -16224,166 +15654,37 @@ def _assistant_core_facet_candidate_confidence(
     prevents an HMI page mentioning a component from satisfying a capacity/checklist
     facet, while preserving cross-language evidence through cosine similarity.
     """
-    text = _v13_candidate_text(candidate)
-    normalized_text = re.sub(
-        r"\s+", " ", _normalize_unicode_advanced(text).lower()
-    ).strip()
-    query_text = " ".join(
-        _dedup_text_values(
-            [facet] + list(dense_queries or []) + list(lexical_queries or []),
-            limit=18,
-        )
-    )
-    query_terms = _content_term_set(query_text, limit=140)
-    text_terms = _content_term_set(text, limit=220)
-    lexical_overlap = _term_overlap_score(query_terms, text_terms) if query_terms else 0.0
-    semantic = max(
-        0.0,
-        float(
-            candidate.get(
-                "semantic_similarity",
-                candidate.get("gate_similarity", candidate.get("similarity", 0.0)),
-            )
-            or 0.0
+    return _retrieval_candidate_assessment.assistant_core_facet_candidate_confidence(
+        candidate=candidate,
+        facet=facet,
+        answer_type=answer_type,
+        dense_queries=dense_queries,
+        lexical_queries=lexical_queries,
+        exact_terms=exact_terms,
+        preferred_source_types=preferred_source_types,
+        rank=rank,
+        runtime=_retrieval_candidate_assessment.AssistantCoreFacetCandidateConfidenceRuntime(
+            ASSISTANT_CORE_FACET_SUPPORT_THRESHOLD=ASSISTANT_CORE_FACET_SUPPORT_THRESHOLD,
+            REQ_CHECKLIST=REQ_CHECKLIST,
+            REQ_EXPLANATION=REQ_EXPLANATION,
+            REQ_INTERFACE_LOCATIONS=REQ_INTERFACE_LOCATIONS,
+            REQ_NUMERIC_VALUE=REQ_NUMERIC_VALUE,
+            REQ_ORDERED_ACTIONS=REQ_ORDERED_ACTIONS,
+            REQ_SAFETY_CONDITIONS=REQ_SAFETY_CONDITIONS,
+            REQ_STATE_SEQUENCE=REQ_STATE_SEQUENCE,
+            _assistant_core_candidate_source_type=_assistant_core_candidate_source_type,
+            _assistant_core_interface_navigation_signal=_assistant_core_interface_navigation_signal,
+            _assistant_core_numeric_signal=_assistant_core_numeric_signal,
+            _assistant_core_required_facet_metrics=_assistant_core_required_facet_metrics,
+            _assistant_core_sequence_signal=_assistant_core_sequence_signal,
+            _content_term_set=_content_term_set,
+            _dedup_text_values=_dedup_text_values,
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+            _term_overlap_score=_term_overlap_score,
+            _v13_candidate_text=_v13_candidate_text,
+            re=re,
         ),
     )
-    facet_metrics = _assistant_core_required_facet_metrics(text, [facet])
-    facet_coverage = float(facet_metrics.get("coverage") or 0.0)
-
-    normalized_exact_hits: list[str] = []
-    for raw_term in exact_terms or []:
-        term = re.sub(
-            r"\s+", " ", _normalize_unicode_advanced(str(raw_term or "")).lower()
-        ).strip()
-        if not term:
-            continue
-        if term in normalized_text:
-            normalized_exact_hits.append(str(raw_term).strip())
-    strong_exact = any(
-        len(re.sub(r"\W+", "", _normalize_unicode_advanced(term))) >= 4
-        or bool(re.search(r"\d", term))
-        for term in normalized_exact_hits
-    )
-    title_support = bool(
-        candidate.get("structured_title_support")
-        or (
-            candidate.get("structured_title_match")
-            and float(candidate.get("structured_title_match_score") or 0.0) >= 0.40
-        )
-    )
-    fts_support = bool(candidate.get("fts_v13") and lexical_overlap >= 0.025)
-    source_type = _assistant_core_candidate_source_type(candidate)
-    preferred = {
-        str(item or "").strip().lower()
-        for item in preferred_source_types or []
-        if str(item or "").strip()
-    }
-    source_preferred = bool(preferred and source_type in preferred)
-
-    answer_type = str(answer_type or REQ_EXPLANATION).strip().lower()
-    numeric_signal = _assistant_core_numeric_signal(text)
-    if answer_type == REQ_NUMERIC_VALUE:
-        answer_shape_score = (
-            1.0 if numeric_signal.get("has_number_with_unit")
-            else 0.45 if numeric_signal.get("has_number")
-            else 0.0
-        )
-    elif answer_type == REQ_INTERFACE_LOCATIONS:
-        answer_shape_score = 1.0 if _assistant_core_interface_navigation_signal(text) else 0.0
-    elif answer_type == REQ_STATE_SEQUENCE:
-        answer_shape_score = 1.0 if _assistant_core_sequence_signal(text) else 0.0
-    elif answer_type in {REQ_ORDERED_ACTIONS, REQ_CHECKLIST, REQ_SAFETY_CONDITIONS}:
-        list_signal = len(
-            re.findall(r"(?m)^\s*(?:[-•*]|\d{1,2}[.)])\s+", str(text or ""))
-        )
-        structured_signal = source_type in {"procedure", "step", "ps"}
-        answer_shape_score = 1.0 if list_signal >= 2 else 0.75 if structured_signal else 0.0
-    else:
-        answer_shape_score = 0.55
-
-    rank_score = max(0.0, 1.0 - min(max(1, int(rank)) - 1, 20) / 20.0)
-    score = (
-        0.40 * min(1.0, semantic)
-        + 0.24 * min(1.0, lexical_overlap * 5.0)
-        + 0.16 * min(1.0, facet_coverage)
-        + 0.12 * answer_shape_score
-        + 0.04 * rank_score
-        + (0.18 if strong_exact else 0.0)
-        + (0.10 if title_support else 0.0)
-        + (0.06 if fts_support else 0.0)
-        + (0.04 if source_preferred else 0.0)
-    )
-    score = min(1.0, max(0.0, score))
-
-    # Rank alone is never sufficient. Precision facets use stricter shape-aware
-    # admission so a nearby page containing an unrelated number/menu/sequence does
-    # not satisfy the contract. The router supplies bilingual lexical variants, so
-    # a real cross-language match still has an independent contextual signal.
-    if answer_type == REQ_NUMERIC_VALUE:
-        credible = bool(
-            strong_exact
-            or title_support
-            or facet_coverage >= 0.50
-            or (
-                lexical_overlap >= 0.10
-                and answer_shape_score >= 0.45
-                and (semantic >= 0.24 or fts_support)
-            )
-        )
-    elif answer_type == REQ_INTERFACE_LOCATIONS:
-        credible = bool(
-            strong_exact
-            or title_support
-            or facet_coverage >= 0.50
-            or (
-                answer_shape_score >= 0.90
-                and (lexical_overlap >= 0.055 or semantic >= 0.46 or fts_support)
-            )
-        )
-    elif answer_type == REQ_STATE_SEQUENCE:
-        credible = bool(
-            strong_exact
-            or title_support
-            or facet_coverage >= 0.50
-            or (
-                answer_shape_score >= 0.90
-                and (lexical_overlap >= 0.045 or semantic >= 0.44 or fts_support)
-            )
-        )
-    elif answer_type in {REQ_ORDERED_ACTIONS, REQ_CHECKLIST, REQ_SAFETY_CONDITIONS}:
-        credible = bool(
-            strong_exact
-            or title_support
-            or facet_coverage >= 0.50
-            or (
-                answer_shape_score >= 0.70
-                and (lexical_overlap >= 0.055 or semantic >= 0.45 or fts_support)
-            )
-        )
-    else:
-        credible = bool(
-            strong_exact
-            or title_support
-            or facet_coverage >= 0.50
-            or lexical_overlap >= 0.10
-            or (semantic >= 0.42 and lexical_overlap >= 0.025)
-            or (semantic >= 0.54 and answer_shape_score >= 0.50)
-            or fts_support
-        )
-    threshold = float(ASSISTANT_CORE_FACET_SUPPORT_THRESHOLD)
-    credible = credible and score >= threshold
-    return {
-        "credible": bool(credible),
-        "score": round(score, 6),
-        "semantic": round(semantic, 6),
-        "lexical_overlap": round(lexical_overlap, 6),
-        "facet_coverage": round(facet_coverage, 6),
-        "answer_shape_score": round(answer_shape_score, 6),
-        "exact_hits": normalized_exact_hits[:8],
-        "title_support": bool(title_support),
-        "fts_support": bool(fts_support),
-        "source_preferred": bool(source_preferred),
-    }
 
 
 def _assistant_core_refine_retrieval(
@@ -16422,38 +15723,16 @@ def _assistant_core_required_facet_metrics(text: str, facets: list[str] | tuple[
     only verifies that the admitted evidence/answer still contains the concepts the
     router declared mandatory; it never invents missing facets.
     """
-    normalized_text = re.sub(
-        r"\s+", " ", _normalize_unicode_advanced(str(text or "")).lower()
-    ).strip()
-    clean_facets = _dedup_text_values(list(facets or []), limit=12)
-    if not normalized_text or not clean_facets:
-        return {"coverage": 0.0, "covered": [], "missing": clean_facets}
-
-    text_terms = _content_term_set(normalized_text, limit=260)
-    covered: list[str] = []
-    missing: list[str] = []
-    for facet in clean_facets:
-        normalized_facet = re.sub(
-            r"\s+", " ", _normalize_unicode_advanced(str(facet or "")).lower()
-        ).strip()
-        facet_terms = _content_term_set(normalized_facet, limit=30)
-        phrase_hit = bool(normalized_facet and normalized_facet in normalized_text)
-        if phrase_hit:
-            covered.append(facet)
-            continue
-        if not facet_terms:
-            missing.append(facet)
-            continue
-        overlap = len(facet_terms & text_terms) / max(1, len(facet_terms))
-        if overlap >= 0.50 or (len(facet_terms) == 1 and overlap >= 1.0):
-            covered.append(facet)
-        else:
-            missing.append(facet)
-    return {
-        "coverage": len(covered) / max(1, len(clean_facets)),
-        "covered": covered,
-        "missing": missing,
-    }
+    return _retrieval_candidate_assessment.assistant_core_required_facet_metrics(
+        text,
+        facets,
+        runtime=_retrieval_candidate_assessment.AssistantCoreRequiredFacetMetricsRuntime(
+            _content_term_set=_content_term_set,
+            _dedup_text_values=_dedup_text_values,
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+            re=re,
+        ),
+    )
 
 
 def _assistant_core_numeric_signal(text: str) -> dict:
@@ -16553,52 +15832,17 @@ def _assistant_core_diagnostic_priority_metrics(
     decision: AssistantCoreDecision,
 ) -> dict:
     """Score explicit user clues without hardcoding a machine or vocabulary."""
-    text = _v13_candidate_text(candidate)
-    tag_text = " ".join(
-        str(x or "").strip()
-        for x in (candidate.get("assistant_core_facet_hits") or [])
-        if str(x or "").strip()
+    return _retrieval_candidate_assessment.assistant_core_diagnostic_priority_metrics(
+        candidate,
+        decision,
+        runtime=_retrieval_candidate_assessment.AssistantCoreDiagnosticPriorityMetricsRuntime(
+            _assistant_core_candidate_source_type=_assistant_core_candidate_source_type,
+            _assistant_core_ps_is_substantive=_assistant_core_ps_is_substantive,
+            _assistant_core_required_facet_metrics=_assistant_core_required_facet_metrics,
+            _dedup_text_values=_dedup_text_values,
+            _v13_candidate_text=_v13_candidate_text,
+        ),
     )
-    combined = f"{text}\n{tag_text}".strip()
-    groups = [
-        ("discriminants", tuple(decision.diagnostic_discriminants), 0.40),
-        ("operating_conditions", tuple(decision.diagnostic_operating_conditions), 0.24),
-        ("observables", tuple(decision.diagnostic_observables), 0.22),
-        ("subsystems", tuple(decision.diagnostic_subsystems), 0.14),
-    ]
-    covered: list[str] = []
-    missing: list[str] = []
-    weighted = 0.0
-    active_weight = 0.0
-    group_scores: dict[str, float] = {}
-    for name, values, weight in groups:
-        if not values:
-            continue
-        metrics = _assistant_core_required_facet_metrics(combined, values)
-        coverage = float(metrics.get("coverage") or 0.0)
-        group_scores[name] = coverage
-        weighted += weight * coverage
-        active_weight += weight
-        covered.extend(metrics.get("covered") or [])
-        missing.extend(metrics.get("missing") or [])
-    score = weighted / active_weight if active_weight > 0.0 else 0.0
-    source_type = _assistant_core_candidate_source_type(candidate)
-    exact_case_bonus = 0.0
-    if source_type == "ps" and _assistant_core_ps_is_substantive(candidate):
-        # A P&S is privileged only when it matches a high-value observation, not
-        # simply because it belongs to the same machine.
-        if group_scores.get("discriminants", 0.0) >= 0.34:
-            exact_case_bonus = 0.20
-        elif group_scores.get("observables", 0.0) >= 0.34 and group_scores.get("subsystems", 0.0) > 0.0:
-            exact_case_bonus = 0.12
-    return {
-        "score": min(1.0, score + exact_case_bonus),
-        "base_score": score,
-        "exact_case_bonus": exact_case_bonus,
-        "covered": _dedup_text_values(covered, limit=16),
-        "missing": _dedup_text_values(missing, limit=16),
-        "groups": group_scores,
-    }
 
 
 def _assistant_core_root_candidate_viable(
@@ -16606,150 +15850,35 @@ def _assistant_core_root_candidate_viable(
     decision: AssistantCoreDecision,
     candidate: dict,
 ) -> bool:
-    if bool(candidate.get("hard_excluded")):
-        return False
-    if not _assistant_core_ps_is_substantive(candidate):
-        return False
-
-    text = _v13_candidate_text(candidate)
-    core_facets = [
-        item.facet for item in (decision.facet_queries or ())
-        if bool(item.must_cover) and str(item.facet or "").strip()
-    ] or list(decision.required_facets)
-    facets = _assistant_core_candidate_facet_metrics(candidate, core_facets)
-    facet_coverage = float(facets.get("coverage") or 0.0)
-    router_selected = bool(candidate.get("assistant_core_router_id_bonus"))
-    semantic = float(
-        candidate.get("semantic_similarity", candidate.get("gate_similarity", candidate.get("similarity", 0.0)))
-        or 0.0
+    return _retrieval_candidate_assessment.assistant_core_root_candidate_viable(
+        request,
+        decision,
+        candidate,
+        runtime=_retrieval_candidate_assessment.AssistantCoreRootCandidateViableRuntime(
+            _assistant_core_candidate_facet_metrics=_assistant_core_candidate_facet_metrics,
+            _assistant_core_candidate_source_type=_assistant_core_candidate_source_type,
+            _assistant_core_diagnostic_priority_metrics=_assistant_core_diagnostic_priority_metrics,
+            _assistant_core_ps_is_substantive=_assistant_core_ps_is_substantive,
+            _assistant_core_retrieval_query=_assistant_core_retrieval_query,
+            _root_cause_target_subsystems=_root_cause_target_subsystems,
+            _v13_candidate_text=_v13_candidate_text,
+        ),
     )
-    causal = float(candidate.get("causal_strength_score") or 0.0)
-    subsystem = float(candidate.get("subsystem_score") or 0.0)
-    context_fit = float(candidate.get("context_fit_score") or 0.0)
-    diag = dict(candidate.get("assistant_core_diagnostic_priority") or {})
-    if not diag:
-        diag = _assistant_core_diagnostic_priority_metrics(candidate, decision)
-    diagnostic_priority = float(diag.get("score") or 0.0)
-    source_type = _assistant_core_candidate_source_type(candidate)
-    exact_documented_case = bool(
-        source_type == "ps"
-        and bool(diag.get("exact_case_bonus"))
-        and (
-            causal >= 0.02
-            or context_fit > 0.0
-            or subsystem > 0.0
-            or semantic >= 0.30
-            or facet_coverage >= 0.40
-        )
-    )
-    if exact_documented_case:
-        return True
-
-    # A diagnostic source must preserve at least one real clue/facet from the
-    # semantic contract.  Request-level similarity plus a generic word such as
-    # "manual" is not enough to turn a nearby maintenance page into causal
-    # evidence.  Strong cross-language semantic evidence remains admissible when
-    # it is also corroborated by a causal/subsystem/context signal.
-    diagnostic_contract_present = bool(decision.diagnostic_clues or core_facets)
-    diagnostic_group_support = max(
-        [float(value or 0.0) for value in (diag.get("groups") or {}).values()] or [0.0]
-    )
-    strongly_corroborated_crosslingual = bool(
-        semantic >= 0.60
-        and causal >= 0.12
-        and (subsystem > 0.0 or context_fit > 0.0)
-    )
-    query_subsystems = set(_root_cause_target_subsystems(_assistant_core_retrieval_query(request), []))
-    candidate_subsystems = {
-        str(value or "").strip()
-        for value in (candidate.get("matched_subsystems") or [])
-        if str(value or "").strip()
-    }
-    subsystem_mismatch = bool(
-        query_subsystems
-        and candidate_subsystems
-        and not (query_subsystems & candidate_subsystems)
-    )
-    # A candidate from a known but different subsystem is not causal evidence
-    # merely because it is semantically nearby.  Apply the same mismatch guard to
-    # every identified subsystem; strong cross-language corroboration remains the
-    # only bounded exception.
-    if subsystem_mismatch and not strongly_corroborated_crosslingual:
-        return False
-    if (
-        diagnostic_contract_present
-        and facet_coverage < 0.50
-        and not strongly_corroborated_crosslingual
-        and (
-            (
-                diagnostic_priority <= 0.0
-                and diagnostic_group_support <= 0.0
-            )
-            or (
-                subsystem_mismatch
-                and diagnostic_priority < 0.35
-            )
-        )
-    ):
-        return False
-    if (
-        diagnostic_priority >= 0.28
-        and (causal >= 0.02 or subsystem > 0.0 or context_fit > 0.0 or semantic >= 0.40)
-    ):
-        return True
-    if (
-        router_selected
-        and causal >= 0.02
-        and (
-            facet_coverage >= 0.20
-            or diagnostic_priority >= 0.20
-            or subsystem > 0.0
-            or context_fit > 0.0
-        )
-    ):
-        return True
-    if (facet_coverage >= 0.25 or diagnostic_priority >= 0.24) and (
-        causal >= 0.02 or subsystem > 0.0 or context_fit > 0.0
-    ):
-        return True
-    if semantic >= 0.46 and causal >= 0.08 and (subsystem > 0.0 or context_fit > 0.0):
-        return True
-    return False
 
 
 def _assistant_core_candidate_facet_metrics(
     candidate: dict,
     facets: tuple[str, ...] | list[str],
 ) -> dict:
-    clean_facets = _dedup_text_values(list(facets or []), limit=12)
-    text_metrics = _assistant_core_required_facet_metrics(
-        _v13_candidate_text(candidate), clean_facets
+    return _retrieval_candidate_assessment.assistant_core_candidate_facet_metrics(
+        candidate,
+        facets,
+        runtime=_retrieval_candidate_assessment.AssistantCoreCandidateFacetMetricsRuntime(
+            _assistant_core_required_facet_metrics=_assistant_core_required_facet_metrics,
+            _dedup_text_values=_dedup_text_values,
+            _v13_candidate_text=_v13_candidate_text,
+        ),
     )
-    tagged = {
-        str(x or "").strip().casefold(): str(x or "").strip()
-        for x in (candidate.get("assistant_core_facet_hits") or [])
-        if str(x or "").strip()
-    }
-    covered: list[str] = []
-    missing: list[str] = []
-    text_covered_keys = {
-        str(x or "").strip().casefold()
-        for x in (text_metrics.get("covered") or [])
-        if str(x or "").strip()
-    }
-    for facet in clean_facets:
-        key = facet.casefold()
-        if key in tagged or key in text_covered_keys:
-            covered.append(facet)
-        else:
-            missing.append(facet)
-    return {
-        "coverage": len(covered) / max(1, len(clean_facets)) if clean_facets else 0.0,
-        "covered": covered,
-        "missing": missing,
-        "tagged": [tagged[k] for k in sorted(tagged)],
-        "text_coverage": float(text_metrics.get("coverage") or 0.0),
-    }
 
 
 def _assistant_core_facet_balanced_pool(
@@ -16759,49 +15888,15 @@ def _assistant_core_facet_balanced_pool(
     limit: int,
 ) -> list[dict]:
     """Keep one strong source per mandatory facet before filling by global rank."""
-    facets = _dedup_text_values(list(facets or []), limit=12)
-    if not candidates or not facets:
-        return list(candidates or [])[:limit]
-
-    selected: list[dict] = []
-    seen: set[str] = set()
-    for facet in facets:
-        facet_key = facet.casefold()
-        best = None
-        for candidate in candidates:
-            hits = {
-                str(x or "").strip().casefold()
-                for x in (candidate.get("assistant_core_facet_hits") or [])
-                if str(x or "").strip()
-            }
-            covered = {
-                str(x or "").strip().casefold()
-                for x in (candidate.get("assistant_core_covered_facets") or [])
-                if str(x or "").strip()
-            }
-            if facet_key not in hits and facet_key not in covered:
-                continue
-            best = candidate
-            break
-        if best is None:
-            continue
-        key = _assistant_core_candidate_stable_key(best)
-        if key in seen:
-            continue
-        seen.add(key)
-        selected.append(best)
-        if len(selected) >= limit:
-            return selected
-
-    for candidate in candidates:
-        key = _assistant_core_candidate_stable_key(candidate)
-        if key in seen:
-            continue
-        seen.add(key)
-        selected.append(candidate)
-        if len(selected) >= limit:
-            break
-    return selected
+    return _retrieval_candidate_assessment.assistant_core_facet_balanced_pool(
+        candidates,
+        facets,
+        limit=limit,
+        runtime=_retrieval_candidate_assessment.AssistantCoreFacetBalancedPoolRuntime(
+            _assistant_core_candidate_stable_key=_assistant_core_candidate_stable_key,
+            _dedup_text_values=_dedup_text_values,
+        ),
+    )
 
 
 
@@ -17154,28 +16249,13 @@ def _assistant_core_machine_overview_schema() -> dict:
 
 def _assistant_core_overview_candidate_score(candidate: dict) -> float:
     """Stable ordering score for source records used by the overview builder."""
-    score = float(
-        candidate.get(
-            "v13_score",
-            candidate.get("retrieval_score", candidate.get("similarity", 0.0)),
-        )
-        or 0.0
+    return _retrieval_candidate_assessment.assistant_core_overview_candidate_score(
+        candidate,
+        runtime=_retrieval_candidate_assessment.AssistantCoreOverviewCandidateScoreRuntime(
+            _assistant_core_candidate_evidence_text=_assistant_core_candidate_evidence_text,
+            re=re,
+        ),
     )
-    text = _assistant_core_candidate_evidence_text(candidate)
-    if len(text) >= 240:
-        score += 1.5
-    if bool(candidate.get("assistant_core_section_expansion")):
-        score += 1.5
-    if str(candidate.get("retrieval_assurance_kind") or "").strip():
-        score += 1.0
-    # Table-of-contents fragments and title pages remain available as support but
-    # rank below narrative technical pages when scores are otherwise similar.
-    digit_ratio = sum(ch.isdigit() for ch in text) / max(1, len(text))
-    if digit_ratio > 0.12:
-        score -= 2.5
-    if len(re.findall(r"(?m)^\s*\d{1,3}\s*$", text)) >= 4:
-        score -= 2.0
-    return score
 
 
 def _assistant_core_overview_clean_source_description(
