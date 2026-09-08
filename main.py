@@ -144,6 +144,8 @@ from machinemind.ingest import metering as _ingest_metering
 from machinemind.ingest import orchestration as _ingest_orchestration
 from machinemind.retrieval import dense as _retrieval_dense
 from machinemind.retrieval import structured as _retrieval_structured
+from machinemind.retrieval import source_priority as _retrieval_source_priority
+from machinemind.retrieval import procedure_families as _retrieval_procedure_families
 from machinemind.retrieval import query_planning as _retrieval_query_planning
 from machinemind.retrieval import candidate_assessment as _retrieval_candidate_assessment
 from machinemind.retrieval import retrieval_policy as _retrieval_policy
@@ -5442,160 +5444,65 @@ def _v12_curate_response_items_for_ui(items: list[dict], *, max_items: int) -> l
 
 
 def _v12_code_keys(value: str) -> set[str]:
-    raw = _normalize_unicode_advanced(str(value or "")).upper()
-    out: set[str] = set()
-    pattern = (
-        r"\b[A-Z]{1,12}[A-Z0-9]*(?:[-_/.][A-Z0-9]{1,16})+\b"
-        r"|\b[A-Z]{2,12}[-_ ]?\d{1,8}[A-Z0-9.,/_-]*\b"
+    return _retrieval_procedure_families.v12_code_keys(
+        value,
+        runtime=_retrieval_procedure_families.V12CodeKeysRuntime(
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+            re=re,
+        ),
     )
-    for token in re.findall(pattern, raw):
-        key = re.sub(r"[^A-Z0-9]", "", token)
-        if len(key) >= 4 and any(ch.isdigit() for ch in key):
-            out.add(key)
-    return out
 
 
 def _v12_identity_tokens(value: str) -> set[str]:
-    text = _normalize_unicode_advanced(str(value or "")).lower()
-    stop = _ask_structured_direct_stopwords() | {
-        "procedure", "procedura", "step", "passaggio", "fase", "title", "titolo",
-        "description", "descrizione", "source", "type", "tipo", "codice", "code",
-    }
-    return {
-        tok for tok in re.findall(r"[a-zà-öø-ÿ0-9]{3,}", text)
-        if tok not in stop
-    }
+    return _retrieval_procedure_families.v12_identity_tokens(
+        value,
+        runtime=_retrieval_procedure_families.V12IdentityTokensRuntime(
+            _ask_structured_direct_stopwords=_ask_structured_direct_stopwords,
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+            re=re,
+        ),
+    )
 
 
 def _v12_structured_parent_values(c: dict) -> list[str]:
     """Read an explicit parent relation, including legacy DESCRIPTION prefixes."""
-    raw = str((c or {}).get("chunk_full") or (c or {}).get("snippet") or "")
-    fields = _parse_structured_source_fields(raw)
-    complete_parser = globals().get("_procedure_ui_fields")
-    if callable(complete_parser):
-        try:
-            fields.update(complete_parser(c) or {})
-        except Exception:
-            pass
-
-    keys = (
-        "parent_source_key",
-        "procedure", "procedura", "parent_procedure", "parent_procedura",
-        "parent_procedure_id", "procedure_id", "procedura_id",
-        "parent_procedure_code", "procedure_code", "codice_procedura",
-        "parent_procedure_title", "procedure_title", "titolo_procedura",
-        "related_procedure", "procedura_collegata",
+    return _retrieval_procedure_families.v12_structured_parent_values(
+        c,
+        runtime=_retrieval_procedure_families.V12StructuredParentValuesRuntime(
+            resolve_procedure_fields=lambda: globals().get("_procedure_ui_fields"),
+            _clean_display_text=_clean_display_text,
+            _normalize_structured_source_key=_normalize_structured_source_key,
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+            _parse_structured_source_fields=_parse_structured_source_fields,
+            re=re,
+        ),
     )
-    vals: list[str] = []
-    seen: set[str] = set()
-
-    def add(value: Any) -> None:
-        clean = _clean_display_text(value or "", max_len=320)
-        norm = re.sub(r"\s+", " ", _normalize_unicode_advanced(clean).lower()).strip()
-        if norm and norm not in seen:
-            seen.add(norm)
-            vals.append(clean)
-
-    for key in keys:
-        add(fields.get(key))
-
-    parent_id = str(
-        fields.get("parent_procedure_id")
-        or fields.get("procedure_id")
-        or fields.get("procedura_id")
-        or ""
-    ).strip()
-    if parent_id:
-        add(parent_id)
-        add(_normalize_structured_source_key("procedure", parent_id))
-
-    # New canonical fields, if present in the raw source.
-    for match in re.finditer(
-        r"(?im)^\s*(?:PARENT_SOURCE_KEY|PARENT_PROCEDURE_ID|PARENT_PROCEDURE_CODE|"
-        r"PARENT_PROCEDURE_TITLE|PROCEDURE_ID|PROCEDURE_CODE)\s*:\s*([^\n]+)",
-        raw,
-    ):
-        add(match.group(1))
-
-    # Legacy indexed Steps already contain:
-    # DESCRIPTION: PROCEDURA: PROC-002 — <title>
-    # This recovery path is language-neutral at the code level and supports IT/EN labels.
-    for match in re.finditer(
-        r"(?im)^\s*(?:DESCRIPTION\s*:\s*)?(?:PROCEDURA|PROCEDURE)\s*:\s*([^\n]+)",
-        raw,
-    ):
-        add(match.group(1))
-
-    description = str(fields.get("description") or "")
-    for match in re.finditer(
-        r"(?i)\b(?:PROCEDURA|PROCEDURE)\s*:\s*([A-Z]{2,12}[-_]?\d{1,8}[A-Z0-9._/-]*)",
-        description,
-    ):
-        add(match.group(1))
-
-    return vals
 
 
 def _v12_procedure_identity_text(c: dict) -> str:
-    raw = str((c or {}).get("chunk_full") or (c or {}).get("snippet") or "")
-    fields = _parse_structured_source_fields(raw)
-    complete_parser = globals().get("_procedure_ui_fields")
-    if callable(complete_parser):
-        try:
-            fields.update(complete_parser(c) or {})
-        except Exception:
-            pass
-    parts = [
-        str(c.get("bubble_document_id") or ""),
-        raw,
-        fields.get("title") or "",
-        fields.get("short_description") or "",
-        fields.get("description") or "",
-        fields.get("procedure_code") or "",
-        fields.get("codice") or "",
-        fields.get("code") or "",
-    ]
-    return " ".join(str(x or "") for x in parts)
+    return _retrieval_procedure_families.v12_procedure_identity_text(
+        c,
+        runtime=_retrieval_procedure_families.V12ProcedureIdentityTextRuntime(
+            resolve_procedure_fields=lambda: globals().get("_procedure_ui_fields"),
+            _parse_structured_source_fields=_parse_structured_source_fields,
+        ),
+    )
 
 
 def _v12_step_matches_procedure(step: dict, procedure: dict) -> Optional[bool]:
     """True/False when the Step declares a parent; None when no parent is declared."""
-    parents = _v12_structured_parent_values(step)
-    if not parents:
-        return None
-
-    proc_bdid = str((procedure or {}).get("bubble_document_id") or "").strip()
-    proc_id = proc_bdid.split(":", 1)[1].strip() if proc_bdid.lower().startswith("procedure:") else proc_bdid
-    proc_text = _v12_procedure_identity_text(procedure)
-    proc_norm = re.sub(r"[^a-zà-öø-ÿ0-9]+", " ", _normalize_unicode_advanced(proc_text).lower()).strip()
-    proc_codes = _v12_code_keys(proc_text)
-    proc_tokens = _v12_identity_tokens(proc_text)
-
-    for parent in parents:
-        parent_raw = str(parent or "").strip()
-        parent_key = parent_raw if parent_raw.lower().startswith("procedure:") else ""
-        if parent_key and parent_key.lower() == proc_bdid.lower():
-            return True
-        if parent_raw and proc_id and parent_raw.lower() == proc_id.lower():
-            return True
-
-        parent_norm = re.sub(
-            r"[^a-zà-öø-ÿ0-9]+",
-            " ",
-            _normalize_unicode_advanced(parent_raw).lower(),
-        ).strip()
-        parent_codes = _v12_code_keys(parent_raw)
-        if parent_codes and proc_codes and (parent_codes & proc_codes):
-            return True
-        if len(parent_norm) >= 5 and parent_norm in proc_norm:
-            return True
-        parent_tokens = _v12_identity_tokens(parent_raw)
-        if parent_tokens and proc_tokens:
-            overlap = len(parent_tokens & proc_tokens)
-            ratio = overlap / max(1, min(len(parent_tokens), len(proc_tokens)))
-            if overlap >= 2 and ratio >= 0.50:
-                return True
-    return False
+    return _retrieval_procedure_families.v12_step_matches_procedure(
+        step,
+        procedure,
+        runtime=_retrieval_procedure_families.V12StepMatchesProcedureRuntime(
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+            _v12_code_keys=_v12_code_keys,
+            _v12_identity_tokens=_v12_identity_tokens,
+            _v12_procedure_identity_text=_v12_procedure_identity_text,
+            _v12_structured_parent_values=_v12_structured_parent_values,
+            re=re,
+        ),
+    )
 
 
 def _v12_structured_rank(c: dict, used_ids: set[str]) -> tuple:
@@ -5606,19 +5513,24 @@ def _v12_structured_rank(c: dict, used_ids: set[str]) -> tuple:
 
 
 def _v12_choose_primary_procedure(citations: list[dict], model_used: list[dict]) -> Optional[dict]:
-    procedures = [
-        c for c in citations or []
-        if isinstance(c, dict) and _v12_evidence_role(c) == "procedure"
-    ]
-    if not procedures:
-        return None
-    used_ids = {str(c.get("citation_id") or "") for c in model_used or [] if isinstance(c, dict)}
-    return sorted(procedures, key=lambda c: _v12_structured_rank(c, used_ids))[0]
+    return _retrieval_procedure_families.v12_choose_primary_procedure(
+        citations,
+        model_used,
+        runtime=_retrieval_procedure_families.V12ChoosePrimaryProcedureRuntime(
+            _v12_evidence_role=_v12_evidence_role,
+            _v12_structured_rank=_v12_structured_rank,
+        ),
+    )
 
 
 def _v12_step_sort_key(c: dict) -> tuple[int, str]:
-    raw = _ask_structured_field_value(c, "step_number", limit=20)
-    return (_safe_int(raw, 9999), str(c.get("bubble_document_id") or ""))
+    return _retrieval_procedure_families.v12_step_sort_key(
+        c,
+        runtime=_retrieval_procedure_families.V12StepSortKeyRuntime(
+            _ask_structured_field_value=_ask_structured_field_value,
+            _safe_int=_safe_int,
+        ),
+    )
 
 
 def _v12_expand_primary_procedure_steps(
@@ -5721,175 +5633,29 @@ def _v12_choose_primary_procedure_family(
     family that best covers the router facets and has the strongest admitted Step
     support wins; a Procedure title alone cannot outvote its own children.
     """
-    citations = [dict(c) for c in (citations or []) if isinstance(c, dict)]
-    model_used = [dict(c) for c in (model_used or []) if isinstance(c, dict)]
-    raw_procedures = [c for c in citations if _v12_evidence_role(c) == "procedure"]
-    raw_steps = [c for c in citations if _v12_evidence_role(c) == "step"]
-    if not raw_steps and not raw_procedures:
-        return None, [], {"reason": "no_procedure_or_step_sources"}
-
-    procedure_by_key: dict[str, dict] = {}
-    raw_procedure_keys: set[str] = set()
-    for procedure in raw_procedures:
-        key = str(procedure.get("bubble_document_id") or "").strip()
-        if not key:
-            continue
-        raw_procedure_keys.add(key)
-        current = procedure_by_key.get(key)
-        if current is None or _v12_structured_rank(procedure, set()) < _v12_structured_rank(current, set()):
-            procedure_by_key[key] = dict(procedure)
-
-    child_keys = _dedup_text_values(
-        [str(step.get("bubble_document_id") or "").strip() for step in raw_steps],
-        limit=500,
-    )
-    relation_rows = _db_fetch_parent_procedure_pages_for_steps(
+    return _retrieval_procedure_families.v12_choose_primary_procedure_family(
         company_id=company_id,
         machine_id=machine_id,
-        child_source_keys=child_keys,
-        text_chars=max(800, int(ASK_STRUCTURED_DIRECT_TEXT_CHARS or 5000)),
+        q=q,
+        planner=planner,
+        citations=citations,
+        model_used=model_used,
+        runtime=_retrieval_procedure_families.V12ChoosePrimaryProcedureFamilyRuntime(
+            ASK_STRUCTURED_DIRECT_TEXT_CHARS=ASK_STRUCTURED_DIRECT_TEXT_CHARS,
+            _db_fetch_parent_procedure_pages_for_steps=_db_fetch_parent_procedure_pages_for_steps,
+            _dedup_text_values=_dedup_text_values,
+            _safe_int=_safe_int,
+            _v12_dedupe_family_steps=_v12_dedupe_family_steps,
+            _v12_evidence_role=_v12_evidence_role,
+            _v12_expand_primary_procedure_steps=_v12_expand_primary_procedure_steps,
+            _v12_family_score=_v12_family_score,
+            _v12_relation_procedure_candidate=_v12_relation_procedure_candidate,
+            _v12_step_matches_procedure=_v12_step_matches_procedure,
+            _v12_step_sort_key=_v12_step_sort_key,
+            _v12_structured_parent_values=_v12_structured_parent_values,
+            _v12_structured_rank=_v12_structured_rank,
+        ),
     )
-    parent_by_child: dict[str, dict] = {}
-    children_by_parent: dict[str, list[dict]] = {}
-    for row in relation_rows:
-        child = str(row.get("child_source_key") or "").strip()
-        parent = str(row.get("parent_source_key") or "").strip()
-        if not child or not parent:
-            continue
-        parent_by_child[child] = dict(row)
-        fallback_title = ""
-        for step in raw_steps:
-            if str(step.get("bubble_document_id") or "").strip() != child:
-                continue
-            values = _v12_structured_parent_values(step)
-            if values:
-                fallback_title = str(values[0] or "")
-            break
-        if parent not in procedure_by_key:
-            procedure_by_key[parent] = _v12_relation_procedure_candidate(
-                parent_source_key=parent,
-                machine_id=str(row.get("machine_id") or machine_id),
-                page_number=_safe_int(row.get("page_number"), 1),
-                parent_text=str(row.get("parent_text") or ""),
-                fallback_title=fallback_title,
-            )
-        children_by_parent.setdefault(parent, [])
-
-    unresolved_steps: list[dict] = []
-    for step in raw_steps:
-        child = str(step.get("bubble_document_id") or "").strip()
-        relation = parent_by_child.get(child)
-        if relation:
-            parent = str(relation.get("parent_source_key") or "").strip()
-            cc = dict(step)
-            cc["_v10_5_parent_source_key"] = parent
-            if relation.get("ordinal") is not None:
-                cc["structured_relation_ordinal"] = _safe_int(relation.get("ordinal"), 0)
-            cc.setdefault("structured_relation_source", "structured_source_relations_seed")
-            children_by_parent.setdefault(parent, []).append(cc)
-        else:
-            unresolved_steps.append(dict(step))
-
-    # Compatibility for legacy data or a staged migration: assign a Step only when
-    # its indexed parent metadata identifies exactly one available Procedure.
-    for step in unresolved_steps:
-        matching = [
-            key for key, procedure in procedure_by_key.items()
-            if _v12_step_matches_procedure(step, procedure) is True
-        ]
-        if len(matching) == 1:
-            parent = matching[0]
-            cc = dict(step)
-            cc["_v10_5_parent_source_key"] = parent
-            cc.setdefault("structured_relation_source", "legacy_parent_text_seed")
-            children_by_parent.setdefault(parent, []).append(cc)
-
-    # Include Procedure-only families as low-priority fallbacks, but never let them
-    # beat a related Step family solely on semantic similarity.
-    for key in procedure_by_key:
-        children_by_parent.setdefault(key, [])
-
-    families: list[dict] = []
-    for parent_key, seed_steps in children_by_parent.items():
-        procedure = procedure_by_key.get(parent_key)
-        if not isinstance(procedure, dict):
-            continue
-        procedure = dict(procedure)
-        procedure["evidence_role"] = "procedure"
-        procedure["ask_structured_direct"] = True
-        complete_steps = _v12_expand_primary_procedure_steps(
-            company_id=company_id,
-            machine_id=machine_id,
-            procedure=procedure,
-            existing_steps=list(raw_steps),
-        )
-        complete_steps = _v12_dedupe_family_steps(list(complete_steps) + list(seed_steps))
-        if not complete_steps and seed_steps:
-            complete_steps = _v12_dedupe_family_steps(seed_steps)
-        metrics = _v12_family_score(
-            q=q,
-            planner=planner,
-            procedure=procedure,
-            seed_steps=seed_steps,
-            complete_steps=complete_steps,
-            raw_procedure_present=parent_key in raw_procedure_keys,
-        )
-        families.append(
-            {
-                "parent_source_key": parent_key,
-                "procedure": procedure,
-                "seed_steps": list(seed_steps),
-                "complete_steps": complete_steps,
-                "metrics": metrics,
-            }
-        )
-
-    if not families:
-        return None, [], {
-            "reason": "no_resolved_procedure_family",
-            "raw_step_count": len(raw_steps),
-            "relation_row_count": len(relation_rows),
-        }
-
-    families.sort(
-        key=lambda row: (
-            -float((row.get("metrics") or {}).get("score") or 0.0),
-            -float((row.get("metrics") or {}).get("facet_coverage") or 0.0),
-            -float((row.get("metrics") or {}).get("seed_facet_coverage") or 0.0),
-            -int((row.get("metrics") or {}).get("seed_count") or 0),
-            str(row.get("parent_source_key") or ""),
-        )
-    )
-    winner = families[0]
-    runner_up_score = float((families[1].get("metrics") or {}).get("score") or 0.0) if len(families) > 1 else None
-    winner_score = float((winner.get("metrics") or {}).get("score") or 0.0)
-    debug = {
-        "reason": "family_voting",
-        "selected_parent_source_key": str(winner.get("parent_source_key") or ""),
-        "selected_score": round(winner_score, 6),
-        "runner_up_score": round(runner_up_score, 6) if runner_up_score is not None else None,
-        "relation_row_count": len(relation_rows),
-        "families": [
-            {
-                "parent_source_key": str(row.get("parent_source_key") or ""),
-                **{
-                    key: value
-                    for key, value in dict(row.get("metrics") or {}).items()
-                    if key not in {"covered_facets", "missing_facets"}
-                },
-                "covered_facets": list((row.get("metrics") or {}).get("covered_facets") or []),
-                "step_numbers": [
-                    _v12_step_sort_key(step)[0]
-                    for step in (row.get("complete_steps") or [])
-                    if 0 < _v12_step_sort_key(step)[0] < 9999
-                ],
-            }
-            for row in families[:6]
-        ],
-    }
-    procedure = dict(winner.get("procedure") or {})
-    procedure["_v10_5_family_debug"] = debug
-    return procedure, list(winner.get("complete_steps") or []), debug
 
 
 def _v12_curate_structured_sources(
@@ -5902,121 +5668,47 @@ def _v12_curate_structured_sources(
     model_used: Optional[list[dict]] = None,
 ) -> list[dict]:
     """Keep one coherent procedure family and remove unrelated P&S/steps."""
-    citations = [dict(c) for c in citations or [] if isinstance(c, dict)]
-    if not citations:
-        return []
-    intent = _ask_structured_direct_intent(q, planner=planner)
-    planner_task = str((planner or {}).get("information_task") or "").strip().lower()
-    operational = bool(
-        planner_task in {INFO_PROCEDURE_FULL, INFO_PROCEDURE_SEGMENT}
-        or (
-            intent.get("enabled")
-            and not intent.get("broad_overview")
-            and any(p in {"procedure", "step"} for p in (intent.get("prefixes") or []))
-        )
-    )
-    model_used = [dict(c) for c in model_used or [] if isinstance(c, dict)]
-    if not operational:
-        # Before synthesis model_used is empty and the full admitted pack is preserved.
-        # After synthesis, non-procedural links must follow the sources the model
-        # actually cited; free UI slots are not a reason to expose nearby media/P&S.
-        if bool(intent.get("broad_overview")) or not model_used:
-            return citations
-        used_ids = {str(c.get("citation_id") or "").strip() for c in model_used}
-        kept = [
-            c for c in citations
-            if str(c.get("citation_id") or "").strip() in used_ids
-        ]
-        return kept or citations[:1]
-
-    primary, expanded_steps, family_debug = _v12_choose_primary_procedure_family(
+    return _retrieval_procedure_families.v12_curate_structured_sources(
         company_id=company_id,
         machine_id=machine_id,
         q=q,
         planner=planner,
         citations=citations,
         model_used=model_used,
+        runtime=_retrieval_procedure_families.V12CurateStructuredSourcesRuntime(
+            ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_MAX_ITEMS=ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_MAX_ITEMS,
+            ASK_UI_STRUCTURED_MAX_CITATIONS=ASK_UI_STRUCTURED_MAX_CITATIONS,
+            INFO_PROCEDURE_FULL=INFO_PROCEDURE_FULL,
+            INFO_PROCEDURE_SEGMENT=INFO_PROCEDURE_SEGMENT,
+            _ask_structured_direct_intent=_ask_structured_direct_intent,
+            _dedup_citations_preserve_order=_dedup_citations_preserve_order,
+            _v12_choose_primary_procedure_family=_v12_choose_primary_procedure_family,
+            _v12_evidence_role=_v12_evidence_role,
+            _v12_step_matches_procedure=_v12_step_matches_procedure,
+            _v12_step_sort_key=_v12_step_sort_key,
+            _v12_structured_rank=_v12_structured_rank,
+        ),
     )
-    if primary is None:
-        used_ids = {str(c.get("citation_id") or "") for c in model_used}
-        if used_ids:
-            kept = [c for c in citations if str(c.get("citation_id") or "") in used_ids]
-            return kept or citations
-        # Do not manufacture INCOMPLETE_PROCEDURE_BUNDLE here. Returning the
-        # admitted evidence lets the caller fall back to a grounded multi-source
-        # procedural synthesis when no single family is objectively dominant.
-        return citations
-
-    primary = dict(primary)
-    primary["evidence_role"] = "procedure"
-    primary["ask_structured_direct"] = True
-    primary["_v10_5_family_debug"] = dict(family_debug or {})
-
-    existing_steps = [c for c in citations if _v12_evidence_role(c) == "step"]
-    used_ids = {str(c.get("citation_id") or "") for c in model_used}
-    for c in existing_steps:
-        relation = _v12_step_matches_procedure(c, primary)
-        if relation is None and str(c.get("citation_id") or "") in used_ids:
-            cc = dict(c)
-            cc["evidence_role"] = "step"
-            expanded_steps.append(cc)
-
-    best_steps: dict[str, dict] = {}
-    for c in expanded_steps:
-        bdid = str(c.get("bubble_document_id") or "").strip()
-        if not bdid:
-            continue
-        cc = dict(c)
-        cc["evidence_role"] = "step"
-        cc["ask_structured_direct"] = True
-        prev = best_steps.get(bdid)
-        if prev is None or _v12_structured_rank(cc, used_ids) < _v12_structured_rank(prev, used_ids):
-            best_steps[bdid] = cc
-    steps = sorted(best_steps.values(), key=_v12_step_sort_key)
-
-    # Keep non-procedure records only when the answer model explicitly used them.
-    extras: list[dict] = []
-    for c in model_used:
-        role = _v12_evidence_role(c)
-        if role in {"ps", "md_photo", "md_video"}:
-            cc = dict(c)
-            cc["evidence_role"] = role
-            extras.append(cc)
-
-    max_structured = max(12, int(ASK_UI_STRUCTURED_MAX_CITATIONS or 14) - max(1, int(ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_MAX_ITEMS or 2)))
-    return _dedup_citations_preserve_order([primary] + steps + extras, max_items=max_structured)
 
 
 def _v12_mark_manual_support(citations: list[dict]) -> list[dict]:
-    out: list[dict] = []
-    for c in citations or []:
-        if not isinstance(c, dict):
-            continue
-        cc = dict(c)
-        cc["ask_structured_manual_support"] = True
-        cc["evidence_role"] = "manual_support"
-        out.append(cc)
-    return out
+    return _retrieval_procedure_families.v12_mark_manual_support(
+        citations,
+        runtime=_retrieval_procedure_families.V12MarkManualSupportRuntime(
+        ),
+    )
 
 
 def _v12_filter_linkable_manual_support(company_id: str, citations: list[dict]) -> list[dict]:
     """A manual claim may be shown only when Bubble can expose its source link."""
-    citations = [dict(c) for c in (citations or []) if isinstance(c, dict)]
-    doc_ids = _dedup_text_values(
-        [str(c.get("bubble_document_id") or "").strip() for c in citations],
-        limit=100,
+    return _retrieval_procedure_families.v12_filter_linkable_manual_support(
+        company_id,
+        citations,
+        runtime=_retrieval_procedure_families.V12FilterLinkableManualSupportRuntime(
+            _dedup_text_values=_dedup_text_values,
+            _fetch_document_file_map=_fetch_document_file_map,
+        ),
     )
-    if not doc_ids:
-        return []
-    try:
-        file_map = _fetch_document_file_map(company_id, doc_ids)
-    except Exception as exc:
-        print("ASK_V12_MANUAL_LINK_PREFLIGHT_FAIL", str(exc)[:500])
-        return []
-    return [
-        c for c in citations
-        if str(file_map.get(str(c.get("bubble_document_id") or "").strip()) or "").strip()
-    ]
 
 
 def _v12_filter_manual_support_to_selected_bundle(
@@ -6032,74 +5724,27 @@ def _v12_filter_manual_support_to_selected_bundle(
     deterministic guard removes pages that supported an earlier setup Step but no
     longer support the final answer. It changes neither retrieval nor embeddings.
     """
-    manual_rows = [dict(c) for c in (manual_support_citations or []) if isinstance(c, dict)]
-    if not manual_rows:
-        return []
-
-    operational_texts: list[str] = []
-    all_selected_texts: list[str] = []
-    for citation in structured_citations or []:
-        if not isinstance(citation, dict):
-            continue
-        role = _v12_evidence_role(citation)
-        if role not in {"procedure", "step"}:
-            continue
-        fields = _procedure_ui_fields(citation)
-        text = " ".join(
-            [
-                str(fields.get("title") or ""),
-                str(fields.get("short_description") or fields.get("description") or ""),
-            ]
-        ).strip()
-        if not text:
-            continue
-        all_selected_texts.append(text)
-        if role == "step" and not _procedure_ui_is_safety_setup(text):
-            operational_texts.append(text)
-
-    query_terms = _content_term_set(q, limit=80)
-    operational_terms = _content_term_set(" ".join(operational_texts), limit=220)
-    all_selected_terms = _content_term_set(" ".join(all_selected_texts), limit=260)
-
-    kept: list[dict] = []
-    for citation in manual_rows:
-        manual_text = str(citation.get("chunk_full") or citation.get("snippet") or "")
-        manual_terms = _content_term_set(manual_text, limit=260)
-        if not manual_terms:
-            continue
-        kind = str(citation.get("ask_manual_support_kind") or "operation").strip().lower()
-        selected_terms = all_selected_terms if kind == "safety" else operational_terms
-        shared_query = query_terms & manual_terms
-        shared_selected = selected_terms & manual_terms
-        strong_shared = {term for term in shared_selected if len(term) >= 8}
-        query_overlap = _term_overlap_score(query_terms, manual_terms) if query_terms else 0.0
-        selected_overlap = _term_overlap_score(selected_terms, manual_terms) if selected_terms else 0.0
-
-        keep = bool(
-            query_overlap >= 0.045
-            or selected_overlap >= 0.045
-            or len(shared_query) >= 2
-            or len(shared_selected) >= 2
-            or strong_shared
-        )
-        if keep:
-            citation["selected_bundle_query_overlap"] = float(query_overlap)
-            citation["selected_bundle_step_overlap"] = float(selected_overlap)
-            kept.append(citation)
-    return kept
+    return _retrieval_procedure_families.v12_filter_manual_support_to_selected_bundle(
+        q=q,
+        structured_citations=structured_citations,
+        manual_support_citations=manual_support_citations,
+        runtime=_retrieval_procedure_families.V12FilterManualSupportToSelectedBundleRuntime(
+            _content_term_set=_content_term_set,
+            _procedure_ui_fields=_procedure_ui_fields,
+            _procedure_ui_is_safety_setup=_procedure_ui_is_safety_setup,
+            _term_overlap_score=_term_overlap_score,
+            _v12_evidence_role=_v12_evidence_role,
+        ),
+    )
 
 
 def _v12_mark_structured_roles(citations: list[dict]) -> list[dict]:
-    out: list[dict] = []
-    for c in citations or []:
-        if not isinstance(c, dict):
-            continue
-        cc = dict(c)
-        role = _v12_evidence_role(cc)
-        cc["evidence_role"] = role
-        cc["ask_structured_direct"] = True
-        out.append(cc)
-    return out
+    return _retrieval_procedure_families.v12_mark_structured_roles(
+        citations,
+        runtime=_retrieval_procedure_families.V12MarkStructuredRolesRuntime(
+            _v12_evidence_role=_v12_evidence_role,
+        ),
+    )
 
 
 def _procedure_ui_raw_text(citation: dict) -> str:
@@ -7447,73 +7092,52 @@ def _ask_full_context_sources_block(citations: list[dict], *, max_context_chars:
 # -----------------------------------------------------------------------------
 
 def _ask_regex_any(text: str, patterns: list[str]) -> bool:
-    t = _normalize_unicode_advanced(text or "").lower()
-    return any(re.search(p, t, flags=re.IGNORECASE) for p in (patterns or []))
+    return _retrieval_source_priority.ask_regex_any(
+        text,
+        patterns,
+        runtime=_retrieval_source_priority.AskRegexAnyRuntime(
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+            re=re,
+        ),
+    )
 
 
 def _ask_has_manual_mode_false_positive(q_low: str) -> bool:
     """True when manuale/manual means machine mode, not document source."""
-    patterns = [
-        r"\bmodalit[aà]\s+manuale\b",
-        r"\bmodo\s+manuale\b",
-        r"\bciclo\s+manuale\b",
-        r"\bcomando\s+manuale\b",
-        r"\bavanzamento\s+manuale\b",
-        r"\bripart(?:ire|enza)?\s+(?:prima\s+)?in\s+manuale\b",
-        r"\bfunzionamento\s+manuale\b",
-        r"\bmanual\s+mode\b",
-        r"\bmanual\s+operation\b",
-        r"\bmanual\s+cycle\b",
-        r"\bmanual\s+command\b",
-        r"\bmanual\s+feed\b",
-    ]
-    return _ask_regex_any(q_low, patterns)
+    return _retrieval_source_priority.ask_has_manual_mode_false_positive(
+        q_low,
+        runtime=_retrieval_source_priority.AskHasManualModeFalsePositiveRuntime(
+            _ask_regex_any=_ask_regex_any,
+        ),
+    )
 
 
 def _ask_has_explicit_xlsx_source_phrase(q_low: str) -> bool:
-    patterns = [
-        r"\b(?:nel|nello|nella|nell|dal|dallo|dalla|secondo|sul|sulla)\s+(?:file\s+)?(?:excel|xlsx|spreadsheet|workbook)\b",
-        r"\b(?:nel|nello|nella|nell|dal|dallo|dalla|secondo|sul|sulla)\s+(?:foglio\s+(?:excel|di\s+calcolo)|tabella\s+excel|cartella\s+excel)\b",
-        r"\b(?:file\s+excel|file\s+xlsx|excel\s+aziendale|xlsx\s+aziendale|foglio\s+di\s+calcolo|foglio\s+excel|tabella\s+excel)\b",
-        r"\b(?:in|from|according\s+to)\s+(?:the\s+)?(?:excel|xlsx|spreadsheet|workbook|worksheet)\b",
-        r"\b(?:excel|xlsx|spreadsheet|workbook|worksheet)\s+(?:file|document|source|table|sheet)\b",
-        r"\b(?:righe|row|rows|colonne|columns|sheet|sheets|fogli)\b.{0,60}\b(?:excel|xlsx|spreadsheet|workbook)\b",
-    ]
-    return _ask_regex_any(q_low, patterns)
+    return _retrieval_source_priority.ask_has_explicit_xlsx_source_phrase(
+        q_low,
+        runtime=_retrieval_source_priority.AskHasExplicitXlsxSourcePhraseRuntime(
+            _ask_regex_any=_ask_regex_any,
+        ),
+    )
 
 
 def _ask_has_explicit_manual_source_phrase(q_low: str) -> bool:
-    if _ask_has_manual_mode_false_positive(q_low):
-        # Still allow "nel manuale, cosa dice sulla modalità manuale?".
-        override = [
-            r"\b(?:nel|nello|nella|dal|dallo|dalla|secondo)\s+(?:il\s+|lo\s+|la\s+)?manuale\b",
-            r"\b(?:in|from|according\s+to)\s+(?:the\s+)?(?:machine\s+manual|technical\s+manual|user\s+manual|manual(?!\s+(?:mode|operation|cycle|feed|command)))\b",
-        ]
-        if not _ask_regex_any(q_low, override):
-            return False
-
-    patterns = [
-        r"\b(?:nel|nello|nella|dal|dallo|dalla|secondo)\s+(?:il\s+|lo\s+|la\s+)?(?:manuale|pdf|documento\s+pdf|documentazione\s+tecnica)\b",
-        r"\b(?:nel|nello|nella|dal|dallo|dalla|secondo)\s+(?:manuale\s+(?:macchina|tecnico|utente)|manuale\s+della\s+macchina)\b",
-        r"\b(?:cosa|che\s+cosa|quali|quanto|quando)\s+(?:dice|indica|riporta|prevede)\s+(?:il\s+)?(?:manuale|pdf|documento\s+pdf)\b",
-        r"\b(?:manuale\s+della\s+macchina|manuale\s+macchina|manuale\s+tecnico|manuale\s+utente|documentazione\s+tecnica)\b",
-        r"\b(?:in|from|according\s+to)\s+(?:the\s+)?(?:machine\s+manual|user\s+manual|technical\s+manual|technical\s+documentation|pdf|manual(?!\s+(?:mode|operation|cycle|feed|command)))\b",
-        r"\b(?:what|which|how|when)\s+(?:does|is|are)?\s*(?:the\s+)?(?:machine\s+manual|user\s+manual|technical\s+manual|pdf|manual(?!\s+(?:mode|operation|cycle|feed|command)))\s+(?:say|state|show|indicate)\b",
-    ]
-    return _ask_regex_any(q_low, patterns)
+    return _retrieval_source_priority.ask_has_explicit_manual_source_phrase(
+        q_low,
+        runtime=_retrieval_source_priority.AskHasExplicitManualSourcePhraseRuntime(
+            _ask_has_manual_mode_false_positive=_ask_has_manual_mode_false_positive,
+            _ask_regex_any=_ask_regex_any,
+        ),
+    )
 
 
 def _ask_has_hard_only_source_instruction(q_low: str) -> bool:
-    patterns = [
-        r"\bsolo\b", r"\bsoltanto\b", r"\besclusivamente\b", r"\bunicamente\b",
-        r"\bnon\s+considerare\s+(?:il\s+)?resto\b",
-        r"\bnon\s+usare\s+(?:altre|altri)\s+(?:fonti|documenti|contenuti)\b",
-        r"\bsenza\s+considerare\s+(?:altre|altri)\s+(?:fonti|documenti|contenuti)\b",
-        r"\bonly\b", r"\bexclusively\b", r"\bsolely\b",
-        r"\bdo\s+not\s+use\s+other\s+(?:sources|documents|content)\b",
-        r"\bwithout\s+using\s+other\s+(?:sources|documents|content)\b",
-    ]
-    return _ask_regex_any(q_low, patterns)
+    return _retrieval_source_priority.ask_has_hard_only_source_instruction(
+        q_low,
+        runtime=_retrieval_source_priority.AskHasHardOnlySourceInstructionRuntime(
+            _ask_regex_any=_ask_regex_any,
+        ),
+    )
 
 
 def _ask_source_preference_profile(q: str) -> dict:
@@ -7525,64 +7149,18 @@ def _ask_source_preference_profile(q: str) -> dict:
     - strength="hard": only when the user explicitly says only/exclusively/do not use others;
     - strength="none": no source preference.
     """
-    q_norm = re.sub(r"\s+", " ", _normalize_unicode_advanced(q or "")).strip()
-    q_low = q_norm.lower()
-
-    xlsx_pref = _ask_has_explicit_xlsx_source_phrase(q_low)
-    manual_pref = _ask_has_explicit_manual_source_phrase(q_low)
-
-    compare_patterns = [
-        r"\bconfronta(?:re)?\b", r"\bconfronto\b", r"\bdifferenz[ae]\b", r"\brispett[oa]\s+a\b",
-        r"\bcompare\b", r"\bcomparison\b", r"\bvs\b", r"\bversus\b",
-    ]
-    asks_comparison = bool(xlsx_pref and manual_pref and _ask_regex_any(q_low, compare_patterns))
-
-    # Contrast logic: "Il PDF dice X, ma nel file Excel qual è Y?" means Excel
-    # is the target source; the PDF is context/contrast, not the answer authority.
-    contrast_markers = [" ma ", " però ", " tuttavia ", " invece ", " but ", " however ", " whereas "]
-    tail = q_low
-    last_contrast = -1
-    for cm in contrast_markers:
-        idx = q_low.rfind(cm)
-        if idx > last_contrast:
-            last_contrast = idx
-            tail = q_low[idx + len(cm):]
-
-    tail_xlsx = _ask_has_explicit_xlsx_source_phrase(tail)
-    tail_manual = _ask_has_explicit_manual_source_phrase(tail)
-
-    preferred_source = None
-    reason = "no_explicit_source_preference"
-    if asks_comparison:
-        reason = "comparison_between_sources"
-    elif last_contrast >= 0 and tail_xlsx and not tail_manual:
-        preferred_source = "xlsx"
-        reason = "contrast_target_xlsx"
-    elif last_contrast >= 0 and tail_manual and not tail_xlsx:
-        preferred_source = "manual"
-        reason = "contrast_target_manual"
-    elif xlsx_pref and not manual_pref:
-        preferred_source = "xlsx"
-        reason = "explicit_xlsx_source_preference"
-    elif manual_pref and not xlsx_pref:
-        preferred_source = "manual"
-        reason = "explicit_manual_source_preference"
-    elif xlsx_pref and manual_pref:
-        reason = "multiple_source_mentions_no_single_preference"
-
-    strength = "none"
-    if preferred_source:
-        strength = "hard" if _ask_has_hard_only_source_instruction(q_low) else "prefer"
-
-    return {
-        "preferred_source": preferred_source,
-        "strength": strength,
-        "reason": reason,
-        "xlsx_preference": bool(xlsx_pref),
-        "manual_preference": bool(manual_pref),
-        "manual_mode_false_positive": _ask_has_manual_mode_false_positive(q_low),
-        "asks_comparison": asks_comparison,
-    }
+    return _retrieval_source_priority.ask_source_preference_profile(
+        q,
+        runtime=_retrieval_source_priority.AskSourcePreferenceProfileRuntime(
+            _ask_has_explicit_manual_source_phrase=_ask_has_explicit_manual_source_phrase,
+            _ask_has_explicit_xlsx_source_phrase=_ask_has_explicit_xlsx_source_phrase,
+            _ask_has_hard_only_source_instruction=_ask_has_hard_only_source_instruction,
+            _ask_has_manual_mode_false_positive=_ask_has_manual_mode_false_positive,
+            _ask_regex_any=_ask_regex_any,
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+            re=re,
+        ),
+    )
 
 
 def _ask_query_has_fabrication_instruction(q: str) -> bool:
@@ -7596,70 +7174,42 @@ def _ask_query_has_fabrication_instruction(q: str) -> bool:
 
 
 def _is_xlsx_indexed_page_text(text: str) -> bool:
-    t = str(text or "")
-    return (
-        "DOCUMENT_FILE_TYPE: XLSX" in t
-        or "EXTRACTION_MODE: XLSX" in t
-        or "DOCUMENT_KIND: Excel file" in t
+    return _retrieval_source_priority.is_xlsx_indexed_page_text(
+        text,
+        runtime=_retrieval_source_priority.IsXlsxIndexedPageTextRuntime(
+        ),
     )
 
 
 
 def _ask_manual_priority_query_is_maintenance(q: str) -> bool:
-    q_low = _normalize_unicode_advanced(q or "").lower()
-    return any(
-        marker in q_low
-        for marker in [
-            "manutenz", "maintenance", "controll", "check", "periodic",
-            "frequenza", "frequency", "intervall", "interval", "ore", "hours",
-            "lubr", "olio", "oil", "filtri", "filters", "ventole", "fans",
-            "quadro elettrico", "electrical cabinet", "impianto elettrico", "impianto pneumatico",
-            "pneumatic", "raddrizzatura", "straightening",
-        ]
+    return _retrieval_source_priority.ask_manual_priority_query_is_maintenance(
+        q,
+        runtime=_retrieval_source_priority.AskManualPriorityQueryIsMaintenanceRuntime(
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+        ),
     )
 
 
 def _ask_manual_priority_page_has_real_maintenance_content(text: str) -> bool:
-    t_low = _normalize_unicode_advanced(text or "").lower()
-    if not t_low:
-        return False
-
-    strong_markers = [
-        "tabella per manutenzione", "tabella generale di manutenzione",
-        "maintenance table", "general maintenance table",
-        "ore di funzionamento", "hours of operation", "operating hours",
-        "componenti", "tipo di lubrificante", "quantità", "quantita", "note",
-        "controllare il livello", "check the level", "cambio olio", "oil change",
-        "pulizia dei filtri", "cleaning the filters", "sostituzione completa dei filtri",
-        "scarico della condensa", "drain condensate", "verifica integrità", "verifica integrita",
-        "verifica corretto funzionamento", "lubrificazione manuale", "lubrificazione automatica",
-        "impianto elettrico", "impianto pneumatico", "raddrizzatura", "riduttore",
-    ]
-    if any(m in t_low for m in strong_markers):
-        return True
-
-    freq_matches = re.findall(r"\bogni\s+\d{1,5}\s*(?:ore|ora|h|giorni|giorno|turno|settimane|settimana|mesi|mese|anni|anno)\b", t_low)
-    freq_matches += re.findall(r"\bevery\s+\d{1,5}\s*(?:hours?|h|days?|shift|weeks?|months?|years?)\b", t_low)
-    if any(x in t_low for x in ["ogni giorno", "ogni turno", "settiman", "mensil", "annual"]):
-        freq_matches.append("periodic_interval")
-    return bool(freq_matches)
+    return _retrieval_source_priority.ask_manual_priority_page_has_real_maintenance_content(
+        text,
+        runtime=_retrieval_source_priority.AskManualPriorityPageHasRealMaintenanceContentRuntime(
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+            re=re,
+        ),
+    )
 
 
 def _ask_manual_priority_page_is_meta_or_index(text: str) -> bool:
-    t_low = _normalize_unicode_advanced(text or "").lower()
-    if not t_low:
-        return False
-    weak_markers = [
-        "indice manuale", "table of contents", "pagina vuota", "blank page",
-        "informazioni generali", "general information", "proprietà delle informazioni",
-        "property of information", "tutti i diritti sono riservati", "all rights reserved",
-        "operatore la o le persone", "manutentore:", "conduttore:",
-    ]
-    if any(marker in t_low for marker in weak_markers):
-        return True
-    short_lines = [ln.strip() for ln in str(text or "").split("\n") if ln.strip()]
-    numeric_line_count = sum(1 for ln in short_lines if re.fullmatch(r"\d{1,4}", ln.strip()))
-    return numeric_line_count >= 8 and not _ask_manual_priority_page_has_real_maintenance_content(text)
+    return _retrieval_source_priority.ask_manual_priority_page_is_meta_or_index(
+        text,
+        runtime=_retrieval_source_priority.AskManualPriorityPageIsMetaOrIndexRuntime(
+            _ask_manual_priority_page_has_real_maintenance_content=_ask_manual_priority_page_has_real_maintenance_content,
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+            re=re,
+        ),
+    )
 
 
 def _ask_scrub_fabricated_echo_from_answer(answer: str, q: str) -> str:
@@ -7720,88 +7270,18 @@ def _ask_manual_priority_page_score(
     with actual maintenance tables/frequencies should outrank index/general pages,
     while company/general manuals can still appear as secondary support.
     """
-    q_low = _normalize_unicode_advanced(q or "").lower()
-    t_low = _normalize_unicode_advanced(page_text or "").lower()
-    score = float(base_score or 0.0)
-
-    requested_mid = str(requested_machine_id or "").strip()
-    row_mid = str(row_machine_id or "").strip()
-    if requested_mid and requested_mid != COMPANY_GENERAL_MACHINE_SENTINEL:
-        if row_mid == requested_mid:
-            score += 24.0
-        elif not row_mid:
-            # Company/general document: still allowed as support, but not ahead of
-            # the exact machine manual when the user says "manuale della macchina".
-            score += 4.0
-        else:
-            score -= 8.0
-
-    asks_maintenance = any(
-        marker in q_low
-        for marker in [
-            "manutenz", "maintenance", "controll", "check", "periodic",
-            "periodic", "frequenza", "frequency", "intervall", "interval",
-            "ore", "hours", "lubr", "olio", "oil", "filtri", "filters",
-            "ventole", "fans", "quadro elettrico", "electrical cabinet",
-        ]
+    return _retrieval_source_priority.ask_manual_priority_page_score(
+        q=q,
+        page_text=page_text,
+        base_score=base_score,
+        row_machine_id=row_machine_id,
+        requested_machine_id=requested_machine_id,
+        runtime=_retrieval_source_priority.AskManualPriorityPageScoreRuntime(
+            COMPANY_GENERAL_MACHINE_SENTINEL=COMPANY_GENERAL_MACHINE_SENTINEL,
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+            re=re,
+        ),
     )
-
-    if asks_maintenance:
-        strong_markers = [
-            "tabella per manutenzione", "tabella generale di manutenzione",
-            "maintenance table", "general maintenance table",
-            "ore di funzionamento", "hours of operation", "operating hours",
-            "componenti", "tipo di lubrificante", "quantità", "quantita", "note",
-            "controllare il livello", "check the level", "cambio olio", "oil change",
-            "pulizia dei filtri", "cleaning the filters", "sostituzione completa dei filtri",
-            "scarico della condensa", "drain condensate", "verifica integrità", "verifica integrita",
-            "verifica corretto funzionamento", "lubrificazione manuale", "lubrificazione automatica",
-        ]
-        for marker in strong_markers:
-            if marker in t_low:
-                score += 10.0
-
-        # Frequencies/intervals are the key evidence for periodic maintenance.
-        freq_matches = re.findall(r"\bogni\s+\d{1,5}\s*(?:ore|ora|h|giorni|giorno|turno|settimane|settimana|mesi|mese|anni|anno)\b", t_low)
-        freq_matches += re.findall(r"\bevery\s+\d{1,5}\s*(?:hours?|h|days?|shift|weeks?|months?|years?)\b", t_low)
-        if "ogni giorno" in t_low:
-            freq_matches.append("ogni giorno")
-        if "ogni turno" in t_low:
-            freq_matches.append("ogni turno")
-        if "settiman" in t_low:
-            freq_matches.append("settimanale")
-        if "mensil" in t_low:
-            freq_matches.append("mensile")
-        if "annual" in t_low:
-            freq_matches.append("annuale")
-        if freq_matches:
-            score += min(32.0, 8.0 * len(set(freq_matches)))
-
-        if "impianto elettrico" in t_low or "electrical" in t_low:
-            score += 5.0
-        if "impianto pneumatico" in t_low or "pneumatic" in t_low:
-            score += 5.0
-        if "raddrizzatura" in t_low or "avanzamento" in t_low or "riduttore" in t_low:
-            score += 5.0
-
-        weak_or_meta_markers = [
-            "indice manuale", "table of contents", "pagina vuota", "blank page",
-            "informazioni generali", "general information", "proprietà delle informazioni",
-            "property of information", "tutti i diritti sono riservati", "all rights reserved",
-            "operatore la o le persone", "manutentore:", "conduttore:",
-        ]
-        for marker in weak_or_meta_markers:
-            if marker in t_low:
-                score -= 24.0
-
-        # Strong TOC heuristic: many page-number lines and section titles, but no
-        # actual interval values or operative table rows.
-        short_lines = [ln.strip() for ln in str(page_text or "").split("\n") if ln.strip()]
-        numeric_line_count = sum(1 for ln in short_lines if re.fullmatch(r"\d{1,4}", ln.strip()))
-        if numeric_line_count >= 8 and not freq_matches:
-            score -= 18.0
-
-    return score
 
 
 def _ask_fetch_preferred_source_pages(
@@ -7858,25 +7338,13 @@ def _ask_secondary_support_citations(
     *,
     max_items: int = 5,
 ) -> list[dict]:
-    primary_ids = {str(c.get("citation_id") or "").strip() for c in (primary_citations or []) if isinstance(c, dict)}
-    primary_docs = {str(c.get("bubble_document_id") or "").strip() for c in (primary_citations or []) if isinstance(c, dict)}
-    out: list[dict] = []
-    seen: set[str] = set()
-    for c in secondary_citations or []:
-        if not isinstance(c, dict):
-            continue
-        cid = str(c.get("citation_id") or "").strip()
-        bdid = str(c.get("bubble_document_id") or "").strip()
-        if not cid or cid in seen or cid in primary_ids:
-            continue
-        # Avoid duplicating the same document/page as secondary when it is already primary.
-        if bdid in primary_docs and bool(c.get("ask_source_priority")):
-            continue
-        seen.add(cid)
-        out.append(c)
-        if len(out) >= max_items:
-            break
-    return out
+    return _retrieval_source_priority.ask_secondary_support_citations(
+        secondary_citations,
+        primary_citations,
+        max_items=max_items,
+        runtime=_retrieval_source_priority.AskSecondarySupportCitationsRuntime(
+        ),
+    )
 
 
 
@@ -15736,64 +15204,45 @@ def _assistant_core_required_facet_metrics(text: str, facets: list[str] | tuple[
 
 
 def _assistant_core_numeric_signal(text: str) -> dict:
-    value = _normalize_unicode_advanced(str(text or ""))
-    number_matches = re.findall(r"(?<![A-Za-z0-9_])[+\-]?\d+(?:[.,]\d+)?", value)
-    unit_matches = re.findall(
-        r"(?i)(?<![A-Za-z0-9_])(?:[+\-]?\d+(?:[.,]\d+)?\s*)"
-        r"(?:kg|g|t|ton|lb|mm|cm|m|m/s|m/s2|m/s²|rpm|min\-?1|1/min|hz|khz|kw|w|v|a|bar|mpa|pa|nm|n|kn|°c|celsius|%|ms|s|sec|min|h|hour|hours)\b",
-        value,
+    return _retrieval_source_priority.assistant_core_numeric_signal(
+        text,
+        runtime=_retrieval_source_priority.AssistantCoreNumericSignalRuntime(
+            _ASSISTANT_CORE_LABELED_VALUE_UNIT_RE=_ASSISTANT_CORE_LABELED_VALUE_UNIT_RE,
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+            re=re,
+        ),
     )
-    labeled_value_unit_matches = list(_ASSISTANT_CORE_LABELED_VALUE_UNIT_RE.finditer(value))
-    return {
-        "has_number": bool(number_matches),
-        "has_number_with_unit": bool(unit_matches or labeled_value_unit_matches),
-        "numbers": number_matches[:12],
-    }
 
 
 def _assistant_core_interface_navigation_signal(text: str) -> bool:
-    low = _normalize_unicode_advanced(str(text or "")).lower()
-    markers = (
-        "hmi", "operator panel", "operator interface", "touch screen", "touchscreen",
-        "screen", "page", "menu", "window", "tab", "alarm history", "alarm list",
-        "pannello operatore", "interfaccia operatore", "schermata", "pagina", "menu",
-        "finestra", "scheda", "storico allarmi", "lista allarmi",
+    return _retrieval_source_priority.assistant_core_interface_navigation_signal(
+        text,
+        runtime=_retrieval_source_priority.AssistantCoreInterfaceNavigationSignalRuntime(
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+        ),
     )
-    return any(marker in low for marker in markers)
 
 
 def _assistant_core_sequence_signal(text: str) -> bool:
-    low = _normalize_unicode_advanced(str(text or "")).lower()
-    markers = (
-        "first", "then", "next", "after", "before", "while", "when", "at the same time",
-        "simultaneously", "during the return", "at the end", "opens", "closes", "returns",
-        "prima", "poi", "quindi", "successivamente", "dopo", "prima di", "mentre",
-        "quando", "contemporaneamente", "simultaneamente", "durante il ritorno",
-        "a fine corsa", "apre", "chiude", "ritorna",
+    return _retrieval_source_priority.assistant_core_sequence_signal(
+        text,
+        runtime=_retrieval_source_priority.AssistantCoreSequenceSignalRuntime(
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+        ),
     )
-    return sum(1 for marker in markers if marker in low) >= 2
 
 
 def _assistant_core_ps_is_substantive(candidate: dict) -> bool:
-    if _assistant_core_candidate_source_type(candidate) != "ps":
-        return True
-    raw = _v13_candidate_text(candidate)
-    fields = _parse_structured_source_fields(raw)
-    values = [
-        str(fields.get("description") or ""),
-        str(fields.get("solution") or ""),
-        str(fields.get("notes") or ""),
-    ]
-    placeholder_values = {
-        "", "-", "n/a", "na", "none", "null", "problema", "problem", "soluzione",
-        "solution", "descr", "description", "test", "other",
-    }
-    substantive = [
-        re.sub(r"\s+", " ", _normalize_unicode_advanced(v).lower()).strip(" .:;-_")
-        for v in values
-    ]
-    substantive = [v for v in substantive if v not in placeholder_values and len(v) >= 24]
-    return bool(substantive)
+    return _retrieval_source_priority.assistant_core_ps_is_substantive(
+        candidate,
+        runtime=_retrieval_source_priority.AssistantCorePsIsSubstantiveRuntime(
+            _assistant_core_candidate_source_type=_assistant_core_candidate_source_type,
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+            _parse_structured_source_fields=_parse_structured_source_fields,
+            _v13_candidate_text=_v13_candidate_text,
+            re=re,
+        ),
+    )
 
 
 def _assistant_core_source_bonus(
@@ -15802,29 +15251,21 @@ def _assistant_core_source_bonus(
     preferred_source_types: set[str],
     information_task: str = INFO_OTHER,
 ) -> float:
-    bonus = 0.0
-    if source_type in preferred_source_types:
-        bonus += 0.18
-
-    if information_task in {INFO_PROCEDURE_FULL, INFO_PROCEDURE_SEGMENT} or request_kind == "procedure":
-        bonus += {"step": 0.22, "procedure": 0.20, "document": 0.07, "ps": 0.02}.get(source_type, 0.0)
-    elif information_task == INFO_NUMERIC_SPECIFICATION:
-        # Numeric values may live in a manual, a procedure or an exact Step. Do not
-        # systematically demote structured records in favour of PDFs.
-        bonus += {"step": 0.16, "procedure": 0.14, "document": 0.15, "ps": 0.03}.get(source_type, 0.0)
-    elif information_task == INFO_INTERFACE_NAVIGATION:
-        bonus += {"document": 0.22, "procedure": 0.02, "step": 0.01, "ps": -0.03}.get(source_type, 0.0)
-    elif information_task == INFO_SEQUENCE_SYNCHRONIZATION:
-        bonus += {"step": 0.18, "procedure": 0.14, "document": 0.17, "ps": 0.02}.get(source_type, 0.0)
-    elif request_kind in {"fault_diagnostic", "guided_diagnostic"} or information_task == INFO_FAULT_DIAGNOSTIC:
-        # A P&S is valuable only after the same-subsystem/facet gate below. The
-        # source-type prior is intentionally modest so an unrelated P&S cannot win.
-        bonus += {"ps": 0.10, "document": 0.10, "procedure": 0.07, "step": 0.08}.get(source_type, 0.0)
-    elif request_kind == "source_retrieval" or information_task == INFO_SOURCE_RETRIEVAL:
-        bonus += 0.10 if source_type in preferred_source_types else 0.0
-    elif request_kind in {"factual", "comparison"}:
-        bonus += {"document": 0.08, "step": 0.06, "procedure": 0.05, "ps": 0.02}.get(source_type, 0.0)
-    return bonus
+    return _retrieval_source_priority.assistant_core_source_bonus(
+        source_type,
+        request_kind,
+        preferred_source_types,
+        information_task,
+        runtime=_retrieval_source_priority.AssistantCoreSourceBonusRuntime(
+            INFO_FAULT_DIAGNOSTIC=INFO_FAULT_DIAGNOSTIC,
+            INFO_INTERFACE_NAVIGATION=INFO_INTERFACE_NAVIGATION,
+            INFO_NUMERIC_SPECIFICATION=INFO_NUMERIC_SPECIFICATION,
+            INFO_PROCEDURE_FULL=INFO_PROCEDURE_FULL,
+            INFO_PROCEDURE_SEGMENT=INFO_PROCEDURE_SEGMENT,
+            INFO_SEQUENCE_SYNCHRONIZATION=INFO_SEQUENCE_SYNCHRONIZATION,
+            INFO_SOURCE_RETRIEVAL=INFO_SOURCE_RETRIEVAL,
+        ),
+    )
 
 
 def _assistant_core_diagnostic_priority_metrics(
