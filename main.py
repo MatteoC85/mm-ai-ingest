@@ -144,6 +144,11 @@ from machinemind.ingest import metering as _ingest_metering
 from machinemind.ingest import orchestration as _ingest_orchestration
 from machinemind.retrieval import dense as _retrieval_dense
 from machinemind.retrieval import structured as _retrieval_structured
+from machinemind.retrieval import retrieval_primitives as _retrieval_retrieval_primitives
+from machinemind.retrieval import query_fallbacks as _retrieval_query_fallbacks
+from machinemind.retrieval import diagnostic_evidence as _retrieval_diagnostic_evidence
+from machinemind.retrieval import source_parsing as _retrieval_source_parsing
+from machinemind.retrieval import context_expansion as _retrieval_context_expansion
 from machinemind.retrieval import source_priority as _retrieval_source_priority
 from machinemind.retrieval import procedure_families as _retrieval_procedure_families
 from machinemind.retrieval import query_planning as _retrieval_query_planning
@@ -615,12 +620,12 @@ def _fetch_document_file_map(company_id: str, doc_ids: list[str]) -> dict[str, s
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
-    try:
-        if value is None or value == "":
-            return default
-        return int(value)
-    except Exception:
-        return default
+    return _retrieval_retrieval_primitives.safe_int(
+        value,
+        default,
+        runtime=_retrieval_retrieval_primitives.SafeIntRuntime(
+        ),
+    )
 
 
 def _clean_display_text(value: Any, max_len: int = 140) -> str:
@@ -697,28 +702,14 @@ def _build_rg_links(company_id: str, citations: list[dict]) -> list[dict]:
 
 
 def _normalize_structured_source_type(source_type: str) -> str:
-    s = re.sub(r"[\s\-]+", "_", str(source_type or "").strip().lower())
-
-    aliases = {
-        "procedure": "procedure",
-        "step": "step",
-        "ps": "ps",
-        "problemsolution": "ps",
-        "problem_solution": "ps",
-        "problem_solution_item": "ps",
-        "md_photo": "md_photo",
-        "machine_detail_photo": "md_photo",
-        "photo_machine_detail": "md_photo",
-        "md_video": "md_video",
-        "machine_detail_video": "md_video",
-        "video_machine_detail": "md_video",
-    }
-
-    s = aliases.get(s, s)
-    if s not in STRUCTURED_SOURCE_TYPES:
-        raise HTTPException(status_code=400, detail=f"Unsupported source_type: {source_type}")
-
-    return s
+    return _retrieval_source_parsing.normalize_structured_source_type(
+        source_type,
+        runtime=_retrieval_source_parsing.NormalizeStructuredSourceTypeRuntime(
+            HTTPException=HTTPException,
+            STRUCTURED_SOURCE_TYPES=STRUCTURED_SOURCE_TYPES,
+            re=re,
+        ),
+    )
 
 
 def _build_structured_source_key(source_type: str, source_id: str) -> str:
@@ -733,11 +724,13 @@ STRUCTURED_RELATION_PROCEDURE_STEP = "procedure_step"
 
 
 def _normalize_structured_source_key(source_type: str, source_id_or_key: Any) -> str:
-    raw = str(source_id_or_key or "").strip()
-    if not raw:
-        return ""
-    prefix = f"{_normalize_structured_source_type(source_type)}:"
-    return raw if raw.lower().startswith(prefix.lower()) else prefix + raw
+    return _retrieval_source_parsing.normalize_structured_source_key(
+        source_type,
+        source_id_or_key,
+        runtime=_retrieval_source_parsing.NormalizeStructuredSourceKeyRuntime(
+            _normalize_structured_source_type=_normalize_structured_source_type,
+        ),
+    )
 
 
 def _parent_procedure_source_key(payload: StructuredSourceIngestRequest) -> str:
@@ -956,12 +949,12 @@ def _db_delete_structured_relations_for_company(company_id: str) -> int:
 
 
 def _is_structured_source_key(value: str) -> bool:
-    v = str(value or "").strip().lower()
-    if ":" not in v:
-        return False
-
-    prefix = v.split(":", 1)[0].strip()
-    return prefix in STRUCTURED_SOURCE_TYPES
+    return _retrieval_source_parsing.is_structured_source_key(
+        value,
+        runtime=_retrieval_source_parsing.IsStructuredSourceKeyRuntime(
+            STRUCTURED_SOURCE_TYPES=STRUCTURED_SOURCE_TYPES,
+        ),
+    )
 
 def _clean_structured_text_value(value: Any) -> str:
     s = _normalize_unicode_advanced(str(value or ""))
@@ -1074,106 +1067,24 @@ def _collapse_structured_chunks(chunks: list[dict]) -> list[dict]:
     ]
 
 def _extract_code_tokens(q: str) -> list[str]:
-    q = _normalize_unicode_advanced(q or "")
-    if not q.strip():
-        return []
-
-    raw = re.findall(r"\b[A-Za-z0-9_\-/]{4,}\b", q)
-    out = []
-    seen = set()
-
-    for tok in raw:
-        tok = tok.strip()
-        if not tok:
-            continue
-
-        has_digit = any(ch.isdigit() for ch in tok)
-        has_sep = ("_" in tok) or ("-" in tok) or ("/" in tok)
-        has_upper = any(ch.isupper() for ch in tok)
-
-        if not (has_digit or has_sep or (has_upper and len(tok) >= 6)):
-            continue
-
-        key = tok.upper()
-        if key in seen:
-            continue
-
-        seen.add(key)
-        out.append(tok)
-
-    return out[:5]
-
-def _llm_classify_root_cause_query_intent(q: str) -> dict:
-    schema = {
-        "name": "root_cause_intent_classifier",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "intent_class": {
-                    "type": "string",
-                    "enum": [
-                        "technical_fault_symptom",
-                        "technical_information_question",
-                        "non_technical_or_nonsense",
-                        "ambiguous",
-                    ],
-                },
-                "confidence": {
-                    "type": "number",
-                },
-                "rationale": {
-                    "type": "string",
-                },
-            },
-            "required": ["intent_class", "confidence", "rationale"],
-        },
-    }
-
-    system_msg = (
-        "You classify a user query in an industrial machinery context. "
-        "Work semantically, not by keyword matching. "
-        "The query may be in Italian, English, or mixed language. "
-        "The machinery type is unknown and can be any industrial machine. "
-        "Classes:\n"
-        "- technical_fault_symptom: the query expresses a fault symptom, anomaly, missing condition, malfunction, abnormal behavior, or a concise diagnostic complaint that could justify root cause analysis.\n"
-        "- technical_information_question: the query is technical and relevant to machinery, but it is explanatory/informational rather than a fault symptom.\n"
-        "- non_technical_or_nonsense: the query is outside the technical machinery domain, casual, or nonsense.\n"
-        "- ambiguous: not enough certainty.\n"
-        "Very short phrases can still be technical_fault_symptom if they express a real machine condition."
+    return _retrieval_retrieval_primitives.extract_code_tokens(
+        q,
+        runtime=_retrieval_retrieval_primitives.ExtractCodeTokensRuntime(
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+            re=re,
+        ),
     )
 
-    user_msg = f"QUERY:\n{q}"
-
-    try:
-        parsed = _openai_chat_json_models(
-            [
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_msg},
-            ],
-            models=[ROOT_CAUSE_INTENT_MODEL, DIAGNOSTIC_EVIDENCE_MODEL, OPENAI_CHAT_MODEL],
-            json_schema=schema,
-            timeout=20,
-        )
-        if not isinstance(parsed, dict):
-            return {
-                "intent_class": "ambiguous",
-                "confidence": 0.0,
-                "rationale": "invalid classifier response",
-            }
-
-        parsed["intent_class"] = str(parsed.get("intent_class") or "ambiguous").strip()
-        parsed["confidence"] = float(parsed.get("confidence") or 0.0)
-        parsed["rationale"] = str(parsed.get("rationale") or "").strip()
-        return parsed
-
-    except Exception as e:
-        return {
-            "intent_class": "ambiguous",
-            "confidence": 0.0,
-            "rationale": f"classifier_error: {str(e)[:160]}",
-        }
+def _llm_classify_root_cause_query_intent(q: str) -> dict:
+    return _retrieval_query_fallbacks.llm_classify_root_cause_query_intent(
+        q,
+        runtime=_retrieval_query_fallbacks.LlmClassifyRootCauseQueryIntentRuntime(
+            DIAGNOSTIC_EVIDENCE_MODEL=DIAGNOSTIC_EVIDENCE_MODEL,
+            OPENAI_CHAT_MODEL=OPENAI_CHAT_MODEL,
+            ROOT_CAUSE_INTENT_MODEL=ROOT_CAUSE_INTENT_MODEL,
+            _openai_chat_json_models=_openai_chat_json_models,
+        ),
+    )
 
 def _root_cause_preliminary_retrieval_signal(
     *,
@@ -1184,37 +1095,21 @@ def _root_cause_preliminary_retrieval_signal(
     bubble_document_id: Optional[str] = None,
     debug: bool = False,
 ) -> dict:
-    if not q_vec:
-        return {
-            "chunks_matching_filter": None,
-            "rows_found": 0,
-            "similarity_max": None,
-            "hits_over_prelim_threshold": 0,
-            "hits_over_ask_threshold": 0,
-        }
-
-    q_vec_lit = _vector_literal(q_vec)
-
-    chunks_matching_filter, raw_rows = _fetch_dense_chunk_candidates(
+    return _retrieval_query_fallbacks.root_cause_preliminary_retrieval_signal(
         company_id=company_id,
         machine_id=machine_id,
-        q_vec_lit=q_vec_lit,
-        candidate_k=max(1, ROOT_CAUSE_GATE_PRELIM_TOP_K),
+        q_vec=q_vec,
         doc_ids=doc_ids,
         bubble_document_id=bubble_document_id,
         debug=debug,
+        runtime=_retrieval_query_fallbacks.RootCausePreliminaryRetrievalSignalRuntime(
+            ASK_SIM_THRESHOLD=ASK_SIM_THRESHOLD,
+            ROOT_CAUSE_GATE_MIN_PRELIM_SIM=ROOT_CAUSE_GATE_MIN_PRELIM_SIM,
+            ROOT_CAUSE_GATE_PRELIM_TOP_K=ROOT_CAUSE_GATE_PRELIM_TOP_K,
+            _fetch_dense_chunk_candidates=_fetch_dense_chunk_candidates,
+            _vector_literal=_vector_literal,
+        ),
     )
-
-    sims = [float(r[6]) for r in raw_rows] if raw_rows else []
-    sim_max = max(sims) if sims else None
-
-    return {
-        "chunks_matching_filter": chunks_matching_filter,
-        "rows_found": len(raw_rows),
-        "similarity_max": sim_max,
-        "hits_over_prelim_threshold": sum(1 for s in sims if s >= ROOT_CAUSE_GATE_MIN_PRELIM_SIM),
-        "hits_over_ask_threshold": sum(1 for s in sims if s >= ASK_SIM_THRESHOLD),
-    }
 
 
 def _root_cause_query_signal_summary(
@@ -1226,76 +1121,31 @@ def _root_cause_query_signal_summary(
     doc_ids: Optional[list[str]] = None,
     debug: bool = False,
 ) -> dict:
-    q_norm = re.sub(r"\s+", " ", _normalize_unicode_advanced(q or "")).strip()
-    q_low = q_norm.lower()
-
-    tokens = re.findall(r"[a-zà-öø-ÿ0-9]{2,}", q_low)
-    code_hits = len(_extract_code_tokens(q_norm))
-
-    classifier_used = True
-    classified = _llm_classify_root_cause_query_intent(q_norm)
-    intent_class = str(classified.get("intent_class") or "ambiguous").strip()
-    intent_confidence = float(classified.get("confidence") or 0.0)
-    intent_rationale = str(classified.get("rationale") or "").strip()
-
-    q_vec = _openai_embed_texts([q_norm])[0] if q_norm else []
-
-    preliminary = _root_cause_preliminary_retrieval_signal(
+    return _retrieval_query_fallbacks.root_cause_query_signal_summary(
+        q,
         company_id=company_id,
         machine_id=machine_id,
-        q_vec=q_vec,
-        doc_ids=doc_ids,
         bubble_document_id=bubble_document_id,
+        doc_ids=doc_ids,
         debug=debug,
+        runtime=_retrieval_query_fallbacks.RootCauseQuerySignalSummaryRuntime(
+            _extract_code_tokens=_extract_code_tokens,
+            _llm_classify_root_cause_query_intent=_llm_classify_root_cause_query_intent,
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+            _openai_embed_texts=_openai_embed_texts,
+            _root_cause_preliminary_retrieval_signal=_root_cause_preliminary_retrieval_signal,
+            re=re,
+        ),
     )
-
-    return {
-        "query_norm": q_norm,
-        "token_count": len(tokens),
-        "code_hits": code_hits,
-        "query_vector": q_vec,
-        "preliminary_retrieval": preliminary,
-        "intent_class": intent_class,
-        "intent_confidence": intent_confidence,
-        "intent_rationale": intent_rationale,
-        "classifier_used": classifier_used,
-    }
 
 def _should_fail_closed_root_cause_query(signal_summary: dict) -> bool:
-    if not signal_summary:
-        return True
-
-    token_count = int(signal_summary.get("token_count", 0) or 0)
-    intent_class = str(signal_summary.get("intent_class") or "ambiguous").strip()
-    intent_confidence = float(signal_summary.get("intent_confidence", 0.0) or 0.0)
-
-    prelim = signal_summary.get("preliminary_retrieval") or {}
-    prelim_sim_max = prelim.get("similarity_max")
-    prelim_hits = int(prelim.get("hits_over_prelim_threshold", 0) or 0)
-
-    if token_count <= 0:
-        return True
-
-    if intent_class == "technical_fault_symptom":
-        return False
-
-    if intent_class == "non_technical_or_nonsense":
-        return True
-
-    strong_preliminary_signal = (
-        prelim_sim_max is not None
-        and float(prelim_sim_max) >= ROOT_CAUSE_GATE_MIN_PRELIM_SIM + 0.04
-        and prelim_hits >= max(1, ROOT_CAUSE_GATE_MIN_PRELIM_HITS)
+    return _retrieval_query_fallbacks.should_fail_closed_root_cause_query(
+        signal_summary,
+        runtime=_retrieval_query_fallbacks.ShouldFailClosedRootCauseQueryRuntime(
+            ROOT_CAUSE_GATE_MIN_PRELIM_HITS=ROOT_CAUSE_GATE_MIN_PRELIM_HITS,
+            ROOT_CAUSE_GATE_MIN_PRELIM_SIM=ROOT_CAUSE_GATE_MIN_PRELIM_SIM,
+        ),
     )
-
-    if intent_class == "technical_information_question":
-        return not strong_preliminary_signal
-
-    # ambiguous
-    if intent_confidence < 0.80 and strong_preliminary_signal:
-        return False
-
-    return True
 
 def _infer_machine_components(q: str) -> list[str]:
     return _retrieval_policy.infer_machine_components(
@@ -1341,25 +1191,14 @@ def _collect_candidate_keywords(q: str, inferred_components: list[str]) -> list[
 
 
 def _dedup_text_values(values: list[str], limit: Optional[int] = None) -> list[str]:
-    out: list[str] = []
-    seen = set()
-
-    for value in values or []:
-        s = re.sub(r"\s+", " ", _normalize_unicode_advanced(str(value or ""))).strip()
-        if not s:
-            continue
-
-        key = s.lower()
-        if key in seen:
-            continue
-
-        seen.add(key)
-        out.append(s)
-
-        if limit is not None and len(out) >= limit:
-            break
-
-    return out
+    return _retrieval_retrieval_primitives.dedup_text_values(
+        values,
+        limit,
+        runtime=_retrieval_retrieval_primitives.DedupTextValuesRuntime(
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+            re=re,
+        ),
+    )
 
 
 def _count_query_tokens(q: str) -> int:
@@ -1373,25 +1212,13 @@ def _count_query_tokens(q: str) -> int:
 
 
 def _simple_query_language(q: str) -> str:
-    toks = re.findall(r"[a-zà-öø-ÿ']{2,}", _normalize_unicode_advanced(q or "").lower())
-    if not toks:
-        return "it"
-
-    it_markers = {
-        "il", "lo", "la", "gli", "le", "di", "del", "della", "dei", "delle", "con",
-        "per", "quando", "durante", "mentre", "dopo", "prima", "non", "si", "una", "un",
-    }
-    en_markers = {
-        "the", "with", "for", "when", "during", "while", "after", "before", "not",
-        "does", "is", "are", "can", "cannot", "won't", "will", "a", "an",
-    }
-
-    it_hits = sum(1 for t in toks if t in it_markers)
-    en_hits = sum(1 for t in toks if t in en_markers)
-
-    if en_hits > it_hits:
-        return "en"
-    return "it"
+    return _retrieval_query_fallbacks.simple_query_language(
+        q,
+        runtime=_retrieval_query_fallbacks.SimpleQueryLanguageRuntime(
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+            re=re,
+        ),
+    )
 
 
 def _select_response_language(
@@ -2974,68 +2801,17 @@ def _expand_with_neighbor_chunks(
     *,
     radius: int = 1,
 ) -> list[dict]:
-    if not citation_ids:
-        return []
-
-    parsed = []
-    for cid in citation_ids:
-        m = re.match(r"^(.*):p(\d+)-(\d+):c(\d+)$", str(cid).strip())
-        if not m:
-            continue
-        bdid = m.group(1).strip()
-        chunk_index = int(m.group(4))
-        if bdid != bubble_document_id:
-            continue
-        parsed.append(chunk_index)
-
-    if not parsed:
-        return []
-
-    min_idx = max(1, min(parsed) - radius)
-    max_idx = max(parsed) + radius
-
-    conn = _db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT bubble_document_id, chunk_index, page_from, page_to,
-                       left(chunk_text, %s) AS snippet,
-                       left(chunk_text, 2000) AS chunk_full
-                FROM public.document_chunks
-                WHERE company_id=%s
-                  AND bubble_document_id=%s
-                  AND chunk_index BETWEEN %s AND %s
-                ORDER BY chunk_index;
-                """,
-                (
-                    ASK_SNIPPET_CHARS,
-                    company_id,
-                    bubble_document_id,
-                    min_idx,
-                    max_idx,
-                ),
-            )
-            rows = cur.fetchall()
-    finally:
-        conn.close()
-
-    out = []
-    for (bdid, chunk_index, page_from, page_to, snippet, chunk_full) in rows:
-        cid = f"{bdid}:p{int(page_from)}-{int(page_to)}:c{int(chunk_index)}"
-        out.append(
-            {
-                "citation_id": cid,
-                "bubble_document_id": str(bdid),
-                "page_from": int(page_from),
-                "page_to": int(page_to),
-                "snippet": (snippet or "").strip(),
-                "chunk_full": (chunk_full or "").strip(),
-                "similarity": 0.0,
-            }
-        )
-
-    return out
+    return _retrieval_context_expansion.expand_with_neighbor_chunks(
+        company_id,
+        bubble_document_id,
+        citation_ids,
+        radius=radius,
+        runtime=_retrieval_context_expansion.ExpandWithNeighborChunksRuntime(
+            ASK_SNIPPET_CHARS=ASK_SNIPPET_CHARS,
+            _db_conn=_db_conn,
+            re=re,
+        ),
+    )
 
 def _root_cause_chunk_signal_summary(
     q: str,
@@ -3096,21 +2872,30 @@ def _score_root_cause_chunk_semantic(
     )
 
 def _q_has_any(q: str, hints: list[str]) -> bool:
-    qq = (q or "").lower()
-    return any(h in qq for h in hints)
+    return _retrieval_retrieval_primitives.q_has_any(
+        q,
+        hints,
+        runtime=_retrieval_retrieval_primitives.QHasAnyRuntime(
+        ),
+    )
 
 
 def _clean_tail(s: str) -> str:
-    return (s or "").rstrip(".,;:!?)\"]}")
+    return _retrieval_retrieval_primitives.clean_tail(
+        s,
+        runtime=_retrieval_retrieval_primitives.CleanTailRuntime(
+        ),
+    )
 
 
 def _extract_first(regex: re.Pattern, text: str) -> Optional[str]:
-    if not text:
-        return None
-    m = regex.search(text)
-    if not m:
-        return None
-    return _clean_tail(m.group(1))
+    return _retrieval_retrieval_primitives.extract_first(
+        regex,
+        text,
+        runtime=_retrieval_retrieval_primitives.ExtractFirstRuntime(
+            _clean_tail=_clean_tail,
+        ),
+    )
 
 
 def _pick_entity_from_citations(q: str, citations: list[dict]) -> Optional[tuple[str, dict]]:
@@ -3204,20 +2989,12 @@ def _dedup_citations_preserve_order(citations: list[dict], max_items: int) -> li
 
 
 def _cosine_sim(a: list[float], b: list[float]) -> float:
-    dot = 0.0
-    na = 0.0
-    nb = 0.0
-
-    for i in range(min(len(a), len(b))):
-        va = float(a[i])
-        vb = float(b[i])
-        dot += va * vb
-        na += va * va
-        nb += vb * vb
-
-    if na <= 0.0 or nb <= 0.0:
-        return 0.0
-    return dot / ((na ** 0.5) * (nb ** 0.5))
+    return _retrieval_retrieval_primitives.cosine_sim(
+        a,
+        b,
+        runtime=_retrieval_retrieval_primitives.CosineSimRuntime(
+        ),
+    )
 
 
 def _mmr_select(
@@ -3617,10 +3394,12 @@ def _openai_chat(
 
 
 def _extract_section_from_text(text: str) -> str:
-    if not text:
-        return ""
-    m = re.search(r"^SECTION:\s*(.+)$", text, flags=re.MULTILINE)
-    return (m.group(1).strip() if m else "")[:120]
+    return _retrieval_retrieval_primitives.extract_section_from_text(
+        text,
+        runtime=_retrieval_retrieval_primitives.ExtractSectionFromTextRuntime(
+            re=re,
+        ),
+    )
 
 
 def _extract_citation_ids_from_answer(answer: str) -> list[str]:
@@ -3733,216 +3512,43 @@ def _llm_filter_diagnostic_chunks(
     candidates: list[dict],
     max_keep: int,
 ) -> list[str]:
-    if not q or not candidates:
-        return []
-
-    items = []
-
-    for c in candidates[:18]:
-        cid = str(c.get("citation_id") or "").strip()
-        snippet = (c.get("snippet") or "").strip()
-        section = _extract_section_from_text(c.get("chunk_full") or c.get("snippet") or "")
-
-        items.append({
-            "citation_id": cid,
-            "section": section[:120],
-            "evidence_family": _root_cause_evidence_family_key(c),
-            "matched_subsystems": c.get("matched_subsystems") or [],
-            "subsystem_score": round(float(c.get("subsystem_score", 0.0)), 4),
-            "causal_strength_score": round(float(c.get("causal_strength_score", 0.0)), 4),
-            "semantic_score": round(float(c.get("semantic_score", 0.0)), 4),
-            "generic_downranked": bool(c.get("generic_downranked")),
-            "snippet": snippet[:300]
-        })
-
-    schema = {
-        "name": "diagnostic_filter",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "selected_ids": {
-                    "type": "array",
-                    "items": {"type": "string"}
-                }
-            },
-            "required": ["selected_ids"]
-        }
-    }
-
-    system_msg = (
-        "Selezioni solo le fonti realmente utili per diagnosticare un problema tecnico su una macchina industriale.\n"
-        "Regole:\n"
-        "1) Tieni solo fonti che parlano del fenomeno o dei componenti coinvolti.\n"
-        "2) Scarta fonti generiche di manutenzione, sicurezza, installazione o lubrificazione se non sono direttamente legate al sintomo.\n"
-        "3) Se una fonte parla solo di controlli generici o procedure standard, scartala.\n"
-        "4) Mantieni poche fonti ma molto pertinenti.\n"
-        "5) Non collassare tutto su una sola fonte se esistono 2-3 aree causali diverse ben supportate.\n"
-        "6) Le fonti con generic_downranked=true sono bassa priorità e vanno tenute solo se il sintomo coincide in modo diretto.\n"
-        "7) Preferisci sezioni operative o di componente rispetto a overview, safety, installation, start-up o caratteristiche generali.\n"
-        "8) Evita di selezionare più citation_id della stessa evidence_family se una sola fonte rappresenta già bene quell'area.\n"
-        "9) Seleziona fonti che coprono aree causali diverse quando sono ben supportate.\n"
-        "10) Preferisci fonti allineate ai sottosistemi dominanti implicati dal sintomo.\n"
-        "11) Se esistono fonti di sottosistemi secondari, mantienile solo se spiegano una causa davvero plausibile e non indiretta.\n"
-        "12) Per sintomi generici come vibrazione, rumore o blocco, non privilegiare lubrificazione, start-up, installazione o sicurezza se il testo non collega esplicitamente quel sottosistema al sintomo.\n"
-        "13) Per il mancato avvio, i blocchi elettrici, interlock e consensi sono più forti di una nota generica di lubrificazione.\n"
-        "14) Favorisci le evidenze con causal_strength_score e semantic_score più alti.\n"
+    return _retrieval_diagnostic_evidence.llm_filter_diagnostic_chunks(
+        q,
+        candidates,
+        max_keep,
+        runtime=_retrieval_diagnostic_evidence.LlmFilterDiagnosticChunksRuntime(
+            DIAGNOSTIC_EVIDENCE_MODEL=DIAGNOSTIC_EVIDENCE_MODEL,
+            OPENAI_CHAT_MODEL=OPENAI_CHAT_MODEL,
+            OPENAI_RERANK_MODEL=OPENAI_RERANK_MODEL,
+            RERANK_TIMEOUT=RERANK_TIMEOUT,
+            _extract_section_from_text=_extract_section_from_text,
+            _openai_chat_json_models=_openai_chat_json_models,
+            _root_cause_evidence_family_key=_root_cause_evidence_family_key,
+            json=json,
+        ),
     )
-
-    user_msg = (
-        f"PROBLEMA:\n{q}\n\n"
-        f"CANDIDATI:\n{json.dumps(items, ensure_ascii=False)}\n\n"
-        f"Restituisci JSON con gli id delle fonti più utili alla diagnosi."
-    )
-
-    parsed = _openai_chat_json_models(
-        [
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": user_msg},
-        ],
-        models=[DIAGNOSTIC_EVIDENCE_MODEL, OPENAI_RERANK_MODEL, OPENAI_CHAT_MODEL],
-        json_schema=schema,
-        timeout=RERANK_TIMEOUT,
-    )
-
-    selected = parsed.get("selected_ids") or []
-
-    out = []
-    used = set()
-
-    for cid in selected:
-        cid = str(cid).strip()
-        if cid and cid not in used:
-            used.add(cid)
-            out.append(cid)
-        if len(out) >= max_keep:
-            break
-
-    return out
 
 def _llm_build_diagnostic_evidence_matrix(
     q: str,
     citations: list[dict],
     max_causes: int,
 ) -> dict:
-    if not q or not citations:
-        return {}
-
-    max_causes = max(1, min(int(max_causes or 1), 3))
-
-    items = []
-    seen = set()
-
-    for c in citations[:10]:
-        cid = str(c.get("citation_id") or "").strip()
-        if not cid or cid in seen:
-            continue
-        seen.add(cid)
-
-        snippet = (c.get("chunk_full") or c.get("snippet") or "").strip()
-        snippet = re.sub(r"^SECTION:\s*[^\n]+\n?", "", snippet).strip()
-
-        section = _extract_section_from_text(c.get("chunk_full") or c.get("snippet") or "")
-
-        items.append(
-            {
-                "citation_id": cid,
-                "section": section[:120],
-                "evidence_family": _root_cause_evidence_family_key(c),
-                "matched_subsystems": c.get("matched_subsystems") or [],
-                "subsystem_score": round(float(c.get("subsystem_score", 0.0)), 4),
-                "causal_strength_score": round(float(c.get("causal_strength_score", 0.0)), 4),
-                "semantic_score": round(float(c.get("semantic_score", 0.0)), 4),
-                "page_from": int(c.get("page_from") or 0),
-                "page_to": int(c.get("page_to") or 0),
-                "generic_downranked": bool(c.get("generic_downranked")),
-                "snippet": snippet[:360],
-            }
-        )
-
-    if not items:
-        return {}
-
-    schema = {
-        "name": "diagnostic_evidence_matrix",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "keep_ids": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                },
-                "discard_ids": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                },
-                "cause_hypotheses": {
-                    "type": "array",
-                    "maxItems": max_causes,
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "properties": {
-                            "cause": {"type": "string"},
-                            "evidence_ids": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                            },
-                            "check_focus": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                            },
-                        },
-                        "required": ["cause", "evidence_ids", "check_focus"],
-                    },
-                },
-            },
-            "required": ["keep_ids", "discard_ids", "cause_hypotheses"],
-        },
-    }
-
-    system_msg = (
-        "Selezioni e organizzi le evidenze per una root cause analysis industriale.\n"
-        "Obiettivo: tenere solo le fonti davvero utili e raggrupparle per area causale.\n"
-        "Regole obbligatorie:\n"
-        "1) keep_ids = solo citazioni utili alla diagnosi.\n"
-        "2) discard_ids = citazioni generiche, ripetitive, di solo contesto o sicurezza.\n"
-        "3) cause_hypotheses = massimo poche ipotesi distinte; non duplicare varianti della stessa causa.\n"
-        "4) Ogni ipotesi deve usare solo citation_id presenti nei candidati.\n"
-        "5) check_focus = verifiche pratiche brevi, non frasi lunghe.\n"
-        "6) Non collassare tutto su una sola causa se le citazioni supportano aree causali diverse.\n"
-        "7) keep_ids deve mantenere copertura delle aree causali utili, non solo il numero minimo di fonti.\n"
-        "8) Le fonti con generic_downranked=true sono bassa priorità e non vanno usate come evidenza centrale se esistono fonti più specifiche.\n"
-        "9) Preferisci sezioni operative o di componente rispetto a overview, safety, installation, start-up o caratteristiche generali.\n"
-        "10) Evita di mantenere più citation_id della stessa evidence_family se una sola fonte è già rappresentativa.\n"
-        "11) keep_ids e cause_hypotheses devono massimizzare la copertura di aree causali diverse, non la ripetizione della stessa area.\n"
-        "12) Preferisci ipotesi coerenti con i sottosistemi dominanti implicati dal sintomo.\n"
-        "13) Per sintomi generici come vibrazione, rumore o blocco, le fonti di lubrificazione, start-up, installazione o sicurezza non devono diventare ipotesi centrali senza un legame esplicito col sintomo.\n"
-        "14) Per il mancato avvio, preferisci cause elettriche/interlock/consensi rispetto a note generiche di lubrificazione.\n"
-        "15) Le evidenze con causal_strength_score e semantic_score più alti hanno priorità.\n"
+    return _retrieval_diagnostic_evidence.llm_build_diagnostic_evidence_matrix(
+        q,
+        citations,
+        max_causes,
+        runtime=_retrieval_diagnostic_evidence.LlmBuildDiagnosticEvidenceMatrixRuntime(
+            DIAGNOSTIC_EVIDENCE_MODEL=DIAGNOSTIC_EVIDENCE_MODEL,
+            OPENAI_CHAT_MODEL=OPENAI_CHAT_MODEL,
+            OPENAI_RERANK_MODEL=OPENAI_RERANK_MODEL,
+            RERANK_TIMEOUT=RERANK_TIMEOUT,
+            _extract_section_from_text=_extract_section_from_text,
+            _openai_chat_json_models=_openai_chat_json_models,
+            _root_cause_evidence_family_key=_root_cause_evidence_family_key,
+            json=json,
+            re=re,
+        ),
     )
-
-    user_msg = (
-        f"SINTOMO/PROBLEMA:\n{q}\n\n"
-        "CITAZIONI_CANDIDATE_JSON:\n"
-        f"{json.dumps(items, ensure_ascii=False)}\n\n"
-        "Restituisci JSON valido."
-    )
-
-    parsed = _openai_chat_json_models(
-        [
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": user_msg},
-        ],
-        models=[DIAGNOSTIC_EVIDENCE_MODEL, OPENAI_RERANK_MODEL, OPENAI_CHAT_MODEL],
-        json_schema=schema,
-        timeout=RERANK_TIMEOUT,
-    )
-
-    return parsed if isinstance(parsed, dict) else {}
 
 def _should_use_reranker(
     q: str,
@@ -3966,25 +3572,12 @@ def _should_use_reranker(
 
 
 def _unique_non_empty_strings(items: list[Any], limit: Optional[int] = None) -> list[str]:
-    out: list[str] = []
-    seen = set()
-
-    for item in items or []:
-        s = str(item or "").strip()
-        if not s:
-            continue
-
-        k = s.lower()
-        if k in seen:
-            continue
-
-        seen.add(k)
-        out.append(s)
-
-        if limit is not None and len(out) >= limit:
-            break
-
-    return out
+    return _retrieval_retrieval_primitives.unique_non_empty_strings(
+        items,
+        limit,
+        runtime=_retrieval_retrieval_primitives.UniqueNonEmptyStringsRuntime(
+        ),
+    )
 
 
 def _extract_citation_ids_from_root_cause_json(result: dict) -> list[str]:
@@ -5030,30 +4623,10 @@ def _ask_structured_manual_support_score(text: str, terms: list[str]) -> float:
 
 
 def _ask_structured_manual_support_selector_schema() -> dict:
-    return {
-        "name": "ask_structured_manual_support_selector_v1",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "operation_support_indices": {"type": "array", "items": {"type": "integer"}, "maxItems": 3},
-                "safety_support_indices": {"type": "array", "items": {"type": "integer"}, "maxItems": 2},
-                "operation_note": {"type": "string"},
-                "safety_note": {"type": "string"},
-                "rejected_reason": {"type": "string"},
-                "reason": {"type": "string"},
-            },
-            "required": [
-                "operation_support_indices",
-                "safety_support_indices",
-                "operation_note",
-                "safety_note",
-                "rejected_reason",
-                "reason",
-            ],
-        },
-    }
+    return _retrieval_diagnostic_evidence.ask_structured_manual_support_selector_schema(
+        runtime=_retrieval_diagnostic_evidence.AskStructuredManualSupportSelectorSchemaRuntime(
+        ),
+    )
 
 
 def _ask_structured_manual_support_search_schema() -> dict:
@@ -5126,84 +4699,25 @@ def _ask_structured_manual_support_select_with_llm(
     prerequisite. Generic safety, generic maintenance, adjacent processes, or pages that
     merely share broad machine vocabulary must be rejected.
     """
-    if not OPENAI_API_KEY or not candidates:
-        return {
-            "operation_support_indices": [],
-            "safety_support_indices": [],
-            "operation_note": "",
-            "safety_note": "",
-            "reason": "selector disabled or no candidates",
-            "rejected_reason": "",
-        }
-
-    structured_block = _ask_full_context_sources_block(
-        structured_citations,
-        max_context_chars=9000,
+    return _retrieval_diagnostic_evidence.ask_structured_manual_support_select_with_llm(
+        q=q,
+        response_language=response_language,
+        structured_citations=structured_citations,
+        candidates=candidates,
+        runtime=_retrieval_diagnostic_evidence.AskStructuredManualSupportSelectWithLlmRuntime(
+            ASK_EVIDENCE_ANALYZER_MODEL=ASK_EVIDENCE_ANALYZER_MODEL,
+            ASK_STRUCTURED_DIRECT_MODEL=ASK_STRUCTURED_DIRECT_MODEL,
+            ASK_STRUCTURED_DIRECT_TIMEOUT=ASK_STRUCTURED_DIRECT_TIMEOUT,
+            OPENAI_API_KEY=OPENAI_API_KEY,
+            OPENAI_CHAT_MODEL=OPENAI_CHAT_MODEL,
+            OPENAI_RERANK_MODEL=OPENAI_RERANK_MODEL,
+            _ask_full_context_sources_block=_ask_full_context_sources_block,
+            _ask_structured_manual_support_selector_schema=_ask_structured_manual_support_selector_schema,
+            _clean_display_text=_clean_display_text,
+            _openai_chat_json_models=_openai_chat_json_models,
+            re=re,
+        ),
     )
-    cand_parts: list[str] = []
-    for c in candidates:
-        idx = int(c.get("selector_index") or 0)
-        label = str(c.get("display_label") or c.get("citation_id") or "Manual page").strip()
-        page_text = str(c.get("chunk_full") or c.get("snippet") or "")
-        page_text = re.sub(r"\s+", " ", page_text).strip()
-        page_text = _clean_display_text(page_text, max_len=1800)
-        if idx and page_text:
-            cand_parts.append(f"[PAGE_INDEX {idx}] {label}\n{page_text}")
-    candidates_block = "\n\n---\n\n".join(cand_parts)
-    if not candidates_block:
-        return {
-            "operation_support_indices": [],
-            "safety_support_indices": [],
-            "operation_note": "",
-            "safety_note": "",
-            "reason": "no readable candidates",
-            "rejected_reason": "",
-        }
-
-    system_msg = (
-        "You are a strict evidence selector for an industrial AI assistant. "
-        "Use semantic reasoning, not keyword matching. The structured sources are the primary source. "
-        "Manual pages are optional secondary support. Select a manual page ONLY if it directly helps answer the user's exact operation/problem, "
-        "or if it describes an immediate prerequisite/continuation that a technician must perform around the structured operation. "
-        "If a manual page does not use the same workshop wording as the structured procedure but explains the formal manual operation that follows or supports it, it may be selected as related manual support. "
-        "Reject pages that are merely generic safety, generic maintenance, setup overview, unrelated adjustment, or broadly similar machine vocabulary. "
-        "Safety pages may be selected only when the safety instruction is directly applicable to the operation, not as a generic disclaimer. "
-        "If unsure, select nothing. Do not infer from outside knowledge."
-    )
-    user_msg = (
-        f"QUESTION:\n{q}\n\n"
-        f"RESPONSE_LANGUAGE:\n{response_language}\n\n"
-        f"PRIMARY STRUCTURED SOURCES:\n{structured_block}\n\n"
-        f"CANDIDATE MANUAL PAGES:\n{candidates_block}\n\n"
-        "Return JSON only. operation_support_indices are manual PAGE_INDEX values that either directly add operational instructions for the exact requested operation "
-        "or explain an immediate connected manual phase/prerequisite needed around the structured operation. "
-        "safety_support_indices are manual PAGE_INDEX values that provide directly applicable prerequisites/safety for that exact operation. "
-        "operation_note and safety_note must be short, user-facing, and based only on selected pages. "
-        "When the manual page is related support rather than the exact internal procedure, say that clearly. If no selected page exists for a note, leave it empty."
-    )
-    try:
-        parsed = _openai_chat_json_models(
-            [
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_msg},
-            ],
-            models=[ASK_STRUCTURED_DIRECT_MODEL, ASK_EVIDENCE_ANALYZER_MODEL, OPENAI_RERANK_MODEL, OPENAI_CHAT_MODEL],
-            json_schema=_ask_structured_manual_support_selector_schema(),
-            timeout=min(int(ASK_STRUCTURED_DIRECT_TIMEOUT or 60), 55),
-        )
-        if isinstance(parsed, dict):
-            return parsed
-    except Exception as e:
-        print("ASK_STRUCTURED_MANUAL_SELECTOR_FAIL", str(e)[:700])
-
-    return {
-        "operation_support_indices": [],
-        "safety_support_indices": [],
-        "operation_note": "",
-        "safety_note": "",
-        "reason": "selector failed closed",
-        "rejected_reason": "selector failed",
-    }
 
 
 def _ask_structured_direct_fetch_manual_support(
@@ -5251,13 +4765,15 @@ def _ask_structured_direct_fetch_manual_support(
 
 
 def _ask_structured_field_value(c: dict, *keys: str, limit: int = 240) -> str:
-    text = str((c or {}).get("chunk_full") or (c or {}).get("snippet") or (c or {}).get("snippet_clean") or "")
-    fields = _parse_structured_source_fields(text)
-    for k in keys:
-        v = _clean_display_text(fields.get(k) or "", max_len=limit)
-        if v:
-            return v
-    return ""
+    return _retrieval_retrieval_primitives.ask_structured_field_value(
+        c,
+        *keys,
+        limit=limit,
+        runtime=_retrieval_retrieval_primitives.AskStructuredFieldValueRuntime(
+            _clean_display_text=_clean_display_text,
+            _parse_structured_source_fields=_parse_structured_source_fields,
+        ),
+    )
 
 
 def _manual_note_from_grounded_points(grounded_points: list[dict], *, language: str) -> str:
@@ -5748,132 +5264,46 @@ def _v12_mark_structured_roles(citations: list[dict]) -> list[dict]:
 
 
 def _procedure_ui_raw_text(citation: dict) -> str:
-    return str(
-        (citation or {}).get("chunk_full")
-        or (citation or {}).get("snippet")
-        or (citation or {}).get("snippet_clean")
-        or ""
-    ).replace("\r\n", "\n").replace("\r", "\n").strip()
+    return _retrieval_source_parsing.procedure_ui_raw_text(
+        citation,
+        runtime=_retrieval_source_parsing.ProcedureUiRawTextRuntime(
+        ),
+    )
 
 
 def _procedure_ui_fields(citation: dict) -> dict[str, str]:
     """Read complete structured fields, including multiline descriptions."""
-    raw = _procedure_ui_raw_text(citation)
-    if not raw:
-        return {}
-
-    known = {
-        "source_type", "title", "procedure_type", "short_description",
-        "step_number", "description", "category", "solution", "notes",
-        "procedure", "procedura", "parent_procedure", "parent_procedura",
-        "procedure_id", "procedura_id", "procedure_code", "codice_procedura",
-        "procedure_title", "titolo_procedura", "related_procedure",
-        "procedura_collegata",
-    }
-    values: dict[str, list[str]] = {}
-    current = ""
-    for raw_line in raw.split("\n"):
-        line = re.sub(r"[ \t]+", " ", str(raw_line or "")).strip()
-        if not line:
-            continue
-        key = ""
-        value = ""
-        if ":" in line:
-            key_part, value_part = line.split(":", 1)
-            normalized = re.sub(
-                r"[^a-z0-9à-öø-ÿ]+",
-                "_",
-                _normalize_unicode_advanced(key_part).lower(),
-            ).strip("_")
-            if normalized in known:
-                key = normalized
-                value = value_part.strip()
-        if key:
-            current = key
-            values.setdefault(current, [])
-            if value:
-                values[current].append(value)
-        elif current:
-            values.setdefault(current, []).append(line)
-
-    # Compatibility with old one-line records. Prefer the complete values above.
-    out = dict(_parse_structured_source_fields(raw))
-    for key, chunks in values.items():
-        value = re.sub(r"\s+", " ", " ".join(chunks)).strip()
-        if value:
-            out[key] = value
-    return out
+    return _retrieval_source_parsing.procedure_ui_fields(
+        citation,
+        runtime=_retrieval_source_parsing.ProcedureUiFieldsRuntime(
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+            _parse_structured_source_fields=_parse_structured_source_fields,
+            _procedure_ui_raw_text=_procedure_ui_raw_text,
+            re=re,
+        ),
+    )
 
 
 def _procedure_ui_clean(value: Any, *, finish_sentence: bool = False) -> str:
-    text = re.sub(r"\s+", " ", _normalize_unicode_advanced(str(value or ""))).strip()
-    if not text:
-        return ""
-    text = re.sub(
-        r"(?i)\b(?:codice\s+interno|internal\s+code)\s+[A-Z0-9._/-]+\s*[.;,:–—-]?\s*",
-        "",
-        text,
+    return _retrieval_source_parsing.procedure_ui_clean(
+        value,
+        finish_sentence=finish_sentence,
+        runtime=_retrieval_source_parsing.ProcedureUiCleanRuntime(
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+            re=re,
+        ),
     )
-    text = re.sub(r"(?i)\s*[—–-]\s*(?:PROCEDURA|PROCEDURE)\s*:.*$", "", text)
-    text = re.sub(r"(?i)\b(?:MEDIA\s+CORRELATI|RELATED\s+MEDIA)\b.*$", "", text)
-    text = re.sub(r"\s+([,.;:!?])", r"\1", text)
-    text = re.sub(r"([,.;:!?])(?=[A-Za-zÀ-ÖØ-öø-ÿ])", r"\1 ", text)
-    text = re.sub(r"\s+", " ", text).strip(" -–—\t\n")
-    if finish_sentence and text and text[-1] not in ".!?":
-        text += "."
-    return text
 
 
 def _procedure_ui_sections(value: str) -> dict[str, str]:
     """Split the labels used in Procedure/Step descriptions, in IT and EN."""
-    text = str(value or "").replace("\r", "\n").strip()
-    if not text:
-        return {}
-    labels = [
-        ("instruction", "AZIONE OPERATIVA"),
-        ("instruction", "OPERATIONAL ACTION"),
-        ("instruction", "ISTRUZIONE OPERATIVA"),
-        ("instruction", "OPERATIONAL INSTRUCTION"),
-        ("instruction", "OPERATING INSTRUCTION"),
-        ("safety", "NOTA DI SICUREZZA"),
-        ("safety", "SAFETY NOTE"),
-        ("media", "MEDIA CORRELATI"),
-        ("media", "RELATED MEDIA"),
-        ("duration", "DURATA INDICATIVA"),
-        ("duration", "INDICATIVE DURATION"),
-        ("safety_level", "LIVELLO DI SICUREZZA"),
-        ("safety_level", "SAFETY LEVEL"),
-        ("technical_sources", "RIFERIMENTI TECNICI"),
-        ("technical_sources", "TECHNICAL REFERENCES"),
-        ("technical_sources", "FONTI TECNICHE"),
-        ("technical_sources", "TECHNICAL SOURCES"),
-        ("recipients", "DESTINATARI"),
-        ("recipients", "RECIPIENTS"),
-        ("purpose", "SCOPO"),
-        ("purpose", "PURPOSE"),
-        ("purpose", "OBJECTIVE"),
-    ]
-    labels.sort(key=lambda item: len(item[1]), reverse=True)
-    key_by_label = {label.lower(): key for key, label in labels}
-    pattern = re.compile(
-        r"\b(" + "|".join(re.escape(label) for _, label in labels) + r")\b\s*[:：–—-]?\s*",
-        flags=re.IGNORECASE,
+    return _retrieval_source_parsing.procedure_ui_sections(
+        value,
+        runtime=_retrieval_source_parsing.ProcedureUiSectionsRuntime(
+            _procedure_ui_clean=_procedure_ui_clean,
+            re=re,
+        ),
     )
-    matches = list(pattern.finditer(text))
-    if not matches:
-        return {"body": _procedure_ui_clean(text)}
-
-    out: dict[str, str] = {}
-    prefix = _procedure_ui_clean(text[:matches[0].start()])
-    if prefix:
-        out["body"] = prefix
-    for idx, match in enumerate(matches):
-        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
-        body = _procedure_ui_clean(text[match.end():end])
-        key = key_by_label.get(str(match.group(1) or "").lower(), "")
-        if key and body:
-            out[key] = (out.get(key, "") + " " + body).strip()
-    return out
 
 
 def _procedure_ui_complete_excerpt(value: str, *, max_chars: int) -> str:
@@ -5993,12 +5423,13 @@ def _procedure_ui_grounded_by_citation(grounded_points: list[dict]) -> dict[str,
 
 
 def _procedure_ui_is_safety_setup(text: str) -> bool:
-    normalized = _normalize_unicode_advanced(text or "").lower()
-    return bool(re.search(
-        r"\b(?:sicurezza|sicure|arrestare|isolamento|isolare|emergenza|ripari|"
-        r"safe|safety|stop|isolation|isolate|emergency|guard|guards|lockout)\b",
-        normalized,
-    ))
+    return _retrieval_source_parsing.procedure_ui_is_safety_setup(
+        text,
+        runtime=_retrieval_source_parsing.ProcedureUiIsSafetySetupRuntime(
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+            re=re,
+        ),
+    )
 
 
 def _procedure_ui_is_final_verification(text: str) -> bool:
@@ -6429,15 +5860,13 @@ def _v12_procedure_selection_mode(q: str, planner: Optional[dict]) -> str:
 
 
 def _v12_step_contract_text(step: dict) -> str:
-    fields = _procedure_ui_fields(step)
-    sections = _procedure_ui_sections(fields.get("description") or "")
-    return " ".join(
-        [
-            str(fields.get("title") or ""),
-            str(sections.get("instruction") or sections.get("body") or ""),
-            str(sections.get("safety") or ""),
-        ]
-    ).strip()
+    return _retrieval_source_parsing.v12_step_contract_text(
+        step,
+        runtime=_retrieval_source_parsing.V12StepContractTextRuntime(
+            _procedure_ui_fields=_procedure_ui_fields,
+            _procedure_ui_sections=_procedure_ui_sections,
+        ),
+    )
 
 
 def _v12_step_facet_score(step: dict, facet_query: dict, q: str) -> dict:
@@ -7064,25 +6493,12 @@ def _ask_full_context_fetch_pages(
 
 
 def _ask_full_context_sources_block(citations: list[dict], *, max_context_chars: int) -> str:
-    parts: list[str] = []
-    total = 0
-    for c in citations or []:
-        body = str(c.get("chunk_full") or c.get("snippet") or "").strip()
-        if not body:
-            continue
-        part = (
-            f"[{c['citation_id']}] "
-            f"(doc={c['bubble_document_id']}, p{c['page_from']}-{c['page_to']})\n"
-            f"{body}\n"
-        )
-        if total + len(part) > max_context_chars:
-            if not parts:
-                part = part[:max_context_chars]
-                parts.append(part)
-            break
-        parts.append(part)
-        total += len(part)
-    return "\n".join(parts).strip()
+    return _retrieval_diagnostic_evidence.ask_full_context_sources_block(
+        citations,
+        max_context_chars=max_context_chars,
+        runtime=_retrieval_diagnostic_evidence.AskFullContextSourcesBlockRuntime(
+        ),
+    )
 
 
 
@@ -8065,33 +7481,13 @@ def _reorder_citations_by_priority_ids(
     priority_ids: list[str],
     max_items: int,
 ) -> list[dict]:
-    if not citations:
-        return []
-
-    by_id = {
-        str(c.get("citation_id") or "").strip(): c
-        for c in citations
-        if c.get("citation_id")
-    }
-
-    out: list[dict] = []
-    used = set()
-
-    for cid in priority_ids or []:
-        cid = str(cid or "").strip()
-        if not cid or cid in used or cid not in by_id:
-            continue
-        used.add(cid)
-        out.append(by_id[cid])
-
-    for c in citations:
-        cid = str(c.get("citation_id") or "").strip()
-        if not cid or cid in used:
-            continue
-        used.add(cid)
-        out.append(c)
-
-    return out[:max_items]
+    return _retrieval_retrieval_primitives.reorder_citations_by_priority_ids(
+        citations,
+        priority_ids,
+        max_items,
+        runtime=_retrieval_retrieval_primitives.ReorderCitationsByPriorityIdsRuntime(
+        ),
+    )
 
 def _score_root_cause_causal_strength(
     q: str,
@@ -8737,15 +8133,13 @@ def search_chunks(
 
 
 def _should_route_ask_through_root_cause(q: str) -> bool:
-    if _is_lookup_or_identifier_query(q):
-        return False
-    profile = _query_symptom_profile(q)
-    classes = set(profile.get("classes") or [])
-    if "no_start" in classes:
-        return True
-    if classes & {"vibration", "noise", "jam"}:
-        return True
-    return False
+    return _retrieval_query_fallbacks.should_route_ask_through_root_cause(
+        q,
+        runtime=_retrieval_query_fallbacks.ShouldRouteAskThroughRootCauseRuntime(
+            _is_lookup_or_identifier_query=_is_lookup_or_identifier_query,
+            _query_symptom_profile=_query_symptom_profile,
+        ),
+    )
 
 
 def _build_ask_answer_from_root_cause_response(
@@ -10155,149 +9549,17 @@ def _classify_diagnostic_role_from_text(
     diagnostic_keywords: list[str],
     target_subsystems: list[str],
 ) -> dict:
-    chunk_text = (chunk_text or "").strip()
-    if not chunk_text:
-        return {
-            "role_class": "collateral",
-            "role_group": "collateral",
-            "role_adjustment": -0.06,
-            "matched_subsystems": [],
-            "role_reason": "empty_chunk",
-        }
-
-    sig = _root_cause_chunk_signal_summary(
-        q=q,
-        chunk_text=chunk_text,
-        diagnostic_keywords=diagnostic_keywords,
+    return _retrieval_diagnostic_evidence.classify_diagnostic_role_from_text(
+        q,
+        chunk_text,
+        symptom_profile,
+        diagnostic_keywords,
+        target_subsystems,
+        runtime=_retrieval_diagnostic_evidence.ClassifyDiagnosticRoleFromTextRuntime(
+            _root_cause_chunk_signal_summary=_root_cause_chunk_signal_summary,
+            _score_root_cause_subsystem_alignment=_score_root_cause_subsystem_alignment,
+        ),
     )
-    subsystem = _score_root_cause_subsystem_alignment(
-        q=q,
-        chunk_text=chunk_text,
-        target_subsystems=target_subsystems,
-    )
-
-    classes = set(symptom_profile.get("classes") or [])
-    matched_set = {str(x).strip() for x in (subsystem.get("matched_subsystems") or []) if str(x).strip()}
-    direct_subsystems = {"drive_train", "material_feed", "forming", "straightening"}
-    support_subsystems = {"lubrication", "fluid_power", "electrical_control", "safety_installation"}
-    has_support_anchor = bool(symptom_profile.get("has_support_anchor"))
-    automatic_mode = bool(symptom_profile.get("automatic_mode"))
-
-    strong_component_hits = int(sig.get("strong_component_hits", 0) or 0)
-    process_hits = int(sig.get("process_hits", 0) or 0)
-    symptom_hits = int(sig.get("symptom_hits", 0) or 0)
-    lube_hits = int(sig.get("lube_control_hits", 0) or 0)
-    startup_hits = int(sig.get("startup_install_hits", 0) or 0) + int(sig.get("positioning_hits", 0) or 0)
-    safety_hits = int(sig.get("safety_access_hits", 0) or 0) + int(sig.get("acoustic_protection_hits", 0) or 0)
-
-    direct_mechanism_supported = bool(matched_set & direct_subsystems) and (
-        strong_component_hits >= 1 or process_hits >= 1 or symptom_hits >= 1 or float(subsystem.get("subsystem_score", 0.0) or 0.0) > 0.0
-    )
-
-    if "no_start" in classes:
-        if "electrical_control" in matched_set:
-            return {
-                "role_class": "support_electrical_interlock",
-                "role_group": "support",
-                "role_adjustment": 0.16 if automatic_mode else 0.12,
-                "matched_subsystems": sorted(matched_set),
-                "role_reason": "no_start_electrical_control",
-            }
-        if "safety_installation" in matched_set:
-            return {
-                "role_class": "support_safety",
-                "role_group": "support",
-                "role_adjustment": 0.10 if automatic_mode else 0.04,
-                "matched_subsystems": sorted(matched_set),
-                "role_reason": "no_start_safety_interlock",
-            }
-        if "lubrication" in matched_set or lube_hits >= 2:
-            return {
-                "role_class": "support_lubrication",
-                "role_group": "support",
-                "role_adjustment": -0.18 if not has_support_anchor else -0.05,
-                "matched_subsystems": sorted(matched_set),
-                "role_reason": "no_start_lubrication_secondary",
-            }
-
-    if direct_mechanism_supported:
-        if (matched_set & {"forming", "material_feed", "straightening"}) or process_hits >= 1:
-            return {
-                "role_class": "core_process",
-                "role_group": "core",
-                "role_adjustment": 0.14,
-                "matched_subsystems": sorted(matched_set),
-                "role_reason": "direct_process_mechanism",
-            }
-        return {
-            "role_class": "core_mechanical",
-            "role_group": "core",
-            "role_adjustment": 0.12,
-            "matched_subsystems": sorted(matched_set),
-            "role_reason": "direct_mechanical_mechanism",
-        }
-
-    if matched_set & {"fluid_power"}:
-        return {
-            "role_class": "support_fluid_power",
-            "role_group": "support",
-            "role_adjustment": 0.06 if ("jam" in classes or has_support_anchor) else -0.04,
-            "matched_subsystems": sorted(matched_set),
-            "role_reason": "fluid_power_support",
-        }
-
-    if matched_set & {"electrical_control"}:
-        return {
-            "role_class": "support_electrical_interlock",
-            "role_group": "support",
-            "role_adjustment": 0.08 if ("no_start" in classes or has_support_anchor) else -0.03,
-            "matched_subsystems": sorted(matched_set),
-            "role_reason": "electrical_or_control_support",
-        }
-
-    if matched_set & {"lubrication"} or lube_hits >= 2:
-        return {
-            "role_class": "support_lubrication",
-            "role_group": "support",
-            "role_adjustment": 0.04 if has_support_anchor else -0.12,
-            "matched_subsystems": sorted(matched_set),
-            "role_reason": "lubrication_support",
-        }
-
-    if startup_hits >= 2 or bool(sig.get("overview_section_hit")) or bool(sig.get("description_section_hit")):
-        return {
-            "role_class": "support_startup_install",
-            "role_group": "support",
-            "role_adjustment": -0.16 if not has_support_anchor else -0.03,
-            "matched_subsystems": sorted(matched_set),
-            "role_reason": "startup_install_or_overview",
-        }
-
-    if safety_hits >= 2:
-        return {
-            "role_class": "support_safety",
-            "role_group": "support",
-            "role_adjustment": 0.03 if ("no_start" in classes and automatic_mode) else -0.12,
-            "matched_subsystems": sorted(matched_set),
-            "role_reason": "safety_support",
-        }
-
-    if strong_component_hits >= 1 or process_hits >= 1:
-        return {
-            "role_class": "core_mechanical",
-            "role_group": "core",
-            "role_adjustment": 0.06,
-            "matched_subsystems": sorted(matched_set),
-            "role_reason": "component_or_process_anchor_without_subsystem",
-        }
-
-    return {
-        "role_class": "collateral",
-        "role_group": "collateral",
-        "role_adjustment": -0.08,
-        "matched_subsystems": sorted(matched_set),
-        "role_reason": "collateral_or_weak",
-    }
 
 
 def _summarize_evidence_roles_for_prompt(
@@ -10309,41 +9571,23 @@ def _summarize_evidence_roles_for_prompt(
     target_subsystems: Optional[list[str]] = None,
     max_items: int = 8,
 ) -> list[dict]:
-    symptom_profile = dict(symptom_profile or _query_symptom_profile(q))
-    inferred_components = _infer_machine_components(q)
-    diagnostic_keywords = list(diagnostic_keywords or _collect_candidate_keywords(q, inferred_components))
-    target_subsystems = list(target_subsystems or _root_cause_target_subsystems(q, inferred_components))
-
-    out = []
-    used = set()
-    for c in citations or []:
-        cid = str(c.get("citation_id") or "").strip()
-        if not cid or cid in used:
-            continue
-        used.add(cid)
-        chunk_text = (c.get("chunk_full") or c.get("snippet") or "").strip()
-        role = _classify_diagnostic_role_from_text(
-            q=q,
-            chunk_text=chunk_text,
-            symptom_profile=symptom_profile,
-            diagnostic_keywords=diagnostic_keywords,
-            target_subsystems=target_subsystems,
-        )
-        out.append(
-            {
-                "citation_id": cid,
-                "role_class": str(c.get("role_class") or role.get("role_class") or "collateral"),
-                "role_group": str(c.get("role_group") or role.get("role_group") or "collateral"),
-                "role_adjustment": round(float(c.get("role_adjustment", role.get("role_adjustment", 0.0)) or 0.0), 4),
-                "matched_subsystems": list(c.get("matched_subsystems") or role.get("matched_subsystems") or []),
-                "source_type": str(c.get("source_type") or _source_type_from_document_id(c.get("bubble_document_id") or "")),
-                "diagnostic_score": round(float(c.get("candidate_score", c.get("diagnostic_score", c.get("retrieval_score", c.get("similarity", 0.0)))) or 0.0), 4),
-                "snippet": re.sub(r"\s+", " ", (c.get("snippet") or chunk_text or "").strip())[:260],
-            }
-        )
-        if len(out) >= max_items:
-            break
-    return out
+    return _retrieval_diagnostic_evidence.summarize_evidence_roles_for_prompt(
+        q,
+        citations,
+        symptom_profile=symptom_profile,
+        diagnostic_keywords=diagnostic_keywords,
+        target_subsystems=target_subsystems,
+        max_items=max_items,
+        runtime=_retrieval_diagnostic_evidence.SummarizeEvidenceRolesForPromptRuntime(
+            _classify_diagnostic_role_from_text=_classify_diagnostic_role_from_text,
+            _collect_candidate_keywords=_collect_candidate_keywords,
+            _infer_machine_components=_infer_machine_components,
+            _query_symptom_profile=_query_symptom_profile,
+            _root_cause_target_subsystems=_root_cause_target_subsystems,
+            _source_type_from_document_id=_source_type_from_document_id,
+            re=re,
+        ),
+    )
 
 
 def _llm_build_role_aware_diagnostic_evidence_matrix(
@@ -10351,83 +9595,21 @@ def _llm_build_role_aware_diagnostic_evidence_matrix(
     citations: list[dict],
     max_causes: int,
 ) -> dict:
-    if not q or not citations:
-        return {}
-
-    max_causes = max(1, min(int(max_causes or 1), 3))
-    items = []
-    used = set()
-    for c in citations[: max(ROOT_CAUSE_CANDIDATE_MATRIX_TOP_K, max_causes + 5)]:
-        cid = str(c.get("citation_id") or "").strip()
-        if not cid or cid in used:
-            continue
-        used.add(cid)
-        items.append(
-            {
-                "citation_id": cid,
-                "role_class": str(c.get("role_class") or "collateral"),
-                "role_group": str(c.get("role_group") or "collateral"),
-                "role_adjustment": round(float(c.get("role_adjustment", 0.0) or 0.0), 4),
-                "matched_subsystems": list(c.get("matched_subsystems") or []),
-                "evidence_family": _root_cause_evidence_family_key(c),
-                "diagnostic_score": round(float(c.get("candidate_score", c.get("diagnostic_score", c.get("retrieval_score", c.get("similarity", 0.0)))) or 0.0), 4),
-                "source_type": str(c.get("source_type") or _source_type_from_document_id(c.get("bubble_document_id") or "")),
-                "snippet": re.sub(r"\s+", " ", (c.get("chunk_full") or c.get("snippet") or "").strip())[:360],
-            }
-        )
-
-    if not items:
-        return {}
-
-    schema = {
-        "name": "role_aware_diagnostic_evidence_matrix",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "keep_ids": {"type": "array", "items": {"type": "string"}},
-                "discard_ids": {"type": "array", "items": {"type": "string"}},
-                "cause_hypotheses": {
-                    "type": "array",
-                    "maxItems": max_causes,
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "properties": {
-                            "cause": {"type": "string"},
-                            "evidence_ids": {"type": "array", "items": {"type": "string"}},
-                            "check_focus": {"type": "array", "items": {"type": "string"}},
-                        },
-                        "required": ["cause", "evidence_ids", "check_focus"],
-                    },
-                },
-            },
-            "required": ["keep_ids", "discard_ids", "cause_hypotheses"],
-        },
-    }
-
-    system_msg = (
-        "You organize evidence for industrial root-cause diagnosis. "
-        "Use the role metadata strictly. core roles are preferred for generic symptoms such as vibration, noise, or jams. "
-        "support roles (lubrication, startup/install, safety, electrical/interlock, fluid power) may stay only when the symptom explicitly anchors them or when no stronger core evidence is available. "
-        "For no-start and automatic-mode failures, support_electrical_interlock can be primary, but support_lubrication should remain secondary unless directly anchored. "
-        "Maximize distinct causal families and avoid duplicate paraphrases. Keep only the most diagnostic evidence."
-    )
-    user_msg = (
-        f"PROBLEM:\n{q}\n\n"
-        f"ROLE_AWARE_CANDIDATES_JSON:\n{json.dumps(items, ensure_ascii=False)}\n\n"
-        "Return valid JSON."
-    )
-
-    return _openai_chat_json_models(
-        [
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": user_msg},
-        ],
-        models=[DIAGNOSTIC_EVIDENCE_MODEL, ROOT_CAUSE_RESPONSE_MODEL, OPENAI_CHAT_MODEL],
-        json_schema=schema,
-        timeout=70,
+    return _retrieval_diagnostic_evidence.llm_build_role_aware_diagnostic_evidence_matrix(
+        q,
+        citations,
+        max_causes,
+        runtime=_retrieval_diagnostic_evidence.LlmBuildRoleAwareDiagnosticEvidenceMatrixRuntime(
+            DIAGNOSTIC_EVIDENCE_MODEL=DIAGNOSTIC_EVIDENCE_MODEL,
+            OPENAI_CHAT_MODEL=OPENAI_CHAT_MODEL,
+            ROOT_CAUSE_CANDIDATE_MATRIX_TOP_K=ROOT_CAUSE_CANDIDATE_MATRIX_TOP_K,
+            ROOT_CAUSE_RESPONSE_MODEL=ROOT_CAUSE_RESPONSE_MODEL,
+            _openai_chat_json_models=_openai_chat_json_models,
+            _root_cause_evidence_family_key=_root_cause_evidence_family_key,
+            _source_type_from_document_id=_source_type_from_document_id,
+            json=json,
+            re=re,
+        ),
     )
 
 
@@ -10912,11 +10094,16 @@ def _should_attempt_root_cause_candidate(q: str, baseline_response: dict) -> boo
 
 
 def _is_lookup_or_identifier_query(q: str) -> bool:
-    if _q_has_any(q, URL_HINTS) or _q_has_any(q, EMAIL_HINTS) or _q_has_any(q, PHONE_HINTS):
-        return True
-    if _extract_code_tokens(q):
-        return True
-    return False
+    return _retrieval_query_fallbacks.is_lookup_or_identifier_query(
+        q,
+        runtime=_retrieval_query_fallbacks.IsLookupOrIdentifierQueryRuntime(
+            EMAIL_HINTS=EMAIL_HINTS,
+            PHONE_HINTS=PHONE_HINTS,
+            URL_HINTS=URL_HINTS,
+            _extract_code_tokens=_extract_code_tokens,
+            _q_has_any=_q_has_any,
+        ),
+    )
 
 
 def _should_attempt_ask_candidate(q: str, baseline_response: dict) -> bool:
@@ -11817,17 +11004,19 @@ def _v13_cache_store(
 
 
 def _v13_fallback_plan(q: str) -> dict:
-    q_norm = re.sub(r"\s+", " ", _normalize_unicode_advanced(q or "")).strip()
-    return {
-        "intent": "diagnostic" if _should_route_ask_through_root_cause(q_norm) else "other",
-        "normalized_query": q_norm,
-        "query_language": _simple_query_language(q_norm),
-        "dense_queries": [q_norm] if q_norm else [],
-        "lexical_queries": [q_norm] if q_norm else [],
-        "exact_terms": _dedup_text_values(_extract_code_tokens(q_norm) + _v13_query_number_tokens(q_norm), limit=16),
-        "required_facets": _dedup_text_values(list(_content_term_set(q_norm, limit=12)), limit=10),
-        "ambiguities": [],
-    }
+    return _retrieval_query_fallbacks.v13_fallback_plan(
+        q,
+        runtime=_retrieval_query_fallbacks.V13FallbackPlanRuntime(
+            _content_term_set=_content_term_set,
+            _dedup_text_values=_dedup_text_values,
+            _extract_code_tokens=_extract_code_tokens,
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+            _should_route_ask_through_root_cause=_should_route_ask_through_root_cause,
+            _simple_query_language=_simple_query_language,
+            _v13_query_number_tokens=_v13_query_number_tokens,
+            re=re,
+        ),
+    )
 
 
 
@@ -12700,37 +11889,15 @@ def _v13_evidence_metrics(candidates: list[dict]) -> dict:
 
 
 def _v13_build_profile_from_plan(q: str, language: str, plan: Optional[dict]) -> dict:
-    profile = _ask_evidence_fallback_profile(q, language)
-    plan = dict(plan or {})
-    profile["search_phrases"] = _dedup_text_values(
-        list(profile.get("search_phrases") or [])
-        + list(plan.get("dense_queries") or [])
-        + list(plan.get("lexical_queries") or []),
-        limit=24,
+    return _retrieval_query_fallbacks.v13_build_profile_from_plan(
+        q,
+        language,
+        plan,
+        runtime=_retrieval_query_fallbacks.V13BuildProfileFromPlanRuntime(
+            _ask_evidence_fallback_profile=_ask_evidence_fallback_profile,
+            _dedup_text_values=_dedup_text_values,
+        ),
     )
-    profile["search_terms_it"] = _dedup_text_values(
-        list(profile.get("search_terms_it") or []) + list(plan.get("exact_terms") or []) + list(plan.get("required_facets") or []),
-        limit=32,
-    )
-    profile["search_terms_en"] = _dedup_text_values(
-        list(profile.get("search_terms_en") or []) + list(plan.get("exact_terms") or []) + list(plan.get("required_facets") or []),
-        limit=32,
-    )
-    profile["required_information"] = _dedup_text_values(
-        list(profile.get("required_information") or []) + list(plan.get("required_facets") or []),
-        limit=20,
-    )
-    profile["important_codes_or_numbers"] = _dedup_text_values(
-        list(profile.get("important_codes_or_numbers") or []) + list(plan.get("exact_terms") or []),
-        limit=24,
-    )
-    intent = str(plan.get("intent") or "").strip().lower()
-    if intent in {"factual", "procedural", "listing", "comparison", "diagnostic"}:
-        profile["answer_type"] = {
-            "listing": "list",
-            "diagnostic": "diagnostic",
-        }.get(intent, intent)
-    return profile
 
 
 
@@ -15351,28 +14518,13 @@ def _assistant_core_enumeration_requested(
     asks retrieval/verification to preserve complete option lists instead of a few
     representative examples. Italian and English are supported symmetrically.
     """
-    query = _normalize_unicode_advanced(str(request.query or "")).lower()
-    interrogative = re.search(
-        r"\b(?:quali|elenca(?:mi|re)?|tutt[ei]|which|what|list|all|available)\b",
-        query,
-    )
-    enumerable = re.search(
-        r"\b(?:tip[oi]|modalit[aà]|opzion[ei]|impostazion[ei]|parametr[oi]|"
-        r"controll[oi]|component[ei]|grupp[oi]|voc[ei]|stat[oi]|azion[ei]|"
-        r"selezion[ei]|types?|modes?|options?|settings?|parameters?|controls?|"
-        r"components?|groups?|items?|states?|actions?|selections?)\b",
-        query,
-    )
-    if interrogative and enumerable:
-        return True
-    # Router facets are semantic and may expose the same intent even when the user
-    # uses terse wording such as "configurable controls?".
-    facet_text = _normalize_unicode_advanced(
-        " ".join(list(decision.required_facets or []))
-    ).lower()
-    return bool(
-        re.search(r"\b(?:tipo|modalit[aà]|opzion|impostazion|parametr|control|type|mode|option|setting|parameter)\b", facet_text)
-        and re.search(r"\b(?:quali|which|what|elenca|list|tutti|all)\b", query)
+    return _retrieval_context_expansion.assistant_core_enumeration_requested(
+        request,
+        decision,
+        runtime=_retrieval_context_expansion.AssistantCoreEnumerationRequestedRuntime(
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+            re=re,
+        ),
     )
 
 
@@ -15382,73 +14534,23 @@ def _assistant_core_extract_enumerated_items(text: str, *, limit: int = 48) -> l
     These are candidates, not automatically trusted requirements. The semantic
     verifier keeps only labels relevant to the user's requested category.
     """
-    raw_lines = [re.sub(r"\s+", " ", line).strip() for line in str(text or "").splitlines()]
-    out: list[str] = []
-    bullet_pending = False
-
-    def add(label: str) -> None:
-        value = re.sub(r"^[\-•*\u2022\s]+", "", str(label or "")).strip(" .;:-")
-        if not value or len(value) < 2 or len(value) > 72:
-            return
-        words = value.split()
-        if len(words) > 9:
-            return
-        if not re.search(r"[A-Za-zÀ-ÖØ-öø-ÿ]", value):
-            return
-        low = value.casefold()
-        if low in {"note", "attention", "description", "section", "source_type"}:
-            return
-        if low not in {x.casefold() for x in out}:
-            out.append(value)
-
-    for line in raw_lines:
-        if not line:
-            continue
-        if line in {"-", "•", "*", "–"}:
-            bullet_pending = True
-            continue
-        marked = bool(re.match(r"^[\-•*–]\s*", line))
-        candidate = re.sub(r"^[\-•*–]\s*", "", line).strip()
-        if bullet_pending or marked:
-            label = re.split(r"\s*[:;–—]\s*", candidate, maxsplit=1)[0]
-            add(label)
-            bullet_pending = False
-        else:
-            bullet_pending = False
-
-        # Short inline alternatives are common in structured Step records.
-        if "/" in line and re.search(
-            r"(?i)\b(?:tipo|type|modalit|mode|azione|action|arrest|stop|polar|control|controll)\b",
-            line,
-        ):
-            tail = line.split(":", 1)[-1]
-            for part in re.split(r"\s*/\s*", tail):
-                add(re.split(r"\s*[,;.]\s*", part, maxsplit=1)[0])
-        if len(out) >= limit:
-            break
-
-    # PDF/HMI extraction often flattens bullets into one paragraph. Recover short
-    # labels immediately followed by a colon without relying on a specific machine
-    # or language. The semantic verifier later keeps only labels in the requested
-    # category, so this expands recall without declaring every label mandatory.
-    flat = re.sub(r"\s+", " ", str(text or "")).strip()
-    for match in re.finditer(
-        r"(?:(?<=^)|(?<=[.;•]))\s*([A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ0-9 /_-]{1,46})\s*:\s*",
-        flat,
-    ):
-        add(match.group(1))
-        if len(out) >= limit:
-            break
-    return out[:limit]
+    return _retrieval_context_expansion.assistant_core_extract_enumerated_items(
+        text,
+        limit=limit,
+        runtime=_retrieval_context_expansion.AssistantCoreExtractEnumeratedItemsRuntime(
+            re=re,
+        ),
+    )
 
 
 def _assistant_core_enumeration_metrics(text: str) -> dict:
-    items = _assistant_core_extract_enumerated_items(text, limit=48)
-    headings = len(re.findall(
-        r"(?m)^\s*[A-ZÀ-ÖØ-Þ][A-ZÀ-ÖØ-Þ0-9 _/\-]{2,45}:\s*$",
-        str(text or ""),
-    ))
-    return {"items": items, "item_count": len(items), "heading_count": headings}
+    return _retrieval_context_expansion.assistant_core_enumeration_metrics(
+        text,
+        runtime=_retrieval_context_expansion.AssistantCoreEnumerationMetricsRuntime(
+            _assistant_core_extract_enumerated_items=_assistant_core_extract_enumerated_items,
+            re=re,
+        ),
+    )
 
 
 def _assistant_core_list_item_in_answer(item: str, answer: str) -> bool:
@@ -15482,74 +14584,23 @@ def _assistant_core_expand_enumeration_sections(
     document around that hit. It never crosses company/machine scope and therefore
     improves recall without replacing the ranked baseline.
     """
-    docs: dict[str, dict] = {}
-    for c in candidates or []:
-        if not isinstance(c, dict):
-            continue
-        bdid = str(c.get("bubble_document_id") or "").strip()
-        if not bdid or _is_structured_source_key(bdid):
-            continue
-        p1 = _safe_int(c.get("page_from"), 0)
-        p2 = _safe_int(c.get("page_to"), p1)
-        if p1 <= 0:
-            continue
-        score = float(c.get("v13_score", c.get("retrieval_score", c.get("similarity", 0.0))) or 0.0)
-        row = docs.setdefault(bdid, {"low": p1, "high": max(p1, p2), "score": score})
-        row["low"] = min(int(row["low"]), p1)
-        row["high"] = max(int(row["high"]), max(p1, p2))
-        row["score"] = max(float(row["score"]), score)
-    selected_docs = sorted(docs.items(), key=lambda x: -float(x[1]["score"]))[:max_documents]
-    if not selected_docs:
-        return []
-    out: list[dict] = []
-    conn = None
-    try:
-        conn = _db_conn()
-        with conn.cursor() as cur:
-            for bdid, meta in selected_docs:
-                low = max(1, int(meta["low"]) - int(page_radius))
-                high = int(meta["high"]) + int(page_radius)
-                cur.execute(
-                    """
-                    SELECT machine_id, page_number, LEFT(COALESCE(text, ''), %s)
-                    FROM public.document_pages
-                    WHERE company_id=%s AND bubble_document_id=%s
-                      AND page_number BETWEEN %s AND %s
-                      AND text IS NOT NULL AND length(text) > 20
-                    ORDER BY page_number
-                    LIMIT %s;
-                    """,
-                    (V13_PAGE_TEXT_CHARS, request.company_id, bdid, low, high, max_pages),
-                )
-                for mid, page_number, page_text in cur.fetchall():
-                    text = str(page_text or "").strip()
-                    if not text:
-                        continue
-                    page = _safe_int(page_number, 1)
-                    out.append({
-                        "citation_id": f"{bdid}:p{page}-{page}:assistant-core:section",
-                        "bubble_document_id": bdid,
-                        "chunk_index": 0,
-                        "page_from": page,
-                        "page_to": page,
-                        "snippet": text[:ASK_SNIPPET_CHARS],
-                        "snippet_clean": text[:ASK_SNIPPET_CHARS],
-                        "chunk_full": text[:V13_PAGE_TEXT_CHARS],
-                        "similarity": min(0.92, max(0.0, 0.50 + float(meta["score"]) * 0.08)),
-                        "semantic_similarity": 0.0,
-                        "retrieval_score": float(meta["score"]),
-                        "v13_score": float(meta["score"]),
-                        "exact_machine_scope": str(mid or "").strip() == str(request.machine_id or "").strip(),
-                        "source_type": _source_type_from_document_id(bdid),
-                        "assistant_core_section_expansion": True,
-                    })
-    except Exception as exc:
-        print("ASSISTANT_CORE_SECTION_EXPANSION_FAIL", str(exc)[:500])
-    finally:
-        if conn is not None:
-            try: conn.close()
-            except Exception: pass
-    return _dedup_citations_by_snippet(out, max_items=max_pages)
+    return _retrieval_context_expansion.assistant_core_expand_enumeration_sections(
+        request=request,
+        retrieval=retrieval,
+        candidates=candidates,
+        max_documents=max_documents,
+        page_radius=page_radius,
+        max_pages=max_pages,
+        runtime=_retrieval_context_expansion.AssistantCoreExpandEnumerationSectionsRuntime(
+            ASK_SNIPPET_CHARS=ASK_SNIPPET_CHARS,
+            V13_PAGE_TEXT_CHARS=V13_PAGE_TEXT_CHARS,
+            _db_conn=_db_conn,
+            _dedup_citations_by_snippet=_dedup_citations_by_snippet,
+            _is_structured_source_key=_is_structured_source_key,
+            _safe_int=_safe_int,
+            _source_type_from_document_id=_source_type_from_document_id,
+        ),
+    )
 
 
 def _assistant_core_source_diversity_pool(candidates: list[dict], *, per_type: int = 2) -> list[dict]:
@@ -16901,81 +15952,19 @@ def _assistant_core_root_applicability_records(
     document/company scope. No machine vocabulary, headings or page constants
     are used to choose them: only each excerpt's own ordered page neighbourhood.
     """
-    ranges: dict[str, set[int]] = {}
-    for c in candidates[:14]:
-        if _assistant_core_candidate_source_type(c) != "document":
-            continue
-        bdid = str(c.get("bubble_document_id") or "").strip()
-        first = _safe_int(c.get("page_from"), 0)
-        last = max(first, _safe_int(c.get("page_to"), first))
-        if not bdid or first <= 0 or _is_structured_source_key(bdid):
-            continue
-        if bdid not in ranges and len(ranges) >= 6:
-            continue
-        ranges.setdefault(bdid, set()).update(range(max(1, first - 2), min(last, first + 2) + 1))
-    pages: dict[tuple[str, int], str] = {}
-    context_error = ""
-    if ranges:
-        where, params = _ask_evidence_scope_where(
-            company_id=request.company_id, machine_id=request.machine_id,
-            doc_ids=_assistant_core_scope_value(request, "document_ids"),
-            bubble_document_id=_assistant_core_scope_value(request, "bubble_document_id"),
-        )
-        predicates = []
-        for bdid, page_numbers in ranges.items():
-            predicates.append("(bubble_document_id = %s AND page_number = ANY(%s))")
-            params.extend([bdid, sorted(page_numbers)[:12]])
-        conn = None
-        try:
-            conn = _db_conn()
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT bubble_document_id, page_number, LEFT(COALESCE(text, ''), 6500) "
-                    "FROM public.document_pages WHERE " + where + " AND (" +
-                    " OR ".join(predicates) + ") ORDER BY bubble_document_id, page_number LIMIT 72",
-                    params,
-                )
-                for doc, page, text in cur.fetchall():
-                    key = (str(doc or ""), int(page or 0))
-                    if key[0] in ranges and key[1] in ranges[key[0]]:
-                        pages[key] = str(text or "")
-        except Exception as exc:
-            # Lack of owner context must remain visible; never infer the owner.
-            context_error = type(exc).__name__
-            print("ROOT_OWNER_CONTEXT_UNAVAILABLE", context_error)
-        finally:
-            if conn is not None:
-                try:
-                    conn.close()
-                except Exception as exc:
-                    print("ROOT_OWNER_CONTEXT_CLOSE_ERROR", type(exc).__name__)
-    records: list[dict] = []
-    for c in candidates[:14]:
-        cid = str(c.get("citation_id") or "").strip()
-        text = _assistant_core_candidate_evidence_text(c)
-        if not cid or not text:
-            continue
-        bdid = str(c.get("bubble_document_id") or "")
-        first = max(1, _safe_int(c.get("page_from"), 1))
-        last = max(first, _safe_int(c.get("page_to"), first))
-        context_pages = [
-            {"page_number": page, "text": pages[(bdid, page)],
-             "read_limit_reached": len(pages[(bdid, page)]) >= 6500}
-            for page in range(max(1, first - 2), min(last, first + 2) + 1)
-            if pages.get((bdid, page))
-        ]
-        records.append({
-            "citation_id": cid,
-            "source_type": _assistant_core_candidate_source_type(c),
-            "page_from": first, "page_to": last,
-            "text": text,
-            "context_pages": context_pages,
-            "context_status": (
-                "unavailable:" + context_error if context_error and bdid in ranges else
-                "loaded" if context_pages else "no_neighbour_context"
-            ),
-        })
-    return records
+    return _retrieval_context_expansion.assistant_core_root_applicability_records(
+        request,
+        candidates,
+        runtime=_retrieval_context_expansion.AssistantCoreRootApplicabilityRecordsRuntime(
+            _ask_evidence_scope_where=_ask_evidence_scope_where,
+            _assistant_core_candidate_evidence_text=_assistant_core_candidate_evidence_text,
+            _assistant_core_candidate_source_type=_assistant_core_candidate_source_type,
+            _assistant_core_scope_value=_assistant_core_scope_value,
+            _db_conn=_db_conn,
+            _is_structured_source_key=_is_structured_source_key,
+            _safe_int=_safe_int,
+        ),
+    )
 
 
 def _assistant_core_adjudicate_root_cause_grounded(
@@ -17933,19 +16922,13 @@ def _assistant_core_candidate_evidence_text(candidate: dict) -> str:
     contain the exact machine/component designation even when a selected page
     does not repeat it. Internal citation ids are intentionally excluded.
     """
-    parts: list[str] = []
-    seen: set[str] = set()
-    for raw in (
-        candidate.get("display_title"),
-        candidate.get("display_label"),
-        _v13_candidate_text(candidate),
-    ):
-        value = str(raw or "").strip()
-        key = _normalize_unicode_advanced(value).casefold()
-        if value and key not in seen:
-            parts.append(value)
-            seen.add(key)
-    return "\n".join(parts)
+    return _retrieval_retrieval_primitives.assistant_core_candidate_evidence_text(
+        candidate,
+        runtime=_retrieval_retrieval_primitives.AssistantCoreCandidateEvidenceTextRuntime(
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+            _v13_candidate_text=_v13_candidate_text,
+        ),
+    )
 
 
 def _assistant_core_recover_citations(
