@@ -9,6 +9,10 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 import re
 
+from .chunk_evidence import (ChunkEvidenceLimits, ChunkEvidenceRead, ChunkReadScope,
+                             ChunkReadBindingError,
+                             build_chunk_read, strip_binding_columns, validate_read)
+
 
 @dataclass(frozen=True)
 class LexicalRuntime:
@@ -69,12 +73,50 @@ def fts_search_chunks_prefix(
     runtime: LexicalRuntime,
     build_prefix_query: Callable[..., Optional[str]],
 ) -> list[dict]:
+    """Unchanged legacy view; no canonical conversion is activated here."""
+    return _read_fts_search_chunks_prefix(
+        company_id, machine_id, texts, top_k, doc_ids, bubble_document_id,
+        runtime=runtime, build_prefix_query=build_prefix_query,
+        include_binding_columns=False,
+    )[0]
+
+
+def read_prefix_chunk_evidence(
+    *, scope: ChunkReadScope, texts: list[str], top_k: int,
+    runtime: LexicalRuntime, build_prefix_query: Callable[..., Optional[str]],
+    limits: ChunkEvidenceLimits,
+) -> ChunkEvidenceRead:
+    """Bound prefix-FTS view; same query builder and one scoped SQL statement."""
+    validate_read(scope, top_k, limits)
+    candidates, rows = _read_fts_search_chunks_prefix(
+        **scope.sql_selectors(), texts=texts, top_k=top_k, runtime=runtime,
+        build_prefix_query=build_prefix_query, include_binding_columns=True,
+    )
+    if len(rows) > top_k:
+        raise ChunkReadBindingError("SQL returned more rows than the requested LIMIT")
+    return build_chunk_read(scope=scope, kind="fts_prefix", rows=rows,
+                            candidates=candidates, limits=limits)
+
+
+def _read_fts_search_chunks_prefix(
+    company_id: str,
+    machine_id: str,
+    texts: list[str],
+    top_k: int,
+    doc_ids: Optional[list[str]] = None,
+    bubble_document_id: Optional[str] = None,
+    *,
+    runtime: LexicalRuntime,
+    build_prefix_query: Callable[..., Optional[str]],
+    include_binding_columns: bool,
+) -> tuple[list[dict], list[tuple]]:
     _build_prefix_tsquery_from_texts = build_prefix_query
     _db_conn = runtime.connect_db
     ASK_SNIPPET_CHARS = runtime.snippet_chars
+    binding_columns = ", company_id AS evidence_company_id, machine_id AS evidence_machine_id" if include_binding_columns else ""
     ts_query = _build_prefix_tsquery_from_texts(texts, limit=10)
     if not ts_query:
-        return []
+        return [], []
 
     conn = _db_conn()
     try:
@@ -103,7 +145,7 @@ def fts_search_chunks_prefix(
                        ts_rank_cd(
                            to_tsvector('simple', chunk_text),
                            to_tsquery('simple', %s)
-                       ) AS rank
+                       ) AS rank{binding_columns}
                 FROM public.document_chunks
                 WHERE {where_sql}
                   AND to_tsvector('simple', chunk_text) @@ to_tsquery('simple', %s)
@@ -113,6 +155,9 @@ def fts_search_chunks_prefix(
                 [ASK_SNIPPET_CHARS, ts_query, *params, ts_query, top_k],
             )
             rows = cur.fetchall()
+            bound_rows = rows if include_binding_columns else []
+            if include_binding_columns:
+                rows = strip_binding_columns(rows, width=6)
 
         out: list[dict] = []
         for (bdid, chunk_index, page_from, page_to, snippet, _rank) in rows:
@@ -128,7 +173,7 @@ def fts_search_chunks_prefix(
                     "similarity": 0.0,
                 }
             )
-        return out
+        return out, bound_rows
     finally:
         conn.close()
 
@@ -144,11 +189,46 @@ def fts_search_chunks(
     *,
     runtime: LexicalRuntime,
 ) -> list[dict]:
+    """Unchanged legacy view; no canonical conversion is activated here."""
+    return _read_fts_search_chunks(
+        company_id, machine_id, q, top_k, doc_ids, bubble_document_id,
+        runtime=runtime, include_binding_columns=False,
+    )[0]
+
+
+def read_fts_chunk_evidence(
+    *, scope: ChunkReadScope, q: str, top_k: int,
+    runtime: LexicalRuntime, limits: ChunkEvidenceLimits,
+) -> ChunkEvidenceRead:
+    """Bound plain-FTS view; raw FTS rank retained separately, never cosine."""
+    validate_read(scope, top_k, limits)
+    candidates, rows = _read_fts_search_chunks(
+        **scope.sql_selectors(), q=q, top_k=top_k, runtime=runtime,
+        include_binding_columns=True,
+    )
+    if len(rows) > top_k:
+        raise ChunkReadBindingError("SQL returned more rows than the requested LIMIT")
+    return build_chunk_read(scope=scope, kind="fts", rows=rows,
+                            candidates=candidates, limits=limits)
+
+
+def _read_fts_search_chunks(
+    company_id: str,
+    machine_id: str,
+    q: str,
+    top_k: int,
+    doc_ids: Optional[list[str]] = None,
+    bubble_document_id: Optional[str] = None,
+    *,
+    runtime: LexicalRuntime,
+    include_binding_columns: bool,
+) -> tuple[list[dict], list[tuple]]:
     _db_conn = runtime.connect_db
     ASK_SNIPPET_CHARS = runtime.snippet_chars
+    binding_columns = ", company_id AS evidence_company_id, machine_id AS evidence_machine_id" if include_binding_columns else ""
     q = (q or "").strip()
     if not q:
-        return []
+        return [], []
 
     conn = _db_conn()
     try:
@@ -177,7 +257,7 @@ def fts_search_chunks(
                        ts_rank_cd(
                            to_tsvector('simple', chunk_text),
                            plainto_tsquery('simple', %s)
-                       ) AS rank
+                       ) AS rank{binding_columns}
                 FROM public.document_chunks
                 WHERE {where_sql}
                   AND to_tsvector('simple', chunk_text) @@ plainto_tsquery('simple', %s)
@@ -187,6 +267,9 @@ def fts_search_chunks(
                 [ASK_SNIPPET_CHARS, q, *params, q, top_k],
             )
             rows = cur.fetchall()
+            bound_rows = rows if include_binding_columns else []
+            if include_binding_columns:
+                rows = strip_binding_columns(rows, width=6)
 
             out: list[dict] = []
             for (bdid, chunk_index, page_from, page_to, snippet, _rank) in rows:
@@ -202,7 +285,7 @@ def fts_search_chunks(
                         "similarity": 0.0,
                     }
                 )
-            return out
+            return out, bound_rows
     finally:
         conn.close()
 

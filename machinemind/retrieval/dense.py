@@ -8,6 +8,10 @@ rewrite or a new query-scope policy.
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
+from .chunk_evidence import (ChunkEvidenceLimits, ChunkEvidenceRead, ChunkReadScope,
+                             ChunkReadBindingError,
+                             build_chunk_read, strip_binding_columns, validate_read)
+
 
 @dataclass(frozen=True)
 class DenseRuntime:
@@ -37,8 +41,60 @@ def fetch_dense_chunk_candidates(
     debug: bool = False,
     runtime: DenseRuntime,
 ) -> tuple[Optional[int], list[tuple]]:
+    """Legacy view: exact pre-P6-B1 SQL, row shape, ordering and call count."""
+    return _read_dense_chunk_rows(
+        company_id=company_id, machine_id=machine_id, q_vec_lit=q_vec_lit,
+        candidate_k=candidate_k, doc_ids=doc_ids,
+        bubble_document_id=bubble_document_id, debug=debug, runtime=runtime,
+        include_binding_columns=False,
+    )
+
+
+def read_dense_chunk_evidence(
+    *,
+    scope: ChunkReadScope,
+    q_vec_lit: str,
+    candidate_k: int,
+    limits: ChunkEvidenceLimits,
+    runtime: DenseRuntime,
+    query_used: Optional[str] = None,
+    debug: bool = False,
+) -> ChunkEvidenceRead:
+    """Opt-in bound view of the SAME SQL read, not a second metadata query.
+
+    Source association comes from the two additional selected DB columns.
+    Embedding generation remains the caller's existing responsibility. This
+    function neither embeds nor changes query planning, limits or ranking.
+    """
+    validate_read(scope, candidate_k, limits)
+    count, rows = _read_dense_chunk_rows(
+        **scope.sql_selectors(), q_vec_lit=q_vec_lit, candidate_k=candidate_k,
+        debug=debug, runtime=runtime, include_binding_columns=True,
+    )
+    if len(rows) > candidate_k:
+        raise ChunkReadBindingError("SQL returned more rows than the requested LIMIT")
+    candidates = raw_rows_to_dense_candidates(strip_binding_columns(rows, width=9),
+                                               query_used=query_used)
+    return build_chunk_read(scope=scope, kind="dense", rows=rows,
+                            candidates=candidates, limits=limits,
+                            chunks_matching_filter=count)
+
+
+def _read_dense_chunk_rows(
+    *,
+    company_id: str,
+    machine_id: str,
+    q_vec_lit: str,
+    candidate_k: int,
+    doc_ids: Optional[list[str]] = None,
+    bubble_document_id: Optional[str] = None,
+    debug: bool = False,
+    runtime: DenseRuntime,
+    include_binding_columns: bool,
+) -> tuple[Optional[int], list[tuple]]:
     _db_conn = runtime.connect_db
     ASK_SNIPPET_CHARS = runtime.snippet_chars
+    binding_columns = ", company_id AS evidence_company_id, machine_id AS evidence_machine_id" if include_binding_columns else ""
     chunks_matching_filter = None
 
     conn = _db_conn()
@@ -59,13 +115,13 @@ def fetch_dense_chunk_candidates(
                     chunks_matching_filter = int(cur.fetchone()[0] or 0)
 
                 cur.execute(
-                    """
+                    f"""
                     SELECT bubble_document_id, chunk_index, page_from, page_to,
                            left(chunk_text, %s) AS snippet,
                            left(chunk_text, 2000) AS chunk_full,
                            1 - (embedding <=> %s::vector) AS similarity,
                            embedding,
-                           CASE WHEN machine_id = %s THEN TRUE ELSE FALSE END AS exact_machine_scope
+                           CASE WHEN machine_id = %s THEN TRUE ELSE FALSE END AS exact_machine_scope{binding_columns}
                     FROM public.document_chunks
                     WHERE company_id = %s
                       AND bubble_document_id = ANY(%s)
@@ -94,13 +150,13 @@ def fetch_dense_chunk_candidates(
                     chunks_matching_filter = int(cur.fetchone()[0] or 0)
 
                 cur.execute(
-                    """
+                    f"""
                     SELECT bubble_document_id, chunk_index, page_from, page_to,
                            left(chunk_text, %s) AS snippet,
                            left(chunk_text, 2000) AS chunk_full,
                            1 - (embedding <=> %s::vector) AS similarity,
                            embedding,
-                           CASE WHEN machine_id = %s THEN TRUE ELSE FALSE END AS exact_machine_scope
+                           CASE WHEN machine_id = %s THEN TRUE ELSE FALSE END AS exact_machine_scope{binding_columns}
                     FROM public.document_chunks
                     WHERE company_id = %s
                       AND bubble_document_id = %s
@@ -127,13 +183,13 @@ def fetch_dense_chunk_candidates(
                     chunks_matching_filter = int(cur.fetchone()[0] or 0)
 
                 cur.execute(
-                    """
+                    f"""
                     SELECT bubble_document_id, chunk_index, page_from, page_to,
                            left(chunk_text, %s) AS snippet,
                            left(chunk_text, 2000) AS chunk_full,
                            1 - (embedding <=> %s::vector) AS similarity,
                            embedding,
-                           CASE WHEN machine_id = %s THEN TRUE ELSE FALSE END AS exact_machine_scope
+                           CASE WHEN machine_id = %s THEN TRUE ELSE FALSE END AS exact_machine_scope{binding_columns}
                     FROM public.document_chunks
                     WHERE company_id = %s
                       AND embedding IS NOT NULL
