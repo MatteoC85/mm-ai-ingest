@@ -121,6 +121,7 @@ from machinemind.core.scope import (
 from machinemind.ask import execution as _ask_execution
 from machinemind.ask import validation as _ask_validation
 from machinemind.ask import request_flow as _ask_request_flow
+from machinemind.ask import request_binding as _ask_request_binding
 
 from machinemind.infrastructure.execution import (
     json_with_hard_timeout as _infra_json_with_hard_timeout,
@@ -17269,6 +17270,17 @@ def _assistant_core_technical_error(
 
 
 
+def _assistant_core_run_request(request: AssistantCoreRequest) -> dict:
+    return _ask_request_binding.run_core_request(
+        request,
+        core=_ASSISTANT_CORE_ENGINE,
+        runtimes=_ask_request_binding.AskRuntimeFactories(
+            execution=_assistant_core_ask_execution_runtime,
+            validation=_assistant_core_ask_validation_runtime,
+        ),
+    )
+
+
 def _assistant_core_request_flow_runtime() -> _ask_request_flow.RequestFlowRuntime:
     return _ask_request_flow.RequestFlowRuntime(
         AI_INTERNAL_SECRET=AI_INTERNAL_SECRET,
@@ -17307,7 +17319,7 @@ def _assistant_core_request_flow_runtime() -> _ask_request_flow.RequestFlowRunti
         _v13_cache_lookup=_v13_cache_lookup,
         _v13_cache_store=_v13_cache_store,
         response_has_rejected_answer=response_has_rejected_answer,
-        run_core=_ASSISTANT_CORE_ENGINE.run,
+        run_core=_assistant_core_run_request,
     )
 
 
