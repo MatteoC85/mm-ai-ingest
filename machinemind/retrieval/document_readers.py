@@ -1,13 +1,21 @@
-"""P4-C4: unchanged scoped document/page readers and existing support-selection coordinators behind explicit runtime dependencies.
+"""P6-B2: opt-in bound views alongside the behavior-preserving P4 readers.
 
-This is an extraction, not a new evidence policy. The composition root supplies
-database, metadata, scoring, policy and existing selector callbacks at call time. This module
-has no application, database, provider or web-framework import. Legacy decisions,
-ordering, exception handling and budget checks are deliberately preserved.
+The composition root still invokes the legacy entry points. Only explicit new
+read_*_evidence calls retain authoritative columns from the same SELECT and
+build P5-compatible snapshots; no consumer or ASK activation is changed here.
+Legacy heuristics, scores, query parameters and fallback behavior remain intact.
 """
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, TYPE_CHECKING
+from .page_evidence import (PAGE_BINDING_COLUMNS, PageEvidenceRead, PageReadBindingError,
+                            _PageReadCapture)
+from .chunk_evidence import ChunkReadScope, ChunkEvidenceLimits
+from .relation_evidence import (RELATION_BINDING_COLUMNS, RelationEvidenceRead,
+                                validate_relation_request, build_relation_read)
+from ..evidence.contracts import SourceIdentity
+
+
 if TYPE_CHECKING:
     from assistant_core_v2 import AssistantCoreRequest
 
@@ -57,12 +65,42 @@ def db_fetch_parent_procedure_pages_for_steps(
     text_chars: int,
     runtime: DbFetchParentProcedurePagesForStepsRuntime,
 ) -> list[dict]:
+    """Legacy entry: existing relation SQL, fallback and result shape preserved."""
+    return _db_fetch_parent_procedure_pages_for_steps_impl(company_id=company_id, machine_id=machine_id, child_source_keys=child_source_keys, text_chars=text_chars, runtime=runtime)
+
+
+def read_parent_procedure_page_evidence(*, scope: ChunkReadScope, children: tuple[SourceIdentity, ...],
+                                        current_allowed_sources: frozenset[SourceIdentity],
+                                        text_chars: int, limits: ChunkEvidenceLimits,
+                                        runtime: DbFetchParentProcedurePagesForStepsRuntime) -> RelationEvidenceRead:
+    validate_relation_request(scope=scope, kind="parent_procedures", anchors=children,
+        current_allowed_sources=current_allowed_sources, text_chars=text_chars, limits=limits)
+    if len(children) > 500:
+        raise PageReadBindingError("child selector list exceeds existing parent reader bound")
+    rows = _db_fetch_parent_procedure_pages_for_steps_impl(company_id=scope.company_id,
+        machine_id=scope.machine_id, child_source_keys=["step:" + a.source_id for a in children],
+        text_chars=text_chars, runtime=runtime, _include_binding_columns=True,
+        _row_budget=limits.assembly.max_occurrences)
+    return build_relation_read(scope=scope, kind="parent_procedures", anchors=children,
+        current_allowed_sources=current_allowed_sources, text_chars=text_chars, limits=limits,
+        relation_type=runtime.STRUCTURED_RELATION_PROCEDURE_STEP, rows=rows)
+
+
+def _db_fetch_parent_procedure_pages_for_steps_impl(
+    *,
+    company_id: str,
+    machine_id: str,
+    child_source_keys: list[str],
+    text_chars: int,
+    runtime: DbFetchParentProcedurePagesForStepsRuntime, _include_binding_columns: bool = False, _row_budget: int = 0) -> list[dict]:
     """Resolve Step -> Procedure using the canonical relation table.
 
     The query is read-only and never touches chunks or embeddings. A LEFT JOIN keeps
     the relation usable even when the Procedure page is temporarily unavailable; the
     caller can then build a minimal parent placeholder and fall back safely.
     """
+    binding_columns = RELATION_BINDING_COLUMNS if _include_binding_columns else ""
+    limit_sql = " LIMIT %s" if _include_binding_columns else ""
     STRUCTURED_RELATION_PROCEDURE_STEP = runtime.STRUCTURED_RELATION_PROCEDURE_STEP
     _db_conn = runtime._db_conn
     _dedup_text_values = runtime._dedup_text_values
@@ -79,14 +117,14 @@ def db_fetch_parent_procedure_pages_for_steps(
         conn = _db_conn()
         with conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 SELECT
                     r.child_source_key,
                     r.parent_source_key,
                     r.ordinal,
                     p.machine_id,
                     p.page_number,
-                    LEFT(COALESCE(p.text, ''), %s) AS parent_text
+                    LEFT(COALESCE(p.text, ''), %s) AS parent_text{binding_columns}
                 FROM public.structured_source_relations AS r
                 LEFT JOIN public.document_pages AS p
                   ON p.company_id = r.company_id
@@ -100,7 +138,7 @@ def db_fetch_parent_procedure_pages_for_steps(
                     r.child_source_key,
                     r.ordinal NULLS LAST,
                     CASE WHEN p.machine_id = %s THEN 0 ELSE 1 END,
-                    p.page_number NULLS LAST;
+                    p.page_number NULLS LAST{limit_sql};
                 """,
                 (
                     int(text_chars),
@@ -109,10 +147,12 @@ def db_fetch_parent_procedure_pages_for_steps(
                     child_keys,
                     STRUCTURED_RELATION_PROCEDURE_STEP,
                     machine_id,
-                ),
+                ) + ((_row_budget + 1,) if _include_binding_columns else ()),
             )
             rows = cur.fetchall()
     except Exception as exc:
+        if _include_binding_columns:
+            raise
         print("STRUCTURED_RELATION_PARENT_READ_FALLBACK", str(exc)[:700])
         return []
     finally:
@@ -121,6 +161,9 @@ def db_fetch_parent_procedure_pages_for_steps(
                 conn.close()
             except Exception:
                 pass
+
+    if _include_binding_columns:
+        return list(rows)
 
     out: list[dict] = []
     seen: set[tuple[str, str]] = set()
@@ -144,6 +187,7 @@ def db_fetch_parent_procedure_pages_for_steps(
             }
         )
     return out
+
 
 
 @dataclass(frozen=True)
@@ -414,12 +458,36 @@ def ask_evidence_fetch_pages(
     top_pages: int = 10,
     runtime: AskEvidenceFetchPagesRuntime,
 ) -> list[dict]:
+    """Legacy entry: SQL, parameters, transformations and selection preserved."""
+    return _ask_evidence_fetch_pages_impl(q=q, profile=profile, company_id=company_id, machine_id=machine_id, doc_ids=doc_ids, bubble_document_id=bubble_document_id, top_pages=top_pages, runtime=runtime)
+
+
+def read_ask_page_evidence(*, scope: ChunkReadScope, q: str, profile: dict,
+                           limits: ChunkEvidenceLimits, runtime: AskEvidenceFetchPagesRuntime,
+                           top_pages: int = 10) -> PageEvidenceRead:
+    capture = _PageReadCapture(scope, limits, "ask_pages", snippet_chars=runtime.ASK_SNIPPET_CHARS)
+    selected = _ask_evidence_fetch_pages_impl(**scope.sql_selectors(), q=q, profile=profile,
+        top_pages=top_pages, runtime=runtime, _page_capture=capture)
+    return capture.finish(selected)
+
+
+def _ask_evidence_fetch_pages_impl(
+    *,
+    q: str,
+    profile: dict,
+    company_id: str,
+    machine_id: str,
+    doc_ids: Optional[list[str]] = None,
+    bubble_document_id: Optional[str] = None,
+    top_pages: int = 10,
+    runtime: AskEvidenceFetchPagesRuntime, _page_capture: _PageReadCapture | None = None) -> list[dict]:
     """Fetch and rank full pages/structured pages within the authorized scope.
 
     Relevance predicates are applied before the database LIMIT. This prevents a
     large machine/company knowledge base from excluding the correct document merely
     because its Bubble id sorts after the first N pages.
     """
+    binding_columns = PAGE_BINDING_COLUMNS if _page_capture is not None else ""
     ASK_EVIDENCE_MAX_PAGE_CHARS = runtime.ASK_EVIDENCE_MAX_PAGE_CHARS
     ASK_EVIDENCE_MIN_PAGE_SCORE = runtime.ASK_EVIDENCE_MIN_PAGE_SCORE
     ASK_EVIDENCE_SCOPE_PAGE_LIMIT = runtime.ASK_EVIDENCE_SCOPE_PAGE_LIMIT
@@ -479,13 +547,15 @@ def ask_evidence_fetch_pages(
             ) + ")"
             term_params = [f"%{term}%" for term in search_terms]
 
+        if _page_capture is not None:
+            _page_capture.expect(limit, int(ASK_EVIDENCE_MAX_PAGE_CHARS or 12000))
         conn = _db_conn()
         try:
             with conn.cursor() as cur:
                 cur.execute(
                     f"""
                     SELECT bubble_document_id, machine_id, page_number,
-                           LEFT(COALESCE(text, ''), %s) AS page_text
+                           LEFT(COALESCE(text, ''), %s) AS page_text{binding_columns}
                     FROM public.document_pages
                     WHERE {where_sql}
                       AND text IS NOT NULL
@@ -505,7 +575,8 @@ def ask_evidence_fetch_pages(
                         limit,
                     ],
                 )
-                return cur.fetchall()
+                raw_rows = cur.fetchall()
+                return _page_capture.capture(raw_rows) if _page_capture is not None else raw_rows
         finally:
             conn.close()
 
@@ -553,6 +624,7 @@ def ask_evidence_fetch_pages(
         )
     )
     return _dedup_citations_by_snippet(scored, max_items=top_pages)
+
 
 
 @dataclass(frozen=True)
@@ -811,12 +883,36 @@ def ask_full_context_fetch_pages(
     seed_citations: Optional[list[dict]],
     runtime: AskFullContextFetchPagesRuntime,
 ) -> list[dict]:
+    """Legacy entry: SQL, parameters, transformations and selection preserved."""
+    return _ask_full_context_fetch_pages_impl(company_id=company_id, machine_id=machine_id, doc_ids=doc_ids, bubble_document_id=bubble_document_id, seed_citations=seed_citations, runtime=runtime)
+
+
+def read_full_context_page_evidence(*, scope: ChunkReadScope,
+                                    seed_citations: Optional[list[dict]],
+                                    limits: ChunkEvidenceLimits,
+                                    runtime: AskFullContextFetchPagesRuntime) -> PageEvidenceRead:
+    capture = _PageReadCapture(scope, limits, "full_context", snippet_chars=runtime.ASK_SNIPPET_CHARS,
+        candidate_chars=max(20000, int(runtime.ASK_FULL_CONTEXT_MAX_CHARS or 120000)))
+    selected = _ask_full_context_fetch_pages_impl(**scope.sql_selectors(), seed_citations=seed_citations,
+        runtime=runtime, _page_capture=capture)
+    return capture.finish(selected)
+
+
+def _ask_full_context_fetch_pages_impl(
+    *,
+    company_id: str,
+    machine_id: str,
+    doc_ids: Optional[list[str]],
+    bubble_document_id: Optional[str],
+    seed_citations: Optional[list[dict]],
+    runtime: AskFullContextFetchPagesRuntime, _page_capture: _PageReadCapture | None = None) -> list[dict]:
     """Fetch full pages for a narrow authorized scope.
 
     This is intentionally generic: it does not know any test question, expected answer,
     document id, product code or component. It simply reads the authorized document pages
     when the scope is narrow enough to fit in the model context.
     """
+    binding_columns = PAGE_BINDING_COLUMNS if _page_capture is not None else ""
     ASK_FULL_CONTEXT_MAX_CHARS = runtime.ASK_FULL_CONTEXT_MAX_CHARS
     ASK_FULL_CONTEXT_MAX_DOCS = runtime.ASK_FULL_CONTEXT_MAX_DOCS
     ASK_FULL_CONTEXT_MAX_PAGES = runtime.ASK_FULL_CONTEXT_MAX_PAGES
@@ -837,12 +933,14 @@ def ask_full_context_fetch_pages(
     page_limit = max(10, int(ASK_FULL_CONTEXT_MAX_PAGES or 140))
     page_chars = max(1200, int(ASK_FULL_CONTEXT_PAGE_CHARS or 6500))
 
+    if _page_capture is not None:
+        _page_capture.expect(page_limit, page_chars)
     conn = _db_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                """
-                SELECT bubble_document_id, machine_id, page_number, LEFT(COALESCE(text, ''), %s) AS page_text
+                f"""
+                SELECT bubble_document_id, machine_id, page_number, LEFT(COALESCE(text, ''), %s) AS page_text{binding_columns}
                 FROM public.document_pages
                 WHERE company_id = %s
                   AND bubble_document_id = ANY(%s)
@@ -853,7 +951,8 @@ def ask_full_context_fetch_pages(
                 """,
                 [page_chars, company_id, target_doc_ids, page_limit],
             )
-            rows = cur.fetchall()
+            raw_rows = cur.fetchall()
+            rows = _page_capture.capture(raw_rows) if _page_capture is not None else raw_rows
     finally:
         conn.close()
 
@@ -886,6 +985,7 @@ def ask_full_context_fetch_pages(
         )
         total_chars += len(txt)
     return citations
+
 
 
 @dataclass(frozen=True)
@@ -1374,7 +1474,31 @@ def v13_fetch_scored_pages(
     top_pages: int,
     runtime: V13FetchScoredPagesRuntime,
 ) -> list[dict]:
+    """Legacy entry: SQL, parameters, transformations and selection preserved."""
+    return _v13_fetch_scored_pages_impl(q=q, profile=profile, company_id=company_id, machine_id=machine_id, doc_ids=doc_ids, bubble_document_id=bubble_document_id, top_pages=top_pages, runtime=runtime)
+
+
+def read_scored_page_evidence(*, scope: ChunkReadScope, q: str, profile: dict,
+                              top_pages: int, limits: ChunkEvidenceLimits,
+                              runtime: V13FetchScoredPagesRuntime) -> PageEvidenceRead:
+    capture = _PageReadCapture(scope, limits, "scored_pages", snippet_chars=runtime.ASK_SNIPPET_CHARS)
+    selected = _v13_fetch_scored_pages_impl(**scope.sql_selectors(), q=q, profile=profile,
+        top_pages=top_pages, runtime=runtime, _page_capture=capture)
+    return capture.finish(selected)
+
+
+def _v13_fetch_scored_pages_impl(
+    *,
+    q: str,
+    profile: dict,
+    company_id: str,
+    machine_id: str,
+    doc_ids: Optional[list[str]],
+    bubble_document_id: Optional[str],
+    top_pages: int,
+    runtime: V13FetchScoredPagesRuntime, _page_capture: _PageReadCapture | None = None) -> list[dict]:
     """Bounded full-page rescue with SQL relevance predicates before LIMIT."""
+    binding_columns = PAGE_BINDING_COLUMNS if _page_capture is not None else ""
     ASK_EVIDENCE_MIN_PAGE_SCORE = runtime.ASK_EVIDENCE_MIN_PAGE_SCORE
     ASK_SNIPPET_CHARS = runtime.ASK_SNIPPET_CHARS
     COMPANY_GENERAL_MACHINE_SENTINEL = runtime.COMPANY_GENERAL_MACHINE_SENTINEL
@@ -1428,13 +1552,15 @@ def v13_fetch_scored_pages(
             ) + ")"
             term_params = [f"%{term}%" for term in search_terms]
 
+        if _page_capture is not None:
+            _page_capture.expect(V13_PAGE_SCAN_LIMIT, V13_PAGE_TEXT_CHARS)
         conn = _db_conn()
         try:
             with conn.cursor() as cur:
                 cur.execute(
                     f"""
                     SELECT bubble_document_id, machine_id, page_number,
-                           LEFT(COALESCE(text, ''), %s) AS page_text
+                           LEFT(COALESCE(text, ''), %s) AS page_text{binding_columns}
                     FROM public.document_pages
                     WHERE {where_sql}
                       AND text IS NOT NULL
@@ -1452,7 +1578,8 @@ def v13_fetch_scored_pages(
                         V13_PAGE_SCAN_LIMIT,
                     ],
                 )
-                return cur.fetchall()
+                raw_rows = cur.fetchall()
+                return _page_capture.capture(raw_rows) if _page_capture is not None else raw_rows
         finally:
             conn.close()
 
@@ -1500,6 +1627,7 @@ def v13_fetch_scored_pages(
         )
     )
     return _dedup_citations_by_snippet(scored, max_items=max(3, min(int(top_pages or 8), 14)))
+
 
 
 @dataclass(frozen=True)

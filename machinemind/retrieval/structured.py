@@ -1,12 +1,20 @@
-"""P4-B: existing retrieval behavior behind explicit dependencies.
+"""P6-B2: opt-in bound views alongside the behavior-preserving P4 readers.
 
-Pure extraction from the P4-A baseline. Existing source selection heuristics,
-SQL, ranking weights, tie-breaking and failure behavior are preserved, including
-legacy limitations. No application, database or provider client is imported.
-Dependencies are resolved by the composition root at call time.
+The composition root still invokes the legacy entry points. Only explicit new
+read_*_evidence calls retain authoritative columns from the same SELECT and
+build P5-compatible snapshots; no consumer or ASK activation is changed here.
+Legacy heuristics, scores, query parameters and fallback behavior remain intact.
 """
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
+from .page_evidence import (PAGE_BINDING_COLUMNS, PageEvidenceRead, PageReadBindingError,
+                            _PageReadCapture)
+from .chunk_evidence import ChunkReadScope, ChunkEvidenceLimits
+from .relation_evidence import (RELATION_BINDING_COLUMNS, RelationEvidenceRead,
+                                validate_relation_request, build_relation_read)
+from ..evidence.contracts import SourceIdentity
+
+
 import re
 import math
 import json
@@ -19,7 +27,29 @@ class DbFetchRelatedStepPagesRuntime:
 
 
 def db_fetch_related_step_pages(*, company_id: str, machine_id: str, parent_source_key: str, text_chars: int, runtime: DbFetchRelatedStepPagesRuntime) -> list[tuple]:
+    """Legacy entry: existing relation SQL, fallback and result shape preserved."""
+    return _db_fetch_related_step_pages_impl(company_id=company_id, machine_id=machine_id, parent_source_key=parent_source_key, text_chars=text_chars, runtime=runtime)
+
+
+def read_related_step_page_evidence(*, scope: ChunkReadScope, parent: SourceIdentity,
+                                    current_allowed_sources: frozenset[SourceIdentity],
+                                    text_chars: int, limits: ChunkEvidenceLimits,
+                                    runtime: DbFetchRelatedStepPagesRuntime) -> RelationEvidenceRead:
+    anchors = (parent,)
+    validate_relation_request(scope=scope, kind="related_steps", anchors=anchors,
+        current_allowed_sources=current_allowed_sources, text_chars=text_chars, limits=limits)
+    rows = _db_fetch_related_step_pages_impl(company_id=scope.company_id, machine_id=scope.machine_id,
+        parent_source_key="procedure:" + parent.source_id, text_chars=text_chars, runtime=runtime,
+        _include_binding_columns=True, _row_budget=limits.assembly.max_occurrences)
+    return build_relation_read(scope=scope, kind="related_steps", anchors=anchors,
+        current_allowed_sources=current_allowed_sources, text_chars=text_chars, limits=limits,
+        relation_type=runtime.STRUCTURED_RELATION_PROCEDURE_STEP, rows=rows)
+
+
+def _db_fetch_related_step_pages_impl(*, company_id: str, machine_id: str, parent_source_key: str, text_chars: int, runtime: DbFetchRelatedStepPagesRuntime, _include_binding_columns: bool = False, _row_budget: int = 0) -> list[tuple]:
     """Return canonical Step children in Bubble order without semantic guessing."""
+    binding_columns = RELATION_BINDING_COLUMNS if _include_binding_columns else ""
+    limit_sql = " LIMIT %s" if _include_binding_columns else ""
     STRUCTURED_RELATION_PROCEDURE_STEP = runtime.STRUCTURED_RELATION_PROCEDURE_STEP
     _db_conn = runtime._db_conn
     if not (company_id and machine_id and parent_source_key):
@@ -30,13 +60,13 @@ def db_fetch_related_step_pages(*, company_id: str, machine_id: str, parent_sour
         conn = _db_conn()
         with conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 SELECT
                     r.child_source_key,
                     r.ordinal,
                     p.machine_id,
                     p.page_number,
-                    LEFT(COALESCE(p.text, ''), %s) AS page_text
+                    LEFT(COALESCE(p.text, ''), %s) AS page_text{binding_columns}
                 FROM public.structured_source_relations AS r
                 JOIN public.document_pages AS p
                   ON p.company_id = r.company_id
@@ -50,7 +80,7 @@ def db_fetch_related_step_pages(*, company_id: str, machine_id: str, parent_sour
                 ORDER BY
                     r.ordinal NULLS LAST,
                     r.child_source_key,
-                    p.page_number;
+                    p.page_number{limit_sql};
                 """,
                 (
                     int(text_chars),
@@ -58,10 +88,12 @@ def db_fetch_related_step_pages(*, company_id: str, machine_id: str, parent_sour
                     machine_id,
                     parent_source_key,
                     STRUCTURED_RELATION_PROCEDURE_STEP,
-                ),
+                ) + ((_row_budget + 1,) if _include_binding_columns else ()),
             )
             return list(cur.fetchall())
     except Exception as exc:
+        if _include_binding_columns:
+            raise
         print("STRUCTURED_RELATION_READ_FALLBACK", str(exc)[:700])
         return []
     finally:
@@ -70,6 +102,7 @@ def db_fetch_related_step_pages(*, company_id: str, machine_id: str, parent_sour
                 conn.close()
             except Exception:
                 pass
+
 
 
 @dataclass(frozen=True)
@@ -525,6 +558,26 @@ class AskStructuredDirectFetchSourcesRuntime:
 
 
 def ask_structured_direct_fetch_sources(*, company_id: str, machine_id: str, q: str, planner: Optional[dict], top_k: int, runtime: AskStructuredDirectFetchSourcesRuntime) -> list[dict]:
+    """Legacy entry: SQL, parameters, transformations and selection preserved."""
+    return _ask_structured_direct_fetch_sources_impl(company_id=company_id, machine_id=machine_id, q=q, planner=planner, top_k=top_k, runtime=runtime)
+
+
+def read_structured_direct_page_evidence(*, scope: ChunkReadScope, q: str,
+                                         planner: Optional[dict], top_k: int,
+                                         limits: ChunkEvidenceLimits,
+                                         runtime: AskStructuredDirectFetchSourcesRuntime) -> PageEvidenceRead:
+    capture = _PageReadCapture(scope, limits, "structured_direct",
+        snippet_chars=int(runtime.ASK_SNIPPET_CHARS or 900))
+    if scope.ai_scope != "machine_all":
+        raise PageReadBindingError("structured direct expansion requires machine_all scope")
+    selected = _ask_structured_direct_fetch_sources_impl(company_id=scope.company_id,
+        machine_id=scope.machine_id, q=q, planner=planner, top_k=top_k,
+        runtime=runtime, _page_capture=capture)
+    return capture.finish(selected)
+
+
+def _ask_structured_direct_fetch_sources_impl(*, company_id: str, machine_id: str, q: str, planner: Optional[dict], top_k: int, runtime: AskStructuredDirectFetchSourcesRuntime, _page_capture: _PageReadCapture | None = None) -> list[dict]:
+    binding_columns = PAGE_BINDING_COLUMNS if _page_capture is not None else ""
     ASK_SNIPPET_CHARS = runtime.ASK_SNIPPET_CHARS
     ASK_STRUCTURED_DIRECT_ENABLED = runtime.ASK_STRUCTURED_DIRECT_ENABLED
     ASK_STRUCTURED_DIRECT_MAX_ITEMS = runtime.ASK_STRUCTURED_DIRECT_MAX_ITEMS
@@ -577,13 +630,15 @@ def ask_structured_direct_fetch_sources(*, company_id: str, machine_id: str, q: 
         params.extend(term_params)
         params.append(scan_limit)
 
+        if _page_capture is not None:
+            _page_capture.expect(scan_limit, text_chars)
         conn = _db_conn()
         try:
             with conn.cursor() as cur:
                 cur.execute(
                     f"""
                     SELECT bubble_document_id, machine_id, page_number,
-                           LEFT(COALESCE(text, ''), %s) AS page_text
+                           LEFT(COALESCE(text, ''), %s) AS page_text{binding_columns}
                     FROM public.document_pages
                     WHERE company_id = %s
                       AND ({like_clauses})
@@ -599,7 +654,8 @@ def ask_structured_direct_fetch_sources(*, company_id: str, machine_id: str, q: 
                     """,
                     params[:-1] + [machine_id, params[-1]],
                 )
-                return cur.fetchall()
+                raw_rows = cur.fetchall()
+                return _page_capture.capture(raw_rows) if _page_capture is not None else raw_rows
         finally:
             conn.close()
 
@@ -707,6 +763,7 @@ def ask_structured_direct_fetch_sources(*, company_id: str, machine_id: str, q: 
         return out[:max_items]
 
     return _dedup_citations_by_snippet(scored, max_items=max_items)
+
 
 
 @dataclass(frozen=True)
@@ -988,11 +1045,29 @@ class V13FetchStructuredTitleCandidatesRuntime:
 
 
 def v13_fetch_structured_title_candidates(*, q: str, company_id: str, machine_id: str, ai_scope: str, doc_ids: Optional[list[str]], bubble_document_id: Optional[str], runtime: V13FetchStructuredTitleCandidatesRuntime) -> list[dict]:
+    """Legacy entry: SQL, parameters, transformations and selection preserved."""
+    return _v13_fetch_structured_title_candidates_impl(q=q, company_id=company_id, machine_id=machine_id, ai_scope=ai_scope, doc_ids=doc_ids, bubble_document_id=bubble_document_id, runtime=runtime)
+
+
+def read_structured_title_page_evidence(*, scope: ChunkReadScope, q: str,
+                                        limits: ChunkEvidenceLimits,
+                                        runtime: V13FetchStructuredTitleCandidatesRuntime) -> PageEvidenceRead:
+    capture = _PageReadCapture(scope, limits, "structured_title",
+        snippet_chars=int(runtime.ASK_SNIPPET_CHARS or 900))
+    if scope.ai_scope != "machine_all":
+        raise PageReadBindingError("structured title expansion requires machine_all scope")
+    selected = _v13_fetch_structured_title_candidates_impl(**scope.sql_selectors(),
+        ai_scope=scope.ai_scope, q=q, runtime=runtime, _page_capture=capture)
+    return capture.finish(selected)
+
+
+def _v13_fetch_structured_title_candidates_impl(*, q: str, company_id: str, machine_id: str, ai_scope: str, doc_ids: Optional[list[str]], bubble_document_id: Optional[str], runtime: V13FetchStructuredTitleCandidatesRuntime, _page_capture: _PageReadCapture | None = None) -> list[dict]:
     """Bounded cross-type title/description retrieval, independent of source keywords.
 
     It runs only for machine-wide ASK and only returns strong content-title matches. The
     returned rows are candidates; they never bypass the shared semantic evidence gate.
     """
+    binding_columns = PAGE_BINDING_COLUMNS if _page_capture is not None else ""
     ASK_SNIPPET_CHARS = runtime.ASK_SNIPPET_CHARS
     ASK_STRUCTURED_DIRECT_TEXT_CHARS = runtime.ASK_STRUCTURED_DIRECT_TEXT_CHARS
     COMPANY_GENERAL_MACHINE_SENTINEL = runtime.COMPANY_GENERAL_MACHINE_SENTINEL
@@ -1056,12 +1131,14 @@ def v13_fetch_structured_title_candidates(*, q: str, company_id: str, machine_id
     rows: list[tuple] = []
     conn = None
     try:
+        if _page_capture is not None:
+            _page_capture.expect(V13_SOURCE_RETRIEVAL_SCAN_LIMIT, ASK_STRUCTURED_DIRECT_TEXT_CHARS)
         conn = _db_conn()
         with conn.cursor() as cur:
             cur.execute(
                 f"""
                 SELECT bubble_document_id, machine_id, page_number,
-                       LEFT(COALESCE(text, ''), %s) AS source_text
+                       LEFT(COALESCE(text, ''), %s) AS source_text{binding_columns}
                 FROM public.document_pages
                 WHERE company_id=%s
                   AND bubble_document_id LIKE ANY(%s)
@@ -1084,8 +1161,11 @@ def v13_fetch_structured_title_candidates(*, q: str, company_id: str, machine_id
                     V13_SOURCE_RETRIEVAL_SCAN_LIMIT,
                 ],
             )
-            rows = cur.fetchall()
+            raw_rows = cur.fetchall()
+            rows = _page_capture.capture(raw_rows) if _page_capture is not None else raw_rows
     except Exception as exc:
+        if _page_capture is not None:
+            raise
         print("V13_SOURCE_TITLE_SCAN_FAIL", str(exc)[:500])
         return []
     finally:
@@ -1093,6 +1173,8 @@ def v13_fetch_structured_title_candidates(*, q: str, company_id: str, machine_id
             try:
                 conn.close()
             except Exception:
+                if _page_capture is not None:
+                    raise
                 pass
 
     out: list[dict] = []
@@ -1167,5 +1249,6 @@ def v13_fetch_structured_title_candidates(*, q: str, company_id: str, machine_id
         )
     )
     return _dedup_citations_by_snippet(out, max_items=V13_SOURCE_RETRIEVAL_MAX_CANDIDATES)
+
 
 
