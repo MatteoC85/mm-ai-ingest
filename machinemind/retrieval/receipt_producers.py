@@ -10,14 +10,15 @@ caller's CURRENT authorization after the read. read_sources is not a grant.
 Merges record parent positions WHERE the algorithm creates each result; they do
 not join authorization by citation ID, text, score or flags after the fact.
 
-Only these four operators are integrated here: RRF merge, V13 merge, snippet
-selection and order-preserving selection. Scoring, P4 prepare, callback-internal
-acquisition, facts/rescue, cache and output/link transformations still require
-explicit producers before main can enable canonical ASK. This is not full intake.
+RRF/V13 merge, snippet/order dedup, V13 scoring, MMR, model reranking and
+structured promotion now retain explicit occurrence lineage. P4 prepare, other
+callback-internal acquisition, facts/rescue, cache and output/link transformations
+still need producers before main enables canonical ASK. This is not full intake.
 """
 from __future__ import annotations
 
 from copy import deepcopy
+from math import isfinite
 from typing import Any, Callable
 
 from . import candidate_ranking as ranking
@@ -186,5 +187,140 @@ def rank_records(*, request: Any, session: AskEvidenceSession,
         return session.derive_batch(request=request, views=tuple(views),
             operation=PRODUCER_VERSION + ":" + operation,
             current_allowed_sources=after)
+
+    return invoke(work, request)
+
+
+TRANSFORM_VERSION = "ask-score-selection-lineage-p6b4h-v1"
+
+
+def transform_records(*, request: Any, session: AskEvidenceSession,
+                      groups: tuple[tuple[RecordHandle, ...], ...], operation: str,
+                      runtime: Any,
+                      authorize: Callable[[Any], frozenset[SourceIdentity]],
+                      invoke: Callable[..., Any], q: str = "",
+                      q_vec: list[float] | None = None, top_k: int | None = None,
+                      lambda_mult: float = 0.85, diagnostic_mode: bool = False
+                      ) -> tuple[RecordHandle, ...]:
+    """Run the EXISTING score/MMR/reranker/structured-promotion algorithms.
+
+    No thresholds, prompts, model budget or selection policy are changed. The
+    reranker performs its one existing model callback only when legacy requires
+    it; this producer adds none and never retries. Caller-supplied runtimes must
+    contain the same trusted dependencies as the corresponding legacy operation.
+
+    Inputs are restored from explicitly owned handles. All consumed inputs are
+    authorized again after computation, including ones dropped by selection or
+    not sent to the model because of the existing candidate cap. Score changes
+    become atomic, single-parent derivations; selection returns ORIGINAL handles.
+    A model's returned ID is only an algorithmic choice amongst its supplied
+    items. Its parent position is captured in that same item-building loop; an
+    ID, score, snippet or selection flag never becomes an authorization grant.
+
+    For score/promotion the nested snippet dedup must SELECT the exact objects it
+    receives (as the existing implementation does). Copying or rewriting that
+    callback requires a separate producer, never an equality-based provenance
+    guess. Immutable snapshots protect selection verification from mutations.
+
+    No new SQL, session, ACL service or engine. Current-authority callback cost,
+    temporary copies, CPU/heap and model usage must still be measured upstream.
+    This does not implement all P4 prepare transformations, raw-page conversion,
+    hidden callback reads, cache, URL verification or live canonical activation.
+    Trusted collaborators must not mutate the session/request or hide their own
+    contract errors; no claim of atomic remote revocation or Python sandboxing.
+    """
+    _callbacks(session, authorize, invoke)
+
+    def work():
+        expected_runtime = {
+            "score": ranking.V13ScoreCandidatesRuntime,
+            "mmr": ranking.MmrSelectRuntime,
+            "rerank": ranking.LlmRerankCitationsRuntime,
+            "promote_structured": ranking.PromoteStructuredRescueHitsRuntime,
+        }
+        if type(operation) is not str or operation not in expected_runtime:
+            raise EvidenceProductionError("unsupported existing transform")
+        if type(runtime) is not expected_runtime[operation]:
+            raise EvidenceProductionError("explicit existing transform runtime required")
+        expected_groups = 2 if operation == "promote_structured" else 1
+        if (type(groups) is not tuple or len(groups) != expected_groups
+                or any(type(group) is not tuple for group in groups)):
+            raise EvidenceProductionError("explicit ordered handle groups required")
+        if type(q) is not str or type(diagnostic_mode) is not bool:
+            raise EvidenceProductionError("explicit query and boolean mode required")
+        before = invoke(authorize, request, request)
+        _, limits = session.read_contract(request=request, current_allowed_sources=before)
+        if sum(len(group) for group in groups) > limits.assembly.max_occurrences:
+            raise EvidenceProductionError("too many transform input occurrences")
+        flat = tuple(handle for group in groups for handle in group)
+        if operation != "score" and (type(top_k) is not int or not 1 <= top_k <= limits.assembly.max_occurrences):
+            raise EvidenceProductionError("positive bounded selection count required")
+        if operation == "mmr":
+            if (type(lambda_mult) not in (int, float) or not isfinite(lambda_mult)
+                    or not 0 <= lambda_mult <= 1):
+                raise EvidenceProductionError("finite MMR blend in [0, 1] required")
+            if q_vec is not None and (type(q_vec) is not list or any(
+                    type(v) not in (int, float) or not isfinite(v) for v in q_vec)):
+                raise EvidenceProductionError("finite explicit query vector required")
+        inputs = session.records(request=request, handles=flat, current_allowed_sources=before)
+        if any(item.layout != "retrieval_candidate" for item in inputs):
+            raise EvidenceProductionError("page-to-candidate conversion must be explicit upstream")
+        values, offset = [], 0
+        for group in groups:
+            values.append([item.record for item in inputs[offset:offset + len(group)]])
+            offset += len(group)
+        # Never let a collaborator rewrite the expected records used below.
+        supplied = deepcopy(values)
+        traces = []
+        try:
+            if operation == "score":
+                result = invoke(ranking.v13_score_candidates, request, q, supplied[0],
+                                runtime=runtime, lineage=traces.append)
+            elif operation == "mmr":
+                result = invoke(ranking.mmr_select, request, deepcopy(q_vec or []), supplied[0],
+                                top_k, lambda_mult, runtime=runtime, lineage=traces.append)
+            elif operation == "rerank":
+                result = invoke(ranking.llm_rerank_citations, request, q, supplied[0], top_k,
+                                diagnostic_mode, runtime=runtime, lineage=traces.append)
+            else:
+                result = invoke(ranking.promote_structured_rescue_hits, request,
+                                supplied[0], supplied[1], top_k, runtime=runtime,
+                                lineage=traces.append)
+        except EvidenceContractError:
+            raise
+        except Exception:
+            raise EvidenceProductionError("evidence transform failed") from None
+        if (type(result) is not list or len(result) > limits.assembly.max_occurrences
+                or len(traces) != 1 or type(traces[0]) is not tuple
+                or len(traces[0]) != len(result)):
+            raise EvidenceProductionError("missing/inconsistent direct transform lineage")
+        selected, views = [], []
+        for record, parents in zip(result, traces[0]):
+            if (type(parents) is not tuple or len(parents) != 1
+                    or type(parents[0]) is not tuple or len(parents[0]) != 2
+                    or any(type(index) is not int for index in parents[0])):
+                raise EvidenceProductionError("one exact transform input occurrence required")
+            group, index = parents[0]
+            if not 0 <= group < len(groups) or not 0 <= index < len(groups[group]):
+                raise EvidenceProductionError("transform lineage references an absent input")
+            handle = groups[group][index]
+            original = values[group][index]
+            if operation == "score":
+                if type(record) is not dict:
+                    raise EvidenceProductionError("score view must be an explicit candidate")
+                views.append(((handle,), record))
+            else:
+                expected = (str(original.get("citation_id") or "").strip()
+                            if operation == "rerank" else original)
+                if not _same_value(record, expected):
+                    raise EvidenceProductionError("selection changed an input without derivation")
+                selected.append(handle)
+        after = invoke(authorize, request, request)
+        session.records(request=request, handles=flat, current_allowed_sources=after)
+        if operation != "score":
+            return tuple(selected)
+        return session.derive_batch(request=request, views=tuple(views),
+                                    operation=TRANSFORM_VERSION + ":score",
+                                    current_allowed_sources=after)
 
     return invoke(work, request)

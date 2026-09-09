@@ -23,7 +23,7 @@ class LlmRerankCitationsRuntime:
     _openai_chat_json: Callable[..., Any]
 
 
-def llm_rerank_citations(q: str, candidates: list[dict], top_k: int, diagnostic_mode: bool=False, *, runtime: LlmRerankCitationsRuntime) -> list[str]:
+def llm_rerank_citations(q: str, candidates: list[dict], top_k: int, diagnostic_mode: bool=False, *, runtime: LlmRerankCitationsRuntime, lineage: Optional[Callable[..., None]]=None) -> list[str]:
     ASK_MAX_TOP_K = runtime.ASK_MAX_TOP_K
     OPENAI_RERANK_MODEL = runtime.OPENAI_RERANK_MODEL
     RERANK_MAX_CANDIDATES = runtime.RERANK_MAX_CANDIDATES
@@ -33,6 +33,8 @@ def llm_rerank_citations(q: str, candidates: list[dict], top_k: int, diagnostic_
     _openai_chat_json = runtime._openai_chat_json
     q = (q or "").strip()
     if not q or not candidates:
+        if lineage is not None:
+            lineage(())
         return []
 
     requested_k = max(1, min(int(top_k or 1), ASK_MAX_TOP_K))
@@ -41,11 +43,18 @@ def llm_rerank_citations(q: str, candidates: list[dict], top_k: int, diagnostic_
     items = []
     seen = set()
 
+    if lineage is not None:
+        _positions = {}
+        _input_index = -1
     for c in candidates[:max_candidates]:
+        if lineage is not None:
+            _input_index += 1
         cid = str(c.get("citation_id") or "").strip()
         if not cid or cid in seen:
             continue
         seen.add(cid)
+        if lineage is not None:
+            _positions[cid] = _input_index
 
         full_text = (c.get("chunk_full") or c.get("snippet") or "").strip()
         section = _extract_section_from_text(full_text)
@@ -65,6 +74,8 @@ def llm_rerank_citations(q: str, candidates: list[dict], top_k: int, diagnostic_
         )
 
     if not items:
+        if lineage is not None:
+            lineage(())
         return []
 
     schema = {
@@ -131,6 +142,8 @@ def llm_rerank_citations(q: str, candidates: list[dict], top_k: int, diagnostic_
 
     selected = parsed.get("selected_ids") or []
     if not isinstance(selected, list):
+        if lineage is not None:
+            lineage(())
         return []
 
     allowed = {item["citation_id"] for item in items}
@@ -146,7 +159,10 @@ def llm_rerank_citations(q: str, candidates: list[dict], top_k: int, diagnostic_
         if len(out) >= requested_k:
             break
 
+    if lineage is not None:
+        lineage(tuple(((0, _positions[cid]),) for cid in out))
     return out
+
 
 
 @dataclass(frozen=True)
@@ -250,34 +266,55 @@ class PromoteStructuredRescueHitsRuntime:
     _dedup_citations_by_snippet: Callable[..., Any]
 
 
-def promote_structured_rescue_hits(selected_citations: list[dict], structured_hits: list[dict], top_k: int, *, runtime: PromoteStructuredRescueHitsRuntime) -> list[dict]:
+def promote_structured_rescue_hits(selected_citations: list[dict], structured_hits: list[dict], top_k: int, *, runtime: PromoteStructuredRescueHitsRuntime, lineage: Optional[Callable[..., None]]=None) -> list[dict]:
     STRUCTURED_RESCUE_MAX_HITS = runtime.STRUCTURED_RESCUE_MAX_HITS
     _dedup_citations_by_snippet = runtime._dedup_citations_by_snippet
     if not structured_hits:
+        if lineage is not None:
+            lineage(tuple(((0, _index),) for _index in range(len(selected_citations or []))))
         return selected_citations or []
 
     out: list[dict] = []
     used: set[str] = set()
 
+    if lineage is not None:
+        _parents = []
+        _input_index = -1
     for h in structured_hits:
+        if lineage is not None:
+            _input_index += 1
         cid = str(h.get("citation_id") or "").strip()
         if not cid or cid in used:
             continue
         out.append(h)
+        if lineage is not None:
+            _parents.append(((1, _input_index),))
         used.add(cid)
         if len(out) >= min(STRUCTURED_RESCUE_MAX_HITS, top_k):
             break
 
+    if lineage is not None:
+        _input_index = -1
     for c in selected_citations or []:
+        if lineage is not None:
+            _input_index += 1
         cid = str(c.get("citation_id") or "").strip()
         if not cid or cid in used:
             continue
         out.append(c)
+        if lineage is not None:
+            _parents.append(((0, _input_index),))
         used.add(cid)
         if len(out) >= top_k:
             break
 
+    if lineage is not None:
+        _before_selection = tuple(out)
+        _result = _dedup_citations_by_snippet(out, max_items=top_k)
+        lineage(_selected_occurrence_lineage(_before_selection, tuple(_parents), _result))
+        return _result
     return _dedup_citations_by_snippet(out, max_items=top_k)
+
 
 
 @dataclass(frozen=True)
@@ -397,15 +434,24 @@ class MmrSelectRuntime:
     _cosine_sim: Callable[..., Any]
 
 
-def mmr_select(q_vec: list[float], candidates: list[dict], top_k: int, lambda_mult: float=0.85, *, runtime: MmrSelectRuntime) -> list[dict]:
+def mmr_select(q_vec: list[float], candidates: list[dict], top_k: int, lambda_mult: float=0.85, *, runtime: MmrSelectRuntime, lineage: Optional[Callable[..., None]]=None) -> list[dict]:
     _cosine_sim = runtime._cosine_sim
     if not candidates:
+        if lineage is not None:
+            lineage(())
         return []
 
     selected: list[dict] = []
     remaining = candidates[:]
 
+    if lineage is not None:
+        _positions = {}
+        for _index, _item in enumerate(remaining):
+            _positions.setdefault(id(_item), []).append(_index)
     remaining.sort(key=lambda x: float(x.get("similarity", 0.0)), reverse=True)
+    if lineage is not None:
+        _remaining_positions = [_positions[id(_item)].pop(0) for _item in remaining]
+        _selected_positions = [((0, _remaining_positions.pop(0)),)]
     selected.append(remaining.pop(0))
 
     while remaining and len(selected) < top_k:
@@ -427,8 +473,13 @@ def mmr_select(q_vec: list[float], candidates: list[dict], top_k: int, lambda_mu
                 best_idx = i
 
         selected.append(remaining.pop(best_idx))
+        if lineage is not None:
+            _selected_positions.append(((0, _remaining_positions.pop(best_idx)),))
 
+    if lineage is not None:
+        lineage(tuple(_selected_positions))
     return selected
+
 
 
 def v12_structured_rank(c: dict, used_ids: set[str]) -> tuple:
@@ -589,7 +640,7 @@ class V13ScoreCandidatesRuntime:
     _v13_real_semantic_similarity: Callable[..., Any]
 
 
-def v13_score_candidates(q: str, candidates: list[dict], *, runtime: V13ScoreCandidatesRuntime) -> list[dict]:
+def v13_score_candidates(q: str, candidates: list[dict], *, runtime: V13ScoreCandidatesRuntime, lineage: Optional[Callable[..., None]]=None) -> list[dict]:
     V13_SOURCE_RETRIEVAL_MIN_TITLE_SCORE = runtime.V13_SOURCE_RETRIEVAL_MIN_TITLE_SCORE
     _candidate_source_bias = runtime._candidate_source_bias
     _candidate_specificity_score = runtime._candidate_specificity_score
@@ -608,7 +659,12 @@ def v13_score_candidates(q: str, candidates: list[dict], *, runtime: V13ScoreCan
     codes = {str(x).lower() for x in _extract_code_tokens(q)}
 
     out: list[dict] = []
+    if lineage is not None:
+        _origins = {}
+        _input_index = -1
     for raw in candidates or []:
+        if lineage is not None:
+            _input_index += 1
         if not isinstance(raw, dict):
             continue
         c = dict(raw)
@@ -684,6 +740,8 @@ def v13_score_candidates(q: str, candidates: list[dict], *, runtime: V13ScoreCan
         c["v13_score"] = float(v13_score)
         c["retrieval_score"] = float(v13_score)
         out.append(c)
+        if lineage is not None:
+            _origins[id(c)] = ((0, _input_index),)
 
     out.sort(
         key=lambda c: (
@@ -696,7 +754,14 @@ def v13_score_candidates(q: str, candidates: list[dict], *, runtime: V13ScoreCan
             int(c.get("chunk_index") or 0),
         )
     )
+    if lineage is not None:
+        _parents = tuple(_origins[id(c)] for c in out)
+        _before_selection = tuple(out)
+        _result = _dedup_citations_by_snippet(out, max_items=max(20, len(out)))
+        lineage(_selected_occurrence_lineage(_before_selection, _parents, _result))
+        return _result
     return _dedup_citations_by_snippet(out, max_items=max(20, len(out)))
+
 
 
 @dataclass(frozen=True)
@@ -942,3 +1007,27 @@ def assistant_core_merge_facet_candidates(candidate_lists: list[list[dict]], *, 
     return out
 
 
+
+
+def _selected_occurrence_lineage(inputs, parents, selected):
+    """Trace a selecting collaborator's actual objects within this operation.
+
+    Positions were captured when the operator made each occurrence. Identity is
+    local to these explicit inputs, not source authorization or a content/ID join.
+    A collaborator returning copies/new records needs its own derivation producer;
+    it is deliberately rejected rather than matched back by text or citation ID.
+    Existing snippet dedup returns its selected input objects. Repeated aliases
+    consume their captured positions in order; no persistent registry is created.
+    """
+    if type(selected) is not list or len(inputs) != len(parents):
+        raise ValueError("invalid selecting collaborator output")
+    available = {}
+    for item, origin in zip(inputs, parents):
+        available.setdefault(id(item), []).append((item, origin))
+    result = []
+    for item in selected:
+        occurrences = available.get(id(item))
+        if not occurrences or occurrences[0][0] is not item:
+            raise ValueError("selecting collaborator returned an untracked occurrence")
+        result.append(occurrences.pop(0)[1])
+    return tuple(result)
