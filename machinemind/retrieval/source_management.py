@@ -1446,12 +1446,16 @@ class AssistantCoreOverviewCatalogCandidatesRuntime:
     _assistant_core_candidate_source_type: Callable[..., Any]
 
 
-def assistant_core_overview_catalog_candidates(candidates: list[dict], *, runtime: AssistantCoreOverviewCatalogCandidatesRuntime) -> list[dict]:
+def assistant_core_overview_catalog_candidates(candidates: list[dict], *, runtime: AssistantCoreOverviewCatalogCandidatesRuntime, lineage: Optional[Callable[..., None]]=None) -> list[dict]:
     _assistant_core_candidate_source_type = runtime._assistant_core_candidate_source_type
     catalog = [
         dict(c) for c in candidates or []
         if isinstance(c, dict) and bool(c.get("assistant_core_catalog_candidate"))
     ]
+    if lineage is not None:
+        origins = {id(record): index for record, index in zip(catalog,
+            (i for i, c in enumerate(candidates or [])
+             if isinstance(c, dict) and bool(c.get("assistant_core_catalog_candidate"))))}
     # Media describes physical layout; procedures expose auxiliary systems and
     # assemblies that may be absent from a single overview page. Preserve both.
     catalog.sort(
@@ -1460,6 +1464,8 @@ def assistant_core_overview_catalog_candidates(candidates: list[dict], *, runtim
             str(c.get("bubble_document_id") or ""),
         )
     )
+    if lineage is not None:
+        lineage(tuple(((0, origins[id(record)]),) for record in catalog))
     return catalog
 
 

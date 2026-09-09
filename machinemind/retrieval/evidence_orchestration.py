@@ -1176,7 +1176,7 @@ class AssistantCorePrepareEvidenceRuntime:
     time_module: Any
 
 
-def assistant_core_prepare_evidence(request: AssistantCoreRequest, retrieval: dict, decision: AssistantCoreDecision, *, runtime: AssistantCorePrepareEvidenceRuntime) -> dict:
+def assistant_core_prepare_evidence(request: AssistantCoreRequest, retrieval: dict, decision: AssistantCoreDecision, *, runtime: AssistantCorePrepareEvidenceRuntime, lineage: Optional[Callable[..., None]]=None) -> dict:
     EVIDENCE_PARTIAL = runtime.EVIDENCE_PARTIAL
     EVIDENCE_REFINE = runtime.EVIDENCE_REFINE
     EVIDENCE_SUPPORTED = runtime.EVIDENCE_SUPPORTED
@@ -1244,6 +1244,10 @@ def assistant_core_prepare_evidence(request: AssistantCoreRequest, retrieval: di
         for c in (retrieval.get("candidates") or retrieval.get("citations") or [])
         if isinstance(c, dict)
     ]
+    if lineage is not None:
+        lineage("copy", tuple(zip(
+            (c for c in (retrieval.get("candidates") or retrieval.get("citations") or [])
+             if isinstance(c, dict)), candidates)))
     if not candidates:
         return {
             "supported": False,
@@ -1461,6 +1465,11 @@ def assistant_core_prepare_evidence(request: AssistantCoreRequest, retrieval: di
         if source_type in preferred and (semantic >= 0.28 or overlap >= 0.04 or title_bonus > 0.0 or exact_bonus > 0.0):
             preferred_viable = True
         scored.append(cc)
+        if lineage is not None:
+            lineage("score", ((c, cc),))
+
+    if lineage is not None:
+        lineage("scored", tuple(scored))
 
     # An explicit "only manual/photo/..." request may constrain source type, but a
     # router mistake must never erase all otherwise relevant evidence. Enforce the

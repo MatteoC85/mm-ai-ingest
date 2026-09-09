@@ -18,11 +18,15 @@ still need producers before main enables canonical ASK. This is not full intake.
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
 from math import isfinite
 from typing import Any, Callable
 
 from . import candidate_ranking as ranking
-from .ask_composition import AskEvidenceSession, RecordHandle, RegisteredRead
+from .ask_composition import AskEvidenceSession, RecordHandle, RegisteredRead, AskSelection, _check_derived_locator
+from . import evidence_orchestration as orchestration
+from ..evidence.legacy_compatibility import _Freezer
+from ..evidence.contracts import canonical_json
 from ..evidence.contracts import EvidenceContractError, SourceIdentity
 from ..evidence.ask_input import _same_value
 from ..evidence.record_adapters import adapt_candidate
@@ -322,5 +326,354 @@ def transform_records(*, request: Any, session: AskEvidenceSession,
         return session.derive_batch(request=request, views=tuple(views),
                                     operation=TRANSFORM_VERSION + ":score",
                                     current_allowed_sources=after)
+
+    return invoke(work, request)
+
+
+PREPARATION_VERSION = "ask-prepare-lineage-p6b4i-v1"
+
+
+class _PreparationTrace:
+    """Bounded, operation-local journal, NOT another evidence session or ACL.
+
+    Identity maps only objects materialized from explicit session handles or
+    copies reported at their creation sites. Strong references prevent ID reuse.
+    Snapshots are independent of collaborator-owned mutable dictionaries.
+    Only terminal views are committed to the existing session, in one batch.
+    """
+
+    def __init__(self, *, limits, max_records, max_bytes):
+        if (type(max_records) is not int or max_records < 1
+                or type(max_bytes) is not int or max_bytes < 1):
+            raise EvidenceProductionError("explicit positive preparation trace limits required")
+        self.limits = limits
+        self.max_records = max_records
+        self.max_bytes = max_bytes
+        self.entries = {}
+        self.roots = {}
+        self.bytes = 0
+        self.active = True
+        self.fault = None
+        self.copy_count = None
+        self.scored = []
+        self.scoring_complete = False
+
+    def check(self):
+        if not self.active:
+            raise EvidenceProductionError("preparation callback expired")
+        if self.fault is not None:
+            raise self.fault
+
+    def run(self, callback, *args, **kwargs):
+        self.check()
+        try:
+            return callback(*args, **kwargs)
+        except EvidenceContractError as exc:
+            self.fault = exc
+            raise
+        except Exception:
+            self.fault = EvidenceProductionError("evidence preparation collaborator failed")
+            raise self.fault from None
+        finally:
+            self.check()
+
+    def entry(self, record):
+        self.check()
+        item = self.entries.get(id(record))
+        if item is None or record is not item[0] or not _same_value(record, item[1]):
+            raise EvidenceProductionError("untracked or altered preparation occurrence")
+        return item
+
+    def add(self, record, parents, *, context=None):
+        self.check()
+        if type(record) is not dict or type(parents) is not tuple or not parents:
+            raise EvidenceProductionError("explicit preparation record and origins required")
+        if len(parents) > self.limits.assembly.max_occurrences:
+            raise EvidenceProductionError("too many preparation origins")
+        if id(record) in self.entries:
+            raise EvidenceProductionError("preparation occurrence already registered")
+        if len(self.entries) >= self.max_records:
+            raise EvidenceProductionError("preparation trace record limit exceeded")
+        size = len(canonical_json(_Freezer(self.limits.legacy).freeze(record)).encode("utf-8"))
+        if self.bytes + size > self.max_bytes:
+            raise EvidenceProductionError("preparation trace byte limit exceeded")
+        contexts = tuple(self.roots[h] for h in parents)
+        source = contexts[0].context.source
+        if any(value.context.source != source for value in contexts):
+            raise EvidenceProductionError("preparation cannot merge different sources")
+        ctx = context or contexts[0].context
+        evidence = adapt_candidate(record, context=ctx, limits=self.limits.adapter).entry.evidence
+        parent_evidence = tuple(adapt_candidate(value.record, context=value.context,
+            limits=self.limits.adapter).entry.evidence for value in contexts)
+        _check_derived_locator(evidence.locator, parent_evidence)
+        self.entries[id(record)] = (record, deepcopy(record), parents)
+        self.bytes += size
+
+    def materialize(self, handles, inputs):
+        if len(handles) != len(inputs):
+            raise EvidenceProductionError("preparation source length mismatch")
+        if len(set(self.roots).union(handles)) > self.limits.assembly.max_occurrences:
+            raise EvidenceProductionError("too many consumed preparation handles")
+        out = []
+        for h, item in zip(handles, inputs):
+            if item.layout != "retrieval_candidate":
+                raise EvidenceProductionError("page conversion must precede preparation")
+            self.roots[h] = item
+            value = deepcopy(item.record)
+            self.add(value, (h,), context=item.context)
+            out.append(value)
+        return out
+
+    def copies(self, stage, pairs):
+        self.check()
+        if stage not in {"copy", "score", "scored"} or type(pairs) is not tuple:
+            raise EvidenceProductionError("unknown preparation creation event")
+        if stage == "scored":
+            if (self.copy_count is None or self.scoring_complete
+                    or len(pairs) != len(self.scored)
+                    or any(a is not b for a, b in zip(pairs, self.scored))):
+                raise EvidenceProductionError("incomplete preparation scoring lineage")
+            for value in pairs:
+                self.entry(value)
+            self.scoring_complete = True
+            return
+        if stage == "copy":
+            if self.copy_count is not None:
+                raise EvidenceProductionError("duplicate preparation input event")
+            self.copy_count = len(pairs)
+        elif self.copy_count is None or self.scoring_complete:
+            raise EvidenceProductionError("out-of-order preparation score event")
+        for pair in pairs:
+            if type(pair) is not tuple or len(pair) != 2:
+                raise EvidenceProductionError("explicit source/view pair required")
+            source, view = pair
+            entry = self.entry(source)
+            if stage == "copy" and not _same_value(source, view):
+                raise EvidenceProductionError("copy changed evidence without transformation")
+            self.add(view, entry[2])
+            if stage == "score":
+                self.scored.append(view)
+
+    def traced(self, callback, groups, *args, identical=False, **kwargs):
+        # Only operator-reported input POSITIONS can give a new object origins.
+        originals = [[self.entry(record) for record in group] for group in groups]
+        traces = []
+        result = callback(*args, lineage=traces.append, **kwargs)
+        if (type(result) is not list or len(traces) != 1
+                or type(traces[0]) is not tuple or len(traces[0]) != len(result)):
+            raise EvidenceProductionError("missing preparation operator lineage")
+        for record, positions in zip(result, traces[0]):
+            if type(positions) is not tuple or not positions:
+                raise EvidenceProductionError("explicit preparation parent positions required")
+            parents = []
+            for pos in positions:
+                if (type(pos) is not tuple or len(pos) != 2
+                        or any(type(v) is not int for v in pos)
+                        or not 0 <= pos[0] < len(groups)
+                        or not 0 <= pos[1] < len(groups[pos[0]])):
+                    raise EvidenceProductionError("invalid preparation parent position")
+                entry = originals[pos[0]][pos[1]]
+                self.entry(entry[0])
+                if len(parents) + len(entry[2]) > self.limits.assembly.max_occurrences:
+                    raise EvidenceProductionError("too many preparation merge origins")
+                parents.extend(entry[2])
+            if identical and (len(positions) != 1 or not _same_value(record, entry[1])):
+                raise EvidenceProductionError("catalog projection changed record")
+            self.add(record, tuple(parents))
+        return result
+
+    def selected(self, callback, records, *args, **kwargs):
+        entries = [self.entry(record) for record in records]
+        result = callback(records, *args, **kwargs)
+        if type(result) is not list:
+            raise EvidenceProductionError("preparation selector must return a list")
+        admitted = {id(item[0]) for item in entries}
+        for record in result:
+            self.entry(record)
+            if id(record) not in admitted:
+                raise EvidenceProductionError("selector introduced a different occurrence")
+        for item in entries:
+            self.entry(item[0])
+        return result
+
+    def verify(self):
+        if self.copy_count is None or (self.copy_count and not self.scoring_complete):
+            raise EvidenceProductionError("preparation creation trace incomplete")
+        for entry in self.entries.values():
+            self.entry(entry[0])
+
+
+def prepare_records(*, request: Any, session: AskEvidenceSession,
+                    retrieval: dict, selections: tuple[AskSelection, ...], decision: Any,
+                    runtime: orchestration.AssistantCorePrepareEvidenceRuntime,
+                    source_callbacks: dict[str, Callable[..., tuple[RecordHandle, ...]]],
+                    authorize: Callable[[Any], frozenset[SourceIdentity]],
+                    invoke: Callable[..., Any], max_trace_records: int,
+                    max_trace_bytes: int) -> tuple[dict, tuple[AskSelection, ...]]:
+    """Run the REAL P4 ASK preparation, retaining its original policy/heuristics.
+
+    The caller supplies the existing request session/owner, CURRENT authority,
+    exact input collection handles, explicit trace capacities, and P4 runtime.
+    This is not a new router/Core/ACL service. No model, SQL or embedding is added.
+
+    Three optional source_callbacks use the corresponding original signatures:
+    catalog, neighbors, sections. If a reached branch lacks its adapter, it fails
+    technically, never silently skips a source. Each adapter must perform its
+    authentic existing read/conversion and return explicit session handles, not
+    raw records or grants inferred from IDs/text. Earlier acquired reads remain
+    in the session on failure; no terminal derived views are committed then.
+
+    Runtime merge and catalog-projection callbacks MUST accept `lineage` and
+    bind the existing traced v13_merge_candidates/overview_catalog_candidates
+    operators. The three selectors must return selected original objects. Metric
+    callbacks must not mutate evidence. Fresh copies require creation-site trace.
+    Main's legacy wrappers do NOT satisfy this binding automatically; caller must
+    explicitly compose these dependencies before activation. No fallback runtime.
+
+    Metadata outside candidates/citations is preserved, NOT made authorized text
+    by this operation. Catalog digest derives from separately authorized inputs,
+    but output semantics and links still need validation. Only ASK->ASK is
+    supported; RC/Smart remain in their unchanged legacy path. This does not wire
+    production reads, page conversion, current ACL, other callbacks, direct/facts,
+    post-Core rescue, cache or main. No claim of full canonical ASK activation.
+
+    Trace capacities bound records/serialized snapshots, not heap, model tokens
+    or dollars. Authority callbacks have real costs to measure. Collaborators are
+    trusted, non-reentrant for this operation; no Python sandbox or atomic remote
+    revocation is promised. Caller owns/ends the same session lifetime.
+    """
+    _callbacks(session, authorize, invoke)
+
+    def work():
+        if (getattr(request, "requested_mode", None) != "ask"
+                or getattr(decision, "effective_mode", None) != "ask"):
+            raise EvidenceProductionError("preparation lineage supports ASK/ASK only")
+        if type(runtime) is not orchestration.AssistantCorePrepareEvidenceRuntime:
+            raise EvidenceProductionError("existing explicit P4 preparation runtime required")
+        if (type(source_callbacks) is not dict
+                or any(k not in {"catalog", "neighbors", "sections"}
+                       or not callable(v) for k, v in source_callbacks.items())):
+            raise EvidenceProductionError("explicit preparation source adapters required")
+        before = invoke(authorize, request, request)
+        _, limits = session.read_contract(request=request, current_allowed_sources=before)
+        journal = _PreparationTrace(limits=limits, max_records=max_trace_records,
+                                    max_bytes=max_trace_bytes)
+        # P6-A exact collection check BEFORE providing data to a collaborator.
+        session.admission(request=request, retrieval=retrieval, selections=selections,
+                          current_allowed_sources=before)
+        supplied = deepcopy(retrieval)
+        try:
+            for selection in selections:
+                inputs = session.records(request=request, handles=selection.records,
+                                         current_allowed_sources=before)
+                values = journal.materialize(selection.records, inputs)
+                supplied[selection.name] = values if selection.container_kind == "list" else tuple(values)
+
+            def call(fn, *args, **kwargs):
+                return journal.run(invoke, fn, request, *args, **kwargs)
+
+            def source(name, *args, **kwargs):
+                def read():
+                    if name not in source_callbacks:
+                        raise EvidenceProductionError("required preparation source adapter missing")
+                    current = invoke(authorize, request, request)
+                    session.read_contract(request=request, current_allowed_sources=current)
+                    session.records(request=request, handles=tuple(journal.roots),
+                                    current_allowed_sources=current)
+                    handles = invoke(source_callbacks[name], request, *args, **kwargs)
+                    if (type(handles) is not tuple or len(handles) > limits.assembly.max_occurrences
+                            or any(type(h) is not RecordHandle for h in handles)):
+                        raise EvidenceProductionError("source adapter must return bounded explicit handles")
+                    after = invoke(authorize, request, request)
+                    inputs = session.records(request=request, handles=handles,
+                                             current_allowed_sources=after)
+                    return journal.materialize(handles, inputs)
+                return journal.run(read)
+
+            def assurance(req, data, route):
+                original = {name: tuple(data.get(name) or ()) for name in ("candidates", "citations")}
+                result = call(runtime._assistant_core_root_diagnostic_evidence_assurance,
+                              req, data, route)
+                # ASK assurance must not silently introduce unregistered copies.
+                for name in ("candidates", "citations"):
+                    records = result.get(name) or []
+                    if len(records) != len(original[name]) or any(
+                            a is not b for a, b in zip(records, original[name])):
+                        raise EvidenceProductionError("ASK assurance changed its registered collections")
+                    for record in records:
+                        journal.entry(record)
+                return result
+
+            def merge(groups):
+                return journal.run(journal.traced,
+                    lambda *a, **kw: call(runtime._v13_merge_candidates, *a, **kw),
+                    groups, groups)
+
+            def overview(records):
+                return journal.run(journal.traced,
+                    lambda *a, **kw: call(runtime._assistant_core_overview_catalog_candidates, *a, **kw),
+                    [records], records, identical=True)
+
+            def selector(fn):
+                def selected(records, *args, **kwargs):
+                    return journal.run(journal.selected,
+                        lambda *a, **kw: call(fn, *a, **kw), records, *args, **kwargs)
+                return selected
+
+            def readonly(fn):
+                def observed(*args, **kwargs):
+                    snapshots = [(value, deepcopy(value)) for value in (*args, *kwargs.values())
+                                 if type(value) in (dict, list, tuple)]
+                    result = call(fn, *args, **kwargs)
+                    if any(not _same_value(value, expected) for value, expected in snapshots):
+                        raise EvidenceProductionError("read-only preparation callback changed its input")
+                    return result
+                return observed
+
+            read_only_names = (
+                "_assistant_core_candidate_source_type", "_v13_candidate_text",
+                "_assistant_core_candidate_facet_metrics", "_assistant_core_diagnostic_priority_metrics",
+                "_assistant_core_ps_is_substantive", "_v13_evidence_metrics",
+                "_assistant_core_machine_catalog_digest", "_v13_deterministic_evidence_state")
+            bound = replace(runtime,
+                **{name: readonly(getattr(runtime, name)) for name in read_only_names},
+                _assistant_core_root_diagnostic_evidence_assurance=assurance,
+                _assistant_core_machine_catalog_candidates=lambda *a, **kw: source("catalog", *a, **kw),
+                _v13_assurance_fetch_neighbor_pages=lambda *a, **kw: source("neighbors", *a, **kw),
+                _assistant_core_expand_enumeration_sections=lambda *a, **kw: source("sections", *a, **kw),
+                _v13_merge_candidates=merge,
+                _assistant_core_overview_catalog_candidates=overview,
+                _dedup_citations_by_snippet=selector(runtime._dedup_citations_by_snippet),
+                _assistant_core_facet_balanced_pool=selector(runtime._assistant_core_facet_balanced_pool),
+                _assistant_core_source_diversity_pool=selector(runtime._assistant_core_source_diversity_pool))
+            result = journal.run(invoke, orchestration.assistant_core_prepare_evidence,
+                request, request, supplied, decision, runtime=bound,
+                lineage=lambda *a: journal.run(journal.copies, *a))
+            journal.verify()  # Includes consumed records no longer in the result.
+            after = invoke(authorize, request, request)
+            roots = tuple(journal.roots)
+            if len(roots) > limits.assembly.max_occurrences:
+                raise EvidenceProductionError("too many consumed preparation handles")
+            session.records(request=request, handles=roots, current_allowed_sources=after)
+            output = result.get("retrieval") if type(result) is dict else None
+            if (type(output) is not dict or type(result.get("supported")) is not bool
+                    or type(output.get("candidates")) is not list
+                    or type(output.get("citations")) is not list):
+                raise EvidenceProductionError("P4 preparation output contract changed")
+            values = output["candidates"]
+            if (not _same_value(values, output["citations"])
+                    or any(a is not b for a, b in zip(values, output["citations"]))
+                    or 2 * len(values) > limits.assembly.max_occurrences):
+                raise EvidenceProductionError("prepared collections lack one exact selection")
+            views = tuple((journal.entry(record)[2], deepcopy(record)) for record in values)
+            # All final source/locator/relationship checks remain in the SAME session.
+            handles = session.derive_batch(request=request, views=views,
+                operation=PREPARATION_VERSION, current_allowed_sources=after)
+            return result, (AskSelection("candidates", handles), AskSelection("citations", handles))
+        finally:
+            journal.active = False
+            journal.entries.clear()
+            journal.roots.clear()
+            journal.scored.clear()
 
     return invoke(work, request)
