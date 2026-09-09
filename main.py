@@ -122,6 +122,7 @@ from machinemind.ask import execution as _ask_execution
 from machinemind.ask import validation as _ask_validation
 from machinemind.ask import request_flow as _ask_request_flow
 from machinemind.ask import request_binding as _ask_request_binding
+from machinemind.ask import acquisition as _ask_acquisition
 
 from machinemind.infrastructure.execution import (
     json_with_hard_timeout as _infra_json_with_hard_timeout,
@@ -12599,6 +12600,38 @@ def _v13_should_use_structured_path(q: str, retrieval: dict) -> bool:
     return bool(any(c in structured for c in ordered[:3]) or best_structured >= top_score - 0.12)
 
 
+def _assistant_core_initial_retrieval_runtime():
+    return _retrieval_evidence_orchestration.V13InitialRetrievalRuntime(
+        V13_DENSE_QUERY_LIMIT=V13_DENSE_QUERY_LIMIT,
+        V13_LEXICAL_QUERY_LIMIT=V13_LEXICAL_QUERY_LIMIT,
+        V13_MAX_EVIDENCE_ITEMS_ASK=V13_MAX_EVIDENCE_ITEMS_ASK,
+        V13_MAX_EVIDENCE_ITEMS_ROOT_CAUSE=V13_MAX_EVIDENCE_ITEMS_ROOT_CAUSE,
+        _ask_source_preference_profile=_ask_source_preference_profile,
+        _ask_structured_direct_fetch_sources=_ask_structured_direct_fetch_sources,
+        _count_query_tokens=_count_query_tokens,
+        _dedup_text_values=_dedup_text_values,
+        _fetch_dense_chunk_candidates=_fetch_dense_chunk_candidates,
+        _fts_search_chunks_multi=_fts_search_chunks_multi,
+        _fts_search_chunks_prefix=_fts_search_chunks_prefix,
+        _openai_embed_texts=_openai_embed_texts,
+        _raw_rows_to_dense_candidates=_raw_rows_to_dense_candidates,
+        _rrf_merge_candidates=_rrf_merge_candidates,
+        _structured_rescue_query_intent=_structured_rescue_query_intent,
+        _v13_build_profile_from_plan=_v13_build_profile_from_plan,
+        _v13_current_budget=_v13_current_budget,
+        _v13_evidence_metrics=_v13_evidence_metrics,
+        _v13_exact_identifier_candidates=_v13_exact_identifier_candidates,
+        _v13_fallback_plan=_v13_fallback_plan,
+        _v13_fetch_preferred_source_pages=_v13_fetch_preferred_source_pages,
+        _v13_fetch_scored_pages=_v13_fetch_scored_pages,
+        _v13_fetch_structured_dense_candidates=_v13_fetch_structured_dense_candidates,
+        _v13_merge_candidates=_v13_merge_candidates,
+        _v13_rescore_root_candidates=_v13_rescore_root_candidates,
+        _v13_score_candidates=_v13_score_candidates,
+        _vector_literal=_vector_literal,
+    )
+
+
 def _v13_initial_retrieval(
     *,
     q: str,
@@ -12621,35 +12654,7 @@ def _v13_initial_retrieval(
         response_language=response_language,
         mode=mode,
         plan=plan,
-        runtime=_retrieval_evidence_orchestration.V13InitialRetrievalRuntime(
-            V13_DENSE_QUERY_LIMIT=V13_DENSE_QUERY_LIMIT,
-            V13_LEXICAL_QUERY_LIMIT=V13_LEXICAL_QUERY_LIMIT,
-            V13_MAX_EVIDENCE_ITEMS_ASK=V13_MAX_EVIDENCE_ITEMS_ASK,
-            V13_MAX_EVIDENCE_ITEMS_ROOT_CAUSE=V13_MAX_EVIDENCE_ITEMS_ROOT_CAUSE,
-            _ask_source_preference_profile=_ask_source_preference_profile,
-            _ask_structured_direct_fetch_sources=_ask_structured_direct_fetch_sources,
-            _count_query_tokens=_count_query_tokens,
-            _dedup_text_values=_dedup_text_values,
-            _fetch_dense_chunk_candidates=_fetch_dense_chunk_candidates,
-            _fts_search_chunks_multi=_fts_search_chunks_multi,
-            _fts_search_chunks_prefix=_fts_search_chunks_prefix,
-            _openai_embed_texts=_openai_embed_texts,
-            _raw_rows_to_dense_candidates=_raw_rows_to_dense_candidates,
-            _rrf_merge_candidates=_rrf_merge_candidates,
-            _structured_rescue_query_intent=_structured_rescue_query_intent,
-            _v13_build_profile_from_plan=_v13_build_profile_from_plan,
-            _v13_current_budget=_v13_current_budget,
-            _v13_evidence_metrics=_v13_evidence_metrics,
-            _v13_exact_identifier_candidates=_v13_exact_identifier_candidates,
-            _v13_fallback_plan=_v13_fallback_plan,
-            _v13_fetch_preferred_source_pages=_v13_fetch_preferred_source_pages,
-            _v13_fetch_scored_pages=_v13_fetch_scored_pages,
-            _v13_fetch_structured_dense_candidates=_v13_fetch_structured_dense_candidates,
-            _v13_merge_candidates=_v13_merge_candidates,
-            _v13_rescore_root_candidates=_v13_rescore_root_candidates,
-            _v13_score_candidates=_v13_score_candidates,
-            _vector_literal=_vector_literal,
-        ),
+        runtime=_assistant_core_initial_retrieval_runtime(),
     )
 
 
@@ -14237,19 +14242,23 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
             request.metadata[_retrieval_precision_facts.SCALAR_TARGET_KEY] = target
     return out
 
+def _assistant_core_neutral_retrieval_runtime():
+    return _retrieval_evidence_orchestration.AssistantCoreRetrieveNeutralRuntime(
+        MODE_ROOT_CAUSE=MODE_ROOT_CAUSE,
+        _assistant_core_retrieval_query=_assistant_core_retrieval_query,
+        _assistant_core_scope_value=_assistant_core_scope_value,
+        _retrieval_diagnostic_query=_retrieval_diagnostic_query,
+        _v13_fallback_plan=_v13_fallback_plan,
+        _v13_fetch_structured_title_candidates=_v13_fetch_structured_title_candidates,
+        _v13_initial_retrieval=_v13_initial_retrieval,
+        _v13_merge_source_title_candidates=_v13_merge_source_title_candidates,
+    )
+
+
 def _assistant_core_retrieve_neutral(request: AssistantCoreRequest) -> dict:
     return _retrieval_evidence_orchestration.assistant_core_retrieve_neutral(
         request,
-        runtime=_retrieval_evidence_orchestration.AssistantCoreRetrieveNeutralRuntime(
-            MODE_ROOT_CAUSE=MODE_ROOT_CAUSE,
-            _assistant_core_retrieval_query=_assistant_core_retrieval_query,
-            _assistant_core_scope_value=_assistant_core_scope_value,
-            _retrieval_diagnostic_query=_retrieval_diagnostic_query,
-            _v13_fallback_plan=_v13_fallback_plan,
-            _v13_fetch_structured_title_candidates=_v13_fetch_structured_title_candidates,
-            _v13_initial_retrieval=_v13_initial_retrieval,
-            _v13_merge_source_title_candidates=_v13_merge_source_title_candidates,
-        ),
+        runtime=_assistant_core_neutral_retrieval_runtime(),
     )
 
 
@@ -14327,6 +14336,27 @@ def _assistant_core_facet_candidate_confidence(
     )
 
 
+def _assistant_core_refine_retrieval_runtime():
+    return _retrieval_evidence_orchestration.AssistantCoreRefineRetrievalRuntime(
+        ASSISTANT_CORE_MAX_FACETS=ASSISTANT_CORE_MAX_FACETS,
+        V13_DENSE_QUERY_LIMIT=V13_DENSE_QUERY_LIMIT,
+        V13_LEXICAL_QUERY_LIMIT=V13_LEXICAL_QUERY_LIMIT,
+        V13_MAX_EVIDENCE_ITEMS_ASK=V13_MAX_EVIDENCE_ITEMS_ASK,
+        V13_MAX_EVIDENCE_ITEMS_ROOT_CAUSE=V13_MAX_EVIDENCE_ITEMS_ROOT_CAUSE,
+        _assistant_core_candidate_source_type=_assistant_core_candidate_source_type,
+        _assistant_core_facet_candidate_confidence=_assistant_core_facet_candidate_confidence,
+        _assistant_core_merge_facet_candidates=_assistant_core_merge_facet_candidates,
+        _assistant_core_retrieval_query=_assistant_core_retrieval_query,
+        _assistant_core_scope_value=_assistant_core_scope_value,
+        _dedup_text_values=_dedup_text_values,
+        _v13_current_budget=_v13_current_budget,
+        _v13_evidence_metrics=_v13_evidence_metrics,
+        _v13_fallback_plan=_v13_fallback_plan,
+        _v13_initial_retrieval=_v13_initial_retrieval,
+        _v13_score_candidates=_v13_score_candidates,
+    )
+
+
 def _assistant_core_refine_retrieval(
     request: AssistantCoreRequest,
     retrieval: dict,
@@ -14336,24 +14366,7 @@ def _assistant_core_refine_retrieval(
         request,
         retrieval,
         decision,
-        runtime=_retrieval_evidence_orchestration.AssistantCoreRefineRetrievalRuntime(
-            ASSISTANT_CORE_MAX_FACETS=ASSISTANT_CORE_MAX_FACETS,
-            V13_DENSE_QUERY_LIMIT=V13_DENSE_QUERY_LIMIT,
-            V13_LEXICAL_QUERY_LIMIT=V13_LEXICAL_QUERY_LIMIT,
-            V13_MAX_EVIDENCE_ITEMS_ASK=V13_MAX_EVIDENCE_ITEMS_ASK,
-            V13_MAX_EVIDENCE_ITEMS_ROOT_CAUSE=V13_MAX_EVIDENCE_ITEMS_ROOT_CAUSE,
-            _assistant_core_candidate_source_type=_assistant_core_candidate_source_type,
-            _assistant_core_facet_candidate_confidence=_assistant_core_facet_candidate_confidence,
-            _assistant_core_merge_facet_candidates=_assistant_core_merge_facet_candidates,
-            _assistant_core_retrieval_query=_assistant_core_retrieval_query,
-            _assistant_core_scope_value=_assistant_core_scope_value,
-            _dedup_text_values=_dedup_text_values,
-            _v13_current_budget=_v13_current_budget,
-            _v13_evidence_metrics=_v13_evidence_metrics,
-            _v13_fallback_plan=_v13_fallback_plan,
-            _v13_initial_retrieval=_v13_initial_retrieval,
-            _v13_score_candidates=_v13_score_candidates,
-        ),
+        runtime=_assistant_core_refine_retrieval_runtime(),
     )
 
 def _assistant_core_required_facet_metrics(text: str, facets: list[str] | tuple[str, ...]) -> dict:
@@ -15634,6 +15647,69 @@ def _assistant_core_root_source_page_diversity(
     result = _assistant_core_root_source_selection(candidates, limit=limit)
     return list(result.candidates)
 
+def _assistant_core_prepare_evidence_runtime():
+    return _retrieval_evidence_orchestration.AssistantCorePrepareEvidenceRuntime(
+        EVIDENCE_PARTIAL=EVIDENCE_PARTIAL,
+        EVIDENCE_REFINE=EVIDENCE_REFINE,
+        EVIDENCE_SUPPORTED=EVIDENCE_SUPPORTED,
+        INFO_FAULT_DIAGNOSTIC=INFO_FAULT_DIAGNOSTIC,
+        INFO_INTERFACE_NAVIGATION=INFO_INTERFACE_NAVIGATION,
+        INFO_NUMERIC_SPECIFICATION=INFO_NUMERIC_SPECIFICATION,
+        INFO_PROCEDURE_FULL=INFO_PROCEDURE_FULL,
+        INFO_PROCEDURE_SEGMENT=INFO_PROCEDURE_SEGMENT,
+        INFO_SEQUENCE_SYNCHRONIZATION=INFO_SEQUENCE_SYNCHRONIZATION,
+        KIND_FAULT_DIAGNOSTIC=KIND_FAULT_DIAGNOSTIC,
+        KIND_GENERAL_TECHNICAL=KIND_GENERAL_TECHNICAL,
+        KIND_GUIDED_DIAGNOSTIC=KIND_GUIDED_DIAGNOSTIC,
+        KIND_PROCEDURE=KIND_PROCEDURE,
+        MODE_ASK=MODE_ASK,
+        MODE_ROOT_CAUSE=MODE_ROOT_CAUSE,
+        MODE_SMART_DIAGNOSTIC=MODE_SMART_DIAGNOSTIC,
+        POLICY_GENERAL_ALLOWED=POLICY_GENERAL_ALLOWED,
+        REQ_DIAGNOSTIC_CAUSES=REQ_DIAGNOSTIC_CAUSES,
+        REQ_INTERFACE_LOCATIONS=REQ_INTERFACE_LOCATIONS,
+        REQ_NUMERIC_VALUE=REQ_NUMERIC_VALUE,
+        REQ_ORDERED_ACTIONS=REQ_ORDERED_ACTIONS,
+        REQ_STATE_SEQUENCE=REQ_STATE_SEQUENCE,
+        V13_MAX_EVIDENCE_ITEMS_ASK=V13_MAX_EVIDENCE_ITEMS_ASK,
+        V13_MAX_EVIDENCE_ITEMS_ROOT_CAUSE=V13_MAX_EVIDENCE_ITEMS_ROOT_CAUSE,
+        _assistant_core_candidate_facet_metrics=_assistant_core_candidate_facet_metrics,
+        _assistant_core_candidate_source_type=_assistant_core_candidate_source_type,
+        _assistant_core_diagnostic_priority_metrics=_assistant_core_diagnostic_priority_metrics,
+        _assistant_core_enumeration_metrics=_assistant_core_enumeration_metrics,
+        _assistant_core_enumeration_requested=_assistant_core_enumeration_requested,
+        _assistant_core_expand_enumeration_sections=_assistant_core_expand_enumeration_sections,
+        _assistant_core_facet_balanced_pool=_assistant_core_facet_balanced_pool,
+        _assistant_core_interface_navigation_signal=_assistant_core_interface_navigation_signal,
+        _assistant_core_machine_catalog_candidates=_assistant_core_machine_catalog_candidates,
+        _assistant_core_machine_catalog_digest=_assistant_core_machine_catalog_digest,
+        _assistant_core_numeric_signal=_assistant_core_numeric_signal,
+        _assistant_core_overview_catalog_candidates=_assistant_core_overview_catalog_candidates,
+        _assistant_core_ps_is_substantive=_assistant_core_ps_is_substantive,
+        _assistant_core_retrieval_query=_assistant_core_retrieval_query,
+        _assistant_core_root_candidate_viable=_assistant_core_root_candidate_viable,
+        _assistant_core_root_diagnostic_evidence_assurance=_assistant_core_root_diagnostic_evidence_assurance,
+        _assistant_core_root_source_selection=_assistant_core_root_source_selection,
+        _assistant_core_sequence_signal=_assistant_core_sequence_signal,
+        _assistant_core_source_bonus=_assistant_core_source_bonus,
+        _assistant_core_source_diversity_pool=_assistant_core_source_diversity_pool,
+        _content_term_set=_content_term_set,
+        _dedup_citations_by_snippet=_dedup_citations_by_snippet,
+        _dedup_text_values=_dedup_text_values,
+        _normalize_unicode_advanced=_normalize_unicode_advanced,
+        _term_overlap_score=_term_overlap_score,
+        _v13_assurance_fetch_neighbor_pages=_v13_assurance_fetch_neighbor_pages,
+        _v13_candidate_text=_v13_candidate_text,
+        _v13_current_budget=_v13_current_budget,
+        _v13_deterministic_evidence_state=_v13_deterministic_evidence_state,
+        _v13_evidence_metrics=_v13_evidence_metrics,
+        _v13_merge_candidates=_v13_merge_candidates,
+        _v13_rescore_root_candidates=_v13_rescore_root_candidates,
+        re=re,
+        time_module=time_module,
+    )
+
+
 def _assistant_core_prepare_evidence(
     request: AssistantCoreRequest,
     retrieval: dict,
@@ -15643,66 +15719,7 @@ def _assistant_core_prepare_evidence(
         request,
         retrieval,
         decision,
-        runtime=_retrieval_evidence_orchestration.AssistantCorePrepareEvidenceRuntime(
-            EVIDENCE_PARTIAL=EVIDENCE_PARTIAL,
-            EVIDENCE_REFINE=EVIDENCE_REFINE,
-            EVIDENCE_SUPPORTED=EVIDENCE_SUPPORTED,
-            INFO_FAULT_DIAGNOSTIC=INFO_FAULT_DIAGNOSTIC,
-            INFO_INTERFACE_NAVIGATION=INFO_INTERFACE_NAVIGATION,
-            INFO_NUMERIC_SPECIFICATION=INFO_NUMERIC_SPECIFICATION,
-            INFO_PROCEDURE_FULL=INFO_PROCEDURE_FULL,
-            INFO_PROCEDURE_SEGMENT=INFO_PROCEDURE_SEGMENT,
-            INFO_SEQUENCE_SYNCHRONIZATION=INFO_SEQUENCE_SYNCHRONIZATION,
-            KIND_FAULT_DIAGNOSTIC=KIND_FAULT_DIAGNOSTIC,
-            KIND_GENERAL_TECHNICAL=KIND_GENERAL_TECHNICAL,
-            KIND_GUIDED_DIAGNOSTIC=KIND_GUIDED_DIAGNOSTIC,
-            KIND_PROCEDURE=KIND_PROCEDURE,
-            MODE_ASK=MODE_ASK,
-            MODE_ROOT_CAUSE=MODE_ROOT_CAUSE,
-            MODE_SMART_DIAGNOSTIC=MODE_SMART_DIAGNOSTIC,
-            POLICY_GENERAL_ALLOWED=POLICY_GENERAL_ALLOWED,
-            REQ_DIAGNOSTIC_CAUSES=REQ_DIAGNOSTIC_CAUSES,
-            REQ_INTERFACE_LOCATIONS=REQ_INTERFACE_LOCATIONS,
-            REQ_NUMERIC_VALUE=REQ_NUMERIC_VALUE,
-            REQ_ORDERED_ACTIONS=REQ_ORDERED_ACTIONS,
-            REQ_STATE_SEQUENCE=REQ_STATE_SEQUENCE,
-            V13_MAX_EVIDENCE_ITEMS_ASK=V13_MAX_EVIDENCE_ITEMS_ASK,
-            V13_MAX_EVIDENCE_ITEMS_ROOT_CAUSE=V13_MAX_EVIDENCE_ITEMS_ROOT_CAUSE,
-            _assistant_core_candidate_facet_metrics=_assistant_core_candidate_facet_metrics,
-            _assistant_core_candidate_source_type=_assistant_core_candidate_source_type,
-            _assistant_core_diagnostic_priority_metrics=_assistant_core_diagnostic_priority_metrics,
-            _assistant_core_enumeration_metrics=_assistant_core_enumeration_metrics,
-            _assistant_core_enumeration_requested=_assistant_core_enumeration_requested,
-            _assistant_core_expand_enumeration_sections=_assistant_core_expand_enumeration_sections,
-            _assistant_core_facet_balanced_pool=_assistant_core_facet_balanced_pool,
-            _assistant_core_interface_navigation_signal=_assistant_core_interface_navigation_signal,
-            _assistant_core_machine_catalog_candidates=_assistant_core_machine_catalog_candidates,
-            _assistant_core_machine_catalog_digest=_assistant_core_machine_catalog_digest,
-            _assistant_core_numeric_signal=_assistant_core_numeric_signal,
-            _assistant_core_overview_catalog_candidates=_assistant_core_overview_catalog_candidates,
-            _assistant_core_ps_is_substantive=_assistant_core_ps_is_substantive,
-            _assistant_core_retrieval_query=_assistant_core_retrieval_query,
-            _assistant_core_root_candidate_viable=_assistant_core_root_candidate_viable,
-            _assistant_core_root_diagnostic_evidence_assurance=_assistant_core_root_diagnostic_evidence_assurance,
-            _assistant_core_root_source_selection=_assistant_core_root_source_selection,
-            _assistant_core_sequence_signal=_assistant_core_sequence_signal,
-            _assistant_core_source_bonus=_assistant_core_source_bonus,
-            _assistant_core_source_diversity_pool=_assistant_core_source_diversity_pool,
-            _content_term_set=_content_term_set,
-            _dedup_citations_by_snippet=_dedup_citations_by_snippet,
-            _dedup_text_values=_dedup_text_values,
-            _normalize_unicode_advanced=_normalize_unicode_advanced,
-            _term_overlap_score=_term_overlap_score,
-            _v13_assurance_fetch_neighbor_pages=_v13_assurance_fetch_neighbor_pages,
-            _v13_candidate_text=_v13_candidate_text,
-            _v13_current_budget=_v13_current_budget,
-            _v13_deterministic_evidence_state=_v13_deterministic_evidence_state,
-            _v13_evidence_metrics=_v13_evidence_metrics,
-            _v13_merge_candidates=_v13_merge_candidates,
-            _v13_rescore_root_candidates=_v13_rescore_root_candidates,
-            re=re,
-            time_module=time_module,
-        ),
+        runtime=_assistant_core_prepare_evidence_runtime(),
     )
 
 def _assistant_core_ask_execution_runtime() -> _ask_execution.AskExecutionRuntime:
@@ -17277,6 +17294,12 @@ def _assistant_core_run_request(request: AssistantCoreRequest) -> dict:
         runtimes=_ask_request_binding.AskRuntimeFactories(
             execution=_assistant_core_ask_execution_runtime,
             validation=_assistant_core_ask_validation_runtime,
+        ),
+        acquisition=_ask_acquisition.AskAcquisitionFactories(
+            initial=_assistant_core_initial_retrieval_runtime,
+            neutral=_assistant_core_neutral_retrieval_runtime,
+            refine=_assistant_core_refine_retrieval_runtime,
+            prepare=_assistant_core_prepare_evidence_runtime,
         ),
     )
 

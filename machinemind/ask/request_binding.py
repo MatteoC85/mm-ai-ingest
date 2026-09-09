@@ -9,7 +9,7 @@ and explicit occurrence selection through B4b EXECUTION and B4c VALIDATION_V1.
 Acquisition/derivation callbacks must already register their own receipts. This
 module never invents grants or reconstructs handles from IDs/text/scores.
 
-Production main supplies NO evidence binding yet. This is request composition,
+Production main supplies acquisition factories but NO evidence binding yet. This is request composition,
 not final canonical activation: callback internals, metadata outside the two
 collections, scalar rescue, cache, link validity and answer semantics remain
 separate integration gates. No transport or new retrieval/model call lives here.
@@ -22,11 +22,12 @@ from typing import Any, Callable
 
 from assistant_core_v2 import AssistantCoreHooks, AssistantCoreV2
 from . import execution, validation
+from .acquisition import AskAcquisitionFactories, bind_acquisition
 from ..evidence.ask_input import apply_ask_evidence_input, ask_request_key
 from ..evidence.contracts import EvidenceContractError, SourceIdentity
 from ..retrieval.ask_composition import AskEvidenceSession, AskSelection
 
-REQUEST_BINDING_VERSION = "ask-request-binding-p6b4e-v1"
+REQUEST_BINDING_VERSION = "ask-request-binding-p6b4f-v1"
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -102,11 +103,14 @@ def _local_legacy_consumers(er: execution.AskExecutionRuntime,
 
 def run_core_request(request: Any, *, core: AssistantCoreV2,
                      runtimes: AskRuntimeFactories,
-                     evidence: AskRequestEvidence | None = None) -> dict:
+                     evidence: AskRequestEvidence | None = None,
+                     acquisition: AskAcquisitionFactories | None = None) -> dict:
     """Execute once using request-owned hooks, never patch the shared engine.
 
     Non-ASK (including RC routed to ASK) goes straight to the existing engine and
-    does not construct ASK runtimes. Main keeps evidence=None in this release.
+    does not construct ASK runtimes or acquisition factories. Main keeps evidence=None.
+    Acquisition factories snapshot the four existing P4 dependency sets once;
+    nested initial retrieval shares that snapshot. No globals are patched.
     Guarded execution validates collection snapshots before routing/preparation
     and before returning, as well as B4b/B4c consumer boundaries. This does not
     authorize evidence hidden in callback internals or outside the collections.
@@ -127,6 +131,9 @@ def run_core_request(request: Any, *, core: AssistantCoreV2,
         if evidence is not None:
             raise EvidenceContractError("canonical request binding is ASK-only")
         return core.run(request)
+
+    if acquisition is not None and type(acquisition) is not AskAcquisitionFactories:
+        raise EvidenceContractError("typed acquisition factories required")
 
     original_request = request
     original_key = ask_request_key(request) if evidence is not None else None
@@ -160,7 +167,7 @@ def run_core_request(request: Any, *, core: AssistantCoreV2,
                 fault = exc
                 raise
 
-    def invoke(callback, req, *args, **kwargs):
+    def invoke(callback, req, /, *args, **kwargs):
         nonlocal fault
         check(req)
         try:
@@ -232,8 +239,14 @@ def run_core_request(request: Any, *, core: AssistantCoreV2,
                                              authorize=authorize, select=select)
             vr = validation.bind_ask_validation(vr, execution_runtime=er)
 
+        # Same P4 algorithms with request-local acquisition snapshots. Existing
+        # consumers see no alternate retrieval policy or second evidence session.
+        acq = (invoke(bind_acquisition, request, request, factories=acquisition,
+                      invoke=invoke) if acquisition is not None else None)
+
         def neutral(req):
-            return admit(req, invoke(hooks.retrieve_neutral, req, req), None,
+            callback = acq.neutral if acq is not None else hooks.retrieve_neutral
+            return admit(req, invoke(callback, req, req), None,
                          "core.retrieve.output")
 
         def route(req, data):
@@ -242,12 +255,12 @@ def run_core_request(request: Any, *, core: AssistantCoreV2,
 
         def refine(req, data, dec):
             data = admit(req, data, dec, "core.refine.input")
-            return admit(req, invoke(hooks.refine_retrieval, req, req, data, dec),
+            return admit(req, invoke(acq.refine if acq is not None else hooks.refine_retrieval, req, req, data, dec),
                          dec, "core.refine.output")
 
         def prepare(req, data, dec):
             data = admit(req, data, dec, "core.prepare.input")
-            out = invoke(hooks.prepare_evidence, req, req, data, dec)
+            out = invoke(acq.prepare if acq is not None else hooks.prepare_evidence, req, req, data, dec)
             if evidence is not None:
                 out = dict(out or {})
                 if "retrieval" in out and out["retrieval"] is not None:
