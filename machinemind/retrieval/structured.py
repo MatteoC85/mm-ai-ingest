@@ -1,4 +1,4 @@
-"""P6-B2: opt-in bound views alongside the behavior-preserving P4 readers.
+"""P6-B3: opt-in bound views alongside the behavior-preserving P4 readers.
 
 The composition root still invokes the legacy entry points. Only explicit new
 read_*_evidence calls retain authoritative columns from the same SELECT and
@@ -13,6 +13,11 @@ from .chunk_evidence import ChunkReadScope, ChunkEvidenceLimits
 from .relation_evidence import (RELATION_BINDING_COLUMNS, RelationEvidenceRead,
                                 validate_relation_request, build_relation_read)
 from ..evidence.contracts import SourceIdentity
+from .supplemental_evidence import (CHUNK_BINDING_COLUMNS, FILE_BINDING_COLUMNS,
+    SupplementalChunkRead, FileReferenceRead, SupplementalBindingError,
+    _ChunkSelectionCapture, build_file_reference_read, checked_input_records,
+    require_machine_scope, storage_key, validate_anchors)
+
 
 
 import re
@@ -244,6 +249,12 @@ class FetchStructuredRescueCandidatesRuntime:
 
 
 def fetch_structured_rescue_candidates(*, company_id: str, machine_id: str, q: str, planner: Optional[dict], top_k: int, doc_ids: Optional[list[str]]=None, bubble_document_id: Optional[str]=None, runtime: FetchStructuredRescueCandidatesRuntime) -> list[dict]:
+    """Legacy entry; existing SQL, parameters, selection and failure behavior."""
+    return _fetch_structured_rescue_candidates_impl(company_id=company_id, machine_id=machine_id, q=q, planner=planner, top_k=top_k, doc_ids=doc_ids, bubble_document_id=bubble_document_id, runtime=runtime)
+
+
+def _fetch_structured_rescue_candidates_impl(*, company_id: str, machine_id: str, q: str, planner: Optional[dict], top_k: int, doc_ids: Optional[list[str]]=None, bubble_document_id: Optional[str]=None, runtime: FetchStructuredRescueCandidatesRuntime, _chunk_capture: _ChunkSelectionCapture | None=None) -> list[dict]:
+    binding_columns = CHUNK_BINDING_COLUMNS if _chunk_capture is not None else ""
     ASK_SNIPPET_CHARS = runtime.ASK_SNIPPET_CHARS
     STRUCTURED_RESCUE_ENABLED = runtime.STRUCTURED_RESCUE_ENABLED
     STRUCTURED_RESCUE_MAX_HITS = runtime.STRUCTURED_RESCUE_MAX_HITS
@@ -273,11 +284,13 @@ def fetch_structured_rescue_candidates(*, company_id: str, machine_id: str, q: s
     conn = _db_conn()
     try:
         with conn.cursor() as cur:
+            if _chunk_capture is not None:
+                _chunk_capture.expect(STRUCTURED_RESCUE_SCAN_LIMIT, query_text=q)
             cur.execute(
                 f"""
                 SELECT bubble_document_id, chunk_index, page_from, page_to,
                        left(chunk_text, %s) AS snippet,
-                       left(chunk_text, 2000) AS chunk_full
+                       left(chunk_text, 2000) AS chunk_full{binding_columns}
                 FROM public.document_chunks
                 WHERE ({like_clauses})
                   AND company_id = %s
@@ -289,6 +302,8 @@ def fetch_structured_rescue_candidates(*, company_id: str, machine_id: str, q: s
                 params,
             )
             rows = cur.fetchall()
+            if _chunk_capture is not None:
+                rows = _chunk_capture.capture(rows)
     finally:
         conn.close()
 
@@ -870,36 +885,8 @@ def v12_expand_primary_procedure_steps(*, company_id: str, machine_id: str, proc
     # Compatibility path for already-indexed sources: no reindex is required.
     # It reads the legacy "PROCEDURA/PROCEDURE: PROC-xxx" prefix from Step text.
     if not relation_rows:
-        scan_limit = max(500, int(ASK_STRUCTURED_DIRECT_SCAN_LIMIT or 1200))
-        rows: list[tuple] = []
-        try:
-            conn = _db_conn()
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        SELECT bubble_document_id, machine_id, page_number,
-                               LEFT(COALESCE(text, ''), %s) AS page_text
-                        FROM public.document_pages
-                        WHERE company_id = %s
-                          AND bubble_document_id LIKE 'step:%%'
-                          AND (machine_id = %s OR machine_id IS NULL OR machine_id = '')
-                          AND text IS NOT NULL
-                          AND length(text) > 10
-                        ORDER BY
-                          CASE WHEN machine_id = %s THEN 0 ELSE 1 END,
-                          bubble_document_id,
-                          page_number
-                        LIMIT %s;
-                        """,
-                        (text_chars, company_id, machine_id, machine_id, scan_limit),
-                    )
-                    rows = cur.fetchall()
-            finally:
-                conn.close()
-        except Exception as exc:
-            print("ASK_V12_STEP_EXPANSION_FAIL", str(exc)[:500])
-            rows = []
+        rows = _legacy_step_fallback_rows(company_id=company_id, machine_id=machine_id,
+            text_chars=text_chars, runtime=runtime)
 
         for idx, (bdid, mid, page_number, page_text) in enumerate(rows, start=1):
             candidate = make_candidate(
@@ -944,7 +931,13 @@ class V13FetchStructuredDenseCandidatesRuntime:
 
 
 def v13_fetch_structured_dense_candidates(*, company_id: str, machine_id: str, query_vectors: list[tuple[str, list[float]]], top_k: int=18, runtime: V13FetchStructuredDenseCandidatesRuntime) -> list[dict]:
+    """Legacy entry; existing SQL, parameters, selection and failure behavior."""
+    return _v13_fetch_structured_dense_candidates_impl(company_id=company_id, machine_id=machine_id, query_vectors=query_vectors, top_k=top_k, runtime=runtime)
+
+
+def _v13_fetch_structured_dense_candidates_impl(*, company_id: str, machine_id: str, query_vectors: list[tuple[str, list[float]]], top_k: int=18, runtime: V13FetchStructuredDenseCandidatesRuntime, _chunk_capture: _ChunkSelectionCapture | None=None) -> list[dict]:
     """Semantic structured-source retrieval without keyword-gating or extra LLM calls."""
+    binding_columns = CHUNK_BINDING_COLUMNS if _chunk_capture is not None else ""
     ASK_SNIPPET_CHARS = runtime.ASK_SNIPPET_CHARS
     COMPANY_GENERAL_MACHINE_SENTINEL = runtime.COMPANY_GENERAL_MACHINE_SENTINEL
     STRUCTURED_SOURCE_TYPES = runtime.STRUCTURED_SOURCE_TYPES
@@ -970,14 +963,16 @@ def v13_fetch_structured_dense_candidates(*, company_id: str, machine_id: str, q
         conn = _db_conn()
         try:
             with conn.cursor() as cur:
+                if _chunk_capture is not None:
+                    _chunk_capture.expect(per_query_k, query_text=query_text)
                 cur.execute(
-                    """
+                    f"""
                     SELECT bubble_document_id, chunk_index, page_from, page_to,
                            LEFT(chunk_text, %s) AS snippet,
                            LEFT(chunk_text, 2400) AS chunk_full,
                            1 - (embedding <=> %s::vector) AS similarity,
                            embedding,
-                           CASE WHEN machine_id = %s THEN TRUE ELSE FALSE END AS exact_machine_scope
+                           CASE WHEN machine_id = %s THEN TRUE ELSE FALSE END AS exact_machine_scope{binding_columns}
                     FROM public.document_chunks
                     WHERE company_id = %s
                       AND bubble_document_id LIKE ANY(%s)
@@ -1001,6 +996,8 @@ def v13_fetch_structured_dense_candidates(*, company_id: str, machine_id: str, q
                     ),
                 )
                 rows = cur.fetchall()
+                if _chunk_capture is not None:
+                    rows = _chunk_capture.capture(rows)
         finally:
             conn.close()
 
@@ -1252,3 +1249,79 @@ def _v13_fetch_structured_title_candidates_impl(*, q: str, company_id: str, mach
 
 
 
+
+
+# P6-B3: existing chunk scans, with source identity captured before scoring.
+def read_structured_rescue_chunk_evidence(*, scope: ChunkReadScope, q: str,
+        planner: dict | None, top_k: int, limits: ChunkEvidenceLimits,
+        runtime: FetchStructuredRescueCandidatesRuntime) -> SupplementalChunkRead:
+    capture = _ChunkSelectionCapture(scope, limits, "structured_rescue", snippet_chars=runtime.ASK_SNIPPET_CHARS)
+    selected = _fetch_structured_rescue_candidates_impl(**scope.sql_selectors(), q=q,
+        planner=planner, top_k=top_k, runtime=runtime, _chunk_capture=capture)
+    return capture.finish(selected)
+
+
+def read_structured_dense_chunk_evidence(*, scope: ChunkReadScope,
+        query_vectors: list[tuple[str, list[float]]], limits: ChunkEvidenceLimits,
+        runtime: V13FetchStructuredDenseCandidatesRuntime, top_k: int = 18) -> SupplementalChunkRead:
+    require_machine_scope(scope)
+    capture = _ChunkSelectionCapture(scope, limits, "structured_dense", snippet_chars=runtime.ASK_SNIPPET_CHARS,
+        max_queries=runtime.V13_DENSE_QUERY_LIMIT)
+    selected = _v13_fetch_structured_dense_candidates_impl(company_id=scope.company_id,
+        machine_id=scope.machine_id, query_vectors=query_vectors, top_k=top_k, runtime=runtime, _chunk_capture=capture)
+    return capture.finish(selected)
+
+
+def _legacy_step_fallback_rows(*, company_id: str, machine_id: str, text_chars: int,
+        runtime: V12ExpandPrimaryProcedureStepsRuntime, _page_capture: _PageReadCapture | None = None) -> list[tuple]:
+    _db_conn = runtime._db_conn
+    ASK_STRUCTURED_DIRECT_SCAN_LIMIT = runtime.ASK_STRUCTURED_DIRECT_SCAN_LIMIT
+    binding_columns = PAGE_BINDING_COLUMNS if _page_capture is not None else ""
+    scan_limit = max(500, int(ASK_STRUCTURED_DIRECT_SCAN_LIMIT or 1200))
+    rows: list[tuple] = []
+    try:
+        conn = _db_conn()
+        try:
+            with conn.cursor() as cur:
+                if _page_capture is not None:
+                    _page_capture.expect(scan_limit, text_chars)
+                cur.execute(
+                    f"""
+                        SELECT bubble_document_id, machine_id, page_number,
+                               LEFT(COALESCE(text, ''), %s) AS page_text{binding_columns}
+                        FROM public.document_pages
+                        WHERE company_id = %s
+                          AND bubble_document_id LIKE 'step:%%'
+                          AND (machine_id = %s OR machine_id IS NULL OR machine_id = '')
+                          AND text IS NOT NULL
+                          AND length(text) > 10
+                        ORDER BY
+                          CASE WHEN machine_id = %s THEN 0 ELSE 1 END,
+                          bubble_document_id,
+                          page_number
+                        LIMIT %s;
+                        """,
+                    (text_chars, company_id, machine_id, machine_id, scan_limit),
+                )
+                rows = cur.fetchall()
+                if _page_capture is not None:
+                    rows = _page_capture.capture(rows)
+        finally:
+            conn.close()
+    except Exception as exc:
+        if _page_capture is not None:
+            raise
+        print("ASK_V12_STEP_EXPANSION_FAIL", str(exc)[:500])
+        rows = []
+    return rows
+
+
+def read_step_fallback_page_evidence(*, scope: ChunkReadScope, limits: ChunkEvidenceLimits,
+        runtime: V12ExpandPrimaryProcedureStepsRuntime) -> PageEvidenceRead:
+    require_machine_scope(scope)
+    capture = _PageReadCapture(scope, limits, "step_fallback_pages", snippet_chars=0)
+    rows = _legacy_step_fallback_rows(company_id=scope.company_id, machine_id=scope.machine_id,
+        text_chars=max(800, int(runtime.ASK_STRUCTURED_DIRECT_TEXT_CHARS or 5000)), runtime=runtime, _page_capture=capture)
+    pages = [{"bubble_document_id": str(key or ""), "machine_id": str(mid or ""),
+              "page_number": page, "text": text} for key, mid, page, text in rows]
+    return capture.finish_pages(pages)

@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
 from typing import Any, Callable, Optional, Sequence, Mapping
+from .chunk_evidence import ChunkReadScope, ChunkEvidenceLimits
+from .page_evidence import PAGE_BINDING_COLUMNS, PageEvidenceRead, _PageReadCapture
 import re
 import copy
 import hashlib
@@ -756,15 +758,13 @@ def resolve_precision_fact_from_pages(
     )
 
 
-def _fetch_scoped_pages(
-    *,
-    runtime: PrecisionFactRuntime,
-    property_query: PropertyQuery,
-    company_id: str,
-    machine_id: str,
-    doc_ids: Optional[list[str]],
-    bubble_document_id: Optional[str],
-) -> list[dict[str, Any]]:
+def _fetch_scoped_pages(*, runtime: PrecisionFactRuntime, property_query: PropertyQuery, company_id: str, machine_id: str, doc_ids: Optional[list[str]], bubble_document_id: Optional[str]) -> list[dict[str, Any]]:
+    """Legacy entry, preserving the existing reader implementation."""
+    return _fetch_scoped_pages_impl(runtime=runtime, property_query=property_query, company_id=company_id, machine_id=machine_id, doc_ids=doc_ids, bubble_document_id=bubble_document_id)
+
+
+def _fetch_scoped_pages_impl(*, runtime: PrecisionFactRuntime, property_query: PropertyQuery, company_id: str, machine_id: str, doc_ids: Optional[list[str]], bubble_document_id: Optional[str], _page_capture: _PageReadCapture | None = None) -> list[dict[str, Any]]:
+    binding_columns = PAGE_BINDING_COLUMNS if _page_capture is not None else ""
     where_sql, base_params = runtime.build_scope_where(
         company_id=company_id,
         machine_id=machine_id,
@@ -780,7 +780,7 @@ def _fetch_scoped_pages(
         predicate = joiner.join(["LOWER(COALESCE(text, '')) LIKE %s" for _ in terms])
         sql = f"""
             SELECT bubble_document_id, machine_id, page_number,
-                   LEFT(COALESCE(text, ''), %s) AS page_text
+                   LEFT(COALESCE(text, ''), %s) AS page_text{binding_columns}
             FROM public.document_pages
             WHERE {where_sql}
               AND text IS NOT NULL
@@ -802,8 +802,12 @@ def _fetch_scoped_pages(
         conn = runtime.connect_db()
         try:
             with conn.cursor() as cur:
+                if _page_capture is not None:
+                    _page_capture.expect(max(20, int(runtime.page_scan_limit or 220)), max(1200, int(runtime.page_text_chars or 12000)))
                 cur.execute(sql, params)
                 rows = cur.fetchall()
+                if _page_capture is not None:
+                    rows = _page_capture.capture(rows)
         finally:
             conn.close()
         return [
@@ -914,3 +918,11 @@ def resolution_to_candidate(resolution: PrecisionFactResolution) -> dict[str, An
         "precision_fact_supporting_pages": list(resolution.supporting_pages),
         "precision_fact_score": float(resolution.score),
     }
+
+
+def read_precision_page_evidence(*, scope: ChunkReadScope, property_query: PropertyQuery,
+        runtime: PrecisionFactRuntime, limits: ChunkEvidenceLimits) -> PageEvidenceRead:
+    capture = _PageReadCapture(scope, limits, "precision_pages", snippet_chars=0)
+    pages = _fetch_scoped_pages_impl(**scope.sql_selectors(), property_query=property_query,
+        runtime=runtime, _page_capture=capture)
+    return capture.finish_pages(pages)

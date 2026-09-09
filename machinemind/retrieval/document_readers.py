@@ -1,4 +1,4 @@
-"""P6-B2: opt-in bound views alongside the behavior-preserving P4 readers.
+"""P6-B3: opt-in bound views alongside the behavior-preserving P4 readers.
 
 The composition root still invokes the legacy entry points. Only explicit new
 read_*_evidence calls retain authoritative columns from the same SELECT and
@@ -14,6 +14,11 @@ from .chunk_evidence import ChunkReadScope, ChunkEvidenceLimits
 from .relation_evidence import (RELATION_BINDING_COLUMNS, RelationEvidenceRead,
                                 validate_relation_request, build_relation_read)
 from ..evidence.contracts import SourceIdentity
+from .supplemental_evidence import (CHUNK_BINDING_COLUMNS, FILE_BINDING_COLUMNS,
+    SupplementalChunkRead, FileReferenceRead, SupplementalBindingError,
+    _ChunkSelectionCapture, build_file_reference_read, checked_input_records,
+    require_machine_scope, storage_key, validate_anchors)
+
 
 
 if TYPE_CHECKING:
@@ -25,25 +30,34 @@ class FetchDocumentFileMapRuntime:
 
 
 def fetch_document_file_map(company_id: str, doc_ids: list[str], *, runtime: FetchDocumentFileMapRuntime) -> dict[str, str]:
+    """Legacy file-map projection, unchanged SQL and parameters."""
+    return _fetch_document_file_map_impl(company_id, doc_ids, runtime=runtime)
+
+
+def _fetch_document_file_map_impl(company_id: str, doc_ids: list[str], *, runtime: FetchDocumentFileMapRuntime, _reference_limit: int | None = None):
+    binding_columns = FILE_BINDING_COLUMNS if _reference_limit is not None else ""
+    limit_clause = " LIMIT %s" if _reference_limit is not None else ""
     _db_conn = runtime._db_conn
     company_id = (company_id or "").strip()
     doc_ids = sorted({str(x or "").strip() for x in (doc_ids or []) if str(x or "").strip()})
     if not company_id or not doc_ids:
-        return {}
+        return ([], 0) if _reference_limit is not None else {}
 
     conn = _db_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                """
-                SELECT bubble_document_id, file_url
+                f"""
+                SELECT bubble_document_id, file_url{binding_columns}
                 FROM public.document_files
                 WHERE company_id = %s
-                  AND bubble_document_id = ANY(%s);
+                  AND bubble_document_id = ANY(%s){limit_clause};
                 """,
-                (company_id, doc_ids),
+                (company_id, doc_ids, _reference_limit + 1) if _reference_limit is not None else (company_id, doc_ids),
             )
             rows = cur.fetchall()
+            if _reference_limit is not None:
+                return rows, 1
             return {str(bdid): (url or "").strip() for (bdid, url) in rows if bdid and url}
     finally:
         conn.close()
@@ -243,14 +257,13 @@ class DbFindTokenChunkRuntime:
     _db_conn: Callable[..., Any]
 
 
-def db_find_token_chunk(
-    company_id: str,
-    machine_id: str,
-    token: str,
-    doc_ids: Optional[list[str]] = None,
-    bubble_document_id: Optional[str] = None,
-    *, runtime: DbFindTokenChunkRuntime,
-) -> Optional[dict]:
+def db_find_token_chunk(company_id: str, machine_id: str, token: str, doc_ids: Optional[list[str]]=None, bubble_document_id: Optional[str]=None, *, runtime: DbFindTokenChunkRuntime) -> Optional[dict]:
+    """Legacy entry; existing SQL, parameters, selection and failure behavior."""
+    return _db_find_token_chunk_impl(company_id=company_id, machine_id=machine_id, token=token, doc_ids=doc_ids, bubble_document_id=bubble_document_id, runtime=runtime)
+
+
+def _db_find_token_chunk_impl(company_id: str, machine_id: str, token: str, doc_ids: Optional[list[str]]=None, bubble_document_id: Optional[str]=None, *, runtime: DbFindTokenChunkRuntime, _chunk_capture: _ChunkSelectionCapture | None=None) -> Optional[dict]:
+    binding_columns = CHUNK_BINDING_COLUMNS if _chunk_capture is not None else ""
     ASK_SNIPPET_CHARS = runtime.ASK_SNIPPET_CHARS
     _db_conn = runtime._db_conn
     token = (token or "").strip()
@@ -277,10 +290,12 @@ def db_find_token_chunk(
 
             where_sql = " AND ".join(where)
 
+            if _chunk_capture is not None:
+                _chunk_capture.expect(1, query_text=token)
             cur.execute(
                 f"""
                 SELECT bubble_document_id, chunk_index, page_from, page_to,
-                       left(chunk_text, %s) AS snippet
+                       left(chunk_text, %s) AS snippet{binding_columns}
                 FROM public.document_chunks
                 WHERE {where_sql}
                   AND chunk_text ILIKE %s
@@ -290,6 +305,9 @@ def db_find_token_chunk(
                 [ASK_SNIPPET_CHARS, *params, f"%{token}%"],
             )
             row = cur.fetchone()
+            if _chunk_capture is not None:
+                observed = _chunk_capture.capture([] if row is None else [row])
+                row = observed[0] if observed else None
             if not row:
                 return None
 
@@ -317,14 +335,13 @@ class DbFindEntityChunkRuntime:
     _extract_first: Callable[..., Any]
 
 
-def db_find_entity_chunk(
-    company_id: str,
-    machine_id: str,
-    kind: str,
-    doc_ids: Optional[list[str]] = None,
-    bubble_document_id: Optional[str] = None,
-    *, runtime: DbFindEntityChunkRuntime,
-) -> Optional[dict]:
+def db_find_entity_chunk(company_id: str, machine_id: str, kind: str, doc_ids: Optional[list[str]]=None, bubble_document_id: Optional[str]=None, *, runtime: DbFindEntityChunkRuntime) -> Optional[dict]:
+    """Legacy entry; existing SQL, parameters, selection and failure behavior."""
+    return _db_find_entity_chunk_impl(company_id=company_id, machine_id=machine_id, kind=kind, doc_ids=doc_ids, bubble_document_id=bubble_document_id, runtime=runtime)
+
+
+def _db_find_entity_chunk_impl(company_id: str, machine_id: str, kind: str, doc_ids: Optional[list[str]]=None, bubble_document_id: Optional[str]=None, *, runtime: DbFindEntityChunkRuntime, _chunk_capture: _ChunkSelectionCapture | None=None) -> Optional[dict]:
+    binding_columns = CHUNK_BINDING_COLUMNS if _chunk_capture is not None else ""
     ASK_SNIPPET_CHARS = runtime.ASK_SNIPPET_CHARS
     EMAIL_REGEX = runtime.EMAIL_REGEX
     PHONE_REGEX = runtime.PHONE_REGEX
@@ -363,10 +380,12 @@ def db_find_entity_chunk(
 
             where_sql = " AND ".join(where)
 
+            if _chunk_capture is not None:
+                _chunk_capture.expect(1, query_text=kind)
             cur.execute(
                 f"""
                 SELECT bubble_document_id, chunk_index, page_from, page_to,
-                       left(chunk_text, %s) AS snippet
+                       left(chunk_text, %s) AS snippet{binding_columns}
                 FROM public.document_chunks
                 WHERE {where_sql}
                   AND chunk_text ~* %s
@@ -376,6 +395,9 @@ def db_find_entity_chunk(
                 [ASK_SNIPPET_CHARS, *params, pattern],
             )
             row = cur.fetchone()
+            if _chunk_capture is not None:
+                observed = _chunk_capture.capture([] if row is None else [row])
+                row = observed[0] if observed else None
             if not row:
                 return None
 
@@ -646,16 +668,12 @@ class AskStructuredDirectFetchManualSupportRuntime:
     os: Any
 
 
-def ask_structured_direct_fetch_manual_support(
-    *,
-    company_id: str,
-    machine_id: str,
-    q: str,
-    planner: Optional[dict],
-    structured_citations: list[dict],
-    response_language: str = "it",
-    runtime: AskStructuredDirectFetchManualSupportRuntime,
-) -> list[dict]:
+def ask_structured_direct_fetch_manual_support(*, company_id: str, machine_id: str, q: str, planner: Optional[dict], structured_citations: list[dict], response_language: str='it', runtime: AskStructuredDirectFetchManualSupportRuntime) -> list[dict]:
+    """Legacy entry; existing SQL, parameters, selection and failure behavior."""
+    return _ask_structured_direct_fetch_manual_support_impl(company_id=company_id, machine_id=machine_id, q=q, planner=planner, structured_citations=structured_citations, response_language=response_language, runtime=runtime)
+
+
+def _ask_structured_direct_fetch_manual_support_impl(*, company_id: str, machine_id: str, q: str, planner: Optional[dict], structured_citations: list[dict], response_language: str='it', runtime: AskStructuredDirectFetchManualSupportRuntime, _page_capture: _PageReadCapture | None=None) -> list[dict]:
     """Fetch optional manual support for structured answers.
 
     Structured records remain primary. Manual pages are selected by a strict LLM
@@ -664,6 +682,7 @@ def ask_structured_direct_fetch_manual_support(
     source, or when it provides directly applicable safety/prerequisite context.
     Generic safety pages and adjacent processes are rejected.
     """
+    binding_columns = PAGE_BINDING_COLUMNS if _page_capture is not None else ""
     ASK_SNIPPET_CHARS = runtime.ASK_SNIPPET_CHARS
     ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_ENABLED = runtime.ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_ENABLED
     ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_MAX_ITEMS = runtime.ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_MAX_ITEMS
@@ -690,10 +709,12 @@ def ask_structured_direct_fetch_manual_support(
     conn = _db_conn()
     try:
         with conn.cursor() as cur:
+            if _page_capture is not None:
+                _page_capture.expect(scan_limit, text_chars)
             cur.execute(
-                """
+                f"""
                 SELECT bubble_document_id, machine_id, page_number,
-                       LEFT(COALESCE(text, ''), %s) AS page_text
+                       LEFT(COALESCE(text, ''), %s) AS page_text{binding_columns}
                 FROM public.document_pages
                 WHERE company_id = %s
                   AND (machine_id = %s OR machine_id IS NULL OR machine_id = '')
@@ -710,6 +731,8 @@ def ask_structured_direct_fetch_manual_support(
                 (text_chars, company_id, machine_id, scan_limit),
             )
             rows = cur.fetchall()
+            if _page_capture is not None:
+                rows = _page_capture.capture(rows)
     finally:
         conn.close()
 
@@ -745,6 +768,8 @@ def ask_structured_direct_fetch_manual_support(
             label_meta = _source_display_metadata_from_citation(c, company_id=company_id)
             c["display_label"] = str(label_meta.get("display_label") or "")
         except Exception:
+            if _page_capture is not None:
+                raise
             c["display_label"] = f"Manuale - pag. {page_no}"
         candidates.append(c)
 
@@ -1009,24 +1034,19 @@ class AskFetchPreferredSourcePagesRuntime:
     _safe_int: Callable[..., Any]
 
 
-def ask_fetch_preferred_source_pages(
-    *,
-    q: str,
-    company_id: str,
-    machine_id: str,
-    doc_ids: Optional[list[str]],
-    bubble_document_id: Optional[str],
-    response_language: str,
-    top_k: int,
-    source_kind: str,
-    runtime: AskFetchPreferredSourcePagesRuntime,
-) -> list[dict]:
+def ask_fetch_preferred_source_pages(*, q: str, company_id: str, machine_id: str, doc_ids: Optional[list[str]], bubble_document_id: Optional[str], response_language: str, top_k: int, source_kind: str, runtime: AskFetchPreferredSourcePagesRuntime) -> list[dict]:
+    """Legacy entry; existing SQL, parameters, selection and failure behavior."""
+    return _ask_fetch_preferred_source_pages_impl(q=q, company_id=company_id, machine_id=machine_id, doc_ids=doc_ids, bubble_document_id=bubble_document_id, response_language=response_language, top_k=top_k, source_kind=source_kind, runtime=runtime)
+
+
+def _ask_fetch_preferred_source_pages_impl(*, q: str, company_id: str, machine_id: str, doc_ids: Optional[list[str]], bubble_document_id: Optional[str], response_language: str, top_k: int, source_kind: str, runtime: AskFetchPreferredSourcePagesRuntime, _page_capture: _PageReadCapture | None=None) -> list[dict]:
     """Fetch primary pages for a soft/hard source preference.
 
     source_kind="xlsx" fetches XLSX-generated pages.
     source_kind="manual" fetches ordinary document/manual/PDF pages, excluding
     Bubble structured records and XLSX-generated pages.
     """
+    binding_columns = PAGE_BINDING_COLUMNS if _page_capture is not None else ""
     ASK_EVIDENCE_SCOPE_PAGE_LIMIT = runtime.ASK_EVIDENCE_SCOPE_PAGE_LIMIT
     ASK_FULL_CONTEXT_PAGE_CHARS = runtime.ASK_FULL_CONTEXT_PAGE_CHARS
     ASK_SNIPPET_CHARS = runtime.ASK_SNIPPET_CHARS
@@ -1061,9 +1081,11 @@ def ask_fetch_preferred_source_pages(
     conn = _db_conn()
     try:
         with conn.cursor() as cur:
+            if _page_capture is not None:
+                _page_capture.expect(scan_limit, page_chars)
             cur.execute(
                 f"""
-                SELECT bubble_document_id, machine_id, page_number, LEFT(COALESCE(text, ''), %s) AS page_text
+                SELECT bubble_document_id, machine_id, page_number, LEFT(COALESCE(text, ''), %s) AS page_text{binding_columns}
                 FROM public.document_pages
                 WHERE {where_sql}
                   AND text IS NOT NULL
@@ -1074,6 +1096,8 @@ def ask_fetch_preferred_source_pages(
                 [page_chars, *params, scan_limit],
             )
             rows = cur.fetchall()
+            if _page_capture is not None:
+                rows = _page_capture.capture(rows)
     finally:
         conn.close()
 
@@ -1115,9 +1139,11 @@ def ask_fetch_preferred_source_pages(
             conn = _db_conn()
             try:
                 with conn.cursor() as cur:
+                    if _page_capture is not None:
+                        _page_capture.expect(target_limit, page_chars)
                     cur.execute(
                         f"""
-                        SELECT bubble_document_id, machine_id, page_number, LEFT(COALESCE(text, ''), %s) AS page_text
+                        SELECT bubble_document_id, machine_id, page_number, LEFT(COALESCE(text, ''), %s) AS page_text{binding_columns}
                         FROM public.document_pages
                         WHERE {where_sql}
                           AND text IS NOT NULL
@@ -1136,9 +1162,13 @@ def ask_fetch_preferred_source_pages(
                         [page_chars, *params, *targeted_patterns, machine_id, target_limit],
                     )
                     targeted_rows = cur.fetchall()
+                    if _page_capture is not None:
+                        targeted_rows = _page_capture.capture(targeted_rows)
             finally:
                 conn.close()
         except Exception as e:
+            if _page_capture is not None:
+                raise
             print("ASK_MANUAL_TARGETED_SCAN_FAIL", str(e)[:300])
             targeted_rows = []
 
@@ -1275,16 +1305,12 @@ class AskFetchManualMaintenanceTargetPagesRuntime:
     _simple_query_language: Callable[..., Any]
 
 
-def ask_fetch_manual_maintenance_target_pages(
-    *,
-    q: str,
-    company_id: str,
-    machine_id: str,
-    doc_ids: Optional[list[str]],
-    bubble_document_id: Optional[str],
-    top_k: int,
-    runtime: AskFetchManualMaintenanceTargetPagesRuntime,
-) -> list[dict]:
+def ask_fetch_manual_maintenance_target_pages(*, q: str, company_id: str, machine_id: str, doc_ids: Optional[list[str]], bubble_document_id: Optional[str], top_k: int, runtime: AskFetchManualMaintenanceTargetPagesRuntime) -> list[dict]:
+    """Legacy entry; existing SQL, parameters, selection and failure behavior."""
+    return _ask_fetch_manual_maintenance_target_pages_impl(q=q, company_id=company_id, machine_id=machine_id, doc_ids=doc_ids, bubble_document_id=bubble_document_id, top_k=top_k, runtime=runtime)
+
+
+def _ask_fetch_manual_maintenance_target_pages_impl(*, q: str, company_id: str, machine_id: str, doc_ids: Optional[list[str]], bubble_document_id: Optional[str], top_k: int, runtime: AskFetchManualMaintenanceTargetPagesRuntime, _page_capture: _PageReadCapture | None=None) -> list[dict]:
     """Fetch high-signal manual maintenance pages for explicit manual questions.
 
     This is a narrow ASK-only supplement used when the user asks what the machine
@@ -1292,6 +1318,7 @@ def ask_fetch_manual_maintenance_target_pages(
     IDs or answers: it scans authorized manual/PDF pages for real maintenance
     evidence and keeps document-specific pages whenever they are available.
     """
+    binding_columns = PAGE_BINDING_COLUMNS if _page_capture is not None else ""
     ASK_FULL_CONTEXT_PAGE_CHARS = runtime.ASK_FULL_CONTEXT_PAGE_CHARS
     ASK_SNIPPET_CHARS = runtime.ASK_SNIPPET_CHARS
     COMPANY_GENERAL_MACHINE_SENTINEL = runtime.COMPANY_GENERAL_MACHINE_SENTINEL
@@ -1347,9 +1374,11 @@ def ask_fetch_manual_maintenance_target_pages(
         conn = _db_conn()
         try:
             with conn.cursor() as cur:
+                if _page_capture is not None:
+                    _page_capture.expect(240, page_chars)
                 cur.execute(
                     f"""
-                    SELECT bubble_document_id, machine_id, page_number, LEFT(COALESCE(text, ''), %s) AS page_text
+                    SELECT bubble_document_id, machine_id, page_number, LEFT(COALESCE(text, ''), %s) AS page_text{binding_columns}
                     FROM public.document_pages
                     WHERE {where_sql}
                       AND text IS NOT NULL
@@ -1368,9 +1397,13 @@ def ask_fetch_manual_maintenance_target_pages(
                     [page_chars, *params, *patterns, machine_id, 240],
                 )
                 rows = cur.fetchall()
+                if _page_capture is not None:
+                    rows = _page_capture.capture(rows)
         finally:
             conn.close()
     except Exception as e:
+        if _page_capture is not None:
+            raise
         print("ASK_MANUAL_MAINTENANCE_DIRECT_FETCH_FAIL", str(e)[:300])
         return []
 
@@ -1652,25 +1685,19 @@ class V13FetchPreferredSourcePagesRuntime:
     _v13_build_profile_from_plan: Callable[..., Any]
 
 
-def v13_fetch_preferred_source_pages(
-    *,
-    q: str,
-    company_id: str,
-    machine_id: str,
-    doc_ids: Optional[list[str]],
-    bubble_document_id: Optional[str],
-    response_language: str,
-    top_k: int,
-    plan: Optional[dict],
-    source_kind: str,
-    runtime: V13FetchPreferredSourcePagesRuntime,
-) -> list[dict]:
+def v13_fetch_preferred_source_pages(*, q: str, company_id: str, machine_id: str, doc_ids: Optional[list[str]], bubble_document_id: Optional[str], response_language: str, top_k: int, plan: Optional[dict], source_kind: str, runtime: V13FetchPreferredSourcePagesRuntime) -> list[dict]:
+    """Legacy entry; existing SQL, parameters, selection and failure behavior."""
+    return _v13_fetch_preferred_source_pages_impl(q=q, company_id=company_id, machine_id=machine_id, doc_ids=doc_ids, bubble_document_id=bubble_document_id, response_language=response_language, top_k=top_k, plan=plan, source_kind=source_kind, runtime=runtime)
+
+
+def _v13_fetch_preferred_source_pages_impl(*, q: str, company_id: str, machine_id: str, doc_ids: Optional[list[str]], bubble_document_id: Optional[str], response_language: str, top_k: int, plan: Optional[dict], source_kind: str, runtime: V13FetchPreferredSourcePagesRuntime, _page_capture: _PageReadCapture | None=None) -> list[dict]:
     """Fetch primary pages for a soft/hard source preference.
 
     source_kind="xlsx" fetches XLSX-generated pages.
     source_kind="manual" fetches ordinary document/manual/PDF pages, excluding
     Bubble structured records and XLSX-generated pages.
     """
+    binding_columns = PAGE_BINDING_COLUMNS if _page_capture is not None else ""
     ASK_FULL_CONTEXT_PAGE_CHARS = runtime.ASK_FULL_CONTEXT_PAGE_CHARS
     ASK_SNIPPET_CHARS = runtime.ASK_SNIPPET_CHARS
     COMPANY_GENERAL_MACHINE_SENTINEL = runtime.COMPANY_GENERAL_MACHINE_SENTINEL
@@ -1706,9 +1733,11 @@ def v13_fetch_preferred_source_pages(
     conn = _db_conn()
     try:
         with conn.cursor() as cur:
+            if _page_capture is not None:
+                _page_capture.expect(scan_limit, page_chars)
             cur.execute(
                 f"""
-                SELECT bubble_document_id, machine_id, page_number, LEFT(COALESCE(text, ''), %s) AS page_text
+                SELECT bubble_document_id, machine_id, page_number, LEFT(COALESCE(text, ''), %s) AS page_text{binding_columns}
                 FROM public.document_pages
                 WHERE {where_sql}
                   AND text IS NOT NULL
@@ -1719,6 +1748,8 @@ def v13_fetch_preferred_source_pages(
                 [page_chars, *params, scan_limit],
             )
             rows = cur.fetchall()
+            if _page_capture is not None:
+                rows = _page_capture.capture(rows)
     finally:
         conn.close()
 
@@ -1760,9 +1791,11 @@ def v13_fetch_preferred_source_pages(
             conn = _db_conn()
             try:
                 with conn.cursor() as cur:
+                    if _page_capture is not None:
+                        _page_capture.expect(target_limit, page_chars)
                     cur.execute(
                         f"""
-                        SELECT bubble_document_id, machine_id, page_number, LEFT(COALESCE(text, ''), %s) AS page_text
+                        SELECT bubble_document_id, machine_id, page_number, LEFT(COALESCE(text, ''), %s) AS page_text{binding_columns}
                         FROM public.document_pages
                         WHERE {where_sql}
                           AND text IS NOT NULL
@@ -1781,9 +1814,13 @@ def v13_fetch_preferred_source_pages(
                         [page_chars, *params, *targeted_patterns, machine_id, target_limit],
                     )
                     targeted_rows = cur.fetchall()
+                    if _page_capture is not None:
+                        targeted_rows = _page_capture.capture(targeted_rows)
             finally:
                 conn.close()
         except Exception as e:
+            if _page_capture is not None:
+                raise
             print("V13_MANUAL_TARGETED_SCAN_FAIL", str(e)[:300])
             targeted_rows = []
 
@@ -1918,15 +1955,13 @@ class V13FetchManualSupportDeterministicRuntime:
     _v12_mark_manual_support: Callable[..., Any]
 
 
-def v13_fetch_manual_support_deterministic(
-    *,
-    company_id: str,
-    machine_id: str,
-    q: str,
-    planner: dict,
-    structured_citations: list[dict],
-    runtime: V13FetchManualSupportDeterministicRuntime,
-) -> list[dict]:
+def v13_fetch_manual_support_deterministic(*, company_id: str, machine_id: str, q: str, planner: dict, structured_citations: list[dict], runtime: V13FetchManualSupportDeterministicRuntime) -> list[dict]:
+    """Legacy entry; existing SQL, parameters, selection and failure behavior."""
+    return _v13_fetch_manual_support_deterministic_impl(company_id=company_id, machine_id=machine_id, q=q, planner=planner, structured_citations=structured_citations, runtime=runtime)
+
+
+def _v13_fetch_manual_support_deterministic_impl(*, company_id: str, machine_id: str, q: str, planner: dict, structured_citations: list[dict], runtime: V13FetchManualSupportDeterministicRuntime, _page_capture: _PageReadCapture | None=None) -> list[dict]:
+    binding_columns = PAGE_BINDING_COLUMNS if _page_capture is not None else ""
     ASK_SNIPPET_CHARS = runtime.ASK_SNIPPET_CHARS
     ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_ENABLED = runtime.ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_ENABLED
     ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_MAX_ITEMS = runtime.ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_MAX_ITEMS
@@ -1955,10 +1990,12 @@ def v13_fetch_manual_support_deterministic(
         conn = _db_conn()
         try:
             with conn.cursor() as cur:
+                if _page_capture is not None:
+                    _page_capture.expect(scan_limit, text_chars)
                 cur.execute(
-                    """
+                    f"""
                     SELECT bubble_document_id, machine_id, page_number,
-                           LEFT(COALESCE(text, ''), %s) AS page_text
+                           LEFT(COALESCE(text, ''), %s) AS page_text{binding_columns}
                     FROM public.document_pages
                     WHERE company_id=%s
                       AND (machine_id=%s OR machine_id IS NULL OR machine_id='')
@@ -1976,9 +2013,13 @@ def v13_fetch_manual_support_deterministic(
                     (text_chars, company_id, machine_id, machine_id, scan_limit),
                 )
                 rows = cur.fetchall()
+                if _page_capture is not None:
+                    rows = _page_capture.capture(rows)
         finally:
             conn.close()
     except Exception as exc:
+        if _page_capture is not None:
+            raise
         print("V13_MANUAL_SUPPORT_SCAN_FAIL", str(exc)[:500])
         return []
 
@@ -2047,13 +2088,14 @@ class AssistantCoreMachineCatalogCandidatesRuntime:
     _v13_merge_candidates: Callable[..., Any]
 
 
-def assistant_core_machine_catalog_candidates(
-    request: AssistantCoreRequest,
-    *,
-    max_rows: int = 48,
-    runtime: AssistantCoreMachineCatalogCandidatesRuntime,
-) -> list[dict]:
+def assistant_core_machine_catalog_candidates(request: AssistantCoreRequest, *, max_rows: int=48, runtime: AssistantCoreMachineCatalogCandidatesRuntime) -> list[dict]:
+    """Legacy entry; existing SQL, parameters, selection and failure behavior."""
+    return _assistant_core_machine_catalog_candidates_impl(request=request, max_rows=max_rows, runtime=runtime)
+
+
+def _assistant_core_machine_catalog_candidates_impl(request: AssistantCoreRequest, *, max_rows: int=48, runtime: AssistantCoreMachineCatalogCandidatesRuntime, _page_capture: _PageReadCapture | None=None) -> list[dict]:
     """Compact machine-wide structured digest for exhaustive overview requests."""
+    binding_columns = PAGE_BINDING_COLUMNS if _page_capture is not None else ""
     ASK_SNIPPET_CHARS = runtime.ASK_SNIPPET_CHARS
     _ask_evidence_fallback_profile = runtime._ask_evidence_fallback_profile
     _ask_evidence_score_text = runtime._ask_evidence_score_text
@@ -2069,9 +2111,11 @@ def assistant_core_machine_catalog_candidates(
     try:
         conn = _db_conn()
         with conn.cursor() as cur:
+            if _page_capture is not None:
+                _page_capture.expect(max_rows, 4500)
             cur.execute(
-                """
-                SELECT bubble_document_id, page_number, LEFT(COALESCE(text, ''), 4500)
+                f"""
+                SELECT bubble_document_id, page_number, LEFT(COALESCE(text, ''), 4500){binding_columns}
                 FROM public.document_pages
                 WHERE company_id=%s AND machine_id=%s
                   AND page_number=1
@@ -2088,7 +2132,7 @@ def assistant_core_machine_catalog_candidates(
                 """,
                 (request.company_id, request.machine_id, max_rows),
             )
-            for bdid, page_number, page_text in cur.fetchall():
+            for bdid, page_number, page_text in (_page_capture.capture_catalog(cur.fetchall()) if _page_capture is not None else cur.fetchall()):
                 text = str(page_text or "").strip()
                 if not text:
                     continue
@@ -2111,6 +2155,8 @@ def assistant_core_machine_catalog_candidates(
                     "assistant_core_catalog_candidate": True,
                 })
     except Exception as exc:
+        if _page_capture is not None:
+            raise
         print("ASSISTANT_CORE_CATALOG_FAIL", str(exc)[:500])
     finally:
         if conn is not None:
@@ -2125,3 +2171,101 @@ def assistant_core_machine_catalog_candidates(
     return _v13_merge_candidates([media[:8], procedures])
 
 
+
+
+# P6-B3 supplemental readers. These are INTERNAL and not configured by main.
+def read_token_chunk_evidence(*, scope: ChunkReadScope, token: str,
+                              limits: ChunkEvidenceLimits, runtime: DbFindTokenChunkRuntime) -> SupplementalChunkRead:
+    capture = _ChunkSelectionCapture(scope, limits, "token_chunk", snippet_chars=runtime.ASK_SNIPPET_CHARS)
+    selected = _db_find_token_chunk_impl(**scope.sql_selectors(), token=token, runtime=runtime, _chunk_capture=capture)
+    return capture.finish([] if selected is None else [selected])
+
+
+def read_entity_chunk_evidence(*, scope: ChunkReadScope, kind: str,
+                               limits: ChunkEvidenceLimits, runtime: DbFindEntityChunkRuntime) -> SupplementalChunkRead:
+    capture = _ChunkSelectionCapture(scope, limits, "entity_chunk", snippet_chars=runtime.ASK_SNIPPET_CHARS)
+    selected = _db_find_entity_chunk_impl(**scope.sql_selectors(), kind=kind, runtime=runtime, _chunk_capture=capture)
+    return capture.finish([] if selected is None else [selected])
+
+
+def read_preferred_page_evidence(*, scope: ChunkReadScope, q: str, response_language: str,
+                                 source_kind: str, top_k: int, limits: ChunkEvidenceLimits,
+                                 runtime: AskFetchPreferredSourcePagesRuntime) -> PageEvidenceRead:
+    capture = _PageReadCapture(scope, limits, "preferred_pages", snippet_chars=runtime.ASK_SNIPPET_CHARS)
+    selected = _ask_fetch_preferred_source_pages_impl(**scope.sql_selectors(), q=q,
+        response_language=response_language, source_kind=source_kind, top_k=top_k, runtime=runtime, _page_capture=capture)
+    return capture.finish(selected)
+
+
+def read_v13_preferred_page_evidence(*, scope: ChunkReadScope, q: str, response_language: str,
+                                     source_kind: str, top_k: int, plan: dict | None,
+                                     limits: ChunkEvidenceLimits, runtime: V13FetchPreferredSourcePagesRuntime) -> PageEvidenceRead:
+    capture = _PageReadCapture(scope, limits, "preferred_pages_v13", snippet_chars=runtime.ASK_SNIPPET_CHARS)
+    selected = _v13_fetch_preferred_source_pages_impl(**scope.sql_selectors(), q=q,
+        response_language=response_language, source_kind=source_kind, top_k=top_k, plan=plan, runtime=runtime, _page_capture=capture)
+    return capture.finish(selected)
+
+
+def read_maintenance_page_evidence(*, scope: ChunkReadScope, q: str, top_k: int,
+                                   limits: ChunkEvidenceLimits, runtime: AskFetchManualMaintenanceTargetPagesRuntime) -> PageEvidenceRead:
+    capture = _PageReadCapture(scope, limits, "maintenance_pages", snippet_chars=runtime.ASK_SNIPPET_CHARS)
+    selected = _ask_fetch_manual_maintenance_target_pages_impl(**scope.sql_selectors(), q=q,
+        top_k=top_k, runtime=runtime, _page_capture=capture)
+    return capture.finish(selected)
+
+
+def read_machine_catalog_page_evidence(request: AssistantCoreRequest, *, scope: ChunkReadScope,
+                                       limits: ChunkEvidenceLimits, max_rows: int = 48,
+                                       runtime: AssistantCoreMachineCatalogCandidatesRuntime) -> PageEvidenceRead:
+    require_machine_scope(scope)
+    if (request.company_id, request.machine_id, request.ai_scope) != (scope.company_id, scope.machine_id, scope.ai_scope):
+        raise SupplementalBindingError("catalog request/scope mismatch")
+    if request.metadata.get("document_ids") or request.metadata.get("bubble_document_id"):
+        raise SupplementalBindingError("unresolved catalog document selectors")
+    capture = _PageReadCapture(scope, limits, "machine_catalog", snippet_chars=runtime.ASK_SNIPPET_CHARS, candidate_chars=4500)
+    selected = _assistant_core_machine_catalog_candidates_impl(request, max_rows=max_rows,
+        runtime=runtime, _page_capture=capture)
+    return capture.finish(selected)
+
+
+def read_semantic_manual_support_page_evidence(*, scope: ChunkReadScope, q: str,
+        planner: dict | None, structured_inputs: tuple, current_allowed_sources: frozenset[SourceIdentity],
+        limits: ChunkEvidenceLimits, runtime: AskStructuredDirectFetchManualSupportRuntime,
+        response_language: str = "it") -> PageEvidenceRead:
+    require_machine_scope(scope)
+    records = checked_input_records(scope=scope, records=structured_inputs,
+        current_allowed_sources=current_allowed_sources, limits=limits)
+    capture = _PageReadCapture(scope, limits, "manual_support_semantic", snippet_chars=int(runtime.ASK_SNIPPET_CHARS or 900))
+    selected = _ask_structured_direct_fetch_manual_support_impl(company_id=scope.company_id,
+        machine_id=scope.machine_id, q=q, planner=planner, structured_citations=records,
+        response_language=response_language, runtime=runtime, _page_capture=capture)
+    return capture.finish(selected)
+
+
+def read_deterministic_manual_support_page_evidence(*, scope: ChunkReadScope, q: str,
+        planner: dict | None, structured_inputs: tuple, current_allowed_sources: frozenset[SourceIdentity],
+        limits: ChunkEvidenceLimits, runtime: V13FetchManualSupportDeterministicRuntime) -> PageEvidenceRead:
+    require_machine_scope(scope)
+    records = checked_input_records(scope=scope, records=structured_inputs,
+        current_allowed_sources=current_allowed_sources, limits=limits)
+    capture = _PageReadCapture(scope, limits, "manual_support_deterministic", snippet_chars=int(runtime.ASK_SNIPPET_CHARS or 900))
+    selected = _v13_fetch_manual_support_deterministic_impl(company_id=scope.company_id,
+        machine_id=scope.machine_id, q=q, planner=planner, structured_citations=records,
+        runtime=runtime, _page_capture=capture)
+    return capture.finish(selected)
+
+
+
+def read_document_file_references(*, scope: ChunkReadScope, sources: tuple[SourceIdentity, ...],
+        current_allowed_sources: frozenset[SourceIdentity], limits: ChunkEvidenceLimits,
+        runtime: FetchDocumentFileMapRuntime) -> FileReferenceRead:
+    validate_anchors(scope=scope, anchors=sources, current_allowed_sources=current_allowed_sources, limits=limits)
+    if any(s.source_type.value != "document" for s in sources):
+        raise SupplementalBindingError("document-only file map")
+    # Legacy normalization must not silently change any authorization selector.
+    if scope.company_id != scope.company_id.strip() or any(storage_key(s) != storage_key(s).strip() for s in sources):
+        raise SupplementalBindingError("unresolved whitespace in file-map selectors")
+    rows, count = _fetch_document_file_map_impl(scope.company_id, [storage_key(s) for s in sources],
+        runtime=runtime, _reference_limit=limits.assembly.max_occurrences)
+    return build_file_reference_read(scope=scope, anchors=sources, current_allowed_sources=current_allowed_sources,
+        rows=rows, limits=limits, query_count=count)

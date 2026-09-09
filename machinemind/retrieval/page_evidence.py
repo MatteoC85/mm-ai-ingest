@@ -24,9 +24,13 @@ from ..evidence.legacy_compatibility import (LegacyEvidenceBundle, LegacyRecordI
     build_legacy_bundle, restore_legacy_records)
 
 PROVIDER_VERSION = "scoped-page-reader-p6b2-v1"
+PAGE_RANGE_BINDING_COLUMNS = ", company_id AS evidence_company_id, machine_id AS evidence_machine_id, bubble_document_id AS evidence_document_id"
 PAGE_BINDING_COLUMNS = ", company_id AS evidence_company_id, machine_id AS evidence_machine_id"
 PAGE_READ_KINDS = frozenset({"ask_pages", "scored_pages", "full_context",
-                            "structured_direct", "structured_title"})
+                            "structured_direct", "structured_title",
+    "manual_support_semantic", "preferred_pages", "maintenance_pages",
+    "preferred_pages_v13", "manual_support_deterministic", "machine_catalog", "precision_pages",
+    "step_fallback_pages", "assurance_parent_pages", "enumeration_pages", "assurance_neighbor_pages"})
 
 
 class PageReadBindingError(EvidenceContractError):
@@ -183,13 +187,18 @@ def assemble_page_read(*, scope: ChunkReadScope, kind: str,
 class _PageReadCapture:
     """Single-call repository collector, never a global or request payload field."""
     def __init__(self, scope: ChunkReadScope, limits: ChunkEvidenceLimits, kind: str,
-                 *, snippet_chars: int, candidate_chars: int | None = None) -> None:
+                 *, snippet_chars: int, candidate_chars: int | None = None, max_queries: int | None = None) -> None:
         validate_read(scope, 0, limits)
         if kind not in PAGE_READ_KINDS:
             raise PageReadBindingError("unsupported page capture")
         _integer(snippet_chars, "snippet_chars")
         if candidate_chars is not None:
             _integer(candidate_chars, "candidate_chars")
+        if max_queries is not None:
+            _integer(max_queries, "max_queries", 1)
+            if kind not in {"enumeration_pages", "assurance_neighbor_pages"} or max_queries > limits.assembly.max_occurrences:
+                raise PageReadBindingError("unexpected explicit page-query budget")
+        self.max_queries = max_queries
         self.scope, self.limits, self.kind = scope, limits, kind
         self.snippet_chars, self.candidate_chars = snippet_chars, candidate_chars
         self._observations: list[PageReadObservation] = []
@@ -205,7 +214,11 @@ class _PageReadCapture:
         _integer(text_chars, "text_chars")
         if text_chars > self.limits.adapter.max_text_chars:
             raise PageReadBindingError("SQL projection exceeds explicit allocation limit")
-        max_queries = 1 if self.kind in {"full_context", "structured_title"} else 2
+        max_queries = 1 if self.kind in {"full_context", "structured_title",
+            "manual_support_semantic", "maintenance_pages", "manual_support_deterministic", "machine_catalog",
+            "step_fallback_pages", "assurance_parent_pages"} else 2
+        if self.max_queries is not None:
+            max_queries = self.max_queries
         if self._queries >= max_queries:
             raise PageReadBindingError("unexpected additional page query")
         self._pending = (row_limit, text_chars)
@@ -236,6 +249,49 @@ class _PageReadCapture:
         self._queries += 1
         self._pending = None
         return out
+
+    def capture_catalog(self, rows: list[tuple]) -> list[tuple]:
+        """Catalog layout: key/page/text + actual company/machine, no guessed mid."""
+        if self.kind != "machine_catalog" or type(rows) is not list or any(type(r) is not tuple or len(r) != 5 for r in rows):
+            raise PageReadBindingError("unexpected catalog SQL layout")
+        if any(mid != self.scope.machine_id or page != 1 for key, page, text, company, mid in rows):
+            raise PageReadBindingError("catalog row violates exact-machine/page selector")
+        self.capture([(key, mid, page, text, company, mid) for key, page, text, company, mid in rows])
+        return [r[:3] for r in rows]
+
+    def capture_range(self, rows: list[tuple], document_key: str) -> list[tuple]:
+        """Legacy mid/page/text plus company/machine/key read from SQL, not WHERE."""
+        if self.kind not in {"enumeration_pages", "assurance_neighbor_pages"} or type(rows) is not list or any(type(r) is not tuple or len(r) != 6 for r in rows):
+            raise PageReadBindingError("unexpected neighboring page SQL layout")
+        if any(key != document_key for mid, page, text, company, stored_mid, key in rows):
+            raise PageReadBindingError("neighboring page differs from selected document")
+        self.capture([(key, mid, page, text, company, stored_mid) for mid, page, text, company, stored_mid, key in rows])
+        return [r[:3] for r in rows]
+
+    def finish_pages(self, pages: list[dict]) -> PageEvidenceRead:
+        """Literal document_page projection for an existing raw-page consumer."""
+        if self._finished or self._pending is not None or type(pages) is not list:
+            raise PageReadBindingError("unfinished or reused page capture")
+        self._finished = True
+        indices = []; used = set()
+        for page in pages:
+            if type(page) is not dict:
+                raise PageReadBindingError("document_page mapping required")
+            matches = []
+            for idx, o in enumerate(self._observations):
+                expected = {"bubble_document_id": o.storage_document_id, "page_number": o.page_number,
+                            "text": o.text_projection, "machine_id": o.stored_machine_id or ""}
+                if all(type(page.get(k)) is type(v) and page[k] == v for k, v in expected.items()):
+                    matches.append(idx)
+            bindings = {(self._observations[i].source, self._observations[i].page_number, self._observations[i].text_projection) for i in matches}
+            if len(bindings) != 1:
+                raise PageReadBindingError("missing or ambiguous raw-page association")
+            available = [i for i in matches if i not in used]
+            if not available:
+                raise PageReadBindingError("raw-page occurrence was not observed")
+            used.add(available[0]); indices.append(available[0])
+        return assemble_page_read(scope=self.scope, kind=self.kind, observations=tuple(self._observations),
+            indices=tuple(indices), records=pages, limits=self.limits, query_count=self._queries, layout="document_page")
 
     def finish(self, candidates: list[dict]) -> PageEvidenceRead:
         if self._finished or self._pending is not None:

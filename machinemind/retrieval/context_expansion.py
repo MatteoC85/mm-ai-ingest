@@ -7,6 +7,11 @@ This is structural extraction, not a semantic change or quality guarantee.
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
+from .chunk_evidence import ChunkReadScope, ChunkEvidenceLimits
+from .page_evidence import PAGE_RANGE_BINDING_COLUMNS, PageEvidenceRead, _PageReadCapture
+from .supplemental_evidence import (CHUNK_BINDING_COLUMNS, SupplementalChunkRead, SupplementalBindingError,
+    _ChunkSelectionCapture, checked_input_records, require_request_scope, storage_key, validate_anchors)
+from ..evidence.contracts import SourceIdentity
 
 @dataclass(frozen=True)
 class ExpandWithNeighborChunksRuntime:
@@ -15,14 +20,14 @@ class ExpandWithNeighborChunksRuntime:
     re: Any
 
 
-def expand_with_neighbor_chunks(
-    company_id: str,
-    bubble_document_id: str,
-    citation_ids: list[str],
-    *,
-    radius: int = 1,
-    runtime: ExpandWithNeighborChunksRuntime,
-) -> list[dict]:
+def expand_with_neighbor_chunks(company_id: str, bubble_document_id: str, citation_ids: list[str], *, radius: int=1, runtime: ExpandWithNeighborChunksRuntime) -> list[dict]:
+    """Legacy entry, preserving the existing reader implementation."""
+    return _expand_with_neighbor_chunks_impl(company_id=company_id, bubble_document_id=bubble_document_id, citation_ids=citation_ids, radius=radius, runtime=runtime)
+
+
+def _expand_with_neighbor_chunks_impl(company_id: str, bubble_document_id: str, citation_ids: list[str], *, radius: int=1, runtime: ExpandWithNeighborChunksRuntime, _chunk_capture: _ChunkSelectionCapture | None = None) -> list[dict]:
+    binding_columns = CHUNK_BINDING_COLUMNS if _chunk_capture is not None else ""
+    limit_clause = " LIMIT %s" if _chunk_capture is not None else ""
     ASK_SNIPPET_CHARS = runtime.ASK_SNIPPET_CHARS
     _db_conn = runtime._db_conn
     re = runtime.re
@@ -49,16 +54,18 @@ def expand_with_neighbor_chunks(
     conn = _db_conn()
     try:
         with conn.cursor() as cur:
+            if _chunk_capture is not None:
+                _chunk_capture.expect(_chunk_capture.limits.assembly.max_occurrences)
             cur.execute(
-                """
+                f"""
                 SELECT bubble_document_id, chunk_index, page_from, page_to,
                        left(chunk_text, %s) AS snippet,
-                       left(chunk_text, 2000) AS chunk_full
+                       left(chunk_text, 2000) AS chunk_full{binding_columns}
                 FROM public.document_chunks
                 WHERE company_id=%s
                   AND bubble_document_id=%s
                   AND chunk_index BETWEEN %s AND %s
-                ORDER BY chunk_index;
+                ORDER BY chunk_index{limit_clause};
                 """,
                 (
                     ASK_SNIPPET_CHARS,
@@ -66,9 +73,11 @@ def expand_with_neighbor_chunks(
                     bubble_document_id,
                     min_idx,
                     max_idx,
-                ),
+                ) + ((_chunk_capture.limits.assembly.max_occurrences + 1,) if _chunk_capture is not None else ()),
             )
             rows = cur.fetchall()
+            if _chunk_capture is not None:
+                rows = _chunk_capture.capture(rows)
     finally:
         conn.close()
 
@@ -234,22 +243,19 @@ class AssistantCoreExpandEnumerationSectionsRuntime:
     _source_type_from_document_id: Callable[..., Any]
 
 
-def assistant_core_expand_enumeration_sections(
-    *,
-    request: AssistantCoreRequest,
-    retrieval: dict,
-    candidates: list[dict],
-    max_documents: int = 4,
-    page_radius: int = 3,
-    max_pages: int = 18,
-    runtime: AssistantCoreExpandEnumerationSectionsRuntime,
-) -> list[dict]:
+def assistant_core_expand_enumeration_sections(*, request: AssistantCoreRequest, retrieval: dict, candidates: list[dict], max_documents: int=4, page_radius: int=3, max_pages: int=18, runtime: AssistantCoreExpandEnumerationSectionsRuntime) -> list[dict]:
+    """Legacy entry, preserving the existing reader implementation."""
+    return _assistant_core_expand_enumeration_sections_impl(request=request, retrieval=retrieval, candidates=candidates, max_documents=max_documents, page_radius=page_radius, max_pages=max_pages, runtime=runtime)
+
+
+def _assistant_core_expand_enumeration_sections_impl(*, request: AssistantCoreRequest, retrieval: dict, candidates: list[dict], max_documents: int=4, page_radius: int=3, max_pages: int=18, runtime: AssistantCoreExpandEnumerationSectionsRuntime, _page_capture: _PageReadCapture | None = None) -> list[dict]:
     """Fetch complete nearby manual/HMI pages for exhaustive-list requests.
 
     The semantic hit selects the document; this function only expands the same
     document around that hit. It never crosses company/machine scope and therefore
     improves recall without replacing the ranked baseline.
     """
+    binding_columns = PAGE_RANGE_BINDING_COLUMNS if _page_capture is not None else ""
     ASK_SNIPPET_CHARS = runtime.ASK_SNIPPET_CHARS
     V13_PAGE_TEXT_CHARS = runtime.V13_PAGE_TEXT_CHARS
     _db_conn = runtime._db_conn
@@ -284,9 +290,11 @@ def assistant_core_expand_enumeration_sections(
             for bdid, meta in selected_docs:
                 low = max(1, int(meta["low"]) - int(page_radius))
                 high = int(meta["high"]) + int(page_radius)
+                if _page_capture is not None:
+                    _page_capture.expect(max_pages, V13_PAGE_TEXT_CHARS)
                 cur.execute(
-                    """
-                    SELECT machine_id, page_number, LEFT(COALESCE(text, ''), %s)
+                    f"""
+                    SELECT machine_id, page_number, LEFT(COALESCE(text, ''), %s){binding_columns}
                     FROM public.document_pages
                     WHERE company_id=%s AND bubble_document_id=%s
                       AND page_number BETWEEN %s AND %s
@@ -296,7 +304,7 @@ def assistant_core_expand_enumeration_sections(
                     """,
                     (V13_PAGE_TEXT_CHARS, request.company_id, bdid, low, high, max_pages),
                 )
-                for mid, page_number, page_text in cur.fetchall():
+                for mid, page_number, page_text in (_page_capture.capture_range(cur.fetchall(), bdid) if _page_capture is not None else cur.fetchall()):
                     text = str(page_text or "").strip()
                     if not text:
                         continue
@@ -319,11 +327,16 @@ def assistant_core_expand_enumeration_sections(
                         "assistant_core_section_expansion": True,
                     })
     except Exception as exc:
+        if _page_capture is not None:
+            raise
         print("ASSISTANT_CORE_SECTION_EXPANSION_FAIL", str(exc)[:500])
     finally:
         if conn is not None:
             try: conn.close()
-            except Exception: pass
+            except Exception:
+                if _page_capture is not None:
+                    raise
+                pass
     return _dedup_citations_by_snippet(out, max_items=max_pages)
 
 
@@ -432,3 +445,32 @@ def assistant_core_root_applicability_records(
     return records
 
 
+
+
+def read_neighbor_chunk_evidence(*, scope: ChunkReadScope, document_source: SourceIdentity,
+        seed_inputs: tuple, current_allowed_sources: frozenset[SourceIdentity],
+        limits: ChunkEvidenceLimits, runtime: ExpandWithNeighborChunksRuntime, radius: int = 1) -> SupplementalChunkRead:
+    validate_anchors(scope=scope, anchors=(document_source,), current_allowed_sources=current_allowed_sources, limits=limits)
+    records = checked_input_records(scope=scope, records=seed_inputs,
+        current_allowed_sources=current_allowed_sources, limits=limits)
+    if any(r.context.source != document_source for r in seed_inputs):
+        raise SupplementalBindingError("neighbor seed belongs to a different source")
+    capture = _ChunkSelectionCapture(scope, limits, "neighbor_chunks", snippet_chars=runtime.ASK_SNIPPET_CHARS)
+    selected = _expand_with_neighbor_chunks_impl(scope.company_id, storage_key(document_source),
+        [r.get("citation_id", "") for r in records], radius=radius, runtime=runtime, _chunk_capture=capture)
+    return capture.finish(selected)
+
+
+def read_enumeration_page_evidence(*, scope: ChunkReadScope, request: AssistantCoreRequest,
+        retrieval: dict, candidate_inputs: tuple, current_allowed_sources: frozenset[SourceIdentity],
+        limits: ChunkEvidenceLimits, runtime: AssistantCoreExpandEnumerationSectionsRuntime,
+        max_documents: int = 4, page_radius: int = 3, max_pages: int = 18) -> PageEvidenceRead:
+    require_request_scope(scope, request)
+    records = checked_input_records(scope=scope, records=candidate_inputs,
+        current_allowed_sources=current_allowed_sources, limits=limits)
+    capture = _PageReadCapture(scope, limits, "enumeration_pages", snippet_chars=runtime.ASK_SNIPPET_CHARS,
+        candidate_chars=runtime.V13_PAGE_TEXT_CHARS, max_queries=max_documents)
+    selected = _assistant_core_expand_enumeration_sections_impl(request=request, retrieval=retrieval,
+        candidates=records, max_documents=max_documents, page_radius=page_radius, max_pages=max_pages,
+        runtime=runtime, _page_capture=capture)
+    return capture.finish(selected)

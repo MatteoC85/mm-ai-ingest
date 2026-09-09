@@ -8,6 +8,10 @@ ordering, exception handling and budget checks are deliberately preserved.
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
+from .chunk_evidence import ChunkReadScope, ChunkEvidenceLimits
+from .page_evidence import PAGE_BINDING_COLUMNS, PAGE_RANGE_BINDING_COLUMNS, PageEvidenceRead, _PageReadCapture
+from .supplemental_evidence import checked_input_records, require_machine_scope
+from ..evidence.contracts import SourceIdentity
 
 @dataclass(frozen=True)
 class V13EvidenceGateSchemaRuntime:
@@ -1181,6 +1185,12 @@ class V13AssuranceFetchNeighborPagesRuntime:
 
 
 def v13_assurance_fetch_neighbor_pages(*, q: str, company_id: str, machine_id: str, candidates: list[dict], retrieval: dict, response_language: str, deadline_monotonic: float, runtime: V13AssuranceFetchNeighborPagesRuntime) -> list[dict]:
+    """Legacy entry, preserving the existing reader implementation."""
+    return _v13_assurance_fetch_neighbor_pages_impl(q=q, company_id=company_id, machine_id=machine_id, candidates=candidates, retrieval=retrieval, response_language=response_language, deadline_monotonic=deadline_monotonic, runtime=runtime)
+
+
+def _v13_assurance_fetch_neighbor_pages_impl(*, q: str, company_id: str, machine_id: str, candidates: list[dict], retrieval: dict, response_language: str, deadline_monotonic: float, runtime: V13AssuranceFetchNeighborPagesRuntime, _page_capture: _PageReadCapture | None = None) -> list[dict]:
+    binding_columns = PAGE_RANGE_BINDING_COLUMNS if _page_capture is not None else ""
     ASK_SNIPPET_CHARS = runtime.ASK_SNIPPET_CHARS
     V13_PAGE_TEXT_CHARS = runtime.V13_PAGE_TEXT_CHARS
     V13_RETRIEVAL_ASSURANCE_MAX_DOCS = runtime.V13_RETRIEVAL_ASSURANCE_MAX_DOCS
@@ -1228,9 +1238,11 @@ def v13_assurance_fetch_neighbor_pages(*, q: str, company_id: str, machine_id: s
                     break
                 low = max(1, int(meta["low"]) - V13_RETRIEVAL_ASSURANCE_PAGE_RADIUS)
                 high = int(meta["high"]) + V13_RETRIEVAL_ASSURANCE_PAGE_RADIUS
+                if _page_capture is not None:
+                    _page_capture.expect(max(3, V13_RETRIEVAL_ASSURANCE_MAX_NEIGHBOR_PAGES), V13_PAGE_TEXT_CHARS)
                 cur.execute(
-                    """
-                    SELECT machine_id, page_number, LEFT(COALESCE(text, ''), %s)
+                    f"""
+                    SELECT machine_id, page_number, LEFT(COALESCE(text, ''), %s){binding_columns}
                     FROM public.document_pages
                     WHERE company_id=%s AND bubble_document_id=%s
                       AND page_number BETWEEN %s AND %s
@@ -1247,7 +1259,7 @@ def v13_assurance_fetch_neighbor_pages(*, q: str, company_id: str, machine_id: s
                         max(3, V13_RETRIEVAL_ASSURANCE_MAX_NEIGHBOR_PAGES),
                     ),
                 )
-                for mid, page_number, page_text in cur.fetchall():
+                for mid, page_number, page_text in (_page_capture.capture_range(cur.fetchall(), bdid) if _page_capture is not None else cur.fetchall()):
                     text = str(page_text or "").strip()
                     if not text:
                         continue
@@ -1275,12 +1287,16 @@ def v13_assurance_fetch_neighbor_pages(*, q: str, company_id: str, machine_id: s
                         }
                     )
     except Exception as exc:
+        if _page_capture is not None:
+            raise
         print("V13_ASSURANCE_NEIGHBOR_FAIL", str(exc)[:500])
     finally:
         if conn is not None:
             try:
                 conn.close()
             except Exception:
+                if _page_capture is not None:
+                    raise
                 pass
     return _dedup_citations_by_snippet(out, max_items=V13_RETRIEVAL_ASSURANCE_MAX_NEIGHBOR_PAGES)
 
@@ -1352,22 +1368,8 @@ def v13_assurance_expand_structured_relations(*, company_id: str, machine_id: st
         try:
             conn = _db_conn()
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT bubble_document_id, machine_id, page_number,
-                           LEFT(COALESCE(text, ''), %s)
-                    FROM public.document_pages
-                    WHERE company_id=%s
-                      AND bubble_document_id LIKE 'procedure:%%'
-                      AND (machine_id=%s OR machine_id IS NULL OR machine_id='')
-                      AND text IS NOT NULL AND length(text) > 10
-                    ORDER BY CASE WHEN machine_id=%s THEN 0 ELSE 1 END,
-                             bubble_document_id, page_number
-                    LIMIT %s;
-                    """,
-                    (ASK_STRUCTURED_DIRECT_TEXT_CHARS, company_id, machine_id, machine_id, 320),
-                )
-                rows = cur.fetchall()
+                rows = _assurance_parent_rows(cur, company_id=company_id, machine_id=machine_id,
+                    ASK_STRUCTURED_DIRECT_TEXT_CHARS=ASK_STRUCTURED_DIRECT_TEXT_CHARS)
             for idx, (bdid, mid, page_number, page_text) in enumerate(rows, start=1):
                 text = str(page_text or "").strip()
                 if not text:
@@ -2356,3 +2358,59 @@ def v13_evidence_metrics(candidates: list[dict], *, runtime: V13EvidenceMetricsR
     }
 
 
+
+
+def read_assurance_neighbor_page_evidence(*, scope: ChunkReadScope, q: str,
+        candidate_inputs: tuple, current_allowed_sources: frozenset[SourceIdentity], retrieval: dict,
+        response_language: str, deadline_monotonic: float, limits: ChunkEvidenceLimits,
+        runtime: V13AssuranceFetchNeighborPagesRuntime) -> PageEvidenceRead:
+    records = checked_input_records(scope=scope, records=candidate_inputs,
+        current_allowed_sources=current_allowed_sources, limits=limits)
+    capture = _PageReadCapture(scope, limits, "assurance_neighbor_pages", snippet_chars=runtime.ASK_SNIPPET_CHARS,
+        candidate_chars=runtime.V13_PAGE_TEXT_CHARS, max_queries=runtime.V13_RETRIEVAL_ASSURANCE_MAX_DOCS)
+    selected = _v13_assurance_fetch_neighbor_pages_impl(company_id=scope.company_id, machine_id=scope.machine_id,
+        q=q, candidates=records, retrieval=retrieval, response_language=response_language,
+        deadline_monotonic=deadline_monotonic, runtime=runtime, _page_capture=capture)
+    return capture.finish(selected)
+
+
+def _assurance_parent_rows(cur: Any, *, company_id: str, machine_id: str,
+        ASK_STRUCTURED_DIRECT_TEXT_CHARS: int, _page_capture: _PageReadCapture | None = None) -> list[tuple]:
+    binding_columns = PAGE_BINDING_COLUMNS if _page_capture is not None else ""
+    if _page_capture is not None:
+        _page_capture.expect(320, ASK_STRUCTURED_DIRECT_TEXT_CHARS)
+    cur.execute(
+        f"""
+                    SELECT bubble_document_id, machine_id, page_number,
+                           LEFT(COALESCE(text, ''), %s){binding_columns}
+                    FROM public.document_pages
+                    WHERE company_id=%s
+                      AND bubble_document_id LIKE 'procedure:%%'
+                      AND (machine_id=%s OR machine_id IS NULL OR machine_id='')
+                      AND text IS NOT NULL AND length(text) > 10
+                    ORDER BY CASE WHEN machine_id=%s THEN 0 ELSE 1 END,
+                             bubble_document_id, page_number
+                    LIMIT %s;
+                    """,
+        (ASK_STRUCTURED_DIRECT_TEXT_CHARS, company_id, machine_id, machine_id, 320),
+    )
+    rows = cur.fetchall()
+    if _page_capture is not None:
+        rows = _page_capture.capture(rows)
+    return rows
+
+
+def read_assurance_parent_page_evidence(*, scope: ChunkReadScope, limits: ChunkEvidenceLimits,
+        runtime: V13AssuranceExpandStructuredRelationsRuntime) -> PageEvidenceRead:
+    require_machine_scope(scope)
+    capture = _PageReadCapture(scope, limits, "assurance_parent_pages", snippet_chars=0)
+    conn = runtime._db_conn()
+    try:
+        with conn.cursor() as cur:
+            rows = _assurance_parent_rows(cur, company_id=scope.company_id, machine_id=scope.machine_id,
+                ASK_STRUCTURED_DIRECT_TEXT_CHARS=runtime.ASK_STRUCTURED_DIRECT_TEXT_CHARS, _page_capture=capture)
+    finally:
+        conn.close()
+    pages = [{"bubble_document_id": str(key or ""), "machine_id": str(mid or ""),
+              "page_number": page, "text": text} for key, mid, page, text in rows]
+    return capture.finish_pages(pages)
