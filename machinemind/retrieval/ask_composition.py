@@ -309,6 +309,19 @@ class AskEvidenceSession:
                     link_target=node.link_target, relations=node.relations), view.indexed_text))
         return tuple(result)
 
+    def read_contract(self, *, request: Any,
+                      current_allowed_sources: frozenset[SourceIdentity]
+                      ) -> tuple[ChunkReadScope, ChunkEvidenceLimits]:
+        """Return this request's immutable provider scope/limits before a read.
+
+        This does not grant sources or execute I/O. The producer supplies current
+        authorization again after acquisition, before registration or reuse.
+        """
+        with self._lock:
+            self._check_request(request)
+            self._check_allowance(current_allowed_sources)
+            return self._scope, self._limits.evidence
+
     def register(self, *, request: Any, receipt: Any,
                  current_allowed_sources: frozenset[SourceIdentity]) -> RegisteredRead:
         """Atomically retain an authentic internal typed receipt; no source lookup.
@@ -454,6 +467,46 @@ class AskEvidenceSession:
             self._nodes.append(node)
             self._bytes += bundle.size_bytes + node.accounting_bytes()
             return handle
+
+    def derive_batch(self, *, request: Any,
+                     views: tuple[tuple[tuple[RecordHandle, ...], dict[str, Any]], ...],
+                     operation: str, current_allowed_sources: frozenset[SourceIdentity],
+                     layout: str = "retrieval_candidate") -> tuple[RecordHandle, ...]:
+        """All-or-nothing group of existing derive operations on pre-existing parents.
+
+        The existing per-record source/locator/relationship and aggregate budget
+        checks remain authoritative. No callbacks or I/O occur under this lock.
+        Failed batches release their temporary nodes/bytes, not any earlier read.
+        Fresh authority is supplied by the same request owner, not a receipt union.
+        """
+        with self._lock:
+            self._check_request(request)
+            self._check_allowance(current_allowed_sources)
+            if type(views) is not tuple or len(views) > self._limits.evidence.assembly.max_occurrences:
+                raise AskCompositionError("bounded immutable derivation batch required")
+            if (type(operation) is not str or not operation.strip()
+                    or len(operation) > self._limits.evidence.adapter.max_aux_chars
+                    or layout not in {"document_page", "retrieval_candidate"}):
+                raise AskCompositionError("bounded operation and supported layout required")
+            start, size = len(self._nodes), self._bytes
+            for view in views:
+                if type(view) is not tuple or len(view) != 2:
+                    raise AskCompositionError("explicit parent handles and view required")
+                parents, record = view
+                if (type(parents) is not tuple or not parents or type(record) is not dict
+                        or len(parents) > self._limits.evidence.assembly.max_occurrences):
+                    raise AskCompositionError("bounded existing parents and mapping required")
+                for parent in parents:
+                    self._node(parent, current_allowed_sources)
+            try:
+                return tuple(self.derive(request=request, parents=parents,
+                    record=record, operation=operation, layout=layout,
+                    current_allowed_sources=current_allowed_sources)
+                    for parents, record in views)
+            except BaseException:
+                del self._nodes[start:]
+                self._bytes = size
+                raise
 
     def admission(self, *, request: Any, retrieval: dict[str, Any],
                   selections: tuple[AskSelection, ...],

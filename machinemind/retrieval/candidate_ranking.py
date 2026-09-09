@@ -194,28 +194,39 @@ def should_use_reranker(q: str, candidates: list[dict], sim_max: float, top_k: i
     return True
 
 
-def rrf_merge_candidates(ranked_lists: list[list[dict]], k: int=60) -> list[dict]:
+def rrf_merge_candidates(ranked_lists: list[list[dict]], k: int=60, *, lineage: Optional[Callable[..., None]]=None) -> list[dict]:
     scores: dict[str, float] = {}
     best_item: dict[str, dict] = {}
 
-    for ranked in ranked_lists:
+    origins = {} if lineage is not None else None
+    chosen = {} if lineage is not None else None
+    emitted = {} if lineage is not None else None
+    for group_index, ranked in enumerate(ranked_lists):
         for idx, item in enumerate(ranked):
             cid = str(item.get("citation_id") or "").strip()
             if not cid:
                 continue
 
+            if lineage is not None:
+                origins.setdefault(cid, []).append((group_index, idx))
             score = 1.0 / float(k + idx + 1)
             scores[cid] = scores.get(cid, 0.0) + score
 
             prev = best_item.get(cid)
             if prev is None or float(item.get("similarity", 0.0)) > float(prev.get("similarity", 0.0)):
                 best_item[cid] = item
+                if lineage is not None:
+                    chosen[cid] = (group_index, idx)
 
     out = []
     for cid, item in best_item.items():
         merged = dict(item)
         merged["rrf_score"] = scores.get(cid, 0.0)
         out.append(merged)
+        if lineage is not None:
+            # Direct birth-site association, not a later value/ID lookup.
+            emitted[id(merged)] = (chosen[cid],) + tuple(
+                pos for pos in origins[cid] if pos != chosen[cid])
 
     out.sort(
         key=lambda x: (
@@ -228,6 +239,8 @@ def rrf_merge_candidates(ranked_lists: list[list[dict]], k: int=60) -> list[dict
             str(x.get("citation_id") or ""),
         ),
     )
+    if lineage is not None:
+        lineage(tuple(emitted[id(item)] for item in out))
     return out
 
 
@@ -272,7 +285,7 @@ class DedupCitationsBySnippetRuntime:
     _normalize_unicode_advanced: Callable[..., Any]
 
 
-def dedup_citations_by_snippet(citations: list[dict], max_items: int, *, runtime: DedupCitationsBySnippetRuntime) -> list[dict]:
+def dedup_citations_by_snippet(citations: list[dict], max_items: int, *, runtime: DedupCitationsBySnippetRuntime, lineage: Optional[Callable[..., None]]=None) -> list[dict]:
     _normalize_unicode_advanced = runtime._normalize_unicode_advanced
     def norm(s: str) -> str:
         s = _normalize_unicode_advanced(s or "")
@@ -306,7 +319,8 @@ def dedup_citations_by_snippet(citations: list[dict], max_items: int, *, runtime
         )
 
     best = {}
-    for c in citations:
+    chosen = {} if lineage is not None else None
+    for item_index, c in enumerate(citations):
         k = norm(c.get("snippet", ""))
         if k:
             k = (
@@ -321,7 +335,14 @@ def dedup_citations_by_snippet(citations: list[dict], max_items: int, *, runtime
         prev = best.get(k)
         if prev is None or priority(c) > priority(prev):
             best[k] = c
+            if lineage is not None:
+                chosen[k] = item_index
 
+    # Selected occurrence only; discarded duplicates do not contribute content.
+    emitted = {} if lineage is not None else None
+    if lineage is not None:
+        for key, pos in chosen.items():
+            emitted.setdefault(id(best[key]), []).append(((0, pos),))
     out = list(best.values())
     out.sort(
         key=lambda x: (
@@ -336,10 +357,12 @@ def dedup_citations_by_snippet(citations: list[dict], max_items: int, *, runtime
             str(x.get("citation_id") or ""),
         )
     )
+    if lineage is not None:
+        lineage(tuple(emitted[id(item)].pop(0) for item in out[:max_items]))
     return out[:max_items]
 
 
-def dedup_citations_preserve_order(citations: list[dict], max_items: int) -> list[dict]:
+def dedup_citations_preserve_order(citations: list[dict], max_items: int, *, lineage: Optional[Callable[..., None]]=None) -> list[dict]:
     """Deduplicate citations while preserving supplied priority order.
 
     Used for structured answers where procedure/step records must remain before
@@ -347,7 +370,8 @@ def dedup_citations_preserve_order(citations: list[dict], max_items: int) -> lis
     """
     out: list[dict] = []
     seen: set[tuple[str, int, int, str]] = set()
-    for c in citations or []:
+    origins = [] if lineage is not None else None
+    for item_index, c in enumerate(citations or []):
         if not isinstance(c, dict):
             continue
         bdid = str(c.get("bubble_document_id") or "").strip()
@@ -359,8 +383,12 @@ def dedup_citations_preserve_order(citations: list[dict], max_items: int) -> lis
             continue
         seen.add(key)
         out.append(c)
+        if lineage is not None:
+            origins.append(((0, item_index),))
         if len(out) >= max_items:
             break
+    if lineage is not None:
+        lineage(tuple(origins))
     return out
 
 
@@ -502,16 +530,19 @@ def v12_dedupe_family_steps(steps: list[dict], *, runtime: V12DedupeFamilyStepsR
     return sorted(best_by_number.values(), key=_v12_step_sort_key)
 
 
-def v13_merge_candidates(candidate_lists: list[list[dict]]) -> list[dict]:
+def v13_merge_candidates(candidate_lists: list[list[dict]], *, lineage: Optional[Callable[..., None]]=None) -> list[dict]:
     by_id: dict[str, dict] = {}
-    for candidates in candidate_lists or []:
-        for raw in candidates or []:
+    origins = {} if lineage is not None else None
+    for group_index, candidates in enumerate(candidate_lists or []):
+        for item_index, raw in enumerate(candidates or []):
             if not isinstance(raw, dict):
                 continue
             c = dict(raw)
             cid = str(c.get("citation_id") or "").strip()
             if not cid:
                 continue
+            if lineage is not None:
+                origins.setdefault(cid, []).append((group_index, item_index))
             prev = by_id.get(cid)
             if prev is None:
                 by_id[cid] = c
@@ -537,6 +568,8 @@ def v13_merge_candidates(candidate_lists: list[list[dict]]) -> list[dict]:
                     else:
                         merged[key] = value
             by_id[cid] = merged
+    if lineage is not None:
+        lineage(tuple(tuple(origins[cid]) for cid in by_id))
     return list(by_id.values())
 
 
