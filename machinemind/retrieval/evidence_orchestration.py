@@ -126,7 +126,7 @@ class V13InitialRetrievalRuntime:
     _vector_literal: Callable[..., Any]
 
 
-def v13_initial_retrieval(*, q: str, company_id: str, machine_id: str, doc_ids: Optional[list[str]], bubble_document_id: Optional[str], ai_scope: str, response_language: str, mode: str, plan: Optional[dict]=None, runtime: V13InitialRetrievalRuntime) -> dict:
+def v13_initial_retrieval(*, q: str, company_id: str, machine_id: str, doc_ids: Optional[list[str]], bubble_document_id: Optional[str], ai_scope: str, response_language: str, mode: str, plan: Optional[dict]=None, runtime: V13InitialRetrievalRuntime, lineage: Optional[Callable[..., None]]=None) -> dict:
     V13_DENSE_QUERY_LIMIT = runtime.V13_DENSE_QUERY_LIMIT
     V13_LEXICAL_QUERY_LIMIT = runtime.V13_LEXICAL_QUERY_LIMIT
     V13_MAX_EVIDENCE_ITEMS_ASK = runtime.V13_MAX_EVIDENCE_ITEMS_ASK
@@ -208,8 +208,12 @@ def v13_initial_retrieval(*, q: str, company_id: str, machine_id: str, doc_ids: 
             doc_ids=doc_ids,
             bubble_document_id=bubble_document_id,
         )
+        if lineage is not None:
+            lineage("prefix_before", tuple(prefix_hits))
         for c in prefix_hits:
             c["fts_v13"] = True
+        if lineage is not None:
+            lineage("prefix_after", tuple(prefix_hits))
     except Exception as exc:
         print("V13_PREFIX_FTS_FAIL", str(exc)[:500])
 
@@ -222,8 +226,12 @@ def v13_initial_retrieval(*, q: str, company_id: str, machine_id: str, doc_ids: 
             doc_ids=doc_ids,
             bubble_document_id=bubble_document_id,
         )
+        if lineage is not None:
+            lineage("lexical_before", tuple(exact_hits))
         for c in exact_hits:
             c["fts_v13"] = True
+        if lineage is not None:
+            lineage("lexical_after", tuple(exact_hits))
     except Exception as exc:
         print("V13_EXACT_FTS_FAIL", str(exc)[:500])
 
@@ -314,6 +322,8 @@ def v13_initial_retrieval(*, q: str, company_id: str, machine_id: str, doc_ids: 
         scored = _v13_rescore_root_candidates(q, scored)
 
     metrics = _v13_evidence_metrics(scored)
+    if lineage is not None:
+        lineage("complete", tuple(scored))
     return {
         "plan": plan,
         "candidates": scored,

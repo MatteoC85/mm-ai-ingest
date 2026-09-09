@@ -677,3 +677,267 @@ def prepare_records(*, request: Any, session: AskEvidenceSession,
             journal.scored.clear()
 
     return invoke(work, request)
+
+
+INITIAL_LINEAGE_VERSION = "ask-initial-retrieval-lineage-p6b4j-v1"
+
+
+def retrieve_initial_records(*, request: Any, session: AskEvidenceSession,
+        q: str, mode: str, runtime: orchestration.V13InitialRetrievalRuntime,
+        source_callbacks: dict[str, Callable[..., Any]],
+        authorize: Callable[[Any], frozenset[SourceIdentity]],
+        invoke: Callable[..., Any], max_trace_records: int, max_trace_bytes: int,
+        plan: dict | None = None) -> tuple[dict, tuple[AskSelection, ...]]:
+    """Run the EXISTING initial P4 policy with explicit registered source adapters.
+
+    Only an ASK-owned request is accepted; P4 mode may be ask or neutral. Scope
+    comes from that request's session, never from candidates or query text.
+    Eight source adapters have the legacy callback signatures: dense, prefix,
+    lexical, identifier, pages, preferred, structured_dense, structured_direct.
+    Dense returns (debug_count_or_None, tuple_of_handles); the others return a
+    tuple of handles. They must actually acquire/register the corresponding
+    authorized receipts, using acquire_read and the SAME owner/session. Raw rows,
+    guessed source identities or read_sources used as grants are not adapters.
+
+    The dense two-callback boundary uses a private single-use token carrying
+    those explicit occurrences, not a fabricated SQL tuple. Its historical
+    query_used annotation is a recorded view. FTS annotations are observed at
+    their mutation site in P4. RRF/merge/score callbacks must forward lineage to
+    the existing traced operators; nested selectors must preserve object origin.
+    Read-only callbacks cannot silently mutate input evidence or a query plan.
+
+    The operation-local bounded journal from B4i is reused, not another evidence
+    session, ACL service, router or algorithm. Output candidates are committed
+    in one existing derive_batch; citations retain their exact prefix positions.
+    Already acquired receipts survive a later failure; caller ends the session.
+    Every consumed handle is authorized again before export, including dropped
+    records. Errors in called collaborators latch despite legacy broad catches;
+    they are technical failures rather than successful empty retrievals.
+
+    Main remains unconfigured. This does not automatically implement adapter
+    bodies, current production authority, raw-page conversion, neutral/refine
+    outer transformations, hidden reads, direct facts/rescue, cache or links.
+    Metadata outside evidence collections is preserved, not authorized text.
+    No new query/model/embedding is introduced; authority callback I/O and trace
+    CPU/heap overhead must be measured. Bounds are serialized state, not heap.
+    Collaborators are trusted/non-reentrant for this operation: no Python sandbox
+    or atomic remote revocation guarantee is claimed.
+    """
+    _callbacks(session, authorize, invoke)
+
+    def work():
+        names = {"dense", "prefix", "lexical", "identifier", "pages", "preferred",
+                 "structured_dense", "structured_direct"}
+        if (getattr(request, "requested_mode", None) != "ask"
+                or type(mode) is not str or mode not in {"ask", "neutral"}):
+            raise EvidenceProductionError("initial lineage supports ASK-owned ask/neutral only")
+        if type(q) is not str or not q.strip() or (plan is not None and type(plan) is not dict):
+            raise EvidenceProductionError("explicit initial query and optional plan required")
+        if type(runtime) is not orchestration.V13InitialRetrievalRuntime:
+            raise EvidenceProductionError("existing initial retrieval runtime required")
+        if (type(source_callbacks) is not dict or any(
+                name not in names or not callable(fn) for name, fn in source_callbacks.items())):
+            raise EvidenceProductionError("explicit initial source adapters required")
+        before = invoke(authorize, request, request)
+        scope, limits = session.read_contract(request=request, current_allowed_sources=before)
+        cap = runtime.V13_MAX_EVIDENCE_ITEMS_ASK
+        if type(cap) is not int or not 1 <= cap <= limits.assembly.max_occurrences:
+            raise EvidenceProductionError("bounded initial citation capacity required")
+        journal = _PreparationTrace(limits=limits, max_records=max_trace_records,
+                                    max_bytes=max_trace_bytes)
+        dense_tokens = {}
+        flags = {}
+        score_result = None
+        complete = False
+        supplied_plan = deepcopy(plan)
+        try:
+            def call(fn, *args, **kwargs):
+                return journal.run(invoke, fn, request, *args, **kwargs)
+
+            def readonly(fn):
+                def observed(*args, **kwargs):
+                    snapshots = [(value, deepcopy(value)) for value in (*args, *kwargs.values())
+                                 if type(value) in (dict, list, tuple)]
+                    result = call(fn, *args, **kwargs)
+                    if any(not _same_value(value, expected) for value, expected in snapshots):
+                        raise EvidenceProductionError("read-only initial callback changed its input")
+                    return result
+                return lambda *a, **kw: journal.run(observed, *a, **kw)
+
+            def source(name, **kwargs):
+                def read():
+                    if name not in source_callbacks:
+                        raise EvidenceProductionError("required initial source adapter missing")
+                    current = invoke(authorize, request, request)
+                    session.read_contract(request=request, current_allowed_sources=current)
+                    session.records(request=request, handles=tuple(journal.roots),
+                                    current_allowed_sources=current)
+                    result = readonly(source_callbacks[name])(**kwargs)
+                    count = None
+                    if name == "dense":
+                        if (type(result) is not tuple or len(result) != 2
+                                or (result[0] is not None and
+                                    (type(result[0]) is not int or result[0] < 0))):
+                            raise EvidenceProductionError("dense adapter requires count and handles")
+                        count, result = result
+                    if (type(result) is not tuple or len(result) > limits.assembly.max_occurrences
+                            or any(type(h) is not RecordHandle for h in result)):
+                        raise EvidenceProductionError("initial source adapter requires bounded explicit handles")
+                    after = invoke(authorize, request, request)
+                    session.records(request=request, handles=tuple(journal.roots),
+                                    current_allowed_sources=after)
+                    inputs = session.records(request=request, handles=result,
+                                             current_allowed_sources=after)
+                    records = journal.materialize(result, inputs)
+                    if name == "dense":
+                        token = object()
+                        dense_tokens[token] = records
+                        return count, token
+                    return records
+                return journal.run(read)
+
+            def dense_candidates(token, *, query_used=None):
+                def convert():
+                    if token not in dense_tokens or type(query_used) is not str:
+                        raise EvidenceProductionError("dense conversion requires this call's one-use token")
+                    originals = dense_tokens.pop(token)
+                    result = []
+                    for original in originals:
+                        entry = journal.entry(original)
+                        value = dict(original)
+                        value["query_used"] = query_used
+                        journal.add(value, entry[2])
+                        result.append(value)
+                    return result
+                return journal.run(convert)
+
+            def traced(fn, groups, *args, same_locator=False, **kwargs):
+                def op(*a, **kw):
+                    emit = kw["lineage"]
+                    def trace(positions):
+                        if type(positions) is not tuple:
+                            raise EvidenceProductionError("explicit initial operator positions required")
+                        for contributors in positions:
+                            if (type(contributors) is not tuple or not contributors
+                                    or any(type(pos) is not tuple or len(pos) != 2
+                                        or type(pos[0]) is not int or type(pos[1]) is not int
+                                        or not 0 <= pos[0] < len(groups)
+                                        or not 0 <= pos[1] < len(groups[pos[0]])
+                                        for pos in contributors)):
+                                raise EvidenceProductionError("invalid initial operator positions")
+                        if same_locator:
+                            # V13 field-wise merge cannot take text from another
+                            # location merely because its legacy CID collides.
+                            for contributors in positions:
+                                locators = []
+                                for group, index in contributors:
+                                    entry = journal.entry(groups[group][index])
+                                    context = journal.roots[entry[2][0]].context
+                                    locators.append(adapt_candidate(entry[1], context=context,
+                                        limits=limits.adapter).entry.evidence.locator)
+                                if locators and any(loc != locators[0] for loc in locators[1:]):
+                                    raise EvidenceProductionError("initial merge combines different locators")
+                        emit(positions)
+                    kw["lineage"] = trace
+                    return call(fn, *a, **kw)
+                return journal.run(journal.traced, op, groups, *args, **kwargs)
+
+            def scored(query, records):
+                nonlocal score_result
+                if score_result is not None:
+                    raise EvidenceProductionError("duplicate initial scoring boundary")
+                result = traced(runtime._v13_score_candidates, [records], query, records)
+                score_result = tuple(result)
+                return result
+
+            def creation(stage, records):
+                nonlocal complete
+                def record_event():
+                    nonlocal complete
+                    if type(records) is not tuple or len(records) > limits.assembly.max_occurrences:
+                        raise EvidenceProductionError("bounded initial creation event required")
+                    if stage == "complete":
+                        if (complete or score_result is None or dense_tokens
+                                or set(flags) != {"prefix_done", "lexical_done"}
+                                or len(records) != len(score_result)
+                                or any(a is not b for a, b in zip(records, score_result))):
+                            raise EvidenceProductionError("initial creation trace incomplete")
+                        for record in records:
+                            journal.entry(record)
+                        complete = True
+                        return
+                    if stage not in {"prefix_before", "prefix_after", "lexical_before", "lexical_after"}:
+                        raise EvidenceProductionError("unknown initial creation event")
+                    name, moment = stage.rsplit("_", 1)
+                    if moment == "before":
+                        if name in flags or name + "_done" in flags:
+                            raise EvidenceProductionError("duplicate initial flag input event")
+                        flags[name] = tuple(journal.entry(record) for record in records)
+                    else:
+                        if name not in flags:
+                            raise EvidenceProductionError("initial flag output without origin")
+                        entries = flags.pop(name)
+                        if len(entries) != len(records):
+                            raise EvidenceProductionError("initial flag occurrence count changed")
+                        for entry, record in zip(entries, records):
+                            expected = dict(entry[1]); expected["fts_v13"] = True
+                            if record is not entry[0] or not _same_value(record, expected):
+                                raise EvidenceProductionError("initial flag changed unrecorded fields")
+                            # Update only this operation-local view. The session's
+                            # immutable SQL observation and original view are intact.
+                            del journal.entries[id(record)]
+                            journal.bytes -= len(canonical_json(
+                                _Freezer(limits.legacy).freeze(entry[1])).encode("utf-8"))
+                            journal.add(record, entry[2])
+                        flags[name + "_done"] = True
+                return journal.run(record_event)
+
+            reads = {"_fetch_dense_chunk_candidates": "dense", "_fts_search_chunks_prefix": "prefix",
+                     "_fts_search_chunks_multi": "lexical", "_v13_exact_identifier_candidates": "identifier",
+                     "_v13_fetch_scored_pages": "pages", "_v13_fetch_preferred_source_pages": "preferred",
+                     "_v13_fetch_structured_dense_candidates": "structured_dense",
+                     "_ask_structured_direct_fetch_sources": "structured_direct"}
+            replacements = {name: (lambda key: lambda **kw: source(key, **kw))(key)
+                            for name, key in reads.items()}
+            for name in ("_v13_current_budget", "_v13_fallback_plan", "_dedup_text_values",
+                         "_openai_embed_texts", "_vector_literal", "_ask_source_preference_profile",
+                         "_count_query_tokens", "_v13_build_profile_from_plan",
+                         "_structured_rescue_query_intent", "_v13_evidence_metrics"):
+                replacements[name] = readonly(getattr(runtime, name))
+            bound = replace(runtime, **replacements,
+                _raw_rows_to_dense_candidates=dense_candidates,
+                _rrf_merge_candidates=lambda groups, **kw: traced(
+                    runtime._rrf_merge_candidates, groups, groups, **kw),
+                _v13_merge_candidates=lambda groups: traced(
+                    runtime._v13_merge_candidates, groups, groups, same_locator=True),
+                _v13_score_candidates=lambda *a: journal.run(scored, *a))
+            result = journal.run(invoke, orchestration.v13_initial_retrieval, request,
+                q=q, mode=mode, response_language=request.response_language,
+                ai_scope=scope.ai_scope, **scope.sql_selectors(), plan=supplied_plan,
+                runtime=bound, lineage=creation)
+            journal.check()
+            if not complete:
+                raise EvidenceProductionError("initial retrieval did not close its creation trace")
+            for entry in journal.entries.values():
+                journal.entry(entry[0])
+            if (type(result) is not dict or type(result.get("candidates")) is not list
+                    or type(result.get("citations")) is not list
+                    or len(result["candidates"]) != len(score_result)
+                    or any(a is not b for a, b in zip(result["candidates"], score_result))
+                    or len(result["citations"]) != len(score_result[:cap])
+                    or any(a is not b for a, b in zip(result["citations"], score_result[:cap]))):
+                raise EvidenceProductionError("initial output differs from exact scored selection")
+            if len(score_result) + len(result["citations"]) > limits.assembly.max_occurrences:
+                raise EvidenceProductionError("aggregate initial output count exceeded")
+            after = invoke(authorize, request, request)
+            session.records(request=request, handles=tuple(journal.roots), current_allowed_sources=after)
+            views = tuple((journal.entry(record)[2], deepcopy(record)) for record in score_result)
+            result_handles = session.derive_batch(request=request, views=views,
+                operation=INITIAL_LINEAGE_VERSION, current_allowed_sources=after)
+            return result, (AskSelection("candidates", result_handles),
+                            AskSelection("citations", result_handles[:cap]))
+        finally:
+            journal.active = False
+            journal.entries.clear(); journal.roots.clear(); dense_tokens.clear(); flags.clear()
+
+    return invoke(work, request)
