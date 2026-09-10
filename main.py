@@ -4,6 +4,7 @@ import asyncio
 import concurrent.futures
 import contextvars
 import functools
+from dataclasses import replace as _dataclass_replace
 import threading
 import base64
 import binascii
@@ -97,6 +98,10 @@ app = FastAPI()
 # Runtime configuration re-exported from a normal importable module.
 # The historical names remain available in ``main`` for compatibility.
 from machinemind.config.runtime import *  # noqa: F401,F403
+from machinemind.ask import application_authority as _application_authority
+from machinemind.authority.contracts import AuthorityError as _AuthorityError
+from machinemind.authority.policy import RequestAuthority as _RequestAuthority
+from machinemind.retrieval.production_adapters import ProductionReaderAdapters as _ProductionReaderAdapters
 
 from machinemind.api.contracts import (
     AskRequest,
@@ -18065,11 +18070,397 @@ async def _assistant_core_json_with_hard_timeout(
     )
 
 
+
+def _assistant_core_authority_reader_runtimes():
+    """B4l: exact K dependencies for the existing typed readers, no I/O here."""
+    return {
+        'read_dense_chunk_evidence': _retrieval_dense.DenseRuntime(_db_conn, ASK_SNIPPET_CHARS),
+        'read_prefix_chunk_evidence': _retrieval_lexical.LexicalRuntime(_db_conn, ASK_SNIPPET_CHARS),
+        'read_fts_chunk_evidence': _retrieval_lexical.LexicalRuntime(_db_conn, ASK_SNIPPET_CHARS),
+        'read_parent_procedure_page_evidence': _retrieval_document_readers.DbFetchParentProcedurePagesForStepsRuntime(
+                    STRUCTURED_RELATION_PROCEDURE_STEP=STRUCTURED_RELATION_PROCEDURE_STEP,
+                    _db_conn=_db_conn,
+                    _dedup_text_values=_dedup_text_values,
+                    _safe_int=_safe_int,
+                ),
+        'read_ask_page_evidence': _retrieval_document_readers.AskEvidenceFetchPagesRuntime(
+                    ASK_EVIDENCE_MAX_PAGE_CHARS=ASK_EVIDENCE_MAX_PAGE_CHARS,
+                    ASK_EVIDENCE_MIN_PAGE_SCORE=ASK_EVIDENCE_MIN_PAGE_SCORE,
+                    ASK_EVIDENCE_SCOPE_PAGE_LIMIT=ASK_EVIDENCE_SCOPE_PAGE_LIMIT,
+                    ASK_EVIDENCE_TOP_PAGES=ASK_EVIDENCE_TOP_PAGES,
+                    ASK_SNIPPET_CHARS=ASK_SNIPPET_CHARS,
+                    COMPANY_GENERAL_MACHINE_SENTINEL=COMPANY_GENERAL_MACHINE_SENTINEL,
+                    _ask_evidence_code_tokens=_ask_evidence_code_tokens,
+                    _ask_evidence_number_tokens=_ask_evidence_number_tokens,
+                    _ask_evidence_scope_where=_ask_evidence_scope_where,
+                    _ask_evidence_score_text=_ask_evidence_score_text,
+                    _ask_evidence_tokenize=_ask_evidence_tokenize,
+                    _db_conn=_db_conn,
+                    _dedup_citations_by_snippet=_dedup_citations_by_snippet,
+                    _normalize_unicode_advanced=_normalize_unicode_advanced,
+                    _safe_int=_safe_int,
+                    re=re,
+                ),
+        'read_full_context_page_evidence': _retrieval_document_readers.AskFullContextFetchPagesRuntime(
+                    ASK_FULL_CONTEXT_MAX_CHARS=ASK_FULL_CONTEXT_MAX_CHARS,
+                    ASK_FULL_CONTEXT_MAX_DOCS=ASK_FULL_CONTEXT_MAX_DOCS,
+                    ASK_FULL_CONTEXT_MAX_PAGES=ASK_FULL_CONTEXT_MAX_PAGES,
+                    ASK_FULL_CONTEXT_PAGE_CHARS=ASK_FULL_CONTEXT_PAGE_CHARS,
+                    ASK_SNIPPET_CHARS=ASK_SNIPPET_CHARS,
+                    _ask_full_context_seed_doc_ids=_ask_full_context_seed_doc_ids,
+                    _db_conn=_db_conn,
+                    _safe_int=_safe_int,
+                ),
+        'read_scored_page_evidence': _retrieval_document_readers.V13FetchScoredPagesRuntime(
+                    ASK_EVIDENCE_MIN_PAGE_SCORE=ASK_EVIDENCE_MIN_PAGE_SCORE,
+                    ASK_SNIPPET_CHARS=ASK_SNIPPET_CHARS,
+                    COMPANY_GENERAL_MACHINE_SENTINEL=COMPANY_GENERAL_MACHINE_SENTINEL,
+                    V13_PAGE_SCAN_LIMIT=V13_PAGE_SCAN_LIMIT,
+                    V13_PAGE_TEXT_CHARS=V13_PAGE_TEXT_CHARS,
+                    _ask_evidence_code_tokens=_ask_evidence_code_tokens,
+                    _ask_evidence_number_tokens=_ask_evidence_number_tokens,
+                    _ask_evidence_scope_where=_ask_evidence_scope_where,
+                    _ask_evidence_score_text=_ask_evidence_score_text,
+                    _ask_evidence_tokenize=_ask_evidence_tokenize,
+                    _db_conn=_db_conn,
+                    _dedup_citations_by_snippet=_dedup_citations_by_snippet,
+                    _normalize_unicode_advanced=_normalize_unicode_advanced,
+                    _safe_int=_safe_int,
+                    re=re,
+                ),
+        'read_token_chunk_evidence': _retrieval_document_readers.DbFindTokenChunkRuntime(
+                    ASK_SNIPPET_CHARS=ASK_SNIPPET_CHARS,
+                    _db_conn=_db_conn,
+                ),
+        'read_entity_chunk_evidence': _retrieval_document_readers.DbFindEntityChunkRuntime(
+                    ASK_SNIPPET_CHARS=ASK_SNIPPET_CHARS,
+                    EMAIL_REGEX=EMAIL_REGEX,
+                    PHONE_REGEX=PHONE_REGEX,
+                    URL_REGEX=URL_REGEX,
+                    _db_conn=_db_conn,
+                    _extract_first=_extract_first,
+                ),
+        'read_preferred_page_evidence': _retrieval_document_readers.AskFetchPreferredSourcePagesRuntime(
+                    ASK_EVIDENCE_SCOPE_PAGE_LIMIT=ASK_EVIDENCE_SCOPE_PAGE_LIMIT,
+                    ASK_FULL_CONTEXT_PAGE_CHARS=ASK_FULL_CONTEXT_PAGE_CHARS,
+                    ASK_SNIPPET_CHARS=ASK_SNIPPET_CHARS,
+                    COMPANY_GENERAL_MACHINE_SENTINEL=COMPANY_GENERAL_MACHINE_SENTINEL,
+                    _ask_evidence_query_profile=_ask_evidence_query_profile,
+                    _ask_evidence_scope_where=_ask_evidence_scope_where,
+                    _ask_evidence_score_text=_ask_evidence_score_text,
+                    _ask_manual_priority_page_has_real_maintenance_content=_ask_manual_priority_page_has_real_maintenance_content,
+                    _ask_manual_priority_page_is_meta_or_index=_ask_manual_priority_page_is_meta_or_index,
+                    _ask_manual_priority_page_score=_ask_manual_priority_page_score,
+                    _ask_manual_priority_query_is_maintenance=_ask_manual_priority_query_is_maintenance,
+                    _db_conn=_db_conn,
+                    _dedup_citations_by_snippet=_dedup_citations_by_snippet,
+                    _is_structured_source_key=_is_structured_source_key,
+                    _is_xlsx_indexed_page_text=_is_xlsx_indexed_page_text,
+                    _normalize_unicode_advanced=_normalize_unicode_advanced,
+                    _safe_int=_safe_int,
+                ),
+        'read_v13_preferred_page_evidence': _retrieval_document_readers.V13FetchPreferredSourcePagesRuntime(
+                    ASK_FULL_CONTEXT_PAGE_CHARS=ASK_FULL_CONTEXT_PAGE_CHARS,
+                    ASK_SNIPPET_CHARS=ASK_SNIPPET_CHARS,
+                    COMPANY_GENERAL_MACHINE_SENTINEL=COMPANY_GENERAL_MACHINE_SENTINEL,
+                    V13_PAGE_TEXT_CHARS=V13_PAGE_TEXT_CHARS,
+                    V13_PREFERRED_PAGE_SCAN_LIMIT=V13_PREFERRED_PAGE_SCAN_LIMIT,
+                    _ask_evidence_scope_where=_ask_evidence_scope_where,
+                    _ask_evidence_score_text=_ask_evidence_score_text,
+                    _ask_manual_priority_page_has_real_maintenance_content=_ask_manual_priority_page_has_real_maintenance_content,
+                    _ask_manual_priority_page_is_meta_or_index=_ask_manual_priority_page_is_meta_or_index,
+                    _ask_manual_priority_page_score=_ask_manual_priority_page_score,
+                    _ask_manual_priority_query_is_maintenance=_ask_manual_priority_query_is_maintenance,
+                    _db_conn=_db_conn,
+                    _dedup_citations_by_snippet=_dedup_citations_by_snippet,
+                    _is_structured_source_key=_is_structured_source_key,
+                    _is_xlsx_indexed_page_text=_is_xlsx_indexed_page_text,
+                    _normalize_unicode_advanced=_normalize_unicode_advanced,
+                    _safe_int=_safe_int,
+                    _v13_build_profile_from_plan=_v13_build_profile_from_plan,
+                ),
+        'read_maintenance_page_evidence': _retrieval_document_readers.AskFetchManualMaintenanceTargetPagesRuntime(
+                    ASK_FULL_CONTEXT_PAGE_CHARS=ASK_FULL_CONTEXT_PAGE_CHARS,
+                    ASK_SNIPPET_CHARS=ASK_SNIPPET_CHARS,
+                    COMPANY_GENERAL_MACHINE_SENTINEL=COMPANY_GENERAL_MACHINE_SENTINEL,
+                    _ask_evidence_fallback_profile=_ask_evidence_fallback_profile,
+                    _ask_evidence_scope_where=_ask_evidence_scope_where,
+                    _ask_evidence_score_text=_ask_evidence_score_text,
+                    _ask_manual_priority_page_has_real_maintenance_content=_ask_manual_priority_page_has_real_maintenance_content,
+                    _ask_manual_priority_page_is_meta_or_index=_ask_manual_priority_page_is_meta_or_index,
+                    _ask_manual_priority_page_score=_ask_manual_priority_page_score,
+                    _db_conn=_db_conn,
+                    _is_structured_source_key=_is_structured_source_key,
+                    _is_xlsx_indexed_page_text=_is_xlsx_indexed_page_text,
+                    _safe_int=_safe_int,
+                    _simple_query_language=_simple_query_language,
+                ),
+        'read_machine_catalog_page_evidence': _retrieval_document_readers.AssistantCoreMachineCatalogCandidatesRuntime(
+                    ASK_SNIPPET_CHARS=ASK_SNIPPET_CHARS,
+                    _ask_evidence_fallback_profile=_ask_evidence_fallback_profile,
+                    _ask_evidence_score_text=_ask_evidence_score_text,
+                    _assistant_core_candidate_source_type=_assistant_core_candidate_source_type,
+                    _db_conn=_db_conn,
+                    _safe_int=_safe_int,
+                    _source_type_from_document_id=_source_type_from_document_id,
+                    _v13_merge_candidates=_v13_merge_candidates,
+                ),
+        'read_semantic_manual_support_page_evidence': _retrieval_document_readers.AskStructuredDirectFetchManualSupportRuntime(
+                    ASK_SNIPPET_CHARS=ASK_SNIPPET_CHARS,
+                    ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_ENABLED=ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_ENABLED,
+                    ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_MAX_ITEMS=ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_MAX_ITEMS,
+                    ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_SCAN_LIMIT=ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_SCAN_LIMIT,
+                    ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_TEXT_CHARS=ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_TEXT_CHARS,
+                    COMPANY_GENERAL_MACHINE_SENTINEL=COMPANY_GENERAL_MACHINE_SENTINEL,
+                    _ask_structured_manual_support_candidate_score=_ask_structured_manual_support_candidate_score,
+                    _ask_structured_manual_support_search_terms_with_llm=_ask_structured_manual_support_search_terms_with_llm,
+                    _ask_structured_manual_support_select_with_llm=_ask_structured_manual_support_select_with_llm,
+                    _ask_structured_manual_support_terms=_ask_structured_manual_support_terms,
+                    _clean_display_text=_clean_display_text,
+                    _db_conn=_db_conn,
+                    _safe_int=_safe_int,
+                    _source_display_metadata_from_citation=_source_display_metadata_from_citation,
+                    os=os,
+                ),
+        'read_deterministic_manual_support_page_evidence': _retrieval_document_readers.V13FetchManualSupportDeterministicRuntime(
+                    ASK_SNIPPET_CHARS=ASK_SNIPPET_CHARS,
+                    ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_ENABLED=ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_ENABLED,
+                    ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_MAX_ITEMS=ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_MAX_ITEMS,
+                    ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_SCAN_LIMIT=ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_SCAN_LIMIT,
+                    ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_TEXT_CHARS=ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_TEXT_CHARS,
+                    COMPANY_GENERAL_MACHINE_SENTINEL=COMPANY_GENERAL_MACHINE_SENTINEL,
+                    _ask_structured_manual_support_score_details=_ask_structured_manual_support_score_details,
+                    _ask_structured_manual_support_terms=_ask_structured_manual_support_terms,
+                    _db_conn=_db_conn,
+                    _safe_int=_safe_int,
+                    _v12_filter_linkable_manual_support=_v12_filter_linkable_manual_support,
+                    _v12_mark_manual_support=_v12_mark_manual_support,
+                ),
+        'read_document_file_references': _retrieval_document_readers.FetchDocumentFileMapRuntime(
+                    _db_conn=_db_conn,
+                ),
+        'read_related_step_page_evidence': _retrieval_structured.DbFetchRelatedStepPagesRuntime(
+                    STRUCTURED_RELATION_PROCEDURE_STEP=STRUCTURED_RELATION_PROCEDURE_STEP,
+                    _db_conn=_db_conn,
+                ),
+        'read_structured_direct_page_evidence': _retrieval_structured.AskStructuredDirectFetchSourcesRuntime(
+                    ASK_SNIPPET_CHARS=ASK_SNIPPET_CHARS,
+                    ASK_STRUCTURED_DIRECT_ENABLED=ASK_STRUCTURED_DIRECT_ENABLED,
+                    ASK_STRUCTURED_DIRECT_MAX_ITEMS=ASK_STRUCTURED_DIRECT_MAX_ITEMS,
+                    ASK_STRUCTURED_DIRECT_SCAN_LIMIT=ASK_STRUCTURED_DIRECT_SCAN_LIMIT,
+                    ASK_STRUCTURED_DIRECT_TEXT_CHARS=ASK_STRUCTURED_DIRECT_TEXT_CHARS,
+                    COMPANY_GENERAL_MACHINE_SENTINEL=COMPANY_GENERAL_MACHINE_SENTINEL,
+                    _ask_structured_direct_intent=_ask_structured_direct_intent,
+                    _ask_structured_direct_score=_ask_structured_direct_score,
+                    _db_conn=_db_conn,
+                    _dedup_citations_by_snippet=_dedup_citations_by_snippet,
+                    _dedup_text_values=_dedup_text_values,
+                    _normalize_unicode_advanced=_normalize_unicode_advanced,
+                    _safe_int=_safe_int,
+                    _source_type_from_document_id=_source_type_from_document_id,
+                ),
+        'read_structured_title_page_evidence': _retrieval_structured.V13FetchStructuredTitleCandidatesRuntime(
+                    ASK_SNIPPET_CHARS=ASK_SNIPPET_CHARS,
+                    ASK_STRUCTURED_DIRECT_TEXT_CHARS=ASK_STRUCTURED_DIRECT_TEXT_CHARS,
+                    COMPANY_GENERAL_MACHINE_SENTINEL=COMPANY_GENERAL_MACHINE_SENTINEL,
+                    STRUCTURED_SOURCE_TYPES=STRUCTURED_SOURCE_TYPES,
+                    V13_SOURCE_RETRIEVAL_ENABLED=V13_SOURCE_RETRIEVAL_ENABLED,
+                    V13_SOURCE_RETRIEVAL_MAX_CANDIDATES=V13_SOURCE_RETRIEVAL_MAX_CANDIDATES,
+                    V13_SOURCE_RETRIEVAL_MAX_QUERY_TOKENS=V13_SOURCE_RETRIEVAL_MAX_QUERY_TOKENS,
+                    V13_SOURCE_RETRIEVAL_MIN_TITLE_SCORE=V13_SOURCE_RETRIEVAL_MIN_TITLE_SCORE,
+                    V13_SOURCE_RETRIEVAL_SCAN_LIMIT=V13_SOURCE_RETRIEVAL_SCAN_LIMIT,
+                    _clean_display_text=_clean_display_text,
+                    _count_query_tokens=_count_query_tokens,
+                    _db_conn=_db_conn,
+                    _dedup_citations_by_snippet=_dedup_citations_by_snippet,
+                    _parse_structured_source_fields=_parse_structured_source_fields,
+                    _safe_int=_safe_int,
+                    _source_type_from_document_id=_source_type_from_document_id,
+                    _v13_source_sql_match_patterns=_v13_source_sql_match_patterns,
+                    _v13_source_title_match_metrics=_v13_source_title_match_metrics,
+                    _v13_source_title_tokens=_v13_source_title_tokens,
+                ),
+        'read_structured_rescue_chunk_evidence': _retrieval_structured.FetchStructuredRescueCandidatesRuntime(
+                    ASK_SNIPPET_CHARS=ASK_SNIPPET_CHARS,
+                    STRUCTURED_RESCUE_ENABLED=STRUCTURED_RESCUE_ENABLED,
+                    STRUCTURED_RESCUE_MAX_HITS=STRUCTURED_RESCUE_MAX_HITS,
+                    STRUCTURED_RESCUE_SCAN_LIMIT=STRUCTURED_RESCUE_SCAN_LIMIT,
+                    _db_conn=_db_conn,
+                    _dedup_citations_by_snippet=_dedup_citations_by_snippet,
+                    _normalize_unicode_advanced=_normalize_unicode_advanced,
+                    _source_type_from_document_id=_source_type_from_document_id,
+                    _structured_rescue_prefixes_for_query=_structured_rescue_prefixes_for_query,
+                    _structured_rescue_query_intent=_structured_rescue_query_intent,
+                    _structured_rescue_terms=_structured_rescue_terms,
+                ),
+        'read_structured_dense_chunk_evidence': _retrieval_structured.V13FetchStructuredDenseCandidatesRuntime(
+                    ASK_SNIPPET_CHARS=ASK_SNIPPET_CHARS,
+                    COMPANY_GENERAL_MACHINE_SENTINEL=COMPANY_GENERAL_MACHINE_SENTINEL,
+                    STRUCTURED_SOURCE_TYPES=STRUCTURED_SOURCE_TYPES,
+                    V13_DENSE_QUERY_LIMIT=V13_DENSE_QUERY_LIMIT,
+                    _db_conn=_db_conn,
+                    _dedup_citations_by_snippet=_dedup_citations_by_snippet,
+                    _raw_rows_to_dense_candidates=_raw_rows_to_dense_candidates,
+                    _rrf_merge_candidates=_rrf_merge_candidates,
+                    _source_type_from_document_id=_source_type_from_document_id,
+                    _vector_literal=_vector_literal,
+                ),
+        'read_step_fallback_page_evidence': _retrieval_structured.V12ExpandPrimaryProcedureStepsRuntime(
+                    ASK_SNIPPET_CHARS=ASK_SNIPPET_CHARS,
+                    ASK_STRUCTURED_DIRECT_SCAN_LIMIT=ASK_STRUCTURED_DIRECT_SCAN_LIMIT,
+                    ASK_STRUCTURED_DIRECT_TEXT_CHARS=ASK_STRUCTURED_DIRECT_TEXT_CHARS,
+                    _db_conn=_db_conn,
+                    _db_fetch_related_step_pages=_db_fetch_related_step_pages,
+                    _safe_int=_safe_int,
+                    _v12_step_matches_procedure=_v12_step_matches_procedure,
+                    _v12_step_sort_key=_v12_step_sort_key,
+                    _v12_structured_rank=_v12_structured_rank,
+                ),
+        'read_neighbor_chunk_evidence': _retrieval_context_expansion.ExpandWithNeighborChunksRuntime(
+                    ASK_SNIPPET_CHARS=ASK_SNIPPET_CHARS,
+                    _db_conn=_db_conn,
+                    re=re,
+                ),
+        'read_enumeration_page_evidence': _retrieval_context_expansion.AssistantCoreExpandEnumerationSectionsRuntime(
+                    ASK_SNIPPET_CHARS=ASK_SNIPPET_CHARS,
+                    V13_PAGE_TEXT_CHARS=V13_PAGE_TEXT_CHARS,
+                    _db_conn=_db_conn,
+                    _dedup_citations_by_snippet=_dedup_citations_by_snippet,
+                    _is_structured_source_key=_is_structured_source_key,
+                    _safe_int=_safe_int,
+                    _source_type_from_document_id=_source_type_from_document_id,
+                ),
+        'read_assurance_neighbor_page_evidence': _retrieval_evidence_assurance.V13AssuranceFetchNeighborPagesRuntime(
+                    ASK_SNIPPET_CHARS=ASK_SNIPPET_CHARS,
+                    V13_PAGE_TEXT_CHARS=V13_PAGE_TEXT_CHARS,
+                    V13_RETRIEVAL_ASSURANCE_MAX_DOCS=V13_RETRIEVAL_ASSURANCE_MAX_DOCS,
+                    V13_RETRIEVAL_ASSURANCE_MAX_NEIGHBOR_PAGES=V13_RETRIEVAL_ASSURANCE_MAX_NEIGHBOR_PAGES,
+                    V13_RETRIEVAL_ASSURANCE_PAGE_RADIUS=V13_RETRIEVAL_ASSURANCE_PAGE_RADIUS,
+                    _ask_evidence_score_text=_ask_evidence_score_text,
+                    _db_conn=_db_conn,
+                    _dedup_citations_by_snippet=_dedup_citations_by_snippet,
+                    _is_structured_source_key=_is_structured_source_key,
+                    _safe_int=_safe_int,
+                    _source_type_from_document_id=_source_type_from_document_id,
+                    _v13_assurance_time_left=_v13_assurance_time_left,
+                    _v13_build_profile_from_plan=_v13_build_profile_from_plan,
+                ),
+        'read_assurance_parent_page_evidence': _retrieval_evidence_assurance.V13AssuranceExpandStructuredRelationsRuntime(
+                    ASK_SNIPPET_CHARS=ASK_SNIPPET_CHARS,
+                    ASK_STRUCTURED_DIRECT_TEXT_CHARS=ASK_STRUCTURED_DIRECT_TEXT_CHARS,
+                    V13_RETRIEVAL_ASSURANCE_MAX_CANDIDATES=V13_RETRIEVAL_ASSURANCE_MAX_CANDIDATES,
+                    _db_conn=_db_conn,
+                    _dedup_citations_preserve_order=_dedup_citations_preserve_order,
+                    _is_structured_source_key=_is_structured_source_key,
+                    _safe_int=_safe_int,
+                    _v12_evidence_role=_v12_evidence_role,
+                    _v12_expand_primary_procedure_steps=_v12_expand_primary_procedure_steps,
+                    _v12_step_matches_procedure=_v12_step_matches_procedure,
+                    _v12_structured_parent_values=_v12_structured_parent_values,
+                    _v13_assurance_time_left=_v13_assurance_time_left,
+                ),
+        'read_precision_page_evidence': _retrieval_precision_facts.PrecisionFactRuntime(
+            connect_db=_db_conn,
+            build_scope_where=_ask_evidence_scope_where,
+            fetch_file_map=_fetch_document_file_map,
+            company_general_machine_sentinel=COMPANY_GENERAL_MACHINE_SENTINEL,
+            page_text_chars=max(12000, int(V13_PAGE_TEXT_CHARS or 12000)),
+            page_scan_limit=max(80, min(900, int(V13_PAGE_SCAN_LIMIT or 500))),
+        ),
+    }
+
+
+def _assistant_core_production_readers(*, request, session, authorized, invoke):
+    """Compose real readers with an owned session and current application authority.
+
+    Full acquisition/selection activation stays OFF until B4m/B4n/B4o. This
+    factory cannot manufacture permission from a retrieval result or receipt.
+    Caller keeps ownership of the supplied session and invocation lifetime.
+    """
+    if type(authorized) is not _application_authority.AuthorizedCall:
+        raise _AuthorityError("AUTHORITY_CONFIGURATION_INVALID")
+    authorized.check(authorized.payload)
+    authority = _RequestAuthority(request=request, scope=authorized.scope,
+        principal=authorized.principal, provider=authorized.provider)
+    adapters = _ProductionReaderAdapters(request=request, session=session,
+        authorize=authority, invoke=invoke,
+        runtimes=_assistant_core_authority_reader_runtimes())
+    return authority, adapters
+
+
+def _assistant_core_authorized_ask_sync(payload, x_ai_internal_secret, *,
+        x_mm_app_authority, x_mm_principal_id, authority_environment):
+    """Protected request path; response cache disabled until the B4n gate."""
+    try:
+        authorized = _application_authority.authorize_http_request(payload,
+            service_secret=x_ai_internal_secret, application_secret=x_mm_app_authority,
+            principal_id=x_mm_principal_id, env=authority_environment,
+            resolve=_resolve_query_scope)
+        runtime = _dataclass_replace(_assistant_core_request_flow_runtime(),
+            _v13_cache_lookup=lambda **kwargs: None,
+            _v13_cache_store=lambda **kwargs: None)
+        def uncached(value, secret):
+            return _ask_request_flow.run_sync(value, secret,
+                requested_mode=MODE_ASK, runtime=runtime)
+        return _application_authority.protected_call(payload, x_ai_internal_secret,
+            authorized=authorized, delegate=uncached)
+    except _AuthorityError as exc:
+        return _application_authority.public_error(exc)
+
+
+@app.post("/v1/ai/ask/authorize")
+async def ask_authorize_v1(payload: AskRequest,
+    x_ai_internal_secret: Optional[str] = Header(default=None),
+    x_mm_app_authority: Optional[str] = Header(default=None),
+    x_mm_principal_id: Optional[str] = Header(default=None),
+    x_mm_authority_nonce: Optional[str] = Header(default=None)):
+    """Permanent production pre-quota/pre-cache request check for the Worker.
+
+    No model/retrieval/cache writes. Nonce binds the response to this invocation;
+    it is not an end-user credential and does not confer source authorization.
+    """
+    try:
+        if (not isinstance(x_mm_authority_nonce, str)
+                or not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", x_mm_authority_nonce)):
+            raise _AuthorityError("AUTHORITY_NONCE_INVALID", 400)
+        call = functools.partial(_application_authority.authorize_http_request,
+            payload, service_secret=x_ai_internal_secret,
+            application_secret=x_mm_app_authority, principal_id=x_mm_principal_id,
+            env=dict(os.environ), resolve=_resolve_query_scope)
+        authorized = await asyncio.to_thread(call)
+        return {**authorized.public_context(), "authority_nonce": x_mm_authority_nonce}
+    except _AuthorityError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.code) from None
+
+
 @app.post("/v1/ai/ask")
 async def ask_v1(
     payload: AskRequest,
     x_ai_internal_secret: Optional[str] = Header(default=None),
+    x_mm_app_authority: Optional[str] = Header(default=None),
+    x_mm_principal_id: Optional[str] = Header(default=None),
 ):
+    # Required mode branches BEFORE every legacy fallback or cache lookup.
+    # No silent fallback is allowed for missing configuration/principal.
+    authority_environment = dict(os.environ)
+    try:
+        authority_required = _application_authority.required(authority_environment)
+    except _AuthorityError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.code) from None
+    if authority_required:
+        if not (V13_ENABLED and V13_ASK_ENABLED and ASSISTANT_CORE_V2_ENABLED):
+            raise HTTPException(status_code=503, detail="AUTHORITY_CORE_REQUIRED")
+        sync_func = functools.partial(_assistant_core_authorized_ask_sync,
+            x_mm_app_authority=x_mm_app_authority, x_mm_principal_id=x_mm_principal_id,
+            authority_environment=authority_environment)
+        if not V13_STREAM_HEARTBEAT_ENABLED:
+            return await _assistant_core_json_with_hard_timeout(
+                mode=MODE_ASK, sync_func=sync_func, payload=payload,
+                x_ai_internal_secret=x_ai_internal_secret,
+                hard_timeout_seconds=ASSISTANT_CORE_HARD_TIMEOUT_SECONDS)
+        return await _v13_stream_json_response(mode="ask", sync_func=sync_func,
+            payload=payload, x_ai_internal_secret=x_ai_internal_secret,
+            hard_timeout_seconds=ASSISTANT_CORE_HARD_TIMEOUT_SECONDS)
     if not (V13_ENABLED and V13_ASK_ENABLED):
         return _ask_v1_baseline_impl(payload, x_ai_internal_secret)
     if not AI_INTERNAL_SECRET:
