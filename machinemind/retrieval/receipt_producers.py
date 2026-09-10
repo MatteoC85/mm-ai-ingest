@@ -941,3 +941,386 @@ def retrieve_initial_records(*, request: Any, session: AskEvidenceSession,
             journal.entries.clear(); journal.roots.clear(); dense_tokens.clear(); flags.clear()
 
     return invoke(work, request)
+
+
+OUTER_RETRIEVAL_LINEAGE_VERSION = "ask-neutral-refinement-lineage-p6b4k-v1"
+
+
+class _OuterRetrievalTrace(_PreparationTrace):
+    """Reuse the bounded B4i journal for ONE neutral/refinement operation.
+
+    This is not a second evidence session. Only explicit input handles and
+    creation-site events populate object identity; keys/scores never grant scope.
+    Collaborators are trusted; callbacks expire even when legacy catches errors.
+    """
+
+    def __init__(self, *, request, session, authorize, invoke, max_records, max_bytes):
+        self.request, self.session = request, session
+        self.authorize, self.invoke = authorize, invoke
+        allowed = invoke(authorize, request, request)
+        self.scope, limits = session.read_contract(request=request, current_allowed_sources=allowed)
+        super().__init__(limits=limits, max_records=max_records, max_bytes=max_bytes)
+        self.pending = {}
+        self.completed = None
+        self.bonus_done = False
+        self.initial_calls = 0
+        self.title_calls = 0
+
+    def call(self, fn, *args, **kwargs):
+        return self.run(self.invoke, fn, self.request, *args, **kwargs)
+
+    def current(self):
+        allowed = self.call(self.authorize, self.request)
+        self.session.read_contract(request=self.request, current_allowed_sources=allowed)
+        self.session.records(request=self.request, handles=tuple(self.roots), current_allowed_sources=allowed)
+        return allowed
+
+    def snapshot(self, value):
+        size = len(canonical_json(_Freezer(self.limits.legacy).freeze(value)).encode("utf-8"))
+        if size > self.max_bytes:
+            raise EvidenceProductionError("outer retrieval snapshot byte limit exceeded")
+        return deepcopy(value)
+
+    def readonly(self, fn):
+        def read(*args, **kwargs):
+            copies = [(v, self.snapshot(v)) for v in (*args, *kwargs.values())
+                      if type(v) in (dict, list, tuple)]
+            result = self.call(fn, *args, **kwargs)
+            if any(not _same_value(v, saved) for v, saved in copies):
+                raise EvidenceProductionError("read-only outer retrieval callback changed input")
+            return result
+        return lambda *a, **kw: self.run(read, *a, **kw)
+
+    def import_pack(self, result, selections):
+        allowed = self.current()
+        self.session.admission(request=self.request, retrieval=result, selections=selections,
+                               current_allowed_sources=allowed)
+        if (type(result) is not dict or type(selections) is not tuple
+                or len(selections) != 2 or {s.name for s in selections} != {"candidates", "citations"}
+                or any(s.container_kind != "list" for s in selections)):
+            raise EvidenceProductionError("explicit list candidate/citation selections required")
+        if sum(len(s.records) for s in selections) > self.limits.assembly.max_occurrences:
+            raise EvidenceProductionError("outer retrieval input occurrence limit exceeded")
+        supplied = self.snapshot(result)
+        # Reuse only an explicitly selected HANDLE, never a content/ID match.
+        objects = {}
+        for selection in selections:
+            values = self.session.records(request=self.request, handles=selection.records,
+                                          current_allowed_sources=allowed)
+            items = []
+            for handle, value in zip(selection.records, values):
+                if handle not in objects:
+                    objects[handle] = self.materialize((handle,), (value,))[0]
+                items.append(objects[handle])
+            supplied[selection.name] = items
+        return supplied
+
+    def selectors(self, kwargs):
+        expected = {**self.scope.sql_selectors(), "ai_scope": self.scope.ai_scope}
+        if any(k not in kwargs or not _same_value(kwargs[k], v) for k, v in expected.items()):
+            raise EvidenceProductionError("outer source adapter scope selectors differ")
+        if "response_language" in kwargs and kwargs["response_language"] != self.request.response_language:
+            raise EvidenceProductionError("outer initial response language differs")
+
+    def initial(self, adapter, **kwargs):
+        def read():
+            self.current()
+            self.selectors(kwargs)
+            if not callable(adapter):
+                raise EvidenceProductionError("required initial retrieval adapter missing")
+            self.initial_calls += 1
+            pair = self.readonly(adapter)(**kwargs)
+            if type(pair) is not tuple or len(pair) != 2:
+                raise EvidenceProductionError("initial adapter must return retrieval and selections")
+            return self.import_pack(*pair)
+        return self.run(read)
+
+    def titles(self, adapter, **kwargs):
+        def read():
+            self.current()
+            self.selectors(kwargs)
+            if not callable(adapter):
+                raise EvidenceProductionError("required title receipt adapter missing")
+            self.title_calls += 1
+            hs = self.readonly(adapter)(**kwargs)
+            if (type(hs) is not tuple or len(hs) > self.limits.assembly.max_occurrences
+                    or any(type(h) is not RecordHandle for h in hs)):
+                raise EvidenceProductionError("title adapter requires bounded explicit handles")
+            allowed = self.current()
+            values = self.session.records(request=self.request, handles=hs, current_allowed_sources=allowed)
+            return self.materialize(hs, values)
+        return self.run(read)
+
+    def operator(self, fn, groups, *args, same_locator=False, **kwargs):
+        def operation(*a, **kw):
+            emit = kw["lineage"]
+            def traced(positions):
+                if type(positions) is not tuple:
+                    raise EvidenceProductionError("explicit outer operator positions required")
+                for parents in positions:
+                    if (type(parents) is not tuple or not parents
+                            or any(type(p) is not tuple or len(p) != 2
+                                or type(p[0]) is not int or type(p[1]) is not int
+                                or not 0 <= p[0] < len(groups)
+                                or not 0 <= p[1] < len(groups[p[0]]) for p in parents)):
+                        raise EvidenceProductionError("invalid outer operator position")
+                    if same_locator:
+                        locations = []
+                        for group, index in parents:
+                            item = self.entry(groups[group][index])
+                            context = self.roots[item[2][0]].context
+                            locations.append(adapt_candidate(item[1], context=context,
+                                limits=self.limits.adapter).entry.evidence.locator)
+                        if any(loc != locations[0] for loc in locations[1:]):
+                            raise EvidenceProductionError("outer merge combines different locators")
+                emit(positions)
+            kw["lineage"] = traced
+            return self.call(fn, *a, **kw)
+        return self.run(self.traced, operation, groups, *args, **kwargs)
+
+    def mutation_before(self, tag, values):
+        if tag in self.pending or type(values) is not tuple:
+            raise EvidenceProductionError("duplicate or invalid mutation boundary")
+        self.pending[tag] = tuple(self.entry(v) for v in values)
+
+    def mutation_after(self, tag, values, allowed_fields):
+        if tag not in self.pending or type(values) is not tuple:
+            raise EvidenceProductionError("mutation without input boundary")
+        entries = self.pending.pop(tag)
+        if len(entries) != len(values):
+            raise EvidenceProductionError("mutation occurrence count changed")
+        for item, record in zip(entries, values):
+            if record is not item[0] or not allowed_fields.issubset(record):
+                raise EvidenceProductionError("mutation lost its exact occurrence or fields")
+            expected = dict(item[1])
+            for key in record:
+                if key in allowed_fields:
+                    expected[key] = record[key]
+            if not _same_value(record, expected):
+                raise EvidenceProductionError("mutation changed unrecorded evidence fields")
+            del self.entries[id(record)]
+            self.bytes -= len(canonical_json(_Freezer(self.limits.legacy).freeze(item[1])).encode("utf-8"))
+            self.add(record, item[2])
+
+    def event(self, stage, *args):
+        def accept():
+            if self.completed is not None:
+                raise EvidenceProductionError("event after outer retrieval completion")
+            if stage == "copy":
+                source, value = args
+                entry = self.entry(source)
+                if not _same_value(source, value):
+                    raise EvidenceProductionError("outer copy changed input")
+                self.add(value, entry[2])
+                return value
+            if stage == "annotation_before":
+                source, value = args
+                self.event("copy", source, value)
+                self.mutation_before(("annotation", id(value)), (value,))
+            elif stage == "annotation_after":
+                value, = args
+                self.mutation_after(("annotation", id(value)), (value,), frozenset({
+                    "assistant_core_facet_hits", "assistant_core_facet_answer_types",
+                    "assistant_core_facet_preferred_source_types", "assistant_core_facet_must_cover",
+                    "assistant_core_facet_retrieval_score", "assistant_core_facet_score_map",
+                    "assistant_core_facet_support"}))
+            elif stage == "facet_merge":
+                source, value, contributors = args
+                entry = self.entry(source)
+                if type(contributors) is not tuple:
+                    raise EvidenceProductionError("explicit facet annotation contributors required")
+                parents = list(entry[2])
+                for origin in contributors:
+                    parents.extend(self.entry(origin)[2])
+                    if len(parents) > self.limits.assembly.max_occurrences:
+                        raise EvidenceProductionError("too many facet annotation origins")
+                self.add(value, tuple(parents))
+            elif stage == "bonus_before":
+                values, = args
+                if self.bonus_done:
+                    raise EvidenceProductionError("repeated bonus phase")
+                self.mutation_before("bonus", values)
+            elif stage == "bonus_after":
+                values, = args
+                self.mutation_after("bonus", values, frozenset({
+                    "assistant_core_facet_retrieval_bonus", "v13_score", "retrieval_score"}))
+                self.bonus_done = True
+            elif stage in {"complete", "unchanged"}:
+                candidates, citations = args
+                if (self.pending or type(candidates) is not tuple or type(citations) is not tuple
+                        or len(candidates) + len(citations) > self.limits.assembly.max_occurrences):
+                    raise EvidenceProductionError("incomplete or oversized outer retrieval trace")
+                for value in candidates + citations:
+                    self.entry(value)
+                self.completed = (stage, candidates, citations)
+            else:
+                raise EvidenceProductionError("unknown outer retrieval lineage event")
+        return self.run(accept)
+
+    def finish(self, result, *, preserve=None):
+        self.check()
+        if self.completed is None or self.pending or type(result) is not dict:
+            raise EvidenceProductionError("outer retrieval did not close its trace")
+        for name, expected in zip(("candidates", "citations"), self.completed[1:]):
+            values = result.get(name)
+            if (type(values) is not list or len(values) != len(expected)
+                    or any(v is not e for v, e in zip(values, expected))):
+                raise EvidenceProductionError("outer output differs from exact traced selection")
+        for entry in self.entries.values():
+            self.entry(entry[0])
+        allowed = self.current()  # Includes inputs no longer selected.
+        candidates, citations = self.completed[1:]
+        positions = {}
+        for index, value in enumerate(candidates):
+            positions.setdefault(id(value), []).append(index)
+        citation_positions = []
+        for value in citations:
+            slots = positions.get(id(value), [])
+            if not slots:
+                raise EvidenceProductionError("citation is not a selected candidate occurrence")
+            citation_positions.append(slots.pop(0))
+        if preserve is not None:
+            self.session.admission(request=self.request, retrieval=result, selections=preserve,
+                                   current_allowed_sources=allowed)
+            return result, preserve
+        views = tuple((self.entry(value)[2], deepcopy(value)) for value in candidates)
+        out = self.session.derive_batch(request=self.request, views=views,
+            operation=OUTER_RETRIEVAL_LINEAGE_VERSION, current_allowed_sources=allowed)
+        return result, (AskSelection("candidates", out),
+                        AskSelection("citations", tuple(out[index] for index in citation_positions)))
+
+    def dispose(self):
+        self.active = False
+        self.entries.clear(); self.roots.clear(); self.pending.clear(); self.completed = None
+
+
+def retrieve_neutral_records(*, request: Any, session: AskEvidenceSession,
+        runtime: orchestration.AssistantCoreRetrieveNeutralRuntime,
+        title_runtime: ranking.V13MergeSourceTitleCandidatesRuntime,
+        initial_adapter: Callable[..., Any], title_adapter: Callable[..., tuple[RecordHandle, ...]],
+        authorize: Callable[[Any], frozenset[SourceIdentity]], invoke: Callable[..., Any],
+        max_trace_records: int, max_trace_bytes: int) -> tuple[dict, tuple[AskSelection, ...]]:
+    """Execute the existing neutral ASK wrapper with explicit initial/title origins.
+
+    initial_adapter(**legacy_kwargs) must call the bound B4j producer (or an
+    equivalent explicit producer) and return (retrieval, AskSelection tuple).
+    title_adapter returns authentic session handles, never rows/IDs as grants.
+    title_runtime binds the existing title merge's collaborators; merge/scoring
+    must forward lineage. Policies/model/SQL calls are those of the supplied P4
+    implementations, not added by this helper. Authority I/O remains measurable.
+
+    No production main wiring, page conversion or current authority is inferred.
+    This is ASK-owned neutral acquisition, not RC/Smart migration. Noncollection
+    metadata remains metadata, not authorized answer text. See refine_records
+    for operation lifetime, rollback and limits shared by these producers.
+    """
+    _callbacks(session, authorize, invoke)
+    def work():
+        if (getattr(request, "requested_mode", None) != "ask"
+                or type(runtime) is not orchestration.AssistantCoreRetrieveNeutralRuntime
+                or type(title_runtime) is not ranking.V13MergeSourceTitleCandidatesRuntime):
+            raise EvidenceProductionError("ASK neutral runtime and title runtime required")
+        trace = _OuterRetrievalTrace(request=request, session=session, authorize=authorize,
+            invoke=invoke, max_records=max_trace_records, max_bytes=max_trace_bytes)
+        try:
+            for cap in (title_runtime.V13_MAX_EVIDENCE_ITEMS_ASK,
+                        title_runtime.V13_SOURCE_RETRIEVAL_MAX_CANDIDATES):
+                if type(cap) is not int or not 1 <= cap <= trace.limits.assembly.max_occurrences:
+                    raise EvidenceProductionError("bounded title retrieval capacities required")
+            title_bound = replace(title_runtime,
+                _v13_merge_candidates=lambda groups: trace.operator(
+                    title_runtime._v13_merge_candidates, groups, groups, same_locator=True),
+                _v13_score_candidates=lambda q, values: trace.operator(
+                    title_runtime._v13_score_candidates, [values], q, values),
+                _v13_evidence_metrics=trace.readonly(title_runtime._v13_evidence_metrics))
+            bound = replace(runtime,
+                _assistant_core_retrieval_query=trace.readonly(runtime._assistant_core_retrieval_query),
+                _assistant_core_scope_value=trace.readonly(runtime._assistant_core_scope_value),
+                _v13_fallback_plan=trace.readonly(runtime._v13_fallback_plan),
+                _v13_initial_retrieval=lambda **kw: trace.initial(initial_adapter, **kw),
+                _v13_fetch_structured_title_candidates=lambda **kw: trace.titles(title_adapter, **kw),
+                _v13_merge_source_title_candidates=lambda q, pack, titles: trace.run(
+                    ranking.v13_merge_source_title_candidates, q, pack, titles, runtime=title_bound))
+            result = trace.call(orchestration.assistant_core_retrieve_neutral,
+                                request, runtime=bound, lineage=trace.event)
+            if trace.initial_calls != 1 or trace.title_calls != 1:
+                raise EvidenceProductionError("neutral acquisition trace incomplete")
+            return trace.finish(result)
+        finally:
+            trace.dispose()
+    return invoke(work, request)
+
+
+def refine_records(*, request: Any, session: AskEvidenceSession, retrieval: dict,
+        selections: tuple[AskSelection, ...], decision: Any,
+        runtime: orchestration.AssistantCoreRefineRetrievalRuntime,
+        facet_runtime: ranking.AssistantCoreMergeFacetCandidatesRuntime,
+        initial_adapter: Callable[..., Any],
+        authorize: Callable[[Any], frozenset[SourceIdentity]], invoke: Callable[..., Any],
+        max_trace_records: int, max_trace_bytes: int) -> tuple[dict, tuple[AskSelection, ...]]:
+    """Execute the existing whole ASK refinement: combined or bounded facet runs.
+
+    Same original budget checks, plans, facet confidence/bonus/order and caps;
+    no new keywords, thresholds, planner/model/embedding or SQL. Confidence and
+    metrics are read-only collaborators, not an authorization authority. Copies,
+    annotations, merges and bonus changes report origins at their creation site.
+    Semantic facet annotations are derived views, never observed measurements.
+
+    initial_adapter follows retrieve_neutral_records's explicit output contract.
+    Reached missing adapters and evidence errors are latched despite P4's broad
+    facet catch. Scope and all consumed handles are rechecked with CURRENT grants.
+    Only terminal views are committed in one atomic derive_batch; receipts and
+    views produced by earlier nested calls survive a later failure. The caller
+    owns/closes the SAME session, including on error. Local callbacks then expire.
+
+    Limits bound serialized snapshots, not heap/tokens/cost; request input must
+    be bounded upstream. No hidden callback reads, live ACL adapter installation,
+    main activation, direct/final rescue, cache or link/semantic certification.
+    Trusted collaborators, no concurrent/reentrant use of this journal or hostile
+    Python sandbox and no atomic external revocation during model execution.
+    """
+    _callbacks(session, authorize, invoke)
+    def work():
+        if (getattr(request, "requested_mode", None) != "ask"
+                or getattr(decision, "effective_mode", None) != "ask"
+                or type(runtime) is not orchestration.AssistantCoreRefineRetrievalRuntime
+                or type(facet_runtime) is not ranking.AssistantCoreMergeFacetCandidatesRuntime):
+            raise EvidenceProductionError("ASK/ASK refinement and facet runtimes required")
+        trace = _OuterRetrievalTrace(request=request, session=session, authorize=authorize,
+            invoke=invoke, max_records=max_trace_records, max_bytes=max_trace_bytes)
+        try:
+            for cap in (runtime.ASSISTANT_CORE_MAX_FACETS, runtime.V13_DENSE_QUERY_LIMIT,
+                        runtime.V13_LEXICAL_QUERY_LIMIT, runtime.V13_MAX_EVIDENCE_ITEMS_ASK,
+                        runtime.V13_MAX_EVIDENCE_ITEMS_ROOT_CAUSE):
+                if type(cap) is not int or not 1 <= cap <= trace.limits.assembly.max_occurrences:
+                    raise EvidenceProductionError("bounded refinement capacities required")
+            supplied = trace.import_pack(retrieval, selections)
+            facet_bound = replace(facet_runtime,
+                _assistant_core_candidate_stable_key=trace.readonly(facet_runtime._assistant_core_candidate_stable_key),
+                _dedup_text_values=trace.readonly(facet_runtime._dedup_text_values),
+                _v13_merge_candidates=lambda groups: trace.operator(
+                    facet_runtime._v13_merge_candidates, groups, groups, same_locator=True))
+            names = ("_assistant_core_retrieval_query", "_assistant_core_scope_value",
+                     "_v13_current_budget", "_v13_fallback_plan", "_dedup_text_values",
+                     "_assistant_core_facet_candidate_confidence", "_assistant_core_candidate_source_type",
+                     "_v13_evidence_metrics")
+            bound = replace(runtime, **{n: trace.readonly(getattr(runtime, n)) for n in names},
+                _v13_initial_retrieval=lambda **kw: trace.initial(initial_adapter, **kw),
+                _v13_score_candidates=lambda q, values: trace.operator(
+                    runtime._v13_score_candidates, [values], q, values),
+                _assistant_core_merge_facet_candidates=lambda groups: trace.run(
+                    ranking.assistant_core_merge_facet_candidates, groups,
+                    runtime=facet_bound, lineage=trace.event))
+            result = trace.call(orchestration.assistant_core_refine_retrieval,
+                                request, supplied, decision, runtime=bound, lineage=trace.event)
+            if trace.completed is None:
+                raise EvidenceProductionError("refinement completion missing")
+            if trace.completed[0] == "unchanged":
+                if result is not supplied or trace.initial_calls or trace.bonus_done:
+                    raise EvidenceProductionError("unchanged refinement altered its path")
+            elif not trace.bonus_done:
+                raise EvidenceProductionError("refinement bonus phase incomplete")
+            return trace.finish(result, preserve=selections if trace.completed[0] == "unchanged" else None)
+        finally:
+            trace.dispose()
+    return invoke(work, request)

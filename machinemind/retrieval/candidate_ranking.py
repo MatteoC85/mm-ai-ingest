@@ -952,13 +952,15 @@ class AssistantCoreMergeFacetCandidatesRuntime:
     _v13_merge_candidates: Callable[..., Any]
 
 
-def assistant_core_merge_facet_candidates(candidate_lists: list[list[dict]], *, runtime: AssistantCoreMergeFacetCandidatesRuntime) -> list[dict]:
+def assistant_core_merge_facet_candidates(candidate_lists: list[list[dict]], *, runtime: AssistantCoreMergeFacetCandidatesRuntime, lineage: Optional[Callable[..., Any]]=None) -> list[dict]:
     """Merge candidates while preserving all facet annotations across searches."""
     _assistant_core_candidate_stable_key = runtime._assistant_core_candidate_stable_key
     _dedup_text_values = runtime._dedup_text_values
     _v13_merge_candidates = runtime._v13_merge_candidates
     merged = _v13_merge_candidates(candidate_lists)
     annotations: dict[str, dict] = {}
+    if lineage is not None:
+        _lineage_annotation_inputs = {}
     for candidates in candidate_lists or []:
         for raw in candidates or []:
             if not isinstance(raw, dict):
@@ -977,6 +979,8 @@ def assistant_core_merge_facet_candidates(candidate_lists: list[list[dict]], *, 
                     "score_map": {},
                 },
             )
+            if lineage is not None:
+                _lineage_annotation_inputs.setdefault(id(item), (item, []))[1].append(raw)
             item["facets"].extend(raw.get("assistant_core_facet_hits") or [])
             item["types"].extend(raw.get("assistant_core_facet_answer_types") or [])
             item["preferred"].extend(raw.get("assistant_core_facet_preferred_source_types") or [])
@@ -1003,6 +1007,8 @@ def assistant_core_merge_facet_candidates(candidate_lists: list[list[dict]], *, 
         c["assistant_core_facet_must_cover"] = _dedup_text_values(item.get("must_cover") or [], limit=12)
         c["assistant_core_facet_retrieval_score"] = float(item.get("score") or 0.0)
         c["assistant_core_facet_score_map"] = dict(item.get("score_map") or {})
+        if lineage is not None:
+            lineage("facet_merge", raw, c, tuple(_lineage_annotation_inputs.get(id(item), (None, ()))[1]))
         out.append(c)
     return out
 

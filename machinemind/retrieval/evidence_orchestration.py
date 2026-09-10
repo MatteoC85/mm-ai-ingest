@@ -550,7 +550,7 @@ class AssistantCoreRetrieveNeutralRuntime:
     _v13_merge_source_title_candidates: Callable[..., Any]
 
 
-def assistant_core_retrieve_neutral(request: AssistantCoreRequest, *, runtime: AssistantCoreRetrieveNeutralRuntime) -> dict:
+def assistant_core_retrieve_neutral(request: AssistantCoreRequest, *, runtime: AssistantCoreRetrieveNeutralRuntime, lineage: Optional[Callable[..., Any]]=None) -> dict:
     MODE_ROOT_CAUSE = runtime.MODE_ROOT_CAUSE
     _assistant_core_retrieval_query = runtime._assistant_core_retrieval_query
     _assistant_core_scope_value = runtime._assistant_core_scope_value
@@ -606,6 +606,8 @@ def assistant_core_retrieve_neutral(request: AssistantCoreRequest, *, runtime: A
             **dict(retrieval or {}),
             "assistant_core_discovery_query_state": profile.public_summary(),
         }
+    if lineage is not None:
+        lineage("complete", tuple(retrieval.get("candidates") or []), tuple(retrieval.get("citations") or []))
     return retrieval
 
 
@@ -629,7 +631,7 @@ class AssistantCoreRefineRetrievalRuntime:
     _v13_score_candidates: Callable[..., Any]
 
 
-def assistant_core_refine_retrieval(request: AssistantCoreRequest, retrieval: dict, decision: AssistantCoreDecision, *, runtime: AssistantCoreRefineRetrievalRuntime) -> dict:
+def assistant_core_refine_retrieval(request: AssistantCoreRequest, retrieval: dict, decision: AssistantCoreDecision, *, runtime: AssistantCoreRefineRetrievalRuntime, lineage: Optional[Callable[..., Any]]=None) -> dict:
     ASSISTANT_CORE_MAX_FACETS = runtime.ASSISTANT_CORE_MAX_FACETS
     V13_DENSE_QUERY_LIMIT = runtime.V13_DENSE_QUERY_LIMIT
     V13_LEXICAL_QUERY_LIMIT = runtime.V13_LEXICAL_QUERY_LIMIT
@@ -649,6 +651,8 @@ def assistant_core_refine_retrieval(request: AssistantCoreRequest, retrieval: di
     retrieval_query = _assistant_core_retrieval_query(request)
     budget = _v13_current_budget()
     if budget is not None and budget.remaining() < 18.0:
+        if lineage is not None:
+            lineage("unchanged", tuple(retrieval.get("candidates") or []), tuple(retrieval.get("citations") or []))
         return retrieval
     if not (
         decision.dense_queries
@@ -657,6 +661,8 @@ def assistant_core_refine_retrieval(request: AssistantCoreRequest, retrieval: di
         or decision.required_facets
         or decision.facet_queries
     ):
+        if lineage is not None:
+            lineage("unchanged", tuple(retrieval.get("candidates") or []), tuple(retrieval.get("citations") or []))
         return retrieval
 
     doc_ids = _assistant_core_scope_value(request, "document_ids")
@@ -715,11 +721,13 @@ def assistant_core_refine_retrieval(request: AssistantCoreRequest, retrieval: di
                 )
                 current_candidates = _v13_score_candidates(
                     query_for_search,
-                    [dict(c) for c in (current.get("candidates") or []) if isinstance(c, dict)],
+                    [(dict(c) if lineage is None else lineage("copy", c, dict(c))) for c in (current.get("candidates") or []) if isinstance(c, dict)],
                 )
                 annotated: list[dict] = []
                 for rank, raw in enumerate(current_candidates, start=1):
                     c = dict(raw)
+                    if lineage is not None:
+                        lineage("annotation_before", raw, c)
                     support = _assistant_core_facet_candidate_confidence(
                         candidate=c,
                         facet=facet,
@@ -741,6 +749,8 @@ def assistant_core_refine_retrieval(request: AssistantCoreRequest, retrieval: di
                     c["assistant_core_facet_retrieval_score"] = facet_score
                     c["assistant_core_facet_score_map"] = {facet: facet_score}
                     c["assistant_core_facet_support"] = dict(support)
+                    if lineage is not None:
+                        lineage("annotation_after", c)
                     annotated.append(c)
                 candidate_lists.append(annotated)
                 facet_runs.append(
@@ -803,6 +813,8 @@ def assistant_core_refine_retrieval(request: AssistantCoreRequest, retrieval: di
 
     merged = _assistant_core_merge_facet_candidates(candidate_lists)
     merged = _v13_score_candidates(retrieval_query, merged)
+    if lineage is not None:
+        lineage("bonus_before", tuple(merged))
     for c in merged:
         source_type = _assistant_core_candidate_source_type(c)
         preferred_for_facets = {
@@ -821,6 +833,8 @@ def assistant_core_refine_retrieval(request: AssistantCoreRequest, retrieval: di
         c["retrieval_score"] = max(
             float(c.get("retrieval_score") or 0.0), float(c.get("v13_score") or 0.0)
         )
+    if lineage is not None:
+        lineage("bonus_after", tuple(merged))
     merged.sort(
         key=lambda c: (
             -len(c.get("assistant_core_facet_must_cover") or []),
@@ -848,6 +862,8 @@ def assistant_core_refine_retrieval(request: AssistantCoreRequest, retrieval: di
             for item in decision.facet_queries
         ],
     }
+    if lineage is not None:
+        lineage("complete", tuple(merged), tuple(merged[: max(16, V13_MAX_EVIDENCE_ITEMS_ASK, V13_MAX_EVIDENCE_ITEMS_ROOT_CAUSE)]))
     return {
         **dict(retrieval or {}),
         "plan": plan,
