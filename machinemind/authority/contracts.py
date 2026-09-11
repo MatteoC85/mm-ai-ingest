@@ -1,11 +1,12 @@
 """Application authority contracts, independent of retrieval and model output.
 
-A service credential is NOT a user's identity. ``authenticate_application``
-accepts a principal assertion only across a *dedicated* server-only boundary.
-Bubble must obtain that assertion from its authenticated backend Current User,
-never from an event parameter/browser state. User role and Company are then read
-again from the application directory. Provisioning this boundary is a release
-prerequisite; the already exposed AI_INTERNAL_SECRET cannot substitute for it.
+``AI_INTERNAL_SECRET`` authenticates the service call; it is not sufficient to
+prove that a Bubble application workflow already authorized the requested
+Company/Machine/scope. ``ApplicationBoundary`` therefore verifies a separate
+server-only application credential. Bubble must attach that credential only
+from its backend bridge after checking ``Current User`` and the requested
+context. The backend then re-validates Company/Machine/source ownership; it does
+not call back into Bubble to re-read the user's role on every ASK.
 """
 from __future__ import annotations
 
@@ -37,39 +38,32 @@ def identifier(value: object, *, optional: bool = False) -> str | None:
 
 
 @dataclass(frozen=True, slots=True, repr=False)
-class ApplicationPrincipal:
-    """Trusted in-process assertion. Not a JSON credential or Python sandbox."""
-    user_id: str
-    audience: str
+class ApplicationGrant:
+    """Trusted in-process proof that the server application boundary passed."""
     _issuer: object = field(repr=False, compare=False)
 
 
 class ApplicationBoundary:
     """One configured server boundary; no HTTP, env mutation, or authority cache."""
-    def __init__(self, *, secret: str, legacy_secret: str, audience: str):
+    def __init__(self, *, secret: str, legacy_secret: str):
         # Require an independently provisioned key, not re-use of an exposed key.
         if (type(secret) is not str or len(secret) < 32 or len(secret) > 256
                 or any(not 33 <= ord(c) <= 126 for c in secret)
                 or not legacy_secret or secret == legacy_secret):
             raise AuthorityError("AUTHORITY_CONFIGURATION_INVALID")
         self._secret = secret
-        self._audience = identifier(audience)
         self._issuer = object()
 
-    def authenticate(self, *, supplied_secret: object, user_id: object) -> ApplicationPrincipal:
+    def authenticate(self, *, supplied_secret: object) -> ApplicationGrant:
         if (type(supplied_secret) is not str or len(supplied_secret) > 256
                 or not supplied_secret.isascii()
                 or not hmac.compare_digest(self._secret, supplied_secret)):
             raise AuthorityError("AUTH_REQUIRED", 401)
-        uid = identifier(user_id)
-        return ApplicationPrincipal(uid, self._audience, self._issuer)
+        return ApplicationGrant(self._issuer)
 
-    def require(self, principal: ApplicationPrincipal) -> None:
-        if (type(principal) is not ApplicationPrincipal
-                or principal._issuer is not self._issuer
-                or principal.audience != self._audience):
+    def require(self, grant: ApplicationGrant) -> None:
+        if type(grant) is not ApplicationGrant or grant._issuer is not self._issuer:
             raise AuthorityError("AUTH_REQUIRED", 401)
-        identifier(principal.user_id)
 
     def __repr__(self) -> str:
         return "ApplicationBoundary(<server-only>)"

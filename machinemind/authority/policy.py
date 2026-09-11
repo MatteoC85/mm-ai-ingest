@@ -1,9 +1,10 @@
-"""MachineMind's confirmed Company/Superadmin policy over fresh Bubble records.
+"""MachineMind source/scope authority behind the trusted Bubble bridge.
 
-The application directory, NOT an index row, candidate, receipt, URL, title,
-model decision or cache entry, supplies grants. All users of a Company have its
-sources; Superadmin may choose another Company. Step ownership is inherited
-from its live Procedure relation. No User/Company record is ever modified.
+The trusted Bubble backend bridge authorizes the end-user context. The
+application directory, NOT an index row, candidate, receipt, URL, title, model
+decision or cache entry, then proves current Company/Machine/source ownership.
+Step ownership is inherited from its live Procedure relation. No application
+record is ever modified.
 
 Every current_sources call re-reads authority; there is no permission cache.
 Remote reads are not an atomic cross-service snapshot. The caller brackets
@@ -15,8 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from .contracts import ApplicationBoundary, ApplicationPrincipal, AuthorityError, identifier
-from .principal_reader import BubblePrincipalReader, PrincipalSnapshot
+from .contracts import ApplicationBoundary, ApplicationGrant, AuthorityError, identifier
 from ..evidence.contracts import SourceIdentity, SourceType, SourceScope, SourceFormat, ScopeLevel
 from ..evidence.ask_input import ask_request_key
 from ..retrieval.chunk_evidence import ChunkReadScope
@@ -59,12 +59,8 @@ class SourceSchema:
 
 @dataclass(frozen=True, slots=True)
 class BubbleSchema:
-    user_type: str
     company_type: str
     machine_type: str
-    user_company_field: str
-    user_role_field: str
-    superadmin_value: str
     machine_company_field: str
     sources: tuple[SourceSchema, ...]
     # This is an explicit deployment choice about unset booleans, not a fallback
@@ -72,8 +68,7 @@ class BubbleSchema:
     deleted_false_or_blank: bool = False
 
     def __post_init__(self):
-        for n in ("user_type", "company_type", "machine_type", "user_company_field", "user_role_field",
-                  "superadmin_value", "machine_company_field"):
+        for n in ("company_type", "machine_type", "machine_company_field"):
             identifier(getattr(self, n))
         if (type(self.sources) is not tuple or len(self.sources) != len(SourceType)
                 or any(type(s) is not SourceSchema for s in self.sources)
@@ -106,50 +101,34 @@ def _ref(row: dict, field: str, *, optional: bool = False) -> str | None:
 
 
 class BubbleAuthority:
-    """Concrete application policy; directory offers only get/search reads."""
-    def __init__(self, *, directory: Any, schema: BubbleSchema, boundary: ApplicationBoundary,
-                 principal_reader: BubblePrincipalReader | None = None):
+    """Concrete source/scope policy behind the trusted Bubble application bridge.
+
+    End-user membership/role is authorized by Bubble before the server-only
+    application credential is attached. This provider deliberately does not
+    re-read User records. It independently proves that the requested Company
+    exists, that a machine (when present) belongs to that Company, and that
+    every consumable source is currently owned by the authorized scope.
+    """
+    def __init__(self, *, directory: Any, schema: BubbleSchema, boundary: ApplicationBoundary):
         if (type(schema) is not BubbleSchema or type(boundary) is not ApplicationBoundary
                 or not callable(getattr(directory, "get", None)) or not callable(getattr(directory, "search", None))):
             raise AuthorityError("AUTHORITY_CONFIGURATION_INVALID")
-        if principal_reader is not None and (type(principal_reader) is not BubblePrincipalReader
-                or principal_reader.meter is not directory.meter):
-            raise AuthorityError("AUTHORITY_CONFIGURATION_INVALID")
         self.directory, self.schema, self.boundary = directory, schema, boundary
-        self.principal_reader = principal_reader
 
-    def authorize_scope(self, principal: ApplicationPrincipal, scope: ChunkReadScope) -> tuple[str | None, str | None]:
-        self.boundary.require(principal)
+    def authorize_scope(self, grant: ApplicationGrant, scope: ChunkReadScope) -> tuple[str, str | None]:
+        self.boundary.require(grant)
         if type(scope) is not ChunkReadScope:
             raise AuthorityError("AUTHORITY_SCOPE_INVALID", 400)
         s = self.schema
-        if self.principal_reader is None:
-            # Explicit compatibility construction for existing direct callers.
-            # Production HTTP composition ALWAYS supplies the workflow reader;
-            # a workflow error never falls back into this branch.
-            user = _row(self.directory.get(s.user_type, principal.user_id), principal.user_id)
-            company = _ref(user, s.user_company_field, optional=True)
-            role = _ref(user, s.user_role_field, optional=True)
-        else:
-            snapshot = self.principal_reader.read(principal.user_id)
-            if snapshot is None:
-                raise AuthorityError("SCOPE_DENIED", 403)
-            if type(snapshot) is not PrincipalSnapshot or snapshot.user_id != principal.user_id:
-                raise AuthorityError("AUTHORITY_RESPONSE_INVALID")
-            company = snapshot.company_id
-            # The workflow compares the real Option Set. No wire spelling or
-            # case guess about a serialized Bubble role is used for permission.
-            role = s.superadmin_value if snapshot.is_superadmin else None
-        if role != s.superadmin_value and company != scope.company_id:
-            raise AuthorityError("SCOPE_DENIED", 403)
         _row(self.directory.get(s.company_type, scope.company_id), scope.company_id)
-        if scope.machine_id not in (None, _GENERAL):
-            machine = _row(self.directory.get(s.machine_type, scope.machine_id), scope.machine_id)
+        machine_id = scope.machine_id
+        if machine_id not in (None, _GENERAL):
+            machine = _row(self.directory.get(s.machine_type, machine_id), machine_id)
             if _ref(machine, s.machine_company_field) != scope.company_id:
                 raise AuthorityError("CONTEXT_MISMATCH", 403)
         elif scope.ai_scope == "machine_all":
             raise AuthorityError("SCOPE_DENIED", 403)
-        return company, role
+        return scope.company_id, machine_id
 
     def _active(self, row: dict, spec: SourceSchema) -> bool:
         if spec.lifecycle == "record_exists":
@@ -190,8 +169,8 @@ class BubbleAuthority:
             spec.source_type, uid,
             SourceFormat.UNKNOWN if spec.source_type == SourceType.DOCUMENT else SourceFormat.STRUCTURED)
 
-    def current_sources(self, principal: ApplicationPrincipal, scope: ChunkReadScope) -> frozenset[SourceIdentity]:
-        before = self.authorize_scope(principal, scope)
+    def current_sources(self, grant: ApplicationGrant, scope: ChunkReadScope) -> frozenset[SourceIdentity]:
+        before = self.authorize_scope(grant, scope)
         result, parents = set(), {}
         seen = set()
         max_records = self.directory.meter.limits.max_records
@@ -257,7 +236,7 @@ class BubbleAuthority:
             machines.add(row["_id"])
         result = {source for source in result if source.scope.machine_id is None
                   or source.scope.machine_id in machines}
-        if self.authorize_scope(principal, scope) != before:
+        if self.authorize_scope(grant, scope) != before:
             raise AuthorityError("AUTHORITY_CHANGED", 403)
         return frozenset(result)
 
@@ -270,14 +249,14 @@ class RequestAuthority:
     No second EvidenceSession, Core or global ContextVar is introduced.
     """
     def __init__(self, *, request: Any, scope: ChunkReadScope,
-                 principal: ApplicationPrincipal, provider: BubbleAuthority):
+                 grant: ApplicationGrant, provider: BubbleAuthority):
         if type(provider) is not BubbleAuthority:
             raise AuthorityError("AUTHORITY_CONFIGURATION_INVALID")
-        self._request, self._scope, self._principal, self._provider = request, scope, principal, provider
+        self._request, self._scope, self._grant, self._provider = request, scope, grant, provider
         self._key = ask_request_key(request)
         self._active, self._fault = True, None
         self._check(request)
-        provider.authorize_scope(principal, scope)
+        provider.authorize_scope(grant, scope)
 
     def _check(self, request):
         if self._fault is not None:
@@ -297,7 +276,7 @@ class RequestAuthority:
     def __call__(self, request) -> frozenset[SourceIdentity]:
         self._check(request)
         try:
-            result = self._provider.current_sources(self._principal, self._scope)
+            result = self._provider.current_sources(self._grant, self._scope)
             self._check(request)
             return result
         except Exception as exc:

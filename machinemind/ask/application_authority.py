@@ -1,4 +1,4 @@
-"""B4l production request boundary, reusable by HTTP ingress and pre-cache checks.
+"""B4l trusted-application request boundary, reusable by HTTP ingress and pre-cache checks.
 
 Required mode is an explicit deployment migration, not enabled by import.
 Unknown configuration fails closed. Source adapters use the same concrete
@@ -8,16 +8,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import hmac
-import json
 import math
 import time
 from typing import Any, Callable, Mapping
 
 from ..authority.contracts import (AUTHORITY_VERSION, ApplicationBoundary,
-    ApplicationPrincipal, AuthorityError, AuthorityLimits, AuthorityMeter)
+    ApplicationGrant, AuthorityError, AuthorityLimits, AuthorityMeter)
 from ..authority.bubble_directory import BubbleConnection, BubbleDirectory, _json_object
 from ..authority.policy import BubbleAuthority, BubbleSchema, SourceSchema
-from ..authority.principal_reader import BubblePrincipalReader
 from ..evidence.contracts import SourceType
 from ..retrieval.chunk_evidence import ChunkReadScope
 
@@ -42,6 +40,12 @@ def _load_schema(value: str) -> BubbleSchema:
     try:
         fields = _json_object(value.encode("utf-8"))
         specs = fields.pop("sources")
+        # B4l originally re-read Bubble User role/company on every ASK. The
+        # trusted Bubble bridge now owns that end-user authorization. Keep
+        # accepting the already-provisioned schema JSON during cleanup by
+        # discarding only those known-deprecated fields.
+        for key in ("user_type", "user_company_field", "user_role_field", "superadmin_value"):
+            fields.pop(key, None)
         if type(specs) is not list:
             raise ValueError()
         fields["sources"] = tuple(SourceSchema(**{**s, "source_type": SourceType(s["source_type"])}) for s in specs)
@@ -65,7 +69,7 @@ class AuthorizedCall:
     """Request-local capability; only server application code can construct one."""
     payload: Any = field(repr=False)
     scope: ChunkReadScope
-    principal: ApplicationPrincipal = field(repr=False)
+    grant: ApplicationGrant = field(repr=False)
     provider: BubbleAuthority = field(repr=False)
     resolve: Callable = field(repr=False)
 
@@ -77,7 +81,7 @@ class AuthorizedCall:
             ai_scope=payload.ai_scope)
         if scope_from_resolved(now) != self.scope:
             raise AuthorityError("AUTHORITY_SCOPE_CHANGED", 403)
-        self.provider.authorize_scope(self.principal, self.scope)
+        self.provider.authorize_scope(self.grant, self.scope)
 
     def public_context(self) -> dict:
         return {"ok": True, "status": "authorized", "result_code": "REQUEST_AUTHORIZED",
@@ -90,7 +94,7 @@ class AuthorizedCall:
 
 
 def authorize_http_request(payload, *, service_secret: object, application_secret: object,
-        principal_id: object, env: Mapping[str, str], resolve: Callable,
+        env: Mapping[str, str], resolve: Callable,
         clock: Callable = time.monotonic, opener=None) -> AuthorizedCall:
     if not required(env):
         raise AuthorityError("AUTHORITY_DISABLED")
@@ -99,8 +103,8 @@ def authorize_http_request(payload, *, service_secret: object, application_secre
             or not old_secret.isascii() or not hmac.compare_digest(service_secret, old_secret)):
         raise AuthorityError("AUTH_REQUIRED", 401)
     boundary = ApplicationBoundary(secret=_config(env, "MM_APP_AUTHORITY_SECRET"),
-        legacy_secret=old_secret, audience=_config(env, "MM_AUTHORITY_AUDIENCE"))
-    principal = boundary.authenticate(supplied_secret=application_secret, user_id=principal_id)
+        legacy_secret=old_secret)
+    grant = boundary.authenticate(supplied_secret=application_secret)
     # All configuration is resolved before reading the application directory.
     schema = _load_schema(_config(env, "MM_BUBBLE_AUTHORITY_SCHEMA_JSON"))
     try:
@@ -111,19 +115,17 @@ def authorize_http_request(payload, *, service_secret: object, application_secre
         allowed_host=_config(env, "MM_BUBBLE_AUTHORITY_HOST"),
         token=_config(env, "MM_BUBBLE_AUTHORITY_TOKEN"))
     directory = BubbleDirectory(connection=connection, meter=AuthorityMeter(limits, clock), opener=opener)
-    principal_reader = BubblePrincipalReader(connection=connection, meter=directory.meter, opener=opener)
-    provider = BubbleAuthority(directory=directory, schema=schema, boundary=boundary,
-        principal_reader=principal_reader)
+    provider = BubbleAuthority(directory=directory, schema=schema, boundary=boundary)
     scope = scope_from_resolved(resolve(company_id=payload.company_id, machine_id=payload.machine_id,
         bubble_document_id=payload.bubble_document_id, document_ids=payload.document_ids, ai_scope=payload.ai_scope))
-    authorized = AuthorizedCall(payload, scope, principal, provider, resolve)
+    authorized = AuthorizedCall(payload, scope, grant, provider, resolve)
     authorized.check(payload)
     return authorized
 
 
 def protected_call(payload, service_secret, *, authorized: AuthorizedCall,
                    delegate: Callable) -> dict:
-    """Check current user/context both before execution and before release.
+    """Check current authorized application context before execution and release.
 
     Delegate must have its response caches disabled until B4n adds source-safe
     re-use. This function does not claim to authorize legacy citation provenance

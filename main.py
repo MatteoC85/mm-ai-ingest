@@ -18381,7 +18381,7 @@ def _assistant_core_production_readers(*, request, session, authorized, invoke):
         raise _AuthorityError("AUTHORITY_CONFIGURATION_INVALID")
     authorized.check(authorized.payload)
     authority = _RequestAuthority(request=request, scope=authorized.scope,
-        principal=authorized.principal, provider=authorized.provider)
+        grant=authorized.grant, provider=authorized.provider)
     adapters = _ProductionReaderAdapters(request=request, session=session,
         authorize=authority, invoke=invoke,
         runtimes=_assistant_core_authority_reader_runtimes())
@@ -18389,13 +18389,12 @@ def _assistant_core_production_readers(*, request, session, authorized, invoke):
 
 
 def _assistant_core_authorized_ask_sync(payload, x_ai_internal_secret, *,
-        x_mm_app_authority, x_mm_principal_id, authority_environment):
+        x_mm_app_authority, authority_environment):
     """Protected request path; response cache disabled until the B4n gate."""
     try:
         authorized = _application_authority.authorize_http_request(payload,
             service_secret=x_ai_internal_secret, application_secret=x_mm_app_authority,
-            principal_id=x_mm_principal_id, env=authority_environment,
-            resolve=_resolve_query_scope)
+            env=authority_environment, resolve=_resolve_query_scope)
         runtime = _dataclass_replace(_assistant_core_request_flow_runtime(),
             _v13_cache_lookup=lambda **kwargs: None,
             _v13_cache_store=lambda **kwargs: None)
@@ -18412,7 +18411,6 @@ def _assistant_core_authorized_ask_sync(payload, x_ai_internal_secret, *,
 async def ask_authorize_v1(payload: AskRequest,
     x_ai_internal_secret: Optional[str] = Header(default=None),
     x_mm_app_authority: Optional[str] = Header(default=None),
-    x_mm_principal_id: Optional[str] = Header(default=None),
     x_mm_authority_nonce: Optional[str] = Header(default=None)):
     """Permanent production pre-quota/pre-cache request check for the Worker.
 
@@ -18425,7 +18423,7 @@ async def ask_authorize_v1(payload: AskRequest,
             raise _AuthorityError("AUTHORITY_NONCE_INVALID", 400)
         call = functools.partial(_application_authority.authorize_http_request,
             payload, service_secret=x_ai_internal_secret,
-            application_secret=x_mm_app_authority, principal_id=x_mm_principal_id,
+            application_secret=x_mm_app_authority,
             env=dict(os.environ), resolve=_resolve_query_scope)
         authorized = await asyncio.to_thread(call)
         return {**authorized.public_context(), "authority_nonce": x_mm_authority_nonce}
@@ -18438,10 +18436,9 @@ async def ask_v1(
     payload: AskRequest,
     x_ai_internal_secret: Optional[str] = Header(default=None),
     x_mm_app_authority: Optional[str] = Header(default=None),
-    x_mm_principal_id: Optional[str] = Header(default=None),
 ):
     # Required mode branches BEFORE every legacy fallback or cache lookup.
-    # No silent fallback is allowed for missing configuration/principal.
+    # No silent fallback is allowed for missing application authority.
     authority_environment = dict(os.environ)
     try:
         authority_required = _application_authority.required(authority_environment)
@@ -18451,7 +18448,7 @@ async def ask_v1(
         if not (V13_ENABLED and V13_ASK_ENABLED and ASSISTANT_CORE_V2_ENABLED):
             raise HTTPException(status_code=503, detail="AUTHORITY_CORE_REQUIRED")
         sync_func = functools.partial(_assistant_core_authorized_ask_sync,
-            x_mm_app_authority=x_mm_app_authority, x_mm_principal_id=x_mm_principal_id,
+            x_mm_app_authority=x_mm_app_authority,
             authority_environment=authority_environment)
         if not V13_STREAM_HEARTBEAT_ENABLED:
             return await _assistant_core_json_with_hard_timeout(
