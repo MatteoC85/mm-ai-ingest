@@ -17,6 +17,7 @@ from ..authority.contracts import (AUTHORITY_VERSION, ApplicationBoundary,
     ApplicationPrincipal, AuthorityError, AuthorityLimits, AuthorityMeter)
 from ..authority.bubble_directory import BubbleConnection, BubbleDirectory, _json_object
 from ..authority.policy import BubbleAuthority, BubbleSchema, SourceSchema
+from ..authority.principal_reader import BubblePrincipalReader
 from ..evidence.contracts import SourceType
 from ..retrieval.chunk_evidence import ChunkReadScope
 
@@ -110,7 +111,9 @@ def authorize_http_request(payload, *, service_secret: object, application_secre
         allowed_host=_config(env, "MM_BUBBLE_AUTHORITY_HOST"),
         token=_config(env, "MM_BUBBLE_AUTHORITY_TOKEN"))
     directory = BubbleDirectory(connection=connection, meter=AuthorityMeter(limits, clock), opener=opener)
-    provider = BubbleAuthority(directory=directory, schema=schema, boundary=boundary)
+    principal_reader = BubblePrincipalReader(connection=connection, meter=directory.meter, opener=opener)
+    provider = BubbleAuthority(directory=directory, schema=schema, boundary=boundary,
+        principal_reader=principal_reader)
     scope = scope_from_resolved(resolve(company_id=payload.company_id, machine_id=payload.machine_id,
         bubble_document_id=payload.bubble_document_id, document_ids=payload.document_ids, ai_scope=payload.ai_scope))
     authorized = AuthorizedCall(payload, scope, principal, provider, resolve)

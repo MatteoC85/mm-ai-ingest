@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .contracts import ApplicationBoundary, ApplicationPrincipal, AuthorityError, identifier
+from .principal_reader import BubblePrincipalReader, PrincipalSnapshot
 from ..evidence.contracts import SourceIdentity, SourceType, SourceScope, SourceFormat, ScopeLevel
 from ..evidence.ask_input import ask_request_key
 from ..retrieval.chunk_evidence import ChunkReadScope
@@ -29,14 +30,22 @@ class SourceSchema:
     typename: str
     company_field: str | None
     machine_field: str | None
-    deleted_field: str
+    deleted_field: str | None
     parent_field: str | None = None
+    # Explicit per-type schema: record_exists is NOT a fallback for missing flags.
+    lifecycle: str = "flag"
 
     def __post_init__(self):
         if not isinstance(self.source_type, SourceType):
             raise AuthorityError("AUTHORITY_SCHEMA_INVALID")
         identifier(self.typename)
-        identifier(self.deleted_field)
+        if self.lifecycle == "flag":
+            identifier(self.deleted_field)
+        elif self.lifecycle == "record_exists":
+            if self.deleted_field is not None:
+                raise AuthorityError("AUTHORITY_SCHEMA_INVALID")
+        else:
+            raise AuthorityError("AUTHORITY_SCHEMA_INVALID")
         if self.source_type == SourceType.STEP:
             identifier(self.parent_field)
         else:
@@ -98,20 +107,39 @@ def _ref(row: dict, field: str, *, optional: bool = False) -> str | None:
 
 class BubbleAuthority:
     """Concrete application policy; directory offers only get/search reads."""
-    def __init__(self, *, directory: Any, schema: BubbleSchema, boundary: ApplicationBoundary):
+    def __init__(self, *, directory: Any, schema: BubbleSchema, boundary: ApplicationBoundary,
+                 principal_reader: BubblePrincipalReader | None = None):
         if (type(schema) is not BubbleSchema or type(boundary) is not ApplicationBoundary
                 or not callable(getattr(directory, "get", None)) or not callable(getattr(directory, "search", None))):
             raise AuthorityError("AUTHORITY_CONFIGURATION_INVALID")
+        if principal_reader is not None and (type(principal_reader) is not BubblePrincipalReader
+                or principal_reader.meter is not directory.meter):
+            raise AuthorityError("AUTHORITY_CONFIGURATION_INVALID")
         self.directory, self.schema, self.boundary = directory, schema, boundary
+        self.principal_reader = principal_reader
 
     def authorize_scope(self, principal: ApplicationPrincipal, scope: ChunkReadScope) -> tuple[str | None, str | None]:
         self.boundary.require(principal)
         if type(scope) is not ChunkReadScope:
             raise AuthorityError("AUTHORITY_SCOPE_INVALID", 400)
         s = self.schema
-        user = _row(self.directory.get(s.user_type, principal.user_id), principal.user_id)
-        company = _ref(user, s.user_company_field, optional=True)
-        role = _ref(user, s.user_role_field, optional=True)
+        if self.principal_reader is None:
+            # Explicit compatibility construction for existing direct callers.
+            # Production HTTP composition ALWAYS supplies the workflow reader;
+            # a workflow error never falls back into this branch.
+            user = _row(self.directory.get(s.user_type, principal.user_id), principal.user_id)
+            company = _ref(user, s.user_company_field, optional=True)
+            role = _ref(user, s.user_role_field, optional=True)
+        else:
+            snapshot = self.principal_reader.read(principal.user_id)
+            if snapshot is None:
+                raise AuthorityError("SCOPE_DENIED", 403)
+            if type(snapshot) is not PrincipalSnapshot or snapshot.user_id != principal.user_id:
+                raise AuthorityError("AUTHORITY_RESPONSE_INVALID")
+            company = snapshot.company_id
+            # The workflow compares the real Option Set. No wire spelling or
+            # case guess about a serialized Bubble role is used for permission.
+            role = s.superadmin_value if snapshot.is_superadmin else None
         if role != s.superadmin_value and company != scope.company_id:
             raise AuthorityError("SCOPE_DENIED", 403)
         _row(self.directory.get(s.company_type, scope.company_id), scope.company_id)
@@ -124,6 +152,10 @@ class BubbleAuthority:
         return company, role
 
     def _active(self, row: dict, spec: SourceSchema) -> bool:
+        if spec.lifecycle == "record_exists":
+            # _row already validated that this authoritative record exists.
+            # Parent/Company/Machine checks still apply; there is no index grant.
+            return True
         value = row.get(spec.deleted_field)
         if type(value) is bool:
             return not value
