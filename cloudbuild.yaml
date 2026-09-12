@@ -156,12 +156,26 @@ steps:
                                      if x['name'] not in managed), key=lambda x: x['name'])
           return result
       
+      def revision_names():
+          raw = gcloud('run', 'revisions', 'list', '--service='+SERVICE,
+                       '--project='+PROJECT, '--region='+REGION, '--format=json')
+          try:
+              rows = json.loads(raw)
+          except (ValueError, TypeError):
+              raise GuardError('REVISION_LIST_JSON_INVALID') from None
+          require(isinstance(rows, list), 'REVISION_LIST_NOT_ARRAY')
+          names = set()
+          for row in rows:
+              name = row.get('metadata', {}).get('name') if isinstance(row, dict) else None
+              require(isinstance(name, str) and name.startswith(SERVICE+'-'),
+                      'REVISION_LIST_NAME_INVALID')
+              require(name not in names, 'REVISION_LIST_DUPLICATE')
+              names.add(name)
+          return names
+
       def validate_candidate(before, service, revision, name, commit, image):
           ready(service)
           ready(revision)
-          status = service.get('status', {})
-          require(status.get('latestCreatedRevisionName') == name and
-                  status.get('latestReadyRevisionName') == name, 'CONCURRENT_OR_UNEXPECTED_REVISION')
           require(revision.get('metadata', {}).get('name') == name, 'REVISION_NAME_MISMATCH')
           spec = template_spec(service)
           for candidate in (spec, revision.get('spec', {})):
@@ -209,6 +223,7 @@ steps:
           before = read_resource('services', SERVICE)
           ready(before)
           configuration(template_spec(before))
+          baseline_revisions = revision_names()
           prior = before.get('status', {}).get('latestReadyRevisionName')
           require(isinstance(prior, str) and prior.startswith(SERVICE+'-'),
                   'BASELINE_READY_REVISION_MISSING')
@@ -232,6 +247,9 @@ steps:
                  '--update-secrets='+refs, '--quiet')
           revision = read_resource('revisions', name)
           staged = read_resource('services', SERVICE)
+          staged_revisions = revision_names()
+          require(staged_revisions - baseline_revisions == {name},
+                  'CONCURRENT_OR_UNEXPECTED_REVISION')
           validate_candidate(before, staged, revision, name, commit, image)
           require(traffic(staged) == {prior: 100}, 'TRAFFIC_CHANGED_BEFORE_VALIDATION')
           # Promote the EXACT verified revision, never whichever happens to be "latest".
@@ -239,6 +257,9 @@ steps:
           gcloud('run', 'services', 'update-traffic', SERVICE, '--project='+PROJECT,
                  '--region='+REGION, '--to-revisions='+name+'=100', '--quiet')
           final = read_resource('services', SERVICE)
+          final_revisions = revision_names()
+          require(final_revisions - baseline_revisions == {name},
+                  'CONCURRENT_OR_UNEXPECTED_REVISION')
           validate_candidate(before, final, revision, name, commit, image)
           require(traffic(final) == {name: 100}, 'FINAL_TRAFFIC_MISMATCH')
           health(final.get('status', {}).get('url'), commit, name)
