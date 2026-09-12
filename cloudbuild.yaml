@@ -210,8 +210,11 @@ steps:
           ready(before)
           configuration(template_spec(before))
           prior = before.get('status', {}).get('latestReadyRevisionName')
-          require(before.get('status', {}).get('latestCreatedRevisionName') == prior and
-                  traffic(before) == {prior: 100}, 'BASELINE_NOT_STABLE_100')
+          require(isinstance(prior, str) and prior.startswith(SERVICE+'-'),
+                  'BASELINE_READY_REVISION_MISSING')
+          prior_revision = read_resource('revisions', prior)
+          ready(prior_revision)
+          require(traffic(before) == {prior: 100}, 'BASELINE_NOT_STABLE_100')
           image_root = 'europe-west1-docker.pkg.dev/'+PROJECT+'/cloud-run-source-deploy/mm-ai-ingest/'+SERVICE
           digest = gcloud('artifacts', 'docker', 'images', 'describe', image_root+':'+commit,
                           '--project='+PROJECT, '--format=value(image_summary.digest)')
