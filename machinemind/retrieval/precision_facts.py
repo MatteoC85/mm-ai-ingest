@@ -626,14 +626,23 @@ def extract_fact_pairs(
     return out
 
 
-def choose_unambiguous_fact(pairs: Sequence[FactPair], query: PropertyQuery) -> Optional[PrecisionFactResolution]:
-    pairs = [pair for pair in pairs if pair.bubble_document_id and pair.value]
+def choose_unambiguous_fact_with_lineage(
+    pairs: Sequence[tuple[FactPair, int]], query: PropertyQuery,
+) -> Optional[tuple[PrecisionFactResolution, int]]:
+    """Choose the legacy scalar result and retain its exact input occurrence.
+
+    The integer is supplied by trusted request-local composition code at page
+    materialization time.  It is not reconstructed from citation IDs, document
+    IDs, text, scores or page numbers after resolution.  Selection/tie-breaking
+    is intentionally identical to ``choose_unambiguous_fact``.
+    """
+    pairs = [(pair, index) for pair, index in pairs if pair.bubble_document_id and pair.value]
     if not pairs:
         return None
 
-    groups: dict[tuple[str, str], list[FactPair]] = {}
-    for pair in pairs:
-        groups.setdefault((pair.canonical_number, pair.canonical_unit), []).append(pair)
+    groups: dict[tuple[str, str], list[tuple[FactPair, int]]] = {}
+    for pair, index in pairs:
+        groups.setdefault((pair.canonical_number, pair.canonical_unit), []).append((pair, index))
 
     # A single generic property word (for example only "peso"/"weight") cannot
     # distinguish the complete machine from subassemblies when the scope contains
@@ -644,38 +653,38 @@ def choose_unambiguous_fact(pairs: Sequence[FactPair], query: PropertyQuery) -> 
     ranked_groups = sorted(
         groups.items(),
         key=lambda item: (
-            -max(pair.score for pair in item[1]),
-            -max(pair.label_coverage for pair in item[1]),
+            -max(pair.score for pair, _ in item[1]),
+            -max(pair.label_coverage for pair, _ in item[1]),
             -len(item[1]),
-            min(pair.page_number for pair in item[1]),
+            min(pair.page_number for pair, _ in item[1]),
         ),
     )
     if not ranked_groups:
         return None
     top_key, top_pairs = ranked_groups[0]
-    top_score = max(pair.score for pair in top_pairs)
-    top_coverage = max(pair.label_coverage for pair in top_pairs)
+    top_score = max(pair.score for pair, _ in top_pairs)
+    top_coverage = max(pair.label_coverage for pair, _ in top_pairs)
 
     # Never choose between materially competing scalar values.  Duplicate pages or
     # a technical table plus a lifting label with the same value are corroboration,
     # not ambiguity.
     for _, competing in ranked_groups[1:]:
-        competing_score = max(pair.score for pair in competing)
-        competing_coverage = max(pair.label_coverage for pair in competing)
+        competing_score = max(pair.score for pair, _ in competing)
+        competing_coverage = max(pair.label_coverage for pair, _ in competing)
         if competing_coverage >= top_coverage - 0.10 and competing_score >= top_score - 0.12:
             return None
 
-    chosen = sorted(
+    chosen, selected_index = sorted(
         top_pairs,
-        key=lambda pair: (
-            -pair.label_coverage,
-            -pair.table_density,
-            -pair.label_precision,
-            -pair.phrase_similarity,
-            pair.page_number,
+        key=lambda item: (
+            -item[0].label_coverage,
+            -item[0].table_density,
+            -item[0].label_precision,
+            -item[0].phrase_similarity,
+            item[0].page_number,
         ),
     )[0]
-    supporting_pages = tuple(sorted({pair.page_number for pair in top_pairs}))
+    supporting_pages = tuple(sorted({pair.page_number for pair, _ in top_pairs}))
     return PrecisionFactResolution(
         label=chosen.label,
         value=chosen.value,
@@ -690,7 +699,15 @@ def choose_unambiguous_fact(pairs: Sequence[FactPair], query: PropertyQuery) -> 
         property_terms=query.property_terms,
         supporting_pages=supporting_pages,
         score=chosen.score,
+    ), selected_index
+
+
+def choose_unambiguous_fact(pairs: Sequence[FactPair], query: PropertyQuery) -> Optional[PrecisionFactResolution]:
+    """Legacy result shape; selection is shared with the lineage-aware variant."""
+    selected = choose_unambiguous_fact_with_lineage(
+        tuple((pair, index) for index, pair in enumerate(pairs)), query
     )
+    return selected[0] if selected is not None else None
 
 
 def _identifier_key(value: str) -> str:
@@ -721,17 +738,22 @@ def _source_matches_query_codes(
     return bool(haystack) and all(code in haystack for code in required)
 
 
-def _matching_scoped_fact_pairs(
+def matching_scoped_fact_pairs_with_lineage(
     pages: Sequence[dict[str, Any]], property_query: PropertyQuery, target_machine_id: str
-) -> list[FactPair]:
-    pairs: list[FactPair] = []
-    for page in pages or []:
+) -> list[tuple[FactPair, int]]:
+    """Return matching facts with their trusted page occurrence positions.
+
+    Positions are captured while iterating the supplied page collection, before
+    scalar selection.  They are the only lineage signal consumed by B4m rescue.
+    """
+    pairs: list[tuple[FactPair, int]] = []
+    for page_index, page in enumerate(pages or []):
         if not isinstance(page, dict):
             continue
         page_text = str(page.get("text") or page.get("page_text") or "")
         if not _ordinary_document_page(page_text):
             continue
-        pairs.extend(extract_fact_pairs(
+        pairs.extend((pair, page_index) for pair in extract_fact_pairs(
             page_text=page_text,
             page_number=int(page.get("page_number") or page.get("page_from") or 1),
             bubble_document_id=str(page.get("bubble_document_id") or ""),
@@ -740,10 +762,19 @@ def _matching_scoped_fact_pairs(
         ))
     target = str(target_machine_id or "").strip()
     if target:
-        exact = [pair for pair in pairs if str(pair.machine_id or "").strip() == target]
+        exact = [(pair, index) for pair, index in pairs
+                 if str(pair.machine_id or "").strip() == target]
         if exact:
             pairs = exact
     return pairs
+
+
+def _matching_scoped_fact_pairs(
+    pages: Sequence[dict[str, Any]], property_query: PropertyQuery, target_machine_id: str
+) -> list[FactPair]:
+    return [pair for pair, _ in matching_scoped_fact_pairs_with_lineage(
+        pages, property_query, target_machine_id
+    )]
 
 
 def resolve_precision_fact_from_pages(
