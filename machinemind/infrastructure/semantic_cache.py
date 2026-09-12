@@ -19,7 +19,7 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping, MutableMapping
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 
 class _Runtime:
@@ -465,6 +465,7 @@ def cache_lookup(
     language: str,
     debug: bool,
     runtime_globals: MutableMapping[str, Any],
+    source_guard_fn: Optional[Callable[[dict], dict]] = None,
 ) -> Optional[dict]:
     rt = _Runtime(runtime_globals)
     budget = rt.call("_v13_current_budget")
@@ -609,6 +610,20 @@ def cache_lookup(
 
     similarity, response, quality_score, created_at = best
     out = dict(response)
+    if source_guard_fn is not None:
+        try:
+            guarded = source_guard_fn(out)
+            if type(guarded) is not dict:
+                raise TypeError("source guard must return a response mapping")
+            out = guarded
+        except Exception as exc:
+            # A cache entry is never evidence authority.  Once B4o supplies the
+            # current-authority guard, missing/stale provenance is a cache MISS,
+            # not fail-open reuse and not a no_sources answer.
+            print("V13_CACHE_SOURCE_AUTHORITY_BYPASS", type(exc).__name__)
+            if budget is not None:
+                budget.semantic_cache = "bypass_source_authority"
+            return None
     citations = list(out.get("citations") or [])
     try:
         out["rg_links"] = rt.call("_build_rg_links", company_id, citations) if citations else []
@@ -731,10 +746,22 @@ def cache_store(
     response: dict,
     debug: bool,
     runtime_globals: MutableMapping[str, Any],
+    source_guard_fn: Optional[Callable[[dict], dict]] = None,
 ) -> None:
     rt = _Runtime(runtime_globals)
     if debug or not rt.require("V13_SEMANTIC_CACHE_ENABLED") or not rt.call("_v13_cache_bootstrap"):
         return
+    if source_guard_fn is not None:
+        try:
+            guarded = source_guard_fn(dict(response))
+            if type(guarded) is not dict:
+                raise TypeError("source guard must return a response mapping")
+            response = guarded
+        except Exception as exc:
+            # Canonical cache writes must never persist an output whose source
+            # identity cannot be re-proved from current provider authority.
+            print("V13_CACHE_SOURCE_AUTHORITY_STORE_BYPASS", type(exc).__name__)
+            return
     if not rt.call("_assistant_core_cache_certified", mode, response):
         return
     response_meta = response.get("meta") or {}
