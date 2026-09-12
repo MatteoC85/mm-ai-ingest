@@ -20,40 +20,245 @@ steps:
         "europe-west1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/mm-ai-ingest/mm-ai-ingest-prod:$COMMIT_SHA"
       ]
 
+  # Deploy only after the OFF baseline has been checked. No secret values in source.
+  # This guard is intentionally OFF-only; B4o activation requires explicit review.
   - name: gcr.io/google.com/cloudsdktool/cloud-sdk
-    entrypoint: gcloud
-    args:
-      [
-        "run",
-        "deploy",
-        "mm-ai-ingest-prod",
-        "--image",
-        "europe-west1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/mm-ai-ingest/mm-ai-ingest-prod:$COMMIT_SHA",
-        "--region",
-        "europe-west1",
-        "--platform",
-        "managed",
-        "--allow-unauthenticated",
-        "--update-env-vars",
-        "COMMIT_SHA=$COMMIT_SHA,MM_INGEST_LEDGER_AUTO_DDL=0",
-        "--quiet"
-      ]
-
-  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
-    entrypoint: gcloud
-    args:
-      [
-        "run",
-        "services",
-        "update-traffic",
-        "mm-ai-ingest-prod",
-        "--project",
-        "$PROJECT_ID",
-        "--region",
-        "europe-west1",
-        "--to-latest",
-        "--quiet"
-      ]
+    id: deploy-authority-config-guard-off
+    env:
+      - 'MM_CB_PROJECT=$PROJECT_ID'
+      - 'MM_CB_COMMIT=$COMMIT_SHA'
+      - 'MM_CB_BUILD=$BUILD_ID'
+    script: |
+      #!/usr/bin/env python3
+      """Build-time guard only; does not import or change MachineMind application code.
+      The OFF gate must be reviewed explicitly when canonical activation is authorized.
+      No secret values are retrieved or printed. No automatic traffic rollback.
+      """
+      import copy
+      import hashlib
+      import json
+      import os
+      import re
+      import subprocess
+      import time
+      import urllib.request
+      import urllib.parse
+      
+      SERVICE = 'mm-ai-ingest-prod'
+      REGION = 'europe-west1'
+      PROJECT = 'machinemind-ai-2a'
+      SCHEMA = {'company_type': 'company', 'machine_type': 'machine', 'machine_company_field': 'company', 'deleted_false_or_blank': False, 'sources': [{'source_type': 'document', 'typename': 'document', 'company_field': 'company', 'machine_field': 'machine', 'deleted_field': 'is_deleted', 'parent_field': None, 'lifecycle': 'flag'}, {'source_type': 'procedure', 'typename': 'procedure', 'company_field': 'company', 'machine_field': 'machine', 'deleted_field': None, 'parent_field': None, 'lifecycle': 'record_exists'}, {'source_type': 'step', 'typename': 'step', 'company_field': None, 'machine_field': None, 'deleted_field': None, 'parent_field': 'procedure', 'lifecycle': 'record_exists'}, {'source_type': 'ps', 'typename': 'problemsolution', 'company_field': 'company', 'machine_field': 'machine', 'deleted_field': None, 'parent_field': None, 'lifecycle': 'record_exists'}, {'source_type': 'md_photo', 'typename': 'photo', 'company_field': 'company', 'machine_field': 'machine', 'deleted_field': 'is_deleted', 'parent_field': None, 'lifecycle': 'flag'}, {'source_type': 'md_video', 'typename': 'video', 'company_field': 'company', 'machine_field': 'machine', 'deleted_field': None, 'parent_field': None, 'lifecycle': 'record_exists'}]}
+      LIMITS = {'max_http_calls': 128, 'max_response_bytes': 2000000, 'max_total_bytes': 25000000, 'max_records': 10000, 'page_size': 100, 'timeout_seconds': 10.0, 'total_seconds': 60.0}
+      SECRET_REFS = {
+          'MM_APP_AUTHORITY_SECRET': {'name': 'mm-app-authority-v1', 'key': '1'},
+          'MM_BUBBLE_AUTHORITY_TOKEN': {'name': 'mm-bubble-authority-token-v1', 'key': '1'},
+      }
+      ENV_VALUES = {
+          'MM_BUBBLE_AUTHORITY_BASE_URL': 'https://machinemind-ai.com/api/1.1/obj',
+          'MM_BUBBLE_AUTHORITY_HOST': 'machinemind-ai.com',
+          'MM_BUBBLE_AUTHORITY_SCHEMA_JSON': json.dumps(SCHEMA, separators=(',', ':')),
+          'MM_AUTHORITY_LIMITS_JSON': json.dumps(LIMITS, separators=(',', ':')),
+      }
+      
+      class GuardError(RuntimeError):
+          pass
+      
+      def require(ok, code):
+          if not ok:
+              raise GuardError(code)
+      
+      def gcloud(*args):
+          # Captured output can contain existing env values. Never print it.
+          try:
+              result = subprocess.run(['gcloud', *args], text=True, capture_output=True,
+                                      timeout=900)
+          except (OSError, subprocess.TimeoutExpired):
+              raise GuardError('GCLOUD_NOT_COMPLETED') from None
+          require(result.returncode == 0, 'GCLOUD_COMMAND_FAILED')
+          return result.stdout.strip()
+      
+      def read_resource(kind, name):
+          raw = gcloud('run', kind, 'describe', name, '--project='+PROJECT,
+                       '--region='+REGION, '--format=json')
+          try:
+              obj = json.loads(raw)
+          except (ValueError, TypeError):
+              raise GuardError('GCLOUD_JSON_INVALID') from None
+          require(isinstance(obj, dict), 'GCLOUD_JSON_NOT_OBJECT')
+          return obj
+      
+      def template_spec(service):
+          return service.get('spec', {}).get('template', {}).get('spec', {})
+      
+      def environment(spec):
+          containers = spec.get('containers')
+          require(isinstance(containers, list) and len(containers) == 1,
+                  'EXPECTED_SINGLE_CONTAINER')
+          env = {}
+          for item in containers[0].get('env', []):
+              require(isinstance(item, dict) and isinstance(item.get('name'), str),
+                      'ENV_FORMAT_INVALID')
+              require(item['name'] not in env, 'DUPLICATE_ENV_NAME')
+              env[item['name']] = item
+          return env
+      
+      def configuration(spec):
+          env = environment(spec)
+          mode = env.get('MM_ASK_REQUEST_AUTHORITY')
+          require(mode is None or (mode.get('value') == 'off' and 'valueFrom' not in mode),
+                  'AUTHORITY_NOT_OFF')
+          for name, expected in ENV_VALUES.items():
+              item = env.get(name, {})
+              require('valueFrom' not in item and isinstance(item.get('value'), str),
+                      'MISSING_OR_NON_LITERAL_'+name)
+              value = item['value']
+              if name.endswith('_JSON'):
+                  try:
+                      # Compare JSON structures, NOT arbitrary formatting or key order.
+                      require(json.dumps(json.loads(value), sort_keys=True) ==
+                              json.dumps(json.loads(expected), sort_keys=True), 'CONFIG_DIFF_'+name)
+                  except (ValueError, TypeError):
+                      raise GuardError('CONFIG_JSON_INVALID_'+name) from None
+              else:
+                  require(value == expected, 'CONFIG_DIFF_'+name)
+          for name, expected in SECRET_REFS.items():
+              item = env.get(name, {})
+              require('value' not in item and
+                      item.get('valueFrom', {}).get('secretKeyRef') == expected,
+                      'SECRET_REF_DIFF_'+name)
+          return env
+      
+      def ready(obj):
+          require(any(x.get('type') == 'Ready' and x.get('status') == 'True'
+                      for x in obj.get('status', {}).get('conditions', [])), 'NOT_READY')
+      
+      def traffic(service):
+          out = {}
+          for item in service.get('status', {}).get('traffic', []):
+              amount = item.get('percent', 0)
+              require(type(amount) is int and 0 <= amount <= 100, 'TRAFFIC_PERCENT_INVALID')
+              if amount:
+                  name = item.get('revisionName')
+                  require(isinstance(name, str) and name.startswith(SERVICE+'-'),
+                          'TRAFFIC_REVISION_MISSING')
+                  out[name] = out.get(name, 0) + amount
+          require(sum(out.values()) == 100, 'TRAFFIC_SUM_INVALID')
+          return out
+      
+      def unaffected_spec(spec):
+          """Detect unrelated template changes without logging existing env/secret values."""
+          result = copy.deepcopy(spec)
+          require(len(result.get('containers', [])) == 1, 'EXPECTED_SINGLE_CONTAINER')
+          container = result['containers'][0]
+          container.pop('image', None)
+          managed = set(ENV_VALUES) | set(SECRET_REFS) | {'COMMIT_SHA', 'MM_INGEST_LEDGER_AUTO_DDL'}
+          container['env'] = sorted((x for x in container.get('env', [])
+                                     if x['name'] not in managed), key=lambda x: x['name'])
+          return result
+      
+      def validate_candidate(before, service, revision, name, commit, image):
+          ready(service)
+          ready(revision)
+          status = service.get('status', {})
+          require(status.get('latestCreatedRevisionName') == name and
+                  status.get('latestReadyRevisionName') == name, 'CONCURRENT_OR_UNEXPECTED_REVISION')
+          require(revision.get('metadata', {}).get('name') == name, 'REVISION_NAME_MISMATCH')
+          spec = template_spec(service)
+          for candidate in (spec, revision.get('spec', {})):
+              env = configuration(candidate)
+              require(env.get('COMMIT_SHA', {}).get('value') == commit, 'COMMIT_ENV_MISMATCH')
+              require(env.get('MM_INGEST_LEDGER_AUTO_DDL', {}).get('value') == '0', 'AUTO_DDL_CHANGED')
+              require(candidate['containers'][0].get('image') == image, 'IMAGE_MISMATCH')
+          require(unaffected_spec(spec) == unaffected_spec(template_spec(before)),
+                  'UNRELATED_TEMPLATE_CHANGED')
+          # A sha256 digest was pinned BEFORE deployment. Cloud Run resolves that exact digest.
+          actual = revision.get('status', {}).get('imageDigest', '')
+          require(actual == image or actual == image.rsplit('@', 1)[-1], 'REVISION_DIGEST_MISMATCH')
+      
+      def health(url, commit, revision):
+          # No authenticated requests and no redirects: these are public health endpoints only.
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+          parsed = urllib.parse.urlsplit(url) if isinstance(url, str) else None
+          require(parsed is not None and parsed.scheme == 'https' and
+                  re.fullmatch(r'[a-z0-9-]+(?:\.[a-z0-9-]+)*\.run\.app', parsed.netloc or '') and
+                  not parsed.path and not parsed.query and not parsed.fragment, 'SERVICE_URL_INVALID')
+          opener = urllib.request.build_opener(NoRedirect)
+          for suffix in ('/ping', '/version'):
+              try:
+                  req = urllib.request.Request(url+suffix, headers={'Cache-Control': 'no-cache'})
+                  with opener.open(req, timeout=20) as response:
+                      raw = response.read(262145)
+                      require(response.status == 200 and len(raw) <= 262144, 'HEALTH_HTTP_INVALID')
+                      body = json.loads(raw)
+              except GuardError:
+                  raise
+              except Exception:
+                  raise GuardError('HEALTH_REQUEST_FAILED') from None
+              require(isinstance(body, dict) and body.get('ok') is True, 'HEALTH_NOT_OK')
+              if suffix == '/version':
+                  require(body.get('commit_sha') == commit and body.get('revision') == revision,
+                          'HEALTH_IDENTITY_MISMATCH')
+      
+      def execute(project, commit, build):
+          require(project == PROJECT, 'WRONG_PROJECT')
+          require(isinstance(commit, str) and re.fullmatch('[0-9a-f]{40}', commit), 'INVALID_COMMIT_SHA')
+          require(isinstance(build, str) and re.fullmatch('[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}', build),
+                  'INVALID_BUILD_ID')
+          before = read_resource('services', SERVICE)
+          ready(before)
+          configuration(template_spec(before))
+          prior = before.get('status', {}).get('latestReadyRevisionName')
+          require(before.get('status', {}).get('latestCreatedRevisionName') == prior and
+                  traffic(before) == {prior: 100}, 'BASELINE_NOT_STABLE_100')
+          image_root = 'europe-west1-docker.pkg.dev/'+PROJECT+'/cloud-run-source-deploy/mm-ai-ingest/'+SERVICE
+          digest = gcloud('artifacts', 'docker', 'images', 'describe', image_root+':'+commit,
+                          '--project='+PROJECT, '--format=value(image_summary.digest)')
+          require(re.fullmatch('sha256:[0-9a-f]{64}', digest), 'REGISTRY_DIGEST_INVALID')
+          image = image_root+'@'+digest
+          suffix = 'b'+build.replace('-', '')
+          name = SERVICE+'-'+suffix
+          # Preserve the pre-deploy OFF mode; do not silently disable required mode.
+          values = dict(ENV_VALUES, COMMIT_SHA=commit, MM_INGEST_LEDGER_AUTO_DDL='0')
+          env_arg = '^@^'+'@'.join(key+'='+value for key, value in values.items())
+          refs = ','.join(key+'='+ref['name']+':'+ref['key'] for key, ref in SECRET_REFS.items())
+          gcloud('run', 'deploy', SERVICE, '--project='+PROJECT, '--region='+REGION,
+                 '--platform=managed', '--allow-unauthenticated', '--image='+image,
+                 '--revision-suffix='+suffix, '--no-traffic', '--update-env-vars='+env_arg,
+                 '--update-secrets='+refs, '--quiet')
+          revision = read_resource('revisions', name)
+          staged = read_resource('services', SERVICE)
+          validate_candidate(before, staged, revision, name, commit, image)
+          require(traffic(staged) == {prior: 100}, 'TRAFFIC_CHANGED_BEFORE_VALIDATION')
+          # Promote the EXACT verified revision, never whichever happens to be "latest".
+          print('CONFIG_GUARD_PASSED_BEFORE_PROMOTION', flush=True)
+          gcloud('run', 'services', 'update-traffic', SERVICE, '--project='+PROJECT,
+                 '--region='+REGION, '--to-revisions='+name+'=100', '--quiet')
+          final = read_resource('services', SERVICE)
+          validate_candidate(before, final, revision, name, commit, image)
+          require(traffic(final) == {name: 100}, 'FINAL_TRAFFIC_MISMATCH')
+          health(final.get('status', {}).get('url'), commit, name)
+          return {'status': 'PASS_DEPLOY_B4L_CONFIG_GUARD_OFF', 'revision': name,
+                  'previous_revision': prior, 'commit_sha': commit, 'image_digest': digest,
+                  'authority_mode': 'OFF', 'config_checked_before_traffic': True,
+                  'unrelated_template_preserved': True, 'traffic_percent': 100,
+                  'health_checked_after_promotion': True, 'ask_calls': 0, 'ai_calls': 0}
+      
+      if __name__ == '__main__':
+          try:
+              report = execute(os.environ.get('MM_CB_PROJECT'), os.environ.get('MM_CB_COMMIT'),
+                               os.environ.get('MM_CB_BUILD'))
+              print(json.dumps(report, sort_keys=True))
+          except GuardError as exc:
+              # Only locally generated error codes; no provider payload or secret values.
+              print(json.dumps({'status': 'FAIL_DEPLOY_B4L_CONFIG_GUARD_OFF', 'code': str(exc),
+                                'automatic_rollback': False}))
+              raise SystemExit(2)
+          except Exception:
+              print(json.dumps({'status': 'FAIL_DEPLOY_B4L_CONFIG_GUARD_OFF', 'code': 'UNEXPECTED_ERROR',
+                                'automatic_rollback': False}))
+              raise SystemExit(2)
 
 images:
   - "europe-west1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/mm-ai-ingest/mm-ai-ingest-prod:$COMMIT_SHA"
