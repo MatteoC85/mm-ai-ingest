@@ -6,6 +6,7 @@ provider; canonical Core activation remains the separate B4o gate.
 """
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 import hmac
 import math
@@ -16,7 +17,10 @@ from ..authority.contracts import (AUTHORITY_VERSION, ApplicationBoundary,
     ApplicationGrant, AuthorityError, AuthorityLimits, AuthorityMeter)
 from ..authority.bubble_directory import BubbleConnection, BubbleDirectory, _json_object
 from ..authority.policy import BubbleAuthority, BubbleSchema, SourceSchema
-from ..evidence.contracts import SourceType
+from ..evidence.contracts import SourceType, SourceIdentity
+from ..evidence.response_authority import make_response_guard, ResponseSourceAuthorityError
+from ..retrieval.supplemental_evidence import storage_key
+from .request_flow import RequestFlowGuards
 from ..retrieval.chunk_evidence import ChunkReadScope
 
 MODE_VARIABLE = "MM_ASK_REQUEST_AUTHORITY"
@@ -124,20 +128,24 @@ def authorize_http_request(payload, *, service_secret: object, application_secre
 
 
 def protected_call(payload, service_secret, *, authorized: AuthorizedCall,
-                   delegate: Callable) -> dict:
+                   delegate: Callable, response_guard: Callable | None = None) -> dict:
     """Check current authorized application context before execution and release.
 
     Delegate must have its response caches disabled until B4n adds source-safe
     re-use. This function does not claim to authorize legacy citation provenance
     or source revocation hidden inside a still-legacy callback.
     """
-    if type(authorized) is not AuthorizedCall or not callable(delegate):
+    if (type(authorized) is not AuthorizedCall or not callable(delegate)
+            or (response_guard is not None and not callable(response_guard))):
         raise AuthorityError("AUTHORITY_CONFIGURATION_INVALID")
     authorized.check(payload)
     result = None
     try:
         result = delegate(payload, service_secret)
         authorized.check(payload)
+        if response_guard is not None:
+            result = response_guard(result)
+            authorized.check(payload)
         if type(result) is not dict or type(result.get("meta", {})) is not dict:
             raise AuthorityError("AUTHORITY_RESPONSE_INVALID")
     except AuthorityError as exc:
@@ -180,3 +188,148 @@ def public_error(exc: AuthorityError) -> dict:
             "error": {"code": exc.code, "message": exc.code},
             "answer": "", "citations": [], "rg_links": [],
             "meta": {**accounting, "cacheable": False, "semantic_cacheable": False}}
+
+
+RESPONSE_FLOW_GUARD_VERSION = "ask-response-flow-guards-p6b4o-v1"
+
+
+class ResponseGuardOwner:
+    """One HTTP request's CURRENT source guards; B4o response-flow substep.
+
+    The application boundary remains Bubble. This owner does not create grants,
+    EvidenceSession, new readers or another Core. It does not infer ownership
+    from citation text, cached manifests or retrieval. Every successful source
+    check obtains a fresh allowance from the existing application provider.
+
+    Lookup proof mismatch is deliberately a cache miss, not a poisoned request.
+    Provider/configuration/lifetime failures are sticky. Store/final proof
+    failures are sticky too: a swallowed store denial cannot release an answer.
+    protected_call performs a final current-source check before release and
+    retains execution accounting when authority is lost after model execution.
+
+    This is source identity/ownership validation, NOT full occurrence lineage,
+    URL validity, answer entailment or end-to-end canonical activation. Protected
+    response cache remains disabled until the complete B4o composition gate.
+    """
+    def __init__(self, authorized: AuthorizedCall):
+        if type(authorized) is not AuthorizedCall:
+            raise AuthorityError("AUTHORITY_CONFIGURATION_INVALID")
+        self._authorized = authorized
+        self._payload = authorized.payload
+        self._scope = authorized.scope
+        self._key = self._payload_key()
+        self._active = True
+        self._fault = None
+        self._guards = RequestFlowGuards(self.lookup, self.store, self.final, self.check)
+
+    def _payload_key(self):
+        value = self._payload
+        return deepcopy(tuple(getattr(value, name, None) for name in (
+            "company_id", "machine_id", "ai_scope", "document_ids", "bubble_document_id",
+            "query", "language", "top_k", "debug")))
+
+    @property
+    def guards(self) -> RequestFlowGuards:
+        self.check()
+        return self._guards
+
+    def _fail(self, code: str):
+        if self._fault is None:
+            self._fault = AuthorityError(code)
+        raise self._fault
+
+    def check(self) -> None:
+        if self._fault is not None:
+            raise self._fault
+        if not self._active:
+            self._fail("AUTHORITY_REQUEST_EXPIRED")
+        try:
+            if (self._authorized.payload is not self._payload
+                    or self._authorized.scope != self._scope
+                    or self._payload_key() != self._key):
+                self._fail("AUTHORITY_SCOPE_CHANGED")
+        except AuthorityError:
+            raise
+        except Exception:
+            self._fail("AUTHORITY_REQUEST_INVALID")
+
+    def _current(self) -> frozenset[SourceIdentity]:
+        self.check()
+        try:
+            self._authorized.check(self._payload)
+            current = self._authorized.provider.current_sources(
+                self._authorized.grant, self._scope)
+            self.check()
+            if (type(current) is not frozenset
+                    or any(type(source) is not SourceIdentity
+                        or not self._scope.permits(source.scope.company_id,
+                            source.scope.machine_id, storage_key(source)) for source in current)):
+                self._fail("AUTHORITY_RESPONSE_INVALID")
+            return current
+        except AuthorityError as exc:
+            self._fault = exc
+            raise
+        except Exception:
+            self._fail("AUTHORITY_PROVIDER_UNAVAILABLE")
+
+    def _validate(self, response: dict, *, cached: bool, terminal: bool) -> dict:
+        current = self._current()
+        try:
+            # Pass detached data: a cache entry must not gain or share authority
+            # metadata by aliasing a response object mutated later by presentation.
+            result = make_response_guard(
+                company_id=self._scope.company_id,
+                machine_id="" if self._scope.ai_scope == "company_general" else (self._scope.machine_id or ""),
+                ai_scope=self._scope.ai_scope,
+                current_allowed_sources=current,
+                require_existing_manifest=cached,
+            )(deepcopy(response))
+        except ResponseSourceAuthorityError:
+            if terminal:
+                self._fail("AUTHORITY_RESPONSE_INVALID")
+            raise
+        except Exception:
+            self._fail("AUTHORITY_RESPONSE_INVALID")
+        self.check()
+        return result
+
+    def lookup(self, response: dict) -> dict:
+        return self._validate(response, cached=True, terminal=False)
+
+    def store(self, response: dict) -> dict:
+        # A miss is allowed for cache lookup, never as release authorization.
+        return self._validate(response, cached=True, terminal=True)
+
+    def final(self, response: dict) -> dict:
+        self.check()
+        if type(response) is not dict or type(response.get("meta", {})) is not dict:
+            self._fail("AUTHORITY_RESPONSE_INVALID")
+        if response.get("ok") is False and response.get("status") == "error":
+            # Do not make an already content-free technical failure depend on a
+            # new provider read. Never release an error carrying a draft/source.
+            result = deepcopy(response)
+            for name in ("answer", "answer_html"):
+                result[name] = ""
+            for name in ("citations", "rg_links", "candidates"):
+                if name in result or name in ("citations", "rg_links"):
+                    result[name] = []
+            result.pop("_assistant_core_validation_evidence", None)
+            result["meta"] = {**result.get("meta", {}),
+                "cacheable": False, "semantic_cacheable": False}
+            return result
+        result = self._validate(response, cached=False, terminal=True)
+        result["meta"] = {**result.get("meta", {}),
+            "response_flow_guard": {"version": RESPONSE_FLOW_GUARD_VERSION,
+                "current_source_authority_checked": True,
+                "canonical_evidence_active": False}}
+        return result
+
+    def close(self) -> None:
+        # Idempotent even on exceptions. Retained guard callbacks then expire.
+        self._active = False
+        self._authorized = None
+        self._payload = None
+        self._key = None
+
+    def __repr__(self):
+        return "ResponseGuardOwner(<request-owned>)"

@@ -10964,6 +10964,7 @@ def _v13_cache_lookup(
     scope: dict,
     language: str,
     debug: bool,
+    source_guard_fn: Optional[Callable[[dict], dict]] = None,
 ) -> Optional[dict]:
     return _semantic_cache.cache_lookup(
         mode=mode,
@@ -10974,6 +10975,7 @@ def _v13_cache_lookup(
         language=language,
         debug=debug,
         runtime_globals=globals(),
+        **({"source_guard_fn": source_guard_fn} if source_guard_fn is not None else {}),
     )
 
 
@@ -10995,6 +10997,7 @@ def _v13_cache_store(
     language: str,
     response: dict,
     debug: bool,
+    source_guard_fn: Optional[Callable[[dict], dict]] = None,
 ) -> None:
     return _semantic_cache.cache_store(
         mode=mode,
@@ -11006,6 +11009,7 @@ def _v13_cache_store(
         response=response,
         debug=debug,
         runtime_globals=globals(),
+        **({"source_guard_fn": source_guard_fn} if source_guard_fn is not None else {}),
     )
 
 
@@ -18390,7 +18394,10 @@ def _assistant_core_production_readers(*, request, session, authorized, invoke):
 
 def _assistant_core_authorized_ask_sync(payload, x_ai_internal_secret, *,
         x_mm_app_authority, authority_environment):
-    """Protected request path; response cache disabled until the B4n gate."""
+    """B4o response guards connected; protected cache still disabled.
+
+    This substep is not full canonical evidence composition/activation.
+    """
     try:
         authorized = _application_authority.authorize_http_request(payload,
             service_secret=x_ai_internal_secret, application_secret=x_mm_app_authority,
@@ -18398,11 +18405,15 @@ def _assistant_core_authorized_ask_sync(payload, x_ai_internal_secret, *,
         runtime = _dataclass_replace(_assistant_core_request_flow_runtime(),
             _v13_cache_lookup=lambda **kwargs: None,
             _v13_cache_store=lambda **kwargs: None)
-        def uncached(value, secret):
-            return _ask_request_flow.run_sync(value, secret,
-                requested_mode=MODE_ASK, runtime=runtime)
-        return _application_authority.protected_call(payload, x_ai_internal_secret,
-            authorized=authorized, delegate=uncached)
+        owner = _application_authority.ResponseGuardOwner(authorized)
+        try:
+            def uncached(value, secret):
+                return _ask_request_flow.run_sync(value, secret,
+                    requested_mode=MODE_ASK, runtime=runtime, guards=owner.guards)
+            return _application_authority.protected_call(payload, x_ai_internal_secret,
+                authorized=authorized, delegate=uncached, response_guard=owner.final)
+        finally:
+            owner.close()
     except _AuthorityError as exc:
         return _application_authority.public_error(exc)
 

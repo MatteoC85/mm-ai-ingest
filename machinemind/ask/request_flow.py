@@ -66,6 +66,38 @@ class RequestFlowRuntime:
     run_core: Callable[..., Any]
 
 
+
+@dataclass(frozen=True, slots=True, repr=False)
+class RequestFlowGuards:
+    """Trusted request-local callbacks, not a portable authorization manifest.
+
+    The boundary owner provides and expires these callbacks. Cache proof failures
+    may be misses; its check callback must re-raise latched provider/lifetime
+    failures even when a cache or legacy consumer swallowed their exception.
+    This bundle does not create EvidenceSession, authorize retrieval, or enable
+    any cache. With guards=None the legacy flow and collaborator calls are exact.
+    """
+    lookup: Callable[[dict], dict]
+    store: Callable[[dict], dict]
+    final: Callable[[dict], dict]
+    check: Callable[[], None]
+
+    def __post_init__(self) -> None:
+        if not all(callable(getattr(self, key)) for key in ("lookup", "store", "final", "check")):
+            raise TypeError("four explicit request-owned guard callbacks required")
+
+
+def _guarded_output(response: dict, guards: RequestFlowGuards | None) -> dict:
+    if guards is None:
+        return response
+    guards.check()
+    result = guards.final(response)
+    guards.check()
+    if type(result) is not dict:
+        raise TypeError("final response guard must return a mapping")
+    return result
+
+
 def precision_fact_rescue(
     *, q: str, company_id: str, machine_id: str,
     doc_ids: Optional[list[str]], bubble_document_id: Optional[str],
@@ -172,7 +204,12 @@ def precision_fact_rescue(
 
 
 def run_sync(payload: Any, x_ai_internal_secret: Optional[str], *,
-             requested_mode: str, runtime: RequestFlowRuntime) -> dict:
+             requested_mode: str, runtime: RequestFlowRuntime,
+             guards: RequestFlowGuards | None = None) -> dict:
+    if guards is not None and type(guards) is not RequestFlowGuards:
+        raise TypeError("typed request flow guards required")
+    if guards is not None and requested_mode != "ask":
+        raise ValueError("response authority flow is ASK-only")
     AI_INTERNAL_SECRET = runtime.AI_INTERNAL_SECRET
     ASK_MAX_TOP_K = runtime.ASK_MAX_TOP_K
     AssistantCoreRequest = runtime.AssistantCoreRequest
@@ -247,11 +284,21 @@ def run_sync(payload: Any, x_ai_internal_secret: Optional[str], *,
             cache_scope["_root_review_packet_policy"] = _retrieval_review_packet.POLICY_VERSION
             cache_scope["_root_review_decision_policy"] = _retrieval_review_references.POLICY_VERSION
 
+        # B4o: guard arguments are absent (not just None) on the legacy path.
+        # Provider/lifetime faults remain terminal despite cache's broad catch.
+        if guards is not None:
+            guards.check()
+        lookup_guard = {"source_guard_fn": guards.lookup} if guards is not None else {}
+        store_guard = {"source_guard_fn": guards.store} if guards is not None else {}
+
         # Reuse only an exact request with a complete current-policy interpretation.
         cached = _v13_cache_lookup(
             mode=requested_mode, q=q, company_id=company_id, machine_id=machine_id,
             scope=cache_scope, language=response_language, debug=bool(payload.debug),
+            **lookup_guard,
         )
+        if guards is not None:
+            guards.check()
         if cached is not None and requested_mode == MODE_ROOT_CAUSE:
             cached_basis = (cached.get("meta") or {}).get(_retrieval_diagnostic_query.BASIS_METADATA_KEY) or {}
             # A semantic neighbour cannot transfer its current-observation proof.
@@ -301,12 +348,13 @@ def run_sync(payload: Any, x_ai_internal_secret: Optional[str], *,
                     rescued = _assistant_ui_finalize_response(
                         rescued, language=response_language
                     )
-                    return _assistant_core_attach_runtime_meta(
+                    return _guarded_output(_assistant_core_attach_runtime_meta(
                         rescued, budget, debug=bool(payload.debug)
-                    )
+                    ), guards)
             budget.route = "assistant_core_semantic_cache"
             cached = _assistant_ui_finalize_response(cached, language=response_language)
-            return _assistant_core_attach_runtime_meta(cached, budget, debug=bool(payload.debug))
+            return _guarded_output(_assistant_core_attach_runtime_meta(
+                cached, budget, debug=bool(payload.debug)), guards)
 
         request = AssistantCoreRequest(
             query=q,
@@ -332,6 +380,8 @@ def run_sync(payload: Any, x_ai_internal_secret: Optional[str], *,
         )
         precision_rescued = False
         final = run_core(request)
+        if guards is not None:
+            guards.check()
         if requested_mode == MODE_ROOT_CAUSE:
             basis_summary = request.metadata.get(_retrieval_diagnostic_query.BASIS_METADATA_KEY)
             if isinstance(basis_summary, dict):
@@ -379,6 +429,8 @@ def run_sync(payload: Any, x_ai_internal_secret: Optional[str], *,
                 final = rescued
                 precision_rescued = True
                 budget.route = "assistant_core_precision_fact_rescue"
+        if guards is not None:
+            guards.check()
         final = _assistant_core_clear_unsupported_sources(final)
         final = _assistant_ui_finalize_response(final, language=response_language)
         effective_mode = str(final.get("effective_mode") or requested_mode)
@@ -389,6 +441,7 @@ def run_sync(payload: Any, x_ai_internal_secret: Optional[str], *,
                 if routed else f"assistant_core_{effective_mode}"
             )
         final = _assistant_core_attach_runtime_meta(final, budget, debug=bool(payload.debug))
+        final = _guarded_output(final, guards)
         _v13_cache_store(
             mode=requested_mode,
             q=q,
@@ -398,7 +451,10 @@ def run_sync(payload: Any, x_ai_internal_secret: Optional[str], *,
             language=response_language,
             response=final,
             debug=bool(payload.debug),
+            **store_guard,
         )
+        if guards is not None:
+            guards.check()
         return final
     except _V13BudgetExceeded as exc:
         return _assistant_core_budget_response(
