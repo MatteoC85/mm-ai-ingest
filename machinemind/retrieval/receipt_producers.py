@@ -339,7 +339,8 @@ class _PreparationTrace:
     Identity maps only objects materialized from explicit session handles or
     copies reported at their creation sites. Strong references prevent ID reuse.
     Snapshots are independent of collaborator-owned mutable dictionaries.
-    Only terminal views are committed to the existing session, in one batch.
+    Terminal views are committed in one batch. Optional anchored source seeds
+    are registered earlier at their exact call boundary in the same session.
     """
 
     def __init__(self, *, limits, max_records, max_bytes):
@@ -509,12 +510,21 @@ def prepare_records(*, request: Any, session: AskEvidenceSession,
                     source_callbacks: dict[str, Callable[..., tuple[RecordHandle, ...]]],
                     authorize: Callable[[Any], frozenset[SourceIdentity]],
                     invoke: Callable[..., Any], max_trace_records: int,
-                    max_trace_bytes: int) -> tuple[dict, tuple[AskSelection, ...]]:
+                    max_trace_bytes: int,
+                    anchored_source_callbacks: dict[str, Callable] | None = None
+                    ) -> tuple[dict, tuple[AskSelection, ...]]:
     """Run the REAL P4 ASK preparation, retaining its original policy/heuristics.
 
     The caller supplies the existing request session/owner, CURRENT authority,
     exact input collection handles, explicit trace capacities, and P4 runtime.
     This is not a new router/Core/ACL service. No model, SQL or embedding is added.
+
+    Optional anchored_source_callbacks for neighbors/sections replace the raw
+    candidates argument with candidate_handles, registered at the call boundary
+    from the trace's exact creation-site parents. They cannot discover origin by
+    matching IDs/text or receive caller-supplied grants. Normal callbacks keep
+    their original signatures; overlapping registrations are rejected. Seed views
+    already registered remain in the same session if later work fails.
 
     Three optional source_callbacks use the corresponding original signatures:
     catalog, neighbors, sections. If a reached branch lacks its adapter, it fails
@@ -554,6 +564,12 @@ def prepare_records(*, request: Any, session: AskEvidenceSession,
                 or any(k not in {"catalog", "neighbors", "sections"}
                        or not callable(v) for k, v in source_callbacks.items())):
             raise EvidenceProductionError("explicit preparation source adapters required")
+        anchored = {} if anchored_source_callbacks is None else anchored_source_callbacks
+        if (type(anchored) is not dict
+                or any(k not in {"neighbors", "sections"} or not callable(v)
+                       for k, v in anchored.items())
+                or set(anchored).intersection(source_callbacks)):
+            raise EvidenceProductionError("distinct explicit anchored source adapters required")
         before = invoke(authorize, request, request)
         _, limits = session.read_contract(request=request, current_allowed_sources=before)
         journal = _PreparationTrace(limits=limits, max_records=max_trace_records,
@@ -574,13 +590,32 @@ def prepare_records(*, request: Any, session: AskEvidenceSession,
 
             def source(name, *args, **kwargs):
                 def read():
-                    if name not in source_callbacks:
+                    if name not in source_callbacks and name not in anchored:
                         raise EvidenceProductionError("required preparation source adapter missing")
                     current = invoke(authorize, request, request)
                     session.read_contract(request=request, current_allowed_sources=current)
                     session.records(request=request, handles=tuple(journal.roots),
                                     current_allowed_sources=current)
-                    handles = invoke(source_callbacks[name], request, *args, **kwargs)
+                    if name in anchored:
+                        # The ORIGINAL preparation algorithm supplies objects
+                        # known by the journal, including its copies/merges.
+                        # Capture their parents BEFORE calling the real reader.
+                        params = dict(kwargs)
+                        seeds = params.pop("candidates", None)
+                        if (args or type(seeds) is not list
+                                or "candidate_handles" in params
+                                or len(seeds) > limits.assembly.max_occurrences):
+                            raise EvidenceProductionError("explicit preparation seed occurrences required")
+                        views = tuple((journal.entry(row)[2], deepcopy(row)) for row in seeds)
+                        seed_handles = session.derive_batch(request=request, views=views,
+                            operation=PREPARATION_VERSION + ":source-seeds:" + name,
+                            current_allowed_sources=current)
+                        handles = invoke(anchored[name], request,
+                                         candidate_handles=seed_handles, **params)
+                        session.records(request=request, handles=seed_handles,
+                            current_allowed_sources=invoke(authorize, request, request))
+                    else:
+                        handles = invoke(source_callbacks[name], request, *args, **kwargs)
                     if (type(handles) is not tuple or len(handles) > limits.assembly.max_occurrences
                             or any(type(h) is not RecordHandle for h in handles)):
                         raise EvidenceProductionError("source adapter must return bounded explicit handles")

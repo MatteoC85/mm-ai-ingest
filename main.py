@@ -18399,7 +18399,7 @@ def _assistant_core_production_readers(*, request, session, authorized, invoke):
 
 
 def _assistant_core_intake_factory(**owned):
-    """B4o real canonical intake; preparation/consumers remain gated, OFF only."""
+    """B4o intake/preparation on one session; consumers remain gated, OFF only."""
     intake = _ask_core_intake.CoreIntakeRuntime(
         initial=_assistant_core_initial_retrieval_runtime(),
         neutral=_assistant_core_neutral_retrieval_runtime(),
@@ -18448,14 +18448,15 @@ def _assistant_core_intake_factory(**owned):
     return _ask_core_intake.bind_core_intake(**owned, core=_ASSISTANT_CORE_ENGINE,
         runtimes=_ask_request_binding.AskRuntimeFactories(
             execution=_assistant_core_ask_execution_runtime,
-            validation=_assistant_core_ask_validation_runtime), runtime=intake)
+            validation=_assistant_core_ask_validation_runtime), runtime=intake,
+        preparation=_assistant_core_prepare_evidence_runtime())
 
 
 def _assistant_core_authorized_ask_sync(payload, x_ai_internal_secret, *,
         x_mm_app_authority, authority_environment):
     """B4o request-owned Core intake plus existing scalar/response guards.
 
-    Canonical preparation/consumers stop at an explicit pending boundary.
+    Canonical synthesis/validation/repair stop at an explicit pending boundary.
     The legacy OFF HTTP branch is untouched; protected cache remains disabled.
     """
     try:

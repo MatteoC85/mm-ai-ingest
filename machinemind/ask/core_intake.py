@@ -5,9 +5,10 @@ client flag. The existing B4j/B4k producers acquire through B4l's real readers a
 retain exact selections. The Core input port consumes those selections, not an
 ID/text/score search over the results. Default OFF remains in main.
 
-This is deliberately the INTAKE lot, not complete canonical ASK. Preparation
-and synthesis contain not-yet-composed source/derivation callbacks. They stop at
-an explicit technical boundary rather than falling back to untracked evidence.
+Intake and optional P4 preparation share this lifetime. Preparation uses the
+existing producer and three real scoped readers with explicit seed occurrences.
+Synthesis/validation/repair remain gated at their next uncomposed boundary;
+no legacy source-acquiring callback is used as a fallback.
 The same owner remains alive for the existing scalar rescue on genuine no-source
 or refusal results; technical errors cannot be converted to successful absence.
 """
@@ -82,7 +83,7 @@ class _CoreIntake:
     serialized into response metadata. Retained callbacks expire at Core return.
     """
     def __init__(self, *, request, session, readers, authorize, invoke,
-                 core, runtimes, runtime):
+                 core, runtimes, runtime, preparation=None):
         if (type(session) is not AskEvidenceSession
                 or type(readers) is not ProductionReaderAdapters
                 or type(core) is not AssistantCoreV2
@@ -91,6 +92,10 @@ class _CoreIntake:
                 or type(runtime) is not CoreIntakeRuntime
                 or not callable(authorize) or not callable(invoke)):
             raise CoreIntakeError("existing Core/session/readers and owner required")
+        if (preparation is not None
+                and type(preparation) is not orchestration.AssistantCorePrepareEvidenceRuntime):
+            raise CoreIntakeError("explicit existing preparation runtime required")
+        self.preparation, self._prepared = preparation, False
         self.request, self.session, self.readers = request, session, readers
         self.authorize, self.owner_invoke = authorize, invoke
         self.core, self.runtimes, self.runtime = core, runtimes, runtime
@@ -313,6 +318,8 @@ class _CoreIntake:
                 if any(type(rows) is not list or rows for rows in data.values()):
                     raise CoreIntakeError("output source derivation not composed")
                 return tuple(AskSelection(name, ()) for name in data)
+            if self._prepared:
+                allowed.update({"core.prepare.output", "core.prepare_ask.input"})
             if stage not in allowed or self._selection is None:
                 raise CoreIntakeError("canonical consumer composition pending: " + str(stage))
             self.session.admission(request=request, retrieval=data,
@@ -321,11 +328,52 @@ class _CoreIntake:
         return self.invoke(work, request)
 
     def prepare(self, request, data, decision):
-        # Do not execute source-acquiring legacy preparation behind a claimed
-        # canonical port. The next lot must connect prepare_records + its three
-        # actual source adapters and consumer creation-site lineage.
+        """Same P4 policy, now with exact input and source-creation lineage.
+
+        Catalog is a machine-wide read, inapplicable to narrower scopes. The
+        anchored neighbors/sections callbacks receive handles created by the
+        preparation journal, never reconstructed from text or citation IDs.
+        The next consumer boundary still fails closed until it is composed.
+        """
         def work():
-            raise CoreIntakeError("canonical preparation/consumer composition pending")
+            if self.preparation is None:
+                raise CoreIntakeError("canonical preparation/consumer composition pending")
+            if self._prepared:
+                raise CoreIntakeError("duplicate preparation boundary")
+            self.select(request, data, decision, "core.prepare.input")
+
+            def catalog(req, **params):
+                self._check(req)
+                scope = self._scope()
+                if scope.ai_scope != "machine_all":
+                    return ()
+                return self.readers.candidate_handles("read_machine_catalog_page_evidence", **params)
+
+            def neighbors(**params):
+                return self.readers.candidate_handles("read_assurance_neighbor_page_evidence",
+                    **self._parameters(params, selectors=False, language=True),
+                    response_language=request.response_language)
+
+            def sections(*, request, **params):
+                self._check(request)
+                return self.readers.candidate_handles("read_enumeration_page_evidence", **params)
+
+            rt = replace(self.preparation,
+                _v13_merge_candidates=ranking.v13_merge_candidates,
+                _assistant_core_overview_catalog_candidates=lambda rows, **kw:
+                    source_management.assistant_core_overview_catalog_candidates(rows,
+                        runtime=source_management.AssistantCoreOverviewCatalogCandidatesRuntime(
+                            self.preparation._assistant_core_candidate_source_type), **kw))
+            result, selections = producers.prepare_records(request=request,
+                session=self.session, retrieval=data, selections=self._selection,
+                decision=decision, runtime=rt, source_callbacks={"catalog": catalog},
+                anchored_source_callbacks={"neighbors": neighbors, "sections": sections},
+                authorize=self.authorize, invoke=self.invoke,
+                max_trace_records=self.runtime.max_trace_records,
+                max_trace_bytes=self.runtime.max_trace_bytes)
+            self._remember(result["retrieval"], selections)
+            self._prepared = True
+            return result
         return self.invoke(work, request)
 
     def run(self, request):
@@ -347,6 +395,7 @@ class _CoreIntake:
             finally:
                 self.active = False
                 self._selection = None
+                self._prepared = False
         return self.owner_invoke(work, request)
 
 
