@@ -129,6 +129,7 @@ from machinemind.ask import request_flow as _ask_request_flow
 from machinemind.ask import request_binding as _ask_request_binding
 from machinemind.ask import request_evidence as _ask_request_evidence
 from machinemind.ask import core_intake as _ask_core_intake
+from machinemind.ask import generation as _ask_generation
 from machinemind.ask import acquisition as _ask_acquisition
 
 from machinemind.infrastructure.execution import (
@@ -1709,7 +1710,7 @@ def _sanitize_secret_like_answer_for_display(text: str) -> str:
     return t
 
 
-def _finalize_ask_response_for_ui(resp: dict, *, language: str = "it") -> dict:
+def _finalize_ask_response_for_ui(resp: dict, *, language: str = "it", citation_copy_fn=None) -> dict:
     if not isinstance(resp, dict):
         return resp
 
@@ -1751,6 +1752,8 @@ def _finalize_ask_response_for_ui(resp: dict, *, language: str = "it") -> dict:
                     max_sn = max(220, int(ASK_UI_MAX_SNIPPET_CLEAN_CHARS or 520))
                 if len(sn) > max_sn:
                     cc["snippet_clean"] = sn[:max_sn].rsplit(" ", 1)[0].strip() + "…"
+            if citation_copy_fn is not None:
+                citation_copy_fn(c, cc)
             cleaned.append(cc)
         citation_limit = (
             20
@@ -13181,6 +13184,47 @@ def _v13_extractive_fallback_answer(
         return parts[0], used
     return "\n\n".join(f"{idx}. {text}" for idx, text in enumerate(parts, start=1)), used
 
+def _assistant_core_generation_runtime() -> _ask_generation.AskGenerationRuntime:
+    return _ask_generation.AskGenerationRuntime(
+        ASK_UI_MAX_POINTS=ASK_UI_MAX_POINTS,
+        INFO_INTERFACE_NAVIGATION=INFO_INTERFACE_NAVIGATION,
+        INFO_NUMERIC_SPECIFICATION=INFO_NUMERIC_SPECIFICATION,
+        INFO_OTHER=INFO_OTHER,
+        INFO_PROCEDURE_FULL=INFO_PROCEDURE_FULL,
+        INFO_PROCEDURE_SEGMENT=INFO_PROCEDURE_SEGMENT,
+        INFO_SEQUENCE_SYNCHRONIZATION=INFO_SEQUENCE_SYNCHRONIZATION,
+        REQ_CHECKLIST=REQ_CHECKLIST,
+        REQ_INTERFACE_LOCATIONS=REQ_INTERFACE_LOCATIONS,
+        REQ_NUMERIC_VALUE=REQ_NUMERIC_VALUE,
+        REQ_ORDERED_ACTIONS=REQ_ORDERED_ACTIONS,
+        REQ_SAFETY_CONDITIONS=REQ_SAFETY_CONDITIONS,
+        REQ_STATE_SEQUENCE=REQ_STATE_SEQUENCE,
+        V13_FAST_CONTEXT_CHARS=V13_FAST_CONTEXT_CHARS,
+        V13_FAST_MAX_OUTPUT_TOKENS=V13_FAST_MAX_OUTPUT_TOKENS,
+        V13_FAST_MODEL=V13_FAST_MODEL,
+        V13_FAST_TIMEOUT_SECONDS=V13_FAST_TIMEOUT_SECONDS,
+        V13_HEAVY_CONTEXT_CHARS=V13_HEAVY_CONTEXT_CHARS,
+        V13_HEAVY_MAX_OUTPUT_TOKENS=V13_HEAVY_MAX_OUTPUT_TOKENS,
+        V13_HEAVY_MODEL=V13_HEAVY_MODEL,
+        V13_HEAVY_TIMEOUT_SECONDS=V13_HEAVY_TIMEOUT_SECONDS,
+        V13_MAX_EVIDENCE_ITEMS_ASK=V13_MAX_EVIDENCE_ITEMS_ASK,
+        _V13BudgetExceeded=_V13BudgetExceeded,
+        _ask_evidence_answer_schema=_ask_evidence_answer_schema,
+        _build_rg_links=_build_rg_links,
+        _dedup_text_values=_dedup_text_values,
+        _finalize_ask_response_for_ui=_finalize_ask_response_for_ui,
+        _localized_no_sources=_localized_no_sources,
+        _render_grounded_answer_points=_render_grounded_answer_points,
+        _sanitize_citations_for_response=_sanitize_citations_for_response,
+        _v13_assurance_prompt_block=_v13_assurance_prompt_block,
+        _v13_choose_ask_model=_v13_choose_ask_model,
+        _v13_extractive_fallback_answer=_v13_extractive_fallback_answer,
+        _v13_json_models=_v13_json_models,
+        _v13_sources_block=_v13_sources_block,
+        json=json,
+    )
+
+
 def _v13_generate_ask_response(
     *,
     q: str,
@@ -13191,232 +13235,10 @@ def _v13_generate_ask_response(
     narrow_scope: bool,
     debug: bool,
 ) -> dict:
-    contract = dict(retrieval.get("assistant_core_contract") or {})
-    overview_catalog_requested = bool(contract.get("overview_catalog_requested"))
-    machine_catalog_digest = str(contract.get("machine_catalog_digest") or "").strip()
-    candidates = list(retrieval.get("citations") or retrieval.get("candidates") or [])
-    evidence_limit = 24 if overview_catalog_requested else V13_MAX_EVIDENCE_ITEMS_ASK
-    candidates = candidates[:evidence_limit]
-    information_task = str(contract.get("information_task") or INFO_OTHER).strip().lower()
-    required_answer_types = {
-        str(x or "").strip().lower()
-        for x in (contract.get("required_answer_types") or [])
-        if str(x or "").strip()
-    }
-    if information_task == INFO_NUMERIC_SPECIFICATION:
-        required_answer_types.add(REQ_NUMERIC_VALUE)
-    elif information_task == INFO_INTERFACE_NAVIGATION:
-        required_answer_types.add(REQ_INTERFACE_LOCATIONS)
-    elif information_task == INFO_SEQUENCE_SYNCHRONIZATION:
-        required_answer_types.add(REQ_STATE_SEQUENCE)
-    elif information_task in {INFO_PROCEDURE_FULL, INFO_PROCEDURE_SEGMENT}:
-        required_answer_types.add(REQ_ORDERED_ACTIONS)
-    required_facets = _dedup_text_values(contract.get("required_facets") or [], limit=12)
-    fail_closed = bool(contract.get("fail_closed"))
-    if not candidates:
-        return {
-            "ok": True,
-            "status": "no_sources",
-            "answer": _localized_no_sources(response_language),
-            "language": response_language,
-            "citations": [],
-            "rg_links": [],
-            "top_k": top_k,
-            "similarity_max": None,
-        }
-
-    model, effort, reasoning_mode = _v13_choose_ask_model(
-        q,
-        retrieval,
-        narrow_scope=narrow_scope,
-    )
-    context_chars = V13_FAST_CONTEXT_CHARS if model == V13_FAST_MODEL else V13_HEAVY_CONTEXT_CHARS
-    if overview_catalog_requested:
-        context_chars = max(context_chars, 28000)
-    sources_block = _v13_sources_block(candidates, max_context_chars=context_chars)
-    if not sources_block:
-        return {
-            "ok": True,
-            "status": "no_sources",
-            "answer": _localized_no_sources(response_language),
-            "language": response_language,
-            "citations": [],
-            "rg_links": [],
-            "top_k": top_k,
-            "similarity_max": None,
-        }
-
-    system_msg = (
-        "You are MachineMind ASK, an evidence-grounded industrial documentation assistant. Use only SOURCES. "
-        "Answer the exact user question, not a nearby topic. Prefer exact-machine evidence over company-general evidence when relevance is comparable. "
-        "For procedures, return the actual ordered operations and conditions; for lists/tables, preserve all relevant items, labels, codes, values and units; for comparisons, keep the compared facts aligned. "
-        "Structured procedure/step/P&S records are first-class evidence. Manual text may support them, but generic legal, overview, installation or safety text cannot replace a specific answer. "
-        "For photo/video records, use metadata only and never claim visual/audio inspection. Do not expose citation ids or internal Bubble ids in visible text. "
-        "If SOURCES do not support the answer, return no_sources. Reply in the requested language."
-    )
-    if REQ_NUMERIC_VALUE in required_answer_types:
-        system_msg += " The answer must state the requested value with its unit/context; a nearby qualitative statement or another unrelated number is insufficient."
-    if REQ_INTERFACE_LOCATIONS in required_answer_types:
-        system_msg += " Name every requested screen/page/menu/location distinctly; mentioning the HMI or feature generically is insufficient."
-    if REQ_STATE_SEQUENCE in required_answer_types:
-        system_msg += " State the participating functions and their temporal/state order explicitly (what opens/closes/moves and when)."
-    if REQ_CHECKLIST in required_answer_types:
-        system_msg += " Include the requested practical checks as a compact checklist grounded in the sources."
-    if REQ_SAFETY_CONDITIONS in required_answer_types:
-        system_msg += " Include directly applicable authorization or safety conditions without replacing the requested technical answer."
-    if overview_catalog_requested:
-        system_msg += (
-            " For a machine overview, MACHINE_CATALOG is the authoritative recall inventory. "
-            "Inspect every catalog item before answering. Merge synonyms, but include every distinct "
-            "physical assembly and explicitly documented auxiliary system relevant to the machine "
-            "(including systems that score weakly against the wording of the question). Do not stop "
-            "after the first overview page or image, and do not present procedure names as physical "
-            "groups unless their descriptions identify the underlying assembly/system."
-        )
-    assurance_block = _v13_assurance_prompt_block(retrieval)
-    contract_block = (
-        f"INFORMATION_TASK: {information_task}\n"
-        f"REQUIRED_ANSWER_TYPES: {json.dumps(sorted(required_answer_types), ensure_ascii=False)}\n"
-        f"REQUIRED_FACETS: {json.dumps(required_facets, ensure_ascii=False)}\n"
-    )
-    catalog_block = (f"MACHINE_CATALOG:\n{machine_catalog_digest}\n\n" if machine_catalog_digest else "")
-    user_msg = (
-        f"QUESTION:\n{q}\n\nRESPONSE_LANGUAGE: {response_language}\n\n{contract_block}\n"
-        + catalog_block
-        + f"SOURCES:\n{sources_block}\n\n"
-        + (f"{assurance_block}\n\n" if assurance_block else "")
-        + "Return JSON only. Produce a concise but operationally complete answer, satisfy every supported required facet, and cite every point using citation_ids from SOURCES."
-    )
-
-    parsed: dict = {}
-    model_used = model
-    try:
-        parsed, model_used = _v13_json_models(
-            [
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_msg},
-            ],
-            models=[model, V13_FAST_MODEL] if model != V13_FAST_MODEL else [model],
-            json_schema=_ask_evidence_answer_schema(),
-            effort=effort,
-            reasoning_mode=reasoning_mode,
-            timeout=V13_HEAVY_TIMEOUT_SECONDS if model == V13_HEAVY_MODEL else V13_FAST_TIMEOUT_SECONDS,
-            max_output_tokens=V13_HEAVY_MAX_OUTPUT_TOKENS if model == V13_HEAVY_MODEL else V13_FAST_MAX_OUTPUT_TOKENS,
-            company_id=company_id,
-            purpose="ask_final_synthesis",
-        )
-    except _V13BudgetExceeded:
-        raise
-    except Exception as exc:
-        print("V13_ASK_SYNTHESIS_FAIL", str(exc)[:800])
-        parsed = {"answer_status": "no_sources", "grounded_points": []}
-
-    answer = ""
-    final_citations: list[dict] = []
-    synthesis_grounded = False
-    if str(parsed.get("answer_status") or "").strip().lower() == "answered":
-        dynamic_max_points = max(
-            1,
-            min(
-                8,
-                max(
-                    int(ASK_UI_MAX_POINTS or 5),
-                    len(required_facets) + (1 if len(required_answer_types) > 1 else 0),
-                ),
-            ),
-        )
-        answer, final_citations = _render_grounded_answer_points(
-            grounded_points=list(parsed.get("grounded_points") or []),
-            citations=candidates,
-            max_points=dynamic_max_points,
-            q=q,
-        )
-        synthesis_grounded = bool(answer and final_citations)
-
-    if (not answer or not final_citations) and fail_closed:
-        return {
-            "ok": True,
-            "status": "no_sources",
-            "answer": _localized_no_sources(response_language),
-            "language": response_language,
-            "citations": [],
-            "rg_links": [],
-            "top_k": top_k,
-            "similarity_max": (retrieval.get("metrics") or {}).get("top_similarity"),
-            "chat_model": model_used,
-            "meta": {
-                "cacheable": False,
-                "semantic_cacheable": False,
-                "degraded": True,
-                "degraded_reason": "assistant_core_synthesis_fail_closed",
-            },
-        }
-
-    if not answer or not final_citations:
-        answer, final_citations = _v13_extractive_fallback_answer(
-            candidates,
-            response_language=response_language,
-            max_points=min(2, top_k),
-            q=q,
-        )
-
-    if not answer or not final_citations:
-        return {
-            "ok": True,
-            "status": "no_sources",
-            "answer": _localized_no_sources(response_language),
-            "language": response_language,
-            "citations": [],
-            "rg_links": [],
-            "top_k": top_k,
-            "similarity_max": (retrieval.get("metrics") or {}).get("top_similarity"),
-            "chat_model": model_used,
-            "meta": {
-                "cacheable": False,
-                "semantic_cacheable": False,
-                "degraded": True,
-                "degraded_reason": "ask_synthesis_unavailable",
-            },
-        }
-
-    response_citations = _sanitize_citations_for_response(final_citations, company_id=company_id)
-    try:
-        rg_links = _build_rg_links(company_id, response_citations)
-    except Exception as exc:
-        print("RG_LINKS_FAIL", str(exc)[:500])
-        rg_links = []
-
-    resp = {
-        "ok": True,
-        "status": "answered",
-        "answer": answer,
-        "language": response_language,
-        "citations": response_citations,
-        "rg_links": rg_links,
-        "top_k": top_k,
-        "similarity_max": (retrieval.get("metrics") or {}).get("top_similarity"),
-        "chat_model": model_used if synthesis_grounded else "v13_extractive_fallback",
-        "meta": (
-            {"cacheable": True, "semantic_cacheable": True}
-            if synthesis_grounded
-            else {
-                "cacheable": False,
-                "semantic_cacheable": False,
-                "degraded": True,
-                "degraded_reason": "ask_extractive_fallback",
-            }
-        ),
-    }
-    if debug:
-        resp["debug"] = {
-            "v13_ask": {
-                "metrics": retrieval.get("metrics") or {},
-                "plan": retrieval.get("plan") or {},
-                "candidate_count": len(retrieval.get("candidates") or []),
-                "evidence_ids": [c.get("citation_id") for c in candidates],
-            }
-        }
-    return _finalize_ask_response_for_ui(resp, language=response_language)
+    return _ask_generation.generate_ask_response(
+        q=q, company_id=company_id, response_language=response_language,
+        top_k=top_k, retrieval=retrieval, narrow_scope=narrow_scope, debug=debug,
+        runtime=_assistant_core_generation_runtime())
 
 
 def _v13_root_cause_model(q: str, retrieval: dict) -> tuple[str, str, str]:
@@ -18449,7 +18271,8 @@ def _assistant_core_intake_factory(**owned):
         runtimes=_ask_request_binding.AskRuntimeFactories(
             execution=_assistant_core_ask_execution_runtime,
             validation=_assistant_core_ask_validation_runtime), runtime=intake,
-        preparation=_assistant_core_prepare_evidence_runtime())
+        preparation=_assistant_core_prepare_evidence_runtime(),
+        generation=_assistant_core_generation_runtime())
 
 
 def _assistant_core_authorized_ask_sync(payload, x_ai_internal_secret, *,

@@ -7,7 +7,8 @@ ID/text/score search over the results. Default OFF remains in main.
 
 Intake and optional P4 preparation share this lifetime. Preparation uses the
 existing producer and three real scoped readers with explicit seed occurrences.
-Synthesis/validation/repair remain gated at their next uncomposed boundary;
+Generic Document/XLSX generation is optional on this same lifetime.
+Structured/overview synthesis and validation/repair remain gated;
 no legacy source-acquiring callback is used as a fallback.
 The same owner remains alive for the existing scalar rescue on genuine no-source
 or refusal results; technical errors cannot be converted to successful absence.
@@ -20,6 +21,8 @@ from typing import Any, Callable
 
 from assistant_core_v2 import AssistantCoreV2, AssistantCoreHooks
 from .request_binding import AskRequestEvidence, AskRuntimeFactories, run_core_request
+from .execution import AskExecutionRuntime
+from .generation import AskGenerationRuntime, GenericGenerationEvidence
 from ..evidence.contracts import EvidenceContractError
 from ..evidence.ask_input import _same_value, ask_request_key
 from ..retrieval.ask_composition import AskEvidenceSession, AskSelection, RecordHandle
@@ -83,7 +86,7 @@ class _CoreIntake:
     serialized into response metadata. Retained callbacks expire at Core return.
     """
     def __init__(self, *, request, session, readers, authorize, invoke,
-                 core, runtimes, runtime, preparation=None):
+                 core, runtimes, runtime, preparation=None, generation=None):
         if (type(session) is not AskEvidenceSession
                 or type(readers) is not ProductionReaderAdapters
                 or type(core) is not AssistantCoreV2
@@ -95,6 +98,13 @@ class _CoreIntake:
         if (preparation is not None
                 and type(preparation) is not orchestration.AssistantCorePrepareEvidenceRuntime):
             raise CoreIntakeError("explicit existing preparation runtime required")
+        if generation is not None and type(generation) is not AskGenerationRuntime:
+            raise CoreIntakeError("explicit existing generation runtime required")
+        self.generation = generation
+        self._execution_snapshot = None
+        self._prepared_retrieval = self._synthesis_decision = self._generation_input = None
+        self._generation_used = False
+        self._generated_response = self._generated_selections = None
         self.preparation, self._prepared = preparation, False
         self.request, self.session, self.readers = request, session, readers
         self.authorize, self.owner_invoke = authorize, invoke
@@ -320,6 +330,17 @@ class _CoreIntake:
                 return tuple(AskSelection(name, ()) for name in data)
             if self._prepared:
                 allowed.update({"core.prepare.output", "core.prepare_ask.input"})
+            if self._prepared and self.generation is not None:
+                allowed.update({"synthesis.input", "synthesis.generate"})
+                if stage == "synthesis.input":
+                    if not _same_value(data, self._prepared_retrieval):
+                        raise CoreIntakeError("synthesis changed prepared metadata")
+                    self._synthesis_decision = deepcopy(decision)
+                elif stage == "synthesis.generate":
+                    if (self._synthesis_decision is None or decision != self._synthesis_decision
+                            or not _same_value(data, self._synthesis_contract(decision))):
+                        raise CoreIntakeError("generation changed prepared contract")
+                    self._generation_input = deepcopy(data)
             if stage not in allowed or self._selection is None:
                 raise CoreIntakeError("canonical consumer composition pending: " + str(stage))
             self.session.admission(request=request, retrieval=data,
@@ -373,8 +394,68 @@ class _CoreIntake:
                 max_trace_bytes=self.runtime.max_trace_bytes)
             self._remember(result["retrieval"], selections)
             self._prepared = True
+            self._prepared_retrieval = deepcopy(result["retrieval"])
             return result
         return self.invoke(work, request)
+
+    def _execution_factory(self):
+        runtime = self.runtimes.execution()
+        if type(runtime) is not AskExecutionRuntime or runtime.evidence_admission is not None:
+            raise CoreIntakeError("fresh existing execution runtime required")
+        self._execution_snapshot = runtime
+        return replace(runtime, _v13_generate_ask_response=self.generate)
+
+    def _synthesis_contract(self, decision):
+        """Verify the existing execution transform, including metadata outside lists.
+
+        These are exactly the contract/planner assignments in synthesize_ask.
+        No new semantic routing, retrieval, inference or model is performed.
+        """
+        if self._execution_snapshot is None or self._prepared_retrieval is None:
+            raise CoreIntakeError("generation requires prepared execution snapshot")
+        data = deepcopy(self._prepared_retrieval)
+        contract = {
+            **dict(data.get("assistant_core_contract") or {}),
+            "information_task": decision.information_task,
+            "required_answer_types": list(decision.required_answer_types),
+            "required_facets": list(decision.required_facets),
+            "facet_queries": [
+                {"facet": item.facet, "answer_type": item.answer_type,
+                 "must_cover": item.must_cover, "dense_queries": list(item.dense_queries),
+                 "lexical_queries": list(item.lexical_queries), "exact_terms": list(item.exact_terms),
+                 "preferred_source_types": list(item.preferred_source_types)}
+                for item in decision.facet_queries],
+            "missing_information": list(decision.missing_information), "fail_closed": True,
+        }
+        planner = dict(data.get("plan") or self._execution_snapshot._v13_fallback_plan(self.request.query))
+        planner["information_task"] = decision.information_task
+        planner["required_answer_types"] = list(decision.required_answer_types)
+        planner["required_facets"] = self._execution_snapshot._dedup_text_values(
+            list(planner.get("required_facets") or []) + list(decision.required_facets), limit=14)
+        planner["facet_queries"] = list(contract.get("facet_queries") or [])
+        planner["request_kind"] = decision.request_kind
+        data.update(assistant_core_contract=contract, plan=planner)
+        return data
+
+    def generate(self, **parameters):
+        def work():
+            if (self.generation is None or self._generation_input is None
+                    or self._generation_used):
+                raise CoreIntakeError("generation requires its one prepared input")
+            expected = dict(q=self.request.query, company_id=self.request.company_id,
+                response_language=self.request.response_language, top_k=self.request.top_k,
+                retrieval=self._generation_input, narrow_scope=self.request.narrow_scope,
+                debug=self.request.debug)
+            if not _same_value(parameters, expected):
+                raise CoreIntakeError("generation request/scope/metadata drift")
+            self._generation_used = True
+            operation = GenericGenerationEvidence(request=self.request, session=self.session,
+                readers=self.readers, authorize=self.authorize, invoke=self.invoke,
+                runtime=self.generation)
+            result, selections = operation.run(parameters["retrieval"], self._selection)
+            self._generated_response, self._generated_selections = deepcopy(result), selections
+            return result
+        return self.invoke(work, self.request)
 
     def run(self, request):
         def work():
@@ -391,11 +472,17 @@ class _CoreIntake:
                 binding = AskRequestEvidence(session=self.session,
                     authorize=self.authorize, select=self.select)
                 return run_core_request(request, core=local_core,
-                    runtimes=self.runtimes, evidence=binding, acquisition=None)
+                    runtimes=(self.runtimes if self.generation is None else
+                        AskRuntimeFactories(execution=self._execution_factory,
+                                            validation=self.runtimes.validation)),
+                    evidence=binding, acquisition=None)
             finally:
                 self.active = False
                 self._selection = None
                 self._prepared = False
+                self._execution_snapshot = None
+                self._prepared_retrieval = self._synthesis_decision = self._generation_input = None
+                self._generated_response = self._generated_selections = None
         return self.owner_invoke(work, request)
 
 
