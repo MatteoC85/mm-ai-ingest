@@ -60,8 +60,17 @@ steps:
           'MM_AUTHORITY_LIMITS_JSON': json.dumps(LIMITS, separators=(',', ':')),
       }
       
+      PHASE = 'INITIALIZE'
+      
+      
       class GuardError(RuntimeError):
           pass
+      
+      
+      def phase(value):
+          global PHASE
+          PHASE = value
+          print('DEPLOY_GUARD_PHASE=' + value, flush=True)
       
       def require(ok, code):
           if not ok:
@@ -74,7 +83,11 @@ steps:
                                       timeout=900)
           except (OSError, subprocess.TimeoutExpired):
               raise GuardError('GCLOUD_NOT_COMPLETED') from None
-          require(result.returncode == 0, 'GCLOUD_COMMAND_FAILED')
+          # Command family only: never echo args, stdout, stderr, or environment values.
+          if result.returncode != 0:
+              family = '_'.join(args[:3]) if args[:2] == ('run', 'services') else '_'.join(args[:2])
+              family = re.sub('[^A-Za-z0-9_]', '_', family).upper()
+              raise GuardError('GCLOUD_COMMAND_FAILED_' + family)
           return result.stdout.strip()
       
       def read_resource(kind, name):
@@ -128,9 +141,25 @@ steps:
                       'SECRET_REF_DIFF_'+name)
           return env
       
-      def ready(obj):
-          require(any(x.get('type') == 'Ready' and x.get('status') == 'True'
-                      for x in obj.get('status', {}).get('conditions', [])), 'NOT_READY')
+      def ready_state(obj):
+          items = [x for x in obj.get('status', {}).get('conditions', [])
+                   if isinstance(x, dict) and x.get('type') == 'Ready']
+          require(len(items) == 1 and items[0].get('status') in ('True', 'False', 'Unknown'),
+                  'READY_CONDITION_INVALID')
+          return items[0]['status']
+      
+      
+      def ready(obj, code='NOT_READY'):
+          require(ready_state(obj) == 'True', code)
+      
+      
+      def reconciled(obj, code):
+          # A Ready condition from an older generation does not validate the current spec.
+          generation = obj.get('metadata', {}).get('generation')
+          observed = obj.get('status', {}).get('observedGeneration')
+          require(type(generation) is int and generation > 0 and
+                  type(observed) is int and observed == generation, code)
+      
       
       def traffic(service):
           out = {}
@@ -172,10 +201,15 @@ steps:
               require(name not in names, 'REVISION_LIST_DUPLICATE')
               names.add(name)
           return names
-
+      
       def validate_candidate(before, service, revision, name, commit, image):
-          ready(service)
-          ready(revision)
+          reconciled(service, 'CANDIDATE_SERVICE_RECONCILING')
+          reconciled(revision, 'CANDIDATE_REVISION_RECONCILING')
+          ready(service, 'CANDIDATE_SERVICE_NOT_READY')
+          ready(revision, 'CANDIDATE_REVISION_NOT_READY')
+          require(service.get('status', {}).get('latestCreatedRevisionName') == name and
+                  service.get('status', {}).get('latestReadyRevisionName') == name,
+                  'CANDIDATE_NOT_CURRENT')
           require(revision.get('metadata', {}).get('name') == name, 'REVISION_NAME_MISMATCH')
           spec = template_spec(service)
           for candidate in (spec, revision.get('spec', {})):
@@ -215,21 +249,72 @@ steps:
                   require(body.get('commit_sha') == commit and body.get('revision') == revision,
                           'HEALTH_IDENTITY_MISMATCH')
       
+      
+      def validate_serving_baseline(before):
+          """Validate the serving revision, not a failed, zero-traffic latest attempt.
+      
+          An aggregate service Ready=False is acceptable ONLY for a reconciled failed
+          latest revision distinct from a proven healthy, OFF, 100%-traffic revision.
+          Missing/Unknown/pending states, split traffic and health failures still deny.
+          No revision is deleted and no traffic is changed here.
+          """
+          require(before.get('metadata', {}).get('name') == SERVICE, 'BASELINE_SERVICE_NAME_MISMATCH')
+          require(not before.get('metadata', {}).get('deletionTimestamp'), 'BASELINE_SERVICE_DELETING')
+          reconciled(before, 'BASELINE_SERVICE_RECONCILING')
+          configuration(template_spec(before))
+          prior = before.get('status', {}).get('latestReadyRevisionName')
+          require(isinstance(prior, str) and prior.startswith(SERVICE+'-'),
+                  'BASELINE_READY_REVISION_MISSING')
+          require(traffic(before) == {prior: 100}, 'BASELINE_NOT_STABLE_100')
+          previous = read_resource('revisions', prior)
+          require(previous.get('metadata', {}).get('name') == prior, 'BASELINE_REVISION_NAME_MISMATCH')
+          require(not previous.get('metadata', {}).get('deletionTimestamp'), 'BASELINE_REVISION_DELETING')
+          reconciled(previous, 'BASELINE_REVISION_RECONCILING')
+          ready(previous, 'BASELINE_TRAFFIC_REVISION_NOT_READY')
+          prior_env = configuration(previous.get('spec', {}))
+          commit = prior_env.get('COMMIT_SHA', {}).get('value')
+          require(isinstance(commit, str) and re.fullmatch('[0-9a-f]{40}', commit),
+                  'BASELINE_COMMIT_INVALID')
+          state = ready_state(before)
+          require(state in ('True', 'False'), 'BASELINE_SERVICE_STATE_UNSETTLED')
+          if state == 'False':
+              latest = before.get('status', {}).get('latestCreatedRevisionName')
+              require(isinstance(latest, str) and latest.startswith(SERVICE+'-') and latest != prior,
+                      'BASELINE_FAILURE_NOT_ISOLATED')
+              failed = read_resource('revisions', latest)
+              require(failed.get('metadata', {}).get('name') == latest and
+                      not failed.get('metadata', {}).get('deletionTimestamp'),
+                      'BASELINE_FAILED_REVISION_INVALID')
+              reconciled(failed, 'BASELINE_FAILED_REVISION_RECONCILING')
+              require(ready_state(failed) == 'False', 'BASELINE_LATEST_NOT_TERMINALLY_FAILED')
+          # Prove the public endpoint still belongs to the serving baseline. No ASK.
+          health(before.get('status', {}).get('url'), commit, prior)
+          print('BASELINE_TRAFFIC_READY_HEALTH_OFF_PASSED', flush=True)
+          return prior
+      
+      
+      def unchanged_baseline(before, current):
+          require(current.get('metadata', {}).get('generation') == before.get('metadata', {}).get('generation') and
+                  current.get('spec') == before.get('spec') and
+                  not current.get('metadata', {}).get('deletionTimestamp'), 'BASELINE_CHANGED_BEFORE_DEPLOY')
+          for key in ('latestCreatedRevisionName', 'latestReadyRevisionName', 'observedGeneration'):
+              require(current.get('status', {}).get(key) == before.get('status', {}).get(key),
+                      'BASELINE_CHANGED_BEFORE_DEPLOY')
+          require(traffic(current) == traffic(before), 'BASELINE_TRAFFIC_CHANGED_BEFORE_DEPLOY')
+      
+      
       def execute(project, commit, build):
           require(project == PROJECT, 'WRONG_PROJECT')
           require(isinstance(commit, str) and re.fullmatch('[0-9a-f]{40}', commit), 'INVALID_COMMIT_SHA')
           require(isinstance(build, str) and re.fullmatch('[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}', build),
                   'INVALID_BUILD_ID')
+          phase('VALIDATE_SERVING_BASELINE')
           before = read_resource('services', SERVICE)
-          ready(before)
-          configuration(template_spec(before))
+          prior = validate_serving_baseline(before)
           baseline_revisions = revision_names()
-          prior = before.get('status', {}).get('latestReadyRevisionName')
-          require(isinstance(prior, str) and prior.startswith(SERVICE+'-'),
-                  'BASELINE_READY_REVISION_MISSING')
-          prior_revision = read_resource('revisions', prior)
-          ready(prior_revision)
-          require(traffic(before) == {prior: 100}, 'BASELINE_NOT_STABLE_100')
+          require(prior in baseline_revisions and
+                  before.get('status', {}).get('latestCreatedRevisionName') in baseline_revisions,
+                  'BASELINE_REVISION_NOT_LISTED')
           image_root = 'europe-west1-docker.pkg.dev/'+PROJECT+'/cloud-run-source-deploy/mm-ai-ingest/'+SERVICE
           digest = gcloud('artifacts', 'docker', 'images', 'describe', image_root+':'+commit,
                           '--project='+PROJECT, '--format=value(image_summary.digest)')
@@ -241,10 +326,15 @@ steps:
           values = dict(ENV_VALUES, COMMIT_SHA=commit, MM_INGEST_LEDGER_AUTO_DDL='0')
           env_arg = '^@^'+'@'.join(key+'='+value for key, value in values.items())
           refs = ','.join(key+'='+ref['name']+':'+ref['key'] for key, ref in SECRET_REFS.items())
+          phase('RECHECK_BASELINE_BEFORE_DEPLOY')
+          unchanged_baseline(before, read_resource('services', SERVICE))
+          require(revision_names() == baseline_revisions, 'BASELINE_REVISIONS_CHANGED_BEFORE_DEPLOY')
+          phase('DEPLOY_CANDIDATE_NO_TRAFFIC')
           gcloud('run', 'deploy', SERVICE, '--project='+PROJECT, '--region='+REGION,
                  '--platform=managed', '--allow-unauthenticated', '--image='+image,
-                 '--revision-suffix='+suffix, '--no-traffic', '--update-env-vars='+env_arg,
+                 '--revision-suffix='+suffix, '--no-traffic', '--deploy-health-check', '--update-env-vars='+env_arg,
                  '--update-secrets='+refs, '--quiet')
+          phase('VALIDATE_CANDIDATE_BEFORE_PROMOTION')
           revision = read_resource('revisions', name)
           staged = read_resource('services', SERVICE)
           staged_revisions = revision_names()
@@ -254,20 +344,25 @@ steps:
           require(traffic(staged) == {prior: 100}, 'TRAFFIC_CHANGED_BEFORE_VALIDATION')
           # Promote the EXACT verified revision, never whichever happens to be "latest".
           print('CONFIG_GUARD_PASSED_BEFORE_PROMOTION', flush=True)
+          phase('PROMOTE_EXACT_CANDIDATE')
           gcloud('run', 'services', 'update-traffic', SERVICE, '--project='+PROJECT,
                  '--region='+REGION, '--to-revisions='+name+'=100', '--quiet')
+          phase('VALIDATE_AFTER_PROMOTION')
           final = read_resource('services', SERVICE)
+          revision = read_resource('revisions', name)
           final_revisions = revision_names()
           require(final_revisions - baseline_revisions == {name},
                   'CONCURRENT_OR_UNEXPECTED_REVISION')
           validate_candidate(before, final, revision, name, commit, image)
           require(traffic(final) == {name: 100}, 'FINAL_TRAFFIC_MISMATCH')
+          phase('HEALTH_AFTER_PROMOTION')
           health(final.get('status', {}).get('url'), commit, name)
           return {'status': 'PASS_DEPLOY_B4L_CONFIG_GUARD_OFF', 'revision': name,
                   'previous_revision': prior, 'commit_sha': commit, 'image_digest': digest,
                   'authority_mode': 'OFF', 'config_checked_before_traffic': True,
                   'unrelated_template_preserved': True, 'traffic_percent': 100,
-                  'health_checked_after_promotion': True, 'ask_calls': 0, 'ai_calls': 0}
+                  'health_checked_before_deploy': True, 'health_checked_after_promotion': True,
+                  'guard_version': 'b4o-serving-baseline-recovery-v1', 'ask_calls': 0, 'ai_calls': 0}
       
       if __name__ == '__main__':
           try:
@@ -276,11 +371,11 @@ steps:
               print(json.dumps(report, sort_keys=True))
           except GuardError as exc:
               # Only locally generated error codes; no provider payload or secret values.
-              print(json.dumps({'status': 'FAIL_DEPLOY_B4L_CONFIG_GUARD_OFF', 'code': str(exc),
+              print(json.dumps({'status': 'FAIL_DEPLOY_B4L_CONFIG_GUARD_OFF', 'code': str(exc), 'phase': PHASE,
                                 'automatic_rollback': False}))
               raise SystemExit(2)
           except Exception:
-              print(json.dumps({'status': 'FAIL_DEPLOY_B4L_CONFIG_GUARD_OFF', 'code': 'UNEXPECTED_ERROR',
+              print(json.dumps({'status': 'FAIL_DEPLOY_B4L_CONFIG_GUARD_OFF', 'code': 'UNEXPECTED_ERROR', 'phase': PHASE,
                                 'automatic_rollback': False}))
               raise SystemExit(2)
 
