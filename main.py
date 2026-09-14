@@ -128,6 +128,7 @@ from machinemind.ask import validation as _ask_validation
 from machinemind.ask import request_flow as _ask_request_flow
 from machinemind.ask import request_binding as _ask_request_binding
 from machinemind.ask import request_evidence as _ask_request_evidence
+from machinemind.ask import core_intake as _ask_core_intake
 from machinemind.ask import acquisition as _ask_acquisition
 
 from machinemind.infrastructure.execution import (
@@ -18397,12 +18398,65 @@ def _assistant_core_production_readers(*, request, session, authorized, invoke):
         raise
 
 
+def _assistant_core_intake_factory(**owned):
+    """B4o real canonical intake; preparation/consumers remain gated, OFF only."""
+    intake = _ask_core_intake.CoreIntakeRuntime(
+        initial=_assistant_core_initial_retrieval_runtime(),
+        neutral=_assistant_core_neutral_retrieval_runtime(),
+        refine=_assistant_core_refine_retrieval_runtime(),
+        score=_retrieval_candidate_ranking.V13ScoreCandidatesRuntime(
+            V13_SOURCE_RETRIEVAL_MIN_TITLE_SCORE=V13_SOURCE_RETRIEVAL_MIN_TITLE_SCORE,
+            _candidate_source_bias=_candidate_source_bias,
+            _candidate_specificity_score=_candidate_specificity_score,
+            _content_term_set=_content_term_set,
+            _count_query_tokens=_count_query_tokens,
+            _dedup_citations_by_snippet=_dedup_citations_by_snippet,
+            _extract_code_tokens=_extract_code_tokens,
+            _normalize_unicode_advanced=_normalize_unicode_advanced,
+            _source_type_from_document_id=_source_type_from_document_id,
+            _term_overlap_score=_term_overlap_score,
+            _v13_candidate_text=_v13_candidate_text,
+            _v13_real_semantic_similarity=_v13_real_semantic_similarity,
+        ),
+        titles=_retrieval_candidate_ranking.V13MergeSourceTitleCandidatesRuntime(
+            V13_MAX_EVIDENCE_ITEMS_ASK=V13_MAX_EVIDENCE_ITEMS_ASK,
+            V13_SOURCE_RETRIEVAL_MAX_CANDIDATES=V13_SOURCE_RETRIEVAL_MAX_CANDIDATES,
+            _v13_evidence_metrics=_v13_evidence_metrics,
+            _v13_merge_candidates=_v13_merge_candidates,
+            _v13_score_candidates=_v13_score_candidates,
+        ),
+        facets=_retrieval_candidate_ranking.AssistantCoreMergeFacetCandidatesRuntime(
+            _assistant_core_candidate_stable_key=_assistant_core_candidate_stable_key,
+            _dedup_text_values=_dedup_text_values,
+            _v13_merge_candidates=_v13_merge_candidates,
+        ),
+        lexical_multi=_retrieval_lexical.LexicalMultiQueryRuntime(
+            dedup_text_values=_dedup_text_values,
+            max_lexical_queries=SEMANTIC_MAX_LEXICAL_QUERIES,
+            search_chunks=_fts_search_chunks,
+            dedup_citations=_dedup_citations_by_snippet,
+        ),
+        snippet=_retrieval_candidate_ranking.DedupCitationsBySnippetRuntime(_normalize_unicode_advanced=_normalize_unicode_advanced),
+        identifier=_retrieval_source_management.V13ExactIdentifierCandidatesRuntime(
+            _db_find_token_chunk=_db_find_token_chunk,
+            _dedup_text_values=_dedup_text_values,
+            _extract_code_tokens=_extract_code_tokens,
+            _source_type_from_document_id=_source_type_from_document_id,
+        ),
+        prefix_query=_build_prefix_tsquery_from_texts,
+    )
+    return _ask_core_intake.bind_core_intake(**owned, core=_ASSISTANT_CORE_ENGINE,
+        runtimes=_ask_request_binding.AskRuntimeFactories(
+            execution=_assistant_core_ask_execution_runtime,
+            validation=_assistant_core_ask_validation_runtime), runtime=intake)
+
+
 def _assistant_core_authorized_ask_sync(payload, x_ai_internal_secret, *,
         x_mm_app_authority, authority_environment):
-    """B4o response guards and request-owned B4m scalar rescue.
+    """B4o request-owned Core intake plus existing scalar/response guards.
 
-    Other Core acquisitions and protected cache remain at their staged state;
-    this does not declare complete canonical ASK or enable authority.
+    Canonical preparation/consumers stop at an explicit pending boundary.
+    The legacy OFF HTTP branch is untouched; protected cache remains disabled.
     """
     try:
         authorized = _application_authority.authorize_http_request(payload,
@@ -18420,6 +18474,7 @@ def _assistant_core_authorized_ask_sync(payload, x_ai_internal_secret, *,
                     readers_factory=lambda **kwargs: _assistant_core_production_readers(
                         authorized=authorized, **kwargs),
                     flow_runtime=runtime, precision_runtime=precision_runtime,
+                    core_factory=_assistant_core_intake_factory,
                     limits=_ask_request_evidence.precision_session_limits(precision_runtime))
             def uncached(value, secret):
                 return _ask_request_flow.run_sync(value, secret,

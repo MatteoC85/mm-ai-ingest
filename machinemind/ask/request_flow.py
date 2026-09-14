@@ -13,7 +13,7 @@ Those boundaries must be migrated before an end-to-end canonical acceptance.
 This module does NOT turn cached payloads, URLs or scalar candidates into authority.
 With evidence_factory=None, the prior session-free behavior is unchanged. The
 optional B4o factory installs a request-owned lifetime and registered scalar
-rescue; it does not bind the remaining Core acquisitions. Nested recovery is
+rescue, optionally replacing run_core with the same owner's internal callback. Nested recovery is
 an explicit callback, not an implicit new engine.
 """
 from __future__ import annotations
@@ -91,7 +91,7 @@ class RequestFlowGuards:
 
 @dataclass(frozen=True, slots=True, repr=False)
 class RequestFlowEvidenceBinding:
-    """Internal request lifetime for B4o's registered scalar rescue.
+    """Internal request lifetime for B4o's scalar rescue and optional Core intake.
 
     The factory receives the original Core request exactly once, after a cache
     miss and before the Core. Its owner reuses B4a/B4l/B4m; the Core's other
@@ -101,11 +101,14 @@ class RequestFlowEvidenceBinding:
     check: Callable[[], None]
     precision_rescue: Callable[..., Optional[dict]]
     close: Callable[[], None]
+    run_core: Callable[[Any], dict] | None = None
 
     def __post_init__(self) -> None:
         if not all(callable(getattr(self, name))
                    for name in ("check", "precision_rescue", "close")):
             raise TypeError("explicit request evidence lifetime callbacks required")
+        if self.run_core is not None and not callable(self.run_core):
+            raise TypeError("request-owned Core callback must be callable")
 
 
 def _guarded_output(response: dict, guards: RequestFlowGuards | None) -> dict:
@@ -410,6 +413,8 @@ def run_sync(payload: Any, x_ai_internal_secret: Optional[str], *,
                 raise TypeError("typed request evidence binding required")
             evidence_binding.check()
             _assistant_core_precision_fact_rescue = evidence_binding.precision_rescue
+            if evidence_binding.run_core is not None:
+                run_core = evidence_binding.run_core
         precision_rescued = False
         final = run_core(request)
         if evidence_binding is not None:

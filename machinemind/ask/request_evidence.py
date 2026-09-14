@@ -3,8 +3,9 @@
 This is the scalar-rescue integration lot, not complete canonical ASK. Main
 installs it only in the guarded HTTP path (authority still OFF by default).
 The existing request_flow scalar response/policy is reused without copying it.
-Legacy Core acquisitions, cache activation and full AskRequestEvidence binding
-remain separate integration work; metadata continues to report canonical=False.
+An optional internal Core factory receives THIS session and guarded readers.
+No extra lifetime is created. Complete consumers/cache/activation remain separate
+integration work; public metadata continues to report canonical=False.
 """
 from __future__ import annotations
 
@@ -68,11 +69,13 @@ class RequestEvidenceOwner:
     def __init__(self, *, request: Any, scope: ChunkReadScope,
                  limits: AskSessionLimits, readers_factory: Callable,
                  flow_runtime: RequestFlowRuntime,
-                 precision_runtime: PrecisionFactRuntime):
+                 precision_runtime: PrecisionFactRuntime,
+                 core_factory: Callable | None = None):
         if (type(scope) is not ChunkReadScope or type(limits) is not AskSessionLimits
                 or not callable(readers_factory)
                 or type(flow_runtime) is not RequestFlowRuntime
                 or type(precision_runtime) is not PrecisionFactRuntime
+                or (core_factory is not None and not callable(core_factory))
                 or getattr(request, "requested_mode", None) != "ask"
                 or getattr(request, "allowed_effective_modes", None) != ("ask",)):
             raise EvidenceContractError("typed ASK request evidence dependencies required")
@@ -85,6 +88,7 @@ class RequestEvidenceOwner:
         self._selected = None
         self._rendered = ()
         self._busy = False
+        self._run_core = None
         self.session = AskEvidenceSession(request=request, scope=scope, limits=limits)
         try:
             pair = readers_factory(request=request, session=self.session, invoke=self.invoke)
@@ -96,6 +100,12 @@ class RequestEvidenceOwner:
                 raise EvidenceContractError("existing production authority/readers required")
             self._sources = ResidualSourceAdapters(request=request, session=self.session,
                 readers=self._readers, authorize=self.authorize, invoke=self.invoke)
+            if core_factory is not None:
+                self._run_core = self.invoke(core_factory, request,
+                    request=request, session=self.session, readers=self._readers,
+                    authorize=self.authorize, invoke=self.invoke)
+                if not callable(self._run_core):
+                    raise EvidenceContractError("request-owned Core factory must return callable")
             self.check()
         except BaseException:
             self.close()
@@ -258,7 +268,8 @@ class RequestEvidenceOwner:
 
     def binding(self) -> RequestFlowEvidenceBinding:
         self.check()
-        return RequestFlowEvidenceBinding(self.check, self.precision_rescue, self.close)
+        return RequestFlowEvidenceBinding(self.check, self.precision_rescue, self.close,
+                                          self._run_core)
 
     def close(self) -> None:
         # Idempotent even after partially failed construction; always release the
@@ -273,6 +284,7 @@ class RequestEvidenceOwner:
             self._request = self._key = self._selected = self._flow = self._precision = None
             self._rendered = ()
             self._fault = None
+            self._run_core = None
 
     def __repr__(self):
         return "RequestEvidenceOwner(<request-owned>)"

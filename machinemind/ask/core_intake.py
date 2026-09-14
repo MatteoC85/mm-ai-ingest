@@ -1,0 +1,355 @@
+"""B4o request-owned initial/neutral/refinement intake for the EXISTING Core.
+
+No new semantic pipeline, authority provider, session, global monkey patch or
+client flag. The existing B4j/B4k producers acquire through B4l's real readers and
+retain exact selections. The Core input port consumes those selections, not an
+ID/text/score search over the results. Default OFF remains in main.
+
+This is deliberately the INTAKE lot, not complete canonical ASK. Preparation
+and synthesis contain not-yet-composed source/derivation callbacks. They stop at
+an explicit technical boundary rather than falling back to untracked evidence.
+The same owner remains alive for the existing scalar rescue on genuine no-source
+or refusal results; technical errors cannot be converted to successful absence.
+"""
+from __future__ import annotations
+
+from copy import deepcopy
+from dataclasses import dataclass, replace
+from typing import Any, Callable
+
+from assistant_core_v2 import AssistantCoreV2, AssistantCoreHooks
+from .request_binding import AskRequestEvidence, AskRuntimeFactories, run_core_request
+from ..evidence.contracts import EvidenceContractError
+from ..evidence.ask_input import _same_value, ask_request_key
+from ..retrieval.ask_composition import AskEvidenceSession, AskSelection, RecordHandle
+from ..retrieval.production_adapters import ProductionReaderAdapters
+from ..retrieval import candidate_ranking as ranking, evidence_orchestration as orchestration
+from ..retrieval import receipt_producers as producers, source_management, lexical
+
+CORE_INTAKE_VERSION = "ask-core-intake-evidence-p6b4o-v1"
+
+
+class CoreIntakeError(EvidenceContractError):
+    """Technical composition failure, never a successful no_sources response."""
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class CoreIntakeRuntime:
+    """One explicit snapshot of the existing P4 collaborators; no I/O here."""
+    initial: orchestration.V13InitialRetrievalRuntime
+    neutral: orchestration.AssistantCoreRetrieveNeutralRuntime
+    refine: orchestration.AssistantCoreRefineRetrievalRuntime
+    score: ranking.V13ScoreCandidatesRuntime
+    titles: ranking.V13MergeSourceTitleCandidatesRuntime
+    facets: ranking.AssistantCoreMergeFacetCandidatesRuntime
+    lexical_multi: lexical.LexicalMultiQueryRuntime
+    snippet: ranking.DedupCitationsBySnippetRuntime
+    identifier: source_management.V13ExactIdentifierCandidatesRuntime
+    prefix_query: Callable
+    max_trace_records: int = 16384
+    max_trace_bytes: int = 64 * 1024 * 1024
+
+    def __post_init__(self):
+        types = (
+            ("initial", orchestration.V13InitialRetrievalRuntime),
+            ("neutral", orchestration.AssistantCoreRetrieveNeutralRuntime),
+            ("refine", orchestration.AssistantCoreRefineRetrievalRuntime),
+            ("score", ranking.V13ScoreCandidatesRuntime),
+            ("titles", ranking.V13MergeSourceTitleCandidatesRuntime),
+            ("facets", ranking.AssistantCoreMergeFacetCandidatesRuntime),
+            ("lexical_multi", lexical.LexicalMultiQueryRuntime),
+            ("snippet", ranking.DedupCitationsBySnippetRuntime),
+            ("identifier", source_management.V13ExactIdentifierCandidatesRuntime),
+        )
+        if any(type(getattr(self, name)) is not cls for name, cls in types):
+            raise CoreIntakeError("explicit existing intake runtimes required")
+        if (not callable(self.prefix_query) or type(self.max_trace_records) is not int
+                or not 1 <= self.max_trace_records <= 32768
+                or type(self.max_trace_bytes) is not int
+                or not 1 <= self.max_trace_bytes <= 128 * 1024 * 1024):
+            raise CoreIntakeError("explicit bounded intake trace required")
+        if (type(self.lexical_multi.max_lexical_queries) is not int
+                or not 0 <= self.lexical_multi.max_lexical_queries <= 32):
+            raise CoreIntakeError("bounded lexical query count required")
+
+
+class _CoreIntake:
+    """One operation using the caller's lifetime, not a second evidence owner.
+
+    Only a producer can replace _selection. Copies supplied by the Core are
+    verified against this exact previously declared selection. Stage names label
+    code boundaries, not machine/language/relevance rules. No evidence/grants are
+    serialized into response metadata. Retained callbacks expire at Core return.
+    """
+    def __init__(self, *, request, session, readers, authorize, invoke,
+                 core, runtimes, runtime):
+        if (type(session) is not AskEvidenceSession
+                or type(readers) is not ProductionReaderAdapters
+                or type(core) is not AssistantCoreV2
+                or type(core.hooks) is not AssistantCoreHooks
+                or type(runtimes) is not AskRuntimeFactories
+                or type(runtime) is not CoreIntakeRuntime
+                or not callable(authorize) or not callable(invoke)):
+            raise CoreIntakeError("existing Core/session/readers and owner required")
+        self.request, self.session, self.readers = request, session, readers
+        self.authorize, self.owner_invoke = authorize, invoke
+        self.core, self.runtimes, self.runtime = core, runtimes, runtime
+        self.key = ask_request_key(request)
+        self.active, self.used, self.fault = False, False, None
+        self._selection = None
+
+    def _check(self, request=None):
+        if self.fault is not None:
+            raise self.fault
+        if (not self.active or (request is not None and request is not self.request)
+                or ask_request_key(self.request) != self.key
+                or self.request.allowed_effective_modes != ("ask",)):
+            raise CoreIntakeError("intake request/lifetime changed")
+
+    def invoke(self, callback, request, /, *args, **kwargs):
+        def work():
+            try:
+                self._check(request)
+                result = callback(*args, **kwargs)
+                self._check(request)
+                return result
+            except Exception as exc:
+                if self.fault is None:
+                    self.fault = exc
+                raise self.fault
+        return self.owner_invoke(work, request)
+
+    def _current(self):
+        return self.invoke(self.authorize, self.request, self.request)
+
+    def _scope(self):
+        return self.session.read_contract(request=self.request,
+            current_allowed_sources=self._current())[0]
+
+    def _parameters(self, values, *, ai_scope=False, language=False, selectors=True):
+        """Reject drift BEFORE a read; returned query parameters grant nothing."""
+        values = dict(values)
+        scope = self._scope()
+        expected = (scope.sql_selectors() if selectors else
+                    {"company_id": scope.company_id, "machine_id": scope.machine_id})
+        if ai_scope:
+            expected = {**expected, "ai_scope": scope.ai_scope}
+        if language:
+            expected = {**expected, "response_language": self.request.response_language}
+        if any(name not in values or not _same_value(values[name], val)
+               for name, val in expected.items()):
+            raise CoreIntakeError("intake callback scope differs from owned request")
+        for name in expected:
+            values.pop(name)
+        return values
+
+    def _values(self, handles):
+        return [deepcopy(dict(item.record)) for item in self.session.records(
+            request=self.request, handles=handles,
+            current_allowed_sources=self._current())]
+
+    def _read(self, reader, values, **options):
+        return self.readers.candidate_handles(reader,
+            **self._parameters(values, **options))
+
+    def _dense(self, **values):
+        return self.readers.dense(**self._parameters(values))
+
+    def _prefix(self, **values):
+        return self.readers.candidate_handles("read_prefix_chunk_evidence",
+            **self._parameters(values), build_prefix_query=self.runtime.prefix_query)
+
+    def _lexical(self, **values):
+        """Run the original multi-query loop; dedup uses direct input positions."""
+        params = self._parameters(values)
+        entries, consumed, selected = {}, [], None
+        def search(**kw):
+            handles = self._read("read_fts_chunk_evidence", kw)
+            rows = self._values(handles)
+            for row, handle in zip(rows, handles):
+                entries[id(row)] = (row, deepcopy(row), handle)
+            consumed.extend(handles)
+            return rows
+        def dedup(rows, max_items):
+            nonlocal selected
+            if selected is not None:
+                raise CoreIntakeError("duplicate lexical selection boundary")
+            handles = []
+            for row in rows:
+                entry = entries.get(id(row))
+                if entry is None or row is not entry[0] or not _same_value(row, entry[1]):
+                    raise CoreIntakeError("lexical input occurrence was replaced or mutated")
+                handles.append(entry[2])
+            selected = producers.rank_records(request=self.request, session=self.session,
+                groups=(tuple(handles),), operation="dedup_snippet", max_items=max_items,
+                snippet_runtime=self.runtime.snippet, authorize=self.authorize, invoke=self.invoke)
+            return self._values(selected)
+        rt = replace(self.runtime.lexical_multi, search_chunks=search, dedup_citations=dedup)
+        out = lexical.fts_search_chunks_multi(**self._scope().sql_selectors(),
+                                              **params, runtime=rt)
+        if selected is None or not _same_value(out, self._values(selected)):
+            raise CoreIntakeError("lexical result differs from its declared selection")
+        self.session.records(request=self.request, handles=tuple(consumed),
+                             current_allowed_sources=self._current())
+        return selected
+
+    def _identifier(self, **values):
+        """Keep the original exact-code algorithm and its existing dedup policy.
+
+        The classification callback is invoked exactly once WHERE that algorithm
+        has accepted/copied the current token hit (before appending its result).
+        We capture that hit's handle at this call boundary. Returned IDs/text are
+        never searched to discover its origin. This is a pinned trusted algorithm
+        contract, not permission derived from a source-type string.
+        """
+        params = self._parameters(values)
+        current = None
+        origins, consumed = [], []
+        def find(**kw):
+            nonlocal current
+            handles = self._read("read_token_chunk_evidence", kw)
+            if len(handles) > 1:
+                raise CoreIntakeError("token reader returned multiple selected occurrences")
+            current = handles[0] if handles else None
+            consumed.extend(handles)
+            return self._values(handles)[0] if handles else None
+        def classify(doc_id):
+            if current is None:
+                raise CoreIntakeError("identifier creation lacks current token occurrence")
+            record = self._values((current,))[0]
+            if not _same_value(doc_id, record.get("bubble_document_id") or ""):
+                raise CoreIntakeError("identifier classification scope drift")
+            origins.append(current)
+            return self.runtime.identifier._source_type_from_document_id(doc_id)
+        rt = replace(self.runtime.identifier, _db_find_token_chunk=find,
+                     _source_type_from_document_id=classify)
+        out = source_management.v13_exact_identifier_candidates(
+            **self._scope().sql_selectors(), **params, runtime=rt)
+        if type(out) is not list or len(out) != len(origins):
+            raise CoreIntakeError("identifier creation events incomplete")
+        after = self._current()
+        self.session.records(request=self.request, handles=tuple(consumed),
+                             current_allowed_sources=after)
+        return self.session.derive_batch(request=self.request,
+            views=tuple(((h,), deepcopy(row)) for h, row in zip(origins, out)),
+            operation=CORE_INTAKE_VERSION + ":identifier", current_allowed_sources=after)
+
+    def _titles(self, **values):
+        params = self._parameters(values, ai_scope=True)
+        # Same structural eligibility as the existing title source: this reader
+        # is machine-wide only. An inapplicable probe is NOT a DB read/receipt.
+        if self._scope().ai_scope != "machine_all":
+            return ()
+        return self.readers.candidate_handles("read_structured_title_page_evidence", **params)
+
+    def _initial(self, **values):
+        params = self._parameters(values, ai_scope=True, language=True)
+        rt = replace(self.runtime.initial,
+            _rrf_merge_candidates=ranking.rrf_merge_candidates,
+            _v13_merge_candidates=ranking.v13_merge_candidates,
+            _v13_score_candidates=self._score)
+        callbacks = {
+            "dense": self._dense,
+            "prefix": self._prefix,
+            "lexical": self._lexical,
+            "identifier": self._identifier,
+            "pages": lambda **kw: self._read("read_scored_page_evidence", kw),
+            "preferred": lambda **kw: self._read("read_v13_preferred_page_evidence", kw),
+            "structured_dense": lambda **kw: self._read("read_structured_dense_chunk_evidence", kw, selectors=False),
+            "structured_direct": lambda **kw: self._read("read_structured_direct_page_evidence", kw, selectors=False),
+        }
+        return producers.retrieve_initial_records(request=self.request, session=self.session,
+            runtime=rt, source_callbacks=callbacks, authorize=self.authorize,
+            invoke=self.invoke, max_trace_records=self.runtime.max_trace_records,
+            max_trace_bytes=self.runtime.max_trace_bytes, **params)
+
+    def _score(self, q, rows, *, lineage=None):
+        return ranking.v13_score_candidates(q, rows, runtime=self.runtime.score,
+                                            lineage=lineage)
+
+    def _remember(self, result, selections):
+        self.session.admission(request=self.request, retrieval=result,
+            selections=selections, current_allowed_sources=self._current())
+        self._selection = selections  # producer supplied; never reconstructed
+        return result
+
+    def neutral(self, request):
+        def work():
+            result, selections = producers.retrieve_neutral_records(
+                request=request, session=self.session, runtime=self.runtime.neutral,
+                title_runtime=replace(self.runtime.titles,
+                    _v13_merge_candidates=ranking.v13_merge_candidates,
+                    _v13_score_candidates=self._score),
+                initial_adapter=self._initial,
+                title_adapter=self._titles,
+                authorize=self.authorize, invoke=self.invoke,
+                max_trace_records=self.runtime.max_trace_records,
+                max_trace_bytes=self.runtime.max_trace_bytes)
+            return self._remember(result, selections)
+        return self.invoke(work, request)
+
+    def refine(self, request, data, decision):
+        def work():
+            self.select(request, data, decision, "core.refine.input")
+            result, selections = producers.refine_records(request=request,
+                session=self.session, retrieval=data, selections=self._selection,
+                decision=decision, runtime=replace(self.runtime.refine,
+                    _v13_score_candidates=self._score),
+                facet_runtime=replace(self.runtime.facets,
+                    _v13_merge_candidates=ranking.v13_merge_candidates),
+                initial_adapter=self._initial, authorize=self.authorize,
+                invoke=self.invoke, max_trace_records=self.runtime.max_trace_records,
+                max_trace_bytes=self.runtime.max_trace_bytes)
+            return self._remember(result, selections)
+        return self.invoke(work, request)
+
+    def select(self, request, data, decision, stage):
+        def work():
+            allowed = {"core.retrieve.output", "core.route.input", "core.refine.input",
+                       "core.refine.output", "core.prepare.input"}
+            if stage == "core.output.collections":
+                # Refusal/clarification exits create empty collections; they do
+                # not assert that a source was searched or that evidence is absent.
+                if any(type(rows) is not list or rows for rows in data.values()):
+                    raise CoreIntakeError("output source derivation not composed")
+                return tuple(AskSelection(name, ()) for name in data)
+            if stage not in allowed or self._selection is None:
+                raise CoreIntakeError("canonical consumer composition pending: " + str(stage))
+            self.session.admission(request=request, retrieval=data,
+                selections=self._selection, current_allowed_sources=self._current())
+            return self._selection
+        return self.invoke(work, request)
+
+    def prepare(self, request, data, decision):
+        # Do not execute source-acquiring legacy preparation behind a claimed
+        # canonical port. The next lot must connect prepare_records + its three
+        # actual source adapters and consumer creation-site lineage.
+        def work():
+            raise CoreIntakeError("canonical preparation/consumer composition pending")
+        return self.invoke(work, request)
+
+    def run(self, request):
+        def work():
+            if self.used or request is not self.request:
+                raise CoreIntakeError("core intake requires the one original request")
+            self.used, self.active = True, True
+            try:
+                self._check(request)
+                local_hooks = replace(self.core.hooks, retrieve_neutral=self.neutral,
+                    refine_retrieval=self.refine, prepare_evidence=self.prepare)
+                # Same implementation, ONE run inside request_binding. This
+                # instance is an immutable per-request hooks container only.
+                local_core = AssistantCoreV2(local_hooks)
+                binding = AskRequestEvidence(session=self.session,
+                    authorize=self.authorize, select=self.select)
+                return run_core_request(request, core=local_core,
+                    runtimes=self.runtimes, evidence=binding, acquisition=None)
+            finally:
+                self.active = False
+                self._selection = None
+        return self.owner_invoke(work, request)
+
+
+def bind_core_intake(**kwargs) -> Callable:
+    """Internal factory for RequestEvidenceOwner's original session."""
+    return _CoreIntake(**kwargs).run
