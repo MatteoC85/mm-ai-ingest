@@ -11,8 +11,10 @@ hits still precede Core execution and scalar rescue still follows its result.
 Those boundaries must be migrated before an end-to-end canonical acceptance.
 
 This module does NOT turn cached payloads, URLs or scalar candidates into authority.
-No session, authorization inference, linguistic rule or extra provider call is
-introduced. Nested recovery is an explicit callback, not an implicit new engine.
+With evidence_factory=None, the prior session-free behavior is unchanged. The
+optional B4o factory installs a request-owned lifetime and registered scalar
+rescue; it does not bind the remaining Core acquisitions. Nested recovery is
+an explicit callback, not an implicit new engine.
 """
 from __future__ import annotations
 from dataclasses import dataclass
@@ -85,6 +87,25 @@ class RequestFlowGuards:
     def __post_init__(self) -> None:
         if not all(callable(getattr(self, key)) for key in ("lookup", "store", "final", "check")):
             raise TypeError("four explicit request-owned guard callbacks required")
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class RequestFlowEvidenceBinding:
+    """Internal request lifetime for B4o's registered scalar rescue.
+
+    The factory receives the original Core request exactly once, after a cache
+    miss and before the Core. Its owner reuses B4a/B4l/B4m; the Core's other
+    acquisitions are NOT declared canonical by installing this binding.
+    No client flag, ambient session, authority cache or alternate Core.
+    """
+    check: Callable[[], None]
+    precision_rescue: Callable[..., Optional[dict]]
+    close: Callable[[], None]
+
+    def __post_init__(self) -> None:
+        if not all(callable(getattr(self, name))
+                   for name in ("check", "precision_rescue", "close")):
+            raise TypeError("explicit request evidence lifetime callbacks required")
 
 
 def _guarded_output(response: dict, guards: RequestFlowGuards | None) -> dict:
@@ -205,11 +226,15 @@ def precision_fact_rescue(
 
 def run_sync(payload: Any, x_ai_internal_secret: Optional[str], *,
              requested_mode: str, runtime: RequestFlowRuntime,
-             guards: RequestFlowGuards | None = None) -> dict:
+             guards: RequestFlowGuards | None = None,
+             evidence_factory: Callable[[Any], RequestFlowEvidenceBinding] | None = None) -> dict:
     if guards is not None and type(guards) is not RequestFlowGuards:
         raise TypeError("typed request flow guards required")
     if guards is not None and requested_mode != "ask":
         raise ValueError("response authority flow is ASK-only")
+    if evidence_factory is not None and (
+            not callable(evidence_factory) or requested_mode != "ask" or guards is None):
+        raise TypeError("request evidence is restricted to the guarded ASK path")
     AI_INTERNAL_SECRET = runtime.AI_INTERNAL_SECRET
     ASK_MAX_TOP_K = runtime.ASK_MAX_TOP_K
     AssistantCoreRequest = runtime.AssistantCoreRequest
@@ -263,6 +288,7 @@ def run_sync(payload: Any, x_ai_internal_secret: Optional[str], *,
     max_causes = max(1, min(int(getattr(payload, "max_causes", 3) or 3), 3))
     budget = _assistant_core_new_budget(requested_mode, company_id=str(payload.company_id or ""))
     token = _V13_BUDGET_CTX.set(budget)
+    evidence_binding = None
     try:
         scope = _resolve_query_scope(
             company_id=payload.company_id,
@@ -378,8 +404,16 @@ def run_sync(payload: Any, x_ai_internal_secret: Optional[str], *,
                 ),
             },
         )
+        if evidence_factory is not None:
+            evidence_binding = evidence_factory(request)
+            if type(evidence_binding) is not RequestFlowEvidenceBinding:
+                raise TypeError("typed request evidence binding required")
+            evidence_binding.check()
+            _assistant_core_precision_fact_rescue = evidence_binding.precision_rescue
         precision_rescued = False
         final = run_core(request)
+        if evidence_binding is not None:
+            evidence_binding.check()
         if guards is not None:
             guards.check()
         if requested_mode == MODE_ROOT_CAUSE:
@@ -455,6 +489,8 @@ def run_sync(payload: Any, x_ai_internal_secret: Optional[str], *,
         )
         if guards is not None:
             guards.check()
+        if evidence_binding is not None:
+            evidence_binding.check()
         return final
     except _V13BudgetExceeded as exc:
         return _assistant_core_budget_response(
@@ -477,6 +513,10 @@ def run_sync(payload: Any, x_ai_internal_secret: Optional[str], *,
             exc=exc,
         )
     finally:
-        _V13_BUDGET_CTX.reset(token)
+        try:
+            if type(evidence_binding) is RequestFlowEvidenceBinding:
+                evidence_binding.close()
+        finally:
+            _V13_BUDGET_CTX.reset(token)
 
 

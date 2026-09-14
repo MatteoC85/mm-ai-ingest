@@ -127,6 +127,7 @@ from machinemind.ask import execution as _ask_execution
 from machinemind.ask import validation as _ask_validation
 from machinemind.ask import request_flow as _ask_request_flow
 from machinemind.ask import request_binding as _ask_request_binding
+from machinemind.ask import request_evidence as _ask_request_evidence
 from machinemind.ask import acquisition as _ask_acquisition
 
 from machinemind.infrastructure.execution import (
@@ -701,11 +702,11 @@ def _format_citation_note_lines(citations: list[dict], *, language: str = "it", 
 
 
 
-def _build_rg_links(company_id: str, citations: list[dict]) -> list[dict]:
+def _build_rg_links(company_id: str, citations: list[dict], *, file_map_fn=None) -> list[dict]:
     return _presentation_citations.build_rg_links(
         company_id,
         citations,
-        fetch_file_map_fn=_fetch_document_file_map,
+        fetch_file_map_fn=_fetch_document_file_map if file_map_fn is None else file_map_fn,
         safe_int_fn=_safe_int,
         source_meta_fn=_source_display_meta_for_citation,
     )
@@ -4181,11 +4182,11 @@ def _clean_xlsx_snippet_for_display(text: str, *, max_len: int = 520) -> str:
 
 
 
-def _sanitize_citations_for_response(citations: list[dict], company_id: Optional[str] = None) -> list[dict]:
+def _sanitize_citations_for_response(citations: list[dict], company_id: Optional[str] = None, *, file_map_fn=None) -> list[dict]:
     return _presentation_citations.sanitize_citations_for_response(
         citations,
         company_id=company_id,
-        fetch_file_map_fn=_fetch_document_file_map,
+        fetch_file_map_fn=_fetch_document_file_map if file_map_fn is None else file_map_fn,
         safe_int_fn=_safe_int,
         source_meta_fn=_source_display_meta_for_citation,
         structured_snippet_fn=_structured_source_snippet_for_display,
@@ -18386,17 +18387,22 @@ def _assistant_core_production_readers(*, request, session, authorized, invoke):
     authorized.check(authorized.payload)
     authority = _RequestAuthority(request=request, scope=authorized.scope,
         grant=authorized.grant, provider=authorized.provider)
-    adapters = _ProductionReaderAdapters(request=request, session=session,
-        authorize=authority, invoke=invoke,
-        runtimes=_assistant_core_authority_reader_runtimes())
-    return authority, adapters
+    try:
+        adapters = _ProductionReaderAdapters(request=request, session=session,
+            authorize=authority, invoke=invoke,
+            runtimes=_assistant_core_authority_reader_runtimes())
+        return authority, adapters
+    except BaseException:
+        authority.close()
+        raise
 
 
 def _assistant_core_authorized_ask_sync(payload, x_ai_internal_secret, *,
         x_mm_app_authority, authority_environment):
-    """B4o response guards connected; protected cache still disabled.
+    """B4o response guards and request-owned B4m scalar rescue.
 
-    This substep is not full canonical evidence composition/activation.
+    Other Core acquisitions and protected cache remain at their staged state;
+    this does not declare complete canonical ASK or enable authority.
     """
     try:
         authorized = _application_authority.authorize_http_request(payload,
@@ -18407,9 +18413,18 @@ def _assistant_core_authorized_ask_sync(payload, x_ai_internal_secret, *,
             _v13_cache_store=lambda **kwargs: None)
         owner = _application_authority.ResponseGuardOwner(authorized)
         try:
+            precision_runtime = _PRECISION_FACT_RUNTIME()
+            def evidence_factory(request):
+                return _ask_request_evidence.bind_request_evidence(
+                    request=request, scope=authorized.scope,
+                    readers_factory=lambda **kwargs: _assistant_core_production_readers(
+                        authorized=authorized, **kwargs),
+                    flow_runtime=runtime, precision_runtime=precision_runtime,
+                    limits=_ask_request_evidence.precision_session_limits(precision_runtime))
             def uncached(value, secret):
                 return _ask_request_flow.run_sync(value, secret,
-                    requested_mode=MODE_ASK, runtime=runtime, guards=owner.guards)
+                    requested_mode=MODE_ASK, runtime=runtime, guards=owner.guards,
+                    evidence_factory=evidence_factory)
             return _application_authority.protected_call(payload, x_ai_internal_secret,
                 authorized=authorized, delegate=uncached, response_guard=owner.final)
         finally:
