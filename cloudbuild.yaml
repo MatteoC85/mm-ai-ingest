@@ -174,6 +174,17 @@ steps:
           require(sum(out.values()) == 100, 'TRAFFIC_SUM_INVALID')
           return out
       
+      def requested_traffic(service):
+          # Do not accept the old failure mode: desired traffic != effective traffic.
+          rows = service.get('spec', {}).get('traffic', [])
+          require(isinstance(rows, list), 'REQUESTED_TRAFFIC_INVALID')
+          for item in rows:
+              require(isinstance(item, dict), 'REQUESTED_TRAFFIC_INVALID')
+              if item.get('percent', 0):
+                  require(item.get('latestRevision', False) is False and
+                          not item.get('configurationName'), 'REQUESTED_TRAFFIC_NOT_FIXED')
+          return traffic({'status': {'traffic': rows}})
+
       def unaffected_spec(spec):
           """Detect unrelated template changes without logging existing env/secret values."""
           result = copy.deepcopy(spec)
@@ -207,9 +218,12 @@ steps:
           reconciled(revision, 'CANDIDATE_REVISION_RECONCILING')
           ready(service, 'CANDIDATE_SERVICE_NOT_READY')
           ready(revision, 'CANDIDATE_REVISION_NOT_READY')
-          require(service.get('status', {}).get('latestCreatedRevisionName') == name and
-                  service.get('status', {}).get('latestReadyRevisionName') == name,
+          # latestReadyRevisionName is not the identity of a no-traffic candidate.
+          # Read the exact revision and bind it to BOTH the template and latestCreated.
+          require(service.get('status', {}).get('latestCreatedRevisionName') == name,
                   'CANDIDATE_NOT_CURRENT')
+          require(service.get('spec', {}).get('template', {}).get('metadata', {}).get('name') == name,
+                  'CANDIDATE_TEMPLATE_NAME_MISMATCH')
           require(revision.get('metadata', {}).get('name') == name, 'REVISION_NAME_MISMATCH')
           spec = template_spec(service)
           for candidate in (spec, revision.get('spec', {})):
@@ -266,6 +280,7 @@ steps:
           require(isinstance(prior, str) and prior.startswith(SERVICE+'-'),
                   'BASELINE_READY_REVISION_MISSING')
           require(traffic(before) == {prior: 100}, 'BASELINE_NOT_STABLE_100')
+          require(requested_traffic(before) == {prior: 100}, 'BASELINE_REQUESTED_TRAFFIC_MISMATCH')
           previous = read_resource('revisions', prior)
           require(previous.get('metadata', {}).get('name') == prior, 'BASELINE_REVISION_NAME_MISMATCH')
           require(not previous.get('metadata', {}).get('deletionTimestamp'), 'BASELINE_REVISION_DELETING')
@@ -342,6 +357,7 @@ steps:
                   'CONCURRENT_OR_UNEXPECTED_REVISION')
           validate_candidate(before, staged, revision, name, commit, image)
           require(traffic(staged) == {prior: 100}, 'TRAFFIC_CHANGED_BEFORE_VALIDATION')
+          require(requested_traffic(staged) == {prior: 100}, 'REQUESTED_TRAFFIC_CHANGED_BEFORE_VALIDATION')
           # Promote the EXACT verified revision, never whichever happens to be "latest".
           print('CONFIG_GUARD_PASSED_BEFORE_PROMOTION', flush=True)
           phase('PROMOTE_EXACT_CANDIDATE')
@@ -355,6 +371,7 @@ steps:
                   'CONCURRENT_OR_UNEXPECTED_REVISION')
           validate_candidate(before, final, revision, name, commit, image)
           require(traffic(final) == {name: 100}, 'FINAL_TRAFFIC_MISMATCH')
+          require(requested_traffic(final) == {name: 100}, 'FINAL_REQUESTED_TRAFFIC_MISMATCH')
           phase('HEALTH_AFTER_PROMOTION')
           health(final.get('status', {}).get('url'), commit, name)
           return {'status': 'PASS_DEPLOY_B4L_CONFIG_GUARD_OFF', 'revision': name,
@@ -362,7 +379,7 @@ steps:
                   'authority_mode': 'OFF', 'config_checked_before_traffic': True,
                   'unrelated_template_preserved': True, 'traffic_percent': 100,
                   'health_checked_before_deploy': True, 'health_checked_after_promotion': True,
-                  'guard_version': 'b4o-serving-baseline-recovery-v1', 'ask_calls': 0, 'ai_calls': 0}
+                  'guard_version': 'b4o-candidate-identity-v1', 'ask_calls': 0, 'ai_calls': 0}
       
       if __name__ == '__main__':
           try:
