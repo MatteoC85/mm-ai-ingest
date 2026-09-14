@@ -20,7 +20,7 @@ import unicodedata
 from difflib import SequenceMatcher
 from datetime import date, datetime, time, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-from typing import Optional, List, Any, Union
+from typing import Optional, List, Any, Union, Callable
 
 import requests
 import psycopg2
