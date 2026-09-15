@@ -17729,22 +17729,40 @@ def _assistant_core_intake_factory(**owned):
         tasks=_assistant_core_task_synthesis_runtime(), consumers=True)
 
 
-def _assistant_core_authorized_ask_sync(payload, x_ai_internal_secret, *,
-        x_mm_app_authority, authority_environment):
-    """B4o request-owned Core intake plus existing scalar/response guards.
+def _assistant_core_protected_cache_factory(*, authorized, source_owner,
+        flow_runtime, authority_environment):
+    from machinemind.ask.protected_cache import ProtectedCacheOwner
+    precision = _PRECISION_FACT_RUNTIME()
+    return ProtectedCacheOwner(authorized=authorized, source_owner=source_owner,
+        flow_runtime=flow_runtime, cache_runtime=dict(globals()),
+        signing_key=authority_environment["MM_APP_AUTHORITY_SECRET"],
+        file_runtime=_retrieval_document_readers.FetchDocumentFileMapRuntime(_db_conn),
+        limits=_ask_request_evidence.precision_session_limits(precision).evidence)
 
-    Canonical synthesis/validation/repair stop at an explicit pending boundary.
-    The legacy OFF HTTP branch is untouched; protected cache remains disabled.
+
+def _assistant_core_authorized_ask_sync(payload, x_ai_internal_secret, *,
+        x_mm_app_authority, authority_environment, cache_factory=None):
+    """Request-owned ASK composition with an optional internal cache owner.
+
+    The HTTP required route supplies guarded exact reuse. Default None preserves
+    the uncached helper contract. OFF dispatch and all non-ASK paths are unchanged.
+    Activation and the integrated live B4o gates remain separate.
     """
     try:
         authorized = _application_authority.authorize_http_request(payload,
             service_secret=x_ai_internal_secret, application_secret=x_mm_app_authority,
             env=authority_environment, resolve=_resolve_query_scope)
-        runtime = _dataclass_replace(_assistant_core_request_flow_runtime(),
+        base_runtime = _assistant_core_request_flow_runtime()
+        runtime = _dataclass_replace(base_runtime,
             _v13_cache_lookup=lambda **kwargs: None,
             _v13_cache_store=lambda **kwargs: None)
         owner = _application_authority.ResponseGuardOwner(authorized)
+        cache_owner = None
         try:
+            if cache_factory is not None:
+                cache_owner = cache_factory(authorized=authorized, source_owner=owner,
+                    flow_runtime=base_runtime, authority_environment=authority_environment)
+                runtime = cache_owner.runtime
             precision_runtime = _PRECISION_FACT_RUNTIME()
             def evidence_factory(request):
                 return _ask_request_evidence.bind_request_evidence(
@@ -17753,15 +17771,23 @@ def _assistant_core_authorized_ask_sync(payload, x_ai_internal_secret, *,
                         authorized=authorized, **kwargs),
                     flow_runtime=runtime, precision_runtime=precision_runtime,
                     core_factory=_assistant_core_intake_factory,
-                    limits=_ask_request_evidence.precision_session_limits(precision_runtime))
+                    limits=_ask_request_evidence.precision_session_limits(precision_runtime),
+                    **({"response_observer": cache_owner.observe_response} if cache_owner else {}))
             def uncached(value, secret):
                 return _ask_request_flow.run_sync(value, secret,
-                    requested_mode=MODE_ASK, runtime=runtime, guards=owner.guards,
+                    requested_mode=MODE_ASK, runtime=runtime,
+                    guards=cache_owner.guards if cache_owner else owner.guards,
                     evidence_factory=evidence_factory)
             return _application_authority.protected_call(payload, x_ai_internal_secret,
-                authorized=authorized, delegate=uncached, response_guard=owner.final)
+                authorized=authorized, delegate=uncached,
+                response_guard=cache_owner.release if cache_owner else owner.final,
+                **({"backend_cache_reuse": True} if cache_owner else {}))
         finally:
-            owner.close()
+            try:
+                if cache_owner is not None:
+                    cache_owner.close()
+            finally:
+                owner.close()
     except _AuthorityError as exc:
         return _application_authority.public_error(exc)
 
@@ -17808,7 +17834,8 @@ async def ask_v1(
             raise HTTPException(status_code=503, detail="AUTHORITY_CORE_REQUIRED")
         sync_func = functools.partial(_assistant_core_authorized_ask_sync,
             x_mm_app_authority=x_mm_app_authority,
-            authority_environment=authority_environment)
+            authority_environment=authority_environment,
+            cache_factory=_assistant_core_protected_cache_factory)
         if not V13_STREAM_HEARTBEAT_ENABLED:
             return await _assistant_core_json_with_hard_timeout(
                 mode=MODE_ASK, sync_func=sync_func, payload=payload,

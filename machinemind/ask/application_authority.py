@@ -128,14 +128,16 @@ def authorize_http_request(payload, *, service_secret: object, application_secre
 
 
 def protected_call(payload, service_secret, *, authorized: AuthorizedCall,
-                   delegate: Callable, response_guard: Callable | None = None) -> dict:
+                   delegate: Callable, response_guard: Callable | None = None,
+                   backend_cache_reuse: bool = False) -> dict:
     """Check current authorized application context before execution and release.
 
     Delegate must have its response caches disabled until B4n adds source-safe
     re-use. This function does not claim to authorize legacy citation provenance
     or source revocation hidden inside a still-legacy callback.
     """
-    if (type(authorized) is not AuthorizedCall or not callable(delegate)
+    if (type(backend_cache_reuse) is not bool
+            or type(authorized) is not AuthorizedCall or not callable(delegate)
             or (response_guard is not None and not callable(response_guard))):
         raise AuthorityError("AUTHORITY_CONFIGURATION_INVALID")
     authorized.check(payload)
@@ -158,7 +160,8 @@ def protected_call(payload, service_secret, *, authorized: AuthorizedCall,
     result["meta"] = {**dict(result.get("meta") or {}),
         "request_authority": {**authorized.provider.directory.meter.summary(),
             "scope_authorized": True, "canonical_evidence_active": False,
-            "cache_reuse": "disabled_pending_B4n"},
+            "cache_reuse": ("backend_guarded_exact" if backend_cache_reuse
+                            else "disabled_pending_B4n")},
         "cacheable": False, "semantic_cacheable": False}
     return result
 

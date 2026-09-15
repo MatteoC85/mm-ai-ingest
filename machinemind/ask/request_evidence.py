@@ -27,6 +27,7 @@ from ..retrieval.chunk_evidence import ChunkEvidenceLimits, ChunkReadScope
 from ..retrieval.production_adapters import ProductionReaderAdapters
 from ..retrieval.residual_producers import (ResidualSourceAdapters,
     resolve_precision_fact_evidence)
+from ..retrieval import precision_facts
 from ..retrieval.precision_facts import PrecisionFactRuntime
 from ..retrieval.supplemental_evidence import storage_key
 
@@ -70,12 +71,14 @@ class RequestEvidenceOwner:
                  limits: AskSessionLimits, readers_factory: Callable,
                  flow_runtime: RequestFlowRuntime,
                  precision_runtime: PrecisionFactRuntime,
-                 core_factory: Callable | None = None):
+                 core_factory: Callable | None = None,
+                 response_observer: Callable | None = None):
         if (type(scope) is not ChunkReadScope or type(limits) is not AskSessionLimits
                 or not callable(readers_factory)
                 or type(flow_runtime) is not RequestFlowRuntime
                 or type(precision_runtime) is not PrecisionFactRuntime
                 or (core_factory is not None and not callable(core_factory))
+                or (response_observer is not None and not callable(response_observer))
                 or getattr(request, "requested_mode", None) != "ask"
                 or getattr(request, "allowed_effective_modes", None) != ("ask",)):
             raise EvidenceContractError("typed ASK request evidence dependencies required")
@@ -89,6 +92,7 @@ class RequestEvidenceOwner:
         self._rendered = ()
         self._busy = False
         self._run_core = None
+        self._response_observer = response_observer
         self.session = AskEvidenceSession(request=request, scope=scope, limits=limits)
         try:
             pair = readers_factory(request=request, session=self.session, invoke=self.invoke)
@@ -110,6 +114,25 @@ class RequestEvidenceOwner:
         except BaseException:
             self.close()
             raise
+
+    def _observe_response(self, result, scalar_target=None):
+        if self._response_observer is not None:
+            self.check()
+            observed = deepcopy(result)
+            # run_sync copies this already-established target after the Core or
+            # scalar result. Observe that exact presentation projection too.
+            target = (self._request.metadata or {}).get(
+                precision_facts.SCALAR_TARGET_KEY) if scalar_target is None else scalar_target
+            if isinstance(target, dict):
+                observed["meta"] = {**dict(observed.get("meta") or {}),
+                    precision_facts.SCALAR_TARGET_KEY: deepcopy(target)}
+            self._response_observer(observed,
+                self.session.cache_dependencies(request=self._request))
+            self.check()
+        return result
+
+    def _observed_core(self, request):
+        return self.invoke(lambda: self._observe_response(self._run_core(request)), request)
 
     def check(self) -> None:
         if self._fault is not None:
@@ -261,6 +284,8 @@ class RequestEvidenceOwner:
                         selections=(AskSelection("citations", self._rendered),),
                         current_allowed_sources=current)
                     result["meta"]["precision_fact_rescue"]["evidence_lineage_version"] = REQUEST_EVIDENCE_VERSION
+                    self._observe_response(result,
+                        (parameters.get("answer_contract") or {}).get(precision_facts.SCALAR_TARGET_KEY))
                 return result
             finally:
                 self._busy = False
@@ -269,7 +294,8 @@ class RequestEvidenceOwner:
     def binding(self) -> RequestFlowEvidenceBinding:
         self.check()
         return RequestFlowEvidenceBinding(self.check, self.precision_rescue, self.close,
-                                          self._run_core)
+                                          (self._observed_core if self._run_core is not None
+                                           and self._response_observer is not None else self._run_core))
 
     def close(self) -> None:
         # Idempotent even after partially failed construction; always release the
@@ -285,6 +311,7 @@ class RequestEvidenceOwner:
             self._rendered = ()
             self._fault = None
             self._run_core = None
+            self._response_observer = None
 
     def __repr__(self):
         return "RequestEvidenceOwner(<request-owned>)"

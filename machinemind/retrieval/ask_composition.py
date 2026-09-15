@@ -252,6 +252,24 @@ class AskEvidenceSession:
             self._request = None
             self._key = None
 
+    def cache_dependencies(self, *, request: Any) -> frozenset[SourceIdentity]:
+        """Dependencies of this observed snapshot, NEVER a current allowance.
+
+        Includes scanned sources and relation targets, not just final citations.
+        Cache reuse must reauthorize the whole set; if an unused source has been
+        revoked, skip storage/reuse rather than invalidating a fresh selected
+        answer. No content, capability handle or mutable receipt is exported.
+        """
+        with self._lock:
+            self._check_request(request)
+            sources = set()
+            for receipt in self._reads:
+                sources.update(_required_sources(receipt))
+            for node in self._nodes:
+                sources.add(node.source)
+                sources.update(relation.target for relation in node.relations)
+            return frozenset(sources)
+
     def summary(self) -> dict[str, Any]:
         """Counts only: no query, tenant/source IDs, text, URLs or permissions."""
         with self._lock:
