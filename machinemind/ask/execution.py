@@ -13,6 +13,8 @@ be wired to the SAME request session before production canonical activation.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from functools import wraps
+from inspect import signature
 from typing import Any, Callable, Optional, TYPE_CHECKING
 
 from ..evidence.ask_input import AskEvidenceAdmission, apply_ask_evidence_input, ask_request_key
@@ -75,6 +77,27 @@ class AskExecutionRuntime:
     _v13_structured_ask: Callable[..., Any]
     json: Any
     evidence_admission: Optional[Callable[[Any, dict, Any, str], AskEvidenceAdmission]] = None
+    evidence_observer: Any = None
+
+
+def _observe_consumer(function):
+    """Optional request-owned observer; the default delegates without alteration.
+
+    Binding uses the function's original signature, not inspection of evidence
+    text/IDs. No global hooks or function implementations are replaced at runtime.
+    """
+    contract = signature(function)
+    @wraps(function)
+    def observed(*args, **kwargs):
+        runtime = kwargs.get("runtime")
+        observer = getattr(runtime, "evidence_observer", None)
+        if observer is None:
+            return function(*args, **kwargs)
+        values = contract.bind(*args, **kwargs)
+        values.apply_defaults()
+        return observer.consume(function.__name__, values.arguments,
+                                lambda: function(*args, **kwargs))
+    return observed
 
 
 def _ask_path(request: Any, decision: Any) -> bool:
@@ -96,6 +119,9 @@ def _admit_input(request: Any, retrieval: dict, decision: Any, *,
     """
     if not _guarded(runtime, request, decision):
         return retrieval
+    if runtime.evidence_observer is not None:
+        return runtime.evidence_observer.admit(request, retrieval, decision, stage,
+            lambda data: runtime.evidence_admission(request, data, decision, stage))
     key = ask_request_key(request)
     admission = runtime.evidence_admission(request, retrieval, decision, stage)
     if ask_request_key(request) != key:
@@ -151,6 +177,7 @@ def bind_ask_execution(runtime: AskExecutionRuntime, *, session: AskEvidenceSess
     return bound
 
 
+@_observe_consumer
 def recover_ask_from_evidence(
     *,
     request: AssistantCoreRequest,
@@ -160,6 +187,7 @@ def recover_ask_from_evidence(
     runtime: AskExecutionRuntime,
 ) -> dict | None:
     """One bounded grounded synthesis when the first ASK synthesis fails closed."""
+    _copy_candidate = runtime.evidence_observer.copy if runtime.evidence_observer is not None else dict
     V13_FAST_MODEL = runtime.V13_FAST_MODEL
     _assistant_core_redact_internal_text = runtime._assistant_core_redact_internal_text
     _assistant_core_should_semantic_verify_answer = runtime._assistant_core_should_semantic_verify_answer
@@ -170,7 +198,7 @@ def recover_ask_from_evidence(
     if not _assistant_core_should_semantic_verify_answer(decision):
         return None
     candidates = [
-        dict(c)
+        _copy_candidate(c)
         for c in (retrieval.get("citations") or retrieval.get("candidates") or [])
         if isinstance(c, dict) and str(c.get("citation_id") or "").strip()
     ][:16]
@@ -234,6 +262,7 @@ def recover_ask_from_evidence(
     }
 
 
+@_observe_consumer
 def synthesize_ask(
     request: AssistantCoreRequest,
     retrieval: dict,
@@ -381,6 +410,7 @@ def synthesize_ask(
     return response
 
 
+@_observe_consumer
 def verify_or_repair_answer(
     *,
     request: AssistantCoreRequest,
@@ -598,6 +628,7 @@ def verify_or_repair_answer(
     return out
 
 
+@_observe_consumer
 def repair_response(
     response: dict,
     request: AssistantCoreRequest,
@@ -612,6 +643,7 @@ def repair_response(
     improve an answer that the first validator would otherwise reject; it never
     rewrites an answer that already passed.
     """
+    _copy_candidate = runtime.evidence_observer.copy if runtime.evidence_observer is not None else dict
     RESULT_INCOMPLETE_ANSWER_CONTRACT = runtime.RESULT_INCOMPLETE_ANSWER_CONTRACT
     _assistant_core_build_no_evidence = runtime._assistant_core_build_no_evidence
     _assistant_core_redact_internal_text = runtime._assistant_core_redact_internal_text
@@ -645,7 +677,7 @@ def repair_response(
         if not cid or cid in seen_ids:
             continue
         seen_ids.add(cid)
-        candidates.append(dict(raw))
+        candidates.append(_copy_candidate(raw))
         if len(candidates) >= 16:
             break
 

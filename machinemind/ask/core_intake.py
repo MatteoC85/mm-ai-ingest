@@ -8,7 +8,8 @@ ID/text/score search over the results. Default OFF remains in main.
 Intake and optional P4 preparation share this lifetime. Preparation uses the
 existing producer and three real scoped readers with explicit seed occurrences.
 Generic Document/XLSX generation is optional on this same lifetime.
-Structured/overview synthesis is optional on this same lifetime; validation/repair remain gated;
+Structured/overview synthesis and the optional grouped validation/repair observer
+share this lifetime. Cache activation and the final live gates remain separate;
 no legacy source-acquiring callback is used as a fallback.
 The same owner remains alive for the existing scalar rescue on genuine no-source
 or refusal results; technical errors cannot be converted to successful absence.
@@ -22,6 +23,8 @@ from typing import Any, Callable
 from assistant_core_v2 import AssistantCoreV2, AssistantCoreHooks
 from .request_binding import AskRequestEvidence, AskRuntimeFactories, run_core_request
 from .execution import AskExecutionRuntime
+from .validation import AskValidationRuntime
+from .response_evidence import ResponseEvidenceFlow
 from .generation import AskGenerationRuntime, GenericGenerationEvidence
 from .task_generation import TaskSynthesisRuntime, TaskGenerationEvidence
 from ..evidence.contracts import EvidenceContractError
@@ -87,7 +90,7 @@ class _CoreIntake:
     serialized into response metadata. Retained callbacks expire at Core return.
     """
     def __init__(self, *, request, session, readers, authorize, invoke,
-                 core, runtimes, runtime, preparation=None, generation=None, tasks=None):
+                 core, runtimes, runtime, preparation=None, generation=None, tasks=None, consumers=False):
         if (type(session) is not AskEvidenceSession
                 or type(readers) is not ProductionReaderAdapters
                 or type(core) is not AssistantCoreV2
@@ -107,6 +110,10 @@ class _CoreIntake:
         self._task_input = {}
         self._task_used = set()
         self._generated_validation_selection = None
+        if type(consumers) is not bool or (consumers and
+                (generation is None or tasks is None or preparation is None)):
+            raise CoreIntakeError("explicit complete synthesis composition required before consumers")
+        self.consumers, self._response_flow = consumers, None
         self.generation = generation
         self._execution_snapshot = None
         self._prepared_retrieval = self._synthesis_decision = self._generation_input = None
@@ -327,6 +334,11 @@ class _CoreIntake:
 
     def select(self, request, data, decision, stage):
         def work():
+            if self._response_flow is not None:
+                if stage == "core.output.collections" and self._response_flow.completed:
+                    return self._response_flow.final_selection(data)
+                if self._response_flow.pending is not None:
+                    return self._response_flow.select_pending(request, data, decision, stage)
             allowed = {"core.retrieve.output", "core.route.input", "core.refine.input",
                        "core.refine.output", "core.prepare.input"}
             if stage == "core.output.collections":
@@ -419,7 +431,32 @@ class _CoreIntake:
         if self.tasks is not None:
             changes.update(_v13_structured_ask=self.structured_generate,
                            _assistant_core_synthesize_machine_overview=self.overview_generate)
-        return replace(runtime, **changes)
+        updated = replace(runtime, **changes)
+        if self.consumers:
+            if self._response_flow is not None:
+                raise CoreIntakeError("one response consumer flow per Core request")
+            self._response_flow = ResponseEvidenceFlow(self)
+            updated = self._response_flow.execution_runtime(updated)
+        return updated
+
+    def _validation_factory(self):
+        runtime = self.runtimes.validation()
+        if type(runtime) is not AskValidationRuntime or runtime.execution_runtime is not None:
+            raise CoreIntakeError("fresh existing validation runtime required")
+        if self.consumers:
+            if self._response_flow is None:
+                raise CoreIntakeError("execution must own the response observer")
+            return self._response_flow.validation_runtime(runtime)
+        return runtime
+
+    def _build_empty_response(self, request, decision, retrieval):
+        if self._response_flow is not None:
+            return self._response_flow.empty(self.core.hooks.build_no_evidence, request, decision, retrieval)
+        return self.core.hooks.build_no_evidence(request, decision, retrieval)
+
+    def _finalize_core(self, request, response):
+        if self._response_flow is not None:
+            return self._response_flow.finish(request, response)
 
     def _synthesis_contract(self, decision):
         """Verify the existing execution transform, including metadata outside lists.
@@ -470,6 +507,8 @@ class _CoreIntake:
                 runtime=self.generation, allow_structured=self.tasks is not None)
             result, selections = operation.run(parameters["retrieval"], self._selection)
             self._generated_response, self._generated_selections = deepcopy(result), selections
+            if self._response_flow is not None:
+                self._response_flow.generated(result, selections, ())
             return result
         return self.invoke(work, self.request)
 
@@ -488,6 +527,8 @@ class _CoreIntake:
             self._generated_response = deepcopy(response)
             self._generated_selections = selections
             self._generated_validation_selection = validation
+            if self._response_flow is not None:
+                self._response_flow.generated(response, selections, validation)
         return response
 
     def overview_generate(self, request, retrieval, decision):
@@ -520,18 +561,22 @@ class _CoreIntake:
             try:
                 self._check(request)
                 local_hooks = replace(self.core.hooks, retrieve_neutral=self.neutral,
-                    refine_retrieval=self.refine, prepare_evidence=self.prepare)
+                    refine_retrieval=self.refine, prepare_evidence=self.prepare,
+                    build_no_evidence=self._build_empty_response if self.consumers else self.core.hooks.build_no_evidence)
                 # Same implementation, ONE run inside request_binding. This
                 # instance is an immutable per-request hooks container only.
                 local_core = AssistantCoreV2(local_hooks)
                 binding = AskRequestEvidence(session=self.session,
-                    authorize=self.authorize, select=self.select)
+                    authorize=self.authorize, select=self.select,
+                    finalize=self._finalize_core if self.consumers else None)
                 return run_core_request(request, core=local_core,
                     runtimes=(self.runtimes if self.generation is None else
                         AskRuntimeFactories(execution=self._execution_factory,
-                                            validation=self.runtimes.validation)),
+                                            validation=self._validation_factory)),
                     evidence=binding, acquisition=None)
             finally:
+                if self._response_flow is not None:
+                    self._response_flow.close()
                 self.active = False
                 self._selection = None
                 self._prepared = False

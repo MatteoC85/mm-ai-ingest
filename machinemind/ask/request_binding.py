@@ -54,7 +54,11 @@ class AskRequestEvidence:
     authorize: Callable[[Any], frozenset[SourceIdentity]] = field(repr=False)
     select: Callable[[Any, dict, Any, str], tuple[AskSelection, ...]] = field(repr=False)
 
+    finalize: Callable[[Any, dict], None] | None = field(default=None, repr=False)
+
     def __post_init__(self) -> None:
+        if (self.finalize is not None and not callable(self.finalize)):
+            raise EvidenceContractError("explicit optional final response observer required")
         if (not isinstance(self.session, AskEvidenceSession)
                 or not callable(self.authorize) or not callable(self.select)):
             raise EvidenceContractError("existing session and trusted authority/selection required")
@@ -313,6 +317,8 @@ def run_core_request(request: Any, *, core: AssistantCoreV2,
         result = AssistantCoreV2(local_hooks).run(request)
         check(request)
         if evidence is not None:
+            if evidence.finalize is not None:
+                invoke(evidence.finalize, request, request, result)
             out = dict(result)
             collections = {k:out[k] for k in ("candidates", "citations") if k in out}
             checked = admit(request, collections, None, "core.output.collections")

@@ -17674,7 +17674,7 @@ def _assistant_core_production_readers(*, request, session, authorized, invoke):
 
 
 def _assistant_core_intake_factory(**owned):
-    """B4o intake/preparation on one session; consumers remain gated, OFF only."""
+    """B4o intake through validation/repair on one session; authority stays OFF."""
     intake = _ask_core_intake.CoreIntakeRuntime(
         initial=_assistant_core_initial_retrieval_runtime(),
         neutral=_assistant_core_neutral_retrieval_runtime(),
@@ -17726,7 +17726,7 @@ def _assistant_core_intake_factory(**owned):
             validation=_assistant_core_ask_validation_runtime), runtime=intake,
         preparation=_assistant_core_prepare_evidence_runtime(),
         generation=_assistant_core_generation_runtime(),
-        tasks=_assistant_core_task_synthesis_runtime())
+        tasks=_assistant_core_task_synthesis_runtime(), consumers=True)
 
 
 def _assistant_core_authorized_ask_sync(payload, x_ai_internal_secret, *,

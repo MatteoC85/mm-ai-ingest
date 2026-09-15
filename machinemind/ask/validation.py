@@ -63,6 +63,7 @@ class AskValidationRuntime:
     _v12_evidence_role: Callable[..., Any]
     _v13_current_budget: Callable[..., Any]
     execution_runtime: execution.AskExecutionRuntime | None = None
+    evidence_observer: Any = None
 
 
 def _guarded(runtime: AskValidationRuntime, request: Any, decision: Any) -> bool:
@@ -81,6 +82,9 @@ def _admit(request: Any, data: dict, decision: Any, *,
     """
     if not _guarded(runtime, request, decision):
         return data
+    if runtime.evidence_observer is not None:
+        return runtime.evidence_observer.admit(request, data, decision, stage,
+            lambda value: runtime.execution_runtime.evidence_admission(request, value, decision, stage))
     key = ask_request_key(request)
     snapshot = deepcopy(data)
     observed = deepcopy(snapshot)
@@ -161,6 +165,7 @@ def bind_ask_validation(runtime: AskValidationRuntime, *,
     return bound
 
 
+@execution._observe_consumer
 def recover_citations(
     response: dict,
     *,
@@ -169,6 +174,7 @@ def recover_citations(
     decision: AssistantCoreDecision,
     runtime: AskValidationRuntime,
 ) -> tuple[list[dict], list[dict]]:
+    _copy_candidate = runtime.evidence_observer.copy if runtime.evidence_observer is not None else dict
     KIND_PROCEDURE = runtime.KIND_PROCEDURE
     _assistant_core_candidate_evidence_text = runtime._assistant_core_candidate_evidence_text
     _assistant_core_candidate_source_type = runtime._assistant_core_candidate_source_type
@@ -184,12 +190,12 @@ def recover_citations(
     _v12_evidence_role = runtime._v12_evidence_role
     response, retrieval = _inputs(response, request, retrieval, decision, runtime=runtime, stage="citation_recovery")
     retrieval_selected = [
-        dict(c)
+        _copy_candidate(c)
         for c in (retrieval.get("citations") or retrieval.get("candidates") or [])
         if isinstance(c, dict) and str(c.get("citation_id") or "").strip()
     ]
     trusted_manifest = [
-        dict(c)
+        _copy_candidate(c)
         for c in (response.get("_assistant_core_validation_evidence") or [])
         if isinstance(c, dict)
         and str(c.get("citation_id") or "").strip()
@@ -215,7 +221,7 @@ def recover_citations(
     selected = _collection(request, selected, decision, runtime=runtime, stage="citation_recovery.selected")
     by_id = {str(c.get("citation_id") or "").strip(): c for c in selected}
     existing = [
-        dict(c)
+        _copy_candidate(c)
         for c in (response.get("citations") or [])
         if isinstance(c, dict) and str(c.get("citation_id") or "").strip() in by_id
     ]
@@ -230,13 +236,13 @@ def recover_citations(
             if str(c.get("citation_id") or "").strip()
         }
         ordered = [
-            dict(c) for c in (response.get("citations") or [])
+            _copy_candidate(c) for c in (response.get("citations") or [])
             if isinstance(c, dict)
             and str(c.get("citation_id") or "").strip() in manifest_ids
         ]
         ordered_ids = {str(c.get("citation_id") or "").strip() for c in ordered}
         ordered.extend(
-            dict(c) for c in trusted_manifest
+            _copy_candidate(c) for c in trusted_manifest
             if str(c.get("citation_id") or "").strip() not in ordered_ids
         )
         ordered = _procedure_ui_order_citations(ordered)
@@ -258,7 +264,7 @@ def recover_citations(
             if _guarded(runtime, request, decision):
                 raise
             links = [
-                dict(link) for link in (response.get("rg_links") or [])
+                _copy_candidate(link) for link in (response.get("rg_links") or [])
                 if isinstance(link, dict)
                 and str(link.get("citation_id") or "").strip()
                 in {str(c.get("citation_id") or "").strip() for c in sanitized}
@@ -341,7 +347,7 @@ def recover_citations(
     sanitized = _collection(request, sanitized, decision, runtime=runtime, stage="citation_recovery.generic_after_sanitize")
     valid_ids = {str(c.get("citation_id") or "").strip() for c in sanitized}
     links = [
-        dict(link)
+        _copy_candidate(link)
         for link in (response.get("rg_links") or [])
         if isinstance(link, dict)
         and str(link.get("citation_id") or "").strip() in valid_ids
@@ -358,6 +364,7 @@ def recover_citations(
     return sanitized, links
 
 
+@execution._observe_consumer
 def validate_response(
     response: dict,
     request: AssistantCoreRequest,
@@ -366,6 +373,7 @@ def validate_response(
     *,
     runtime: AskValidationRuntime,
 ) -> dict:
+    _copy_candidate = runtime.evidence_observer.copy if runtime.evidence_observer is not None else dict
     EVIDENCE_PARTIAL = runtime.EVIDENCE_PARTIAL
     MODE_ASK = runtime.MODE_ASK
     MODE_ROOT_CAUSE = runtime.MODE_ROOT_CAUSE
@@ -396,12 +404,12 @@ def validate_response(
     response, retrieval = _inputs(response, request, retrieval, decision, runtime=runtime, stage="validation")
     out = dict(response or {})
     allowed_candidates = [
-        dict(c)
+        _copy_candidate(c)
         for c in (retrieval.get("citations") or retrieval.get("candidates") or [])
         if isinstance(c, dict) and str(c.get("citation_id") or "").strip()
     ]
     allowed_candidates.extend(
-        dict(c)
+        _copy_candidate(c)
         for c in (out.get("_assistant_core_validation_evidence") or [])
         if isinstance(c, dict) and str(c.get("citation_id") or "").strip()
     )
