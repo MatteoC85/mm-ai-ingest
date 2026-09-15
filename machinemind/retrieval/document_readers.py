@@ -2258,9 +2258,13 @@ def read_deterministic_manual_support_page_evidence(*, scope: ChunkReadScope, q:
 
 def read_document_file_references(*, scope: ChunkReadScope, sources: tuple[SourceIdentity, ...],
         current_allowed_sources: frozenset[SourceIdentity], limits: ChunkEvidenceLimits,
-        runtime: FetchDocumentFileMapRuntime) -> FileReferenceRead:
+        runtime: FetchDocumentFileMapRuntime, allow_structured: bool = False) -> FileReferenceRead:
+    # Internal opt-in for existing structured source URLs; anchors still come from
+    # admitted occurrences and independent current authority, never citation IDs.
+    if type(allow_structured) is not bool:
+        raise SupplementalBindingError("explicit internal file source policy required")
     validate_anchors(scope=scope, anchors=sources, current_allowed_sources=current_allowed_sources, limits=limits)
-    if any(s.source_type.value != "document" for s in sources):
+    if not allow_structured and any(s.source_type.value != "document" for s in sources):
         raise SupplementalBindingError("document-only file map")
     # Legacy normalization must not silently change any authorization selector.
     if scope.company_id != scope.company_id.strip() or any(storage_key(s) != storage_key(s).strip() for s in sources):
@@ -2268,4 +2272,4 @@ def read_document_file_references(*, scope: ChunkReadScope, sources: tuple[Sourc
     rows, count = _fetch_document_file_map_impl(scope.company_id, [storage_key(s) for s in sources],
         runtime=runtime, _reference_limit=limits.assembly.max_occurrences)
     return build_file_reference_read(scope=scope, anchors=sources, current_allowed_sources=current_allowed_sources,
-        rows=rows, limits=limits, query_count=count)
+        rows=rows, limits=limits, query_count=count, allow_structured=allow_structured)

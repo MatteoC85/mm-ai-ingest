@@ -279,6 +279,7 @@ def v12_choose_primary_procedure_family(
     citations: list[dict],
     model_used: Optional[list[dict]] = None,
     runtime: V12ChoosePrimaryProcedureFamilyRuntime,
+    trace=None,
 ) -> tuple[Optional[dict], list[dict], dict]:
     """Recover and rank Procedure families from the Step children first.
 
@@ -287,6 +288,7 @@ def v12_choose_primary_procedure_family(
     family that best covers the router facets and has the strongest admitted Step
     support wins; a Procedure title alone cannot outvote its own children.
     """
+    _copy_candidate = dict if trace is None else trace.copy
     ASK_STRUCTURED_DIRECT_TEXT_CHARS = runtime.ASK_STRUCTURED_DIRECT_TEXT_CHARS
     _db_fetch_parent_procedure_pages_for_steps = runtime._db_fetch_parent_procedure_pages_for_steps
     _dedup_text_values = runtime._dedup_text_values
@@ -300,8 +302,8 @@ def v12_choose_primary_procedure_family(
     _v12_step_sort_key = runtime._v12_step_sort_key
     _v12_structured_parent_values = runtime._v12_structured_parent_values
     _v12_structured_rank = runtime._v12_structured_rank
-    citations = [dict(c) for c in (citations or []) if isinstance(c, dict)]
-    model_used = [dict(c) for c in (model_used or []) if isinstance(c, dict)]
+    citations = [_copy_candidate(c) for c in (citations or []) if isinstance(c, dict)]
+    model_used = [_copy_candidate(c) for c in (model_used or []) if isinstance(c, dict)]
     raw_procedures = [c for c in citations if _v12_evidence_role(c) == "procedure"]
     raw_steps = [c for c in citations if _v12_evidence_role(c) == "step"]
     if not raw_steps and not raw_procedures:
@@ -316,13 +318,16 @@ def v12_choose_primary_procedure_family(
         raw_procedure_keys.add(key)
         current = procedure_by_key.get(key)
         if current is None or _v12_structured_rank(procedure, set()) < _v12_structured_rank(current, set()):
-            procedure_by_key[key] = dict(procedure)
+            procedure_by_key[key] = _copy_candidate(procedure)
 
     child_keys = _dedup_text_values(
         [str(step.get("bubble_document_id") or "").strip() for step in raw_steps],
         limit=500,
     )
-    relation_rows = _db_fetch_parent_procedure_pages_for_steps(
+    relation_rows = (
+        _db_fetch_parent_procedure_pages_for_steps if trace is None else
+        lambda **parameters: trace.parent_rows(raw_steps, **parameters)
+    )(
         company_id=company_id,
         machine_id=machine_id,
         child_source_keys=child_keys,
@@ -352,6 +357,8 @@ def v12_choose_primary_procedure_family(
                 parent_text=str(row.get("parent_text") or ""),
                 fallback_title=fallback_title,
             )
+            if trace is not None:
+                trace.page_view(row, procedure_by_key[parent])
         children_by_parent.setdefault(parent, [])
 
     unresolved_steps: list[dict] = []
@@ -360,14 +367,14 @@ def v12_choose_primary_procedure_family(
         relation = parent_by_child.get(child)
         if relation:
             parent = str(relation.get("parent_source_key") or "").strip()
-            cc = dict(step)
+            cc = _copy_candidate(step)
             cc["_v10_5_parent_source_key"] = parent
             if relation.get("ordinal") is not None:
                 cc["structured_relation_ordinal"] = _safe_int(relation.get("ordinal"), 0)
             cc.setdefault("structured_relation_source", "structured_source_relations_seed")
             children_by_parent.setdefault(parent, []).append(cc)
         else:
-            unresolved_steps.append(dict(step))
+            unresolved_steps.append(_copy_candidate(step))
 
     # Compatibility for legacy data or a staged migration: assign a Step only when
     # its indexed parent metadata identifies exactly one available Procedure.
@@ -378,7 +385,7 @@ def v12_choose_primary_procedure_family(
         ]
         if len(matching) == 1:
             parent = matching[0]
-            cc = dict(step)
+            cc = _copy_candidate(step)
             cc["_v10_5_parent_source_key"] = parent
             cc.setdefault("structured_relation_source", "legacy_parent_text_seed")
             children_by_parent.setdefault(parent, []).append(cc)
@@ -393,7 +400,7 @@ def v12_choose_primary_procedure_family(
         procedure = procedure_by_key.get(parent_key)
         if not isinstance(procedure, dict):
             continue
-        procedure = dict(procedure)
+        procedure = _copy_candidate(procedure)
         procedure["evidence_role"] = "procedure"
         procedure["ask_structured_direct"] = True
         complete_steps = _v12_expand_primary_procedure_steps(
@@ -466,7 +473,7 @@ def v12_choose_primary_procedure_family(
             for row in families[:6]
         ],
     }
-    procedure = dict(winner.get("procedure") or {})
+    procedure = _copy_candidate(winner.get("procedure") or {})
     procedure["_v10_5_family_debug"] = debug
     return procedure, list(winner.get("complete_steps") or []), debug
 
@@ -495,8 +502,10 @@ def v12_curate_structured_sources(
     citations: list[dict],
     model_used: Optional[list[dict]] = None,
     runtime: V12CurateStructuredSourcesRuntime,
+    trace=None,
 ) -> list[dict]:
     """Keep one coherent procedure family and remove unrelated P&S/steps."""
+    _copy_candidate = dict if trace is None else trace.copy
     ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_MAX_ITEMS = runtime.ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_MAX_ITEMS
     ASK_UI_STRUCTURED_MAX_CITATIONS = runtime.ASK_UI_STRUCTURED_MAX_CITATIONS
     INFO_PROCEDURE_FULL = runtime.INFO_PROCEDURE_FULL
@@ -508,7 +517,7 @@ def v12_curate_structured_sources(
     _v12_step_matches_procedure = runtime._v12_step_matches_procedure
     _v12_step_sort_key = runtime._v12_step_sort_key
     _v12_structured_rank = runtime._v12_structured_rank
-    citations = [dict(c) for c in citations or [] if isinstance(c, dict)]
+    citations = [_copy_candidate(c) for c in citations or [] if isinstance(c, dict)]
     if not citations:
         return []
     intent = _ask_structured_direct_intent(q, planner=planner)
@@ -521,7 +530,7 @@ def v12_curate_structured_sources(
             and any(p in {"procedure", "step"} for p in (intent.get("prefixes") or []))
         )
     )
-    model_used = [dict(c) for c in model_used or [] if isinstance(c, dict)]
+    model_used = [_copy_candidate(c) for c in model_used or [] if isinstance(c, dict)]
     if not operational:
         # Before synthesis model_used is empty and the full admitted pack is preserved.
         # After synthesis, non-procedural links must follow the sources the model
@@ -553,7 +562,7 @@ def v12_curate_structured_sources(
         # procedural synthesis when no single family is objectively dominant.
         return citations
 
-    primary = dict(primary)
+    primary = _copy_candidate(primary)
     primary["evidence_role"] = "procedure"
     primary["ask_structured_direct"] = True
     primary["_v10_5_family_debug"] = dict(family_debug or {})
@@ -563,7 +572,7 @@ def v12_curate_structured_sources(
     for c in existing_steps:
         relation = _v12_step_matches_procedure(c, primary)
         if relation is None and str(c.get("citation_id") or "") in used_ids:
-            cc = dict(c)
+            cc = _copy_candidate(c)
             cc["evidence_role"] = "step"
             expanded_steps.append(cc)
 
@@ -572,7 +581,7 @@ def v12_curate_structured_sources(
         bdid = str(c.get("bubble_document_id") or "").strip()
         if not bdid:
             continue
-        cc = dict(c)
+        cc = _copy_candidate(c)
         cc["evidence_role"] = "step"
         cc["ask_structured_direct"] = True
         prev = best_steps.get(bdid)
@@ -585,7 +594,7 @@ def v12_curate_structured_sources(
     for c in model_used:
         role = _v12_evidence_role(c)
         if role in {"ps", "md_photo", "md_video"}:
-            cc = dict(c)
+            cc = _copy_candidate(c)
             cc["evidence_role"] = role
             extras.append(cc)
 
@@ -653,6 +662,7 @@ def v12_filter_manual_support_to_selected_bundle(
     structured_citations: list[dict],
     manual_support_citations: list[dict],
     runtime: V12FilterManualSupportToSelectedBundleRuntime,
+    trace=None,
 ) -> list[dict]:
     """Keep only manual pages that still match the final selected Step span.
 
@@ -661,12 +671,13 @@ def v12_filter_manual_support_to_selected_bundle(
     deterministic guard removes pages that supported an earlier setup Step but no
     longer support the final answer. It changes neither retrieval nor embeddings.
     """
+    _copy_candidate = dict if trace is None else trace.copy
     _content_term_set = runtime._content_term_set
     _procedure_ui_fields = runtime._procedure_ui_fields
     _procedure_ui_is_safety_setup = runtime._procedure_ui_is_safety_setup
     _term_overlap_score = runtime._term_overlap_score
     _v12_evidence_role = runtime._v12_evidence_role
-    manual_rows = [dict(c) for c in (manual_support_citations or []) if isinstance(c, dict)]
+    manual_rows = [_copy_candidate(c) for c in (manual_support_citations or []) if isinstance(c, dict)]
     if not manual_rows:
         return []
 
@@ -728,13 +739,14 @@ class V12MarkStructuredRolesRuntime:
     _v12_evidence_role: Callable[..., Any]
 
 
-def v12_mark_structured_roles(citations: list[dict], *, runtime: V12MarkStructuredRolesRuntime) -> list[dict]:
+def v12_mark_structured_roles(citations: list[dict], *, runtime: V12MarkStructuredRolesRuntime, trace=None) -> list[dict]:
+    _copy_candidate = dict if trace is None else trace.copy
     _v12_evidence_role = runtime._v12_evidence_role
     out: list[dict] = []
     for c in citations or []:
         if not isinstance(c, dict):
             continue
-        cc = dict(c)
+        cc = _copy_candidate(c)
         role = _v12_evidence_role(cc)
         cc["evidence_role"] = role
         cc["ask_structured_direct"] = True

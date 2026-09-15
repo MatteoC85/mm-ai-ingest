@@ -130,6 +130,7 @@ from machinemind.ask import request_binding as _ask_request_binding
 from machinemind.ask import request_evidence as _ask_request_evidence
 from machinemind.ask import core_intake as _ask_core_intake
 from machinemind.ask import generation as _ask_generation
+from machinemind.ask import task_generation as _ask_task_generation
 from machinemind.ask import acquisition as _ask_acquisition
 
 from machinemind.infrastructure.execution import (
@@ -5344,8 +5345,9 @@ def _procedure_ui_complete_excerpt(value: str, *, max_chars: int) -> str:
     return _procedure_ui_clean(text, finish_sentence=True)
 
 
-def _procedure_ui_merge_sources(*groups: list[dict]) -> list[dict]:
+def _procedure_ui_merge_sources(*groups: list[dict], trace=None) -> list[dict]:
     """One coherent procedure followed by unique steps in their true order."""
+    _copy_candidate = dict if trace is None else trace.copy
     best: dict[str, dict] = {}
     insertion: dict[str, int] = {}
     sequence = 0
@@ -5362,7 +5364,7 @@ def _procedure_ui_merge_sources(*groups: list[dict]) -> list[dict]:
                 continue
             sequence += 1
             insertion.setdefault(key, sequence)
-            candidate = dict(citation)
+            candidate = _copy_candidate(citation)
             candidate["evidence_role"] = role
             candidate["ask_structured_direct"] = True
             previous = best.get(key)
@@ -5395,9 +5397,10 @@ def _procedure_ui_merge_sources(*groups: list[dict]) -> list[dict]:
     return ([primary] if primary is not None else []) + steps
 
 
-def _procedure_ui_order_citations(citations: list[dict]) -> list[dict]:
+def _procedure_ui_order_citations(citations: list[dict], trace=None) -> list[dict]:
+    _copy_candidate = dict if trace is None else trace.copy
     unique = _dedup_citations_preserve_order(
-        [dict(c) for c in (citations or []) if isinstance(c, dict)],
+        [_copy_candidate(c) for c in (citations or []) if isinstance(c, dict)],
         max_items=max(1, len(citations or [])) + 20,
     )
     def sort_key(citation: dict) -> tuple:
@@ -5909,8 +5912,10 @@ def _v12_select_sparse_ordered_steps(
     q: str,
     planner: Optional[dict],
     seed_step_ids: Optional[set[str]] = None,
+    trace=None,
 ) -> list[dict]:
-    steps = _v12_dedupe_family_steps(all_steps)
+    _copy_candidate = dict if trace is None else trace.copy
+    steps = (_v12_dedupe_family_steps(all_steps) if trace is None else trace.dedupe_steps(all_steps))
     if not steps:
         return []
     facet_queries = _v12_family_facet_queries(planner)
@@ -6014,6 +6019,7 @@ def _v12_select_response_steps(
     model_used_citations: list[dict],
     q: str,
     planner: Optional[dict] = None,
+    trace=None,
 ) -> list[dict]:
     """Choose the smallest coherent contiguous interval from one Procedure family.
 
@@ -6022,9 +6028,10 @@ def _v12_select_response_steps(
     included generic loading/setup prerequisites. Gaps and a directly adjacent
     closing/verification Step are preserved without hardcoding any Procedure.
     """
+    _copy_candidate = dict if trace is None else trace.copy
     steps = _dedup_citations_preserve_order(
         sorted(
-            [dict(c) for c in all_steps or [] if isinstance(c, dict)],
+            [_copy_candidate(c) for c in all_steps or [] if isinstance(c, dict)],
             key=_v12_step_sort_key,
         ),
         max_items=max(1, len(all_steps or [])) + 10,
@@ -6065,6 +6072,7 @@ def _v12_select_response_steps(
             q=q,
             planner=planner,
             seed_step_ids=seed_ids,
+            **({"trace": trace} if trace is not None else {}),
         )
 
     range_span = _v12_range_anchor_span(steps, q)
@@ -12791,6 +12799,124 @@ def _v13_fetch_manual_support_deterministic(
     )
 
 
+def _assistant_core_task_synthesis_runtime():
+    return _ask_task_generation.TaskSynthesisRuntime(
+        ASK_STRUCTURED_DIRECT_MAX_CONTEXT_CHARS=ASK_STRUCTURED_DIRECT_MAX_CONTEXT_CHARS,
+        ASK_UI_MAX_POINTS=ASK_UI_MAX_POINTS,
+        ASK_UI_STRUCTURED_MAX_CITATIONS=ASK_UI_STRUCTURED_MAX_CITATIONS,
+        INFO_OTHER=INFO_OTHER,
+        INFO_PROCEDURE_FULL=INFO_PROCEDURE_FULL,
+        INFO_PROCEDURE_SEGMENT=INFO_PROCEDURE_SEGMENT,
+        V13_FAST_EFFORT=V13_FAST_EFFORT,
+        V13_FAST_MAX_OUTPUT_TOKENS=V13_FAST_MAX_OUTPUT_TOKENS,
+        V13_FAST_MODEL=V13_FAST_MODEL,
+        V13_FAST_TIMEOUT_SECONDS=V13_FAST_TIMEOUT_SECONDS,
+        V13_HEAVY_CONTEXT_CHARS=V13_HEAVY_CONTEXT_CHARS,
+        V13_PLANNER_MODEL=V13_PLANNER_MODEL,
+        _V13BudgetExceeded=_V13BudgetExceeded,
+        _ask_evidence_answer_schema=_ask_evidence_answer_schema,
+        _ask_structured_direct_fetch_sources=_ask_structured_direct_fetch_sources,
+        _assistant_core_build_machine_overview_answer=_assistant_core_build_machine_overview_answer,
+        _assistant_core_candidate_source_type=_assistant_core_candidate_source_type,
+        _assistant_core_machine_overview_schema=_assistant_core_machine_overview_schema,
+        _assistant_core_overview_attach_record=_assistant_core_overview_attach_record,
+        _assistant_core_overview_fallback_function=_assistant_core_overview_fallback_function,
+        _assistant_core_overview_inventory_records=_assistant_core_overview_inventory_records,
+        _assistant_core_overview_item_text=_assistant_core_overview_item_text,
+        _assistant_core_overview_merge_duplicate_items=_assistant_core_overview_merge_duplicate_items,
+        _assistant_core_overview_records_block=_assistant_core_overview_records_block,
+        _assistant_core_redact_internal_text=_assistant_core_redact_internal_text,
+        _build_rg_links=_build_rg_links,
+        _build_structured_procedure_ui_model=_build_structured_procedure_ui_model,
+        _clean_display_text=_clean_display_text,
+        _content_term_set=_content_term_set,
+        _dedup_text_values=_dedup_text_values,
+        _finalize_ask_response_for_ui=_finalize_ask_response_for_ui,
+        _looks_like_target_language=_looks_like_target_language,
+        _procedure_ui_fields=_procedure_ui_fields,
+        _procedure_ui_is_safety_setup=_procedure_ui_is_safety_setup,
+        _procedure_ui_merge_sources=_procedure_ui_merge_sources,
+        _procedure_ui_model_to_text=_procedure_ui_model_to_text,
+        _procedure_ui_order_citations=_procedure_ui_order_citations,
+        _render_grounded_answer_points=_render_grounded_answer_points,
+        _sanitize_citations_for_response=_sanitize_citations_for_response,
+        _source_type_from_document_id=_source_type_from_document_id,
+        _structured_rescue_query_intent=_structured_rescue_query_intent,
+        _term_overlap_score=_term_overlap_score,
+        _v12_choose_primary_procedure=_v12_choose_primary_procedure,
+        _v12_curate_response_items_for_ui=_v12_curate_response_items_for_ui,
+        _v12_curate_structured_sources=_v12_curate_structured_sources,
+        _v12_evidence_role=_v12_evidence_role,
+        _v12_filter_manual_support_to_selected_bundle=_v12_filter_manual_support_to_selected_bundle,
+        _v12_mark_structured_roles=_v12_mark_structured_roles,
+        _v12_procedure_selection_mode=_v12_procedure_selection_mode,
+        _v12_select_response_steps=_v12_select_response_steps,
+        _v12_step_sort_key=_v12_step_sort_key,
+        _v13_assurance_prompt_block=_v13_assurance_prompt_block,
+        _v13_fetch_manual_support_deterministic=_v13_fetch_manual_support_deterministic,
+        _v13_json_models=_v13_json_models,
+        _v13_merge_candidates=_v13_merge_candidates,
+        _v13_sources_block=_v13_sources_block,
+        family=_retrieval_procedure_families.V12ChoosePrimaryProcedureFamilyRuntime(
+            ASK_STRUCTURED_DIRECT_TEXT_CHARS=ASK_STRUCTURED_DIRECT_TEXT_CHARS,
+            _db_fetch_parent_procedure_pages_for_steps=_db_fetch_parent_procedure_pages_for_steps,
+            _dedup_text_values=_dedup_text_values,
+            _safe_int=_safe_int,
+            _v12_dedupe_family_steps=_v12_dedupe_family_steps,
+            _v12_evidence_role=_v12_evidence_role,
+            _v12_expand_primary_procedure_steps=_v12_expand_primary_procedure_steps,
+            _v12_family_score=_v12_family_score,
+            _v12_relation_procedure_candidate=_v12_relation_procedure_candidate,
+            _v12_step_matches_procedure=_v12_step_matches_procedure,
+            _v12_step_sort_key=_v12_step_sort_key,
+            _v12_structured_parent_values=_v12_structured_parent_values,
+            _v12_structured_rank=_v12_structured_rank,
+        ),
+        curation=_retrieval_procedure_families.V12CurateStructuredSourcesRuntime(
+            ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_MAX_ITEMS=ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_MAX_ITEMS,
+            ASK_UI_STRUCTURED_MAX_CITATIONS=ASK_UI_STRUCTURED_MAX_CITATIONS,
+            INFO_PROCEDURE_FULL=INFO_PROCEDURE_FULL,
+            INFO_PROCEDURE_SEGMENT=INFO_PROCEDURE_SEGMENT,
+            _ask_structured_direct_intent=_ask_structured_direct_intent,
+            _dedup_citations_preserve_order=_dedup_citations_preserve_order,
+            _v12_choose_primary_procedure_family=_v12_choose_primary_procedure_family,
+            _v12_evidence_role=_v12_evidence_role,
+            _v12_step_matches_procedure=_v12_step_matches_procedure,
+            _v12_step_sort_key=_v12_step_sort_key,
+            _v12_structured_rank=_v12_structured_rank,
+        ),
+        expansion=_retrieval_structured.V12ExpandPrimaryProcedureStepsRuntime(
+            ASK_SNIPPET_CHARS=ASK_SNIPPET_CHARS,
+            ASK_STRUCTURED_DIRECT_SCAN_LIMIT=ASK_STRUCTURED_DIRECT_SCAN_LIMIT,
+            ASK_STRUCTURED_DIRECT_TEXT_CHARS=ASK_STRUCTURED_DIRECT_TEXT_CHARS,
+            _db_conn=_db_conn,
+            _db_fetch_related_step_pages=_db_fetch_related_step_pages,
+            _safe_int=_safe_int,
+            _v12_step_matches_procedure=_v12_step_matches_procedure,
+            _v12_step_sort_key=_v12_step_sort_key,
+            _v12_structured_rank=_v12_structured_rank,
+        ),
+        step_dedupe=_retrieval_candidate_ranking.V12DedupeFamilyStepsRuntime(
+            _v12_merge_candidate_metadata=_v12_merge_candidate_metadata,
+            _v12_step_sort_key=_v12_step_sort_key,
+            _v12_structured_rank=_v12_structured_rank,
+        ),
+        metadata_merge=_retrieval_candidate_ranking.V12MergeCandidateMetadataRuntime(
+            _dedup_text_values=_dedup_text_values,
+        ),
+        manual_filter=_retrieval_procedure_families.V12FilterManualSupportToSelectedBundleRuntime(
+            _content_term_set=_content_term_set,
+            _procedure_ui_fields=_procedure_ui_fields,
+            _procedure_ui_is_safety_setup=_procedure_ui_is_safety_setup,
+            _term_overlap_score=_term_overlap_score,
+            _v12_evidence_role=_v12_evidence_role,
+        ),
+        roles=_retrieval_procedure_families.V12MarkStructuredRolesRuntime(
+            _v12_evidence_role=_v12_evidence_role,
+        ),
+    )
+
+
 def _v13_structured_ask(
     *,
     q: str,
@@ -12803,323 +12929,7 @@ def _v13_structured_ask(
     assurance_meta: Optional[dict] = None,
     debug: bool,
 ) -> Optional[dict]:
-    structured_types = {"procedure", "step", "ps", "md_photo", "md_video"}
-    raw = [
-        dict(c) for c in (seed_citations or [])
-        if isinstance(c, dict)
-        and str(c.get("source_type") or _source_type_from_document_id(c.get("bubble_document_id") or "")) in structured_types
-    ]
-
-    # Explicit listing/source requests may require records that are not semantically
-    # similar to a single operation. Merge the bounded deterministic structured scan.
-    if _structured_rescue_query_intent(q, planner):
-        try:
-            direct = _ask_structured_direct_fetch_sources(
-                company_id=company_id,
-                machine_id=machine_id,
-                q=q,
-                planner=planner,
-                top_k=max(10, top_k),
-            )
-            raw = _v13_merge_candidates([raw, direct])
-        except Exception as exc:
-            print("V13_STRUCTURED_FETCH_FAIL", str(exc)[:600])
-
-    if not raw:
-        return None
-
-    structured = _v12_curate_structured_sources(
-        company_id=company_id,
-        machine_id=machine_id,
-        q=q,
-        planner=planner,
-        citations=raw,
-        model_used=[],
-    )
-    structured = _v12_mark_structured_roles(structured)
-    if not structured:
-        return None
-
-    information_task = str((planner or {}).get("information_task") or INFO_OTHER).strip().lower()
-    procedure_sequence_mode = information_task in {
-        INFO_PROCEDURE_FULL,
-        INFO_PROCEDURE_SEGMENT,
-    }
-    structured_scope = list(structured)
-    selected_step_numbers: list[int] = []
-    expanded_step_numbers: list[int] = []
-
-    if procedure_sequence_mode:
-        primary = _v12_choose_primary_procedure(structured, [])
-        complete_steps = sorted(
-            [dict(c) for c in structured if _v12_evidence_role(c) == "step"],
-            key=_v12_step_sort_key,
-        )
-        expanded_step_numbers = [
-            _v12_step_sort_key(c)[0] for c in complete_steps
-            if 0 < _v12_step_sort_key(c)[0] < 9999
-        ]
-        if primary is None or not complete_steps:
-            # A Procedure title/parent may be absent from semantic top-k. Family
-            # recovery above normally restores it from Step relations; if no single
-            # family can be proven, return None so the caller can perform the normal
-            # grounded multi-source procedural synthesis instead of a false bundle
-            # error.
-            return None
-
-        if information_task == INFO_PROCEDURE_FULL:
-            selected_steps = complete_steps
-        else:
-            selected_steps = _v12_select_response_steps(
-                all_steps=complete_steps,
-                selected_step_ids=[],
-                model_used_citations=[],
-                q=q,
-                planner=planner,
-            )
-        if not selected_steps:
-            return None
-
-        selected_step_numbers = [
-            _v12_step_sort_key(c)[0] for c in selected_steps
-            if 0 < _v12_step_sort_key(c)[0] < 9999
-        ]
-        selected_number_set = set(selected_step_numbers)
-        first_selected = min(selected_number_set or {9999})
-        safety_prerequisites: list[dict] = []
-        for candidate in complete_steps:
-            number = _v12_step_sort_key(candidate)[0]
-            fields = _procedure_ui_fields(candidate)
-            safety_text = " ".join([
-                str(fields.get("title") or ""),
-                str(fields.get("description") or ""),
-            ])
-            if (
-                number < first_selected
-                and number not in selected_number_set
-                and _procedure_ui_is_safety_setup(safety_text)
-            ):
-                safety_prerequisites = [dict(candidate)]
-                break
-
-        extras = [
-            dict(c) for c in structured
-            if _v12_evidence_role(c) not in {"procedure", "step"}
-        ]
-        structured_scope = _v12_mark_structured_roles(
-            [dict(primary)] + safety_prerequisites + list(selected_steps) + extras
-        )
-
-    manual_support = _v13_fetch_manual_support_deterministic(
-        company_id=company_id,
-        machine_id=machine_id,
-        q=q,
-        planner=planner,
-        structured_citations=structured_scope,
-    )
-    if procedure_sequence_mode:
-        manual_support = _v12_filter_manual_support_to_selected_bundle(
-            q=q,
-            structured_citations=structured_scope,
-            manual_support_citations=manual_support,
-        )
-    all_evidence = list(structured_scope) + list(manual_support)
-    sources_block = _v13_sources_block(
-        all_evidence,
-        max_context_chars=min(V13_HEAVY_CONTEXT_CHARS, max(16000, ASK_STRUCTURED_DIRECT_MAX_CONTEXT_CHARS)),
-    )
-    if not sources_block:
-        return None
-
-    system_msg = (
-        "You are MachineMind ASK. Use only the supplied evidence. Structured procedures and their explicitly related ordered steps are primary. "
-        "Never mix steps from different procedure families. The supplied Step set is authoritative: it may be a contiguous operation span or a sparse ordered checklist of conditions. Preserve its order, do not invent missing intermediate Steps, and include all supplied conditions and warnings needed to answer the request. "
-        "Manual-support sources are secondary: use them only for directly relevant operating detail, prerequisite or safety context, and keep their citations so the manual appears among the links. "
-        "For P&S records, report problem, solution and notes. For photo/video records, use title/description metadata only and never claim visual or audio inspection. "
-        "Every visible point must be grounded in citation_ids from SOURCES. Do not expose raw ids in text. Reply in the requested language."
-    )
-    assurance_block = _v13_assurance_prompt_block({"retrieval_assurance": dict(assurance_meta or {})})
-    user_msg = (
-        f"QUESTION:\n{q}\n\nRESPONSE_LANGUAGE: {response_language}\n\nSOURCES:\n{sources_block}\n\n"
-        + (f"{assurance_block}\n\n" if assurance_block else "")
-        + "Return JSON only. Answer from the selected structured procedure/steps first, then add a brief directly applicable manual support or safety note when present."
-    )
-
-    model = V13_FAST_MODEL
-    effort = V13_FAST_EFFORT
-    mode = ""
-    timeout = V13_FAST_TIMEOUT_SECONDS
-    output_tokens = V13_FAST_MAX_OUTPUT_TOKENS
-
-    parsed: dict = {}
-    model_used = model
-    try:
-        parsed, model_used = _v13_json_models(
-            [
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_msg},
-            ],
-            models=[model],
-            json_schema=_ask_evidence_answer_schema(),
-            effort=effort,
-            reasoning_mode=mode,
-            timeout=timeout,
-            max_output_tokens=output_tokens,
-            company_id=company_id,
-            purpose="ask_structured_synthesis",
-        )
-    except _V13BudgetExceeded:
-        raise
-    except Exception as exc:
-        print("V13_STRUCTURED_SYNTHESIS_FAIL", str(exc)[:700])
-        parsed = {"answer_status": "no_sources", "grounded_points": []}
-
-    grounded_points = list(parsed.get("grounded_points") or [])
-    model_answer, model_citations = _render_grounded_answer_points(
-        grounded_points=grounded_points,
-        citations=all_evidence,
-        max_points=max(1, int(ASK_UI_MAX_POINTS or 5)),
-        q=q,
-    )
-
-    if procedure_sequence_mode:
-        # The deterministic Procedure span is authoritative. Do not call the
-        # generic curator again here, because it expands the parent Procedure back
-        # to every Step and would undo a valid partial selection.
-        final_structured = _v12_mark_structured_roles(structured_scope)
-    else:
-        final_structured = _v12_curate_structured_sources(
-            company_id=company_id,
-            machine_id=machine_id,
-            q=q,
-            planner=planner,
-            citations=structured_scope,
-            model_used=model_citations,
-        )
-        final_structured = _v12_mark_structured_roles(final_structured)
-    has_procedure_context = any(
-        _v12_evidence_role(c) in {"procedure", "step"}
-        for c in final_structured
-        if isinstance(c, dict)
-    )
-    if not has_procedure_context:
-        used_ids = {
-            str(c.get("citation_id") or "").strip()
-            for c in (model_citations or [])
-            if isinstance(c, dict) and str(c.get("citation_id") or "").strip()
-        }
-        manual_support = [
-            c for c in manual_support
-            if str(c.get("citation_id") or "").strip() in used_ids
-        ]
-    ui_structured = _procedure_ui_merge_sources(
-        structured_scope,
-        final_structured,
-        model_citations,
-    )
-    answer_ui_model = _build_structured_procedure_ui_model(
-        structured_citations=ui_structured,
-        manual_support_citations=manual_support,
-        grounded_points=grounded_points,
-        response_language=response_language,
-        q=q,
-    )
-    sectioned_answer = _procedure_ui_model_to_text(
-        answer_ui_model,
-        response_language=response_language,
-    )
-    synthesis_grounded = bool(model_answer and model_citations)
-    answer = sectioned_answer or model_answer
-    if not answer:
-        return None
-
-    # Keep one complete ordered Procedure/Step family, then secondary evidence.
-    model_extras = [
-        c for c in (model_citations or [])
-        if isinstance(c, dict) and _v12_evidence_role(c) not in {"procedure", "step"}
-    ]
-    final_citations = _v12_curate_response_items_for_ui(
-        _procedure_ui_order_citations(
-            list(ui_structured) + list(manual_support) + model_extras
-        ),
-        max_items=max(1, int(ASK_UI_STRUCTURED_MAX_CITATIONS or 14)),
-    )
-    if not final_citations:
-        return None
-
-    response_citations = _sanitize_citations_for_response(final_citations, company_id=company_id)
-    role_by_id = {
-        str(c.get("citation_id") or ""): {
-            "evidence_role": _v12_evidence_role(c),
-            "ask_structured_direct": bool(c.get("ask_structured_direct")),
-            "ask_structured_manual_support": bool(c.get("ask_structured_manual_support")),
-            "ask_manual_support_kind": str(c.get("ask_manual_support_kind") or ""),
-            "exact_machine_scope": bool(c.get("exact_machine_scope")),
-        }
-        for c in final_citations
-    }
-    for c in response_citations:
-        c.update(role_by_id.get(str(c.get("citation_id") or ""), {}))
-    response_citations = _procedure_ui_order_citations(response_citations)
-
-    try:
-        rg_links = _procedure_ui_order_citations(
-            _build_rg_links(company_id, response_citations)
-        )
-    except Exception as exc:
-        print("RG_LINKS_FAIL", str(exc)[:500])
-        rg_links = []
-
-    resp = {
-        "ok": True,
-        "status": "answered",
-        "answer": answer,
-        "language": response_language,
-        "citations": response_citations,
-        "rg_links": rg_links,
-        "top_k": top_k,
-        "similarity_max": max([float(c.get("similarity") or 0.0) for c in all_evidence], default=None),
-        "chat_model": model_used if synthesis_grounded else "v13_deterministic_structured_fallback",
-        "_assistant_ui_model": answer_ui_model,
-        # Internal, trusted evidence manifest. These citations are loaded and
-        # curated deterministically by the backend (including Procedure->Step
-        # expansion) and must survive Assistant Core validation even when they
-        # were not part of the original semantic retrieval top-k.
-        "_assistant_core_validation_evidence": [dict(c) for c in final_citations],
-        # Sparse procedural checklists combine non-contiguous conditions. Their
-        # semantic completeness cannot be judged reliably by phrase overlap alone,
-        # so the existing bounded third-call verifier is enabled only for this mode.
-        "_assistant_core_force_semantic_verify": bool(
-            procedure_sequence_mode
-            and _v12_procedure_selection_mode(q, planner) == "sparse_ordered_steps"
-        ),
-        "meta": (
-            {"cacheable": True, "semantic_cacheable": True}
-            if synthesis_grounded
-            else {
-                "cacheable": False,
-                "semantic_cacheable": False,
-                "degraded": True,
-                "degraded_reason": "structured_deterministic_fallback",
-            }
-        ),
-    }
-    if debug:
-        resp["debug"] = {
-            "v13_structured": {
-                "raw_sources": len(raw),
-                "structured_sources": len(final_structured),
-                "manual_support_sources": len(manual_support),
-                "manual_support_links": sum(1 for x in rg_links if str(x.get("evidence_role") or "") == "manual_support"),
-                "procedure_sequence_mode": bool(procedure_sequence_mode),
-                "information_task": information_task,
-                "procedure_selection_mode": _v12_procedure_selection_mode(q, planner),
-                "procedure_family": dict((primary or {}).get("_v10_5_family_debug") or {}) if procedure_sequence_mode else {},
-                "expanded_step_numbers": expanded_step_numbers,
-                "selected_step_numbers": selected_step_numbers,
-            }
-        }
-    return _finalize_ask_response_for_ui(resp, language=response_language)
+    return _ask_task_generation.structured_ask(q=q, company_id=company_id, machine_id=machine_id, response_language=response_language, top_k=top_k, planner=planner, seed_citations=seed_citations, assurance_meta=assurance_meta, debug=debug, runtime=_assistant_core_task_synthesis_runtime())
 
 
 # -----------------------------------------------------------------------------
@@ -14646,7 +14456,9 @@ def _assistant_core_overview_record(
     *,
     inventory_id: str,
     must_account: bool,
+    trace=None,
 ) -> dict:
+    _copy_candidate = dict if trace is None else trace.copy
     source_type = _assistant_core_candidate_source_type(candidate) or "document"
     raw_text = _v13_candidate_text(candidate)
     fields = _parse_structured_source_fields(raw_text)
@@ -14681,18 +14493,19 @@ def _assistant_core_overview_record(
         "title": title or source_type,
         "description": description,
         "must_account": bool(must_account),
-        "candidate": dict(candidate),
+        "candidate": _copy_candidate(candidate),
     }
 
 
-def _assistant_core_overview_inventory_records(retrieval: dict) -> list[dict]:
+def _assistant_core_overview_inventory_records(retrieval: dict, trace=None) -> list[dict]:
     """Build one bounded source inventory from the admitted evidence pack.
 
     Catalog media/procedure records are mandatory accounting inputs. Exact-machine
     manual pages are optional support and are kept separately so at least one
     technical document can ground the function summary.
     """
-    merged = _v13_merge_candidates(
+    _copy_candidate = dict if trace is None else trace.copy
+    merged = (_v13_merge_candidates if trace is None else trace.merge_candidates)(
         [
             list((retrieval or {}).get("citations") or []),
             list((retrieval or {}).get("candidates") or []),
@@ -14712,11 +14525,11 @@ def _assistant_core_overview_inventory_records(retrieval: dict) -> list[dict]:
         seen.add(cid)
         source_type = _assistant_core_candidate_source_type(candidate)
         if bool(candidate.get("assistant_core_catalog_candidate")):
-            catalog.append(dict(candidate))
+            catalog.append(_copy_candidate(candidate))
         elif source_type == "document" and bool(candidate.get("exact_machine_scope", True)):
-            manual.append(dict(candidate))
+            manual.append(_copy_candidate(candidate))
         elif source_type in {"procedure", "step", "ps", "md_photo", "md_video"}:
-            extra_structured.append(dict(candidate))
+            extra_structured.append(_copy_candidate(candidate))
 
     catalog.sort(
         key=lambda c: (
@@ -14750,6 +14563,7 @@ def _assistant_core_overview_inventory_records(retrieval: dict) -> list[dict]:
                 candidate,
                 inventory_id=f"I{idx:02d}",
                 must_account=must_account,
+                **({"trace": trace} if trace is not None else {}),
             )
         )
     return records
@@ -15058,370 +14872,7 @@ def _assistant_core_synthesize_machine_overview(
     retrieval: dict,
     decision: AssistantCoreDecision,
 ) -> dict | None:
-    """Exhaustive overview path with deterministic source accounting.
-
-    This path replaces free-form overview generation only when the evidence stage
-    explicitly requested the machine catalog. The model may merge and translate
-    source records, but deterministic post-processing appends any record it failed
-    to represent. Therefore a low lexical score cannot silently remove a documented
-    assembly or auxiliary system.
-    """
-    records = _assistant_core_overview_inventory_records(retrieval)
-    catalog_records = [record for record in records if bool(record.get("must_account"))]
-    manual_records = [record for record in records if str(record.get("source_type") or "") == "document"]
-    if not catalog_records:
-        return None
-
-    record_by_inventory = {str(record.get("inventory_id") or ""): record for record in records}
-    candidate_by_citation = {
-        str(record.get("citation_id") or ""): dict(record.get("candidate") or {})
-        for record in records
-        if str(record.get("citation_id") or "").strip()
-    }
-    block = _assistant_core_overview_records_block(records)
-    parsed: dict = {}
-    model_used = "deterministic_overview_fallback"
-    if block:
-        system_msg = (
-            "You are MachineMind's machine-overview inventory compiler. Use only SOURCE_INVENTORY. "
-            "Return an exhaustive but concise machine overview in RESPONSE_LANGUAGE. Merge synonyms and duplicate views into distinct user-facing assemblies or systems. "
-            "Every row marked MUST_ACCOUNT=yes must be represented by at least one overview item through its INVENTORY_ID. This does not require one item per source: multiple source rows may support one item. "
-            "Do not discard an auxiliary system merely because its wording scores weakly against the question. Include physical assemblies, material-flow groups, clamping/feed functions, tooling, HMI/control interfaces, lubrication/pneumatic/ventilation or other explicitly documented auxiliary systems, protections and outfeed when present. "
-            "Procedure records are evidence about the underlying assembly or system, not instructions to expose internal procedure codes. Cite only supplied CITATION_ID values. Do not claim direct visual inspection of media."
-        )
-        user_msg = (
-            f"QUESTION:\n{request.query}\n\n"
-            f"RESPONSE_LANGUAGE: {request.response_language}\n\n"
-            f"SOURCE_INVENTORY:\n{block}\n\n"
-            "Return JSON only. The function summary must be grounded in at least one technical document when available. Every overview item must have valid INVENTORY_ID and CITATION_ID values."
-        )
-        try:
-            parsed, model_used = _v13_json_models(
-                [
-                    {"role": "system", "content": system_msg},
-                    {"role": "user", "content": user_msg},
-                ],
-                models=[V13_FAST_MODEL, V13_PLANNER_MODEL],
-                json_schema=_assistant_core_machine_overview_schema(),
-                effort=V13_FAST_EFFORT,
-                reasoning_mode="",
-                timeout=min(28, V13_FAST_TIMEOUT_SECONDS),
-                max_output_tokens=min(5200, V13_FAST_MAX_OUTPUT_TOKENS),
-                company_id=request.company_id,
-                purpose="assistant_core_machine_overview_inventory",
-            )
-        except _V13BudgetExceeded:
-            parsed = {}
-        except Exception as exc:
-            print("ASSISTANT_CORE_OVERVIEW_INVENTORY_FAIL", str(exc)[:700])
-            parsed = {}
-
-    valid_inventory_ids = set(record_by_inventory)
-    valid_citation_ids = set(candidate_by_citation)
-    items: list[dict] = []
-    used_inventory_ids: set[str] = set()
-    used_citation_ids: list[str] = []
-    rejected_unsupported_model_items = 0
-
-    for raw in (parsed.get("overview_items") or []):
-        if not isinstance(raw, dict):
-            continue
-        inventory_ids = [
-            str(iid or "").strip()
-            for iid in (raw.get("inventory_ids") or [])
-            if str(iid or "").strip() in valid_inventory_ids
-        ]
-        citation_ids = [
-            str(cid or "").strip()
-            for cid in (raw.get("citation_ids") or [])
-            if str(cid or "").strip() in valid_citation_ids
-        ]
-        # Derive citations from assigned inventory rows when the model omitted or
-        # mistyped the long citation id but correctly identified the source row.
-        for iid in inventory_ids:
-            cid = str(record_by_inventory[iid].get("citation_id") or "").strip()
-            if cid and cid not in citation_ids:
-                citation_ids.append(cid)
-        label = _clean_display_text(raw.get("label") or "", max_len=160)
-        description = _clean_display_text(raw.get("description") or "", max_len=620)
-        if not label or not citation_ids or not inventory_ids:
-            # Every model item must identify at least one admitted inventory row.
-            # This prevents unsupported decorative groups from competing with the
-            # deterministic source-accounted items.
-            rejected_unsupported_model_items += 1
-            continue
-        assigned_text = " ".join(
-            " ".join(
-                [
-                    str(record_by_inventory[iid].get("title") or ""),
-                    str(record_by_inventory[iid].get("description") or ""),
-                ]
-            )
-            for iid in inventory_ids
-            if iid in record_by_inventory
-        ).strip()
-        item_text_for_support = " ".join([label, description]).strip()
-        same_language_support = bool(
-            _looks_like_target_language(assigned_text, request.response_language)
-            and _looks_like_target_language(item_text_for_support, request.response_language)
-        )
-        lexical_support = _term_overlap_score(
-            _content_term_set(assigned_text, limit=220),
-            _content_term_set(item_text_for_support, limit=180),
-        )
-        if same_language_support and lexical_support < 0.035:
-            # The item points to real source ids but its visible claim is unrelated
-            # to those sources. Drop it; deterministic accounting will append the
-            # clean admitted records instead. Cross-language translations are not
-            # rejected by this lexical guard.
-            rejected_unsupported_model_items += 1
-            continue
-        item = {
-            "label": label,
-            "description": description,
-            "kind": str(raw.get("kind") or "other"),
-            "inventory_ids": _dedup_text_values(inventory_ids, limit=24),
-            "citation_ids": _dedup_text_values(citation_ids, limit=16),
-        }
-        items.append(item)
-        used_inventory_ids.update(item["inventory_ids"])
-        for cid in item["citation_ids"]:
-            if cid not in used_citation_ids:
-                used_citation_ids.append(cid)
-
-    # Build document-frequency statistics for source terminology. They let the
-    # deterministic accounting check a few distinctive system terms instead of
-    # requiring lexical overlap with every administrative word in a Procedure.
-    from collections import Counter as _OverviewCounter
-    catalog_term_df = _OverviewCounter()
-    catalog_terms_by_id: dict[str, set[str]] = {}
-    for source_record in catalog_records:
-        source_text = " ".join(
-            [
-                str(source_record.get("title") or ""),
-                str(source_record.get("description") or ""),
-            ]
-        ).strip()
-        terms = set(_content_term_set(source_text, limit=120))
-        catalog_terms_by_id[str(source_record.get("inventory_id") or "")] = terms
-        catalog_term_df.update(terms)
-
-    # The model is never allowed to be the sole completeness gate. Attach every
-    # catalog record that it did not account for, and append the source wording
-    # when an assigned item failed to carry the record's distinctive terminology.
-    for record in catalog_records:
-        iid = str(record.get("inventory_id") or "")
-        if iid not in used_inventory_ids:
-            _assistant_core_overview_attach_record(items, record)
-        else:
-            # Even an accounted source may have been attached to a semantically
-            # empty item. Preserve its distinctive source wording in the same item.
-            matched = [item for item in items if iid in (item.get("inventory_ids") or [])]
-            if matched:
-                record_text = " ".join(
-                    [str(record.get("title") or ""), str(record.get("description") or "")]
-                ).strip()
-                record_terms = _content_term_set(record_text, limit=120)
-                combined_item_text = " ".join(
-                    _assistant_core_overview_item_text(item) for item in items
-                )
-                combined_terms = set(
-                    _content_term_set(combined_item_text, limit=420)
-                )
-                iid_terms = catalog_terms_by_id.get(iid, record_terms)
-                # Rare terms are the most useful evidence that the underlying
-                # system/function really appears in the overview. Prioritize title
-                # terms, then globally rare terms from the short description.
-                title_terms = set(
-                    _content_term_set(str(record.get("title") or ""), limit=50)
-                )
-                distinctive = sorted(
-                    [
-                        term
-                        for term in iid_terms
-                        if len(term) >= 5 and catalog_term_df.get(term, 0) <= 2
-                    ],
-                    key=lambda term: (
-                        0 if term in title_terms else 1,
-                        catalog_term_df.get(term, 99),
-                        -len(term),
-                        term,
-                    ),
-                )[:7]
-                same_language = _looks_like_target_language(
-                    record_text, request.response_language
-                )
-                if same_language and distinctive:
-                    hits = sum(1 for term in distinctive if term in combined_terms)
-                    needed = 1 if len(distinctive) <= 2 else 2
-                    represented = hits >= needed
-                else:
-                    representation = _term_overlap_score(
-                        record_terms, combined_terms
-                    )
-                    represented = representation >= 0.18
-
-                if not represented:
-                    # Preserve the missing source wording in the best matching
-                    # model item when it fits without truncation. If one broad item
-                    # claimed many inventory ids, fall back to a separate source
-                    # item before any later record can be erased by a length cap.
-                    target = max(
-                        matched,
-                        key=lambda item: _term_overlap_score(
-                            record_terms,
-                            _content_term_set(
-                                _assistant_core_overview_item_text(item), limit=180
-                            ),
-                        ),
-                    )
-                    support = _clean_display_text(
-                        record.get("description") or record.get("title") or "",
-                        max_len=520,
-                    )
-                    current = str(target.get("description") or "").strip()
-                    proposed = (current + "; " + support).strip(" ;")
-                    claimed_ids = len(target.get("inventory_ids") or [])
-                    if support and claimed_ids <= 4 and len(proposed) <= 560:
-                        target["description"] = proposed
-                    else:
-                        _assistant_core_overview_attach_record(items, record)
-
-    items = _assistant_core_overview_merge_duplicate_items(items)
-
-    function_summary = _assistant_core_redact_internal_text(
-        parsed.get("function_summary") or ""
-    )
-    function_citation_ids = [
-        str(cid or "").strip()
-        for cid in (parsed.get("function_citation_ids") or [])
-        if str(cid or "").strip() in valid_citation_ids
-    ]
-    fallback_summary, fallback_cids = _assistant_core_overview_fallback_function(
-        records,
-        query=request.query,
-        language=request.response_language,
-    )
-    if not function_summary:
-        function_summary = fallback_summary
-    if not function_citation_ids:
-        function_citation_ids = list(fallback_cids)
-
-    # A machine overview should retain one technical document whenever the admitted
-    # pack contains one. This is a source-diversity requirement, not a keyword rule.
-    if manual_records and not any(
-        str(record.get("citation_id") or "") in function_citation_ids
-        for record in manual_records
-    ):
-        top_manual_id = str(manual_records[0].get("citation_id") or "").strip()
-        if top_manual_id:
-            function_citation_ids.insert(0, top_manual_id)
-
-    for cid in function_citation_ids:
-        if cid and cid not in used_citation_ids:
-            used_citation_ids.insert(0, cid)
-    for item in items:
-        for cid in item.get("citation_ids") or []:
-            if cid and cid not in used_citation_ids:
-                used_citation_ids.append(cid)
-
-    # Preserve at least one media and one structured/system source when present.
-    for family in (
-        {"md_photo", "md_video", "photo", "video"},
-        {"procedure", "step", "ps"},
-    ):
-        if any(
-            _assistant_core_candidate_source_type(candidate_by_citation.get(cid, {})) in family
-            for cid in used_citation_ids
-        ):
-            continue
-        for record in records:
-            if str(record.get("source_type") or "") in family:
-                cid = str(record.get("citation_id") or "").strip()
-                if cid and cid not in used_citation_ids:
-                    used_citation_ids.append(cid)
-                break
-
-    if not function_summary:
-        return None
-    answer = _assistant_core_build_machine_overview_answer(
-        function_summary=function_summary,
-        items=items,
-        language=request.response_language,
-    )
-    if not answer or not items:
-        return None
-
-    used_candidates: list[dict] = []
-    for cid in used_citation_ids:
-        candidate = candidate_by_citation.get(cid)
-        if not candidate:
-            continue
-        cc = dict(candidate)
-        st = _assistant_core_candidate_source_type(cc)
-        if st == "document":
-            cc.setdefault("evidence_role", "manual_support")
-            cc.setdefault("ask_structured_manual_support", True)
-        else:
-            cc.setdefault("evidence_role", st)
-            cc.setdefault("ask_structured_direct", True)
-        used_candidates.append(cc)
-
-    expected_items = [str(item.get("label") or "").strip() for item in items if str(item.get("label") or "").strip()]
-    semantic_contract = {
-        "outcome": "pass",
-        "answer": answer,
-        "covered_facets": list(decision.required_facets),
-        "missing_facets": [],
-        "covered_answer_types": list(decision.required_answer_types),
-        "missing_answer_types": [],
-        "enumeration_requested": True,
-        "expected_list_items": expected_items,
-        "covered_list_items": expected_items,
-        "missing_list_items": [],
-        "citation_ids": [str(c.get("citation_id") or "") for c in used_candidates],
-        "reason": "deterministic_machine_overview_inventory_complete",
-        "model": model_used,
-    }
-    return {
-        "ok": True,
-        "status": "answered",
-        "answer": answer,
-        "language": request.response_language,
-        "citations": used_candidates,
-        "rg_links": [],
-        "top_k": request.top_k,
-        "similarity_max": (retrieval.get("metrics") or {}).get("top_similarity"),
-        "chat_model": model_used,
-        "information_task": decision.information_task,
-        "_assistant_core_semantic_verified": semantic_contract,
-        "_assistant_core_validation_evidence": used_candidates,
-        "meta": {
-            "cacheable": True,
-            "semantic_cacheable": True,
-            "machine_overview_inventory": {
-                "enabled": True,
-                "version": "machine-overview-inventory-v1",
-                "record_count": len(records),
-                "catalog_record_count": len(catalog_records),
-                "manual_record_count": len(manual_records),
-                "item_count": len(items),
-                "all_catalog_records_accounted": all(
-                    str(record.get("inventory_id") or "")
-                    in {
-                        iid
-                        for item in items
-                        for iid in (item.get("inventory_ids") or [])
-                    }
-                    for record in catalog_records
-                ),
-                "model": model_used,
-                "rejected_unsupported_model_items": int(
-                    rejected_unsupported_model_items
-                ),
-            },
-        },
-    }
+    return _ask_task_generation.synthesize_machine_overview(request=request, retrieval=retrieval, decision=decision, runtime=_assistant_core_task_synthesis_runtime())
 
 def _assistant_core_root_diagnostic_evidence_assurance(
     request: AssistantCoreRequest,
@@ -18047,7 +17498,7 @@ def _assistant_core_authority_reader_runtimes():
                     _clean_display_text=_clean_display_text,
                     _db_conn=_db_conn,
                     _safe_int=_safe_int,
-                    _source_display_metadata_from_citation=_source_display_metadata_from_citation,
+                    _source_display_metadata_from_citation=lambda c, company_id: _source_display_meta_for_citation(c),
                     os=os,
                 ),
         'read_deterministic_manual_support_page_evidence': _retrieval_document_readers.V13FetchManualSupportDeterministicRuntime(
@@ -18061,7 +17512,9 @@ def _assistant_core_authority_reader_runtimes():
                     _ask_structured_manual_support_terms=_ask_structured_manual_support_terms,
                     _db_conn=_db_conn,
                     _safe_int=_safe_int,
-                    _v12_filter_linkable_manual_support=_v12_filter_linkable_manual_support,
+                    _v12_filter_linkable_manual_support=lambda company_id, rows: rows,
+                    # File-map filtering is receipted by TaskGenerationEvidence.
+                    # The legacy runtime outside this protected factory is unchanged.
                     _v12_mark_manual_support=_v12_mark_manual_support,
                 ),
         'read_document_file_references': _retrieval_document_readers.FetchDocumentFileMapRuntime(
@@ -18272,7 +17725,8 @@ def _assistant_core_intake_factory(**owned):
             execution=_assistant_core_ask_execution_runtime,
             validation=_assistant_core_ask_validation_runtime), runtime=intake,
         preparation=_assistant_core_prepare_evidence_runtime(),
-        generation=_assistant_core_generation_runtime())
+        generation=_assistant_core_generation_runtime(),
+        tasks=_assistant_core_task_synthesis_runtime())
 
 
 def _assistant_core_authorized_ask_sync(payload, x_ai_internal_secret, *,

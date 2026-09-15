@@ -258,17 +258,19 @@ class _ChunkSelectionCapture:
 
 @dataclass(frozen=True, slots=True)
 class FileReferenceObservation:
-    """A company-scoped URL row tied to a separately authorized document anchor."""
+    """A company-scoped URL row tied to an independently authorized source anchor."""
     source: SourceIdentity
     provenance: Provenance
     link_target: LinkTarget
     stored_company_id: str
     storage_document_id: str
     file_url: str | None = field(repr=False)
+    structured_anchor: bool = False
 
     def __post_init__(self) -> None:
-        if not isinstance(self.source,SourceIdentity) or self.source.source_type!=SourceType.DOCUMENT:
-            raise SupplementalBindingError("document anchor required for file metadata")
+        if (not isinstance(self.source,SourceIdentity) or type(self.structured_anchor) is not bool
+                or (self.source.source_type!=SourceType.DOCUMENT and not self.structured_anchor)):
+            raise SupplementalBindingError("document or explicitly enabled structured anchor required for file metadata")
         if self.source.scope.company_id!=self.stored_company_id or storage_key(self.source)!=self.storage_document_id:
             raise SupplementalBindingError("file company/key differs from authorized anchor")
         if not isinstance(self.provenance,Provenance) or self.link_target!=LinkTarget('document_files',self.storage_document_id):
@@ -310,9 +312,11 @@ class FileReferenceRead:
 def build_file_reference_read(*, scope: ChunkReadScope, anchors: tuple[SourceIdentity,...],
                               current_allowed_sources: frozenset[SourceIdentity],
                               rows: list[tuple], limits: ChunkEvidenceLimits,
-                              query_count: int) -> FileReferenceRead:
+                              query_count: int, allow_structured: bool = False) -> FileReferenceRead:
+    if type(allow_structured) is not bool:
+        raise SupplementalBindingError("explicit internal file source policy required")
     validate_anchors(scope=scope,anchors=anchors,current_allowed_sources=current_allowed_sources,limits=limits)
-    if any(s.source_type!=SourceType.DOCUMENT for s in anchors):
+    if not allow_structured and any(s.source_type!=SourceType.DOCUMENT for s in anchors):
         raise SupplementalBindingError("file-map anchors must be documents")
     if type(rows) is not list:raise SupplementalBindingError("file rows required")
     validate_read(scope,len(rows),limits)
@@ -325,7 +329,8 @@ def build_file_reference_read(*, scope: ChunkReadScope, anchors: tuple[SourceIde
         if type(url) is str and len(url)>limits.adapter.max_aux_chars:
             raise SupplementalBindingError("file URL exceeds explicit allocation bound")
         o=FileReferenceObservation(by_key[key],Provenance(PROVIDER_VERSION+':document_files',
-            canonical_json(('public.document_files',company,key,idx))),LinkTarget('document_files',key),company,key,url)
+            canonical_json(('public.document_files',company,key,idx))),LinkTarget('document_files',key),company,key,url,
+            structured_anchor=allow_structured and by_key[key].source_type!=SourceType.DOCUMENT)
         size+=len(canonical_json(o).encode('utf-8'))
         if size>limits.legacy.max_bytes:raise SupplementalBindingError("file observation budget exceeded")
         observations.append(o)

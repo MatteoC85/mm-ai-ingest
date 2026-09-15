@@ -346,17 +346,21 @@ class GenericGenerationEvidence:
     objects retain the original occurrence handles. Copy events are explicit.
     This is a trusted-code contract, not a sandbox against malicious Python.
 
-    This lot covers the generic Document/XLSX synthesis path. Dedicated
-    structured/overview generation and downstream validation/repair remain
-    pending, and main does not enable authority or cache.
+    The default covers Document/XLSX synthesis. Task composition can explicitly
+    enable structured inputs and their stored URLs on the same session.
+    Downstream validation/repair remain pending; main enables neither authority nor cache.
     """
-    def __init__(self, *, request, session, readers, authorize, invoke, runtime):
+    def __init__(self, *, request, session, readers, authorize, invoke, runtime, allow_structured=False):
         if (type(session) is not AskEvidenceSession
                 or type(readers) is not ProductionReaderAdapters
                 or type(runtime) is not AskGenerationRuntime
                 or not callable(authorize) or not callable(invoke)):
             raise GenerationEvidenceError("existing generation dependencies required")
+        if type(allow_structured) is not bool:
+            raise GenerationEvidenceError("explicit internal structured composition switch required")
+        self.allow_structured = allow_structured
         self.request, self.session, self.runtime = request, session, runtime
+        self.readers = readers
         self.authorize, self.owner_invoke = authorize, invoke
         self.key = ask_request_key(request)
         self.active, self.used, self.fault = False, False, None
@@ -426,7 +430,7 @@ class GenericGenerationEvidence:
                 raise GenerationEvidenceError("duplicate generation source block")
             # The next lot owns structured source rendering/family expansion.
             # Do not silently treat a non-document as a document file reference.
-            if any(item.context.source.source_type != SourceType.DOCUMENT
+            if not self.allow_structured and any(item.context.source.source_type != SourceType.DOCUMENT
                    for item in self.records(handles)):
                 raise GenerationEvidenceError("canonical structured synthesis composition pending")
             self.provider_handles = handles
@@ -466,6 +470,16 @@ class GenericGenerationEvidence:
             return answer, selected
         return self.invoke(work, self.request)
 
+    def _source_file_map(self, handles):
+        """Existing table/SQL, explicit admitted anchors including structured URLs."""
+        sources = tuple(sorted({item.context.source for item in self.records(handles)}, key=storage_key))
+        if not sources:
+            return {}
+        registered = self.readers.read("read_document_file_references", sources=sources,
+                                       allow_structured=True)
+        return self.session.file_map(request=self.request, handle=registered.read,
+                                      current_allowed_sources=self.current())
+
     def _file_map(self, company_id, keys):
         def work():
             if company_id != self.request.company_id:
@@ -474,7 +488,8 @@ class GenericGenerationEvidence:
             expected = sorted({storage_key(item.context.source) for item in values})
             if not _same_value(keys, expected):
                 raise GenerationEvidenceError("generation file selection drift")
-            return self.sources.document_file_map(self.selected)
+            return (self._source_file_map(self.selected) if self.allow_structured
+                    else self.sources.document_file_map(self.selected))
         return self.invoke(work, self.request)
 
     def _sanitize(self, rows, *, company_id):
@@ -556,7 +571,7 @@ class GenericGenerationEvidence:
                 self.session.admission(request=self.request, retrieval=retrieval,
                     selections=selections, current_allowed_sources=self.current())
                 contract = retrieval.get("assistant_core_contract") or {}
-                if contract.get("fail_closed") is not True or contract.get("overview_catalog_requested"):
+                if contract.get("fail_closed") is not True or (contract.get("overview_catalog_requested") and not self.allow_structured):
                     raise GenerationEvidenceError("generic fail-closed synthesis contract required")
                 self.input_handles = tuple(h for selection in selections for h in selection.records)
                 for selection in selections:

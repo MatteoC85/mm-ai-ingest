@@ -794,8 +794,9 @@ class V12ExpandPrimaryProcedureStepsRuntime:
     _v12_structured_rank: Callable[..., Any]
 
 
-def v12_expand_primary_procedure_steps(*, company_id: str, machine_id: str, procedure: dict, existing_steps: list[dict], runtime: V12ExpandPrimaryProcedureStepsRuntime) -> list[dict]:
+def v12_expand_primary_procedure_steps(*, company_id: str, machine_id: str, procedure: dict, existing_steps: list[dict], runtime: V12ExpandPrimaryProcedureStepsRuntime, trace=None) -> list[dict]:
     """Load all Step children deterministically; text parsing is compatibility only."""
+    _copy_candidate = dict if trace is None else trace.copy
     ASK_SNIPPET_CHARS = runtime.ASK_SNIPPET_CHARS
     ASK_STRUCTURED_DIRECT_SCAN_LIMIT = runtime.ASK_STRUCTURED_DIRECT_SCAN_LIMIT
     ASK_STRUCTURED_DIRECT_TEXT_CHARS = runtime.ASK_STRUCTURED_DIRECT_TEXT_CHARS
@@ -815,7 +816,7 @@ def v12_expand_primary_procedure_steps(*, company_id: str, machine_id: str, proc
         ).strip()
         relation = (exact_parent == parent_source_key) if exact_parent else _v12_step_matches_procedure(c, procedure)
         if relation is True:
-            cc = dict(c)
+            cc = _copy_candidate(c)
             cc.setdefault("structured_relation_source", "indexed_parent_metadata")
             if parent_source_key:
                 cc["parent_source_key"] = parent_source_key
@@ -863,13 +864,17 @@ def v12_expand_primary_procedure_steps(*, company_id: str, machine_id: str, proc
         return candidate
 
     # Preferred path: exact Bubble Step -> Procedure relation stored in Cloud SQL.
-    relation_rows = _db_fetch_related_step_pages(
+    relation_rows = (
+        _db_fetch_related_step_pages if trace is None else
+        lambda **parameters: trace.related_rows(procedure, **parameters)
+    )(
         company_id=company_id,
         machine_id=machine_id,
         parent_source_key=parent_source_key,
         text_chars=text_chars,
     )
-    for idx, (bdid, ordinal, mid, page_number, page_text) in enumerate(relation_rows, start=1):
+    for idx, source_row in enumerate(relation_rows, start=1):
+        bdid, ordinal, mid, page_number, page_text = source_row
         candidate = make_candidate(
             bdid=bdid,
             mid=mid,
@@ -879,16 +884,20 @@ def v12_expand_primary_procedure_steps(*, company_id: str, machine_id: str, proc
             ordinal=_safe_int(ordinal, 0) or None,
             relation_source="structured_source_relations",
         )
+        if trace is not None:
+            trace.page_view(source_row, candidate)
         if candidate.get("bubble_document_id") and candidate.get("chunk_full"):
             matched.append(candidate)
 
     # Compatibility path for already-indexed sources: no reindex is required.
     # It reads the legacy "PROCEDURA/PROCEDURE: PROC-xxx" prefix from Step text.
     if not relation_rows:
-        rows = _legacy_step_fallback_rows(company_id=company_id, machine_id=machine_id,
-            text_chars=text_chars, runtime=runtime)
+        rows = (_legacy_step_fallback_rows(company_id=company_id, machine_id=machine_id,
+            text_chars=text_chars, runtime=runtime) if trace is None else
+            trace.fallback_rows(company_id=company_id, machine_id=machine_id, text_chars=text_chars))
 
-        for idx, (bdid, mid, page_number, page_text) in enumerate(rows, start=1):
+        for idx, source_row in enumerate(rows, start=1):
+            bdid, mid, page_number, page_text = source_row
             candidate = make_candidate(
                 bdid=str(bdid or ""),
                 mid=mid,
@@ -898,6 +907,8 @@ def v12_expand_primary_procedure_steps(*, company_id: str, machine_id: str, proc
                 ordinal=None,
                 relation_source="legacy_parent_text",
             )
+            if trace is not None:
+                trace.page_view(source_row, candidate)
             if (
                 candidate.get("bubble_document_id")
                 and candidate.get("chunk_full")

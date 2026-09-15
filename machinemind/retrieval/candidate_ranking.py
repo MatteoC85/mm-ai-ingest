@@ -538,8 +538,9 @@ class V12DedupeFamilyStepsRuntime:
     _v12_structured_rank: Callable[..., Any]
 
 
-def v12_dedupe_family_steps(steps: list[dict], *, runtime: V12DedupeFamilyStepsRuntime) -> list[dict]:
+def v12_dedupe_family_steps(steps: list[dict], *, runtime: V12DedupeFamilyStepsRuntime, trace=None) -> list[dict]:
     """Deduplicate Step representations and conflicting duplicate ordinals."""
+    _copy_candidate = dict if trace is None else trace.copy
     _v12_merge_candidate_metadata = runtime._v12_merge_candidate_metadata
     _v12_step_sort_key = runtime._v12_step_sort_key
     _v12_structured_rank = runtime._v12_structured_rank
@@ -552,7 +553,7 @@ def v12_dedupe_family_steps(steps: list[dict], *, runtime: V12DedupeFamilyStepsR
             continue
         current = best_by_doc.get(bdid)
         if current is None:
-            best_by_doc[bdid] = dict(candidate)
+            best_by_doc[bdid] = _copy_candidate(candidate)
             continue
         if _v12_structured_rank(candidate, set()) < _v12_structured_rank(current, set()):
             best_by_doc[bdid] = _v12_merge_candidate_metadata(candidate, current)
