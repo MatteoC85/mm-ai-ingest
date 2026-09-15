@@ -324,3 +324,21 @@ def bind_request_evidence(**kwargs) -> RequestFlowEvidenceBinding:
     except BaseException:
         owner.close()
         raise
+
+
+def complete_session_limits(runtime: PrecisionFactRuntime, *, read_caps: tuple[int, ...]) -> AskSessionLimits:
+    """Allocate lineage for the existing full-ASK SQL limits, not new retrieval.
+
+    The scalar-only envelope (1,024 occurrences) cannot admit the pre-existing
+    structured scan (1,200 by default). Derive the occurrence envelope from the
+    configured readers while retaining the lifetime's 8,192-record/64-MiB caps.
+    No SQL LIMIT, top_k, prompt/context, HTTP meter or model budget is changed.
+    """
+    base = precision_session_limits(runtime)
+    if (type(read_caps) is not tuple or not read_caps
+            or any(type(x) is not int or x < 0 or x > base.max_records for x in read_caps)):
+        raise EvidenceContractError("explicit bounded full-request read caps required")
+    count = max(base.evidence.assembly.max_occurrences, *read_caps)
+    assembly = replace(base.evidence.assembly, max_occurrences=count,
+        manifest_limits=replace(base.evidence.assembly.manifest_limits, max_records=count))
+    return replace(base, evidence=replace(base.evidence, assembly=assembly))

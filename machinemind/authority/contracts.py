@@ -100,25 +100,35 @@ class AuthorityMeter:
         self.limits, self.clock = limits, clock
         self.started = clock()
         self.calls = self.bytes = self.failed_calls = 0
+        self.transport_seconds = 0.0
         self._in_flight = False
+        self._call_started = None
 
     def begin(self) -> float:
-        remaining = self.limits.total_seconds - (self.clock() - self.started)
+        remaining = self.limits.total_seconds - self.transport_seconds
         if self._in_flight or self.calls >= self.limits.max_http_calls or remaining <= 0:
             raise AuthorityError("AUTHORITY_BUDGET_EXCEEDED")
         self.calls += 1
         self._in_flight = True
+        self._call_started = self.clock()
         return min(self.limits.timeout_seconds, remaining)
 
     def finish(self, size: int, *, failed: bool) -> None:
+        now = self.clock()
+        started = self._call_started
         self._in_flight = False
+        self._call_started = None
+        if type(started) not in (int, float) or not math.isfinite(started):
+            raise AuthorityError("AUTHORITY_CONFIGURATION_INVALID")
+        elapsed = max(0.0, now - started)
+        self.transport_seconds += elapsed
         self.bytes += size
         self.failed_calls += int(failed)
-        if self.bytes > self.limits.max_total_bytes or self.clock() - self.started > self.limits.total_seconds:
+        if self.bytes > self.limits.max_total_bytes or self.transport_seconds > self.limits.total_seconds:
             raise AuthorityError("AUTHORITY_BUDGET_EXCEEDED")
 
     def summary(self) -> dict:
         return dict(version=AUTHORITY_VERSION, http_calls=self.calls,
                     response_bytes=self.bytes, failed_http_calls=self.failed_calls,
-                    elapsed_seconds=max(0.0, self.clock() - self.started),
+                    elapsed_seconds=max(0.0, self.transport_seconds),
                     grants_cached=False, prices_measured=False)

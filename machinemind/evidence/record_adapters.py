@@ -28,6 +28,9 @@ DEFAULT_SCORE_FIELDS = (
 TRANSPORT_FIELDS = frozenset({"embedding", "embedding_list", "file_url", "source_url", "url",
                              "rg_links", "exact_machine_scope", "query_used"})
 SOURCE_TYPE_ALIASES = {
+    # Existing source_management discriminator for an ordinary document.
+    # Identity and scope still come exclusively from the typed provider binding.
+    "manual": SourceType.DOCUMENT,
     "document": SourceType.DOCUMENT,
     "procedure": SourceType.PROCEDURE,
     "step": SourceType.STEP,

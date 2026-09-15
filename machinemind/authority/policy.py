@@ -34,11 +34,13 @@ class SourceSchema:
     parent_field: str | None = None
     # Explicit per-type schema: record_exists is NOT a fallback for missing flags.
     lifecycle: str = "flag"
+    file_field: str = "file"
 
     def __post_init__(self):
         if not isinstance(self.source_type, SourceType):
             raise AuthorityError("AUTHORITY_SCHEMA_INVALID")
         identifier(self.typename)
+        identifier(self.file_field)
         if self.lifecycle == "flag":
             identifier(self.deleted_field)
         elif self.lifecycle == "record_exists":
@@ -239,6 +241,99 @@ class BubbleAuthority:
         if self.authorize_scope(grant, scope) != before:
             raise AuthorityError("AUTHORITY_CHANGED", 403)
         return frozenset(result)
+    def validate_sources(self, grant: ApplicationGrant, scope: ChunkReadScope, expected: frozenset[SourceIdentity]) -> frozenset[SourceIdentity]:
+        """Revalidate only source identities already observed by this request.
+
+        The initial admission still enumerates the complete Bubble catalog.  A
+        later external-consumption fence re-reads only the authoritative source
+        *families* needed by the observed dependencies.  Structured Step rows
+        are re-derived through their live Procedure parents in the same batched
+        parent query used by ``current_sources``.  This keeps revocation and
+        reassignment checks current without turning a large Procedure into one
+        HTTP GET per Step.
+        """
+        if type(expected) is not frozenset or any(type(source) is not SourceIdentity for source in expected):
+            raise AuthorityError("AUTHORITY_RESPONSE_INVALID")
+        before = self.authorize_scope(grant, scope)
+        wanted = {(source.source_type, source.source_id): source for source in expected}
+        if len(wanted) != len(expected):
+            raise AuthorityError("AUTHORITY_RESPONSE_INVALID")
+        actual = {}
+        procedures = {}
+        needed = {source.source_type for source in expected if source.source_type != SourceType.STEP}
+        if any(source.source_type == SourceType.STEP for source in expected):
+            needed.add(SourceType.PROCEDURE)
+        for kind in (SourceType.DOCUMENT, SourceType.PROCEDURE, SourceType.PROBLEM_SOLUTION,
+                     SourceType.PHOTO, SourceType.VIDEO):
+            if kind not in needed:
+                continue
+            spec = self.schema.source(kind)
+            rows = self._owned_rows(spec, scope)
+            seen_ids = set()
+            for row in rows:
+                uid = row["_id"]
+                if uid in seen_ids:
+                    raise AuthorityError("AUTHORITY_CATALOG_UNSTABLE")
+                seen_ids.add(uid)
+                if not self._active(row, spec):
+                    continue
+                machine = _ref(row, spec.machine_field, optional=True)
+                if kind == SourceType.PROCEDURE:
+                    procedures[uid] = machine
+                identity = self._identity(scope, spec, row, machine)
+                key = (kind, uid)
+                if key in wanted and identity is not None:
+                    actual[key] = identity
+        if any(source.source_type == SourceType.STEP for source in expected):
+            step = self.schema.source(SourceType.STEP)
+            parent_ids = tuple(procedures)
+            seen_steps = set()
+            for offset in range(0, len(parent_ids), 50):
+                batch = parent_ids[offset:offset + 50]
+                rows = self.directory.search(step.typename, ({"key": step.parent_field,
+                    "constraint_type": "in", "value": list(batch)},))
+                if type(rows) is not tuple:
+                    raise AuthorityError("AUTHORITY_RESPONSE_INVALID")
+                for raw in rows:
+                    row = _row(raw)
+                    uid = row["_id"]
+                    if uid in seen_steps:
+                        raise AuthorityError("AUTHORITY_CATALOG_UNSTABLE")
+                    seen_steps.add(uid)
+                    parent = _ref(row, step.parent_field)
+                    if parent not in batch:
+                        raise AuthorityError("AUTHORITY_RESPONSE_INVALID")
+                    if not self._active(row, step):
+                        continue
+                    machine = procedures[parent]
+                    if step.company_field is not None and _ref(row, step.company_field) != scope.company_id:
+                        raise AuthorityError("AUTHORITY_SCHEMA_INVALID")
+                    if step.machine_field is not None and _ref(row, step.machine_field, optional=True) != machine:
+                        raise AuthorityError("AUTHORITY_SCHEMA_INVALID")
+                    identity = self._identity(scope, step, row, machine)
+                    key = (SourceType.STEP, uid)
+                    if key in wanted and identity is not None:
+                        actual[key] = identity
+        machine_ids = {source.scope.machine_id for source in expected if source.scope.machine_id is not None}
+        if machine_ids:
+            machine_rows = self.directory.search(self.schema.machine_type, ({
+                "key": self.schema.machine_company_field, "constraint_type": "equals",
+                "value": scope.company_id},))
+            if type(machine_rows) is not tuple:
+                raise AuthorityError("AUTHORITY_RESPONSE_INVALID")
+            machines = set()
+            for raw in machine_rows:
+                row = _row(raw)
+                if _ref(row, self.schema.machine_company_field) != scope.company_id or row["_id"] in machines:
+                    raise AuthorityError("AUTHORITY_RESPONSE_INVALID")
+                machines.add(row["_id"])
+            if not machine_ids.issubset(machines):
+                raise AuthorityError("SCOPE_DENIED", 403)
+        if set(actual) != set(wanted) or any(actual[key] != wanted[key] for key in wanted):
+            raise AuthorityError("SCOPE_DENIED", 403)
+        if self.authorize_scope(grant, scope) != before:
+            raise AuthorityError("AUTHORITY_CHANGED", 403)
+        return frozenset(actual.values())
 
 
 class RequestAuthority:
@@ -249,10 +344,15 @@ class RequestAuthority:
     No second EvidenceSession, Core or global ContextVar is introduced.
     """
     def __init__(self, *, request: Any, scope: ChunkReadScope,
-                 grant: ApplicationGrant, provider: BubbleAuthority):
+                 grant: ApplicationGrant, provider: BubbleAuthority, admission=None):
         if type(provider) is not BubbleAuthority:
             raise AuthorityError("AUTHORITY_CONFIGURATION_INVALID")
         self._request, self._scope, self._grant, self._provider = request, scope, grant, provider
+        from .request_admission import RequestAdmission
+        if admission is not None and (type(admission) is not RequestAdmission or
+                admission.provider is not provider or admission.grant is not grant or admission.scope != scope):
+            raise AuthorityError("AUTHORITY_CONFIGURATION_INVALID")
+        self._admission = admission
         self._key = ask_request_key(request)
         self._active, self._fault = True, None
         self._check(request)
@@ -276,7 +376,8 @@ class RequestAuthority:
     def __call__(self, request) -> frozenset[SourceIdentity]:
         self._check(request)
         try:
-            result = self._provider.current_sources(self._grant, self._scope)
+            result = (self._provider.current_sources(self._grant, self._scope) if self._admission is None
+                      else self._admission.sources())
             self._check(request)
             return result
         except Exception as exc:

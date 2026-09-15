@@ -88,8 +88,12 @@ def _wire(node: _Frozen) -> Any:
     return [node.kind, node.value]
 
 
+# Stateless encoder: reuses only configuration, never content, grants or IDs.
+_JSON_ENCODER = json.JSONEncoder(ensure_ascii=True, separators=(",", ":"), allow_nan=False)
+
+
 def _json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=True, separators=(",", ":"), allow_nan=False)
+    return _JSON_ENCODER.encode(value)
 
 
 class _Freezer:
@@ -114,7 +118,8 @@ class _Freezer:
             if typ is str and len(value) > self.limits.max_bytes:
                 raise EvidenceAssemblyError("legacy byte budget exceeded")
             try:
-                self.scalar_bytes += len(_json([kind, value]).encode("utf-8"))
+                # ensure_ascii guarantees ASCII; same wire length as [kind,value].
+                self.scalar_bytes += len(_json(value)) + len(kind) + 5
             except (ValueError, OverflowError) as exc:
                 raise EvidenceAssemblyError("unserializable legacy scalar") from exc
             if self.scalar_bytes > self.limits.max_bytes:
@@ -140,6 +145,26 @@ class _Freezer:
                            tuple(self.freeze(item, depth + 1) for item in value))
         finally:
             self.ancestors.remove(id(value))
+
+
+def _frozen_canonical_size(node: _Frozen) -> int:
+    """Exact ASCII byte count of canonical_json(node), without a JSON object tree.
+
+    Only accepts the private tree produced by _Freezer. Bounds, cycles and
+    non-finite values have already been checked by that traversal. This is NOT
+    the compatibility wire format (_wire), and it changes no allocation limit.
+    No snapshot data is cached; scalar escaping uses the same JSON encoder.
+    """
+    if node.kind == "map":
+        return (len('{"kind":"map","value":[]}')
+                + max(0, len(node.value) - 1)
+                + sum(len(_json(k)) + _frozen_canonical_size(v) + 3
+                      for k, v in node.value))
+    if node.kind in ("list", "tuple"):
+        return (len('{"kind":"' + node.kind + '","value":[]}')
+                + max(0, len(node.value) - 1)
+                + sum(_frozen_canonical_size(v) for v in node.value))
+    return len('{"kind":"' + node.kind + '","value":}') + len(_json(node.value))
 
 
 def _thaw(node: _Frozen) -> Any:
@@ -183,15 +208,17 @@ class LegacyEvidenceBundle:
         if type(self._snapshots) is not tuple or len(self._snapshots) != len(self.assembly.occurrences):
             raise EvidenceAssemblyError("one snapshot per input occurrence required")
         entries = self.assembly.occurrence_entries()
+        snapshot_bytes = 0
         for snapshot, entry in zip(self._snapshots, entries):
             if not isinstance(snapshot, _Snapshot) or snapshot.layout not in LAYOUTS:
                 raise EvidenceAssemblyError("invalid internal legacy snapshot")
             if snapshot.source != entry.evidence.source or snapshot.evidence_id != entry.evidence.evidence_id:
                 raise EvidenceAssemblyError("snapshot/canonical binding mismatch")
-            if _digest(snapshot.payload) != snapshot.digest:
+            serialized = _json(_wire(snapshot.payload)).encode("utf-8")
+            if hashlib.sha256(serialized).hexdigest() != snapshot.digest:
                 raise EvidenceAssemblyError("snapshot integrity mismatch")
-        actual = len(self.assembly.to_json().encode("utf-8")) + sum(
-            len(_json(_wire(s.payload)).encode("utf-8")) for s in self._snapshots)
+            snapshot_bytes += len(serialized)
+        actual = len(self.assembly.to_json().encode("utf-8")) + snapshot_bytes
         _int(self.size_bytes, "bundle size")
         if actual != self.size_bytes or actual > self.limits.max_bytes:
             raise EvidenceAssemblyError("compatibility byte budget exceeded or invalid size")
@@ -237,7 +264,8 @@ def build_legacy_bundle(records: Iterable[LegacyRecordInput], *, company_id: str
         ):
             raise EvidenceAssemblyError("provider binding outside assembly allowance")
         frozen = freezer.freeze(item.record)
-        snapshot_bytes += len(_json(_wire(frozen)).encode("utf-8"))
+        serialized = _json(_wire(frozen)).encode("utf-8")
+        snapshot_bytes += len(serialized)
         if snapshot_bytes > legacy_limits.max_bytes:
             raise EvidenceAssemblyError("legacy byte budget exceeded")
         raw = _thaw(frozen)
@@ -245,7 +273,7 @@ def build_legacy_bundle(records: Iterable[LegacyRecordInput], *, company_id: str
                         context=item.context, limits=adapter_limits)
         results.append(result)
         snapshots.append(_Snapshot(item.layout, item.context.source, result.entry.evidence.evidence_id,
-                                   frozen, _digest(frozen)))
+                                   frozen, hashlib.sha256(serialized).hexdigest()))
     assembly = assemble_evidence(results, company_id=company_id, allowed_sources=allowed_sources,
                                  limits=assembly_limits)
     size = snapshot_bytes + len(assembly.to_json().encode("utf-8"))

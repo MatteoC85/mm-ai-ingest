@@ -3380,6 +3380,8 @@ def _chunk_sentences_with_pages(
     )
 
 def _openai_embed_texts(texts: list[str], *, timeout: int = 60) -> list[list[float]]:
+    from machinemind.authority.request_admission import before_egress
+    before_egress("embedding")
     return _openai_transport.embed_texts(
         texts,
         timeout=timeout,
@@ -3398,6 +3400,8 @@ def _openai_chat(
     model: Optional[str] = None,
     temperature: float = 0.0,
 ) -> str:
+    from machinemind.authority.request_admission import before_egress
+    before_egress("chat_text")
     return _openai_transport.chat_text(
         messages,
         model=model,
@@ -3464,6 +3468,8 @@ def _openai_chat_json(
     max_output_tokens: Optional[int] = None,
     purpose: str = "legacy_chat_json",
 ) -> dict:
+    from machinemind.authority.request_admission import before_egress
+    before_egress(purpose)
     return _openai_transport.chat_json(
         messages,
         model=model,
@@ -10844,6 +10850,8 @@ def _v13_responses_json(
     company_id: str,
     purpose: str,
 ) -> dict:
+    from machinemind.authority.request_admission import before_egress
+    before_egress(purpose)
     # Capture is request-local and active only in the authorized Root Cause
     # debug review. All other requests keep the original transport unchanged.
     post_fn = requests.post
@@ -17662,11 +17670,20 @@ def _assistant_core_production_readers(*, request, session, authorized, invoke):
         raise _AuthorityError("AUTHORITY_CONFIGURATION_INVALID")
     authorized.check(authorized.payload)
     authority = _RequestAuthority(request=request, scope=authorized.scope,
-        grant=authorized.grant, provider=authorized.provider)
+        grant=authorized.grant, provider=authorized.provider, admission=authorized.admission)
+    if authorized.admission is not None:
+        authorized.admission.attach(request, session)
     try:
+        runtimes = _assistant_core_authority_reader_runtimes()
+        if authorized.admission is not None:
+            from machinemind.authority.current_files import CurrentFileReader
+            runtimes["read_token_chunk_evidence"] = _dataclass_replace(
+                runtimes["read_token_chunk_evidence"], project_chunk_locator=True)
+            legacy_files = runtimes["read_document_file_references"]
+            runtimes["read_document_file_references"] = _dataclass_replace(legacy_files,
+                current_file_reader=CurrentFileReader(authorized, legacy_files))
         adapters = _ProductionReaderAdapters(request=request, session=session,
-            authorize=authority, invoke=invoke,
-            runtimes=_assistant_core_authority_reader_runtimes())
+            authorize=authority, invoke=invoke, runtimes=runtimes)
         return authority, adapters
     except BaseException:
         authority.close()
@@ -17729,15 +17746,34 @@ def _assistant_core_intake_factory(**owned):
         tasks=_assistant_core_task_synthesis_runtime(), consumers=True)
 
 
+def _assistant_core_complete_session_limits(precision):
+    # Retain existing retrieval/context/HTTP budgets. Allocate provenance for
+    # the full set of readers rather than reusing the scalar-only scan envelope.
+    return _ask_request_evidence.complete_session_limits(precision, read_caps=(
+        max(100, int(ASK_STRUCTURED_DIRECT_SCAN_LIMIT or 1200),
+            int(ASK_STRUCTURED_DIRECT_MAX_ITEMS or 12) * 20),
+        max(500, int(ASK_STRUCTURED_DIRECT_SCAN_LIMIT or 1200)),
+        V13_SOURCE_RETRIEVAL_SCAN_LIMIT, STRUCTURED_RESCUE_SCAN_LIMIT,
+        V13_PAGE_SCAN_LIMIT, V13_PREFERRED_PAGE_SCAN_LIMIT,
+        max(80, int(ASK_EVIDENCE_SCOPE_PAGE_LIMIT or 900)),
+        max(20, int(ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_SCAN_LIMIT or 180)),
+    ))
+
+
 def _assistant_core_protected_cache_factory(*, authorized, source_owner,
         flow_runtime, authority_environment):
     from machinemind.ask.protected_cache import ProtectedCacheOwner
     precision = _PRECISION_FACT_RUNTIME()
+    from machinemind.authority.current_files import CurrentFileReader
+    file_runtime = _retrieval_document_readers.FetchDocumentFileMapRuntime(_db_conn)
+    if authorized.admission is not None:
+        file_runtime = _dataclass_replace(file_runtime,
+            current_file_reader=CurrentFileReader(authorized, file_runtime))
     return ProtectedCacheOwner(authorized=authorized, source_owner=source_owner,
         flow_runtime=flow_runtime, cache_runtime=dict(globals()),
         signing_key=authority_environment["MM_APP_AUTHORITY_SECRET"],
-        file_runtime=_retrieval_document_readers.FetchDocumentFileMapRuntime(_db_conn),
-        limits=_ask_request_evidence.precision_session_limits(precision).evidence)
+        file_runtime=file_runtime,
+        limits=_assistant_core_complete_session_limits(precision).evidence)
 
 
 def _assistant_core_authorized_ask_sync(payload, x_ai_internal_secret, *,
@@ -17748,10 +17784,14 @@ def _assistant_core_authorized_ask_sync(payload, x_ai_internal_secret, *,
     the uncached helper contract. OFF dispatch and all non-ASK paths are unchanged.
     Activation and the integrated live B4o gates remain separate.
     """
+    authorized = None
+    admission_token = None
     try:
         authorized = _application_authority.authorize_http_request(payload,
             service_secret=x_ai_internal_secret, application_secret=x_mm_app_authority,
-            env=authority_environment, resolve=_resolve_query_scope)
+            env=authority_environment, resolve=_resolve_query_scope, admission_windows=True)
+        from machinemind.authority.request_admission import activate, deactivate
+        admission_token = activate(authorized.admission) if authorized.admission is not None else None
         base_runtime = _assistant_core_request_flow_runtime()
         runtime = _dataclass_replace(base_runtime,
             _v13_cache_lookup=lambda **kwargs: None,
@@ -17771,7 +17811,9 @@ def _assistant_core_authorized_ask_sync(payload, x_ai_internal_secret, *,
                         authorized=authorized, **kwargs),
                     flow_runtime=runtime, precision_runtime=precision_runtime,
                     core_factory=_assistant_core_intake_factory,
-                    limits=_ask_request_evidence.precision_session_limits(precision_runtime),
+                    limits=(_assistant_core_complete_session_limits(precision_runtime)
+                        if authorized.admission is not None else
+                        _ask_request_evidence.precision_session_limits(precision_runtime)),
                     **({"response_observer": cache_owner.observe_response} if cache_owner else {}))
             def uncached(value, secret):
                 return _ask_request_flow.run_sync(value, secret,
@@ -17781,7 +17823,7 @@ def _assistant_core_authorized_ask_sync(payload, x_ai_internal_secret, *,
             return _application_authority.protected_call(payload, x_ai_internal_secret,
                 authorized=authorized, delegate=uncached,
                 response_guard=cache_owner.release if cache_owner else owner.final,
-                **({"backend_cache_reuse": True} if cache_owner else {}))
+                **({"backend_cache_reuse": True, "completed": cache_owner.completed} if cache_owner else {}))
         finally:
             try:
                 if cache_owner is not None:
@@ -17790,6 +17832,11 @@ def _assistant_core_authorized_ask_sync(payload, x_ai_internal_secret, *,
                 owner.close()
     except _AuthorityError as exc:
         return _application_authority.public_error(exc)
+    finally:
+        if authorized is not None and authorized.admission is not None:
+            authorized.admission.close()
+        if admission_token is not None:
+            deactivate(admission_token)
 
 
 @app.post("/v1/ai/ask/authorize")

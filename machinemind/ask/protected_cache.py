@@ -39,7 +39,7 @@ from ..retrieval.document_readers import (FetchDocumentFileMapRuntime,
 from ..retrieval.supplemental_evidence import storage_key
 from ..infrastructure import semantic_cache
 
-PROTECTED_CACHE_VERSION = "ask-canonical-exact-cache-p6b4o-v1"
+PROTECTED_CACHE_VERSION = "ask-canonical-exact-cache-p6b4o-e2e-v2"
 ARTIFACT_KEY = "_mm_canonical_cache_artifact"
 MAX_ARTIFACT_BYTES = 2 * 1024 * 1024
 MAX_DEPENDENCIES = 8192
@@ -255,6 +255,8 @@ class ProtectedCacheOwner:
                 raise ValueError()
         except (KeyError, ValueError, TypeError, OverflowError, RecursionError):
             raise ResponseSourceAuthorityError("invalid canonical cache artifact") from None
+        if self.authorized.admission is not None:
+            self.authorized.admission.refresh("cache.admission")
         current = self._current()  # provider exceptions are NOT cache misses
         index = {_json(to_primitive(source)): source for source in current}
         if any(token not in index for token in tokens):
@@ -417,6 +419,10 @@ class ProtectedCacheOwner:
             "mode": "exact_request", "outcome": self._mode,
             "worker_cacheable": False, "canonical_activation_certified": False}
         return out
+
+    def completed(self):
+        self.check()
+        return self._final is not None and (self._observed is not None or self._hit_expected is not None)
 
     def close(self):
         self._active = False

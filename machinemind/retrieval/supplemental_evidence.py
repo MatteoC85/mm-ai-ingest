@@ -273,7 +273,11 @@ class FileReferenceObservation:
             raise SupplementalBindingError("document or explicitly enabled structured anchor required for file metadata")
         if self.source.scope.company_id!=self.stored_company_id or storage_key(self.source)!=self.storage_document_id:
             raise SupplementalBindingError("file company/key differs from authorized anchor")
-        if not isinstance(self.provenance,Provenance) or self.link_target!=LinkTarget('document_files',self.storage_document_id):
+        native = (self.link_target == LinkTarget('bubble_sources',self.storage_document_id)
+            and isinstance(self.provenance,Provenance)
+            and self.provenance.provider == 'bubble-current-file-reference-v1'
+            and self.source.source_type == SourceType.DOCUMENT)
+        if not isinstance(self.provenance,Provenance) or (not native and self.link_target!=LinkTarget('document_files',self.storage_document_id)):
             raise SupplementalBindingError("invalid opaque file reference")
         if self.file_url is not None and type(self.file_url) is not str:
             raise SupplementalBindingError("file URL must remain text or NULL")

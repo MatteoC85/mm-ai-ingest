@@ -25,7 +25,7 @@ from typing import Any, Callable
 from . import candidate_ranking as ranking
 from .ask_composition import AskEvidenceSession, RecordHandle, RegisteredRead, AskSelection, _check_derived_locator
 from . import evidence_orchestration as orchestration
-from ..evidence.legacy_compatibility import _Freezer
+from ..evidence.legacy_compatibility import _Freezer, _frozen_canonical_size
 from ..evidence.contracts import canonical_json
 from ..evidence.contracts import EvidenceContractError, SourceIdentity
 from ..evidence.ask_input import _same_value
@@ -352,6 +352,7 @@ class _PreparationTrace:
         self.max_bytes = max_bytes
         self.entries = {}
         self.roots = {}
+        self._adapted_roots = {}
         self.bytes = 0
         self.active = True
         self.fault = None
@@ -385,6 +386,26 @@ class _PreparationTrace:
             raise EvidenceProductionError("untracked or altered preparation occurrence")
         return item
 
+    def _parent_evidence(self, handle):
+        """Reuse a pure adaptation only while the exact private input is unchanged.
+
+        Handles and witnesses live solely inside this bounded trace. This caches
+        no permission or reader result, and callers still reauthorize the same
+        session records at every original boundary. Mutation, a new context or
+        new limits forces the original adapter to run again.
+        """
+        item = self.roots[handle]
+        cached = self._adapted_roots.get(handle)
+        if (cached is not None and cached[0] == item.context
+                and cached[1] == self.limits.adapter
+                and _same_value(item.record, cached[2])):
+            return cached[3]
+        evidence = adapt_candidate(item.record, context=item.context,
+                                   limits=self.limits.adapter).entry.evidence
+        self._adapted_roots[handle] = (item.context, self.limits.adapter,
+                                       deepcopy(item.record), evidence)
+        return evidence
+
     def add(self, record, parents, *, context=None):
         self.check()
         if type(record) is not dict or type(parents) is not tuple or not parents:
@@ -395,7 +416,7 @@ class _PreparationTrace:
             raise EvidenceProductionError("preparation occurrence already registered")
         if len(self.entries) >= self.max_records:
             raise EvidenceProductionError("preparation trace record limit exceeded")
-        size = len(canonical_json(_Freezer(self.limits.legacy).freeze(record)).encode("utf-8"))
+        size = _frozen_canonical_size(_Freezer(self.limits.legacy).freeze(record))
         if self.bytes + size > self.max_bytes:
             raise EvidenceProductionError("preparation trace byte limit exceeded")
         contexts = tuple(self.roots[h] for h in parents)
@@ -404,8 +425,7 @@ class _PreparationTrace:
             raise EvidenceProductionError("preparation cannot merge different sources")
         ctx = context or contexts[0].context
         evidence = adapt_candidate(record, context=ctx, limits=self.limits.adapter).entry.evidence
-        parent_evidence = tuple(adapt_candidate(value.record, context=value.context,
-            limits=self.limits.adapter).entry.evidence for value in contexts)
+        parent_evidence = tuple(self._parent_evidence(h) for h in parents)
         _check_derived_locator(evidence.locator, parent_evidence)
         self.entries[id(record)] = (record, deepcopy(record), parents)
         self.bytes += size
@@ -708,7 +728,7 @@ def prepare_records(*, request: Any, session: AskEvidenceSession,
         finally:
             journal.active = False
             journal.entries.clear()
-            journal.roots.clear()
+            journal.roots.clear(); journal._adapted_roots.clear()
             journal.scored.clear()
 
     return invoke(work, request)
@@ -973,7 +993,7 @@ def retrieve_initial_records(*, request: Any, session: AskEvidenceSession,
                             AskSelection("citations", result_handles[:cap]))
         finally:
             journal.active = False
-            journal.entries.clear(); journal.roots.clear(); dense_tokens.clear(); flags.clear()
+            journal.entries.clear(); journal.roots.clear(); journal._adapted_roots.clear(); dense_tokens.clear(); flags.clear()
 
     return invoke(work, request)
 
@@ -1011,14 +1031,19 @@ class _OuterRetrievalTrace(_PreparationTrace):
         return allowed
 
     def snapshot(self, value):
-        size = len(canonical_json(_Freezer(self.limits.legacy).freeze(value)).encode("utf-8"))
+        size = _frozen_canonical_size(_Freezer(self.limits.legacy).freeze(value))
         if size > self.max_bytes:
             raise EvidenceProductionError("outer retrieval snapshot byte limit exceeded")
         return deepcopy(value)
 
     def readonly(self, fn):
         def read(*args, **kwargs):
-            copies = [(v, self.snapshot(v)) for v in (*args, *kwargs.values())
+            # An existing traced occurrence already owns an exact detached
+            # witness and has passed the same freeze/size bounds in add(). Use
+            # that witness only for this comparison, never pass it to callbacks.
+            # Untracked objects retain the original bounded snapshot path.
+            copies = [(v, self.entry(v)[1] if type(v) is dict and id(v) in self.entries
+                       else self.snapshot(v)) for v in (*args, *kwargs.values())
                       if type(v) in (dict, list, tuple)]
             result = self.call(fn, *args, **kwargs)
             if any(not _same_value(v, saved) for v, saved in copies):
@@ -1134,7 +1159,7 @@ class _OuterRetrievalTrace(_PreparationTrace):
             if not _same_value(record, expected):
                 raise EvidenceProductionError("mutation changed unrecorded evidence fields")
             del self.entries[id(record)]
-            self.bytes -= len(canonical_json(_Freezer(self.limits.legacy).freeze(item[1])).encode("utf-8"))
+            self.bytes -= _frozen_canonical_size(_Freezer(self.limits.legacy).freeze(item[1]))
             self.add(record, item[2])
 
     def event(self, stage, *args):
@@ -1226,7 +1251,7 @@ class _OuterRetrievalTrace(_PreparationTrace):
 
     def dispose(self):
         self.active = False
-        self.entries.clear(); self.roots.clear(); self.pending.clear(); self.completed = None
+        self.entries.clear(); self.roots.clear(); self._adapted_roots.clear(); self.pending.clear(); self.completed = None
 
 
 def retrieve_neutral_records(*, request: Any, session: AskEvidenceSession,

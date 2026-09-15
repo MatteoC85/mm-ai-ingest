@@ -132,7 +132,13 @@ class _Node:
             self.derivation)).encode("utf-8"))
 
     def evidence(self) -> EvidenceRecord:
-        return self.bundle.assembly.occurrence_entries()[self.offset].evidence
+        assembly = self.bundle.assembly
+        # Session nodes own singleton bundles; no ID serialization or temporary
+        # EvidenceEntry is needed to retrieve an already-bound immutable record.
+        # Retain the general path for any other internal representation.
+        if self.offset == 0 and len(assembly.manifest.entries) == len(assembly.occurrences) == 1:
+            return assembly.manifest.entries[0].evidence
+        return assembly.occurrence_entries()[self.offset].evidence
 
 
 def _receipt_scope(receipt: Any) -> ChunkReadScope:
@@ -233,6 +239,9 @@ class AskEvidenceSession:
         self._reads: list[Any] = []
         self._nodes: list[_Node] = []
         self._bytes = 0
+        # One immutable admission envelope, owned by this request only. Reuse
+        # never skips current allowance checks or the canonical round-trip.
+        self._admission_cache = None
 
     def __enter__(self) -> AskEvidenceSession:
         with self._lock:
@@ -248,6 +257,7 @@ class AskEvidenceSession:
             self._closed = True
             self._reads.clear()
             self._nodes.clear()
+            self._admission_cache = None
             self._bytes = 0
             self._request = None
             self._key = None
@@ -542,15 +552,30 @@ class AskEvidenceSession:
                 raise AskCompositionError("explicit bounded ASK collection selections required")
             if sum(len(s.records) for s in selections) > self._limits.evidence.assembly.max_occurrences:
                 raise AskCompositionError("aggregate ASK selection count exceeded")
-            collections = tuple(AskCollectionInput(s.name,
-                self._inputs(s.records, current_allowed_sources), s.container_kind) for s in selections)
             bounds = self._limits.evidence
-            envelope = build_ask_evidence_input(request_key=self._key, collections=collections,
-                allowed_sources=current_allowed_sources, adapter_limits=bounds.adapter,
-                assembly_limits=bounds.assembly, legacy_limits=bounds.legacy)
+            # Handles are capabilities of this session, not inferred IDs/text.
+            # Validate every selected handle against the CURRENT allowance even
+            # when the same immutable envelope can be reused.
+            for selection in selections:
+                for handle in selection.records:
+                    self._node(handle, current_allowed_sources)
+            cached = self._admission_cache
+            if (cached is not None and cached[0] == selections
+                    and cached[1] == current_allowed_sources and cached[2] == bounds):
+                envelope = cached[3]
+            else:
+                self._admission_cache = None
+                collections = tuple(AskCollectionInput(s.name,
+                    self._inputs(s.records, current_allowed_sources), s.container_kind) for s in selections)
+                envelope = build_ask_evidence_input(request_key=self._key, collections=collections,
+                    allowed_sources=current_allowed_sources, adapter_limits=bounds.adapter,
+                    assembly_limits=bounds.assembly, legacy_limits=bounds.legacy)
             result = AskEvidenceAdmission(envelope, current_allowed_sources, bounds.adapter)
             self._check_capacity(0, envelope.bundle.size_bytes)
+            # Restore with the fresh allowance and compare exact retrieval shape
+            # on EVERY invocation. Mutable records are never cached or shared.
             apply_ask_evidence_input(retrieval, request_key=self._key, admission=result)
+            self._admission_cache = (selections, current_allowed_sources, bounds, envelope)
             return result
 
     def admission_hook(self, *,

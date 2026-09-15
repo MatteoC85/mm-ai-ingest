@@ -76,6 +76,7 @@ class AuthorizedCall:
     grant: ApplicationGrant = field(repr=False)
     provider: BubbleAuthority = field(repr=False)
     resolve: Callable = field(repr=False)
+    admission: Any = field(default=None, repr=False)
 
     def check(self, payload) -> None:
         if payload is not self.payload:
@@ -99,7 +100,7 @@ class AuthorizedCall:
 
 def authorize_http_request(payload, *, service_secret: object, application_secret: object,
         env: Mapping[str, str], resolve: Callable,
-        clock: Callable = time.monotonic, opener=None) -> AuthorizedCall:
+        clock: Callable = time.monotonic, opener=None, admission_windows=False) -> AuthorizedCall:
     if not required(env):
         raise AuthorityError("AUTHORITY_DISABLED")
     old_secret = _config(env, "AI_INTERNAL_SECRET")
@@ -122,14 +123,19 @@ def authorize_http_request(payload, *, service_secret: object, application_secre
     provider = BubbleAuthority(directory=directory, schema=schema, boundary=boundary)
     scope = scope_from_resolved(resolve(company_id=payload.company_id, machine_id=payload.machine_id,
         bubble_document_id=payload.bubble_document_id, document_ids=payload.document_ids, ai_scope=payload.ai_scope))
-    authorized = AuthorizedCall(payload, scope, grant, provider, resolve)
+    if type(admission_windows) is not bool:
+        raise AuthorityError("AUTHORITY_CONFIGURATION_INVALID")
+    from ..authority.request_admission import RequestAdmission
+    admission = (RequestAdmission(provider=provider, grant=grant, scope=scope,
+        payload=payload, resolve=resolve) if admission_windows else None)
+    authorized = AuthorizedCall(payload, scope, grant, provider, resolve, admission)
     authorized.check(payload)
     return authorized
 
 
 def protected_call(payload, service_secret, *, authorized: AuthorizedCall,
                    delegate: Callable, response_guard: Callable | None = None,
-                   backend_cache_reuse: bool = False) -> dict:
+                   backend_cache_reuse: bool = False, completed: Callable | None = None) -> dict:
     """Check current authorized application context before execution and release.
 
     Delegate must have its response caches disabled until B4n adds source-safe
@@ -138,7 +144,8 @@ def protected_call(payload, service_secret, *, authorized: AuthorizedCall,
     """
     if (type(backend_cache_reuse) is not bool
             or type(authorized) is not AuthorizedCall or not callable(delegate)
-            or (response_guard is not None and not callable(response_guard))):
+            or (response_guard is not None and not callable(response_guard))
+            or (completed is not None and not callable(completed))):
         raise AuthorityError("AUTHORITY_CONFIGURATION_INVALID")
     authorized.check(payload)
     result = None
@@ -157,12 +164,20 @@ def protected_call(payload, service_secret, *, authorized: AuthorizedCall,
         exc.execution_accounting = _accounting_after_execution(result)
         raise
     result = dict(result)
+    canonical = bool(completed()) if completed is not None else False
     result["meta"] = {**dict(result.get("meta") or {}),
+        "canonical_evidence_active": canonical,
         "request_authority": {**authorized.provider.directory.meter.summary(),
-            "scope_authorized": True, "canonical_evidence_active": False,
+            "scope_authorized": True, "canonical_evidence_active": canonical,
             "cache_reuse": ("backend_guarded_exact" if backend_cache_reuse
                             else "disabled_pending_B4n")},
         "cacheable": False, "semantic_cacheable": False}
+    if type(result["meta"].get("response_flow_guard")) is dict:
+        result["meta"]["response_flow_guard"] = {**result["meta"]["response_flow_guard"],
+            "canonical_evidence_active": canonical}
+    if authorized.admission is not None:
+        result["meta"]["request_authority"]["admission_policy"] = "request-local-observed-source-fences-v2"
+        result["meta"]["request_authority"]["remote_fence_count"] = len(authorized.admission.fences)
     return result
 
 
@@ -259,9 +274,10 @@ class ResponseGuardOwner:
     def _current(self) -> frozenset[SourceIdentity]:
         self.check()
         try:
-            self._authorized.check(self._payload)
-            current = self._authorized.provider.current_sources(
-                self._authorized.grant, self._scope)
+            if self._authorized.admission is None:
+                self._authorized.check(self._payload)
+            current = (self._authorized.provider.current_sources(self._authorized.grant, self._scope)
+                if self._authorized.admission is None else self._authorized.admission.sources())
             self.check()
             if (type(current) is not frozenset
                     or any(type(source) is not SourceIdentity
@@ -320,6 +336,8 @@ class ResponseGuardOwner:
             result["meta"] = {**result.get("meta", {}),
                 "cacheable": False, "semantic_cacheable": False}
             return result
+        if self._authorized.admission is not None:
+            self._authorized.admission.refresh("response.publication")
         result = self._validate(response, cached=False, terminal=True)
         result["meta"] = {**result.get("meta", {}),
             "response_flow_guard": {"version": RESPONSE_FLOW_GUARD_VERSION,

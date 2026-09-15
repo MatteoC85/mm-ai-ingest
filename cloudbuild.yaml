@@ -21,7 +21,7 @@ steps:
       ]
 
   # Deploy only after the OFF baseline has been checked. No secret values in source.
-  # This guard is intentionally OFF-only; B4o activation requires explicit review.
+  # This guard preserves the serving mode; it NEVER activates required mode.
   - name: gcr.io/google.com/cloudsdktool/cloud-sdk
     id: deploy-authority-config-guard-off
     env:
@@ -31,7 +31,7 @@ steps:
     script: |
       #!/usr/bin/env python3
       """Build-time guard only; does not import or change MachineMind application code.
-      The OFF gate must be reviewed explicitly when canonical activation is authorized.
+      Activation remains a separate operation after acceptance of the isolated gate.
       No secret values are retrieved or printed. No automatic traffic rollback.
       """
       import copy
@@ -118,8 +118,8 @@ steps:
       def configuration(spec):
           env = environment(spec)
           mode = env.get('MM_ASK_REQUEST_AUTHORITY')
-          require(mode is None or (mode.get('value') == 'off' and 'valueFrom' not in mode),
-                  'AUTHORITY_NOT_OFF')
+          require(mode is None or (mode.get('value') in ('off', 'required') and 'valueFrom' not in mode),
+                  'AUTHORITY_MODE_INVALID')
           for name, expected in ENV_VALUES.items():
               item = env.get(name, {})
               require('valueFrom' not in item and isinstance(item.get('value'), str),
@@ -287,6 +287,9 @@ steps:
           reconciled(previous, 'BASELINE_REVISION_RECONCILING')
           ready(previous, 'BASELINE_TRAFFIC_REVISION_NOT_READY')
           prior_env = configuration(previous.get('spec', {}))
+          require(environment(template_spec(before)).get('MM_ASK_REQUEST_AUTHORITY', {}).get('value', 'off') ==
+                  prior_env.get('MM_ASK_REQUEST_AUTHORITY', {}).get('value', 'off'),
+                  'BASELINE_AUTHORITY_MODE_DIFFERS_FROM_SERVING')
           commit = prior_env.get('COMMIT_SHA', {}).get('value')
           require(isinstance(commit, str) and re.fullmatch('[0-9a-f]{40}', commit),
                   'BASELINE_COMMIT_INVALID')
@@ -326,6 +329,7 @@ steps:
           phase('VALIDATE_SERVING_BASELINE')
           before = read_resource('services', SERVICE)
           prior = validate_serving_baseline(before)
+          serving_mode = environment(template_spec(before)).get('MM_ASK_REQUEST_AUTHORITY', {}).get('value', 'off')
           baseline_revisions = revision_names()
           require(prior in baseline_revisions and
                   before.get('status', {}).get('latestCreatedRevisionName') in baseline_revisions,
@@ -374,12 +378,12 @@ steps:
           require(requested_traffic(final) == {name: 100}, 'FINAL_REQUESTED_TRAFFIC_MISMATCH')
           phase('HEALTH_AFTER_PROMOTION')
           health(final.get('status', {}).get('url'), commit, name)
-          return {'status': 'PASS_DEPLOY_B4L_CONFIG_GUARD_OFF', 'revision': name,
+          return {'status': ('PASS_DEPLOY_B4L_CONFIG_GUARD_OFF' if serving_mode == 'off' else 'PASS_DEPLOY_B4O_CONFIG_GUARD_REQUIRED'), 'revision': name,
                   'previous_revision': prior, 'commit_sha': commit, 'image_digest': digest,
-                  'authority_mode': 'OFF', 'config_checked_before_traffic': True,
+                  'authority_mode': serving_mode.upper(), 'config_checked_before_traffic': True,
                   'unrelated_template_preserved': True, 'traffic_percent': 100,
                   'health_checked_before_deploy': True, 'health_checked_after_promotion': True,
-                  'guard_version': 'b4o-candidate-identity-v1', 'ask_calls': 0, 'ai_calls': 0}
+                  'guard_version': 'b4o-e2e-mode-preserving-v1', 'ask_calls': 0, 'ai_calls': 0}
       
       if __name__ == '__main__':
           try:

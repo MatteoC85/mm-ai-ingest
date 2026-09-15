@@ -1101,13 +1101,20 @@ class TaskGenerationEvidence(GenericGenerationEvidence):
         def merge(preferred, secondary):
             handles = self.handles([preferred, secondary])
             result = ranking.v12_merge_candidate_metadata(preferred, secondary, runtime=self.tasks.metadata_merge)
-            # The original merge policy keeps preferred evidence text and merges
-            # ranking metadata. Record the chosen body at that exact branch.
-            if not _same_value({k:result[k] for k in self._BODY if k in result},
-                               {k:preferred[k] for k in self._BODY if k in preferred}):
+            # The legacy algorithm overlays preferred onto secondary. An observed
+            # page may omit chunk_index while an observed chunk of the SAME source
+            # supplies it. Retain both explicit parents for that exact branch;
+            # do not invent the chunk locator or find a parent by citation text.
+            inputs = self.records(handles)
+            same_source = inputs[0].context.source == inputs[1].context.source
+            expected = {k: secondary[k] for k in self._BODY if k in secondary} if same_source else {}
+            expected.update({k: preferred[k] for k in self._BODY if k in preferred})
+            expected = {k: expected[k] for k in self._BODY if k in expected}
+            if not _same_value({k:result[k] for k in self._BODY if k in result}, expected):
                 raise GenerationEvidenceError("family metadata merge changed chosen body")
+            parents = handles if same_source else (handles[0],)
             handle = self.session.derive_batch(request=self.request,
-                views=(((handles[0],), deepcopy(result)),), operation=TASK_GENERATION_VERSION+":preferred-body",
+                views=((parents, deepcopy(result)),), operation=TASK_GENERATION_VERSION+":explicit-body-merge",
                 current_allowed_sources=self.current())[0]
             return self._remember(result, handle)
         runtime = replace(self.tasks.step_dedupe, _v12_merge_candidate_metadata=merge)

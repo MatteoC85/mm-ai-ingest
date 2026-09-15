@@ -82,17 +82,22 @@ def _tuple_of(value: Any, cls: type, name: str) -> None:
 
 
 def to_primitive(value: Any) -> Any:
-    """A fresh JSON-compatible value; no references to mutable caller objects."""
+    """A fresh JSON-compatible value; no references to mutable caller objects.
+
+    Exact scalar types bypass dataclass inspection; Enum subclasses still take
+    the original conversion path. No caller data or authorization is cached.
+    """
+    typ = type(value)
+    if value is None or typ in (str, bool, int):
+        return value
+    if typ is float and math.isfinite(value):
+        return value
     if isinstance(value, Enum):
         return value.value
     if is_dataclass(value) and not isinstance(value, type):
         return {f.name: to_primitive(getattr(value, f.name)) for f in fields(value)}
     if isinstance(value, tuple):
         return [to_primitive(x) for x in value]
-    if value is None or type(value) in (str, bool, int):
-        return value
-    if type(value) is float and math.isfinite(value):
-        return value
     raise EvidenceContractError("unsupported JSON value")
 
 
@@ -266,8 +271,15 @@ class EvidenceRecord:
         return "ev1_" + digest
 
     def to_dict(self) -> dict[str, Any]:
-        return {"schema_version": SCHEMA_VERSION, "evidence_id": self.evidence_id,
-                **to_primitive(self)}
+        if type(self) is not EvidenceRecord:
+            return {"schema_version": SCHEMA_VERSION, "evidence_id": self.evidence_id,
+                    **to_primitive(self)}
+        primitive = to_primitive(self)
+        serialized = json.dumps(primitive, ensure_ascii=True, sort_keys=True,
+                                separators=(",", ":"), allow_nan=False)
+        digest = hashlib.sha256((SCHEMA_VERSION + "\n" + serialized).encode("utf-8")).hexdigest()
+        return {"schema_version": SCHEMA_VERSION, "evidence_id": "ev1_" + digest,
+                **primitive}
 
 
 @dataclass(frozen=True, slots=True)

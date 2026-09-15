@@ -72,9 +72,10 @@ class EvidenceManifest:
             record = entry.evidence
             if record.source.scope.company_id != self.company_id or record.source not in self.allowed_sources:
                 raise EvidenceContractError("evidence not in the explicit source allowance")
-            if record.evidence_id in seen:
+            evidence_id = record.evidence_id
+            if evidence_id in seen:
                 raise EvidenceContractError("duplicate evidence; no implicit merge or reranking")
-            seen.add(record.evidence_id)
+            seen.add(evidence_id)
         if len(self.to_json().encode("utf-8")) > self.limits.max_serialized_bytes:
             raise EvidenceContractError("manifest serialized budget exceeded")
 

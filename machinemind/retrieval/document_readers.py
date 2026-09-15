@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 @dataclass(frozen=True)
 class FetchDocumentFileMapRuntime:
     _db_conn: Callable[..., Any]
+    current_file_reader: Optional[Callable[..., Any]] = None
 
 
 def fetch_document_file_map(company_id: str, doc_ids: list[str], *, runtime: FetchDocumentFileMapRuntime) -> dict[str, str]:
@@ -255,6 +256,7 @@ def v12_relation_procedure_candidate(
 class DbFindTokenChunkRuntime:
     ASK_SNIPPET_CHARS: Any
     _db_conn: Callable[..., Any]
+    project_chunk_locator: bool = False
 
 
 def db_find_token_chunk(company_id: str, machine_id: str, token: str, doc_ids: Optional[list[str]]=None, bubble_document_id: Optional[str]=None, *, runtime: DbFindTokenChunkRuntime) -> Optional[dict]:
@@ -318,6 +320,9 @@ def _db_find_token_chunk_impl(company_id: str, machine_id: str, token: str, doc_
                 "bubble_document_id": str(bdid),
                 "page_from": int(page_from),
                 "page_to": int(page_to),
+                # Preserve the selected SQL locator in the canonical opt-in.
+                # The legacy projection remains byte-for-byte unchanged.
+                **({"chunk_index": int(chunk_index)} if _chunk_capture is not None and runtime.project_chunk_locator is True else {}),
                 "snippet": (snippet or "").strip(),
                 "similarity": 0.0,
             }
@@ -2269,6 +2274,12 @@ def read_document_file_references(*, scope: ChunkReadScope, sources: tuple[Sourc
     # Legacy normalization must not silently change any authorization selector.
     if scope.company_id != scope.company_id.strip() or any(storage_key(s) != storage_key(s).strip() for s in sources):
         raise SupplementalBindingError("unresolved whitespace in file-map selectors")
+    if runtime.current_file_reader is not None:
+        if not callable(runtime.current_file_reader):
+            raise SupplementalBindingError("explicit current file reader required")
+        return runtime.current_file_reader(scope=scope,sources=sources,
+            current_allowed_sources=current_allowed_sources,limits=limits,
+            allow_structured=allow_structured)
     rows, count = _fetch_document_file_map_impl(scope.company_id, [storage_key(s) for s in sources],
         runtime=runtime, _reference_limit=limits.assembly.max_occurrences)
     return build_file_reference_read(scope=scope, anchors=sources, current_allowed_sources=current_allowed_sources,
