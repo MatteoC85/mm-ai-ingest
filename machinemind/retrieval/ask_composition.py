@@ -30,7 +30,7 @@ from ..evidence.contracts import (
 )
 from ..evidence.legacy_compatibility import (
     LegacyEvidenceBundle, LegacyRecordInput, build_legacy_bundle,
-    restore_legacy_records,
+    restore_legacy_records, _has_validated_conversion,
 )
 
 COMPOSITION_VERSION = "ask-request-evidence-composition-p6b4a-v1"
@@ -297,9 +297,14 @@ class AskEvidenceSession:
     def _check_allowance(self, current: frozenset[SourceIdentity]) -> None:
         if type(current) is not frozenset:
             raise AskCompositionError("explicit CURRENT immutable allowance required")
+        # Machine/company scopes do not consume the storage key. Keep every
+        # current source check, but do not construct a key that permits() ignores.
+        needs_key = (type(self._scope) is not ChunkReadScope
+                     or bool(self._scope.document_ids or self._scope.bubble_document_id))
         for source in current:
             if not isinstance(source, SourceIdentity) or not self._scope.permits(
-                    source.scope.company_id, source.scope.machine_id, storage_key(source)):
+                    source.scope.company_id, source.scope.machine_id,
+                    storage_key(source) if needs_key else ""):
                 raise AskCompositionError("current allowance outside resolved ASK scope")
 
     def _read(self, handle: ReadHandle, current: frozenset[SourceIdentity]) -> Any:
@@ -414,6 +419,29 @@ class AskEvidenceSession:
             self._check_allowance(current_allowed_sources)
             return self._inputs(handles, current_allowed_sources)
 
+    def validate_records(self, *, request: Any, handles: tuple[RecordHandle, ...],
+                         current_allowed_sources: frozenset[SourceIdentity]) -> None:
+        """Revalidate capabilities without allocating unused legacy copies.
+
+        Immutable bundles have a pure conversion proof from their construction,
+        not a permission cache. EVERY call checks request identity, scope,
+        selection bounds, handle ownership and CURRENT source/relation grants.
+        Changed adapter limits or an unproven bundle use the original restore.
+        Mutable consumer data remain checked by their journals and the unchanged
+        admission/public Core port. No external calls or limits are removed.
+        """
+        with self._lock:
+            self._check_request(request)
+            self._check_allowance(current_allowed_sources)
+            if type(handles) is not tuple or len(handles) > self._limits.evidence.assembly.max_occurrences:
+                raise AskCompositionError("bounded immutable occurrence selection required")
+            for handle in handles:
+                node = self._node(handle, current_allowed_sources)
+                if not _has_validated_conversion(node.bundle, self._limits.evidence.adapter):
+                    restore_legacy_records(node.bundle, company_id=self._scope.company_id,
+                        allowed_sources=current_allowed_sources,
+                        adapter_limits=self._limits.evidence.adapter)
+
     def inspect_record(self, *, request: Any, handle: RecordHandle,
                        current_allowed_sources: frozenset[SourceIdentity]) -> RecordInspection:
         with self._lock:
@@ -490,10 +518,14 @@ class AskEvidenceSession:
             _check_derived_locator(evidence.locator, tuple(n.evidence() for n in nodes))
             node = _Node(bundle, 0, layout, source, provenance, context.link_target,
                          relations, roots, derivation)
-            self._check_capacity(1, bundle.size_bytes + node.accounting_bytes())
+            # The node is immutable and this block holds the session lock.
+            # Use the same exact byte count for the capacity check and commit,
+            # rather than serializing the unchanged lineage twice.
+            retained_bytes = bundle.size_bytes + node.accounting_bytes()
+            self._check_capacity(1, retained_bytes)
             handle = RecordHandle(self._owner, len(self._nodes))
             self._nodes.append(node)
-            self._bytes += bundle.size_bytes + node.accounting_bytes()
+            self._bytes += retained_bytes
             return handle
 
     def derive_batch(self, *, request: Any,

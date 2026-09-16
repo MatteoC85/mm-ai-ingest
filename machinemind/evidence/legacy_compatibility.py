@@ -167,6 +167,72 @@ def _frozen_canonical_size(node: _Frozen) -> int:
     return len('{"kind":"' + node.kind + '","value":}') + len(_json(node.value))
 
 
+def _legacy_canonical_size(value: Any, limits: LegacyLimits) -> int:
+    """Validate/count exactly as freeze + frozen_canonical_size, without a tree.
+
+    Used only where the temporary frozen object was discarded after counting.
+    Limits, scalar escaping, mapping order and cycle rejection are unchanged.
+    Real retained snapshots still use _Freezer and retain their immutable tree.
+    """
+    nodes = 0
+    scalar_bytes = 0
+    ancestors = set()
+
+    def measure(item: Any, depth: int) -> int:
+        nonlocal nodes, scalar_bytes
+        if depth > limits.max_depth:
+            raise EvidenceAssemblyError("legacy depth budget exceeded")
+        nodes += 1
+        if nodes > limits.max_nodes:
+            raise EvidenceAssemblyError("legacy node budget exceeded")
+        typ = type(item)
+        if item is None or typ in (str, bool, int, float):
+            if typ is float and not math.isfinite(item):
+                raise EvidenceAssemblyError("non-finite legacy value")
+            kind = "null" if item is None else {str:"str", bool:"bool", int:"int", float:"float"}[typ]
+            if typ is str and len(item) > limits.max_bytes:
+                raise EvidenceAssemblyError("legacy byte budget exceeded")
+            try:
+                encoded_length = len(_json(item))
+                scalar_bytes += encoded_length + len(kind) + 5
+            except (ValueError, OverflowError) as exc:
+                raise EvidenceAssemblyError("unserializable legacy scalar") from exc
+            if scalar_bytes > limits.max_bytes:
+                raise EvidenceAssemblyError("legacy byte budget exceeded")
+            return len('{"kind":"' + kind + '","value":}') + encoded_length
+        if not isinstance(item, Mapping) and typ not in (list, tuple):
+            raise EvidenceAssemblyError("unsupported legacy value; no implicit conversion")
+        if id(item) in ancestors:
+            raise EvidenceAssemblyError("cyclic legacy data")
+        if len(item) > limits.max_nodes - nodes:
+            raise EvidenceAssemblyError("legacy node budget exceeded")
+        ancestors.add(id(item))
+        try:
+            if isinstance(item, Mapping):
+                size = len('{"kind":"map","value":[]}')
+                count = 0
+                for key, child in item.items():
+                    if type(key) is not str:
+                        raise EvidenceAssemblyError("legacy mapping keys must be strings")
+                    key_size = measure(key, depth + 1)
+                    # Map keys occupy their escaped string, NOT a tagged node.
+                    key_length = key_size - len('{"kind":"str","value":}')
+                    size += key_length + measure(child, depth + 1) + 3
+                    count += 1
+                return size + max(0, count - 1)
+            kind = "list" if typ is list else "tuple"
+            size = len('{"kind":"' + kind + '","value":[]}')
+            count = 0
+            for child in item:
+                size += measure(child, depth + 1)
+                count += 1
+            return size + max(0, count - 1)
+        finally:
+            ancestors.remove(id(item))
+
+    return measure(value, 0)
+
+
 def _thaw(node: _Frozen) -> Any:
     if node.kind == "map":
         return {k: _thaw(v) for k, v in node.value}
@@ -191,6 +257,18 @@ def _digest(payload: _Frozen) -> str:
 
 
 @dataclass(frozen=True, slots=True)
+class _ConversionProof:
+    """Private proof of a PURE conversion, never a stored permission grant.
+
+    Issued only by build_legacy_bundle for the exact immutable assembly and
+    snapshot tuple it constructed. Substitution of either invalidates reuse.
+    """
+    assembly: EvidenceAssembly = field(repr=False)
+    snapshots: tuple[_Snapshot, ...] = field(repr=False)
+    adapter_limits: AdapterLimits
+
+
+@dataclass(frozen=True, slots=True)
 class LegacyEvidenceBundle:
     """Canonical assembly + private, immutable, request-local sidecars.
 
@@ -201,6 +279,7 @@ class LegacyEvidenceBundle:
     _snapshots: tuple[_Snapshot, ...] = field(repr=False)
     limits: LegacyLimits
     size_bytes: int
+    _conversion_proof: _ConversionProof | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.assembly, EvidenceAssembly) or not isinstance(self.limits, LegacyLimits):
@@ -222,6 +301,17 @@ class LegacyEvidenceBundle:
         _int(self.size_bytes, "bundle size")
         if actual != self.size_bytes or actual > self.limits.max_bytes:
             raise EvidenceAssemblyError("compatibility byte budget exceeded or invalid size")
+
+
+def _has_validated_conversion(bundle: LegacyEvidenceBundle,
+                              adapter_limits: AdapterLimits) -> bool:
+    """Check binding of the creation proof; NEVER infer current authorization."""
+    if type(bundle) is not LegacyEvidenceBundle or type(adapter_limits) is not AdapterLimits:
+        return False
+    proof = bundle._conversion_proof
+    return (type(proof) is _ConversionProof and proof.assembly is bundle.assembly
+            and proof.snapshots is bundle._snapshots
+            and proof.adapter_limits == adapter_limits)
 
 
 def _adapt(layout: str, raw: dict[str, Any], *, indexed_text: str | None,
@@ -277,7 +367,11 @@ def build_legacy_bundle(records: Iterable[LegacyRecordInput], *, company_id: str
     assembly = assemble_evidence(results, company_id=company_id, allowed_sources=allowed_sources,
                                  limits=assembly_limits)
     size = snapshot_bytes + len(assembly.to_json().encode("utf-8"))
-    return LegacyEvidenceBundle(assembly, tuple(snapshots), legacy_limits, size)
+    snapshots = tuple(snapshots)
+    # Both the adaptation and assembly were just computed from these immutable
+    # snapshots. The constructor still performs all original integrity checks.
+    proof = _ConversionProof(assembly, snapshots, adapter_limits)
+    return LegacyEvidenceBundle(assembly, snapshots, legacy_limits, size, proof)
 
 
 def restore_legacy_records(bundle: LegacyEvidenceBundle, *, company_id: str,
@@ -285,7 +379,9 @@ def restore_legacy_records(bundle: LegacyEvidenceBundle, *, company_id: str,
                            adapter_limits: AdapterLimits) -> tuple[LegacyRecordView, ...]:
     """Explicit internal restore with FRESH provider allowance and fresh copies.
 
-    Re-adaptation validates correspondence to canonical records, scores and traces.
+    Reuse the pure conversion only for the exact privately validated immutable
+    graph and unchanged adapter limits; otherwise re-adapt against records,
+    scores and traces. CURRENT source/relation grants are checked at every use.
     The original field names, values, order, duplicates and types are preserved;
     missing fields stay missing. Signed URLs in raw transport stay unverified.
     """
@@ -294,18 +390,36 @@ def restore_legacy_records(bundle: LegacyEvidenceBundle, *, company_id: str,
         raise EvidenceAssemblyError("bundle and explicit adapter limits required")
     if bundle.assembly.manifest.company_id != company_id:
         raise EvidenceAssemblyError("restore company differs from assembly")
+    conversion_valid = _has_validated_conversion(bundle, adapter_limits)
+    # Session nodes usually hold one privately validated occurrence. Its
+    # canonical record is already present in the immutable manifest. Rebuilding
+    # an ID dictionary (and a scored EvidenceEntry) is unnecessary here: scores
+    # and trace are consumed only by the unproven conversion fallback below.
+    # Keep that original path for changed limits/graphs, manual bundles, empty
+    # bundles and multi-occurrence order/multiplicity.
+    assembly = bundle.assembly
+    if (conversion_valid and type(assembly) is EvidenceAssembly
+            and len(bundle._snapshots) == 1 and len(assembly.occurrences) == 1
+            and len(assembly.manifest.entries) == 1):
+        entries = assembly.manifest.entries
+    else:
+        entries = assembly.occurrence_entries()
     output = []
-    for snapshot, occurrence, entry in zip(bundle._snapshots, bundle.assembly.occurrences,
-                                            bundle.assembly.occurrence_entries()):
+    for snapshot, occurrence, entry in zip(bundle._snapshots, assembly.occurrences,
+                                            entries):
         evidence = entry.evidence
         if evidence.source not in allowed_sources or any(r.target not in allowed_sources for r in evidence.relations):
             raise EvidenceAssemblyError("restore outside current provider allowance")
         raw = _thaw(snapshot.payload)
         indexed = evidence.text if snapshot.layout == "structured_source_snapshot" else None
-        context = AdapterContext(evidence.source, evidence.provenance, allowed_sources,
-                                 evidence.link_target, evidence.relations)
-        result = _adapt(snapshot.layout, raw, indexed_text=indexed, context=context, limits=adapter_limits)
-        if result.entry != entry or result.trace != occurrence.trace:
-            raise EvidenceAssemblyError("legacy/canonical conversion mismatch")
+        if not conversion_valid:
+            # Hand-built/replaced bundles and changed adapter limits retain the
+            # original full re-adaptation. Current authorization above is ALWAYS
+            # checked, also for bundles whose pure conversion can be reused.
+            context = AdapterContext(evidence.source, evidence.provenance, allowed_sources,
+                                     evidence.link_target, evidence.relations)
+            result = _adapt(snapshot.layout, raw, indexed_text=indexed, context=context, limits=adapter_limits)
+            if result.entry != entry or result.trace != occurrence.trace:
+                raise EvidenceAssemblyError("legacy/canonical conversion mismatch")
         output.append(LegacyRecordView(snapshot.layout, raw, indexed))
     return tuple(output)

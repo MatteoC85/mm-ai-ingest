@@ -25,7 +25,7 @@ from typing import Any, Callable
 from . import candidate_ranking as ranking
 from .ask_composition import AskEvidenceSession, RecordHandle, RegisteredRead, AskSelection, _check_derived_locator
 from . import evidence_orchestration as orchestration
-from ..evidence.legacy_compatibility import _Freezer, _frozen_canonical_size
+from ..evidence.legacy_compatibility import _Freezer, _frozen_canonical_size, _legacy_canonical_size
 from ..evidence.contracts import canonical_json
 from ..evidence.contracts import EvidenceContractError, SourceIdentity
 from ..evidence.ask_input import _same_value
@@ -185,7 +185,7 @@ def rank_records(*, request: Any, session: AskEvidenceSession,
                         raise EvidenceProductionError("legacy merge combined incompatible locators")
                 views.append((tuple(parent_handles), record))
         after = invoke(authorize, request, request)
-        session.records(request=request, handles=flat, current_allowed_sources=after)
+        session.validate_records(request=request, handles=flat, current_allowed_sources=after)
         if operation.startswith("dedup_"):
             return tuple(selected)
         return session.derive_batch(request=request, views=tuple(views),
@@ -320,7 +320,7 @@ def transform_records(*, request: Any, session: AskEvidenceSession,
                     raise EvidenceProductionError("selection changed an input without derivation")
                 selected.append(handle)
         after = invoke(authorize, request, request)
-        session.records(request=request, handles=flat, current_allowed_sources=after)
+        session.validate_records(request=request, handles=flat, current_allowed_sources=after)
         if operation != "score":
             return tuple(selected)
         return session.derive_batch(request=request, views=tuple(views),
@@ -416,7 +416,7 @@ class _PreparationTrace:
             raise EvidenceProductionError("preparation occurrence already registered")
         if len(self.entries) >= self.max_records:
             raise EvidenceProductionError("preparation trace record limit exceeded")
-        size = _frozen_canonical_size(_Freezer(self.limits.legacy).freeze(record))
+        size = _legacy_canonical_size(record, self.limits.legacy)
         if self.bytes + size > self.max_bytes:
             raise EvidenceProductionError("preparation trace byte limit exceeded")
         contexts = tuple(self.roots[h] for h in parents)
@@ -614,7 +614,7 @@ def prepare_records(*, request: Any, session: AskEvidenceSession,
                         raise EvidenceProductionError("required preparation source adapter missing")
                     current = invoke(authorize, request, request)
                     session.read_contract(request=request, current_allowed_sources=current)
-                    session.records(request=request, handles=tuple(journal.roots),
+                    session.validate_records(request=request, handles=tuple(journal.roots),
                                     current_allowed_sources=current)
                     if name in anchored:
                         # The ORIGINAL preparation algorithm supplies objects
@@ -632,7 +632,7 @@ def prepare_records(*, request: Any, session: AskEvidenceSession,
                             current_allowed_sources=current)
                         handles = invoke(anchored[name], request,
                                          candidate_handles=seed_handles, **params)
-                        session.records(request=request, handles=seed_handles,
+                        session.validate_records(request=request, handles=seed_handles,
                             current_allowed_sources=invoke(authorize, request, request))
                     else:
                         handles = invoke(source_callbacks[name], request, *args, **kwargs)
@@ -709,7 +709,7 @@ def prepare_records(*, request: Any, session: AskEvidenceSession,
             roots = tuple(journal.roots)
             if len(roots) > limits.assembly.max_occurrences:
                 raise EvidenceProductionError("too many consumed preparation handles")
-            session.records(request=request, handles=roots, current_allowed_sources=after)
+            session.validate_records(request=request, handles=roots, current_allowed_sources=after)
             output = result.get("retrieval") if type(result) is dict else None
             if (type(output) is not dict or type(result.get("supported")) is not bool
                     or type(output.get("candidates")) is not list
@@ -825,7 +825,7 @@ def retrieve_initial_records(*, request: Any, session: AskEvidenceSession,
                         raise EvidenceProductionError("required initial source adapter missing")
                     current = invoke(authorize, request, request)
                     session.read_contract(request=request, current_allowed_sources=current)
-                    session.records(request=request, handles=tuple(journal.roots),
+                    session.validate_records(request=request, handles=tuple(journal.roots),
                                     current_allowed_sources=current)
                     result = readonly(source_callbacks[name])(**kwargs)
                     count = None
@@ -839,7 +839,7 @@ def retrieve_initial_records(*, request: Any, session: AskEvidenceSession,
                             or any(type(h) is not RecordHandle for h in result)):
                         raise EvidenceProductionError("initial source adapter requires bounded explicit handles")
                     after = invoke(authorize, request, request)
-                    session.records(request=request, handles=tuple(journal.roots),
+                    session.validate_records(request=request, handles=tuple(journal.roots),
                                     current_allowed_sources=after)
                     inputs = session.records(request=request, handles=result,
                                              current_allowed_sources=after)
@@ -985,7 +985,7 @@ def retrieve_initial_records(*, request: Any, session: AskEvidenceSession,
             if len(score_result) + len(result["citations"]) > limits.assembly.max_occurrences:
                 raise EvidenceProductionError("aggregate initial output count exceeded")
             after = invoke(authorize, request, request)
-            session.records(request=request, handles=tuple(journal.roots), current_allowed_sources=after)
+            session.validate_records(request=request, handles=tuple(journal.roots), current_allowed_sources=after)
             views = tuple((journal.entry(record)[2], deepcopy(record)) for record in score_result)
             result_handles = session.derive_batch(request=request, views=views,
                 operation=INITIAL_LINEAGE_VERSION, current_allowed_sources=after)
@@ -1027,11 +1027,11 @@ class _OuterRetrievalTrace(_PreparationTrace):
     def current(self):
         allowed = self.call(self.authorize, self.request)
         self.session.read_contract(request=self.request, current_allowed_sources=allowed)
-        self.session.records(request=self.request, handles=tuple(self.roots), current_allowed_sources=allowed)
+        self.session.validate_records(request=self.request, handles=tuple(self.roots), current_allowed_sources=allowed)
         return allowed
 
     def snapshot(self, value):
-        size = _frozen_canonical_size(_Freezer(self.limits.legacy).freeze(value))
+        size = _legacy_canonical_size(value, self.limits.legacy)
         if size > self.max_bytes:
             raise EvidenceProductionError("outer retrieval snapshot byte limit exceeded")
         return deepcopy(value)
@@ -1159,7 +1159,7 @@ class _OuterRetrievalTrace(_PreparationTrace):
             if not _same_value(record, expected):
                 raise EvidenceProductionError("mutation changed unrecorded evidence fields")
             del self.entries[id(record)]
-            self.bytes -= _frozen_canonical_size(_Freezer(self.limits.legacy).freeze(item[1]))
+            self.bytes -= _legacy_canonical_size(item[1], self.limits.legacy)
             self.add(record, item[2])
 
     def event(self, stage, *args):
