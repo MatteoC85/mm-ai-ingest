@@ -16,6 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from collections.abc import Mapping
 from typing import Any
+from array import array
 
 from .adapter_types import AdapterLimits
 from .assembly import AssemblyLimits, EvidenceAssemblyError
@@ -200,16 +201,33 @@ class AskEvidenceAdmission:
 
 
 def _same_value(left: Any, right: Any) -> bool:
-    """Exact supported legacy shape, including insertion order and scalar types."""
-    if type(left) is not type(right):
+    """Exact supported shape/order/types; no permission or mutable-data cache."""
+    typ = type(left)
+    if typ is not type(right):
         return False
-    if type(left) is dict:
-        return tuple(left) == tuple(right) and all(_same_value(left[k], right[k]) for k in left)
-    if type(left) in (list, tuple):
-        return len(left) == len(right) and all(_same_value(a, b) for a, b in zip(left, right))
-    if type(left) is float:
-        return left.hex() == right.hex()
-    return (left is None or type(left) in (str, int, bool)) and left == right
+    if typ is dict:
+        if tuple(left) != tuple(right):
+            return False
+        for a, b in zip(left.values(), right.values()):
+            if not _same_value(a, b):
+                return False
+        return True
+    if typ in (list, tuple):
+        if len(left) != len(right):
+            return False
+        if len(left) >= 8 and all(type(x) is float for x in left) and all(type(x) is float for x in right):
+            # Binary double comparison preserves every finite float bit, notably
+            # signed zero. NaNs retain the original hex()-based comparison below.
+            if array("d", left).tobytes() == array("d", right).tobytes():
+                return True
+            return all(a.hex() == b.hex() for a, b in zip(left, right))
+        for a, b in zip(left, right):
+            if not _same_value(a, b):
+                return False
+        return True
+    if typ is float:
+        return left is right or left.hex() == right.hex()
+    return (left is None or typ in (str, int, bool)) and (left is right or left == right)
 
 
 def apply_ask_evidence_input(retrieval: dict, *, request_key: AskRequestKey,

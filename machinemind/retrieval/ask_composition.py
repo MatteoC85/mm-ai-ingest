@@ -30,7 +30,8 @@ from ..evidence.contracts import (
 )
 from ..evidence.legacy_compatibility import (
     LegacyEvidenceBundle, LegacyRecordInput, build_legacy_bundle,
-    restore_legacy_records, _has_validated_conversion,
+    restore_legacy_records, _has_validated_conversion, _occurrence_entries,
+    _PayloadPool, _payload_scope,
 )
 
 COMPOSITION_VERSION = "ask-request-evidence-composition-p6b4a-v1"
@@ -132,13 +133,7 @@ class _Node:
             self.derivation)).encode("utf-8"))
 
     def evidence(self) -> EvidenceRecord:
-        assembly = self.bundle.assembly
-        # Session nodes own singleton bundles; no ID serialization or temporary
-        # EvidenceEntry is needed to retrieve an already-bound immutable record.
-        # Retain the general path for any other internal representation.
-        if self.offset == 0 and len(assembly.manifest.entries) == len(assembly.occurrences) == 1:
-            return assembly.manifest.entries[0].evidence
-        return assembly.occurrence_entries()[self.offset].evidence
+        return _occurrence_entries(self.bundle)[self.offset].evidence
 
 
 def _receipt_scope(receipt: Any) -> ChunkReadScope:
@@ -239,6 +234,7 @@ class AskEvidenceSession:
         self._reads: list[Any] = []
         self._nodes: list[_Node] = []
         self._bytes = 0
+        self._payload_pool = _PayloadPool(limits.max_bytes)
         # One immutable admission envelope, owned by this request only. Reuse
         # never skips current allowance checks or the canonical round-trip.
         self._admission_cache = None
@@ -256,6 +252,7 @@ class AskEvidenceSession:
         with self._lock:
             self._closed = True
             self._reads.clear()
+            self._payload_pool.close()
             self._nodes.clear()
             self._admission_cache = None
             self._bytes = 0
@@ -286,7 +283,14 @@ class AskEvidenceSession:
             return {"version": COMPOSITION_VERSION, "closed": self._closed,
                     "registered_reads": len(self._reads), "record_views": len(self._nodes),
                     "retained_serialized_bytes": self._bytes,
-                    "scope": "request_local_composition"}
+                    "scope": "request_local_composition",
+                    **self._payload_pool.summary()}
+
+    def payload_scope(self, *, request):
+        """Share immutable values only during this checked request invocation."""
+        with self._lock:
+            self._check_request(request)
+        return _payload_scope(self._payload_pool)
 
     def _check_request(self, request: Any) -> None:
         if self._closed:
@@ -329,18 +333,24 @@ class AskEvidenceSession:
     def _inputs(self, handles: tuple[RecordHandle, ...], current: frozenset[SourceIdentity]) -> tuple[LegacyRecordInput, ...]:
         if type(handles) is not tuple or len(handles) > self._limits.evidence.assembly.max_occurrences:
             raise AskCompositionError("bounded immutable occurrence selection required")
-        result = []
-        for handle in handles:
-            node = self._node(handle, current)
-            # Each node owns a single-record P5 snapshot. Restore reauthorizes
-            # only the selected occurrence (and relations), not unrelated rows.
-            # Repeated handles produce independent nested mappings, not aliases.
-            view = restore_legacy_records(node.bundle, company_id=self._scope.company_id,
-                allowed_sources=current, adapter_limits=self._limits.evidence.adapter)[node.offset]
-            result.append(LegacyRecordInput(node.layout, view.record,
-                AdapterContext(node.source, node.provenance, current,
-                    link_target=node.link_target, relations=node.relations), view.indexed_text))
-        return tuple(result)
+        nodes = tuple(self._node(h, current) for h in handles)
+        groups = {}
+        for index, node in enumerate(nodes):
+            groups.setdefault(id(node.bundle), []).append((index, node))
+        restored = {}
+        for occurrences in groups.values():
+            bundle = occurrences[0][1].bundle
+            width = bundle.assembly.limits.max_occurrences
+            for start in range(0, len(occurrences), width):
+                group = occurrences[start:start + width]
+                views = restore_legacy_records(bundle, company_id=self._scope.company_id,
+                    allowed_sources=current, adapter_limits=self._limits.evidence.adapter,
+                    positions=tuple(n.offset for _, n in group))
+                for (index, node), view in zip(group, views):
+                    restored[index] = LegacyRecordInput(node.layout, view.record,
+                        AdapterContext(node.source, node.provenance, current,
+                            link_target=node.link_target, relations=node.relations), view.indexed_text)
+        return tuple(restored[i] for i in range(len(nodes)))
 
     def read_contract(self, *, request: Any,
                       current_allowed_sources: frozenset[SourceIdentity]
@@ -377,26 +387,28 @@ class AskEvidenceSession:
             if len(self._reads) >= self._limits.max_reads:
                 raise AskCompositionError("aggregate read count exceeded")
             part = _page_part(receipt)
+            read_index = len(self._reads)
+            nodes = []
             if type(receipt) is FileReferenceRead:
                 receipt.as_file_map(scope=self._scope, current_allowed_sources=current_allowed_sources)
-                inputs, indices = (), ()
             else:
-                inputs = receipt.as_legacy_inputs(scope=self._scope,
-                    current_allowed_sources=current_allowed_sources,
-                    adapter_limits=self._limits.evidence.adapter)
+                # The receipt ALREADY owns the checked immutable payload. An
+                # occurrence node references it; it does not thaw/re-freeze a
+                # singleton copy. Keep full validation for unproven conversions.
+                if not _has_validated_conversion(part.bundle, self._limits.evidence.adapter):
+                    receipt.as_legacy_inputs(scope=self._scope,
+                        current_allowed_sources=current_allowed_sources,
+                        adapter_limits=self._limits.evidence.adapter)
                 indices = (tuple(range(len(part.observations))) if type(receipt) is ChunkEvidenceRead
                            else part.selected_observation_indices)
-            read_index = len(self._reads)
-            bounds = self._limits.evidence
-            nodes = []
-            for pos, value in enumerate(inputs):
-                single = build_legacy_bundle((value,), company_id=self._scope.company_id,
-                    allowed_sources=current_allowed_sources, adapter_limits=bounds.adapter,
-                    assembly_limits=bounds.assembly, legacy_limits=bounds.legacy)
-                nodes.append(_Node(single, 0, value.layout, value.context.source,
-                    value.context.provenance, value.context.link_target, value.context.relations,
-                    ((read_index, indices[pos]),)))
-            extra_bytes = receipt.size_bytes + sum(n.bundle.size_bytes + n.accounting_bytes() for n in nodes)
+                for pos, entry in enumerate(_occurrence_entries(part.bundle)):
+                    evidence = entry.evidence
+                    nodes.append(_Node(part.bundle, pos, part.bundle._snapshots[pos].layout,
+                        evidence.source, evidence.provenance, evidence.link_target,
+                        evidence.relations, ((read_index, indices[pos]),)))
+            # Each receipt bundle is counted once, plus every occurrence's
+            # lineage. No receipt, observation or selectable view is removed.
+            extra_bytes = receipt.size_bytes + sum(n.accounting_bytes() for n in nodes)
             self._check_capacity(len(nodes), extra_bytes)
             # No registry mutation occurs until all authorization/data/budget checks pass.
             start = len(self._nodes)

@@ -7,7 +7,9 @@ Offsets refer to the exact indexed text, NOT to bytes or the original PDF.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, fields, is_dataclass
+from array import array
+
+from dataclasses import dataclass, fields, is_dataclass, field
 from enum import Enum
 import hashlib
 import json
@@ -81,6 +83,46 @@ def _tuple_of(value: Any, cls: type, name: str) -> None:
         raise EvidenceContractError(f"{name}: expected immutable tuple of {cls.__name__}")
 
 
+@dataclass(frozen=True, slots=True)
+class _PackedFloats:
+    """Private compact storage of an already-checked legacy scalar sequence.
+
+    This is not an evidence format or a permission. Its logical representation
+    remains the exact tuple of {kind: float, value: ...} immutable nodes used by
+    the existing sidecar. No dimension, model, field name or tolerance is assumed.
+    """
+    values: tuple[float, ...]
+    encoded: str = field(init=False, repr=False, compare=False)
+    binary: bytes = field(init=False, repr=False, compare=False)
+    reference_id: str = field(init=False, repr=False, compare=False)
+    _wire_children: str = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if type(self.values) is not tuple or not all(type(x) is float and math.isfinite(x) for x in self.values):
+            raise EvidenceContractError("non-finite or non-float compact scalar")
+        object.__setattr__(self, "encoded", json.dumps(self.values, ensure_ascii=True,
+                       separators=(",", ":"), allow_nan=False))
+        object.__setattr__(self, "binary", array("d", self.values).tobytes())
+        object.__setattr__(self, "reference_id", hashlib.sha256(self.binary).hexdigest())
+        body = self.encoded[1:-1]
+        object.__setattr__(self, "_wire_children",
+            '[["float",' + body.replace(',', '],["float",') + ']]' if body else '[]')
+
+    @classmethod
+    def from_values(cls, values):
+        return cls(tuple(values))
+
+    @property
+    def scalar_bytes(self) -> int:
+        return len(self.encoded) - 2 - max(0, len(self.values) - 1) + 10 * len(self.values)
+
+    def canonical_children_bytes(self) -> int:
+        return len(self.values) * len('{"kind":"float","value":}') + len(self.encoded) - 2
+
+    def wire_children(self) -> str:
+        return self._wire_children
+
+
 def to_primitive(value: Any) -> Any:
     """A fresh JSON-compatible value; no references to mutable caller objects.
 
@@ -92,6 +134,8 @@ def to_primitive(value: Any) -> Any:
         return value
     if typ is float and math.isfinite(value):
         return value
+    if type(value) is _PackedFloats:
+        return [{"kind": "float", "value": x} for x in value.values]
     if isinstance(value, Enum):
         return value.value
     if is_dataclass(value) and not isinstance(value, type):

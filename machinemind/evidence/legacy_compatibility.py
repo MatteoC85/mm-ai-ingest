@@ -13,6 +13,10 @@ No pickle/eval, I/O, retrieval, ranking, text normalization or source inference.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from array import array
+from contextlib import contextmanager
+from contextvars import ContextVar
+from threading import RLock
 from dataclasses import dataclass, field
 import hashlib
 import json
@@ -22,7 +26,7 @@ from typing import Any, Iterable
 from .adapter_types import AdapterContext, AdapterLimits, AdaptationResult
 from .assembly import (AssemblyLimits, EvidenceAssembly, EvidenceAssemblyError,
                        _allowance, _int, assemble_evidence)
-from .contracts import SourceIdentity
+from .contracts import SourceIdentity, _PackedFloats
 from .record_adapters import adapt_candidate, adapt_chunk, adapt_page
 from .structured_adapters import adapt_structured_source
 
@@ -73,6 +77,81 @@ class LegacyRecordView:
     indexed_text: str | None = field(default=None, repr=False)
 
 
+class _PayloadPool:
+    """Request-owned interning of immutable numeric VALUES, never permissions.
+
+    Every lookup checks the actual incoming component types and IEEE-754 bytes.
+    No source ID, hash-only provenance join, mutable object-ID cache, dimension,
+    language or model-specific rule is involved. The index is bounded; overflow
+    merely uses an unshared immutable value, never drops or truncates evidence.
+    """
+    def __init__(self, max_bytes: int):
+        _int(max_bytes, "payload pool bound", 1)
+        self.max_bytes = max_bytes
+        self._lock = RLock()
+        self._values = {}
+        self.retained_bytes = 0
+        self.hits = 0
+        self.misses = 0
+        self.closed = False
+
+    def pack(self, values):
+        with self._lock:
+            if self.closed:
+                raise EvidenceAssemblyError("legacy payload pool is closed")
+            # Called only after the freezer's exact homogeneous-float type check.
+            key = array("d", values).tobytes()
+            found = self._values.get(key)
+            if found is not None:
+                self.hits += 1
+                return found
+            packed = _PackedFloats.from_values(values)
+            self.misses += 1
+            # Includes every retained encoded representation, not just the key.
+            size = _numeric_retained_bytes(packed)
+            if self.retained_bytes + size <= self.max_bytes:
+                self._values[packed.binary] = packed
+                self.retained_bytes += size
+            return packed
+
+    def summary(self):
+        with self._lock:
+            return {"unique_numeric_payloads": len(self._values),
+                    "numeric_payload_pool_bytes": self.retained_bytes,
+                    "numeric_payload_pool_hits": self.hits,
+                    "numeric_payload_pool_misses": self.misses}
+
+    def close(self):
+        with self._lock:
+            self._values.clear()
+            self.retained_bytes = 0
+            self.closed = True
+
+
+# Context-local ONLY while the owning ASK invocation is executing. This carries
+# no source, principal, grant or authority result and defaults to no sharing.
+_CURRENT_PAYLOAD_POOL = ContextVar("mm_ask_immutable_payload_pool", default=None)
+
+
+@contextmanager
+def _payload_scope(pool):
+    if type(pool) is not _PayloadPool or pool.closed:
+        raise EvidenceAssemblyError("live request-owned payload pool required")
+    if _CURRENT_PAYLOAD_POOL.get() is pool:
+        yield
+        return
+    token = _CURRENT_PAYLOAD_POOL.set(pool)
+    try:
+        yield
+    finally:
+        _CURRENT_PAYLOAD_POOL.reset(token)
+
+
+def _pack_floats(values):
+    pool = _CURRENT_PAYLOAD_POOL.get()
+    return pool.pack(values) if pool is not None else _PackedFloats.from_values(values)
+
+
 # Immutable tagged tree; dict insertion order and tuple/list types are preserved.
 @dataclass(frozen=True, slots=True)
 class _Frozen:
@@ -84,8 +163,22 @@ def _wire(node: _Frozen) -> Any:
     if node.kind == "map":
         return ["map", [[k, _wire(v)] for k, v in node.value]]
     if node.kind in ("list", "tuple"):
+        if type(node.value) is _PackedFloats:
+            return [node.kind, [["float", x] for x in node.value.values]]
         return [node.kind, [_wire(v) for v in node.value]]
     return [node.kind, node.value]
+
+
+def _wire_json(node: _Frozen) -> str:
+    """Exact former _json(_wire(node)), without building scalar wrapper trees."""
+    if node.kind == "map":
+        return '["map",[' + ','.join('[' + _json(k) + ',' + _wire_json(v) + ']'
+                                      for k, v in node.value) + ']]'
+    if node.kind in ("list", "tuple"):
+        children = (node.value.wire_children() if type(node.value) is _PackedFloats
+                    else '[' + ','.join(_wire_json(v) for v in node.value) + ']')
+        return '[' + _json(node.kind) + ',' + children + ']'
+    return _json([node.kind, node.value])
 
 
 # Stateless encoder: reuses only configuration, never content, grants or IDs.
@@ -131,6 +224,18 @@ class _Freezer:
             raise EvidenceAssemblyError("cyclic legacy data")
         if len(value) > self.limits.max_nodes - self.nodes:
             raise EvidenceAssemblyError("legacy node budget exceeded")
+        if typ in (list, tuple) and value and set(map(type, value)) == {float}:
+            if depth + 1 > self.limits.max_depth:
+                raise EvidenceAssemblyError("legacy depth budget exceeded")
+            try:
+                packed = _pack_floats(value)
+            except (ValueError, OverflowError) as exc:
+                raise EvidenceAssemblyError("non-finite legacy value") from exc
+            self.nodes += len(value)
+            self.scalar_bytes += packed.scalar_bytes
+            if self.scalar_bytes > self.limits.max_bytes:
+                raise EvidenceAssemblyError("legacy byte budget exceeded")
+            return _Frozen("list" if typ is list else "tuple", packed)
         self.ancestors.add(id(value))
         try:
             if isinstance(value, Mapping):
@@ -161,6 +266,8 @@ def _frozen_canonical_size(node: _Frozen) -> int:
                 + sum(len(_json(k)) + _frozen_canonical_size(v) + 3
                       for k, v in node.value))
     if node.kind in ("list", "tuple"):
+        if type(node.value) is _PackedFloats:
+            return len('{"kind":"' + node.kind + '","value":[]}') + node.value.canonical_children_bytes()
         return (len('{"kind":"' + node.kind + '","value":[]}')
                 + max(0, len(node.value) - 1)
                 + sum(_frozen_canonical_size(v) for v in node.value))
@@ -206,6 +313,19 @@ def _legacy_canonical_size(value: Any, limits: LegacyLimits) -> int:
             raise EvidenceAssemblyError("cyclic legacy data")
         if len(item) > limits.max_nodes - nodes:
             raise EvidenceAssemblyError("legacy node budget exceeded")
+        if typ in (list, tuple) and item and set(map(type, item)) == {float}:
+            if depth + 1 > limits.max_depth:
+                raise EvidenceAssemblyError("legacy depth budget exceeded")
+            try:
+                packed = _pack_floats(item)
+            except (ValueError, OverflowError) as exc:
+                raise EvidenceAssemblyError("non-finite legacy value") from exc
+            nodes += len(item)
+            scalar_bytes += packed.scalar_bytes
+            if scalar_bytes > limits.max_bytes:
+                raise EvidenceAssemblyError("legacy byte budget exceeded")
+            kind = "list" if typ is list else "tuple"
+            return len('{"kind":"' + kind + '","value":[]}') + packed.canonical_children_bytes()
         ancestors.add(id(item))
         try:
             if isinstance(item, Mapping):
@@ -237,10 +357,200 @@ def _thaw(node: _Frozen) -> Any:
     if node.kind == "map":
         return {k: _thaw(v) for k, v in node.value}
     if node.kind == "list":
+        if type(node.value) is _PackedFloats:
+            return list(node.value.values)
         return [_thaw(v) for v in node.value]
     if node.kind == "tuple":
+        if type(node.value) is _PackedFloats:
+            return tuple(node.value.values)
         return tuple(_thaw(v) for v in node.value)
     return node.value
+
+
+def _matches_frozen(value: Any, node: _Frozen) -> bool:
+    """Exact mutable-input comparison to a private immutable witness.
+
+    Component values are checked again at EVERY use. Cached serialization never
+    stands in for checking a mutable list, including type changes and -0.0.
+    """
+    typ = type(value)
+    if node.kind == "map":
+        return (typ is dict and tuple(value) == tuple(k for k, _ in node.value)
+                and all(_matches_frozen(v, n) for v, (_, n) in zip(value.values(), node.value)))
+    if node.kind in ("list", "tuple"):
+        if typ is not (list if node.kind == "list" else tuple):
+            return False
+        if type(node.value) is _PackedFloats:
+            return (len(value) == len(node.value.values)
+                    and set(map(type, value)) == {float}
+                    and array("d", value).tobytes() == node.value.binary)
+        return len(value) == len(node.value) and all(
+            _matches_frozen(v, n) for v, n in zip(value, node.value))
+    expected = {"null": type(None), "str": str, "bool": bool, "int": int, "float": float}[node.kind]
+    if typ is not expected:
+        return False
+    if typ is float:
+        return value is node.value or value.hex() == node.value.hex()
+    return value is node.value or value == node.value
+
+
+@dataclass(frozen=True, slots=True)
+class _LegacyWitness(Mapping):
+    """Private immutable journal snapshot; materialize only at a real boundary.
+
+    The Mapping interface returns fresh values for existing metadata adapters.
+    It is NEVER handed to a legacy collaborator or to the public ASK port.
+    """
+    _tree: _Frozen = field(repr=False)
+    size_bytes: int
+    retained_metadata_bytes: int = field(init=False, repr=False)
+    numeric_payloads: tuple = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self):
+        size, payloads = _retained_witness_profile(self._tree)
+        object.__setattr__(self, "retained_metadata_bytes", size)
+        object.__setattr__(self, "numeric_payloads", payloads)
+
+    @classmethod
+    def capture(cls, value, limits):
+        tree = _Freezer(limits).freeze(value)
+        return cls(tree, _frozen_canonical_size(tree))
+
+    def matches(self, value):
+        return _matches_frozen(value, self._tree)
+
+    def detached(self):
+        return _thaw(self._tree)
+
+    def __iter__(self):
+        if self._tree.kind != "map":
+            raise TypeError("mapping witness required")
+        return (k for k, _ in self._tree.value)
+
+    def __len__(self):
+        return len(self._tree.value)
+
+    def __getitem__(self, key):
+        if self._tree.kind != "map":
+            raise TypeError("mapping witness required")
+        for k, node in self._tree.value:
+            if k == key:
+                return _thaw(node)
+        raise KeyError(key)
+
+    def __deepcopy__(self, memo):
+        return self  # Only immutable primitives/tree nodes are retained.
+
+
+
+def _numeric_retained_bytes(payload):
+    # Actual immutable numeric buffers held by _PackedFloats. The numeric tuple
+    # has the same binary payload, not an additional serialized JSON document.
+    # Python object/header/allocator overhead is measured separately by RSS.
+    return (len(payload.binary) + len(payload.encoded) + len(payload.wire_children())
+            + len(payload.reference_id))
+
+
+def _retained_witness_profile(root):
+    """Internal reference-form footprint, NOT a change to compatibility wire JSON.
+
+    A journal witness really retains references to shared _PackedFloats objects.
+    Charge each occurrence's reference metadata, then each OWNED numeric buffer
+    once in _WitnessBudget. Canonical round-trip/digest/type/node/depth checks
+    still inspect the original full payload; no component is omitted.
+    """
+    payloads = {}
+    def size(node):
+        if node.kind == "map":
+            return (len('{"kind":"map","value":[]}') + max(0, len(node.value)-1)
+                    + sum(len(_json(k)) + size(v) + 3 for k,v in node.value))
+        if node.kind in ("list", "tuple"):
+            if type(node.value) is _PackedFloats:
+                payloads[id(node.value)] = node.value
+                return len(_json({"kind":node.kind,"value":{
+                    "numeric_payload_ref":node.value.reference_id,
+                    "components":len(node.value.values)}}))
+            return (len('{"kind":"'+node.kind+'","value":[]}')
+                    + max(0,len(node.value)-1) + sum(size(v) for v in node.value))
+        return len('{"kind":"'+node.kind+'","value":}') + len(_json(node.value))
+    return size(root), tuple(payloads.values())
+
+
+class _WitnessBudget:
+    """Bounded live journal accounting for the representation actually retained.
+
+    Deduplication is by strong OBJECT reference to privately immutable buffers,
+    never by source ID, string equality, checksum-only permission or allowance.
+    Full legacy snapshots supplied by old internal callers remain fully charged.
+    Every mutable record is still checked against its witness on every entry().
+    """
+    def __init__(self, limits):
+        self.limits = limits
+        self.metadata_bytes = 0
+        self.numeric_bytes = 0
+        self.logical_bytes = 0
+        self.payloads = {}
+
+    @property
+    def size(self):
+        return self.metadata_bytes + self.numeric_bytes
+
+    def _parts(self, witness):
+        if type(witness) is _LegacyWitness:
+            return witness.retained_metadata_bytes, witness.numeric_payloads, witness.size_bytes
+        full = _legacy_canonical_size(witness, self.limits)
+        return full, (), full
+
+    def delta(self, witness):
+        metadata, payloads, _ = self._parts(witness)
+        return metadata + sum(_numeric_retained_bytes(p) for p in payloads
+                              if id(p) not in self.payloads)
+
+    def add(self, witness):
+        metadata, payloads, logical = self._parts(witness)
+        self.metadata_bytes += metadata
+        self.logical_bytes += logical
+        for p in payloads:
+            old = self.payloads.get(id(p))
+            if old is None:
+                self.payloads[id(p)] = [p, 1]
+                self.numeric_bytes += _numeric_retained_bytes(p)
+            else:
+                if old[0] is not p:
+                    raise EvidenceAssemblyError("numeric witness identity changed")
+                old[1] += 1
+
+    def remove(self, witness):
+        metadata, payloads, logical = self._parts(witness)
+        if self.metadata_bytes < metadata or self.logical_bytes < logical:
+            raise EvidenceAssemblyError("witness budget underflow")
+        for p in payloads:
+            old = self.payloads.get(id(p))
+            if old is None or old[0] is not p or old[1] < 1:
+                raise EvidenceAssemblyError("unowned numeric witness")
+        self.metadata_bytes -= metadata
+        self.logical_bytes -= logical
+        for p in payloads:
+            old = self.payloads[id(p)]
+            old[1] -= 1
+            if not old[1]:
+                self.numeric_bytes -= _numeric_retained_bytes(p)
+                del self.payloads[id(p)]
+
+    @classmethod
+    def from_witnesses(cls, witnesses, limits):
+        budget = cls(limits)
+        for witness in witnesses:
+            budget.add(witness)
+        return budget
+
+    def clear(self):
+        self.payloads.clear()
+        self.metadata_bytes = self.numeric_bytes = self.logical_bytes = 0
+
+
+def _witness_size(value, limits):
+    return value.size_bytes if type(value) is _LegacyWitness else _legacy_canonical_size(value, limits)
 
 
 @dataclass(frozen=True, slots=True)
@@ -253,7 +563,7 @@ class _Snapshot:
 
 
 def _digest(payload: _Frozen) -> str:
-    return hashlib.sha256(_json(_wire(payload)).encode("utf-8")).hexdigest()
+    return hashlib.sha256(_wire_json(payload).encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,6 +576,10 @@ class _ConversionProof:
     assembly: EvidenceAssembly = field(repr=False)
     snapshots: tuple[_Snapshot, ...] = field(repr=False)
     adapter_limits: AdapterLimits
+    entries: tuple = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self):
+        object.__setattr__(self, "entries", self.assembly.occurrence_entries())
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,7 +607,7 @@ class LegacyEvidenceBundle:
                 raise EvidenceAssemblyError("invalid internal legacy snapshot")
             if snapshot.source != entry.evidence.source or snapshot.evidence_id != entry.evidence.evidence_id:
                 raise EvidenceAssemblyError("snapshot/canonical binding mismatch")
-            serialized = _json(_wire(snapshot.payload)).encode("utf-8")
+            serialized = _wire_json(snapshot.payload).encode("utf-8")
             if hashlib.sha256(serialized).hexdigest() != snapshot.digest:
                 raise EvidenceAssemblyError("snapshot integrity mismatch")
             snapshot_bytes += len(serialized)
@@ -312,6 +626,14 @@ def _has_validated_conversion(bundle: LegacyEvidenceBundle,
     return (type(proof) is _ConversionProof and proof.assembly is bundle.assembly
             and proof.snapshots is bundle._snapshots
             and proof.adapter_limits == adapter_limits)
+
+
+def _occurrence_entries(bundle):
+    proof = bundle._conversion_proof
+    if (type(proof) is _ConversionProof and proof.assembly is bundle.assembly
+            and proof.snapshots is bundle._snapshots):
+        return proof.entries
+    return bundle.assembly.occurrence_entries()
 
 
 def _adapt(layout: str, raw: dict[str, Any], *, indexed_text: str | None,
@@ -354,7 +676,7 @@ def build_legacy_bundle(records: Iterable[LegacyRecordInput], *, company_id: str
         ):
             raise EvidenceAssemblyError("provider binding outside assembly allowance")
         frozen = freezer.freeze(item.record)
-        serialized = _json(_wire(frozen)).encode("utf-8")
+        serialized = _wire_json(frozen).encode("utf-8")
         snapshot_bytes += len(serialized)
         if snapshot_bytes > legacy_limits.max_bytes:
             raise EvidenceAssemblyError("legacy byte budget exceeded")
@@ -376,7 +698,8 @@ def build_legacy_bundle(records: Iterable[LegacyRecordInput], *, company_id: str
 
 def restore_legacy_records(bundle: LegacyEvidenceBundle, *, company_id: str,
                            allowed_sources: frozenset[SourceIdentity],
-                           adapter_limits: AdapterLimits) -> tuple[LegacyRecordView, ...]:
+                           adapter_limits: AdapterLimits,
+                           positions: tuple[int, ...] | None = None) -> tuple[LegacyRecordView, ...]:
     """Explicit internal restore with FRESH provider allowance and fresh copies.
 
     Reuse the pure conversion only for the exact privately validated immutable
@@ -391,22 +714,18 @@ def restore_legacy_records(bundle: LegacyEvidenceBundle, *, company_id: str,
     if bundle.assembly.manifest.company_id != company_id:
         raise EvidenceAssemblyError("restore company differs from assembly")
     conversion_valid = _has_validated_conversion(bundle, adapter_limits)
-    # Session nodes usually hold one privately validated occurrence. Its
-    # canonical record is already present in the immutable manifest. Rebuilding
-    # an ID dictionary (and a scored EvidenceEntry) is unnecessary here: scores
-    # and trace are consumed only by the unproven conversion fallback below.
-    # Keep that original path for changed limits/graphs, manual bundles, empty
-    # bundles and multi-occurrence order/multiplicity.
     assembly = bundle.assembly
-    if (conversion_valid and type(assembly) is EvidenceAssembly
-            and len(bundle._snapshots) == 1 and len(assembly.occurrences) == 1
-            and len(assembly.manifest.entries) == 1):
-        entries = assembly.manifest.entries
-    else:
-        entries = assembly.occurrence_entries()
+    entries = _occurrence_entries(bundle)
+    if positions is None:
+        positions = tuple(range(len(bundle._snapshots)))
+    elif (type(positions) is not tuple or len(positions) > assembly.limits.max_occurrences
+          or any(type(p) is not int or not 0 <= p < len(bundle._snapshots) for p in positions)):
+        raise EvidenceAssemblyError("bounded explicit legacy occurrence positions required")
     output = []
-    for snapshot, occurrence, entry in zip(bundle._snapshots, assembly.occurrences,
-                                            entries):
+    for position in positions:
+        snapshot = bundle._snapshots[position]
+        occurrence = assembly.occurrences[position]
+        entry = entries[position]
         evidence = entry.evidence
         if evidence.source not in allowed_sources or any(r.target not in allowed_sources for r in evidence.relations):
             raise EvidenceAssemblyError("restore outside current provider allowance")

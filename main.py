@@ -35,6 +35,8 @@ from pydantic import BaseModel
 from google.cloud import tasks_v2
 from urllib.parse import urlparse, unquote
 
+from machinemind.ask import routing_runtime as _ask_routing_runtime
+
 from assistant_core_v2 import (
     response_has_rejected_answer,
     AssistantCoreDecision,
@@ -125,6 +127,7 @@ from machinemind.core.scope import (
 
 from machinemind.ask import execution as _ask_execution
 from machinemind.ask import validation as _ask_validation
+from machinemind.ask import unit_grounding as _ask_unit_grounding
 from machinemind.ask import request_flow as _ask_request_flow
 from machinemind.ask import request_binding as _ask_request_binding
 from machinemind.ask import request_evidence as _ask_request_evidence
@@ -3381,7 +3384,6 @@ def _chunk_sentences_with_pages(
 
 def _openai_embed_texts(texts: list[str], *, timeout: int = 60) -> list[list[float]]:
     from machinemind.authority.request_admission import before_egress
-    before_egress("embedding")
     return _openai_transport.embed_texts(
         texts,
         timeout=timeout,
@@ -3391,6 +3393,7 @@ def _openai_embed_texts(texts: list[str], *, timeout: int = 60) -> list[list[flo
         post_fn=requests.post,
         current_budget_fn=_v13_current_budget,
         current_ingest_meter_fn=_current_ingest_meter,
+        before_dispatch=lambda: before_egress("embedding"),
     )
 
 
@@ -13800,7 +13803,7 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
                     if request.requested_mode == MODE_ASK else build_router_schema(allowed_modes)
                 )
             ),
-            effort=ASSISTANT_CORE_ROUTER_EFFORT,
+            effort=_ask_routing_runtime.router_effort(request.requested_mode, ASSISTANT_CORE_ROUTER_EFFORT),
             reasoning_mode="",
             timeout=router_timeout,
             max_output_tokens=ASSISTANT_CORE_ROUTER_MAX_OUTPUT_TOKENS,
@@ -16163,6 +16166,11 @@ def _assistant_core_ask_validation_runtime():
     )
 
 
+def _assistant_core_scoped_ask_validation_runtime():
+    # Only the protected ASK intake calls this; shared/OFF/RC validation is unchanged.
+    return _ask_unit_grounding.bind_validation(_assistant_core_ask_validation_runtime())
+
+
 def _assistant_core_recover_citations(
     response: dict,
     *,
@@ -16680,6 +16688,7 @@ def _v13_attach_runtime_meta(response: dict, budget: _V13RequestBudget, *, debug
     response = dict(response or {})
     meta = dict(response.get("meta") or {})
     runtime_meta = budget.public_meta()
+    _ask_routing_runtime.record_ledger(runtime_meta)
 
     cache_detail = meta.get("v13_semantic_cache") if isinstance(meta.get("v13_semantic_cache"), dict) else None
     if cache_detail:
@@ -17736,11 +17745,12 @@ def _assistant_core_intake_factory(**owned):
             _source_type_from_document_id=_source_type_from_document_id,
         ),
         prefix_query=_build_prefix_tsquery_from_texts,
+        max_trace_bytes=128 * 1024 * 1024,
     )
     return _ask_core_intake.bind_core_intake(**owned, core=_ASSISTANT_CORE_ENGINE,
         runtimes=_ask_request_binding.AskRuntimeFactories(
             execution=_assistant_core_ask_execution_runtime,
-            validation=_assistant_core_ask_validation_runtime), runtime=intake,
+            validation=_assistant_core_scoped_ask_validation_runtime), runtime=intake,
         preparation=_assistant_core_prepare_evidence_runtime(),
         generation=_assistant_core_generation_runtime(),
         tasks=_assistant_core_task_synthesis_runtime(), consumers=True)
@@ -17784,6 +17794,9 @@ def _assistant_core_authorized_ask_sync(payload, x_ai_internal_secret, *,
     the uncached helper contract. OFF dispatch and all non-ASK paths are unchanged.
     Activation and the integrated live B4o gates remain separate.
     """
+    from machinemind.ask import routing_runtime as _ask_routing_runtime
+    protected_started = _ask_routing_runtime.now()
+    execution = execution_token = None
     authorized = None
     admission_token = None
     try:
@@ -17792,6 +17805,7 @@ def _assistant_core_authorized_ask_sync(payload, x_ai_internal_secret, *,
             env=authority_environment, resolve=_resolve_query_scope, admission_windows=True)
         from machinemind.authority.request_admission import activate, deactivate
         admission_token = activate(authorized.admission) if authorized.admission is not None else None
+        execution, execution_token = _ask_routing_runtime.activate(protected_started)
         base_runtime = _assistant_core_request_flow_runtime()
         runtime = _dataclass_replace(base_runtime,
             _v13_cache_lookup=lambda **kwargs: None,
@@ -17820,10 +17834,11 @@ def _assistant_core_authorized_ask_sync(payload, x_ai_internal_secret, *,
                     requested_mode=MODE_ASK, runtime=runtime,
                     guards=cache_owner.guards if cache_owner else owner.guards,
                     evidence_factory=evidence_factory)
-            return _application_authority.protected_call(payload, x_ai_internal_secret,
+            result = _application_authority.protected_call(payload, x_ai_internal_secret,
                 authorized=authorized, delegate=uncached,
                 response_guard=cache_owner.release if cache_owner else owner.final,
                 **({"backend_cache_reuse": True, "completed": cache_owner.completed} if cache_owner else {}))
+            return execution.finish(result)
         finally:
             try:
                 if cache_owner is not None:
@@ -17831,8 +17846,11 @@ def _assistant_core_authorized_ask_sync(payload, x_ai_internal_secret, *,
             finally:
                 owner.close()
     except _AuthorityError as exc:
-        return _application_authority.public_error(exc)
+        result = _application_authority.public_error(exc)
+        return execution.finish(result) if execution is not None else result
     finally:
+        if execution_token is not None:
+            _ask_routing_runtime.deactivate(execution_token)
         if authorized is not None and authorized.admission is not None:
             authorized.admission.close()
         if admission_token is not None:

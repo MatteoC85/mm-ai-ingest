@@ -254,7 +254,14 @@ class BubbleAuthority:
         """
         if type(expected) is not frozenset or any(type(source) is not SourceIdentity for source in expected):
             raise AuthorityError("AUTHORITY_RESPONSE_INVALID")
-        before = self.authorize_scope(grant, scope)
+        # Validate the trusted boundary before I/O. Do not publish an allowance
+        # until the company/machine are freshly checked after the catalogs.
+        # Each actual external-consumption fence still performs fresh source,
+        # parent and scope reads; no permissions are cached across fences.
+        self.boundary.require(grant)
+        if type(scope) is not ChunkReadScope:
+            raise AuthorityError("AUTHORITY_SCOPE_INVALID", 400)
+        before = (scope.company_id, scope.machine_id)
         wanted = {(source.source_type, source.source_id): source for source in expected}
         if len(wanted) != len(expected):
             raise AuthorityError("AUTHORITY_RESPONSE_INVALID")
@@ -315,7 +322,12 @@ class BubbleAuthority:
                     if key in wanted and identity is not None:
                         actual[key] = identity
         machine_ids = {source.scope.machine_id for source in expected if source.scope.machine_id is not None}
-        if machine_ids:
+        if scope.machine_id not in (None, _GENERAL):
+            # The final authorize_scope reads this exact machine and proves its
+            # current owner. A whole-machine catalog adds no second owner fact.
+            if not machine_ids.issubset({scope.machine_id}):
+                raise AuthorityError("SCOPE_DENIED", 403)
+        elif machine_ids:
             machine_rows = self.directory.search(self.schema.machine_type, ({
                 "key": self.schema.machine_company_field, "constraint_type": "equals",
                 "value": scope.company_id},))

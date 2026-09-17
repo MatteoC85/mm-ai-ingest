@@ -96,7 +96,8 @@ def _send_json(*, url: str, headers: dict, payload: dict, timeout: int,
 
 def embed_texts(texts: list[str], *, timeout: int = 60, api_key: str, model: str,
                 url: str, post_fn: PostFn, current_budget_fn: BudgetResolver,
-                current_ingest_meter_fn: IngestMeterResolver) -> list[list[float]]:
+                current_ingest_meter_fn: IngestMeterResolver,
+                before_dispatch: Optional[Callable[[], None]] = None) -> list[list[float]]:
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY missing")
     values = [str(value or "") for value in (texts or [])]
@@ -114,6 +115,11 @@ def embed_texts(texts: list[str], *, timeout: int = 60, api_key: str, model: str
             missing.append(value)
             seen.add(key)
     if missing:
+        # Cached vectors do not leave the process. Reauthorize immediately
+        # before each actual outbound embedding batch, BEFORE reservation or
+        # mark_dispatched: a denied fence must never be reported as paid I/O.
+        if before_dispatch is not None:
+            before_dispatch()
         request_timeout = max(1, int(timeout or 60))
         call_index = None
         if budget is not None:

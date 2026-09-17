@@ -28,6 +28,7 @@ import math
 from typing import Callable
 
 from .application_authority import AuthorizedCall, ResponseGuardOwner
+from .routing_runtime import accounting_state
 from .request_flow import RequestFlowRuntime, RequestFlowGuards
 from ..authority.contracts import AuthorityError
 from ..evidence.contracts import SourceIdentity, to_primitive
@@ -39,7 +40,7 @@ from ..retrieval.document_readers import (FetchDocumentFileMapRuntime,
 from ..retrieval.supplemental_evidence import storage_key
 from ..infrastructure import semantic_cache
 
-PROTECTED_CACHE_VERSION = "ask-canonical-exact-cache-p6b4o-e2e-v2"
+PROTECTED_CACHE_VERSION = "ask-canonical-exact-cache-p6b4o-accounting-v3"
 ARTIFACT_KEY = "_mm_canonical_cache_artifact"
 MAX_ARTIFACT_BYTES = 2 * 1024 * 1024
 MAX_DEPENDENCIES = 8192
@@ -220,6 +221,19 @@ class ProtectedCacheOwner:
         _sources(dependencies)
         self._observed, self._dependencies = deepcopy(response), dependencies
 
+    def _accounting_allows_store(self):
+        # The request-local ledger, not public response flags, controls sealing.
+        # The new namespace also rejects old artifacts minted without this gate.
+        try:
+            budget = self.cache["_v13_current_budget"]()
+            state = accounting_state(budget.public_meta()) if budget is not None else {}
+            allowed = state.get("cache_eligible") is True
+        except Exception:
+            allowed = False
+        if not allowed:
+            self._mode = "miss_accounting_incomplete_no_store"
+        return allowed
+
     def _proof(self, response, dependencies):
         payload = dict(version=PROTECTED_CACHE_VERSION, context=self._context,
             knowledge_version=self._epoch, dependencies=_sources(dependencies),
@@ -322,10 +336,13 @@ class ProtectedCacheOwner:
 
     def final(self, response):
         self.check()
+        # Internal validation is not publication. Store performs its own fresh
+        # dependency admission, and release() ALWAYS performs the final remote
+        # source/scope fence before this body may reach the HTTP caller.
         if type(response) is not dict:
             self._fail("AUTHORITY_RESPONSE_INVALID")
         if response.get("ok") is False and response.get("status") == "error":
-            out = self.source_owner.final(response)
+            out = self.source_owner.final(response, _refresh_current=False)
         else:
             expected = self._hit_expected
             if expected is None and self._observed is not None:
@@ -334,13 +351,14 @@ class ProtectedCacheOwner:
                     language=self._context["language"])
             if expected is None or _flow_view(response) != _flow_view(expected):
                 self._fail("AUTHORITY_CACHE_RESPONSE_CHANGED")
-            out = self.source_owner.final(response)
+            out = self.source_owner.final(response, _refresh_current=False)
             if self._hit_dependencies is not None:
                 if not self._hit_dependencies.issubset(self._current()):
                     self._fail("AUTHORITY_CACHE_DEPENDENCY_CHANGED")
                 if self._version() != self._epoch:
                     self._fail("AUTHORITY_CACHE_KNOWLEDGE_CHANGED")
             elif (self._epoch > 0 and self._dependencies
+                    and self._accounting_allows_store()
                     and semantic_cache.assistant_core_cache_certified("ask", out)
                     and out.get("meta", {}).get("cacheable") is not False
                     and out.get("meta", {}).get("semantic_cacheable") is not False):
@@ -380,6 +398,8 @@ class ProtectedCacheOwner:
             self._fail("AUTHORITY_CACHE_STORE_INVALID")
         self._set_context(parameters)
         if ARTIFACT_KEY not in response.get("meta", {}):
+            return None
+        if not self._accounting_allows_store():
             return None
         semantic_cache.cache_store(**parameters, response=deepcopy(response),
             runtime_globals=self._runtime(storing=True), source_guard_fn=self.store)

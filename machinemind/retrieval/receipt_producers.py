@@ -17,7 +17,46 @@ still need producers before main enables canonical ASK. This is not full intake.
 """
 from __future__ import annotations
 
-from copy import deepcopy
+from copy import deepcopy as _generic_deepcopy, _keep_alive as _copy_keep_alive
+
+def deepcopy(value, memo=None):
+    """Detached copy with the same alias semantics for bounded legacy JSON.
+
+    Exact built-in scalars need no dispatcher lookup. Unknown classes retain
+    copy.deepcopy (including their hooks); no new type is admitted by this helper.
+    """
+    if memo is not None and type(memo) is not dict:
+        return _generic_deepcopy(value, memo)
+    typ = type(value)
+    if value is None or typ in (str, bool, int, float, bytes):
+        if memo is not None and id(value) in memo:
+            return _generic_deepcopy(value, memo)
+        return value
+    if memo is None:
+        memo = {}
+    if id(value) in memo:
+        return memo[id(value)]
+    if typ is dict:
+        out = {}
+        memo[id(value)] = out
+        for key, item in value.items():
+            out[deepcopy(key, memo)] = deepcopy(item, memo)
+        _copy_keep_alive(value, memo)
+        return out
+    if typ is list:
+        if value and all(type(x) is float for x in value):
+            out = value.copy()
+            memo[id(value)] = out
+            _copy_keep_alive(value, memo)
+            return out
+        out = []
+        memo[id(value)] = out
+        out.extend(deepcopy(item, memo) for item in value)
+        _copy_keep_alive(value, memo)
+        return out
+    return _generic_deepcopy(value, memo)
+
+
 from dataclasses import replace
 from math import isfinite
 from typing import Any, Callable
@@ -28,7 +67,19 @@ from . import evidence_orchestration as orchestration
 from ..evidence.legacy_compatibility import _Freezer, _frozen_canonical_size, _legacy_canonical_size
 from ..evidence.contracts import canonical_json
 from ..evidence.contracts import EvidenceContractError, SourceIdentity
-from ..evidence.ask_input import _same_value
+from ..evidence.ask_input import _same_value as _legacy_same_value
+from ..evidence.legacy_compatibility import _LegacyWitness, _witness_size, _WitnessBudget
+
+
+def _same_value(left, right):
+    # Journal witnesses are immutable; old consumers still receive plain dicts.
+    if type(right) is _LegacyWitness:
+        if type(left) is _LegacyWitness:
+            return left is right or right.matches(left.detached())
+        return right.matches(left)
+    if type(left) is _LegacyWitness:
+        return left.matches(right)
+    return _legacy_same_value(left, right)
 from ..evidence.record_adapters import adapt_candidate
 
 PRODUCER_VERSION = "ask-receipt-lineage-p6b4g-v1"
@@ -354,6 +405,7 @@ class _PreparationTrace:
         self.roots = {}
         self._adapted_roots = {}
         self.bytes = 0
+        self._witness_budget = _WitnessBudget(limits.legacy)
         self.active = True
         self.fault = None
         self.copy_count = None
@@ -403,7 +455,8 @@ class _PreparationTrace:
         evidence = adapt_candidate(item.record, context=item.context,
                                    limits=self.limits.adapter).entry.evidence
         self._adapted_roots[handle] = (item.context, self.limits.adapter,
-                                       deepcopy(item.record), evidence)
+                                       (item.record if type(item.record) is _LegacyWitness else
+                                        _LegacyWitness.capture(item.record, self.limits.legacy)), evidence)
         return evidence
 
     def add(self, record, parents, *, context=None):
@@ -416,8 +469,13 @@ class _PreparationTrace:
             raise EvidenceProductionError("preparation occurrence already registered")
         if len(self.entries) >= self.max_records:
             raise EvidenceProductionError("preparation trace record limit exceeded")
-        size = _legacy_canonical_size(record, self.limits.legacy)
-        if self.bytes + size > self.max_bytes:
+        witness = _LegacyWitness.capture(record, self.limits.legacy)
+        budget = getattr(self, "_witness_budget", None)
+        if budget is None:
+            budget = _WitnessBudget.from_witnesses(
+                (e[1] for e in self.entries.values()), self.limits.legacy)
+        size = budget.delta(witness)
+        if budget.size + size > self.max_bytes:
             raise EvidenceProductionError("preparation trace byte limit exceeded")
         contexts = tuple(self.roots[h] for h in parents)
         source = contexts[0].context.source
@@ -427,8 +485,18 @@ class _PreparationTrace:
         evidence = adapt_candidate(record, context=ctx, limits=self.limits.adapter).entry.evidence
         parent_evidence = tuple(self._parent_evidence(h) for h in parents)
         _check_derived_locator(evidence.locator, parent_evidence)
-        self.entries[id(record)] = (record, deepcopy(record), parents)
-        self.bytes += size
+        self.entries[id(record)] = (record, witness, parents)
+        budget.add(witness)
+        self._witness_budget = budget
+        self.bytes = budget.size
+
+    def release_witness(self, witness):
+        budget = getattr(self, "_witness_budget", None)
+        if budget is None:
+            self.bytes -= _witness_size(witness, self.limits.legacy)
+        else:
+            budget.remove(witness)
+            self.bytes = budget.size
 
     def materialize(self, handles, inputs):
         if len(handles) != len(inputs):
@@ -439,7 +507,12 @@ class _PreparationTrace:
         for h, item in zip(handles, inputs):
             if item.layout != "retrieval_candidate":
                 raise EvidenceProductionError("page conversion must precede preparation")
-            self.roots[h] = item
+            # The journal's parent is private and immutable. Legacy callbacks
+            # still receive a detached mutable copy, with the original alias
+            # semantics. Parent evidence can reuse its pure conversion without
+            # walking an inaccessible mutable duplicate of every dense vector.
+            parent = _LegacyWitness.capture(item.record, self.limits.legacy)
+            self.roots[h] = replace(item, record=parent)
             value = deepcopy(item.record)
             self.add(value, (h,), context=item.context)
             out.append(value)
@@ -597,7 +670,8 @@ def prepare_records(*, request: Any, session: AskEvidenceSession,
         # P6-A exact collection check BEFORE providing data to a collaborator.
         session.admission(request=request, retrieval=retrieval, selections=selections,
                           current_allowed_sources=before)
-        supplied = deepcopy(retrieval)
+        supplied = {k: None if k in {s.name for s in selections} else deepcopy(v)
+                    for k, v in retrieval.items()}
         try:
             for selection in selections:
                 inputs = session.records(request=request, handles=selection.records,
@@ -626,7 +700,7 @@ def prepare_records(*, request: Any, session: AskEvidenceSession,
                                 or "candidate_handles" in params
                                 or len(seeds) > limits.assembly.max_occurrences):
                             raise EvidenceProductionError("explicit preparation seed occurrences required")
-                        views = tuple((journal.entry(row)[2], deepcopy(row)) for row in seeds)
+                        views = tuple((journal.entry(row)[2], row) for row in seeds)
                         seed_handles = session.derive_batch(request=request, views=views,
                             operation=PREPARATION_VERSION + ":source-seeds:" + name,
                             current_allowed_sources=current)
@@ -720,7 +794,7 @@ def prepare_records(*, request: Any, session: AskEvidenceSession,
                     or any(a is not b for a, b in zip(values, output["citations"]))
                     or 2 * len(values) > limits.assembly.max_occurrences):
                 raise EvidenceProductionError("prepared collections lack one exact selection")
-            views = tuple((journal.entry(record)[2], deepcopy(record)) for record in values)
+            views = tuple((journal.entry(record)[2], record) for record in values)
             # All final source/locator/relationship checks remain in the SAME session.
             handles = session.derive_batch(request=request, views=views,
                 operation=PREPARATION_VERSION, current_allowed_sources=after)
@@ -728,6 +802,7 @@ def prepare_records(*, request: Any, session: AskEvidenceSession,
         finally:
             journal.active = False
             journal.entries.clear()
+            journal._witness_budget.clear()
             journal.roots.clear(); journal._adapted_roots.clear()
             journal.scored.clear()
 
@@ -941,8 +1016,7 @@ def retrieve_initial_records(*, request: Any, session: AskEvidenceSession,
                             # Update only this operation-local view. The session's
                             # immutable SQL observation and original view are intact.
                             del journal.entries[id(record)]
-                            journal.bytes -= len(canonical_json(
-                                _Freezer(limits.legacy).freeze(entry[1])).encode("utf-8"))
+                            journal.release_witness(entry[1])
                             journal.add(record, entry[2])
                         flags[name + "_done"] = True
                 return journal.run(record_event)
@@ -986,14 +1060,14 @@ def retrieve_initial_records(*, request: Any, session: AskEvidenceSession,
                 raise EvidenceProductionError("aggregate initial output count exceeded")
             after = invoke(authorize, request, request)
             session.validate_records(request=request, handles=tuple(journal.roots), current_allowed_sources=after)
-            views = tuple((journal.entry(record)[2], deepcopy(record)) for record in score_result)
+            views = tuple((journal.entry(record)[2], record) for record in score_result)
             result_handles = session.derive_batch(request=request, views=views,
                 operation=INITIAL_LINEAGE_VERSION, current_allowed_sources=after)
             return result, (AskSelection("candidates", result_handles),
                             AskSelection("citations", result_handles[:cap]))
         finally:
             journal.active = False
-            journal.entries.clear(); journal.roots.clear(); journal._adapted_roots.clear(); dense_tokens.clear(); flags.clear()
+            journal.entries.clear(); journal._witness_budget.clear(); journal.roots.clear(); journal._adapted_roots.clear(); dense_tokens.clear(); flags.clear()
 
     return invoke(work, request)
 
@@ -1020,6 +1094,41 @@ class _OuterRetrievalTrace(_PreparationTrace):
         self.bonus_done = False
         self.initial_calls = 0
         self.title_calls = 0
+        # These are the live records retained by the OUTER algorithm: the
+        # original pack and each completed facet's annotated outputs. Old
+        # nested-query scratch copies are checked before being released.
+        self._live_outer_records = {}
+
+    def _retire_nested_scratch(self):
+        """Release only completed nested-query scratch, never session receipts.
+
+        The unchanged outer algorithm retains the original candidate pack and
+        the annotated list of each facet. Copies used before annotation have no
+        subsequent consumer. Check every witness at the retirement boundary,
+        retain all outer-algorithm objects by identity, and keep ALL canonical
+        session handles/original observations/current-authorization checks.
+        The next nested query cannot receive an object retired here: it is bound
+        to new read results. Untracked object use still raises entry().
+        """
+        self.check()
+        if self.pending or self.completed is not None:
+            raise EvidenceProductionError("unfinished outer operation cannot retire scratch")
+        for entry in self.entries.values():
+            self.entry(entry[0])
+        kept = {}
+        for key, record in self._live_outer_records.items():
+            entry = self.entry(record)
+            if key != id(record):
+                raise EvidenceProductionError("outer live occurrence identity changed")
+            kept[key] = entry
+        budget = _WitnessBudget.from_witnesses(
+            (entry[1] for entry in kept.values()), self.limits.legacy)
+        size = budget.size
+        if size > self.max_bytes or len(kept) > self.max_records:
+            raise EvidenceProductionError("retained outer scratch exceeds its original bounds")
+        self.entries = kept
+        self._witness_budget = budget
+        self.bytes = size
 
     def call(self, fn, *args, **kwargs):
         return self.run(self.invoke, fn, self.request, *args, **kwargs)
@@ -1031,10 +1140,10 @@ class _OuterRetrievalTrace(_PreparationTrace):
         return allowed
 
     def snapshot(self, value):
-        size = _legacy_canonical_size(value, self.limits.legacy)
-        if size > self.max_bytes:
+        witness = _LegacyWitness.capture(value, self.limits.legacy)
+        if witness.size_bytes > self.max_bytes:
             raise EvidenceProductionError("outer retrieval snapshot byte limit exceeded")
-        return deepcopy(value)
+        return witness
 
     def readonly(self, fn):
         def read(*args, **kwargs):
@@ -1061,7 +1170,9 @@ class _OuterRetrievalTrace(_PreparationTrace):
             raise EvidenceProductionError("explicit list candidate/citation selections required")
         if sum(len(s.records) for s in selections) > self.limits.assembly.max_occurrences:
             raise EvidenceProductionError("outer retrieval input occurrence limit exceeded")
-        supplied = self.snapshot(result)
+        self.snapshot(result)  # Keep the complete original allocation check.
+        supplied = {k: None if k in {s.name for s in selections} else deepcopy(v)
+                    for k, v in result.items()}
         # Reuse only an explicitly selected HANDLE, never a content/ID match.
         objects = {}
         for selection in selections:
@@ -1088,6 +1199,11 @@ class _OuterRetrievalTrace(_PreparationTrace):
             self.selectors(kwargs)
             if not callable(adapter):
                 raise EvidenceProductionError("required initial retrieval adapter missing")
+            if self.initial_calls == 0:
+                self._live_outer_records.update(
+                    (key, entry[0]) for key, entry in self.entries.items())
+            else:
+                self._retire_nested_scratch()
             self.initial_calls += 1
             pair = self.readonly(adapter)(**kwargs)
             if type(pair) is not tuple or len(pair) != 2:
@@ -1159,7 +1275,7 @@ class _OuterRetrievalTrace(_PreparationTrace):
             if not _same_value(record, expected):
                 raise EvidenceProductionError("mutation changed unrecorded evidence fields")
             del self.entries[id(record)]
-            self.bytes -= _legacy_canonical_size(item[1], self.limits.legacy)
+            self.release_witness(item[1])
             self.add(record, item[2])
 
     def event(self, stage, *args):
@@ -1184,6 +1300,9 @@ class _OuterRetrievalTrace(_PreparationTrace):
                     "assistant_core_facet_preferred_source_types", "assistant_core_facet_must_cover",
                     "assistant_core_facet_retrieval_score", "assistant_core_facet_score_map",
                     "assistant_core_facet_support"}))
+                # This exact annotated object is appended to candidate_lists
+                # by the unchanged outer refinement algorithm.
+                self._live_outer_records[id(value)] = value
             elif stage == "facet_merge":
                 source, value, contributors = args
                 entry = self.entry(source)
@@ -1243,7 +1362,7 @@ class _OuterRetrievalTrace(_PreparationTrace):
             self.session.admission(request=self.request, retrieval=result, selections=preserve,
                                    current_allowed_sources=allowed)
             return result, preserve
-        views = tuple((self.entry(value)[2], deepcopy(value)) for value in candidates)
+        views = tuple((self.entry(value)[2], value) for value in candidates)
         out = self.session.derive_batch(request=self.request, views=views,
             operation=OUTER_RETRIEVAL_LINEAGE_VERSION, current_allowed_sources=allowed)
         return result, (AskSelection("candidates", out),
@@ -1252,6 +1371,10 @@ class _OuterRetrievalTrace(_PreparationTrace):
     def dispose(self):
         self.active = False
         self.entries.clear(); self.roots.clear(); self._adapted_roots.clear(); self.pending.clear(); self.completed = None
+        budget = getattr(self, "_witness_budget", None)
+        if budget is not None:
+            budget.clear()
+        self._live_outer_records.clear()
 
 
 def retrieve_neutral_records(*, request: Any, session: AskEvidenceSession,

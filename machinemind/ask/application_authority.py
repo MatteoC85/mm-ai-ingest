@@ -86,7 +86,16 @@ class AuthorizedCall:
             ai_scope=payload.ai_scope)
         if scope_from_resolved(now) != self.scope:
             raise AuthorityError("AUTHORITY_SCOPE_CHANGED", 403)
-        self.provider.authorize_scope(self.grant, self.scope)
+        self.provider.boundary.require(self.grant)
+        if self.admission is None:
+            self.provider.authorize_scope(self.grant, self.scope)
+        else:
+            # This forwarding check has no external consumer. The admission's
+            # immutable selector binding is checked here; actual dispatch and
+            # final publication perform fresh provider scope/source reads.
+            self.admission.check()
+            if self.admission.scope != self.scope or self.admission.payload is not payload:
+                raise AuthorityError("AUTHORITY_SCOPE_CHANGED", 403)
 
     def public_context(self) -> dict:
         return {"ok": True, "status": "authorized", "result_code": "REQUEST_AUTHORIZED",
@@ -319,8 +328,10 @@ class ResponseGuardOwner:
         # A miss is allowed for cache lookup, never as release authorization.
         return self._validate(response, cached=True, terminal=True)
 
-    def final(self, response: dict) -> dict:
+    def final(self, response: dict, *, _refresh_current: bool = True) -> dict:
         self.check()
+        if type(_refresh_current) is not bool:
+            self._fail("AUTHORITY_CONFIGURATION_INVALID")
         if type(response) is not dict or type(response.get("meta", {})) is not dict:
             self._fail("AUTHORITY_RESPONSE_INVALID")
         if response.get("ok") is False and response.get("status") == "error":
@@ -336,7 +347,7 @@ class ResponseGuardOwner:
             result["meta"] = {**result.get("meta", {}),
                 "cacheable": False, "semantic_cacheable": False}
             return result
-        if self._authorized.admission is not None:
+        if _refresh_current and self._authorized.admission is not None:
             self._authorized.admission.refresh("response.publication")
         result = self._validate(response, cached=False, terminal=True)
         result["meta"] = {**result.get("meta", {}),

@@ -33,6 +33,14 @@ from ..retrieval.supplemental_evidence import storage_key
 
 REQUEST_EVIDENCE_VERSION = "ask-request-scalar-evidence-p6b4o-v1"
 
+# Full-ASK bookkeeping is not the scalar-only allocation envelope. These are
+# retained-data bounds, independent of permissions, transport calls, query/model
+# count, monetary reservation and request deadlines. Numeric coordinates still
+# count individually: compact storage is not a discount of logical elements.
+FULL_ASK_MAX_READ_RECEIPTS = 256
+FULL_ASK_MAX_LOGICAL_NODES = 4 * 1024 * 1024
+FULL_ASK_MAX_RETAINED_BYTES = 256 * 1024 * 1024
+
 
 def precision_session_limits(runtime: PrecisionFactRuntime) -> AskSessionLimits:
     """Explicit allocation caps, never a heap estimate, price or truncation rule.
@@ -152,7 +160,8 @@ class RequestEvidenceOwner:
         try:
             if request is not self._request or not callable(callback):
                 raise EvidenceContractError("callback belongs to another request")
-            result = callback(*args, **kwargs)
+            with self.session.payload_scope(request=request):
+                result = callback(*args, **kwargs)
             self.check()
             return result
         except Exception as exc:
@@ -331,7 +340,8 @@ def complete_session_limits(runtime: PrecisionFactRuntime, *, read_caps: tuple[i
 
     The scalar-only envelope (1,024 occurrences) cannot admit the pre-existing
     structured scan (1,200 by default). Derive the occurrence envelope from the
-    configured readers while retaining the lifetime's 8,192-record/64-MiB caps.
+    configured readers. Keep the 8,192-view bound, and explicitly separate the
+    full path's 256-MiB retained envelope from the scalar-only defaults.
     No SQL LIMIT, top_k, prompt/context, HTTP meter or model budget is changed.
     """
     base = precision_session_limits(runtime)
@@ -341,4 +351,14 @@ def complete_session_limits(runtime: PrecisionFactRuntime, *, read_caps: tuple[i
     count = max(base.evidence.assembly.max_occurrences, *read_caps)
     assembly = replace(base.evidence.assembly, max_occurrences=count,
         manifest_limits=replace(base.evidence.assembly.manifest_limits, max_records=count))
-    return replace(base, evidence=replace(base.evidence, assembly=assembly))
+    # The scalar envelope is NOT a full-ASK acquisition plan. A legal multi-query
+    # + facet + structured-family request can retain >32 distinct receipts, and
+    # a packed 1,536-dimensional vector still counts as 1,536 logical nodes.
+    # Give full composition an explicit bounded metadata envelope; do not change
+    # any reader SQL LIMIT, query/facet count, model/deadline, transport meter,
+    # source permission or 8,192-view cap. Both full byte envelopes remain finite.
+    # Both scalar defaults and the session's actual capacity checks remain intact.
+    legacy = replace(base.evidence.legacy, max_nodes=FULL_ASK_MAX_LOGICAL_NODES)
+    return replace(base, max_reads=FULL_ASK_MAX_READ_RECEIPTS,
+        max_bytes=FULL_ASK_MAX_RETAINED_BYTES,
+        evidence=replace(base.evidence, assembly=assembly, legacy=legacy))
