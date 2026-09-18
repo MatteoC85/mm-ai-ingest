@@ -29,6 +29,7 @@ from typing import Callable
 
 from .application_authority import AuthorizedCall, ResponseGuardOwner
 from .routing_runtime import accounting_state
+from .final_contract import response_contract_bound
 from .request_flow import RequestFlowRuntime, RequestFlowGuards
 from ..authority.contracts import AuthorityError
 from ..evidence.contracts import SourceIdentity, to_primitive
@@ -40,7 +41,7 @@ from ..retrieval.document_readers import (FetchDocumentFileMapRuntime,
 from ..retrieval.supplemental_evidence import storage_key
 from ..infrastructure import semantic_cache
 
-PROTECTED_CACHE_VERSION = "ask-canonical-exact-cache-p6b4o-accounting-v3"
+PROTECTED_CACHE_VERSION = "ask-canonical-exact-cache-p6b4o-final-contract-v4"
 ARTIFACT_KEY = "_mm_canonical_cache_artifact"
 MAX_ARTIFACT_BYTES = 2 * 1024 * 1024
 MAX_DEPENDENCIES = 8192
@@ -259,7 +260,8 @@ class ProtectedCacheOwner:
                     or type(proof["knowledge_version"]) is not int
                     or proof["knowledge_version"] != self._epoch or self._epoch < 1
                     or proof["response_sha256"] != _hash(_storage_view(response))
-                    or not semantic_cache.assistant_core_cache_certified("ask", response)):
+                    or not (semantic_cache.assistant_core_cache_certified("ask", response)
+                            and response_contract_bound(response))):
                 raise ValueError()
             deps = proof["dependencies"]
             if type(deps) is not list or not deps or len(deps) > MAX_DEPENDENCIES:
@@ -359,7 +361,8 @@ class ProtectedCacheOwner:
                     self._fail("AUTHORITY_CACHE_KNOWLEDGE_CHANGED")
             elif (self._epoch > 0 and self._dependencies
                     and self._accounting_allows_store()
-                    and semantic_cache.assistant_core_cache_certified("ask", out)
+                    and (semantic_cache.assistant_core_cache_certified("ask", out)
+                         and response_contract_bound(out))
                     and out.get("meta", {}).get("cacheable") is not False
                     and out.get("meta", {}).get("semantic_cacheable") is not False):
                 current = self._current()

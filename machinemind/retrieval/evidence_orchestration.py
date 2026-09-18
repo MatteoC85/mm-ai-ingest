@@ -1797,7 +1797,20 @@ def assistant_core_prepare_evidence(request: AssistantCoreRequest, retrieval: di
             priority_pool.extend(interface_viable)
         if needs_sequence:
             priority_pool.extend(sequence_viable)
-        if needs_ordered_actions:
+        # Output shape is not source intent. A P&S, manual or spreadsheet may
+        # supply ordered actions without requesting a Procedure/Step family.
+        # Only the request-bound canonical ASK path changes; legacy/OFF/RC keep
+        # the historical selection. All output-shape gates and limits above stay.
+        procedure_source_intent = (
+            decision.information_task in {INFO_PROCEDURE_FULL, INFO_PROCEDURE_SEGMENT}
+            or decision.request_kind == KIND_PROCEDURE
+        )
+        canonical_ask_selection = (
+            lineage is not None
+            and getattr(request, "requested_mode", None) == MODE_ASK
+            and decision.effective_mode == MODE_ASK
+        )
+        if needs_ordered_actions and (not canonical_ask_selection or procedure_source_intent):
             priority_pool.extend(
                 c for c in scored
                 if str(c.get("source_type") or "") in {"procedure", "step"}

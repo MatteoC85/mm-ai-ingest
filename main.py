@@ -16168,7 +16168,10 @@ def _assistant_core_ask_validation_runtime():
 
 def _assistant_core_scoped_ask_validation_runtime():
     # Only the protected ASK intake calls this; shared/OFF/RC validation is unchanged.
-    return _ask_unit_grounding.bind_validation(_assistant_core_ask_validation_runtime())
+    from machinemind.ask.final_contract import bind_source_fields
+    return bind_source_fields(
+        _ask_unit_grounding.bind_validation(_assistant_core_ask_validation_runtime()),
+        fields=_procedure_ui_fields, sections=_procedure_ui_sections)
 
 
 def _assistant_core_recover_citations(

@@ -13,6 +13,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Callable, TYPE_CHECKING
 
 from . import execution
+from . import final_contract as _final_contract
 from ..evidence.ask_input import apply_ask_evidence_input, ask_request_key
 from ..evidence.contracts import EvidenceContractError
 
@@ -64,6 +65,9 @@ class AskValidationRuntime:
     _v13_current_budget: Callable[..., Any]
     execution_runtime: execution.AskExecutionRuntime | None = None
     evidence_observer: Any = None
+    final_contract_enabled: bool = False
+    source_fields: Callable[..., dict] | None = None
+    source_sections: Callable[..., dict] | None = None
 
 
 def _guarded(runtime: AskValidationRuntime, request: Any, decision: Any) -> bool:
@@ -442,6 +446,20 @@ def validate_response(
     out["citations"] = citations
     out["rg_links"] = links
     used_ids = {str(c.get("citation_id") or "").strip() for c in citations}
+    protected_procedure = bool(
+        _guarded(runtime, request, decision)
+        and (str(getattr(decision, "information_task", "")) in {"procedure_full", "procedure_segment"}
+             or getattr(decision, "request_kind", None) == runtime.KIND_PROCEDURE)
+        and callable(runtime.source_fields) and callable(runtime.source_sections)
+    )
+    # These occurrences have just passed the same request admission as synthesis.
+    # Preserve source-owned notes even when a free-text reviewer shortens prose.
+    procedure_occurrences = [allowed[cid] for cid in
+        (str(c.get("citation_id") or "").strip() for c in citations)
+        if cid in allowed and runtime._assistant_core_candidate_source_type(allowed[cid]) == "step"] if protected_procedure else []
+    source_notes = _final_contract.source_safety_notes(
+        procedure_occurrences, fields=runtime.source_fields, sections=runtime.source_sections,
+        source_type=runtime._assistant_core_candidate_source_type) if protected_procedure else ()
 
     # Validate against the complete evidence pack actually supplied to synthesis,
     # not merely against the subset the model happened to repeat as citations.
@@ -669,6 +687,30 @@ def validate_response(
                 )
                 out["answer"] = answer
 
+        reviewed_body = answer
+        source_proof = {}
+        if protected_procedure and str(out.get("status") or "").lower() == "answered" and answer:
+            # Reattach only source occurrences already selected by the structured
+            # producer and admitted above, never guessed authorization from IDs.
+            retained_ids = {str(c.get("citation_id") or "") for c in citations}
+            required_notes = {n["citation_id"] for n in source_notes}
+            extras = [c for c in procedure_occurrences
+                      if str(c.get("citation_id") or "") in required_notes - retained_ids]
+            if extras:
+                raw_notes = _collection(request, extras, decision, runtime=runtime,
+                                        stage="validation.source_notes")
+                citations = list(citations) + _sanitize_citations_for_response(raw_notes, company_id=request.company_id)
+                citations = runtime._procedure_ui_order_citations(citations)
+                out["citations"] = citations
+                out["rg_links"] = _build_rg_links(request.company_id, citations)
+            answer, source_proof = _final_contract.preserve_source_notes(
+                answer, source_notes, language=request.response_language)
+            out["answer"] = answer
+            if answer != reviewed_body:
+                # Never render a pre-review UI model over the final bound text.
+                out.pop("_assistant_ui_model", None)
+                out.pop("answer_html", None)
+
         if str(out.get("status") or "").lower() == "answered" and answer:
             deterministic_contract = _assistant_core_answer_contract_check(
                 answer=answer,
@@ -695,6 +737,29 @@ def validate_response(
                     **dict(deterministic_contract),
                     "semantic_verifier": dict(semantic_contract),
                 }
+            if _guarded(runtime, request, decision) and runtime.final_contract_enabled:
+                semantic_text = _assistant_core_redact_internal_text(semantic_contract.get("answer") or "")
+                grounding_proof = {}
+                if ((semantic_contract_pass or semantic_contract_partial)
+                        and _final_contract.answer_digest(semantic_text) != _final_contract.answer_digest(reviewed_body)):
+                    # The existing claim filter also normalizes sentence layout.
+                    # Accept only its exact zero-removal projection, not an
+                    # arbitrary edit or a body that lost an unsupported claim.
+                    projected, projection_removed = _assistant_core_filter_unsupported_claim_sentences(
+                        semantic_text, source_text)
+                    if not projection_removed and projected == reviewed_body:
+                        grounding_proof = {
+                            "basis": "existing_grounding_projection",
+                            "removed_claims": 0,
+                            "input_answer_sha256": _final_contract.answer_digest(semantic_text),
+                            "output_answer_sha256": _final_contract.answer_digest(projected),
+                        }
+                answer_contract_result = _final_contract.final_contract(
+                    deterministic=deterministic_contract, semantic=semantic_contract,
+                    reviewed_answer=semantic_text, answer=reviewed_body,
+                    semantic_complete=semantic_contract_pass,
+                    semantic_partial=semantic_contract_partial, source_proof=source_proof,
+                    final_answer=answer, grounding_proof=grounding_proof)
             semantic_rejected_with_evidence = bool(
                 out.pop("_assistant_core_semantic_rejected_with_evidence", False)
             )
