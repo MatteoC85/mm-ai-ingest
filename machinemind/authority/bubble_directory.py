@@ -10,6 +10,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
+from threading import RLock
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -66,13 +69,22 @@ class BubbleConnection:
 
 
 class BubbleDirectory:
-    def __init__(self, *, connection: BubbleConnection, meter: AuthorityMeter, opener=None):
-        if type(connection) is not BubbleConnection or type(meter) is not AuthorityMeter:
+    def __init__(self, *, connection: BubbleConnection, meter: AuthorityMeter, opener=None, request_owned_io=False):
+        if (type(connection) is not BubbleConnection or type(meter) is not AuthorityMeter
+                or type(request_owned_io) is not bool):
             raise AuthorityError("AUTHORITY_CONFIGURATION_INVALID")
         self._connection, self.meter = connection, meter
         # Injection is trusted deployment/test code, never an API parameter.
-        self._opener = opener or urllib.request.build_opener(
-            urllib.request.ProxyHandler({}), _NoRedirect())
+        self._parallel = request_owned_io
+        self._closed = False
+        self._batch_lock = RLock()
+        self._owns_opener = opener is None and request_owned_io
+        if self._owns_opener:
+            from .pooled_transport import ReadOnlyPool
+            self._opener = ReadOnlyPool(connection.base_url)
+        else:
+            self._opener = opener or urllib.request.build_opener(
+                urllib.request.ProxyHandler({}), _NoRedirect())
 
     @staticmethod
     def _typename(typename: str) -> str:
@@ -81,6 +93,8 @@ class BubbleDirectory:
         return typename
 
     def _get(self, path: str, params: dict | None = None, *, missing_record: bool = False) -> dict | None:
+        if self._closed:
+            raise AuthorityError("AUTHORITY_REQUEST_EXPIRED")
         url = self._connection.base_url + "/" + path
         if params:
             url += "?" + urllib.parse.urlencode(params)
@@ -99,6 +113,8 @@ class BubbleDirectory:
                 status = r.code if hasattr(r, "code") else r.status
                 raw = r.read(self.meter.limits.max_response_bytes + 1)
                 size = len(raw)
+                if self._closed:
+                    raise AuthorityError("AUTHORITY_REQUEST_EXPIRED")
                 if size > self.meter.limits.max_response_bytes:
                     raise AuthorityError("AUTHORITY_RESPONSE_TOO_LARGE")
                 if status != 200:
@@ -169,6 +185,39 @@ class BubbleDirectory:
             if not remaining:
                 return tuple(rows)
             cursor += count
+
+    def read_batch(self, callbacks):
+        """Join independent reads; preserve order and all-or-nothing publication.
+
+        Callback input is trusted policy code, not an HTTP/client value. No
+        result, catalog, grant or permission is retained after this method.
+        Every callback invokes the normal bounded/validated GET path.
+        """
+        if (type(callbacks) is not tuple or len(callbacks) > 6
+                or any(not callable(f) for f in callbacks)):
+            raise AuthorityError("AUTHORITY_CONFIGURATION_INVALID")
+        with self._batch_lock:
+            if self._closed:
+                raise AuthorityError("AUTHORITY_REQUEST_EXPIRED")
+            if not self._parallel or len(callbacks) < 2:
+                return tuple(f() for f in callbacks)
+            with self.meter.parallel_window(len(callbacks)):
+                # Copy context separately for each worker: trace parents and
+                # request budget observation must not disappear in a thread.
+                with ThreadPoolExecutor(max_workers=len(callbacks),
+                        thread_name_prefix="mm-authority-read") as executor:
+                    futures = [executor.submit(copy_context().run, f) for f in callbacks]
+                    # Even on error the executor joins all dispatched siblings.
+                    # No partial authority or successful subset is returned.
+                    return tuple(future.result() for future in futures)
+
+    def close(self):
+        with self._batch_lock:
+            if self._closed:
+                return
+            self._closed = True
+            if self._owns_opener:
+                self._opener.close()
 
     def __repr__(self):
         return "BubbleDirectory(<read-only>)"

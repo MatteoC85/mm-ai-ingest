@@ -99,8 +99,12 @@ class RequestAdmission:
 
     def close(self):
         self.active = False
+        provider = self.provider
         self._sources = self._session = self._request = None
         self.payload = self.provider = self.grant = self.resolve = None
+        from .bubble_directory import BubbleDirectory
+        if provider is not None and type(provider.directory) is BubbleDirectory:
+            provider.directory.close()
 
     def __repr__(self):
         return "RequestAdmission(<request-owned>)"

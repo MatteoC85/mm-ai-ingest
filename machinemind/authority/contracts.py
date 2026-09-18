@@ -13,6 +13,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import hmac
 import math
+from contextlib import contextmanager
+from threading import Condition, get_ident
 from typing import Callable
 
 from ..evidence.contracts import EvidenceContractError
@@ -93,7 +95,15 @@ class AuthorityLimits:
 
 
 class AuthorityMeter:
-    """One request's observed HTTP exposure. No retries or silent free timeouts."""
+    """Request-owned, bounded transport accounting, including concurrent reads.
+
+    A parallel window does not multiply the 60-second transport allowance. Each
+    dispatch reserves its full socket timeout before I/O; actual elapsed time
+    replaces that reservation on completion. New dispatches require pending reservations plus observed transport and the
+    new timeout to fit the configured exposure; completions are checked again.
+    This is NOT a permission
+    cache and does not change the configured call/time/byte limits.
+    """
     def __init__(self, limits: AuthorityLimits, clock: Callable[[], float]):
         if type(limits) is not AuthorityLimits or not callable(clock):
             raise AuthorityError("AUTHORITY_CONFIGURATION_INVALID")
@@ -103,32 +113,95 @@ class AuthorityMeter:
         self.transport_seconds = 0.0
         self._in_flight = False
         self._call_started = None
+        self._condition = Condition()
+        self._tickets = {}
+        self._parallel_owner = None
+        self._parallel_limit = 1
+        self._fault = None
+        self.peak_parallel_calls = 0
+        self.peak_reserved_transport_seconds = 0.0
+
+    @contextmanager
+    def parallel_window(self, workers: int):
+        """One internal read batch. The caller must join every worker on exit."""
+        with self._condition:
+            if (type(workers) is not int or not 1 <= workers <= 6
+                    or self._parallel_owner is not None or self._tickets):
+                raise AuthorityError("AUTHORITY_CONFIGURATION_INVALID")
+            self._parallel_owner = get_ident()
+            self._parallel_limit = workers
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._parallel_owner = None
+                self._parallel_limit = 1
+                if self._tickets:
+                    self._fault = AuthorityError("AUTHORITY_CONFIGURATION_INVALID")
+                    self._condition.notify_all()
+                    raise self._fault
+                self._condition.notify_all()
 
     def begin(self) -> float:
-        remaining = self.limits.total_seconds - self.transport_seconds
-        if self._in_flight or self.calls >= self.limits.max_http_calls or remaining <= 0:
-            raise AuthorityError("AUTHORITY_BUDGET_EXCEEDED")
-        self.calls += 1
-        self._in_flight = True
-        self._call_started = self.clock()
-        return min(self.limits.timeout_seconds, remaining)
+        ident = get_ident()
+        with self._condition:
+            while True:
+                if self._fault is not None:
+                    raise self._fault
+                remaining = self.limits.total_seconds - self.transport_seconds
+                if (ident in self._tickets or self.calls >= self.limits.max_http_calls
+                        or remaining <= 0):
+                    raise AuthorityError("AUTHORITY_BUDGET_EXCEEDED")
+                if self._parallel_owner is None and self._tickets:
+                    raise AuthorityError("AUTHORITY_BUDGET_EXCEEDED")
+                timeout = min(self.limits.timeout_seconds, remaining)
+                reserved = sum(ticket[1] for ticket in self._tickets.values())
+                if (len(self._tickets) < self._parallel_limit
+                        and remaining - reserved >= timeout):
+                    break
+                # Do not shorten a read timeout merely to launch more work.
+                # Wait for a sibling to settle/refund its reservation instead.
+                self._condition.wait(timeout=min(timeout, 0.1))
+            self.calls += 1
+            started = self.clock()
+            if type(started) not in (int, float) or not math.isfinite(started):
+                self._fault = AuthorityError("AUTHORITY_CONFIGURATION_INVALID")
+                raise self._fault
+            self._tickets[ident] = (started, timeout)
+            self._in_flight = True
+            self._call_started = started
+            self.peak_parallel_calls = max(self.peak_parallel_calls, len(self._tickets))
+            self.peak_reserved_transport_seconds = max(
+                self.peak_reserved_transport_seconds, reserved + timeout)
+            return timeout
 
     def finish(self, size: int, *, failed: bool) -> None:
-        now = self.clock()
-        started = self._call_started
-        self._in_flight = False
-        self._call_started = None
-        if type(started) not in (int, float) or not math.isfinite(started):
-            raise AuthorityError("AUTHORITY_CONFIGURATION_INVALID")
-        elapsed = max(0.0, now - started)
-        self.transport_seconds += elapsed
-        self.bytes += size
-        self.failed_calls += int(failed)
-        if self.bytes > self.limits.max_total_bytes or self.transport_seconds > self.limits.total_seconds:
-            raise AuthorityError("AUTHORITY_BUDGET_EXCEEDED")
+        with self._condition:
+            ticket = self._tickets.pop(get_ident(), None)
+            self._in_flight = bool(self._tickets)
+            self._call_started = None
+            try:
+                now = self.clock()
+                if (ticket is None or type(now) not in (int, float)
+                        or not math.isfinite(now) or type(size) is not int or size < 0
+                        or type(failed) is not bool):
+                    raise AuthorityError("AUTHORITY_CONFIGURATION_INVALID")
+                elapsed = max(0.0, now - ticket[0])
+                self.transport_seconds += elapsed
+                self.bytes += size
+                self.failed_calls += int(failed)
+                if (self.bytes > self.limits.max_total_bytes
+                        or self.transport_seconds > self.limits.total_seconds):
+                    raise AuthorityError("AUTHORITY_BUDGET_EXCEEDED")
+            except AuthorityError as exc:
+                self._fault = exc
+                raise
+            finally:
+                self._condition.notify_all()
 
     def summary(self) -> dict:
-        return dict(version=AUTHORITY_VERSION, http_calls=self.calls,
-                    response_bytes=self.bytes, failed_http_calls=self.failed_calls,
-                    elapsed_seconds=max(0.0, self.transport_seconds),
-                    grants_cached=False, prices_measured=False)
+        with self._condition:
+            return dict(version=AUTHORITY_VERSION, http_calls=self.calls,
+                        response_bytes=self.bytes, failed_http_calls=self.failed_calls,
+                        elapsed_seconds=max(0.0, self.transport_seconds),
+                        grants_cached=False, prices_measured=False)

@@ -117,19 +117,36 @@ class BubbleAuthority:
             raise AuthorityError("AUTHORITY_CONFIGURATION_INVALID")
         self.directory, self.schema, self.boundary = directory, schema, boundary
 
+    def _read_batch(self, callbacks):
+        # Old trusted adapters remain sequential. Only the concrete directory
+        # opts into bounded parallel transport; no different authority policy.
+        from .bubble_directory import BubbleDirectory
+        if type(self.directory) is BubbleDirectory:
+            return self.directory.read_batch(callbacks)
+        return tuple(f() for f in callbacks)
+
     def authorize_scope(self, grant: ApplicationGrant, scope: ChunkReadScope) -> tuple[str, str | None]:
         self.boundary.require(grant)
         if type(scope) is not ChunkReadScope:
             raise AuthorityError("AUTHORITY_SCOPE_INVALID", 400)
         s = self.schema
-        _row(self.directory.get(s.company_type, scope.company_id), scope.company_id)
         machine_id = scope.machine_id
-        if machine_id not in (None, _GENERAL):
+        def company_exists():
+            return _row(self.directory.get(s.company_type, scope.company_id), scope.company_id)
+        def machine_owned():
             machine = _row(self.directory.get(s.machine_type, machine_id), machine_id)
             if _ref(machine, s.machine_company_field) != scope.company_id:
                 raise AuthorityError("CONTEXT_MISMATCH", 403)
-        elif scope.ai_scope == "machine_all":
-            raise AuthorityError("SCOPE_DENIED", 403)
+            return machine
+        if machine_id not in (None, _GENERAL):
+            # Both reads are mandatory and freshly validated. Their results are
+            # joined before any source read/egress. The same check also remains
+            # after each catalog fence; only independent I/O overlaps.
+            self._read_batch((company_exists, machine_owned))
+        else:
+            company_exists()
+            if scope.ai_scope == "machine_all":
+                raise AuthorityError("SCOPE_DENIED", 403)
         return scope.company_id, machine_id
 
     def _active(self, row: dict, spec: SourceSchema) -> bool:
@@ -176,10 +193,13 @@ class BubbleAuthority:
         result, parents = set(), {}
         seen = set()
         max_records = self.directory.meter.limits.max_records
-        for kind in (SourceType.DOCUMENT, SourceType.PROCEDURE, SourceType.PROBLEM_SOLUTION,
-                     SourceType.PHOTO, SourceType.VIDEO):
+        kinds = (SourceType.DOCUMENT, SourceType.PROCEDURE, SourceType.PROBLEM_SOLUTION,
+                 SourceType.PHOTO, SourceType.VIDEO)
+        catalogs = self._read_batch(tuple(
+            lambda kind=kind: self._owned_rows(self.schema.source(kind), scope)
+            for kind in kinds))
+        for kind, rows in zip(kinds, catalogs):
             spec = self.schema.source(kind)
-            rows = self._owned_rows(spec, scope)
             for row in rows:
                 key = kind, row["_id"]
                 if key in seen or len(seen) >= max_records:
@@ -270,12 +290,14 @@ class BubbleAuthority:
         needed = {source.source_type for source in expected if source.source_type != SourceType.STEP}
         if any(source.source_type == SourceType.STEP for source in expected):
             needed.add(SourceType.PROCEDURE)
-        for kind in (SourceType.DOCUMENT, SourceType.PROCEDURE, SourceType.PROBLEM_SOLUTION,
-                     SourceType.PHOTO, SourceType.VIDEO):
-            if kind not in needed:
-                continue
+        kinds = tuple(kind for kind in (SourceType.DOCUMENT, SourceType.PROCEDURE,
+            SourceType.PROBLEM_SOLUTION, SourceType.PHOTO, SourceType.VIDEO)
+            if kind in needed)
+        catalogs = self._read_batch(tuple(
+            lambda kind=kind: self._owned_rows(self.schema.source(kind), scope)
+            for kind in kinds))
+        for kind, rows in zip(kinds, catalogs):
             spec = self.schema.source(kind)
-            rows = self._owned_rows(spec, scope)
             seen_ids = set()
             for row in rows:
                 uid = row["_id"]

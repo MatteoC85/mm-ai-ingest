@@ -128,12 +128,13 @@ def authorize_http_request(payload, *, service_secret: object, application_secre
     connection = BubbleConnection(base_url=_config(env, "MM_BUBBLE_AUTHORITY_BASE_URL"),
         allowed_host=_config(env, "MM_BUBBLE_AUTHORITY_HOST"),
         token=_config(env, "MM_BUBBLE_AUTHORITY_TOKEN"))
-    directory = BubbleDirectory(connection=connection, meter=AuthorityMeter(limits, clock), opener=opener)
+    if type(admission_windows) is not bool:
+        raise AuthorityError("AUTHORITY_CONFIGURATION_INVALID")
+    directory = BubbleDirectory(connection=connection, meter=AuthorityMeter(limits, clock),
+        opener=opener, request_owned_io=admission_windows)
     provider = BubbleAuthority(directory=directory, schema=schema, boundary=boundary)
     scope = scope_from_resolved(resolve(company_id=payload.company_id, machine_id=payload.machine_id,
         bubble_document_id=payload.bubble_document_id, document_ids=payload.document_ids, ai_scope=payload.ai_scope))
-    if type(admission_windows) is not bool:
-        raise AuthorityError("AUTHORITY_CONFIGURATION_INVALID")
     from ..authority.request_admission import RequestAdmission
     admission = (RequestAdmission(provider=provider, grant=grant, scope=scope,
         payload=payload, resolve=resolve) if admission_windows else None)
