@@ -10,6 +10,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import replace
 import hashlib
+import re
 from typing import Callable, Any
 
 VERSION = "ask-final-contract-v1"
@@ -58,8 +59,26 @@ def source_safety_notes(candidates: list[dict], *, fields: Callable,
     return tuple(out)
 
 
+def source_note_present(answer: str, note: str) -> bool:
+    """Literal note retention, allowing only prose sentence-initial casing.
+
+    Do NOT casefold technical text: mA/MA, mW/MW and identifiers are distinct.
+    A lowercase initial prose word may match its title-cased source spelling;
+    the remainder, negation, numbers, punctuation and units stay exact.
+    """
+    body, text = " ".join(str(answer).split()), " ".join(str(note).split())
+    if text in body:
+        return True
+    word = re.match(r"[^\W\d_]{3,}\b", text, flags=re.UNICODE)
+    if not word or not word.group().istitle():
+        return False
+    variant = text[0].lower() + text[1:]
+    # A substring inside a different word is not a retained source note.
+    return re.search(r"(?<!\w)" + re.escape(variant), body) is not None
+
+
 def preserve_source_notes(answer: str, notes: tuple[dict, ...], *,
-                          language: str) -> tuple[str, dict]:
+                          language: str, sentence_initial_equivalence: bool = False) -> tuple[str, dict]:
     """Retain exact source wording if a reviewer omitted or translated a note.
 
     The separate, labelled source quotation cannot be mistaken for a model
@@ -69,9 +88,11 @@ def preserve_source_notes(answer: str, notes: tuple[dict, ...], *,
     answer = str(answer or "").strip()
     original_answer = answer
     normal = " ".join(answer.split())
+    present = (source_note_present if sentence_initial_equivalence else
+               lambda a, t: " ".join(str(t).split()) in " ".join(str(a).split()))
     missing = []
     for note in notes:
-        texts = [str(x) for x in note["texts"] if " ".join(str(x).split()) not in normal]
+        texts = [str(x) for x in note["texts"] if not present(answer, str(x))]
         if texts:
             missing.append((note, texts))
     english = str(language).lower().startswith("en")
@@ -91,7 +112,7 @@ def preserve_source_notes(answer: str, notes: tuple[dict, ...], *,
              "quoted_notes": len(missing), "source_units": [
                  {"citation_id": n["citation_id"], "source_number": n["source_number"],
                   "text_sha256": [answer_digest(t) for t in n["texts"]]} for n in notes],
-             "all_present": all(" ".join(t.split()) in " ".join(answer.split())
+             "all_present": all(present(answer, t)
                                 for n in notes for t in n["texts"])}
     return answer, proof
 

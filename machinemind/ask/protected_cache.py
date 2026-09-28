@@ -41,7 +41,7 @@ from ..retrieval.document_readers import (FetchDocumentFileMapRuntime,
 from ..retrieval.supplemental_evidence import storage_key
 from ..infrastructure import semantic_cache
 
-PROTECTED_CACHE_VERSION = "ask-canonical-exact-cache-p6b4o-final-contract-v4"
+PROTECTED_CACHE_VERSION = "ask-canonical-exact-cache-p6b4o-procedure-review-v5"
 ARTIFACT_KEY = "_mm_canonical_cache_artifact"
 MAX_ARTIFACT_BYTES = 2 * 1024 * 1024
 MAX_DEPENDENCIES = 8192

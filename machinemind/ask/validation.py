@@ -14,6 +14,7 @@ from typing import Any, Callable, TYPE_CHECKING
 
 from . import execution
 from . import final_contract as _final_contract
+from . import procedure_review as _procedure_review
 from ..evidence.ask_input import apply_ask_evidence_input, ask_request_key
 from ..evidence.contracts import EvidenceContractError
 
@@ -582,6 +583,24 @@ def validate_response(
             and not list(semantic_contract.get("missing_list_items") or [])
         )
         semantic_contract_partial = False
+        procedure_structure = {}
+        if protected_procedure and runtime.final_contract_enabled and answer and str(out.get("status") or "").lower() == "answered":
+            # Present admitted source-owned notes BEFORE the independent review.
+            # Do not ask a model to recreate a warning already held by the request.
+            # A response already returned by bounded repair is bound to that
+            # reviewed text. Restore its notes later with the existing explicit
+            # source-preservation proof, never as an untracked pre-review edit.
+            if not semantic_contract_pass:
+                note_complete_answer, _ = _final_contract.preserve_source_notes(
+                    answer, source_notes, language=request.response_language)
+                if note_complete_answer != answer:
+                    answer = note_complete_answer
+                    out["answer"] = answer
+                    out.pop("_assistant_ui_model", None)
+                    out.pop("answer_html", None)
+            procedure_structure = _procedure_review.observe_structure(answer, procedure_occurrences,
+                fields=runtime.source_fields, notes=source_notes,
+                notes_present=_final_contract.source_note_present)
         if (
             not semantic_contract_pass
             and str(out.get("status") or "").lower() == "answered"
@@ -596,6 +615,8 @@ def validate_response(
                 decision=decision,
                 answer=answer,
                 candidates=list(allowed.values()),
+                **({"repair_context": {"procedure_structure": procedure_structure}}
+                   if procedure_structure.get("usable") else {}),
             )
             outcome = str(semantic_contract.get("outcome") or "").strip().lower()
             repaired_answer = _assistant_core_redact_internal_text(semantic_contract.get("answer") or "")
@@ -698,13 +719,14 @@ def validate_response(
                       if str(c.get("citation_id") or "") in required_notes - retained_ids]
             if extras:
                 raw_notes = _collection(request, extras, decision, runtime=runtime,
-                                        stage="validation.source_notes")
+                                        stage="validation.semantic_citations")
                 citations = list(citations) + _sanitize_citations_for_response(raw_notes, company_id=request.company_id)
                 citations = runtime._procedure_ui_order_citations(citations)
                 out["citations"] = citations
                 out["rg_links"] = _build_rg_links(request.company_id, citations)
             answer, source_proof = _final_contract.preserve_source_notes(
-                answer, source_notes, language=request.response_language)
+                answer, source_notes, language=request.response_language,
+                sentence_initial_equivalence=(semantic_contract.get("procedure_review") or {}).get("reply_mode") in {"retain", "edit"})
             out["answer"] = answer
             if answer != reviewed_body:
                 # Never render a pre-review UI model over the final bound text.
@@ -760,6 +782,14 @@ def validate_response(
                     semantic_complete=semantic_contract_pass,
                     semantic_partial=semantic_contract_partial, source_proof=source_proof,
                     final_answer=answer, grounding_proof=grounding_proof)
+            if procedure_structure.get("usable"):
+                final_structure = _procedure_review.observe_structure(answer, procedure_occurrences,
+                    fields=runtime.source_fields, notes=source_notes,
+                    notes_present=_final_contract.source_note_present)
+                answer_contract_result["procedure_structure"] = final_structure
+                if not final_structure.get("sequence_complete") or not final_structure.get("source_notes_present"):
+                    answer_contract_result.update(passed=False, complete=False,
+                        reason="source_step_sequence_or_notes_incomplete")
             semantic_rejected_with_evidence = bool(
                 out.pop("_assistant_core_semantic_rejected_with_evidence", False)
             )
@@ -872,6 +902,11 @@ def validate_response(
                         "evidence_facet_coverage": answer_contract_result.get(
                             "evidence_facet_coverage"
                         ),
+                        # The existing bounded repair may retain/edit the draft;
+                        # this does not create another verifier call or alter its
+                        # triggering conditions. Bind the actual final text.
+                        **({"procedure_structure": dict(answer_contract_result["procedure_structure"])}
+                           if answer_contract_result.get("procedure_structure", {}).get("usable") else {}),
                     }
                 else:
                     no_evidence = _assistant_core_build_no_evidence(

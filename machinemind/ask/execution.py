@@ -17,6 +17,7 @@ from functools import wraps
 from inspect import signature
 from typing import Any, Callable, Optional, TYPE_CHECKING
 
+from . import procedure_review as _procedure_review
 from ..evidence.ask_input import AskEvidenceAdmission, apply_ask_evidence_input, ask_request_key
 from ..evidence.contracts import EvidenceContractError, SourceIdentity
 from ..retrieval.ask_composition import AskEvidenceSession, AskSelection
@@ -544,6 +545,31 @@ def verify_or_repair_answer(
         f"SOURCES:\n{sources_block}\n\n"
         "Return only the required JSON."
     )
+    # Only the protected procedural path opts into compact independent review.
+    # All SOURCES, semantic requirements, authority fences and model budgets
+    # above remain unchanged. No model result can activate this branch.
+    compact_review = bool(_guarded(runtime, request, decision)
+        and decision.information_task in {runtime.INFO_PROCEDURE_FULL, runtime.INFO_PROCEDURE_SEGMENT}
+        and (repair_context.get("procedure_structure") or {}).get("usable")
+        and (repair_context.get("procedure_structure") or {}).get("answer_sha256") == _procedure_review.digest(answer))
+    layout = _procedure_review.block_layout(answer) if compact_review else None
+    review_facets = list(dict.fromkeys(list(decision.required_facets) + [
+        item.facet for item in decision.facet_queries if item.must_cover]))
+    verifier_schema = _assistant_core_contract_verifier_schema()
+    if compact_review:
+        verifier_schema = _procedure_review.review_schema(verifier_schema, layout, review_facets, requirements)
+        system_msg += _procedure_review.PROTOCOL_INSTRUCTIONS
+        # Digests stay in the server-side binding/audit. The verifier needs the
+        # source-to-number mapping, not hexadecimal hashes repeated as tokens.
+        observation = repair_context["procedure_structure"]
+        review_view = {k: observation[k] for k in ("usable", "basis", "expected_numbers",
+            "visible_numbers", "sequence_complete", "source_notes", "source_notes_present",
+            "semantic_coverage_proven")}
+        review_view["units"] = [{"citation_id": u["citation_id"], "number": u["number"]}
+            for u in observation["units"]]
+        user_msg += "\n\nPROCEDURE_STRUCTURE:\n" + json.dumps(review_view, ensure_ascii=False)
+        # Blocks are lossless spans of CURRENT_ANSWER, not additional sources.
+        user_msg += "\n\nPROCEDURE_BLOCKS:\n" + json.dumps([{"block_id": b["block_id"], "first_line": b["text"].splitlines()[0] if b["text"] else ""} for b in layout["blocks"]], ensure_ascii=False)
     _admit_input(request, {"candidates": candidates}, decision,
         runtime=runtime, stage="verifier.provider")
     try:
@@ -553,7 +579,7 @@ def verify_or_repair_answer(
                 {"role": "user", "content": user_msg},
             ],
             models=[V13_FAST_MODEL, V13_PLANNER_MODEL],
-            json_schema=_assistant_core_contract_verifier_schema(),
+            json_schema=verifier_schema,
             effort=V13_FAST_EFFORT,
             reasoning_mode="",
             timeout=min(20, max(12, V13_FAST_TIMEOUT_SECONDS)),
@@ -570,6 +596,9 @@ def verify_or_repair_answer(
         return {"outcome": "unavailable", "answer": answer, "reason": str(exc)[:300]}
 
     out = dict(parsed or {})
+    if compact_review:
+        out = _procedure_review.resolve_reply(out, answer=answer, layout=layout,
+            required_facets=review_facets, required_types=requirements)
     out["model"] = model_used
     valid_ids = {
         str(c.get("citation_id") or "").strip()
