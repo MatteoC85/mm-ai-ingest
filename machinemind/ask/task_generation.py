@@ -911,6 +911,16 @@ class TaskGenerationEvidence(GenericGenerationEvidence):
              "page_from", "page_to", "page_number", "chunk_index", "snippet",
              "snippet_clean", "chunk_full", "text", "source_type")
 
+    # Only these existing family-ranking annotations may be aggregated across
+    # DIFFERENT admitted sources. They are not content, provenance, permission,
+    # or proof that the selected Step covers a semantic requirement. Everything
+    # else (including absent/unknown fields) belongs to the chosen occurrence.
+    _FAMILY_RANKING_METADATA = frozenset((
+        "assistant_core_facet_hits", "assistant_core_covered_facets",
+        "matched_subsystems", "v13_score", "retrieval_score", "similarity",
+        "semantic_similarity", "assistant_core_facet_coverage",
+    ))
+
     def __init__(self, *, tasks, **kwargs):
         super().__init__(**kwargs)
         if type(tasks) is not TaskSynthesisRuntime:
@@ -1100,21 +1110,40 @@ class TaskGenerationEvidence(GenericGenerationEvidence):
     def dedupe_steps(self, rows):
         def merge(preferred, secondary):
             handles = self.handles([preferred, secondary])
-            result = ranking.v12_merge_candidate_metadata(preferred, secondary, runtime=self.tasks.metadata_merge)
-            # The legacy algorithm overlays preferred onto secondary. An observed
-            # page may omit chunk_index while an observed chunk of the SAME source
-            # supplies it. Retain both explicit parents for that exact branch;
-            # do not invent the chunk locator or find a parent by citation text.
             inputs = self.records(handles)
             same_source = inputs[0].context.source == inputs[1].context.source
+            # Decide from the admitted identities BEFORE calling the legacy
+            # overlay. For a cross-source ordinal collision this is a selection,
+            # not a composite source. Pass only the secondary's declared ranking
+            # annotations; no secondary body, locator, embedding, link, relation,
+            # flag or unknown field can fill a hole in the chosen occurrence.
+            secondary_metadata = secondary if same_source else {
+                k: secondary[k] for k in self._FAMILY_RANKING_METADATA if k in secondary
+            }
+            result = ranking.v12_merge_candidate_metadata(
+                preferred, secondary_metadata, runtime=self.tasks.metadata_merge)
+            # The shared merger must remain pure; also recheck current grants
+            # before sealing either a same-source union or a source selection.
+            self.handles([preferred, secondary])
+            # Representations of the SAME admitted source still retain the
+            # existing explicit union and BOTH parents. The session continues to
+            # check their locators/references; no parent is inferred from text.
             expected = {k: secondary[k] for k in self._BODY if k in secondary} if same_source else {}
             expected.update({k: preferred[k] for k in self._BODY if k in preferred})
             expected = {k: expected[k] for k in self._BODY if k in expected}
             if not _same_value({k:result[k] for k in self._BODY if k in result}, expected):
                 raise GenerationEvidenceError("family metadata merge changed chosen body")
+            if not same_source and not _same_value(
+                    {k: v for k, v in result.items() if k not in self._FAMILY_RANKING_METADATA},
+                    {k: v for k, v in preferred.items() if k not in self._FAMILY_RANKING_METADATA}):
+                raise GenerationEvidenceError("family selection changed chosen occurrence")
+            # Both alternatives remain in the request's admitted evidence and
+            # are revalidated above. Only the selected source is a payload parent:
+            # conflicting text/values are never spliced into a fabricated Step.
             parents = handles if same_source else (handles[0],)
+            operation = ":explicit-body-merge" if same_source else ":family-representation-choice"
             handle = self.session.derive_batch(request=self.request,
-                views=((parents, deepcopy(result)),), operation=TASK_GENERATION_VERSION+":explicit-body-merge",
+                views=((parents, deepcopy(result)),), operation=TASK_GENERATION_VERSION+operation,
                 current_allowed_sources=self.current())[0]
             return self._remember(result, handle)
         runtime = replace(self.tasks.step_dedupe, _v12_merge_candidate_metadata=merge)
