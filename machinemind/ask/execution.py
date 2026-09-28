@@ -421,6 +421,8 @@ def verify_or_repair_answer(
     repair_context: Optional[dict] = None,
     runtime: AskExecutionRuntime,
 ) -> dict:
+    INFO_PROCEDURE_FULL = runtime.INFO_PROCEDURE_FULL
+    INFO_PROCEDURE_SEGMENT = runtime.INFO_PROCEDURE_SEGMENT
     REQ_CHECKLIST = runtime.REQ_CHECKLIST
     REQ_INTERFACE_LOCATIONS = runtime.REQ_INTERFACE_LOCATIONS
     REQ_NUMERIC_VALUE = runtime.REQ_NUMERIC_VALUE
@@ -456,24 +458,43 @@ def verify_or_repair_answer(
         return {"outcome": "unavailable", "answer": answer, "reason": "budget_unavailable"}
 
     enumeration_requested = _assistant_core_enumeration_requested(request, decision)
-    ordered_candidates = list(candidates or [])
-    catalog_candidates = _assistant_core_overview_catalog_candidates(ordered_candidates) if enumeration_requested else []
-    if enumeration_requested:
-        ordered_candidates.sort(
-            key=lambda c: (
-                -float((c.get("assistant_core_enumeration_metrics") or {}).get("item_count") or 0),
-                -float(c.get("assistant_core_enumeration_bonus") or 0.0),
-                -float(c.get("v13_score", c.get("retrieval_score", c.get("similarity", 0.0))) or 0.0),
+    # The request-owned flow can provide a complete, stable procedure packet.
+    # Legacy/OFF/Root Cause and nonprocedural consumers keep the old algorithm.
+    context_limit = min(30000 if enumeration_requested else 24000,
+        max(V13_FAST_CONTEXT_CHARS, 28000 if enumeration_requested else 22000))
+    packet = None
+    packet_builder = getattr(runtime.evidence_observer, "procedure_review_sources", None)
+    if (_guarded(runtime, request, decision) and callable(packet_builder)
+            and decision.information_task in {INFO_PROCEDURE_FULL, INFO_PROCEDURE_SEGMENT}):
+        packet = packet_builder(candidates, max_records=24 if enumeration_requested else 18,
+            max_context_chars=context_limit)
+    review_evidence_diagnostic = {}
+    if packet is not None:
+        ordered_candidates, sources_block, review_evidence_diagnostic = packet
+        # Keep catalog diagnostics and enumeration checks, but only over the
+        # actually emitted records. They cannot reorder or truncate the producer
+        # manifest after the packet has been checked.
+        catalog_candidates = _assistant_core_overview_catalog_candidates(ordered_candidates) if enumeration_requested else []
+        catalog_digest = _assistant_core_machine_catalog_digest(catalog_candidates)
+    else:
+        ordered_candidates = list(candidates or [])
+        catalog_candidates = _assistant_core_overview_catalog_candidates(ordered_candidates) if enumeration_requested else []
+        if enumeration_requested:
+            ordered_candidates.sort(
+                key=lambda c: (
+                    -float((c.get("assistant_core_enumeration_metrics") or {}).get("item_count") or 0),
+                    -float(c.get("assistant_core_enumeration_bonus") or 0.0),
+                    -float(c.get("v13_score", c.get("retrieval_score", c.get("similarity", 0.0))) or 0.0),
+                )
             )
+        if catalog_candidates:
+            ordered_candidates = _v13_merge_candidates([catalog_candidates, ordered_candidates])
+        ordered_candidates = ordered_candidates[:24 if enumeration_requested else 18]
+        catalog_digest = _assistant_core_machine_catalog_digest(catalog_candidates)
+        sources_block = _v13_sources_block(
+            ordered_candidates,
+            max_context_chars=min(30000 if enumeration_requested else 24000, max(V13_FAST_CONTEXT_CHARS, 28000 if enumeration_requested else 22000)),
         )
-    if catalog_candidates:
-        ordered_candidates = _v13_merge_candidates([catalog_candidates, ordered_candidates])
-    ordered_candidates = ordered_candidates[:24 if enumeration_requested else 18]
-    catalog_digest = _assistant_core_machine_catalog_digest(catalog_candidates)
-    sources_block = _v13_sources_block(
-        ordered_candidates,
-        max_context_chars=min(30000 if enumeration_requested else 24000, max(V13_FAST_CONTEXT_CHARS, 28000 if enumeration_requested else 22000)),
-    )
     if not sources_block:
         return {"outcome": "no_sources", "answer": "", "reason": "empty_evidence"}
 
@@ -570,7 +591,7 @@ def verify_or_repair_answer(
         user_msg += "\n\nPROCEDURE_STRUCTURE:\n" + json.dumps(review_view, ensure_ascii=False)
         # Blocks are lossless spans of CURRENT_ANSWER, not additional sources.
         user_msg += "\n\nPROCEDURE_BLOCKS:\n" + json.dumps([{"block_id": b["block_id"], "first_line": b["text"].splitlines()[0] if b["text"] else ""} for b in layout["blocks"]], ensure_ascii=False)
-    _admit_input(request, {"candidates": candidates}, decision,
+    _admit_input(request, {"candidates": ordered_candidates if packet is not None else candidates}, decision,
         runtime=runtime, stage="verifier.provider")
     try:
         parsed, model_used = _v13_json_models(
@@ -596,6 +617,8 @@ def verify_or_repair_answer(
         return {"outcome": "unavailable", "answer": answer, "reason": str(exc)[:300]}
 
     out = dict(parsed or {})
+    if review_evidence_diagnostic:
+        out["review_evidence"] = review_evidence_diagnostic
     if compact_review:
         out = _procedure_review.resolve_reply(out, answer=answer, layout=layout,
             required_facets=review_facets, required_types=requirements)

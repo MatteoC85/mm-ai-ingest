@@ -19,6 +19,7 @@ from assistant_core_v2 import (
     _choose_monotonic_response, _finish_ask_validation, _clean_text,
     response_has_rejected_answer, decorate_response,
 )
+from . import review_evidence
 from .task_generation import TaskGenerationEvidence
 from .generation import GenerationEvidenceError
 from ..evidence.ask_input import _same_value, apply_ask_evidence_input
@@ -67,6 +68,9 @@ class ResponseEvidenceFlow(TaskGenerationEvidence):
         self.final_data, self.final_handles = None, None
         self.model_inputs = None
         self.verifier_calls = 0
+        self._review_packet = None
+        self._review_packet_handles = ()
+        self._review_packet_uses = 0
         self.synthesis_calls = self.repair_calls = 0
 
     def _seed(self, data, selections):
@@ -299,6 +303,52 @@ class ResponseEvidenceFlow(TaskGenerationEvidence):
             return result
         return self.invoke(work, self.request)
 
+    def procedure_review_sources(self, rows, *, max_records, max_context_chars):
+        """Compile once from the observed producer; reuse DATA, never authority.
+
+        The first verifier and bounded repair see the same source representations
+        even when their caller-provided ranking/prefix differs. The original
+        manifest is handed off with explicit occurrence handles at generation;
+        it is not recovered from a model citation ID or a permission cache.
+        """
+        def work():
+            if (not self.stack or self.stack[-1] != "verify_or_repair_answer"
+                    or self.model_inputs is not None):
+                raise ResponseEvidenceError("one verifier sources block per call required")
+            self.handles(rows)
+            if (self.synthesis is None or self.decision.information_task not in
+                    {self.execution.INFO_PROCEDURE_FULL, self.execution.INFO_PROCEDURE_SEGMENT}):
+                return None
+            original, _, handles = self.synthesis
+            primary = original.get("_assistant_core_validation_evidence", [])
+            if not primary:
+                return None
+            # Re-admit the exact snapshot with its declared positional handles.
+            # No lookup by text/citation ID supplies or reconstructs an origin.
+            self._seed({"candidates": primary}, (AskSelection("candidates", handles),))
+            if self._review_packet is None:
+                # The first verifier's admitted collection contains its complete
+                # retrieval/manifest union. Keep these occurrence-bound views;
+                # a later repair prefix must not replace the stored selection.
+                extension = rows
+                packet = review_evidence.compile_packet(primary=primary,
+                    extension=extension, render=self.execution._v13_sources_block,
+                    max_records=max_records, max_context_chars=max_context_chars)
+                self._review_packet_handles = self.handles(list(packet.rows))
+                self._review_packet = packet
+            packet = self._review_packet
+            if (packet.max_records != max_records
+                    or packet.max_context_chars != max_context_chars):
+                raise ResponseEvidenceError("review packet limits changed within request")
+            if self.handles(list(packet.rows)) != self._review_packet_handles:
+                raise ResponseEvidenceError("review packet occurrence identity changed")
+            self.records(self.all_handles)
+            self.model_inputs = self._review_packet_handles
+            diagnostic = packet.diagnostic(reused=self._review_packet_uses > 0)
+            self._review_packet_uses += 1
+            return list(packet.rows), packet.sources, diagnostic
+        return self.invoke(work, self.request)
+
     def _verification_model(self, *args, **parameters):
         def work():
             if (not self.model_inputs or not self.stack or self.stack[-1] != "verify_or_repair_answer"
@@ -408,3 +458,6 @@ class ResponseEvidenceFlow(TaskGenerationEvidence):
         self.validated.clear(); self.stack.clear()
         self.final_data = self.final_handles = None
         self.model_inputs = None
+        self._review_packet = None
+        self._review_packet_handles = ()
+        self._review_packet_uses = 0
