@@ -8,16 +8,102 @@ not generated or silently translated, and carry their original citation identity
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 import hashlib
 import re
 from typing import Callable, Any
+
+from ..evidence.contracts import EvidenceContractError
 
 VERSION = "ask-final-contract-v1"
 
 
 def answer_digest(answer: str) -> str:
     return hashlib.sha256(str(answer or "").strip().encode("utf-8")).hexdigest()
+
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewedDraft:
+    """Server-owned input snapshot, never a model/client-supplied hash or grant.
+
+    Strings and tuples are immutable. The request key is the existing immutable
+    ASK key and is checked again after the provider. This object lives only on
+    the verifier's stack; it is not exported, cached, or reused by another ASK.
+    """
+    answer: str = field(repr=False)
+    request_key: Any = field(repr=False)
+    required_facets: tuple[str, ...]
+    required_types: tuple[str, ...]
+
+
+def capture_reviewed_draft(answer: str, *, request_key: Any,
+                           required_facets: tuple[str, ...],
+                           required_types: tuple[str, ...]) -> ReviewedDraft:
+    # Recovery-from-evidence intentionally starts with an empty CURRENT_ANSWER.
+    # Capture it too: a nonempty rewrite remains legal, but there is no existing
+    # body to approve via an empty PASS (checked at resolution, not pre-call).
+    if type(answer) is not str:
+        raise EvidenceContractError("reviewed_draft_requires_text")
+    for values in (required_facets, required_types):
+        if type(values) is not tuple or any(type(x) is not str for x in values):
+            raise EvidenceContractError("reviewed_draft_requires_immutable_requirements")
+    return ReviewedDraft(answer, request_key, required_facets, required_types)
+
+
+def resolve_unchanged_pass(parsed: dict, *, draft: ReviewedDraft,
+                           request_key: Any) -> dict:
+    """Resolve only an explicit, fully covered PASS with no replacement text.
+
+    A rewrite must still contain a replacement. An incomplete or malformed PASS
+    is not promoted by copying whatever answer happens to be current. The only
+    permitted body comes from the exact immutable input captured at the call.
+    Enumeration is checked again by the existing verifier after resolution;
+    grounding, authority, the final text binding and cache accounting are not
+    replaced by this local protocol adapter.
+    """
+    if type(draft) is not ReviewedDraft or draft.request_key != request_key:
+        raise EvidenceContractError("reviewed_draft_request_changed")
+    out = deepcopy(parsed)
+    # A provider cannot manufacture the server's binding metadata.
+    out.pop("reviewed_draft_binding", None)
+    outcome = str(out.get("outcome") or "").strip().lower()
+    if outcome not in {"pass", "rewrite"}:
+        return out
+    body = out.get("answer")
+    if type(body) is not str:
+        raise EvidenceContractError("reviewed_draft_success_text_invalid")
+    if body.strip():
+        return out  # Existing full-answer and compact-procedure paths unchanged.
+    if outcome == "rewrite":
+        raise EvidenceContractError("reviewed_draft_empty_rewrite")
+    if not draft.answer.strip():
+        raise EvidenceContractError("reviewed_draft_empty_pass_without_draft")
+    required_lists = ("covered_facets", "covered_answer_types", "missing_facets",
+                      "missing_answer_types", "expected_list_items",
+                      "covered_list_items", "missing_list_items")
+    for key in required_lists:
+        values = out.get(key)
+        if type(values) is not list or any(type(x) is not str for x in values):
+            raise EvidenceContractError("reviewed_draft_coverage_shape_invalid")
+    if any(out[key] for key in ("missing_facets", "missing_answer_types", "missing_list_items")):
+        raise EvidenceContractError("reviewed_draft_success_has_missing_requirements")
+    if (not set(draft.required_facets).issubset(out["covered_facets"])
+            or not set(draft.required_types).issubset(
+                str(x).strip().lower() for x in out["covered_answer_types"])
+            or not set(out["expected_list_items"]).issubset(out["covered_list_items"])):
+        raise EvidenceContractError("reviewed_draft_coverage_not_complete")
+    out["answer"] = draft.answer
+    out["reviewed_draft_binding"] = {
+        "version": "ask-reviewed-draft-v1",
+        "basis": "server_snapshot_at_verifier_call",
+        "wire_answer_empty": True,
+        "input_answer_sha256": hashlib.sha256(draft.answer.encode("utf-8")).hexdigest(),
+        "input_answer_utf8_bytes": len(draft.answer.encode("utf-8")),
+        "resolved_answer_sha256": answer_digest(draft.answer),
+        "coverage_reported_complete": True,
+    }
+    return out
 
 
 def bind_source_fields(runtime: Any, *, fields: Callable, sections: Callable):
@@ -186,6 +272,19 @@ def final_contract(*, deterministic: dict, semantic: dict, reviewed_answer: str,
             and any(result.get(k) for k in ("missing_answer_facets", "missing_evidence_facets", "missing_list_items"))):
         result["reason"] = "deterministic_response_accepted_with_unresolved_facets"
         result["coverage_basis"] = "existing_deterministic_thresholds"
+    draft_binding = semantic.get("reviewed_draft_binding")
+    if draft_binding is not None:
+        binding_valid = bool(type(draft_binding) is dict
+            and draft_binding.get("version") == "ask-reviewed-draft-v1"
+            and draft_binding.get("basis") == "server_snapshot_at_verifier_call"
+            and draft_binding.get("wire_answer_empty") is True
+            and draft_binding.get("coverage_reported_complete") is True
+            and outcome == "pass" and not semantic_missing
+            and bool(reviewed_answer.strip())
+            and draft_binding.get("resolved_answer_sha256") == answer_digest(reviewed_answer)
+            and answer_digest(semantic.get("answer") or "") == answer_digest(reviewed_answer))
+        if not binding_valid:
+            result.update(passed=False, reason="reviewed_draft_binding_invalid")
     result["complete"] = bool(result.get("passed") and not semantic_partial
         and not any(result.get(k) for k in ("missing_answer_facets", "missing_evidence_facets", "missing_list_items")))
     return result

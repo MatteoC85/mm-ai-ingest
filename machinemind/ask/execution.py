@@ -18,6 +18,7 @@ from inspect import signature
 from typing import Any, Callable, Optional, TYPE_CHECKING
 
 from . import procedure_review as _procedure_review
+from . import final_contract as _final_contract
 from ..evidence.ask_input import AskEvidenceAdmission, apply_ask_evidence_input, ask_request_key
 from ..evidence.contracts import EvidenceContractError, SourceIdentity
 from ..retrieval.ask_composition import AskEvidenceSession, AskSelection
@@ -593,6 +594,12 @@ def verify_or_repair_answer(
         user_msg += "\n\nPROCEDURE_BLOCKS:\n" + json.dumps([{"block_id": b["block_id"], "first_line": b["text"].splitlines()[0] if b["text"] else ""} for b in layout["blocks"]], ensure_ascii=False)
     _admit_input(request, {"candidates": ordered_candidates if packet is not None else candidates}, decision,
         runtime=runtime, stage="verifier.provider")
+    # Snapshot the exact CURRENT_ANSWER at the provider boundary. Neither a
+    # later response field nor a hash returned by the model selects the body.
+    reviewed_draft = (_final_contract.capture_reviewed_draft(
+        answer, request_key=ask_request_key(request),
+        required_facets=tuple(review_facets), required_types=tuple(requirements))
+        if _guarded(runtime, request, decision) else None)
     try:
         parsed, model_used = _v13_json_models(
             [
@@ -622,6 +629,9 @@ def verify_or_repair_answer(
     if compact_review:
         out = _procedure_review.resolve_reply(out, answer=answer, layout=layout,
             required_facets=review_facets, required_types=requirements)
+    if reviewed_draft is not None:
+        out = _final_contract.resolve_unchanged_pass(out, draft=reviewed_draft,
+            request_key=ask_request_key(request))
     out["model"] = model_used
     valid_ids = {
         str(c.get("citation_id") or "").strip()
@@ -655,6 +665,10 @@ def verify_or_repair_answer(
         limit=10,
     )
     out["answer"] = _assistant_core_redact_internal_text(out.get("answer") or "")
+    if reviewed_draft is not None and "reviewed_draft_binding" in out:
+        # The same existing redaction projection is applied exactly once. The
+        # final validator must still bind this output to the grounded answer.
+        out["reviewed_draft_binding"]["resolved_answer_sha256"] = _final_contract.answer_digest(out["answer"])
     out["enumeration_requested"] = bool(enumeration_requested)
     expected_items = _dedup_text_values(out.get("expected_list_items") or [], limit=40)
     model_missing_items = _dedup_text_values(out.get("missing_list_items") or [], limit=40)
