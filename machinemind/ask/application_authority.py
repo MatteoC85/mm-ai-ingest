@@ -21,6 +21,7 @@ from ..evidence.contracts import SourceType, SourceIdentity
 from ..evidence.response_authority import make_response_guard, ResponseSourceAuthorityError
 from ..retrieval.supplemental_evidence import storage_key
 from .request_flow import RequestFlowGuards
+from ..infrastructure.request_budget import _V13BudgetExceeded
 from ..retrieval.chunk_evidence import ChunkReadScope
 
 MODE_VARIABLE = "MM_ASK_REQUEST_AUTHORITY"
@@ -297,6 +298,8 @@ class ResponseGuardOwner:
             return current
         except AuthorityError as exc:
             self._fault = exc
+            raise
+        except _V13BudgetExceeded:
             raise
         except Exception:
             self._fail("AUTHORITY_PROVIDER_UNAVAILABLE")

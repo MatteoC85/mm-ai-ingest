@@ -55,6 +55,9 @@ class RequestAdmission:
         self.check()
         if not isinstance(stage, str) or not stage or len(stage) > 128:
             self._fail("AUTHORITY_FENCE_INVALID")
+        from ..ask.request_completion import record_fence
+        from ..infrastructure.request_budget import _monotonic, _V13BudgetExceeded
+        started = _monotonic()
         try:
             if observed and self._session is not None:
                 deps = self._session.cache_dependencies(request=self._request)
@@ -75,9 +78,13 @@ class RequestAdmission:
             self.fences.append({"stage": stage, "source_count": len(sources),
                 "checked_dependency_count": 0, "fence_mode": "full_catalog"})
             return sources
+        except _V13BudgetExceeded:
+            raise
         except Exception as exc:
             self.fault = exc if isinstance(exc, AuthorityError) else AuthorityError("AUTHORITY_PROVIDER_UNAVAILABLE")
             raise self.fault from None
+        finally:
+            record_fence(max(0.0, _monotonic() - started))
 
     def attach(self, request, session):
         from ..retrieval.ask_composition import AskEvidenceSession

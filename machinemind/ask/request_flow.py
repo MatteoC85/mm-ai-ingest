@@ -230,7 +230,8 @@ def precision_fact_rescue(
 def run_sync(payload: Any, x_ai_internal_secret: Optional[str], *,
              requested_mode: str, runtime: RequestFlowRuntime,
              guards: RequestFlowGuards | None = None,
-             evidence_factory: Callable[[Any], RequestFlowEvidenceBinding] | None = None) -> dict:
+             evidence_factory: Callable[[Any], RequestFlowEvidenceBinding] | None = None,
+             completion=None) -> dict:
     if guards is not None and type(guards) is not RequestFlowGuards:
         raise TypeError("typed request flow guards required")
     if guards is not None and requested_mode != "ask":
@@ -238,6 +239,13 @@ def run_sync(payload: Any, x_ai_internal_secret: Optional[str], *,
     if evidence_factory is not None and (
             not callable(evidence_factory) or requested_mode != "ask" or guards is None):
         raise TypeError("request evidence is restricted to the guarded ASK path")
+    if completion is not None:
+        # The composition root injects the owner; this orchestration module
+        # deliberately has no dependency on transport or budget registries.
+        if guards is None or requested_mode != "ask" or not all(
+                callable(getattr(completion, name, None)) for name in
+                ("budget_for", "core_done", "timeout_response")):
+            raise TypeError("completion is restricted to guarded ASK")
     AI_INTERNAL_SECRET = runtime.AI_INTERNAL_SECRET
     ASK_MAX_TOP_K = runtime.ASK_MAX_TOP_K
     AssistantCoreRequest = runtime.AssistantCoreRequest
@@ -289,8 +297,9 @@ def run_sync(payload: Any, x_ai_internal_secret: Optional[str], *,
     top_default = 8 if requested_mode == MODE_ROOT_CAUSE else 5
     top_k = max(1, min(int(payload.top_k or top_default), ASK_MAX_TOP_K))
     max_causes = max(1, min(int(getattr(payload, "max_causes", 3) or 3), 3))
-    budget = _assistant_core_new_budget(requested_mode, company_id=str(payload.company_id or ""))
-    token = _V13_BUDGET_CTX.set(budget)
+    budget = (_assistant_core_new_budget(requested_mode, company_id=str(payload.company_id or ""))
+              if completion is None else completion.budget_for(payload, runtime))
+    token = _V13_BUDGET_CTX.set(budget) if completion is None else None
     evidence_binding = None
     try:
         scope = _resolve_query_scope(
@@ -326,6 +335,10 @@ def run_sync(payload: Any, x_ai_internal_secret: Optional[str], *,
             scope=cache_scope, language=response_language, debug=bool(payload.debug),
             **lookup_guard,
         )
+        if completion is not None:
+            # Legacy optional cache failures may be absorbed by its reader.
+            # Time already consumed still belongs to this entire request.
+            budget.ensure_time(0.0)
         if guards is not None:
             guards.check()
         if cached is not None and requested_mode == MODE_ROOT_CAUSE:
@@ -417,6 +430,8 @@ def run_sync(payload: Any, x_ai_internal_secret: Optional[str], *,
                 run_core = evidence_binding.run_core
         precision_rescued = False
         final = run_core(request)
+        if completion is not None:
+            completion.core_done()
         if evidence_binding is not None:
             evidence_binding.check()
         if guards is not None:
@@ -496,8 +511,12 @@ def run_sync(payload: Any, x_ai_internal_secret: Optional[str], *,
             guards.check()
         if evidence_binding is not None:
             evidence_binding.check()
+        if completion is not None:
+            completion.budget.ensure_time(0.0)
         return final
     except _V13BudgetExceeded as exc:
+        if completion is not None:
+            return completion.timeout_response(exc)
         return _assistant_core_budget_response(
             requested_mode=requested_mode,
             q=q,
@@ -522,6 +541,7 @@ def run_sync(payload: Any, x_ai_internal_secret: Optional[str], *,
             if type(evidence_binding) is RequestFlowEvidenceBinding:
                 evidence_binding.close()
         finally:
-            _V13_BUDGET_CTX.reset(token)
+            if token is not None:
+                _V13_BUDGET_CTX.reset(token)
 
 

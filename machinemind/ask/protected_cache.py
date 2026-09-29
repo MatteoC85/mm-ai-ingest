@@ -195,6 +195,12 @@ class ProtectedCacheOwner:
 
     def _runtime(self, *, storing=False):
         rt = dict(self.cache)
+        if storing:
+            from .request_completion import current
+            completion = current()
+            if completion is not None:
+                connect = rt["_db_conn"]
+                rt["_db_conn"] = lambda: completion.cache_connection(connect)
         base_key = self.cache["_v13_scope_key"]
         rt["_v13_scope_key"] = lambda scope: _hash({
             "namespace": PROTECTED_CACHE_VERSION, "legacy_scope": base_key(scope),
@@ -206,7 +212,15 @@ class ProtectedCacheOwner:
         def version(company):
             if company != self.scope.company_id:
                 self._fail("AUTHORITY_CACHE_SCOPE_CHANGED")
-            value = self._version()
+            if storing and completion is not None:
+                # Same original version SQL and epoch comparison, with the
+                # optional window checked before/after each statement and
+                # before commit. A version transaction is NOT an entry write.
+                version_rt = dict(rt)
+                version_rt["_db_conn"] = lambda: completion.cache_connection(connect, entry_write=False)
+                value = semantic_cache.get_knowledge_version(company, version_rt)
+            else:
+                value = self._version()
             if storing:
                 return value if value == self._epoch else 0
             self._epoch = value
@@ -314,6 +328,8 @@ class ProtectedCacheOwner:
         except AuthorityError:
             raise
         except Exception:
+            from .request_completion import check_io_time
+            check_io_time()
             self._fail("AUTHORITY_CACHE_LINKS_UNAVAILABLE")
 
     def lookup_entry(self, *, source_guard_fn=None, **parameters):
@@ -404,8 +420,37 @@ class ProtectedCacheOwner:
             return None
         if not self._accounting_allows_store():
             return None
-        semantic_cache.cache_store(**parameters, response=deepcopy(response),
-            runtime_globals=self._runtime(storing=True), source_guard_fn=self.store)
+        from .request_completion import current
+        completion = current()
+        if completion is None:
+            semantic_cache.cache_store(**parameters, response=deepcopy(response),
+                runtime_globals=self._runtime(storing=True), source_guard_fn=self.store)
+        else:
+            # These are the SAME non-authority eligibility tests performed by
+            # semantic_cache.cache_store. Run the pure quality/embedding checks
+            # before remote cache admission, not after fetching permissions for
+            # an entry that cannot be written. Publication still reauthorizes.
+            quality = self.cache["_v13_response_quality"]("ask", response)
+            if quality < self.cache["V13_SEMANTIC_CACHE_MIN_QUALITY"]:
+                completion.cache_state = "skipped_original_quality_policy"
+                self._mode = "miss_quality_no_store"
+                return None
+            budget = self.cache["_v13_current_budget"]()
+            if budget is None or (self.cache["OPENAI_EMBED_MODEL"], parameters["q"]) not in budget.embedding_cache:
+                completion.cache_state = "skipped_embedding_unavailable"
+                self._mode = "miss_embedding_no_store"
+                return None
+            # Keep the full signed-dependency/epoch/quality guard for every
+            # attempted write; never start optional I/O at publication's expense.
+            with completion.optional_cache(authority_timeout=
+                    self.authorized.provider.directory.meter.limits.timeout_seconds) as admitted:
+                if admitted:
+                    semantic_cache.cache_store(**parameters, response=deepcopy(response),
+                        runtime_globals=self._runtime(storing=True), source_guard_fn=self.store)
+            if completion.cache_state.startswith("skipped_"):
+                self._mode = "miss_" + completion.cache_state
+            elif completion.cache_state == "not_stored":
+                self._mode = "miss_not_stored"
         self.check()
         return None
 

@@ -17798,18 +17798,22 @@ def _assistant_core_authorized_ask_sync(payload, x_ai_internal_secret, *,
     Activation and the integrated live B4o gates remain separate.
     """
     from machinemind.ask import routing_runtime as _ask_routing_runtime
+    from machinemind.infrastructure.request_budget import _V13BudgetExceeded as _CompletionBudgetExceeded
     protected_started = _ask_routing_runtime.now()
     execution = execution_token = None
     authorized = None
     admission_token = None
+    completion = None
     try:
+        from machinemind.ask.request_completion import RequestCompletion
+        base_runtime = _assistant_core_request_flow_runtime()
+        completion = RequestCompletion(runtime=base_runtime, payload=payload, started=protected_started)
         authorized = _application_authority.authorize_http_request(payload,
             service_secret=x_ai_internal_secret, application_secret=x_mm_app_authority,
             env=authority_environment, resolve=_resolve_query_scope, admission_windows=True)
         from machinemind.authority.request_admission import activate, deactivate
         admission_token = activate(authorized.admission) if authorized.admission is not None else None
         execution, execution_token = _ask_routing_runtime.activate(protected_started)
-        base_runtime = _assistant_core_request_flow_runtime()
         runtime = _dataclass_replace(base_runtime,
             _v13_cache_lookup=lambda **kwargs: None,
             _v13_cache_store=lambda **kwargs: None)
@@ -17836,22 +17840,32 @@ def _assistant_core_authorized_ask_sync(payload, x_ai_internal_secret, *,
                 return _ask_request_flow.run_sync(value, secret,
                     requested_mode=MODE_ASK, runtime=runtime,
                     guards=cache_owner.guards if cache_owner else owner.guards,
-                    evidence_factory=evidence_factory)
+                    evidence_factory=evidence_factory, completion=completion)
             result = _application_authority.protected_call(payload, x_ai_internal_secret,
                 authorized=authorized, delegate=uncached,
-                response_guard=cache_owner.release if cache_owner else owner.final,
+                response_guard=lambda response: completion.publish(
+                    response, cache_owner.release if cache_owner else owner.final),
                 **({"backend_cache_reuse": True, "completed": cache_owner.completed} if cache_owner else {}))
-            return execution.finish(result)
+            return execution.finish(completion.finish(result))
         finally:
             try:
                 if cache_owner is not None:
                     cache_owner.close()
             finally:
                 owner.close()
+    except _CompletionBudgetExceeded as exc:
+        if completion is None:
+            raise
+        result = completion.finish(completion.timeout_response(exc))
+        return execution.finish(result) if execution is not None else result
     except _AuthorityError as exc:
         result = _application_authority.public_error(exc)
+        if completion is not None:
+            result = completion.finish(result)
         return execution.finish(result) if execution is not None else result
     finally:
+        if completion is not None:
+            completion.close()
         if execution_token is not None:
             _ask_routing_runtime.deactivate(execution_token)
         if authorized is not None and authorized.admission is not None:

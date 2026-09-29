@@ -102,17 +102,23 @@ class BubbleDirectory:
             "Authorization": "Bearer " + self._connection.token,
             "Accept": "application/json", "Cache-Control": "no-store",
             "User-Agent": "MachineMind-B4l-Authority/1"})
+        from ..ask.request_completion import check_io_time, transport_timeout
+        from ..infrastructure.request_budget import _V13BudgetExceeded
+        check_io_time()
         timeout = self.meter.begin()
         size, failed = 0, True
         try:
+            timeout = transport_timeout(timeout)
             try:
                 response = self._opener.open(request, timeout=timeout)
             except urllib.error.HTTPError as exc:
                 response = exc
             with response as r:
                 status = r.code if hasattr(r, "code") else r.status
+                check_io_time()
                 raw = r.read(self.meter.limits.max_response_bytes + 1)
                 size = len(raw)
+                check_io_time()
                 if self._closed:
                     raise AuthorityError("AUTHORITY_REQUEST_EXPIRED")
                 if size > self.meter.limits.max_response_bytes:
@@ -135,9 +141,12 @@ class BubbleDirectory:
                     raise AuthorityError("AUTHORITY_RESPONSE_INVALID")
                 failed = False
                 return body
-        except AuthorityError:
+        except (AuthorityError, _V13BudgetExceeded):
             raise
         except Exception:
+            # Expiry of an optional time window is not a poisoned permission.
+            # Before expiry, a transport failure retains its original meaning.
+            check_io_time()
             raise AuthorityError("AUTHORITY_PROVIDER_UNAVAILABLE") from None
         finally:
             self.meter.finish(size, failed=failed)
@@ -209,7 +218,20 @@ class BubbleDirectory:
                     futures = [executor.submit(copy_context().run, f) for f in callbacks]
                     # Even on error the executor joins all dispatched siblings.
                     # No partial authority or successful subset is returned.
-                    return tuple(future.result() for future in futures)
+                    from ..ask.request_completion import current, _CacheWindowExpired
+                    if current() is None:
+                        return tuple(future.result() for future in futures)
+                    values, errors = [], []
+                    for future in futures:
+                        try:
+                            values.append(future.result())
+                        except BaseException as exc:
+                            errors.append(exc)
+                    if errors:
+                        # Do not hide a sibling's real failure behind an optional
+                        # cache cancellation. All dispatched work is joined.
+                        raise next((e for e in errors if not isinstance(e, _CacheWindowExpired)), errors[0])
+                    return tuple(values)
 
     def close(self):
         with self._batch_lock:
