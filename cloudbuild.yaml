@@ -199,7 +199,7 @@ steps:
           require(len(result.get('containers', [])) == 1, 'EXPECTED_SINGLE_CONTAINER')
           container = result['containers'][0]
           container.pop('image', None)
-          managed = set(ENV_VALUES) | set(SECRET_REFS) | {'COMMIT_SHA', 'MM_INGEST_LEDGER_AUTO_DDL'}
+          managed = set(ENV_VALUES) | set(SECRET_REFS) | {'COMMIT_SHA', 'MM_INGEST_LEDGER_AUTO_DDL', 'MM_ASK_REQUEST_AUTHORITY'}
           container['env'] = sorted((x for x in container.get('env', [])
                                      if x['name'] not in managed), key=lambda x: x['name'])
           return result
@@ -221,7 +221,7 @@ steps:
               names.add(name)
           return names
       
-      def validate_candidate(before, service, revision, name, commit, image):
+      def validate_candidate(serving_revision, service, revision, name, commit, image):
           reconciled(service, 'CANDIDATE_SERVICE_RECONCILING')
           reconciled(revision, 'CANDIDATE_REVISION_RECONCILING')
           ready(service, 'CANDIDATE_SERVICE_NOT_READY')
@@ -239,7 +239,7 @@ steps:
               require(env.get('COMMIT_SHA', {}).get('value') == commit, 'COMMIT_ENV_MISMATCH')
               require(env.get('MM_INGEST_LEDGER_AUTO_DDL', {}).get('value') == '0', 'AUTO_DDL_CHANGED')
               require(candidate['containers'][0].get('image') == image, 'IMAGE_MISMATCH')
-          require(unaffected_spec(spec) == unaffected_spec(template_spec(before)),
+          require(unaffected_spec(spec) == unaffected_spec(serving_revision.get('spec', {})),
                   'UNRELATED_TEMPLATE_CHANGED')
           # A sha256 digest was pinned BEFORE deployment. Cloud Run resolves that exact digest.
           actual = revision.get('status', {}).get('imageDigest', '')
@@ -287,34 +287,34 @@ steps:
 
 
       def validate_serving_baseline(before):
-          """Validate the serving revision, not a failed, zero-traffic latest attempt.
-      
-          An aggregate service Ready=False is acceptable ONLY for a reconciled failed
-          latest revision distinct from a proven healthy, OFF, 100%-traffic revision.
-          Missing/Unknown/pending states, split traffic and health failures still deny.
-          No revision is deleted and no traffic is changed here.
+          """Validate the revision actually receiving 100% of production traffic.
+
+          During O6 staging, Cloud Run may have a newer Ready revision at 0% traffic.
+          Therefore latestReadyRevisionName and the service template are NOT used as
+          proof of the production authority mode. The effective and requested traffic
+          must both remain pinned 100% to one OFF revision, which is health-checked.
           """
           require(before.get('metadata', {}).get('name') == SERVICE, 'BASELINE_SERVICE_NAME_MISMATCH')
           require(not before.get('metadata', {}).get('deletionTimestamp'), 'BASELINE_SERVICE_DELETING')
           reconciled(before, 'BASELINE_SERVICE_RECONCILING')
-          configuration(template_spec(before), allow_legacy_off_secret=True)
-          prior = before.get('status', {}).get('latestReadyRevisionName')
-          require(isinstance(prior, str) and prior.startswith(SERVICE+'-'),
-                  'BASELINE_READY_REVISION_MISSING')
-          require(traffic(before) == {prior: 100}, 'BASELINE_NOT_STABLE_100')
-          require(requested_traffic(before) == {prior: 100}, 'BASELINE_REQUESTED_TRAFFIC_MISMATCH')
+          effective = traffic(before)
+          requested = requested_traffic(before)
+          require(len(effective) == 1 and list(effective.values()) == [100], 'BASELINE_NOT_STABLE_100')
+          prior = next(iter(effective))
+          require(requested == {prior: 100}, 'BASELINE_REQUESTED_TRAFFIC_MISMATCH')
           previous = read_resource('revisions', prior)
           require(previous.get('metadata', {}).get('name') == prior, 'BASELINE_REVISION_NAME_MISMATCH')
           require(not previous.get('metadata', {}).get('deletionTimestamp'), 'BASELINE_REVISION_DELETING')
           reconciled(previous, 'BASELINE_REVISION_RECONCILING')
           ready(previous, 'BASELINE_TRAFFIC_REVISION_NOT_READY')
           prior_env = configuration(previous.get('spec', {}), allow_legacy_off_secret=True)
-          require(environment(template_spec(before)).get('MM_ASK_REQUEST_AUTHORITY', {}).get('value', 'off') ==
-                  prior_env.get('MM_ASK_REQUEST_AUTHORITY', {}).get('value', 'off'),
-                  'BASELINE_AUTHORITY_MODE_DIFFERS_FROM_SERVING')
+          prior_mode = prior_env.get('MM_ASK_REQUEST_AUTHORITY', {}).get('value', 'off')
+          require(prior_mode == 'off', 'O6_STAGE_REQUIRES_OFF_BASELINE')
           commit = prior_env.get('COMMIT_SHA', {}).get('value')
           require(isinstance(commit, str) and re.fullmatch('[0-9a-f]{40}', commit),
                   'BASELINE_COMMIT_INVALID')
+          # The aggregate service can point latestReady/latestCreated at an earlier
+          # zero-traffic O6 candidate. That does not change production runtime.
           state = ready_state(before)
           require(state in ('True', 'False'), 'BASELINE_SERVICE_STATE_UNSETTLED')
           if state == 'False':
@@ -327,11 +327,10 @@ steps:
                       'BASELINE_FAILED_REVISION_INVALID')
               reconciled(failed, 'BASELINE_FAILED_REVISION_RECONCILING')
               require(ready_state(failed) == 'False', 'BASELINE_LATEST_NOT_TERMINALLY_FAILED')
-          # Prove the public endpoint still belongs to the serving baseline. No ASK.
           health(before.get('status', {}).get('url'), commit, prior)
           print('BASELINE_TRAFFIC_READY_HEALTH_OFF_PASSED', flush=True)
-          return prior
-      
+          return prior, previous
+
       
       def unchanged_baseline(before, current):
           require(current.get('metadata', {}).get('generation') == before.get('metadata', {}).get('generation') and
@@ -350,9 +349,7 @@ steps:
                   'INVALID_BUILD_ID')
           phase('VALIDATE_SERVING_BASELINE')
           before = read_resource('services', SERVICE)
-          prior = validate_serving_baseline(before)
-          serving_mode = environment(template_spec(before)).get('MM_ASK_REQUEST_AUTHORITY', {}).get('value', 'off')
-          require(serving_mode == 'off', 'O6_STAGE_REQUIRES_OFF_BASELINE')
+          prior, serving_revision = validate_serving_baseline(before)
           baseline_revisions = revision_names()
           require(prior in baseline_revisions and
                   before.get('status', {}).get('latestCreatedRevisionName') in baseline_revisions,
@@ -384,7 +381,7 @@ steps:
           staged_revisions = revision_names()
           require(staged_revisions - baseline_revisions == {name},
                   'CONCURRENT_OR_UNEXPECTED_REVISION')
-          validate_candidate(before, staged, revision, name, commit, image)
+          validate_candidate(serving_revision, staged, revision, name, commit, image)
           require(traffic(staged) == {prior: 100}, 'TRAFFIC_CHANGED_BEFORE_VALIDATION')
           require(requested_traffic(staged) == {prior: 100}, 'REQUESTED_TRAFFIC_CHANGED_BEFORE_VALIDATION')
           # O6 stage stops here: required candidate is tagged but production stays OFF.
@@ -405,7 +402,7 @@ steps:
                   'unrelated_template_preserved': True, 'production_traffic_percent': 100,
                   'candidate_traffic_percent': 0, 'health_checked_before_deploy': True,
                   'tagged_candidate_health_checked': True,
-                  'guard_version': 'b4o-o6-stage-required-no-traffic-v1',
+                  'guard_version': 'b4o-o6-stage-required-no-traffic-v2',
                   'ask_calls': 0, 'ai_calls': 0}
       
       if __name__ == '__main__':
