@@ -52,10 +52,11 @@ steps:
       LIMITS = {'max_http_calls': 128, 'max_response_bytes': 2000000, 'max_total_bytes': 25000000, 'max_records': 10000, 'page_size': 100, 'timeout_seconds': 10.0, 'total_seconds': 60.0}
       SECRET_REFS = {
           'MM_APP_AUTHORITY_SECRET': {'name': 'mm-app-authority-v1', 'key': '2'},
-          'MM_BUBBLE_AUTHORITY_TOKEN': {'name': 'mm-bubble-authority-token-v1', 'key': '1'},
+          'MM_BUBBLE_AUTHORITY_TOKEN': {'name': 'mm-bubble-authority-token-v1', 'key': '2'},
       }
       LEGACY_OFF_SECRET_REFS = {
           'MM_APP_AUTHORITY_SECRET': {'name': 'mm-app-authority-v1', 'key': '1'},
+          'MM_BUBBLE_AUTHORITY_TOKEN': {'name': 'mm-bubble-authority-token-v1', 'key': '1'},
       }
       ENV_VALUES = {
           'MM_BUBBLE_AUTHORITY_BASE_URL': 'https://machinemind-ai.com/api/1.1/obj',
@@ -402,7 +403,7 @@ steps:
                   'unrelated_template_preserved': True, 'production_traffic_percent': 100,
                   'candidate_traffic_percent': 0, 'health_checked_before_deploy': True,
                   'tagged_candidate_health_checked': True,
-                  'guard_version': 'b4o-o6-stage-required-no-traffic-v2',
+                  'guard_version': 'b4o-o6-stage-required-no-traffic-v3',
                   'ask_calls': 0, 'ai_calls': 0}
       
       if __name__ == '__main__':
