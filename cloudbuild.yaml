@@ -20,8 +20,8 @@ steps:
         "europe-west1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/mm-ai-ingest/mm-ai-ingest-prod:$COMMIT_SHA"
       ]
 
-  # Deploy only after the OFF baseline has been checked. No secret values in source.
-  # This guard preserves the serving mode; it NEVER activates required mode.
+  # O6 staged activation: create a REQUIRED tagged revision with zero production traffic.
+  # The currently serving OFF revision remains at 100% until the later coordinated gate.
   - name: gcr.io/google.com/cloudsdktool/cloud-sdk
     id: deploy-authority-config-guard-off
     env:
@@ -31,7 +31,7 @@ steps:
     script: |
       #!/usr/bin/env python3
       """Build-time guard only; does not import or change MachineMind application code.
-      Activation remains a separate operation after acceptance of the isolated gate.
+      This stage creates a tagged REQUIRED candidate but leaves production traffic on OFF.
       No secret values are retrieved or printed. No automatic traffic rollback.
       """
       import copy
@@ -45,6 +45,7 @@ steps:
       import urllib.parse
       
       SERVICE = 'mm-ai-ingest-prod'
+      O6_TAG = 'o6-required'
       REGION = 'europe-west1'
       PROJECT = 'machinemind-ai-2a'
       SCHEMA = {'company_type': 'company', 'machine_type': 'machine', 'machine_company_field': 'company', 'deleted_false_or_blank': False, 'sources': [{'source_type': 'document', 'typename': 'document', 'company_field': 'company', 'machine_field': 'machine', 'deleted_field': 'is_deleted', 'parent_field': None, 'lifecycle': 'flag'}, {'source_type': 'procedure', 'typename': 'procedure', 'company_field': 'company', 'machine_field': 'machine', 'deleted_field': None, 'parent_field': None, 'lifecycle': 'record_exists'}, {'source_type': 'step', 'typename': 'step', 'company_field': None, 'machine_field': None, 'deleted_field': None, 'parent_field': 'procedure', 'lifecycle': 'record_exists'}, {'source_type': 'ps', 'typename': 'problemsolution', 'company_field': 'company', 'machine_field': 'machine', 'deleted_field': None, 'parent_field': None, 'lifecycle': 'record_exists'}, {'source_type': 'md_photo', 'typename': 'photo', 'company_field': 'company', 'machine_field': 'machine', 'deleted_field': 'is_deleted', 'parent_field': None, 'lifecycle': 'flag'}, {'source_type': 'md_video', 'typename': 'video', 'company_field': 'company', 'machine_field': 'machine', 'deleted_field': None, 'parent_field': None, 'lifecycle': 'record_exists'}]}
@@ -271,6 +272,20 @@ steps:
                           'HEALTH_IDENTITY_MISMATCH')
       
       
+      def tagged_url(service, tag, revision):
+          rows = service.get('status', {}).get('traffic', [])
+          matches = [row for row in rows if isinstance(row, dict) and
+                     row.get('tag') == tag and row.get('revisionName') == revision]
+          require(len(matches) == 1, 'O6_TAG_BINDING_MISSING')
+          url = matches[0].get('url')
+          parsed = urllib.parse.urlsplit(url) if isinstance(url, str) else None
+          require(parsed is not None and parsed.scheme == 'https' and
+                  re.fullmatch(r'[a-z0-9-]+(?:\.[a-z0-9-]+)*\.run\.app', parsed.netloc or '') and
+                  not parsed.path and not parsed.query and not parsed.fragment,
+                  'O6_TAG_URL_INVALID')
+          return url
+
+
       def validate_serving_baseline(before):
           """Validate the serving revision, not a failed, zero-traffic latest attempt.
       
@@ -337,6 +352,7 @@ steps:
           before = read_resource('services', SERVICE)
           prior = validate_serving_baseline(before)
           serving_mode = environment(template_spec(before)).get('MM_ASK_REQUEST_AUTHORITY', {}).get('value', 'off')
+          require(serving_mode == 'off', 'O6_STAGE_REQUIRES_OFF_BASELINE')
           baseline_revisions = revision_names()
           require(prior in baseline_revisions and
                   before.get('status', {}).get('latestCreatedRevisionName') in baseline_revisions,
@@ -348,8 +364,9 @@ steps:
           image = image_root+'@'+digest
           suffix = 'b'+build.replace('-', '')
           name = SERVICE+'-'+suffix
-          # Preserve the pre-deploy OFF mode; do not silently disable required mode.
-          values = dict(ENV_VALUES, COMMIT_SHA=commit, MM_INGEST_LEDGER_AUTO_DDL='0')
+          # Staged O6 candidate is REQUIRED, but it receives zero production traffic.
+          values = dict(ENV_VALUES, COMMIT_SHA=commit, MM_INGEST_LEDGER_AUTO_DDL='0',
+                        MM_ASK_REQUEST_AUTHORITY='required')
           env_arg = '^@^'+'@'.join(key+'='+value for key, value in values.items())
           refs = ','.join(key+'='+ref['name']+':'+ref['key'] for key, ref in SECRET_REFS.items())
           phase('RECHECK_BASELINE_BEFORE_DEPLOY')
@@ -358,7 +375,8 @@ steps:
           phase('DEPLOY_CANDIDATE_NO_TRAFFIC')
           gcloud('run', 'deploy', SERVICE, '--project='+PROJECT, '--region='+REGION,
                  '--platform=managed', '--allow-unauthenticated', '--image='+image,
-                 '--revision-suffix='+suffix, '--no-traffic', '--deploy-health-check', '--update-env-vars='+env_arg,
+                 '--revision-suffix='+suffix, '--no-traffic', '--tag='+O6_TAG,
+                 '--deploy-health-check', '--update-env-vars='+env_arg,
                  '--update-secrets='+refs, '--quiet')
           phase('VALIDATE_CANDIDATE_BEFORE_PROMOTION')
           revision = read_resource('revisions', name)
@@ -369,28 +387,26 @@ steps:
           validate_candidate(before, staged, revision, name, commit, image)
           require(traffic(staged) == {prior: 100}, 'TRAFFIC_CHANGED_BEFORE_VALIDATION')
           require(requested_traffic(staged) == {prior: 100}, 'REQUESTED_TRAFFIC_CHANGED_BEFORE_VALIDATION')
-          # Promote the EXACT verified revision, never whichever happens to be "latest".
-          print('CONFIG_GUARD_PASSED_BEFORE_PROMOTION', flush=True)
-          phase('PROMOTE_EXACT_CANDIDATE')
-          gcloud('run', 'services', 'update-traffic', SERVICE, '--project='+PROJECT,
-                 '--region='+REGION, '--to-revisions='+name+'=100', '--quiet')
-          phase('VALIDATE_AFTER_PROMOTION')
+          # O6 stage stops here: required candidate is tagged but production stays OFF.
+          candidate_env = environment(revision.get('spec', {}))
+          require(candidate_env.get('MM_ASK_REQUEST_AUTHORITY', {}).get('value') == 'required',
+                  'O6_CANDIDATE_NOT_REQUIRED')
+          tag_url = tagged_url(staged, O6_TAG, name)
+          phase('HEALTH_TAGGED_REQUIRED_CANDIDATE')
+          health(tag_url, commit, name)
           final = read_resource('services', SERVICE)
-          revision = read_resource('revisions', name)
-          final_revisions = revision_names()
-          require(final_revisions - baseline_revisions == {name},
-                  'CONCURRENT_OR_UNEXPECTED_REVISION')
-          validate_candidate(before, final, revision, name, commit, image)
-          require(traffic(final) == {name: 100}, 'FINAL_TRAFFIC_MISMATCH')
-          require(requested_traffic(final) == {name: 100}, 'FINAL_REQUESTED_TRAFFIC_MISMATCH')
-          phase('HEALTH_AFTER_PROMOTION')
-          health(final.get('status', {}).get('url'), commit, name)
-          return {'status': ('PASS_DEPLOY_B4L_CONFIG_GUARD_OFF' if serving_mode == 'off' else 'PASS_DEPLOY_B4O_CONFIG_GUARD_REQUIRED'), 'revision': name,
+          require(traffic(final) == {prior: 100}, 'O6_PRODUCTION_TRAFFIC_CHANGED')
+          require(requested_traffic(final) == {prior: 100}, 'O6_REQUESTED_TRAFFIC_CHANGED')
+          require(tagged_url(final, O6_TAG, name) == tag_url, 'O6_TAG_CHANGED')
+          return {'status': 'PASS_STAGE_B4O_REQUIRED_NO_TRAFFIC', 'revision': name,
                   'previous_revision': prior, 'commit_sha': commit, 'image_digest': digest,
-                  'authority_mode': serving_mode.upper(), 'config_checked_before_traffic': True,
-                  'unrelated_template_preserved': True, 'traffic_percent': 100,
-                  'health_checked_before_deploy': True, 'health_checked_after_promotion': True,
-                  'guard_version': 'b4o-e2e-mode-preserving-v1', 'ask_calls': 0, 'ai_calls': 0}
+                  'serving_authority_mode': 'OFF', 'candidate_authority_mode': 'REQUIRED',
+                  'tag': O6_TAG, 'tag_url': tag_url, 'config_checked_before_traffic': True,
+                  'unrelated_template_preserved': True, 'production_traffic_percent': 100,
+                  'candidate_traffic_percent': 0, 'health_checked_before_deploy': True,
+                  'tagged_candidate_health_checked': True,
+                  'guard_version': 'b4o-o6-stage-required-no-traffic-v1',
+                  'ask_calls': 0, 'ai_calls': 0}
       
       if __name__ == '__main__':
           try:
@@ -399,11 +415,11 @@ steps:
               print(json.dumps(report, sort_keys=True))
           except GuardError as exc:
               # Only locally generated error codes; no provider payload or secret values.
-              print(json.dumps({'status': 'FAIL_DEPLOY_B4L_CONFIG_GUARD_OFF', 'code': str(exc), 'phase': PHASE,
+              print(json.dumps({'status': 'FAIL_STAGE_B4O_REQUIRED_NO_TRAFFIC', 'code': str(exc), 'phase': PHASE,
                                 'automatic_rollback': False}))
               raise SystemExit(2)
           except Exception:
-              print(json.dumps({'status': 'FAIL_DEPLOY_B4L_CONFIG_GUARD_OFF', 'code': 'UNEXPECTED_ERROR', 'phase': PHASE,
+              print(json.dumps({'status': 'FAIL_STAGE_B4O_REQUIRED_NO_TRAFFIC', 'code': 'UNEXPECTED_ERROR', 'phase': PHASE,
                                 'automatic_rollback': False}))
               raise SystemExit(2)
 
