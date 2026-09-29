@@ -50,8 +50,11 @@ steps:
       SCHEMA = {'company_type': 'company', 'machine_type': 'machine', 'machine_company_field': 'company', 'deleted_false_or_blank': False, 'sources': [{'source_type': 'document', 'typename': 'document', 'company_field': 'company', 'machine_field': 'machine', 'deleted_field': 'is_deleted', 'parent_field': None, 'lifecycle': 'flag'}, {'source_type': 'procedure', 'typename': 'procedure', 'company_field': 'company', 'machine_field': 'machine', 'deleted_field': None, 'parent_field': None, 'lifecycle': 'record_exists'}, {'source_type': 'step', 'typename': 'step', 'company_field': None, 'machine_field': None, 'deleted_field': None, 'parent_field': 'procedure', 'lifecycle': 'record_exists'}, {'source_type': 'ps', 'typename': 'problemsolution', 'company_field': 'company', 'machine_field': 'machine', 'deleted_field': None, 'parent_field': None, 'lifecycle': 'record_exists'}, {'source_type': 'md_photo', 'typename': 'photo', 'company_field': 'company', 'machine_field': 'machine', 'deleted_field': 'is_deleted', 'parent_field': None, 'lifecycle': 'flag'}, {'source_type': 'md_video', 'typename': 'video', 'company_field': 'company', 'machine_field': 'machine', 'deleted_field': None, 'parent_field': None, 'lifecycle': 'record_exists'}]}
       LIMITS = {'max_http_calls': 128, 'max_response_bytes': 2000000, 'max_total_bytes': 25000000, 'max_records': 10000, 'page_size': 100, 'timeout_seconds': 10.0, 'total_seconds': 60.0}
       SECRET_REFS = {
-          'MM_APP_AUTHORITY_SECRET': {'name': 'mm-app-authority-v1', 'key': '1'},
+          'MM_APP_AUTHORITY_SECRET': {'name': 'mm-app-authority-v1', 'key': '2'},
           'MM_BUBBLE_AUTHORITY_TOKEN': {'name': 'mm-bubble-authority-token-v1', 'key': '1'},
+      }
+      LEGACY_OFF_SECRET_REFS = {
+          'MM_APP_AUTHORITY_SECRET': {'name': 'mm-app-authority-v1', 'key': '1'},
       }
       ENV_VALUES = {
           'MM_BUBBLE_AUTHORITY_BASE_URL': 'https://machinemind-ai.com/api/1.1/obj',
@@ -115,11 +118,12 @@ steps:
               env[item['name']] = item
           return env
       
-      def configuration(spec):
+      def configuration(spec, allow_legacy_off_secret=False):
           env = environment(spec)
           mode = env.get('MM_ASK_REQUEST_AUTHORITY')
           require(mode is None or (mode.get('value') in ('off', 'required') and 'valueFrom' not in mode),
                   'AUTHORITY_MODE_INVALID')
+          mode_value = mode.get('value', 'off') if isinstance(mode, dict) else 'off'
           for name, expected in ENV_VALUES.items():
               item = env.get(name, {})
               require('valueFrom' not in item and isinstance(item.get('value'), str),
@@ -136,8 +140,11 @@ steps:
                   require(value == expected, 'CONFIG_DIFF_'+name)
           for name, expected in SECRET_REFS.items():
               item = env.get(name, {})
-              require('value' not in item and
-                      item.get('valueFrom', {}).get('secretKeyRef') == expected,
+              actual = item.get('valueFrom', {}).get('secretKeyRef')
+              allowed = [expected]
+              if allow_legacy_off_secret and mode_value == 'off' and name in LEGACY_OFF_SECRET_REFS:
+                  allowed.append(LEGACY_OFF_SECRET_REFS[name])
+              require('value' not in item and actual in allowed,
                       'SECRET_REF_DIFF_'+name)
           return env
       
@@ -275,7 +282,7 @@ steps:
           require(before.get('metadata', {}).get('name') == SERVICE, 'BASELINE_SERVICE_NAME_MISMATCH')
           require(not before.get('metadata', {}).get('deletionTimestamp'), 'BASELINE_SERVICE_DELETING')
           reconciled(before, 'BASELINE_SERVICE_RECONCILING')
-          configuration(template_spec(before))
+          configuration(template_spec(before), allow_legacy_off_secret=True)
           prior = before.get('status', {}).get('latestReadyRevisionName')
           require(isinstance(prior, str) and prior.startswith(SERVICE+'-'),
                   'BASELINE_READY_REVISION_MISSING')
@@ -286,7 +293,7 @@ steps:
           require(not previous.get('metadata', {}).get('deletionTimestamp'), 'BASELINE_REVISION_DELETING')
           reconciled(previous, 'BASELINE_REVISION_RECONCILING')
           ready(previous, 'BASELINE_TRAFFIC_REVISION_NOT_READY')
-          prior_env = configuration(previous.get('spec', {}))
+          prior_env = configuration(previous.get('spec', {}), allow_legacy_off_secret=True)
           require(environment(template_spec(before)).get('MM_ASK_REQUEST_AUTHORITY', {}).get('value', 'off') ==
                   prior_env.get('MM_ASK_REQUEST_AUTHORITY', {}).get('value', 'off'),
                   'BASELINE_AUTHORITY_MODE_DIFFERS_FROM_SERVING')
