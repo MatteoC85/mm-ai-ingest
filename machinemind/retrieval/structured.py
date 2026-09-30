@@ -1284,11 +1284,16 @@ def read_structured_dense_chunk_evidence(*, scope: ChunkReadScope,
 
 
 def _legacy_step_fallback_rows(*, company_id: str, machine_id: str, text_chars: int,
-        runtime: V12ExpandPrimaryProcedureStepsRuntime, _page_capture: _PageReadCapture | None = None) -> list[tuple]:
+        runtime: V12ExpandPrimaryProcedureStepsRuntime, _page_capture: _PageReadCapture | None = None,
+        _complete_row_limit: int | None = None) -> list[tuple]:
     _db_conn = runtime._db_conn
     ASK_STRUCTURED_DIRECT_SCAN_LIMIT = runtime.ASK_STRUCTURED_DIRECT_SCAN_LIMIT
     binding_columns = PAGE_BINDING_COLUMNS if _page_capture is not None else ""
     scan_limit = max(500, int(ASK_STRUCTURED_DIRECT_SCAN_LIMIT or 1200))
+    if _complete_row_limit is not None:
+        if _page_capture is None:
+            raise PageReadBindingError("complete fallback requires typed allocation capture")
+        scan_limit = _complete_row_limit
     rows: list[tuple] = []
     try:
         conn = _db_conn()
@@ -1312,7 +1317,8 @@ def _legacy_step_fallback_rows(*, company_id: str, machine_id: str, text_chars: 
                           page_number
                         LIMIT %s;
                         """,
-                    (text_chars, company_id, machine_id, machine_id, scan_limit),
+                    (text_chars, company_id, machine_id, machine_id,
+                     scan_limit + 1 if _complete_row_limit is not None else scan_limit),
                 )
                 rows = cur.fetchall()
                 if _page_capture is not None:
@@ -1328,11 +1334,14 @@ def _legacy_step_fallback_rows(*, company_id: str, machine_id: str, text_chars: 
 
 
 def read_step_fallback_page_evidence(*, scope: ChunkReadScope, limits: ChunkEvidenceLimits,
-        runtime: V12ExpandPrimaryProcedureStepsRuntime) -> PageEvidenceRead:
+        runtime: V12ExpandPrimaryProcedureStepsRuntime, require_complete: bool=False) -> PageEvidenceRead:
     require_machine_scope(scope)
     capture = _PageReadCapture(scope, limits, "step_fallback_pages", snippet_chars=0)
     rows = _legacy_step_fallback_rows(company_id=scope.company_id, machine_id=scope.machine_id,
-        text_chars=max(800, int(runtime.ASK_STRUCTURED_DIRECT_TEXT_CHARS or 5000)), runtime=runtime, _page_capture=capture)
+        text_chars=(limits.adapter.max_text_chars if require_complete else
+            max(800, int(runtime.ASK_STRUCTURED_DIRECT_TEXT_CHARS or 5000))),
+        runtime=runtime, _page_capture=capture,
+        _complete_row_limit=limits.assembly.max_occurrences if require_complete else None)
     pages = [{"bubble_document_id": str(key or ""), "machine_id": str(mid or ""),
               "page_number": page, "text": text} for key, mid, page, text in rows]
     return capture.finish_pages(pages)

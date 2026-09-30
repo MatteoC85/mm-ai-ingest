@@ -55,7 +55,7 @@ class CurrentFileReader:
                 runtime=self.legacy, allow_structured=allow_structured)
             observations.extend(old.observations)
         spec = a.provider.schema.source(SourceType.DOCUMENT)
-        for source in docs:
+        def read_current(source):
             raw = _row(a.provider.directory.get(spec.typename, source.source_id), source.source_id)
             if not a.provider._active(raw, spec):
                 raise AuthorityError("AUTHORITY_FILE_REVOKED", 403)
@@ -70,9 +70,19 @@ class CurrentFileReader:
             if url is not None and len(url) > limits.adapter.max_aux_chars:
                 raise AuthorityError("AUTHORITY_FILE_REFERENCE_TOO_LARGE")
             key = storage_key(source)
-            observations.append(FileReferenceObservation(source,
+            return FileReferenceObservation(source,
                 Provenance(VERSION, canonical_json(("bubble",spec.typename,company,source.source_id,spec.file_field))),
-                LinkTarget("bubble_sources", key),company,key,url))
+                LinkTarget("bubble_sources", key),company,key,url)
+        # Each document is still freshly read and independently validated.
+        # Join a bounded batch completely before exposing any file reference;
+        # _read_batch retains caller order and propagates any member failure.
+        # No file/grant is cached across calls or authority fences.
+        from ..ask.phase_trace import span
+        with span("authority.files"):
+            for start in range(0, len(docs), 6):
+                batch = docs[start:start + 6]
+                observations.extend(a.provider._read_batch(tuple(
+                    lambda source=source: read_current(source) for source in batch)))
         (a.check(a.payload) if a.admission is None else a.admission.check())
         obs = tuple(observations)
         return FileReferenceRead(scope,sources,obs,limits,

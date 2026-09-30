@@ -22,6 +22,8 @@ from typing import Any, Callable
 
 from assistant_core_v2 import AssistantCoreHooks, AssistantCoreV2
 from . import execution, validation
+from . import phase_trace
+from .request_completion import current as _completion, synthesis_review_reserve
 from .acquisition import AskAcquisitionFactories, bind_acquisition
 from ..evidence.ask_input import apply_ask_evidence_input, ask_request_key
 from ..evidence.contracts import EvidenceContractError, SourceIdentity
@@ -174,8 +176,14 @@ def run_core_request(request: Any, *, core: AssistantCoreV2,
     def invoke(callback, req, /, *args, **kwargs):
         nonlocal fault
         check(req)
+        completion = _completion()
+        if completion is not None:
+            completion.budget.ensure_time(0.0)
         try:
-            return callback(*args, **kwargs)
+            result = callback(*args, **kwargs)
+            if completion is not None:
+                completion.budget.ensure_time(0.0)
+            return result
         except EvidenceContractError as exc:
             if evidence is not None:
                 fault = exc
@@ -248,20 +256,24 @@ def run_core_request(request: Any, *, core: AssistantCoreV2,
         acq = (invoke(bind_acquisition, request, request, factories=acquisition,
                       invoke=invoke) if acquisition is not None else None)
 
+        @phase_trace.traced("core.neutral")
         def neutral(req):
             callback = acq.neutral if acq is not None else hooks.retrieve_neutral
             return admit(req, invoke(callback, req, req), None,
                          "core.retrieve.output")
 
+        @phase_trace.traced("core.router")
         def route(req, data):
             data = admit(req, data, None, "core.route.input")
             return invoke(hooks.route_semantically, req, req, data)
 
+        @phase_trace.traced("core.refine")
         def refine(req, data, dec):
             data = admit(req, data, dec, "core.refine.input")
             return admit(req, invoke(acq.refine if acq is not None else hooks.refine_retrieval, req, req, data, dec),
                          dec, "core.refine.output")
 
+        @phase_trace.traced("core.prepare")
         def prepare(req, data, dec):
             data = admit(req, data, dec, "core.prepare.input")
             out = invoke(acq.prepare if acq is not None else hooks.prepare_evidence, req, req, data, dec)
@@ -272,22 +284,27 @@ def run_core_request(request: Any, *, core: AssistantCoreV2,
                                              "core.prepare.output")
             return out
 
+        @phase_trace.traced("core.admit")
         def prepare_ask(req, data, dec):
             check(req)
             result = er.evidence_admission(req, data, dec, "core.prepare_ask.input")
             check(req)
             return result
 
+        @phase_trace.traced("core.synthesis")
         def synthesize(req, data, dec):
             if not execution._ask_path(req, dec):
                 return invoke(hooks.synthesize_ask, req, req, data, dec)
-            return invoke(execution.synthesize_ask, req, req, data, dec, runtime=er)
+            with synthesis_review_reserve(required=bool(er._assistant_core_should_semantic_verify_answer(dec))):
+                return invoke(execution.synthesize_ask, req, req, data, dec, runtime=er)
 
+        @phase_trace.traced("core.validate")
         def validate(response, req, data, dec):
             if not execution._ask_path(req, dec):
                 return invoke(hooks.validate_response, req, response, req, data, dec)
             return invoke(validation.validate_response, req, response, req, data, dec, runtime=vr)
 
+        @phase_trace.traced("core.repair")
         def repair(response, req, data, dec):
             if not execution._ask_path(req, dec):
                 return invoke(hooks.repair_response, req, response, req, data, dec)
@@ -318,7 +335,7 @@ def run_core_request(request: Any, *, core: AssistantCoreV2,
         check(request)
         if evidence is not None:
             if evidence.finalize is not None:
-                invoke(evidence.finalize, request, request, result)
+                phase_trace.call("core.output", invoke, evidence.finalize, request, request, result)
             out = dict(result)
             collections = {k:out[k] for k in ("candidates", "citations") if k in out}
             checked = admit(request, collections, None, "core.output.collections")

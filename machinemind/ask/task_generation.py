@@ -82,6 +82,7 @@ class TaskSynthesisRuntime:
     manual_filter: families.V12FilterManualSupportToSelectedBundleRuntime
     roles: families.V12MarkStructuredRolesRuntime
     copy_fn: Any = None
+    preserve_complete: bool = False
 
 def structured_ask(
     *,
@@ -373,10 +374,12 @@ def structured_ask(
         grounded_points=grounded_points,
         response_language=response_language,
         q=q,
+        **({"preserve_complete": True} if runtime.preserve_complete else {}),
     )
     sectioned_answer = _procedure_ui_model_to_text(
         answer_ui_model,
         response_language=response_language,
+        **({"preserve_complete": True} if runtime.preserve_complete else {}),
     )
     synthesis_grounded = bool(model_answer and model_citations)
     answer = sectioned_answer or model_answer
@@ -388,12 +391,13 @@ def structured_ask(
         c for c in (model_citations or [])
         if isinstance(c, dict) and _v12_evidence_role(c) not in {"procedure", "step"}
     ]
+    ordered_citations = _procedure_ui_order_citations(
+        list(ui_structured) + list(manual_support) + model_extras)
+    citation_cap = max(1, int(ASK_UI_STRUCTURED_MAX_CITATIONS or 14))
+    if runtime.preserve_complete and has_procedure_context:
+        citation_cap = max(citation_cap, len(ordered_citations))
     final_citations = _v12_curate_response_items_for_ui(
-        _procedure_ui_order_citations(
-            list(ui_structured) + list(manual_support) + model_extras
-        ),
-        max_items=max(1, int(ASK_UI_STRUCTURED_MAX_CITATIONS or 14)),
-    )
+        ordered_citations, max_items=citation_cap)
     if not final_citations:
         return None
 
@@ -927,6 +931,8 @@ class TaskGenerationEvidence(GenericGenerationEvidence):
             raise GenerationEvidenceError("explicit task synthesis runtime required")
         self.tasks = tasks
         self.drafts, self.raw_refs, self.inventory_refs = {}, {}, {}
+        self._complete_pages = {}
+        self._ambiguous_step_sources = set()
         self.all_handles, self.validation_handles = (), ()
         self.model_handles = None
         self.kind = None
@@ -1007,6 +1013,12 @@ class TaskGenerationEvidence(GenericGenerationEvidence):
         receipt = self.session.inspect_read(request=self.request, handle=registered.read,
                                            current_allowed_sources=self.current())
         pages = self.records(registered.records)
+        # SQL LEFT(text, n) cannot prove whether exactly n characters were the
+        # whole body. Refuse the ambiguous boundary; never certify a truncated
+        # instruction. This guard applies only to the protected ASK adapter.
+        if any(len(o.text_projection) >= o.projection_chars
+               for o in receipt.pages.observations):
+            raise self.tasks._V13BudgetExceeded("procedure_evidence_projection_capacity")
         self.all_handles += registered.records
         out, seen = [], set()
         for relation in receipt.relations:
@@ -1016,6 +1028,7 @@ class TaskGenerationEvidence(GenericGenerationEvidence):
                 raise GenerationEvidenceError("parent relation has no observed page")
             item, handle = pages[index], registered.records[index]
             raw = dict(item.record)
+            self._retain_complete_page(handle, item)
             if kind == "parents":
                 key = (relation.child_source_key, relation.parent_source_key)
                 if key in seen:
@@ -1044,7 +1057,10 @@ class TaskGenerationEvidence(GenericGenerationEvidence):
             if args.get("child_source_keys") != keys or set(args) != {"child_source_keys", "text_chars"}:
                 raise GenerationEvidenceError("parent read anchor drift")
             if not handles: return []
-            registered = self.sources.parent_procedure_pages(step_handles=handles, text_chars=args["text_chars"])
+            _, limits = self.session.read_contract(request=self.request,
+                current_allowed_sources=self.current())
+            registered = self.sources.parent_procedure_pages(step_handles=handles,
+                text_chars=limits.adapter.max_text_chars)
             return self._relation_rows(registered, "parents")
         return self.invoke(work, self.request)
 
@@ -1055,8 +1071,10 @@ class TaskGenerationEvidence(GenericGenerationEvidence):
             source = self.records((handle,))[0].context.source
             if args.get("parent_source_key") != storage_key(source) or set(args) != {"parent_source_key", "text_chars"}:
                 raise GenerationEvidenceError("related step anchor drift")
+            _, limits = self.session.read_contract(request=self.request,
+                current_allowed_sources=self.current())
             return self._relation_rows(self.sources.related_step_pages(
-                procedure_handle=handle, text_chars=args["text_chars"]), "steps")
+                procedure_handle=handle, text_chars=limits.adapter.max_text_chars), "steps")
         return self.invoke(work, self.request)
 
     def fallback_rows(self, **parameters):
@@ -1065,10 +1083,16 @@ class TaskGenerationEvidence(GenericGenerationEvidence):
             expected = max(800, int(self.tasks.expansion.ASK_STRUCTURED_DIRECT_TEXT_CHARS or 5000))
             if args != {"text_chars": expected}:
                 raise GenerationEvidenceError("step fallback projection drift")
-            registered = self.sources.step_fallback_pages()
+            registered = self.readers.read("read_step_fallback_page_evidence",
+                require_complete=True)
+            receipt = self.session.inspect_read(request=self.request,
+                handle=registered.read, current_allowed_sources=self.current())
+            if any(len(o.text_projection) >= o.projection_chars for o in receipt.observations):
+                raise self.tasks._V13BudgetExceeded("procedure_evidence_projection_capacity")
             result = []
             for handle, item in zip(registered.records, self.records(registered.records)):
                 raw = item.record
+                self._retain_complete_page(handle, item)
                 row = (raw["bubble_document_id"], raw["machine_id"], raw["page_number"], raw["text"])
                 self._bounded(row)
                 self.raw_refs[id(row)] = (row, deepcopy(row), handle)
@@ -1112,6 +1136,12 @@ class TaskGenerationEvidence(GenericGenerationEvidence):
             handles = self.handles([preferred, secondary])
             inputs = self.records(handles)
             same_source = inputs[0].context.source == inputs[1].context.source
+            if not same_source:
+                # The legacy ranker uses an ordinal as a representation key.
+                # Distinct admitted Step identities have no proof of being the
+                # same Step, even when their text happens to match. Let ranking
+                # finish unchanged, then reject only if this family is chosen.
+                self._ambiguous_step_sources.update(item.context.source for item in inputs)
             # Decide from the admitted identities BEFORE calling the legacy
             # overlay. For a cross-source ordinal collision this is a selection,
             # not a composite source. Pass only the secondary's declared ranking
@@ -1157,7 +1187,79 @@ class TaskGenerationEvidence(GenericGenerationEvidence):
 
     def _curate(self, **parameters):
         runtime = replace(self.tasks.curation, _v12_choose_primary_procedure_family=self._family)
-        return families.v12_curate_structured_sources(**parameters, runtime=runtime, trace=self)
+        selected = families.v12_curate_structured_sources(**parameters, runtime=runtime,
+            trace=self, preserve_complete=True)
+        if not any(self.tasks._v12_evidence_role(r) == "procedure"
+                   and "_v10_5_family_debug" in r for r in selected):
+            return selected
+        family = [r for r in selected if self.tasks._v12_evidence_role(r) in {"procedure", "step"}]
+        if not family:
+            return selected
+        self._check_family_ambiguity(family)
+        # Keep the semantic family/Step selection unchanged. Replace only a
+        # selected truncated retrieval representation with its explicit full
+        # relation-page observation, preserving both positional parents.
+        steps = [r for r in family if self.tasks._v12_evidence_role(r) == "step"]
+        if steps:
+            parents = [r for r in family if self.tasks._v12_evidence_role(r) == "procedure"]
+            if any(self.records(self.handles([r]))[0].context.source not in self._complete_pages
+                   for r in parents):
+                keys = list(dict.fromkeys(storage_key(i.context.source)
+                    for i in self.records(self.handles(steps))))
+                self.parent_rows(steps, company_id=self.request.company_id,
+                    machine_id=self.request.machine_id, child_source_keys=keys,
+                    text_chars=max(800, int(self.tasks.family.ASK_STRUCTURED_DIRECT_TEXT_CHARS or 5000)))
+        family_objects = {id(row) for row in family}
+        return [self._complete_family_view(row) if id(row) in family_objects else row for row in selected]
+
+    def _check_family_ambiguity(self, rows):
+        for item in self.records(self.handles(rows)):
+            if item.context.source in self._ambiguous_step_sources:
+                raise GenerationEvidenceError("selected procedure has distinct Steps with the same ordinal")
+
+    def _retain_complete_page(self, handle, item):
+        """Retain an already-admitted typed page handle, never an ID grant."""
+        raw = item.record
+        source = item.context.source
+        if source.source_type not in {SourceType.PROCEDURE, SourceType.STEP}:
+            raise GenerationEvidenceError("procedure page has unexpected source type")
+        previous = self._complete_pages.get(source)
+        if previous is not None:
+            prior = self.records((previous,))[0].record
+            if (prior.get("page_number") != raw.get("page_number")
+                    or prior.get("text") != raw.get("text")):
+                raise GenerationEvidenceError("procedure source changed or has ambiguous pages")
+        self._complete_pages[source] = handle
+
+    def _complete_family_view(self, row):
+        selected = self.handles([row])[0]
+        original = self.records((selected,))[0]
+        full = self._complete_pages.get(original.context.source)
+        if full is None:
+            # Legacy data without a canonical relation cannot prove a complete
+            # Procedure body. Keep the existing admission, never fabricate a
+            # full page by extending its snippet.
+            raise GenerationEvidenceError("selected procedure source lacks complete page observation")
+        page = self.records((full,))[0]
+        if page.context.source != original.context.source:
+            raise GenerationEvidenceError("complete page belongs to another selected source")
+        text = str(page.record.get("text") or "")
+        if not text:
+            raise GenerationEvidenceError("complete procedure page has no body")
+        if (row.get("chunk_full") == text and row.get("page_from") == page.record["page_number"]
+                and row.get("page_to") == page.record["page_number"]):
+            return row
+        view = deepcopy(row)
+        view.pop("chunk_index", None)
+        view["page_from"] = view["page_to"] = page.record["page_number"]
+        view["chunk_full"] = text
+        if "text" in view:
+            view["text"] = text
+        handle = self.session.derive_batch(request=self.request,
+            views=(((selected, full), view),),
+            operation=TASK_GENERATION_VERSION + ":complete-family-page",
+            current_allowed_sources=self.current())[0]
+        return self._remember(view, handle)
 
     def _direct(self, **parameters):
         def work():
@@ -1186,7 +1288,30 @@ class TaskGenerationEvidence(GenericGenerationEvidence):
     def _sources_block(self, rows, **parameters):
         def work():
             self.model_handles = self.handles(rows)
-            value = self.tasks._v13_sources_block(rows, **parameters)
+            procedural = any(self.tasks._v12_evidence_role(row) in {"procedure", "step"}
+                             for row in rows)
+            if procedural:
+                cap = parameters.get("max_context_chars")
+                if type(cap) is not int or cap < 1:
+                    raise GenerationEvidenceError("explicit procedure context capacity required")
+                # Render the SAME source block once, using the already-bounded
+                # session allocation as a construction bound. The heuristic
+                # display/context prefix cannot cut a selected family. The
+                # unchanged model ledger reserves the complete prompt cost
+                # before dispatch and keeps the original output-token ceiling.
+                _, limits = self.session.read_contract(request=self.request,
+                    current_allowed_sources=self.current())
+                build_cap = limits.legacy.max_bytes
+                value = self.tasks._v13_sources_block(rows,
+                    **{**parameters, "max_context_chars": build_cap})
+                if len(value) >= build_cap or len(value.encode("utf-8")) > build_cap:
+                    raise self.tasks._V13BudgetExceeded("procedure_evidence_context_capacity")
+                for row in rows:
+                    cid = str(row.get("citation_id") or "").strip()
+                    if not cid or ("[" + cid + "]") not in value:
+                        raise GenerationEvidenceError("procedure source omitted from model context")
+            else:
+                value = self.tasks._v13_sources_block(rows, **parameters)
             self.handles(rows)
             if not isinstance(value, str):raise GenerationEvidenceError("task sources must be text")
             return value
@@ -1286,7 +1411,7 @@ class TaskGenerationEvidence(GenericGenerationEvidence):
             if language!=self.request.response_language:raise GenerationEvidenceError("task UI language drift")
             self.rendered=self.handles(response["citations"])
             result=self.runtime._finalize_ask_response_for_ui(response,language=language,
-                citation_copy_fn=self._copy_citation)
+                citation_copy_fn=self._copy_citation, preserve_complete=True)
             self.handles(response["citations"])
             self.rendered=self.handles(result["citations"])
             for row in result.get("rg_links",[]):
@@ -1298,7 +1423,7 @@ class TaskGenerationEvidence(GenericGenerationEvidence):
 
     def _bound_runtime(self):
         t=self.tasks
-        return replace(t,copy_fn=self.copy,_v13_merge_candidates=self.merge_candidates,
+        return replace(t,copy_fn=self.copy,preserve_complete=True,_v13_merge_candidates=self.merge_candidates,
             _v12_curate_structured_sources=lambda **kw:self.invoke(self._curate,self.request,**kw),
             _v12_mark_structured_roles=lambda rows:families.v12_mark_structured_roles(rows,runtime=t.roles,trace=self),
             _v12_select_response_steps=lambda **kw:t._v12_select_response_steps(**kw,trace=self),
@@ -1352,5 +1477,7 @@ class TaskGenerationEvidence(GenericGenerationEvidence):
         finally:
             self.active=False
             self.refs.clear();self.link_refs.clear();self.drafts.clear();self.raw_refs.clear();self.inventory_refs.clear()
+            self._complete_pages.clear()
+            self._ambiguous_step_sources.clear()
             self.all_handles=self.input_handles=self.validation_handles=()
             self.retrieval=self.retrieval_snapshot=None

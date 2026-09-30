@@ -12,6 +12,8 @@ import json
 import math
 from collections.abc import Callable
 from typing import Any, Optional, Type
+from machinemind.ask.phase_trace import span as _phase_span
+from machinemind.ask.request_completion import provider_timeout as _provider_timeout
 
 PostFn = Callable[..., Any]
 BudgetResolver = Callable[[], Any]
@@ -63,14 +65,25 @@ def response_text(data: dict) -> str:
 
 def _send_json(*, url: str, headers: dict, payload: dict, timeout: int,
                post_fn: PostFn, budget=None, call_index: Optional[int] = None,
-               embedding: bool = False, cache_hits: int = 0) -> dict:
+               embedding: bool = False, cache_hits: int = 0, purpose: str = "") -> dict:
     """One reservation, one HTTP dispatch. Never perform transparent HTTP retries.
 
     Usage is reconciled before content parsing/refusal/status checks. Any outcome
     after dispatch without usable usage stays uncertain. Closing a client timeout
     does not prove the provider performed no work.
     """
+    with _phase_span("provider.embedding" if embedding else "provider.llm"):
+        return _send_json_attempt(url=url, headers=headers, payload=payload,
+            timeout=timeout, post_fn=post_fn, budget=budget, call_index=call_index,
+            embedding=embedding, cache_hits=cache_hits, purpose=purpose)
+
+
+def _send_json_attempt(*, url, headers, payload, timeout, post_fn, budget,
+                      call_index, embedding, cache_hits, purpose):
     try:
+        # Recheck after payload/reservation work, before dispatch. If no time
+        # remains, the existing not_sent receipt releases only unsent liability.
+        timeout = _provider_timeout("embedding" if embedding else purpose, timeout)
         if budget is not None:
             budget.mark_dispatched(call_index, embedding=embedding)
         response = post_fn(url, headers=headers, json=payload, timeout=timeout, allow_redirects=False)
@@ -121,6 +134,7 @@ def embed_texts(texts: list[str], *, timeout: int = 60, api_key: str, model: str
         if before_dispatch is not None:
             before_dispatch()
         request_timeout = max(1, int(timeout or 60))
+        request_timeout = _provider_timeout("embedding", request_timeout)
         call_index = None
         if budget is not None:
             request_timeout, call_index = budget.reserve_embedding(model=model, texts=missing, requested_timeout=request_timeout)
@@ -172,6 +186,7 @@ def _chat_response(messages: list[dict], *, model: str, json_schema: Optional[di
         payload["response_format"] = {"type": "json_schema", "json_schema": json_schema}
     call_index = None
     if budget is not None:
+        timeout = _provider_timeout(purpose, timeout)
         timeout, cap, call_index = budget.reserve_call(model=model, purpose=purpose, requested_timeout=timeout,
                                                       max_output_tokens=2000 if max_output_tokens is None else max_output_tokens, messages=messages,
                                                       request_payload=payload)
@@ -181,7 +196,8 @@ def _chat_response(messages: list[dict], *, model: str, json_schema: Optional[di
             raise ValueError("Invalid output limit")
         payload["max_completion_tokens"] = int(max_output_tokens)
     data = _send_json(url=url, headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                      payload=payload, timeout=timeout, post_fn=post_fn, budget=budget, call_index=call_index)
+                      payload=payload, timeout=timeout, post_fn=post_fn, budget=budget, call_index=call_index,
+                      purpose=purpose)
     return data, budget, call_index
 
 
@@ -274,13 +290,15 @@ def responses_json(messages: list[dict], *, model: str, json_schema: dict, effor
                "safety_identifier": safety_identifier_fn(company_id)}
     if reasoning_mode:
         payload["reasoning"]["mode"] = reasoning_mode
+    timeout = _provider_timeout(purpose, timeout)
     timeout, cap, index = budget.reserve_call(model=model, purpose=purpose, requested_timeout=timeout,
                                               max_output_tokens=max_output_tokens, messages=messages,
                                               request_payload=payload)
     payload["max_output_tokens"] = cap
     try:
         data = _send_json(url=url, headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                          payload=payload, timeout=timeout, post_fn=post_fn, budget=budget, call_index=index)
+                          payload=payload, timeout=timeout, post_fn=post_fn, budget=budget, call_index=index,
+                          purpose=purpose)
         status = str(data.get("status") or "completed").lower()
         if status != "completed":
             raise RuntimeError(f"OpenAI Responses status={status}")

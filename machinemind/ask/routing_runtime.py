@@ -10,10 +10,42 @@ from __future__ import annotations
 from contextvars import ContextVar
 from copy import deepcopy
 import math
+import re
 import time
 
 VERSION = "ask-router-low-accounting-v1"
 _ACTIVE = ContextVar("mm_protected_ask_routing_runtime", default=None)
+
+
+def _safe_name(value):
+    return value if (type(value) is str and len(value) <= 128
+        and re.fullmatch(r"[A-Za-z0-9_.:-]+", value)) else "unknown"
+
+
+def _provider_attempts(ledger):
+    """Safe accounting/timing projection; no prompts, IDs or exception messages."""
+    result = []
+    for kind, rows in (("llm", ledger.get("calls", [])), ("embedding", ledger.get("embeddings", []))):
+        for row in rows[:32]:
+            if type(row) is not dict:
+                continue
+            item = {"kind": kind, "purpose": _safe_name(row.get("purpose", "embedding")),
+                    "model": _safe_name(row.get("model")),
+                    "accounting_state": _safe_name(row.get("accounting_state")),
+                    "failed": row.get("failed") is True,
+                    "dispatched": row.get("dispatched") is True}
+            for key in ("started_at_elapsed_seconds", "completed_at_elapsed_seconds",
+                        "timeout_seconds", "max_output_tokens", "reserved_input_tokens",
+                        "input_tokens", "output_tokens", "reasoning_tokens",
+                        "reserved_cost_usd", "estimated_cost_usd"):
+                value = row.get(key)
+                if type(value) in (int, float) and math.isfinite(value) and value >= 0:
+                    item[key] = value
+            start, end = item.get("started_at_elapsed_seconds"), item.get("completed_at_elapsed_seconds")
+            if start is not None and end is not None:
+                item["reservation_through_outcome_seconds"] = round(max(0.0, end - start), 6)
+            result.append(item)
+    return result
 
 
 def accounting_state(meta: dict) -> dict:
@@ -83,6 +115,7 @@ class ProtectedExecution:
             "elapsed_sync_seconds": round(max(0.0, time.monotonic() - self.started), 3),
             "timing_scope": "protected_sync_entry_to_after_final_authority_checks",
             "accounting": accounting_state(ledger), "router_attempts": attempts,
+            "provider_attempts": _provider_attempts(ledger),
             "router_fallback_used": len(router) > 1,
             "end_user_privacy_certified": False}}
         return out

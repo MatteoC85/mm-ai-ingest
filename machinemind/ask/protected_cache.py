@@ -41,7 +41,7 @@ from ..retrieval.document_readers import (FetchDocumentFileMapRuntime,
 from ..retrieval.supplemental_evidence import storage_key
 from ..infrastructure import semantic_cache
 
-PROTECTED_CACHE_VERSION = "ask-canonical-exact-cache-p6b4o-procedure-review-v5"
+PROTECTED_CACHE_VERSION = "ask-canonical-exact-cache-phase6-closure-v6"
 ARTIFACT_KEY = "_mm_canonical_cache_artifact"
 MAX_ARTIFACT_BYTES = 2 * 1024 * 1024
 MAX_DEPENDENCIES = 8192
@@ -157,6 +157,15 @@ class ProtectedCacheOwner:
     def _version(self):
         value = self.cache["_v13_get_knowledge_version"](self.scope.company_id)
         return value if type(value) is int and value > 0 else 0
+
+    def _render_expected(self, response):
+        # Match request_flow's protected renderer exactly. Cache proofs from
+        # the preceding (truncating) policy cannot cross the new namespace.
+        # Unowned legacy callers retain their original callback contract.
+        from .request_completion import current
+        options = {"preserve_complete": True} if current() is not None else {}
+        return self.flow._assistant_ui_finalize_response(
+            response, language=self._context["language"], **options)
 
     def _set_context(self, parameters):
         self.check()
@@ -347,8 +356,7 @@ class ProtectedCacheOwner:
             self._hit_dependencies = None
             return None
         # Exact pure rendering expected at the cache-return branch of run_sync.
-        self._hit_expected = self.flow._assistant_ui_finalize_response(deepcopy(result),
-                                                     language=self._context["language"])
+        self._hit_expected = self._render_expected(deepcopy(result))
         self._mode = "hit"
         return result
 
@@ -364,9 +372,8 @@ class ProtectedCacheOwner:
         else:
             expected = self._hit_expected
             if expected is None and self._observed is not None:
-                expected = self.flow._assistant_ui_finalize_response(
-                    self.flow._assistant_core_clear_unsupported_sources(deepcopy(self._observed)),
-                    language=self._context["language"])
+                expected = self._render_expected(
+                    self.flow._assistant_core_clear_unsupported_sources(deepcopy(self._observed)))
             if expected is None or _flow_view(response) != _flow_view(expected):
                 self._fail("AUTHORITY_CACHE_RESPONSE_CHANGED")
             out = self.source_owner.final(response, _refresh_current=False)

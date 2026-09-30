@@ -503,6 +503,7 @@ def v12_curate_structured_sources(
     model_used: Optional[list[dict]] = None,
     runtime: V12CurateStructuredSourcesRuntime,
     trace=None,
+    preserve_complete: bool = False,
 ) -> list[dict]:
     """Keep one coherent procedure family and remove unrelated P&S/steps."""
     _copy_candidate = dict if trace is None else trace.copy
@@ -599,6 +600,11 @@ def v12_curate_structured_sources(
             extras.append(cc)
 
     max_structured = max(12, int(ASK_UI_STRUCTURED_MAX_CITATIONS or 14) - max(1, int(ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_MAX_ITEMS or 2)))
+    # Protected ASK binds this option explicitly. A selected family is an
+    # indivisible answer contract; presentation slots must not remove its tail.
+    # The request-owned evidence/session allocation limits still bound inputs.
+    if preserve_complete:
+        max_structured = max(max_structured, 1 + len(steps) + len(extras))
     return _dedup_citations_preserve_order([primary] + steps + extras, max_items=max_structured)
 
 
@@ -752,5 +758,4 @@ def v12_mark_structured_roles(citations: list[dict], *, runtime: V12MarkStructur
         cc["ask_structured_direct"] = True
         out.append(cc)
     return out
-
 

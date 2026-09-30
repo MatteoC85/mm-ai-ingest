@@ -189,6 +189,7 @@ def protected_call(payload, service_secret, *, authorized: AuthorizedCall,
     if authorized.admission is not None:
         result["meta"]["request_authority"]["admission_policy"] = "request-local-observed-source-fences-v2"
         result["meta"]["request_authority"]["remote_fence_count"] = len(authorized.admission.fences)
+        result["meta"]["request_authority"].update(authorized.admission.summary())
     return result
 
 

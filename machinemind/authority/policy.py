@@ -245,19 +245,26 @@ class BubbleAuthority:
                     result.add(source)
         # A source cannot keep its former tenant permission after its Machine
         # moves Company or is removed. This catalog is independent of retrieval.
-        machine_rows = self.directory.search(self.schema.machine_type, ({
-            "key": self.schema.machine_company_field, "constraint_type": "equals",
-            "value": scope.company_id},))
-        if type(machine_rows) is not tuple:
-            raise AuthorityError("AUTHORITY_RESPONSE_INVALID")
-        machines = set()
-        for raw in machine_rows:
-            row = _row(raw)
-            if _ref(row, self.schema.machine_company_field) != scope.company_id or row["_id"] in machines:
+        machine_ids = {source.scope.machine_id for source in result if source.scope.machine_id is not None}
+        if (scope.machine_id not in (None, _GENERAL)
+                and machine_ids.issubset({scope.machine_id})):
+            # The final scope read below freshly proves this exact Machine's
+            # owner. Re-reading every Machine in the Company adds no fact.
+            pass
+        else:
+            machine_rows = self.directory.search(self.schema.machine_type, ({
+                "key": self.schema.machine_company_field, "constraint_type": "equals",
+                "value": scope.company_id},))
+            if type(machine_rows) is not tuple:
                 raise AuthorityError("AUTHORITY_RESPONSE_INVALID")
-            machines.add(row["_id"])
-        result = {source for source in result if source.scope.machine_id is None
-                  or source.scope.machine_id in machines}
+            machines = set()
+            for raw in machine_rows:
+                row = _row(raw)
+                if _ref(row, self.schema.machine_company_field) != scope.company_id or row["_id"] in machines:
+                    raise AuthorityError("AUTHORITY_RESPONSE_INVALID")
+                machines.add(row["_id"])
+            result = {source for source in result if source.scope.machine_id is None
+                      or source.scope.machine_id in machines}
         if self.authorize_scope(grant, scope) != before:
             raise AuthorityError("AUTHORITY_CHANGED", 403)
         return frozenset(result)
@@ -344,12 +351,15 @@ class BubbleAuthority:
                     if key in wanted and identity is not None:
                         actual[key] = identity
         machine_ids = {source.scope.machine_id for source in expected if source.scope.machine_id is not None}
-        if scope.machine_id not in (None, _GENERAL):
+        if (scope.machine_id not in (None, _GENERAL)
+                and machine_ids.issubset({scope.machine_id})):
             # The final authorize_scope reads this exact machine and proves its
             # current owner. A whole-machine catalog adds no second owner fact.
-            if not machine_ids.issubset({scope.machine_id}):
-                raise AuthorityError("SCOPE_DENIED", 403)
+            pass
         elif machine_ids:
+            # Explicit document_ids intentionally permit another Machine in
+            # this Company (ChunkReadScope contract). Check every real owner;
+            # the request's machine_id alone cannot authorize those sources.
             machine_rows = self.directory.search(self.schema.machine_type, ({
                 "key": self.schema.machine_company_field, "constraint_type": "equals",
                 "value": scope.company_id},))
@@ -390,7 +400,14 @@ class RequestAuthority:
         self._key = ask_request_key(request)
         self._active, self._fault = True, None
         self._check(request)
-        provider.authorize_scope(grant, scope)
+        if admission is None:
+            provider.authorize_scope(grant, scope)
+        else:
+            # attach()/sources() performs the complete fresh catalog admission
+            # before any reader can run. This constructor has no consumer and
+            # must not duplicate that admission's Company/Machine GET pair.
+            provider.boundary.require(grant)
+            admission.check()
 
     def _check(self, request):
         if self._fault is not None:
@@ -417,6 +434,15 @@ class RequestAuthority:
         except Exception as exc:
             self._fault = exc if isinstance(exc, AuthorityError) else AuthorityError("AUTHORITY_PROVIDER_UNAVAILABLE")
             raise self._fault from None
+
+    @property
+    def catalog_epoch(self):
+        """Internal snapshot lifetime for exact reader reuse, never a grant."""
+        self._check(self._request)
+        if self._admission is None:
+            return None
+        self._admission.check()
+        return self._admission.catalog_epoch
 
     def close(self):
         self._active = False

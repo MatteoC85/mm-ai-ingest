@@ -1714,14 +1714,15 @@ def _sanitize_secret_like_answer_for_display(text: str) -> str:
     return t
 
 
-def _finalize_ask_response_for_ui(resp: dict, *, language: str = "it", citation_copy_fn=None) -> dict:
+def _finalize_ask_response_for_ui(resp: dict, *, language: str = "it", citation_copy_fn=None, preserve_complete: bool = False) -> dict:
     if not isinstance(resp, dict):
         return resp
 
     out = dict(resp)
+    preserve_family = preserve_complete and any(isinstance(c, dict) and _v12_evidence_role(c) in {"procedure", "step"} for c in out.get("citations") or [])
     if str(out.get("status") or "").lower() == "answered":
         safe_answer_text = _sanitize_secret_like_answer_for_display(str(out.get("answer") or ""))
-        out["answer"] = _compact_answer_for_ui(safe_answer_text, language=language)
+        out["answer"] = safe_answer_text if preserve_family else _compact_answer_for_ui(safe_answer_text, language=language)
         out["answer"] = _sanitize_media_no_vision_answer(
             str(out.get("answer") or ""),
             out.get("citations") if isinstance(out.get("citations"), list) else [],
@@ -1754,7 +1755,7 @@ def _finalize_ask_response_for_ui(resp: dict, *, language: str = "it", citation_
                     max_sn = max(180, int(ASK_UI_MANUAL_SUPPORT_SNIPPET_CHARS or 260))
                 else:
                     max_sn = max(220, int(ASK_UI_MAX_SNIPPET_CLEAN_CHARS or 520))
-                if len(sn) > max_sn:
+                if len(sn) > max_sn and not preserve_family:
                     cc["snippet_clean"] = sn[:max_sn].rsplit(" ", 1)[0].strip() + "…"
             if citation_copy_fn is not None:
                 citation_copy_fn(c, cc)
@@ -1768,6 +1769,8 @@ def _finalize_ask_response_for_ui(resp: dict, *, language: str = "it", citation_
                 else max(1, int(ASK_UI_MAX_CITATIONS or 8))
             )
         )
+        if preserve_family:
+            citation_limit = max(citation_limit, len(cleaned))
         out["citations"] = _v12_curate_response_items_for_ui(cleaned, max_items=citation_limit)
 
     if isinstance(out.get("rg_links"), list):
@@ -1785,9 +1788,11 @@ def _finalize_ask_response_for_ui(resp: dict, *, language: str = "it", citation_
                 else max(1, int(ASK_UI_MAX_LINKS or 8))
             )
         )
+        if preserve_family:
+            link_limit = max(link_limit, len(out.get("rg_links") or []))
         out["rg_links"] = _v12_curate_response_items_for_ui(out.get("rg_links") or [], max_items=link_limit)
 
-    return _assistant_ui_finalize_response(out, language=language)
+    return _assistant_ui_finalize_response(out, language=language, preserve_complete=preserve_family)
 
 
 
@@ -5477,17 +5482,17 @@ def _procedure_ui_note_is_novel(note: str, existing_text: str) -> bool:
     return len(note_terms & existing_terms) / max(1, len(note_terms)) < 0.72
 
 
-def _build_structured_procedure_ui_model(*, structured_citations: list[dict], manual_support_citations: list[dict], grounded_points: list[dict], response_language: str, q: str='') -> dict:
+def _build_structured_procedure_ui_model(*, structured_citations: list[dict], manual_support_citations: list[dict], grounded_points: list[dict], response_language: str, q: str='', preserve_complete: bool=False) -> dict:
     """Build one safe, deterministic presentation model from grounded sources.
 
     The model never contains raw HTML. It is rendered twice: plain text for
     backward compatibility and escaped HTML for Bubble's HTML element.
     """
-    return _presentation_responses.build_structured_procedure_ui_model(structured_citations=structured_citations, manual_support_citations=manual_support_citations, grounded_points=grounded_points, response_language=response_language, q=q, _runtime=_RESPONSE_PRESENTATION_RUNTIME())
+    return _presentation_responses.build_structured_procedure_ui_model(structured_citations=structured_citations, manual_support_citations=manual_support_citations, grounded_points=grounded_points, response_language=response_language, q=q, _runtime=_RESPONSE_PRESENTATION_RUNTIME(), preserve_complete=preserve_complete)
 
 
-def _procedure_ui_model_to_text(model: dict, *, response_language: str) -> str:
-    return _presentation_responses.procedure_ui_model_to_text(model, response_language=response_language, _runtime=_RESPONSE_PRESENTATION_RUNTIME())
+def _procedure_ui_model_to_text(model: dict, *, response_language: str, preserve_complete: bool=False) -> str:
+    return _presentation_responses.procedure_ui_model_to_text(model, response_language=response_language, _runtime=_RESPONSE_PRESENTATION_RUNTIME(), preserve_complete=preserve_complete)
 
 
 def _assistant_ui_escape(value: Any) -> str:
@@ -5622,9 +5627,9 @@ def _assistant_ui_lossless_html(answer: str, *, response_language: str, status: 
 
 
 
-def _assistant_ui_finalize_response(resp: dict, *, language: str='it') -> dict:
+def _assistant_ui_finalize_response(resp: dict, *, language: str='it', preserve_complete: bool=False) -> dict:
     """Create one canonical answer and prove that the rendered body is lossless."""
-    return _presentation_responses.assistant_ui_finalize_response(resp, language=language, _runtime=_RESPONSE_PRESENTATION_RUNTIME())
+    return _presentation_responses.assistant_ui_finalize_response(resp, language=language, _runtime=_RESPONSE_PRESENTATION_RUNTIME(), preserve_complete=preserve_complete)
 
 def _format_structured_procedure_answer_for_ui(*, structured_citations: list[dict], manual_support_citations: list[dict], grounded_points: list[dict], response_language: str, q: str='') -> str:
     return _presentation_responses.format_structured_procedure_answer_for_ui(structured_citations=structured_citations, manual_support_citations=manual_support_citations, grounded_points=grounded_points, response_language=response_language, q=q, _runtime=_RESPONSE_PRESENTATION_RUNTIME())
@@ -17695,7 +17700,8 @@ def _assistant_core_production_readers(*, request, session, authorized, invoke):
             runtimes["read_document_file_references"] = _dataclass_replace(legacy_files,
                 current_file_reader=CurrentFileReader(authorized, legacy_files))
         adapters = _ProductionReaderAdapters(request=request, session=session,
-            authorize=authority, invoke=invoke, runtimes=runtimes)
+            authorize=authority, invoke=invoke, runtimes=runtimes,
+            memo_epoch=lambda: authority.catalog_epoch)
         return authority, adapters
     except BaseException:
         authority.close()
@@ -17806,9 +17812,11 @@ def _assistant_core_authorized_ask_sync(payload, x_ai_internal_secret, *,
     completion = None
     try:
         from machinemind.ask.request_completion import RequestCompletion
+        from machinemind.ask import phase_trace as _phase_trace
         base_runtime = _assistant_core_request_flow_runtime()
         completion = RequestCompletion(runtime=base_runtime, payload=payload, started=protected_started)
-        authorized = _application_authority.authorize_http_request(payload,
+        authorized = _phase_trace.call("authority.initial",
+            _application_authority.authorize_http_request, payload,
             service_secret=x_ai_internal_secret, application_secret=x_mm_app_authority,
             env=authority_environment, resolve=_resolve_query_scope, admission_windows=True)
         from machinemind.authority.request_admission import activate, deactivate
@@ -21847,4 +21855,3 @@ def smart_diagnostic_finalize_v1(
         citations=list(state.get("citations") or []), rg_links=list(state.get("rg_links") or []),
         debug=bool(payload.debug),
     )
-

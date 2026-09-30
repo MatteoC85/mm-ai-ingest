@@ -19,6 +19,7 @@ an explicit callback, not an implicit new engine.
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
+from . import phase_trace
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -111,6 +112,7 @@ class RequestFlowEvidenceBinding:
             raise TypeError("request-owned Core callback must be callable")
 
 
+@phase_trace.traced("flow.guard")
 def _guarded_output(response: dict, guards: RequestFlowGuards | None) -> dict:
     if guards is None:
         return response
@@ -263,7 +265,10 @@ def run_sync(payload: Any, x_ai_internal_secret: Optional[str], *,
     _assistant_core_new_budget = runtime._assistant_core_new_budget
     _assistant_core_precision_fact_rescue = runtime._assistant_core_precision_fact_rescue
     _assistant_core_technical_error = runtime._assistant_core_technical_error
-    _assistant_ui_finalize_response = runtime._assistant_ui_finalize_response
+    def _assistant_ui_finalize_response(value, *, language):
+        options = {"preserve_complete": True} if completion is not None and guards is not None and requested_mode == MODE_ASK else {}
+        return phase_trace.call("flow.finalize", runtime._assistant_ui_finalize_response,
+                                value, language=language, **options)
     _resolve_query_scope = runtime._resolve_query_scope
     _retrieval_diagnostic_query = runtime._retrieval_diagnostic_query
     _retrieval_precision_facts = runtime._retrieval_precision_facts
@@ -302,7 +307,7 @@ def run_sync(payload: Any, x_ai_internal_secret: Optional[str], *,
     token = _V13_BUDGET_CTX.set(budget) if completion is None else None
     evidence_binding = None
     try:
-        scope = _resolve_query_scope(
+        scope = phase_trace.call("flow.scope", _resolve_query_scope,
             company_id=payload.company_id,
             machine_id=payload.machine_id,
             bubble_document_id=payload.bubble_document_id,
@@ -330,7 +335,7 @@ def run_sync(payload: Any, x_ai_internal_secret: Optional[str], *,
         store_guard = {"source_guard_fn": guards.store} if guards is not None else {}
 
         # Reuse only an exact request with a complete current-policy interpretation.
-        cached = _v13_cache_lookup(
+        cached = phase_trace.call("flow.cache_lookup", _v13_cache_lookup,
             mode=requested_mode, q=q, company_id=company_id, machine_id=machine_id,
             scope=cache_scope, language=response_language, debug=bool(payload.debug),
             **lookup_guard,
@@ -375,7 +380,7 @@ def run_sync(payload: Any, x_ai_internal_secret: Optional[str], *,
                 requested_mode == MODE_ASK
                 and str(cached.get("status") or "").strip().lower() == "no_sources"
             ):
-                rescued = _assistant_core_precision_fact_rescue(
+                rescued = phase_trace.call("flow.precision_rescue", _assistant_core_precision_fact_rescue,
                     q=q,
                     company_id=company_id,
                     machine_id=machine_id,
@@ -429,7 +434,7 @@ def run_sync(payload: Any, x_ai_internal_secret: Optional[str], *,
             if evidence_binding.run_core is not None:
                 run_core = evidence_binding.run_core
         precision_rescued = False
-        final = run_core(request)
+        final = phase_trace.call("flow.core", run_core, request)
         if completion is not None:
             completion.core_done()
         if evidence_binding is not None:
@@ -463,7 +468,7 @@ def run_sync(payload: Any, x_ai_internal_secret: Optional[str], *,
             requested_mode == MODE_ASK
             and str(final.get("status") or "").strip().lower() == "no_sources"
         ):
-            rescued = _assistant_core_precision_fact_rescue(
+            rescued = phase_trace.call("flow.precision_rescue", _assistant_core_precision_fact_rescue,
                 q=q,
                 company_id=company_id,
                 machine_id=machine_id,
@@ -496,7 +501,7 @@ def run_sync(payload: Any, x_ai_internal_secret: Optional[str], *,
             )
         final = _assistant_core_attach_runtime_meta(final, budget, debug=bool(payload.debug))
         final = _guarded_output(final, guards)
-        _v13_cache_store(
+        phase_trace.call("flow.cache_store", _v13_cache_store,
             mode=requested_mode,
             q=q,
             company_id=company_id,
@@ -543,5 +548,3 @@ def run_sync(payload: Any, x_ai_internal_secret: Optional[str], *,
         finally:
             if token is not None:
                 _V13_BUDGET_CTX.reset(token)
-
-

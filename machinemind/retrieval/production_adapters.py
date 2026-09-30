@@ -17,7 +17,7 @@ from typing import Any, Callable
 from . import dense, lexical, document_readers, structured, context_expansion, evidence_assurance, precision_facts
 from .ask_composition import AskEvidenceSession, RecordHandle, RegisteredRead
 from .receipt_producers import acquire_read
-from ..evidence.contracts import EvidenceContractError
+from ..evidence.contracts import EvidenceContractError, canonical_json
 
 PRODUCTION_ADAPTER_VERSION = "production-readers-p6b4l-v1"
 
@@ -65,11 +65,32 @@ _RESERVED = frozenset({"scope", "limits", "runtime", "current_allowed_sources", 
 _HANDLE_INPUTS = {"seed_handles": "seed_inputs", "candidate_handles": "candidate_inputs",
                   "structured_handles": "structured_inputs"}
 
+# Exact-query reuse is limited to immutable DB search snapshots. In particular
+# file URLs, relation expansion and readers consuming occurrence handles are
+# never memoized here. Authorization must be checked on every hit.
+_MEMO_READERS = frozenset({"read_dense_chunk_evidence", "read_fts_chunk_evidence",
+    "read_token_chunk_evidence", "read_structured_dense_chunk_evidence"})
+
+
+def _memo_value(value, depth=0):
+    """Type/order-sensitive bounded key; unsupported inputs disable reuse."""
+    if depth > 16:
+        raise ValueError("memo key nesting")
+    typ = type(value)
+    if value is None or typ in {str, int, float, bool}:
+        return (typ.__name__, value)
+    if typ in {list, tuple}:
+        return (typ.__name__, tuple(_memo_value(x, depth + 1) for x in value))
+    if typ is dict and all(type(k) is str for k in value):
+        return ("dict", tuple((k, _memo_value(v, depth + 1)) for k, v in value.items()))
+    raise ValueError("unsupported memo key")
+
 
 class ProductionReaderAdapters:
     """No new owner/session and no mutable shared runtime patching."""
     def __init__(self, *, request: Any, session: AskEvidenceSession,
-                 authorize: Callable, invoke: Callable, runtimes: dict[str, Any]):
+                 authorize: Callable, invoke: Callable, runtimes: dict[str, Any],
+                 memo_epoch: Callable[[], int | None] | None = None):
         if (type(session) is not AskEvidenceSession or not callable(authorize)
                 or not callable(invoke) or type(runtimes) is not dict
                 or set(runtimes) != set(READER_NAMES)):
@@ -79,8 +100,43 @@ class ProductionReaderAdapters:
                 raise EvidenceContractError("wrong production reader runtime: " + name)
         self._request, self._session = request, session
         self._authorize, self._invoke, self._runtimes = authorize, invoke, dict(runtimes)
+        if memo_epoch is not None and not callable(memo_epoch):
+            raise EvidenceContractError("explicit request snapshot epoch required")
+        self._memo_epoch = memo_epoch
+        self._memo = {}
+        self._epoch = None
+        self._memo_hits = self._memo_misses = 0
+
+    def memo_summary(self):
+        return {"hits": self._memo_hits, "misses": self._memo_misses,
+                "retained_reads": len(self._memo)}
+
+    def _memo_key(self, name, parameters):
+        if self._memo_epoch is None or name not in _MEMO_READERS:
+            return None
+        try:
+            key = canonical_json(_memo_value(parameters))
+        except (ValueError, TypeError, OverflowError):
+            return None
+        if len(key) > 262144:
+            return None
+        current = self._invoke(self._authorize, self._request, self._request)
+        self._session.read_contract(request=self._request, current_allowed_sources=current)
+        epoch = self._invoke(self._memo_epoch, self._request)
+        if epoch is None:
+            return None
+        if type(epoch) is not int or epoch < 0:
+            raise EvidenceContractError("invalid request snapshot epoch")
+        if epoch != self._epoch:
+            self._memo.clear()
+            self._epoch = epoch
+        return (name, epoch, key), current
 
     def read(self, name: str, **parameters) -> RegisteredRead:
+        # Fixed names and integer counters only; no query, source or tenant data.
+        # An inactive ASK trace performs no output, network or clock reads here.
+        from ..ask.phase_trace import count, span
+
         def work():
             if type(name) is not str or name not in _READERS or _RESERVED.intersection(parameters):
                 raise EvidenceContractError("unknown reader or caller-supplied authority input")
@@ -90,6 +146,23 @@ class ProductionReaderAdapters:
             for value in handles.values():
                 if type(value) is not tuple or any(type(h) is not RecordHandle for h in value):
                     raise EvidenceContractError("explicit same-session occurrence handles required")
+
+            memo = self._memo_key(name, parameters) if not handles else None
+            if memo is not None:
+                memo_key, current = memo
+                cached = self._memo.get(memo_key)
+                if cached is not None:
+                    # Revalidate ALL original read dependencies, not just the
+                    # selected candidates. A revoked read never becomes a hit.
+                    self._session.inspect_read(request=self._request, handle=cached.read,
+                        current_allowed_sources=current)
+                    self._session.validate_records(request=self._request, handles=cached.records,
+                        current_allowed_sources=current)
+                    self._memo_hits += 1
+                    count("retrieval.memo_hits")
+                    return cached
+                self._memo_misses += 1
+                count("retrieval.memo_misses")
 
             def reader(*, scope, limits, current_allowed_sources):
                 kwargs = dict(supplied, scope=scope, limits=limits, runtime=self._runtimes[name])
@@ -107,9 +180,21 @@ class ProductionReaderAdapters:
                     raise EvidenceContractError("reader adapter arguments do not match its contract") from None
                 return spec.reader(**kwargs)
 
-            return acquire_read(request=self._request, session=self._session, reader=reader,
+            result = acquire_read(request=self._request, session=self._session, reader=reader,
                 authorize=self._authorize, invoke=self._invoke)
-        return self._invoke(work, self._request)
+            if (memo is not None and len(self._memo) < 128
+                    and self._invoke(self._memo_epoch, self._request) == memo_key[1]):
+                self._memo[memo_key] = result
+            return result
+
+        def measured_work():
+            with span("retrieval.read"):
+                count("retrieval.read_calls")
+                result = work()
+                count("retrieval.records", len(result.records))
+                return result
+
+        return self._invoke(measured_work, self._request)
 
     def candidate_handles(self, name: str, **parameters) -> tuple[RecordHandle, ...]:
         """For actual candidate-layout reads only; raw page conversion stays explicit."""

@@ -14,12 +14,16 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import replace
+import sys
 
 from assistant_core_v2 import (
     _choose_monotonic_response, _finish_ask_validation, _clean_text,
     response_has_rejected_answer, decorate_response,
 )
 from . import review_evidence
+from . import phase_trace
+from .request_completion import current as _completion
+from ..infrastructure.request_budget import _V13BudgetExceeded
 from .task_generation import TaskGenerationEvidence
 from .generation import GenerationEvidenceError
 from ..evidence.ask_input import _same_value, apply_ask_evidence_input
@@ -27,6 +31,29 @@ from ..retrieval.ask_composition import AskSelection
 from ..retrieval import source_management
 
 RESPONSE_EVIDENCE_VERSION = "ask-response-evidence-p6b4o-v1"
+
+
+def _complete_review_limits(primary, *, render, max_records, max_context_chars, max_bytes):
+    """Keep complete producer records; the real provider ledger owns cost.
+
+    Count/context display heuristics do not authorize dropping a selected Step.
+    The existing canonical allocation remains a hard cap. This function neither
+    grants sources nor changes model/schema/output token/cost limits.
+    """
+    required, _ = review_evidence._unique(primary, [])
+    chars = size = 0
+    for row in required:
+        part = render([row], max_context_chars=sys.maxsize)
+        if not isinstance(part, str) or not part:
+            raise review_evidence.ReviewEvidenceError("producer review record has no rendered body")
+        if chars:
+            chars += 2
+            size += 2
+        chars += len(part)
+        size += len(part.encode("utf-8"))
+        if size > max_bytes:
+            raise _V13BudgetExceeded("procedure_review_evidence_capacity")
+    return max(max_records, len(required)), max(max_context_chars, chars)
 
 
 class ResponseEvidenceError(GenerationEvidenceError):
@@ -71,6 +98,7 @@ class ResponseEvidenceFlow(TaskGenerationEvidence):
         self._review_packet = None
         self._review_packet_handles = ()
         self._review_packet_uses = 0
+        self._review_packet_input_limits = None
         self.synthesis_calls = self.repair_calls = 0
 
     def _seed(self, data, selections):
@@ -303,6 +331,7 @@ class ResponseEvidenceFlow(TaskGenerationEvidence):
             return result
         return self.invoke(work, self.request)
 
+    @phase_trace.traced("consumer.review_packet")
     def procedure_review_sources(self, rows, *, max_records, max_context_chars):
         """Compile once from the observed producer; reuse DATA, never authority.
 
@@ -327,18 +356,26 @@ class ResponseEvidenceFlow(TaskGenerationEvidence):
             # No lookup by text/citation ID supplies or reconstructs an origin.
             self._seed({"candidates": primary}, (AskSelection("candidates", handles),))
             if self._review_packet is None:
+                effective_max_records, effective_context_chars = max_records, max_context_chars
+                if _completion() is not None:
+                    _, bounds = self.session.read_contract(request=self.request,
+                        current_allowed_sources=self.current())
+                    effective_max_records, effective_context_chars = _complete_review_limits(
+                        primary, render=self.execution._v13_sources_block,
+                        max_records=max_records, max_context_chars=max_context_chars,
+                        max_bytes=bounds.legacy.max_bytes)
                 # The first verifier's admitted collection contains its complete
                 # retrieval/manifest union. Keep these occurrence-bound views;
                 # a later repair prefix must not replace the stored selection.
                 extension = rows
                 packet = review_evidence.compile_packet(primary=primary,
                     extension=extension, render=self.execution._v13_sources_block,
-                    max_records=max_records, max_context_chars=max_context_chars)
+                    max_records=effective_max_records, max_context_chars=effective_context_chars)
                 self._review_packet_handles = self.handles(list(packet.rows))
                 self._review_packet = packet
+                self._review_packet_input_limits = (max_records, max_context_chars)
             packet = self._review_packet
-            if (packet.max_records != max_records
-                    or packet.max_context_chars != max_context_chars):
+            if self._review_packet_input_limits != (max_records, max_context_chars):
                 raise ResponseEvidenceError("review packet limits changed within request")
             if self.handles(list(packet.rows)) != self._review_packet_handles:
                 raise ResponseEvidenceError("review packet occurrence identity changed")
@@ -450,6 +487,8 @@ class ResponseEvidenceFlow(TaskGenerationEvidence):
 
     def close(self):
         self.active = False
+        self._complete_pages.clear()
+        self._ambiguous_step_sources.clear()
         self.refs.clear(); self.link_refs.clear(); self.drafts.clear()
         self.raw_refs.clear(); self.inventory_refs.clear()
         self.all_handles = self.input_handles = ()
@@ -459,5 +498,6 @@ class ResponseEvidenceFlow(TaskGenerationEvidence):
         self.final_data = self.final_handles = None
         self.model_inputs = None
         self._review_packet = None
+        self._review_packet_input_limits = None
         self._review_packet_handles = ()
         self._review_packet_uses = 0

@@ -15,15 +15,24 @@ from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass
 import math
+import os
 from typing import Any
+from . import phase_trace
 
 from ..infrastructure.request_budget import (
     _V13BudgetExceeded, _REQUEST_CONTROL_CTX, _RequestControl, _monotonic,
 )
 
 VERSION = "ask-completion-through-publication-v1"
+PHASE6_CANDIDATE_VERSION = "phase6-closure-2026-09-29-v1"
 _ACTIVE = ContextVar("mm_ask_request_completion", default=None)
 _CACHE_WINDOW = ContextVar("mm_ask_optional_cache_window", default=None)
+_REVIEW_RESERVE = ContextVar("mm_ask_synthesis_review_reserve", default=None)
+_SYNTHESIS_PURPOSES = frozenset({"ask_structured_synthesis", "ask_final_synthesis",
+    "assistant_core_machine_overview_inventory"})
+_REVIEW_PURPOSE = "assistant_core_answer_contract_verifier"
+_KNOWN_PURPOSES = _SYNTHESIS_PURPOSES | {_REVIEW_PURPOSE,
+    "assistant_core_v2_semantic_router", "assistant_core_general_technical_answer", "embedding"}
 
 
 class _CacheWindowExpired(BaseException):
@@ -80,6 +89,29 @@ def record_fence(seconds: float) -> None:
         owner.largest_fence_seconds = max(owner.largest_fence_seconds, float(seconds), 0.0)
 
 
+@contextmanager
+def synthesis_review_reserve(*, required: bool):
+    """Reserve the EXISTING nine-second review admission threshold, not a SLA.
+
+    Applied only to synthesis dispatch purposes. A nested recovery verifier can
+    use its reserved window without inheriting a synthesis child deadline.
+    """
+    owner = current()
+    if owner is None:
+        yield
+        return
+    token = _REVIEW_RESERVE.set((owner, bool(required)))
+    try:
+        yield
+    finally:
+        _REVIEW_RESERVE.reset(token)
+
+
+def provider_timeout(purpose: str, configured: int) -> int:
+    owner = current()
+    return configured if owner is None else owner.provider_timeout(purpose, configured)
+
+
 class RequestCompletion:
     """One explicit outer owner, never selected by client request metadata."""
     def __init__(self, *, runtime, payload, started: float):
@@ -100,6 +132,8 @@ class RequestCompletion:
         self.active = True
         self._budget_token = runtime._V13_BUDGET_CTX.set(self.budget)
         self._owner_token = _ACTIVE.set(self)
+        self.trace = phase_trace.PhaseTrace(started=start, clock=_monotonic)
+        self._trace_token = phase_trace.activate(self.trace)
         self._terminal = None
         self.largest_fence_seconds = 0.0
         self.core_finished = None
@@ -109,6 +143,36 @@ class RequestCompletion:
         self.publication_reserve = 0.0
         self.cache_allowance = 0.0
         self.cache_committed = False
+        self.provider_schedules = []
+
+    def provider_timeout(self, purpose, configured):
+        self.budget.ensure_time(0.0)
+        # Observed request-local fence wall time plus existing local DB/admission
+        # allowance. The floor reserves three seconds before the first fence.
+        # This is a scheduling estimate; fresh final authority still decides.
+        publication = max(1.5, self.largest_fence_seconds) + 1.5
+        review = 0.0
+        planned = _REVIEW_RESERVE.get()
+        if (purpose in _SYNTHESIS_PURPOSES and planned is not None
+                and planned[0] is self and planned[1]):
+            review = 9.0 + max(1.5, self.largest_fence_seconds)
+        available = self.budget.remaining() - publication - review
+        minimum = 9.0 if purpose == _REVIEW_PURPOSE else 1.0
+        timeout = min(int(configured), math.floor(available))
+        row = {"purpose": purpose if purpose in _KNOWN_PURPOSES else "other",
+               "at_seconds": round(self.budget.elapsed(), 6),
+               "publication_reserve_seconds": round(publication, 6),
+               "review_reserve_seconds": round(review, 6),
+               "remaining_seconds": round(self.budget.remaining(), 6),
+               "timeout_seconds": max(0, timeout), "admitted": timeout >= minimum}
+        # At most six LLM calls and bounded embeddings; don't let diagnostics
+        # create an unbounded payload if a caller violates those assumptions.
+        if len(self.provider_schedules) < 64:
+            self.provider_schedules.append(row)
+        self.publication_reserve = max(self.publication_reserve, publication)
+        if timeout < minimum:
+            raise _V13BudgetExceeded("protected ASK deadline lacks time for provider and required finalization")
+        return timeout
 
     def budget_for(self, payload, runtime):
         if (not self.active or current() is not self or payload is not self.payload
@@ -147,7 +211,8 @@ class RequestCompletion:
             return guard(response)  # original error sanitization, no content
         self.budget.ensure_time(0.0)
         self.publication_started = self.budget.elapsed()
-        result = guard(response)
+        with phase_trace.span("flow.publication"):
+            result = guard(response)
         self.budget.ensure_time(0.0)
         self.publication_finished = self.budget.elapsed()
         return result
@@ -206,6 +271,8 @@ class RequestCompletion:
             self.budget.ensure_time(0.0)
         result = self.runtime._assistant_core_attach_runtime_meta(
             response, self.budget, debug=bool(getattr(self.payload, "debug", False)))
+        commit = os.environ.get("COMMIT_SHA", "").lower()
+        commit = commit if len(commit) == 40 and all(c in "0123456789abcdef" for c in commit) else None
         result["meta"] = {**dict(result.get("meta") or {}), "request_completion": {
             "version": VERSION, "timing_scope": "protected_entry_through_publication",
             "elapsed_seconds": round(self.budget.elapsed(), 6),
@@ -219,7 +286,23 @@ class RequestCompletion:
             "cache_allowance_seconds": round(self.cache_allowance, 6),
             "cache_commit_observed": self.cache_committed,
             "late_success_forbidden": True,
-        }}
+            "provider_scheduling": list(self.provider_schedules),
+            "reserve_basis": "observed_fence_wall_plus_local_allowance_not_SLA",
+        }, "ask_phase_trace": self.trace.summary(), "runtime_commit_sha": commit,
+            "phase6_candidate_version": PHASE6_CANDIDATE_VERSION}
+        # Read-only diagnostics must survive timeout/revocation. Never trigger
+        # fresh authority I/O here or turn a fault snapshot into scope approval.
+        from ..authority.request_admission import current_summary
+        authority = current_summary()
+        if authority is not None:
+            existing = result["meta"].get("request_authority")
+            result["meta"]["request_authority"] = {
+                **authority, **(existing if type(existing) is dict else {})}
+        if str(result.get("status") or "").lower() == "answered":
+            # Metadata/trace serialization belongs to this request too. A
+            # callback or scheduler pause after the entry check cannot release
+            # an answer that the same clock already knows is late.
+            self.budget.ensure_time(0.0)
         return result
 
     def close(self):
@@ -229,8 +312,11 @@ class RequestCompletion:
         try:
             self.runtime._V13_BUDGET_CTX.reset(self._budget_token)
         finally:
-            _ACTIVE.reset(self._owner_token)
-            self._terminal = self.payload = self.runtime = None
+            try:
+                phase_trace.deactivate(self._trace_token)
+            finally:
+                _ACTIVE.reset(self._owner_token)
+                self._terminal = self.payload = self.runtime = None
 
 
 class _CacheConnection:

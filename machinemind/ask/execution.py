@@ -19,6 +19,8 @@ from typing import Any, Callable, Optional, TYPE_CHECKING
 
 from . import procedure_review as _procedure_review
 from . import final_contract as _final_contract
+from . import phase_trace
+from .request_completion import current as _current_completion
 from ..evidence.ask_input import AskEvidenceAdmission, apply_ask_evidence_input, ask_request_key
 from ..evidence.contracts import EvidenceContractError, SourceIdentity
 from ..retrieval.ask_composition import AskEvidenceSession, AskSelection
@@ -413,6 +415,7 @@ def synthesize_ask(
 
 
 @_observe_consumer
+@phase_trace.traced("consumer.review")
 def verify_or_repair_answer(
     *,
     request: AssistantCoreRequest,
@@ -455,6 +458,13 @@ def verify_or_repair_answer(
         runtime=runtime, stage="verifier.input")
     candidates = admitted["candidates"]
     budget = _v13_current_budget()
+    protected_budget = _guarded(runtime, request, decision) and _current_completion() is not None
+    if protected_budget:
+        if budget is None:
+            raise EvidenceContractError("protected verifier budget missing")
+        budget.ensure_time(9.0)
+        if budget.llm_calls >= budget.max_llm_calls:
+            raise _V13BudgetExceeded("protected verifier LLM call budget exhausted")
     if budget is None or budget.llm_calls >= budget.max_llm_calls or budget.remaining() < 9.0:
         return {"outcome": "unavailable", "answer": answer, "reason": "budget_unavailable"}
 
@@ -616,6 +626,8 @@ def verify_or_repair_answer(
             purpose="assistant_core_answer_contract_verifier",
         )
     except _V13BudgetExceeded:
+        if protected_budget:
+            raise
         return {"outcome": "unavailable", "answer": answer, "reason": "budget_exceeded"}
     except Exception as exc:
         if _guarded(runtime, request, decision) and isinstance(exc, EvidenceContractError):
@@ -731,10 +743,15 @@ def repair_response(
 
     candidates: list[dict] = []
     seen_ids: set[str] = set()
+    primary_validation = list(out.get("_assistant_core_validation_evidence") or [])
+    complete_procedure = bool(_guarded(runtime, request, decision)
+        and _current_completion() is not None
+        and decision.information_task in {runtime.INFO_PROCEDURE_FULL, runtime.INFO_PROCEDURE_SEGMENT})
+    candidate_limit = max(16, len(primary_validation)) if complete_procedure else 16
     for raw in (
         # Prefer the curated manifest that actually fed the first synthesis.
         # Semantic retrieval candidates are only a fallback/extension.
-        list(out.get("_assistant_core_validation_evidence") or [])
+        primary_validation
         + list(retrieval.get("citations") or retrieval.get("candidates") or [])
     ):
         if not isinstance(raw, dict):
@@ -744,7 +761,7 @@ def repair_response(
             continue
         seen_ids.add(cid)
         candidates.append(_copy_candidate(raw))
-        if len(candidates) >= 16:
+        if len(candidates) >= candidate_limit:
             break
 
     budget = _v13_current_budget()
@@ -754,6 +771,12 @@ def repair_response(
         and budget.remaining() >= 9.0
         and budget.estimated_cost_usd < budget.max_estimated_cost_usd
     )
+    if (_guarded(runtime, request, decision) and _current_completion() is not None
+            and first_answer and candidates and not budget_available):
+        if budget is None:
+            raise EvidenceContractError("protected repair budget missing")
+        budget.ensure_time(9.0)
+        raise runtime._V13BudgetExceeded("protected repair AI call/cost budget exhausted")
     repair_meta = {
         "attempted": True,
         "trigger": "grounded_answer_contract_incomplete",
@@ -861,5 +884,3 @@ def repair_response(
     meta["semantic_cacheable"] = False
     out["meta"] = meta
     return out
-
-
