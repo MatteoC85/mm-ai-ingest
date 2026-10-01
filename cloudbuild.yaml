@@ -1,29 +1,7 @@
-serviceAccount: projects/machinemind-ai-2a/serviceAccounts/443517556116-compute@developer.gserviceaccount.com
-logsBucket: gs://mm-ai-cb-logs-443517556116
-
-# A GitHub-approved commit restores the normal build of THIS commit.
-# Rollback uses the same trigger and only the pinned REQUIRED revision.
-substitutions:
-  _P6_OPERATION: deploy
-  _P6_EXPECTED_CURRENT_SHA: 5dbb9f1f71acdd555f1336e8b7baf2615d5d245e
-
+# ISOLATED TEST BRANCH. Never deploy application resources from this tree.
 steps:
-  - name: gcr.io/cloud-builders/docker
-    id: build-candidate
-    args: [build, -t, 'europe-west1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/mm-ai-ingest/mm-ai-ingest-prod:$COMMIT_SHA', -f, Dockerfile, '.']
-  - name: gcr.io/cloud-builders/docker
-    id: push-candidate
-    args: [push, 'europe-west1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/mm-ai-ingest/mm-ai-ingest-prod:$COMMIT_SHA']
-  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
-    id: phase6-required-release-guard
-    entrypoint: python3
-    args: [tools/phase6_release.py]
-    env:
-      - 'MM_CB_PROJECT=$PROJECT_ID'
-      - 'MM_CB_COMMIT=$COMMIT_SHA'
-      - 'MM_CB_BUILD=$BUILD_ID'
-      - 'MM_P6_OPERATION=${_P6_OPERATION}'
-      - 'MM_P6_EXPECTED_CURRENT_SHA=${_P6_EXPECTED_CURRENT_SHA}'
-
-images:
-  - 'europe-west1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/mm-ai-ingest/mm-ai-ingest-prod:$COMMIT_SHA'
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: bash
+    args: ['-c', 'echo ISOLATED_NATIVE_VALIDATION_NO_DEPLOY']
+options:
+  logging: CLOUD_LOGGING_ONLY
