@@ -97,6 +97,10 @@ from assistant_core_v2 import (
 
 app = FastAPI()
 
+# Phase 6: admission/settlement wraps existing routes; no alternate AI pipeline.
+from machinemind.accounting.middleware import InteractiveUsageMiddleware, runtime_health as _usage_runtime_health
+app.add_middleware(InteractiveUsageMiddleware)
+
 # Runtime configuration re-exported from a normal importable module.
 # The historical names remain available in ``main`` for compatibility.
 from machinemind.config.runtime import *  # noqa: F401,F403
@@ -7904,6 +7908,7 @@ def ingest_usage_month(
 @app.get("/version")
 def version():
     return {
+        "usage_v6": _usage_runtime_health(),
         "ok": True,
         "service": os.environ.get("K_SERVICE"),
         "revision": os.environ.get("K_REVISION"),
@@ -17710,6 +17715,7 @@ def _assistant_core_production_readers(*, request, session, authorized, invoke):
 
 def _assistant_core_intake_factory(**owned):
     """B4o intake through validation/repair on one session; authority stays OFF."""
+    from machinemind.ask import request_completion as _ask_request_completion
     intake = _ask_core_intake.CoreIntakeRuntime(
         initial=_assistant_core_initial_retrieval_runtime(),
         neutral=_assistant_core_neutral_retrieval_runtime(),
@@ -17759,7 +17765,9 @@ def _assistant_core_intake_factory(**owned):
     return _ask_core_intake.bind_core_intake(**owned, core=_ASSISTANT_CORE_ENGINE,
         runtimes=_ask_request_binding.AskRuntimeFactories(
             execution=_assistant_core_ask_execution_runtime,
-            validation=_assistant_core_scoped_ask_validation_runtime), runtime=intake,
+            validation=_assistant_core_scoped_ask_validation_runtime,
+            check=_ask_request_completion.check_io_time,
+            synthesis=_ask_request_completion.synthesize_observed), runtime=intake,
         preparation=_assistant_core_prepare_evidence_runtime(),
         generation=_assistant_core_generation_runtime(),
         tasks=_assistant_core_task_synthesis_runtime(), consumers=True)

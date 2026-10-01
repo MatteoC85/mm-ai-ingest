@@ -19,7 +19,6 @@ an explicit callback, not an implicit new engine.
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
-from . import phase_trace
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -112,7 +111,6 @@ class RequestFlowEvidenceBinding:
             raise TypeError("request-owned Core callback must be callable")
 
 
-@phase_trace.traced("flow.guard")
 def _guarded_output(response: dict, guards: RequestFlowGuards | None) -> dict:
     if guards is None:
         return response
@@ -248,6 +246,15 @@ def run_sync(payload: Any, x_ai_internal_secret: Optional[str], *,
                 callable(getattr(completion, name, None)) for name in
                 ("budget_for", "core_done", "timeout_response")):
             raise TypeError("completion is restricted to guarded ASK")
+    def measured(name, callback, /, *args, **kwargs):
+        # Timing belongs to the explicit protected owner, never an ambient import.
+        if completion is not None:
+            return completion.measure(name, callback, *args, **kwargs)
+        return callback(*args, **kwargs)
+
+    def guarded(response, value):
+        return measured("flow.guard", _guarded_output, response, value)
+
     AI_INTERNAL_SECRET = runtime.AI_INTERNAL_SECRET
     ASK_MAX_TOP_K = runtime.ASK_MAX_TOP_K
     AssistantCoreRequest = runtime.AssistantCoreRequest
@@ -267,7 +274,7 @@ def run_sync(payload: Any, x_ai_internal_secret: Optional[str], *,
     _assistant_core_technical_error = runtime._assistant_core_technical_error
     def _assistant_ui_finalize_response(value, *, language):
         options = {"preserve_complete": True} if completion is not None and guards is not None and requested_mode == MODE_ASK else {}
-        return phase_trace.call("flow.finalize", runtime._assistant_ui_finalize_response,
+        return measured("flow.finalize", runtime._assistant_ui_finalize_response,
                                 value, language=language, **options)
     _resolve_query_scope = runtime._resolve_query_scope
     _retrieval_diagnostic_query = runtime._retrieval_diagnostic_query
@@ -307,7 +314,7 @@ def run_sync(payload: Any, x_ai_internal_secret: Optional[str], *,
     token = _V13_BUDGET_CTX.set(budget) if completion is None else None
     evidence_binding = None
     try:
-        scope = phase_trace.call("flow.scope", _resolve_query_scope,
+        scope = measured("flow.scope", _resolve_query_scope,
             company_id=payload.company_id,
             machine_id=payload.machine_id,
             bubble_document_id=payload.bubble_document_id,
@@ -335,7 +342,7 @@ def run_sync(payload: Any, x_ai_internal_secret: Optional[str], *,
         store_guard = {"source_guard_fn": guards.store} if guards is not None else {}
 
         # Reuse only an exact request with a complete current-policy interpretation.
-        cached = phase_trace.call("flow.cache_lookup", _v13_cache_lookup,
+        cached = measured("flow.cache_lookup", _v13_cache_lookup,
             mode=requested_mode, q=q, company_id=company_id, machine_id=machine_id,
             scope=cache_scope, language=response_language, debug=bool(payload.debug),
             **lookup_guard,
@@ -380,7 +387,7 @@ def run_sync(payload: Any, x_ai_internal_secret: Optional[str], *,
                 requested_mode == MODE_ASK
                 and str(cached.get("status") or "").strip().lower() == "no_sources"
             ):
-                rescued = phase_trace.call("flow.precision_rescue", _assistant_core_precision_fact_rescue,
+                rescued = measured("flow.precision_rescue", _assistant_core_precision_fact_rescue,
                     q=q,
                     company_id=company_id,
                     machine_id=machine_id,
@@ -395,12 +402,12 @@ def run_sync(payload: Any, x_ai_internal_secret: Optional[str], *,
                     rescued = _assistant_ui_finalize_response(
                         rescued, language=response_language
                     )
-                    return _guarded_output(_assistant_core_attach_runtime_meta(
+                    return guarded(_assistant_core_attach_runtime_meta(
                         rescued, budget, debug=bool(payload.debug)
                     ), guards)
             budget.route = "assistant_core_semantic_cache"
             cached = _assistant_ui_finalize_response(cached, language=response_language)
-            return _guarded_output(_assistant_core_attach_runtime_meta(
+            return guarded(_assistant_core_attach_runtime_meta(
                 cached, budget, debug=bool(payload.debug)), guards)
 
         request = AssistantCoreRequest(
@@ -434,7 +441,7 @@ def run_sync(payload: Any, x_ai_internal_secret: Optional[str], *,
             if evidence_binding.run_core is not None:
                 run_core = evidence_binding.run_core
         precision_rescued = False
-        final = phase_trace.call("flow.core", run_core, request)
+        final = measured("flow.core", run_core, request)
         if completion is not None:
             completion.core_done()
         if evidence_binding is not None:
@@ -468,7 +475,7 @@ def run_sync(payload: Any, x_ai_internal_secret: Optional[str], *,
             requested_mode == MODE_ASK
             and str(final.get("status") or "").strip().lower() == "no_sources"
         ):
-            rescued = phase_trace.call("flow.precision_rescue", _assistant_core_precision_fact_rescue,
+            rescued = measured("flow.precision_rescue", _assistant_core_precision_fact_rescue,
                 q=q,
                 company_id=company_id,
                 machine_id=machine_id,
@@ -500,8 +507,8 @@ def run_sync(payload: Any, x_ai_internal_secret: Optional[str], *,
                 if routed else f"assistant_core_{effective_mode}"
             )
         final = _assistant_core_attach_runtime_meta(final, budget, debug=bool(payload.debug))
-        final = _guarded_output(final, guards)
-        phase_trace.call("flow.cache_store", _v13_cache_store,
+        final = guarded(final, guards)
+        measured("flow.cache_store", _v13_cache_store,
             mode=requested_mode,
             q=q,
             company_id=company_id,

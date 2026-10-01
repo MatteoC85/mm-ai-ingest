@@ -19,9 +19,11 @@ import os
 from typing import Any
 from . import phase_trace
 
-from ..infrastructure.request_budget import (
-    _V13BudgetExceeded, _REQUEST_CONTROL_CTX, _RequestControl, _monotonic,
-)
+def _monotonic() -> float:
+    # The completion observer can be imported by pure request-bound Core tests.
+    # Load infrastructure only when a protected lifetime actually asks for time.
+    from ..infrastructure.request_budget import _monotonic as clock
+    return clock()
 
 VERSION = "ask-completion-through-publication-v1"
 PHASE6_CANDIDATE_VERSION = "phase6-closure-2026-09-29-v1"
@@ -79,6 +81,7 @@ def transport_timeout(configured: float) -> float:
     value = min(float(configured), remaining)
     if not math.isfinite(value) or value <= 0:
         check_io_time()
+        from ..infrastructure.request_budget import _V13BudgetExceeded
         raise _V13BudgetExceeded("protected request deadline before transport")
     return value
 
@@ -105,6 +108,14 @@ def synthesis_review_reserve(*, required: bool):
         yield
     finally:
         _REVIEW_RESERVE.reset(token)
+
+
+def synthesize_observed(callback, review_required):
+    """Injected observer; querying the review policy is protected-request-only."""
+    if current() is None:
+        return callback()
+    with synthesis_review_reserve(required=bool(review_required())):
+        return callback()
 
 
 def provider_timeout(purpose: str, configured: int) -> int:
@@ -145,6 +156,11 @@ class RequestCompletion:
         self.cache_committed = False
         self.provider_schedules = []
 
+    def measure(self, name, callback, /, *args, **kwargs):
+        if not self.active or current() is not self:
+            raise RuntimeError("ASK_COMPLETION_EXPIRED")
+        return phase_trace.call(name, callback, *args, **kwargs)
+
     def provider_timeout(self, purpose, configured):
         self.budget.ensure_time(0.0)
         # Observed request-local fence wall time plus existing local DB/admission
@@ -171,6 +187,7 @@ class RequestCompletion:
             self.provider_schedules.append(row)
         self.publication_reserve = max(self.publication_reserve, publication)
         if timeout < minimum:
+            from ..infrastructure.request_budget import _V13BudgetExceeded
             raise _V13BudgetExceeded("protected ASK deadline lacks time for provider and required finalization")
         return timeout
 
@@ -219,6 +236,7 @@ class RequestCompletion:
 
     @contextmanager
     def optional_cache(self, *, authority_timeout: float):
+        from ..infrastructure.request_budget import _REQUEST_CONTROL_CTX, _RequestControl
         self.budget.ensure_time(0.0)
         if _CACHE_WINDOW.get() is not None:
             raise RuntimeError("ASK_COMPLETION_NESTED_CACHE")

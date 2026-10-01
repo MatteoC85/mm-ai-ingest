@@ -23,7 +23,6 @@ from typing import Any, Callable
 from assistant_core_v2 import AssistantCoreHooks, AssistantCoreV2
 from . import execution, validation
 from . import phase_trace
-from .request_completion import current as _completion, synthesis_review_reserve
 from .acquisition import AskAcquisitionFactories, bind_acquisition
 from ..evidence.ask_input import apply_ask_evidence_input, ask_request_key
 from ..evidence.contracts import EvidenceContractError, SourceIdentity
@@ -37,10 +36,14 @@ class AskRuntimeFactories:
     """Call-time dependency factories; never evaluated on a non-ASK dispatch."""
     execution: Callable[[], execution.AskExecutionRuntime]
     validation: Callable[[], validation.AskValidationRuntime]
+    check: Callable[[], None] | None = None
+    synthesis: Callable[..., Any] | None = None
 
     def __post_init__(self) -> None:
         if not callable(self.execution) or not callable(self.validation):
             raise EvidenceContractError("explicit ASK runtime factories required")
+        if any(value is not None and not callable(value) for value in (self.check, self.synthesis)):
+            raise EvidenceContractError("explicit optional protected lifecycle callbacks required")
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -176,13 +179,12 @@ def run_core_request(request: Any, *, core: AssistantCoreV2,
     def invoke(callback, req, /, *args, **kwargs):
         nonlocal fault
         check(req)
-        completion = _completion()
-        if completion is not None:
-            completion.budget.ensure_time(0.0)
+        if runtimes.check is not None:
+            runtimes.check()
         try:
             result = callback(*args, **kwargs)
-            if completion is not None:
-                completion.budget.ensure_time(0.0)
+            if runtimes.check is not None:
+                runtimes.check()
             return result
         except EvidenceContractError as exc:
             if evidence is not None:
@@ -295,8 +297,13 @@ def run_core_request(request: Any, *, core: AssistantCoreV2,
         def synthesize(req, data, dec):
             if not execution._ask_path(req, dec):
                 return invoke(hooks.synthesize_ask, req, req, data, dec)
-            with synthesis_review_reserve(required=bool(er._assistant_core_should_semantic_verify_answer(dec))):
+            # The composition root supplies protected lifecycle observers only
+            # for protected ASK. Legacy runs do not evaluate the review predicate.
+            if runtimes.synthesis is None:
                 return invoke(execution.synthesize_ask, req, req, data, dec, runtime=er)
+            return runtimes.synthesis(
+                lambda: invoke(execution.synthesize_ask, req, req, data, dec, runtime=er),
+                lambda: bool(er._assistant_core_should_semantic_verify_answer(dec)))
 
         @phase_trace.traced("core.validate")
         def validate(response, req, data, dec):

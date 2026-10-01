@@ -786,6 +786,13 @@ def cache_store(
     if knowledge_version <= 0:
         return
 
+    # The metered HTTP path must durably prove current provider usage before
+    # storing an answer. No active receipt means the legacy/OFF contract is
+    # unchanged. A failed checkpoint only skips this optional cache write.
+    from machinemind.accounting.cache_receipt import allow_cache
+    if not allow_cache(company_id, budget):
+        return
+
     normalized_q = rt.call("_v13_normalize_query", q)
     query_hash = hashlib.sha256(
         (rt.require("V13_ENGINE_KEY") + "\n" + normalized_q).encode("utf-8")

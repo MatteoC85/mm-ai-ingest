@@ -25,6 +25,9 @@ SECRET_REFS = {
     'MM_BUBBLE_AUTHORITY_TOKEN': {'name': 'mm-bubble-authority-token-v1', 'key': '2'},
 }
 PHASE = 'initialize'
+USAGE_VERSION = 'p6-interactive-ledger-v1'
+USAGE_SECRET = {'name': 'mm-usage-authority-v6', 'key': '1'}
+USAGE_ENV = frozenset({'MM_USAGE_ENFORCEMENT', 'MM_USAGE_TIMEZONE', 'MM_USAGE_AUTHORITY_SECRET'})
 
 
 class GuardError(RuntimeError):
@@ -105,14 +108,23 @@ def required_configuration(spec, commit=None):
     return actual
 
 
-def unaffected_spec(spec):
+def unaffected_spec(spec, usage_required=False):
     value = copy.deepcopy(spec)
     environment(value)
     container = value['containers'][0]
     container.pop('image', None)
     container['env'] = sorted((r for r in container.get('env', [])
-                               if r['name'] != 'COMMIT_SHA'), key=lambda r: r['name'])
+                               if r['name'] != 'COMMIT_SHA' and not (usage_required and r['name'] in USAGE_ENV)), key=lambda r: r['name'])
     return value
+
+
+def usage_configuration(spec):
+    env=environment(spec)
+    require(env.get('MM_USAGE_ENFORCEMENT',{}).get('value')=='required','USAGE_MUST_BE_REQUIRED')
+    require(env.get('MM_USAGE_TIMEZONE',{}).get('value')=='Europe/Rome','USAGE_TIMEZONE_MISMATCH')
+    row=env.get('MM_USAGE_AUTHORITY_SECRET',{})
+    require('value' not in row and row.get('valueFrom',{}).get('secretKeyRef')==USAGE_SECRET,
+            'USAGE_SECRET_REFERENCE_MISMATCH')
 
 
 def routing_configuration(service):
@@ -172,7 +184,7 @@ def revision_names():
     return set(names)
 
 
-def health(url, commit, revision):
+def health(url, commit, revision, usage_required=False):
     parsed = urllib.parse.urlsplit(url) if type(url) is str else None
     require(parsed is not None and parsed.scheme == 'https' and
             re.fullmatch(r'[a-z0-9-]+(?:\.[a-z0-9-]+)*\.run\.app', parsed.netloc or '') and
@@ -196,19 +208,24 @@ def health(url, commit, revision):
         if suffix == '/version':
             require(result.get('commit_sha') == commit and result.get('revision') == revision,
                     'HEALTH_IDENTITY_MISMATCH')
+            if usage_required:
+                u=result.get('usage_v6') or {}
+                require(u.get('version')==USAGE_VERSION and u.get('mode')=='required' and u.get('ready') is True and u.get('database')=='postgresql',
+                        'USAGE_NATIVE_HEALTH_NOT_READY')
 
 
-def validate_candidate(before_spec, service, revision, name, commit, digest):
+def validate_candidate(before_spec, service, revision, name, commit, digest, usage_required=False):
     ready(revision)
     require(revision.get('metadata', {}).get('name') == name, 'CANDIDATE_NAME_MISMATCH')
     for spec in (template(service), revision.get('spec', {})):
         required_configuration(spec, commit)
-        require(unaffected_spec(spec) == unaffected_spec(before_spec), 'UNRELATED_CONFIG_CHANGED')
+        if usage_required:usage_configuration(spec)
+        require(unaffected_spec(spec,usage_required) == unaffected_spec(before_spec,usage_required), 'UNRELATED_CONFIG_CHANGED')
         require(spec['containers'][0].get('image') == IMAGE_ROOT + '@' + digest, 'CANDIDATE_IMAGE_NOT_PINNED')
     require(image_digest(revision) == digest, 'CANDIDATE_DIGEST_MISMATCH')
 
 
-def execute(project, commit, build, operation, expected_current):
+def execute(project, commit, build, operation, expected_current, *, usage_required=False):
     require(project == PROJECT, 'WRONG_PROJECT')
     require(type(commit) is str and re.fullmatch('[0-9a-f]{40}', commit), 'COMMIT_SHA_INVALID')
     require(type(expected_current) is str and re.fullmatch('[0-9a-f]{40}', expected_current),
@@ -216,6 +233,7 @@ def execute(project, commit, build, operation, expected_current):
     require(type(build) is str and re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', build),
             'BUILD_ID_INVALID')
     require(operation in {'deploy', 'rollback'}, 'OPERATION_INVALID')
+    require(not usage_required or operation=='deploy', 'LEGACY_ROLLBACK_REQUIRES_MAINTENANCE')
     phase('validate_current_required')
     before = resource('services', SERVICE)
     prior = pinned_traffic(before)
@@ -226,7 +244,7 @@ def execute(project, commit, build, operation, expected_current):
     # service template. The ACTIVE revision is the runtime identity. Permit
     # only image/COMMIT differences; all other settings remain identical.
     required_configuration(template(before))
-    require(unaffected_spec(template(before)) == unaffected_spec(prior_revision.get('spec', {})),
+    require(unaffected_spec(template(before),usage_required) == unaffected_spec(prior_revision.get('spec', {}),usage_required),
             'SERVICE_TEMPLATE_DIFFERS_FROM_ACTIVE')
     if expected_current == BASELINE_COMMIT:
         require(prior == BASELINE_REVISION and image_digest(prior_revision) == BASELINE_DIGEST,
@@ -270,23 +288,24 @@ def execute(project, commit, build, operation, expected_current):
     gcloud('run', 'deploy', SERVICE, '--project=' + PROJECT, '--region=' + REGION,
            '--platform=managed', '--image=' + IMAGE_ROOT + '@' + digest,
            '--revision-suffix=' + suffix, '--no-traffic', '--tag=p6-candidate',
-           '--update-env-vars=COMMIT_SHA=' + commit, '--quiet')
+           '--update-env-vars=COMMIT_SHA=' + commit + (',MM_USAGE_ENFORCEMENT=required,MM_USAGE_TIMEZONE=Europe/Rome' if usage_required else ''),
+           *(['--update-secrets=MM_USAGE_AUTHORITY_SECRET='+USAGE_SECRET['name']+':'+USAGE_SECRET['key']] if usage_required else []), '--quiet')
     staged = resource('services', SERVICE)
     candidate = resource('revisions', name)
     require(pinned_traffic(staged) == prior, 'TRAFFIC_CHANGED_BEFORE_VALIDATION')
     require(revision_names() == names_before | {name}, 'CONCURRENT_OR_UNEXPECTED_REVISION')
     require(routing_configuration(staged) == routing_before, 'UNRELATED_ANNOTATIONS_CHANGED')
-    validate_candidate(template(before), staged, candidate, name, commit, digest)
+    validate_candidate(template(before), staged, candidate, name, commit, digest, usage_required)
     tags = [r for r in staged.get('status', {}).get('traffic', [])
             if r.get('tag') == 'p6-candidate' and r.get('revisionName') == name]
     require(len(tags) == 1, 'CANDIDATE_TAG_MISSING')
     phase('check_candidate_identity_before_promotion')
-    health(tags[0].get('url'), commit, name)
+    health(tags[0].get('url'), commit, name, **({'usage_required':True} if usage_required else {}))
     latest = resource('services', SERVICE)
     require(pinned_traffic(latest) == prior and revision_names() == names_before | {name},
             'CONCURRENT_CHANGE_BEFORE_PROMOTION')
     require(routing_configuration(latest) == routing_before, 'UNRELATED_ANNOTATIONS_CHANGED')
-    validate_candidate(template(before), latest, resource('revisions', name), name, commit, digest)
+    validate_candidate(template(before), latest, resource('revisions', name), name, commit, digest, usage_required)
     phase('promote_exact_revision')
     gcloud('run', 'services', 'update-traffic', SERVICE, '--project=' + PROJECT,
            '--region=' + REGION, '--to-revisions=' + name + '=100', '--quiet')
@@ -294,20 +313,21 @@ def execute(project, commit, build, operation, expected_current):
     require(pinned_traffic(final) == name, 'PROMOTION_TRAFFIC_MISMATCH')
     require(revision_names() == names_before | {name}, 'CONCURRENT_CHANGE_AFTER_PROMOTION')
     require(routing_configuration(final) == routing_before, 'UNRELATED_ANNOTATIONS_CHANGED')
-    validate_candidate(template(before), final, resource('revisions', name), name, commit, digest)
-    health(final.get('status', {}).get('url'), commit, name)
+    validate_candidate(template(before), final, resource('revisions', name), name, commit, digest, usage_required)
+    health(final.get('status', {}).get('url'), commit, name, **({'usage_required':True} if usage_required else {}))
     return {'status': 'PASS_REQUIRED_DEPLOY', 'revision': name, 'previous_revision': prior,
             'runtime_commit_sha': commit, 'image_digest': digest, 'authority_mode': 'required',
-            'new_revision': True, 'health_before_promotion': True, 'unrelated_spec_preserved': True}
+            'new_revision': True, 'health_before_promotion': True, 'unrelated_spec_preserved': True,
+            'usage_required':usage_required,'usage_native_health_verified':usage_required}
 
 
 def main():
     try:
         result = execute(os.environ.get('MM_CB_PROJECT'), os.environ.get('MM_CB_COMMIT'),
                          os.environ.get('MM_CB_BUILD'), os.environ.get('MM_P6_OPERATION'),
-                         os.environ.get('MM_P6_EXPECTED_CURRENT_SHA'))
+                         os.environ.get('MM_P6_EXPECTED_CURRENT_SHA'), usage_required=True)
         print(json.dumps({**result, 'ask_calls': 0, 'provider_calls': 0,
-                          'automatic_rollback': False, 'guard_version': 'phase6-required-v1'}, sort_keys=True))
+                          'automatic_rollback': False, 'guard_version': 'phase6-integrated-usage-v2'}, sort_keys=True))
     except GuardError as exc:
         print(json.dumps({'status': 'FAIL_REQUIRED_RELEASE', 'phase': PHASE,
                           'code': str(exc), 'automatic_rollback': False}))
