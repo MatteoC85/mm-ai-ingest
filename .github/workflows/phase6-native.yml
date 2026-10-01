@@ -25,49 +25,65 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
+    env:
+      PYTHONPATH: ${{ github.workspace }}/app:${{ github.workspace }}/harness/unpacked/tests:${{ github.workspace }}/harness/recovery_unpacked/tests
+      MM_CANDIDATE_PATH: ${{ github.workspace }}/app
+      P6_NATIVE_TEST_DSN: postgresql://mm_gate:isolated_validation_password_not_a_secret_20261001@127.0.0.1:5432/p6_validation
+      PYTHONDONTWRITEBYTECODE: '1'
     steps:
       - name: Checkout isolated harness
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           path: harness
           persist-credentials: false
-      - name: Checkout exact public source baseline
+      - name: Checkout exact public application source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: 3608ee56b2eb292c35c34558e5ae998425a26504
+          ref: 201e9492fb5fc061f1702ec8925c051567963125
           path: app
           persist-credentials: false
       - name: Python 3.11
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: '3.11'
-      - name: Reconstruct and verify candidate
+      - name: Verify baseline, reconstruct candidate and compare full Git trees
         shell: bash
         run: |
           python - <<'PY'
           from pathlib import Path
-          import base64,hashlib,lzma,json
-          root=Path('harness'); out=root/'unpacked';out.mkdir()
-          text=''.join((root/'bundle'/f'part{i}.b64').read_text() for i in range(1,5))
-          raw=base64.b64decode(text,validate=True)
-          assert hashlib.sha256(raw).hexdigest()=='b0acea26dfd147f7a57f648f49627cf21e34621e85e93cdfafd955ded8c9b06c'
-          for name,content in json.loads(lzma.decompress(raw)).items():
-            p=out/name
-            assert not Path(name).is_absolute() and '..' not in Path(name).parts
-            p.parent.mkdir(parents=True,exist_ok=True);p.write_text(content,encoding='utf-8')
+          import base64,hashlib,lzma,json,shutil
+          root=Path('harness'); app=Path('app')
+          def unpack(folder,count,out,expected):
+            text=''.join((root/folder/f'part{i}.b64').read_text() for i in range(1,count+1))
+            raw=base64.b64decode(text,validate=True)
+            assert hashlib.sha256(raw).hexdigest()==expected,'BUNDLE_HASH_MISMATCH'
+            for name,content in json.loads(lzma.decompress(raw)).items():
+              assert not Path(name).is_absolute() and '..' not in Path(name).parts
+              p=out/name;p.parent.mkdir(parents=True,exist_ok=True);p.write_text(content,encoding='utf-8')
+          unpack('bundle',4,root/'unpacked','b0acea26dfd147f7a57f648f49627cf21e34621e85e93cdfafd955ded8c9b06c')
+          out=root/'recovery_unpacked'
+          unpack('recovery',3,out,'27e4a6dde1e7d8a5c34a361886817e8214ac6c41a50688d7745ec33534b92202')
+          def obj(kind,raw):return hashlib.sha1(kind+b' '+str(len(raw)).encode()+b'\0'+raw).digest()
+          def tree(p):
+            rows=[]
+            for f in sorted(p.iterdir(),key=lambda f:(f.name+('/' if f.is_dir() else '')).encode()):
+              if f.name in ['.git','__pycache__']:continue
+              if f.is_dir():rows.append(b'40000 '+f.name.encode()+b'\0'+tree(f))
+              else:rows.append(b'100644 '+f.name.encode()+b'\0'+obj(b'blob',f.read_bytes()))
+            return obj(b'tree',b''.join(rows))
+          identity=json.loads((out/'identity.json').read_text())
+          assert tree(app).hex()==identity['baseline'],'BASELINE_TREE_MISMATCH'
+          for p in (out/'overlay').rglob('*'):
+            if p.is_file():
+              dest=app/p.relative_to(out/'overlay');dest.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(p,dest)
+          assert tree(app).hex()==identity['candidate'],'CANDIDATE_TREE_MISMATCH'
+          print(json.dumps({'status':'COMPLETE_GIT_TREES_MATCH',**identity}))
           PY
-          python harness/unpacked/prepare.py app
       - name: Install actual application dependencies
         run: python -m pip install -r app/requirements.txt httpx
-      - name: Contracts, ASGI, cache checkpoint and real SQL concurrency tests
-        env:
-          PYTHONPATH: ${{ github.workspace }}/app:${{ github.workspace }}/harness/unpacked/tests
-          MM_CANDIDATE_PATH: ${{ github.workspace }}/app
-          P6_NATIVE_TEST_DSN: postgresql://mm_gate:isolated_validation_password_not_a_secret_20261001@127.0.0.1:5432/p6_validation
+      - name: Original 88 contract, cache and real PostgreSQL tests unchanged
         run: python -m unittest discover -s harness/unpacked/tests -p 'test_*.py' -v
-      - name: Actual FastAPI app, database health and unauthorized dispatch
-        env:
-          PYTHONPATH: ${{ github.workspace }}/app:${{ github.workspace }}/harness/unpacked/tests
-          MM_CANDIDATE_PATH: ${{ github.workspace }}/app
-          P6_NATIVE_TEST_DSN: postgresql://mm_gate:isolated_validation_password_not_a_secret_20261001@127.0.0.1:5432/p6_validation
-        run: python harness/unpacked/tests/probe_actual_app.py
+      - name: Signed protocol and real PostgreSQL routing tests
+        run: python -m unittest discover -s harness/recovery_unpacked/tests -p 'test_*.py' -v
+      - name: Actual application and native database health, no provider calls
+        run: python harness/recovery_unpacked/tests/probe_actual_app_v2.py
