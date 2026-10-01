@@ -40,13 +40,15 @@ class ResponsePresentationRuntime:
     ask_ui_structured_max_citations: int
     ask_ui_structured_max_links: int
 
-def build_structured_procedure_ui_model(*, structured_citations: list[dict], manual_support_citations: list[dict], grounded_points: list[dict], response_language: str, q: str='', _runtime: ResponsePresentationRuntime) -> dict:
+def build_structured_procedure_ui_model(*, structured_citations: list[dict], manual_support_citations: list[dict], grounded_points: list[dict], response_language: str, q: str='', _runtime: ResponsePresentationRuntime, preserve_complete: bool=False) -> dict:
     """Build one safe, deterministic presentation model from grounded sources.
 
     The model never contains raw HTML. It is rendered twice: plain text for
     backward compatibility and escaped HTML for Bubble's HTML element.
     """
     is_en = str(response_language or 'it').strip().lower().startswith('en')
+    excerpt = ((lambda value, **_: str(value or '').strip()) if preserve_complete
+               else _runtime.procedure_ui_complete_excerpt)
     coherent = _runtime.procedure_ui_merge_sources(structured_citations)
     procedures = [c for c in coherent if _runtime.evidence_role(c) == 'procedure']
     step_sources = [c for c in coherent if _runtime.evidence_role(c) == 'step']
@@ -64,17 +66,17 @@ def build_structured_procedure_ui_model(*, structured_citations: list[dict], man
             title = source_title
         description = fields.get('short_description') or fields.get('description') or ''
         sections = _runtime.procedure_ui_sections(description)
-        purpose = _runtime.procedure_ui_complete_excerpt(sections.get('purpose') or sections.get('body') or description, max_chars=700)
-        recipients = _runtime.procedure_ui_complete_excerpt(sections.get('recipients') or '', max_chars=320)
-        safety_level = _runtime.procedure_ui_complete_excerpt(sections.get('safety_level') or '', max_chars=140)
+        purpose = excerpt(sections.get('purpose') or sections.get('body') or description, max_chars=700)
+        recipients = excerpt(sections.get('recipients') or '', max_chars=320)
+        safety_level = excerpt(sections.get('safety_level') or '', max_chars=140)
     records: list[dict] = []
     for fallback_no, citation in enumerate(step_sources, start=1):
         fields = _runtime.procedure_ui_fields(citation)
         source_no = _runtime.safe_int(fields.get('step_number'), fallback_no)
         step_title = _runtime.procedure_ui_clean(fields.get('title') or '') or f'Step {source_no}'
         sections = _runtime.procedure_ui_sections(fields.get('description') or '')
-        instruction = _runtime.procedure_ui_complete_excerpt(sections.get('instruction') or sections.get('body') or fields.get('description') or '', max_chars=1500)
-        safety = _runtime.procedure_ui_complete_excerpt(sections.get('safety') or '', max_chars=800)
+        instruction = excerpt(sections.get('instruction') or sections.get('body') or fields.get('description') or '', max_chars=1500)
+        safety = excerpt(sections.get('safety') or '', max_chars=800)
         cid = str(citation.get('citation_id') or '').strip()
         grounded = max(grounded_by_citation.get(cid) or [''], key=len)
         if grounded and instruction and (not _runtime.looks_like_target_language(instruction, response_language)):
@@ -102,35 +104,37 @@ def build_structured_procedure_ui_model(*, structured_citations: list[dict], man
             safety_note = _runtime.manual_note_from_grounded_points(grounded_points, language=response_language)
         existing = ' '.join([title, purpose, recipients, safety_level] + [str(r.get('instruction') or '') + ' ' + str(r.get('safety') or '') for r in records])
         for candidate in (operation_note if not records else '', safety_note):
-            note = _runtime.procedure_ui_complete_excerpt(candidate, max_chars=700)
+            note = excerpt(candidate, max_chars=700)
             if note and _runtime.procedure_ui_note_is_novel(note, existing + ' ' + ' '.join(manual_notes)):
                 manual_notes.append(note)
     return {'kind': 'procedure', 'language': 'en' if is_en else 'it', 'title': title, 'summary': purpose, 'personnel': recipients, 'safety_level': safety_level, 'before': before, 'steps': operational, 'final_checks': final_checks, 'manual_notes': manual_notes[:2]}
 
-def procedure_ui_model_to_text(model: dict, *, response_language: str, _runtime: ResponsePresentationRuntime) -> str:
+def procedure_ui_model_to_text(model: dict, *, response_language: str, _runtime: ResponsePresentationRuntime, preserve_complete: bool=False) -> str:
     if not isinstance(model, dict) or model.get('kind') != 'procedure':
         return ''
     is_en = str(response_language or 'it').strip().lower().startswith('en')
+    excerpt = ((lambda value, **_: str(value or '').strip()) if preserve_complete
+               else _runtime.procedure_ui_complete_excerpt)
     parts: list[str] = []
     title = _runtime.procedure_ui_clean(model.get('title') or '')
     if title:
         parts.append(title)
-    summary = _runtime.procedure_ui_complete_excerpt(model.get('summary') or '', max_chars=700)
+    summary = excerpt(model.get('summary') or '', max_chars=700)
     if summary:
         parts.append(summary)
     before_lines: list[str] = []
     for item in model.get('before') or []:
         item_title = _runtime.procedure_ui_clean(item.get('title') or '')
-        instruction = _runtime.procedure_ui_complete_excerpt(item.get('instruction') or '', max_chars=1500)
-        safety = _runtime.procedure_ui_complete_excerpt(item.get('safety') or '', max_chars=800)
+        instruction = excerpt(item.get('instruction') or '', max_chars=1500)
+        safety = excerpt(item.get('safety') or '', max_chars=800)
         if item_title:
             before_lines.append(item_title)
         if instruction:
             before_lines.append(instruction)
         if safety:
             before_lines.append(('Safety: ' if is_en else 'Sicurezza: ') + safety)
-    personnel = _runtime.procedure_ui_complete_excerpt(model.get('personnel') or '', max_chars=320)
-    safety_level = _runtime.procedure_ui_complete_excerpt(model.get('safety_level') or '', max_chars=140)
+    personnel = excerpt(model.get('personnel') or '', max_chars=320)
+    safety_level = excerpt(model.get('safety_level') or '', max_chars=140)
     if personnel:
         before_lines.append(('Qualified personnel: ' if is_en else 'Personale qualificato: ') + personnel)
     if safety_level:
@@ -141,8 +145,8 @@ def procedure_ui_model_to_text(model: dict, *, response_language: str, _runtime:
     for idx, item in enumerate(model.get('steps') or [], start=1):
         display_no = _runtime.safe_int(item.get('display_number'), idx)
         title_line = _runtime.procedure_ui_clean(item.get('title') or '') or (f'Step {display_no}' if is_en else f'Passaggio {display_no}')
-        instruction = _runtime.procedure_ui_complete_excerpt(item.get('instruction') or '', max_chars=1500)
-        safety = _runtime.procedure_ui_complete_excerpt(item.get('safety') or '', max_chars=800)
+        instruction = excerpt(item.get('instruction') or '', max_chars=1500)
+        safety = excerpt(item.get('safety') or '', max_chars=800)
         lines = [f'{display_no}. {title_line}']
         if instruction:
             lines.append(instruction)
@@ -154,8 +158,8 @@ def procedure_ui_model_to_text(model: dict, *, response_language: str, _runtime:
     final_blocks: list[str] = []
     for item in model.get('final_checks') or []:
         title_line = _runtime.procedure_ui_clean(item.get('title') or '')
-        instruction = _runtime.procedure_ui_complete_excerpt(item.get('instruction') or '', max_chars=1500)
-        safety = _runtime.procedure_ui_complete_excerpt(item.get('safety') or '', max_chars=800)
+        instruction = excerpt(item.get('instruction') or '', max_chars=1500)
+        safety = excerpt(item.get('safety') or '', max_chars=800)
         if title_line:
             final_blocks.append(title_line)
         if instruction:
@@ -164,7 +168,7 @@ def procedure_ui_model_to_text(model: dict, *, response_language: str, _runtime:
             final_blocks.append(('Attention: ' if is_en else 'Attenzione: ') + safety)
     if final_blocks:
         parts.append(('Final check' if is_en else 'Verifica finale') + '\n' + '\n'.join(final_blocks))
-    notes = [_runtime.procedure_ui_complete_excerpt(x, max_chars=700) for x in model.get('manual_notes') or [] if _runtime.procedure_ui_complete_excerpt(x, max_chars=700)]
+    notes = [excerpt(x, max_chars=700) for x in model.get('manual_notes') or [] if excerpt(x, max_chars=700)]
     if notes:
         parts.append(('Manual support' if is_en else 'Supporto dal manuale') + '\n' + '\n'.join((f'- {x}' for x in notes)))
     return '\n\n'.join((x for x in parts if str(x or '').strip())).strip()
@@ -870,15 +874,17 @@ def assistant_ui_lossless_html(answer: str, *, response_language: str, status: s
     chunks.append('</article>')
     return ''.join(chunks)
 
-def assistant_ui_finalize_response(resp: dict, *, language: str='it', _runtime: ResponsePresentationRuntime) -> dict:
+def assistant_ui_finalize_response(resp: dict, *, language: str='it', _runtime: ResponsePresentationRuntime, preserve_complete: bool=False) -> dict:
     """Create one canonical answer and prove that the rendered body is lossless."""
     if not isinstance(resp, dict):
         return resp
     out = dict(resp)
+    preserve_family = preserve_complete and any(isinstance(c, dict) and
+        _runtime.evidence_role(c) in {'procedure', 'step'} for c in out.get('citations') or [])
     if isinstance(out.get('rg_links'), list):
-        out['rg_links'] = assistant_ui_dedupe_links(out.get('rg_links') or [], max_items=max(1, int(_runtime.ask_ui_structured_max_links or _runtime.ask_ui_max_links or 14)), _runtime=_runtime)
+        out['rg_links'] = assistant_ui_dedupe_links(out.get('rg_links') or [], max_items=max(len(out['rg_links']) if preserve_family else 1, int(_runtime.ask_ui_structured_max_links or _runtime.ask_ui_max_links or 14)), _runtime=_runtime)
     if isinstance(out.get('citations'), list):
-        out['citations'] = assistant_ui_dedupe_citations(out.get('citations') or [], max_items=max(1, int(_runtime.ask_ui_structured_max_citations or _runtime.ask_ui_max_citations or 14)), _runtime=_runtime)
+        out['citations'] = assistant_ui_dedupe_citations(out.get('citations') or [], max_items=max(len(out['citations']) if preserve_family else 1, int(_runtime.ask_ui_structured_max_citations or _runtime.ask_ui_max_citations or 14)), _runtime=_runtime)
     status = str(out.get('status') or 'answered').strip().lower()
     effective_mode = str(out.get('effective_mode') or '').strip().lower()
     ui_model = out.get('_assistant_ui_model')

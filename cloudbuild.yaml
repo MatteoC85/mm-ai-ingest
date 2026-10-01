@@ -5,7 +5,7 @@ logsBucket: gs://mm-ai-cb-logs-443517556116
 # Rollback uses the same trigger and only the pinned REQUIRED revision.
 substitutions:
   _P6_OPERATION: deploy
-  _P6_EXPECTED_CURRENT_SHA: 27d0f2bd5b5ae698bc6dc0cb652f50a8832dcd2b
+  _P6_EXPECTED_CURRENT_SHA: 5dbb9f1f71acdd555f1336e8b7baf2615d5d245e
 
 steps:
   - name: gcr.io/cloud-builders/docker
