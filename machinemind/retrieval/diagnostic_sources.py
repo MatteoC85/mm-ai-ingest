@@ -389,7 +389,7 @@ def select_root_cause_candidates(
 
     assessments: list[DiagnosticCandidateAssessment] = []
     seen_ids: set[str] = set()
-    seen_pages: set[tuple[str, int, int]] = set()
+    seen_excerpts: set[tuple[str, int, int, str]] = set()
     duplicate_count = 0
     hard_excluded_count = 0
     for rank, raw in enumerate(raw_items):
@@ -400,11 +400,19 @@ def select_root_cause_candidates(
         if not assessed.stable_key:
             duplicate_count += 1
             continue
-        if assessed.stable_key in seen_ids or assessed.page_key in seen_pages:
+        # A page (or an unpaginated structured record) can contain several
+        # independent mechanisms/checks. It is provenance, not duplicate text.
+        # Compare the complete available excerpt, preserving case and numbers;
+        # a shared preview must not discard a different continuation.
+        body = next((raw[key] for key in ('chunk_full', 'text', 'snippet')
+                     if isinstance(raw.get(key), str) and raw[key].strip()), '')
+        excerpt_key = (*assessed.page_key, ' '.join(body.split()))
+        if assessed.stable_key in seen_ids or (body and excerpt_key in seen_excerpts):
             duplicate_count += 1
             continue
         seen_ids.add(assessed.stable_key)
-        seen_pages.add(assessed.page_key)
+        if body:
+            seen_excerpts.add(excerpt_key)
         assessments.append(assessed)
 
     if not assessments:
@@ -436,7 +444,6 @@ def select_root_cause_candidates(
 
     selected: list[dict] = []
     selected_ids: set[str] = set()
-    selected_pages: set[tuple[str, int, int]] = set()
     source_counts: dict[str, int] = {}
     family_counts: dict[str, int] = {}
     covered_tokens: set[str] = set()
@@ -445,7 +452,7 @@ def select_root_cause_candidates(
     def capacity_reason(assessed: DiagnosticCandidateAssessment) -> str:
         if len(selected) >= limit:
             return "limit"
-        if assessed.stable_key in selected_ids or assessed.page_key in selected_pages:
+        if assessed.stable_key in selected_ids:
             return "duplicate"
         if source_counts.get(assessed.source_key, 0) >= max(
             1, policy.per_source_cap
@@ -483,7 +490,6 @@ def select_root_cause_candidates(
             )
         )
         selected_ids.add(assessed.stable_key)
-        selected_pages.add(assessed.page_key)
         source_counts[assessed.source_key] = source_counts.get(assessed.source_key, 0) + 1
         family_counts[assessed.family_key] = family_counts.get(assessed.family_key, 0) + 1
         covered_tokens.update(assessed.evidence_tokens)

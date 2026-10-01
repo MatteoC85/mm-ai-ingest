@@ -38,6 +38,20 @@ class Ledger:
 
     def health(self):
         with self.transaction() as cur:
+            # SELECT-only access is insufficient for admission and settlement.
+            # Test each privilege separately: PostgreSQL treats a comma-separated
+            # privilege list as ANY, whereas this runtime needs ALL of these.
+            for table, privileges in (
+                    ('mm_ai_usage_schema_v6', ('SELECT',)),
+                    ('mm_ai_usage_owner_v6', ('SELECT', 'INSERT', 'UPDATE')),
+                    ('mm_ai_usage_bucket_v6', ('SELECT', 'INSERT', 'UPDATE')),
+                    ('mm_ai_usage_request_v6', ('SELECT', 'INSERT', 'UPDATE'))):
+                for privilege in privileges:
+                    cur.execute('SELECT has_table_privilege(to_regclass(%s), %s)',
+                        ('public.' + table, privilege))
+                    permission = cur.fetchone()
+                    if not permission or permission[0] is not True:
+                        raise UsageError('USAGE_SCHEMA_PRIVILEGE_INVALID')
             cur.execute('SELECT version FROM public.mm_ai_usage_schema_v6 WHERE singleton=true')
             row = cur.fetchone()
             if not row or row[0] != VERSION: raise UsageError('USAGE_SCHEMA_INVALID')

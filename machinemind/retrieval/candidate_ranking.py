@@ -325,28 +325,10 @@ class DedupCitationsBySnippetRuntime:
 def dedup_citations_by_snippet(citations: list[dict], max_items: int, *, runtime: DedupCitationsBySnippetRuntime, lineage: Optional[Callable[..., None]]=None) -> list[dict]:
     _normalize_unicode_advanced = runtime._normalize_unicode_advanced
     def norm(s: str) -> str:
-        s = _normalize_unicode_advanced(s or "")
-        s = re.sub(r"^SECTION:\s*[^\n]+\n?", "", s, flags=re.IGNORECASE).strip()
-
-        lines = [ln.strip() for ln in s.split("\n") if ln.strip()]
-        cleaned = []
-        seen_lines = set()
-
-        for ln in lines:
-            ln_low = re.sub(r"\s+", " ", ln.lower()).strip()
-
-            if re.fullmatch(r"\d+", ln_low):
-                continue
-
-            if ln_low in seen_lines:
-                continue
-
-            seen_lines.add(ln_low)
-            cleaned.append(ln_low)
-
-        s = " ".join(cleaned)
-        s = re.sub(r"\s+", " ", s).strip()
-        return s[:500]
+        # Deduplication must compare the available evidence, not its UI preview.
+        # Headings, standalone values, repeated actions and case-sensitive units
+        # can distinguish two operational passages from the same source page.
+        return re.sub(r"\s+", " ", _normalize_unicode_advanced(s or "")).strip()
 
     def priority(c: dict) -> tuple[float, float, float]:
         return (
@@ -358,13 +340,13 @@ def dedup_citations_by_snippet(citations: list[dict], max_items: int, *, runtime
     best = {}
     chosen = {} if lineage is not None else None
     for item_index, c in enumerate(citations):
-        k = norm(c.get("snippet", ""))
+        k = norm(c.get("chunk_full") or c.get("snippet") or "")
         if k:
             k = (
                 f"{str(c.get('bubble_document_id') or '').strip()}"
                 f"|{int(c.get('page_from') or 0)}"
                 f"|{int(c.get('page_to') or 0)}"
-                f"|{k[:220]}"
+                f"|{k}"
             )
         else:
             k = str(c.get("citation_id") or "").strip()

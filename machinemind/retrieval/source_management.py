@@ -624,19 +624,20 @@ class DedupRootCauseCandidatesSemanticRuntime:
 
 
 def dedup_root_cause_candidates_semantic(citations: list[dict], max_items: int, *, runtime: DedupRootCauseCandidatesSemanticRuntime) -> list[dict]:
-    _normalize_unicode_advanced = runtime._normalize_unicode_advanced
     re = runtime.re
-    def _sig(c: dict) -> str:
-        txt = _normalize_unicode_advanced(c.get("snippet", "") or "")
-        txt = re.sub(r"^SECTION:\s*[^\n]+\n?", "", txt, flags=re.IGNORECASE).strip()
-        txt = re.sub(r"\s+", " ", txt).lower()
-        txt = txt[:220]
-
+    def _sig(c: dict) -> tuple:
+        # Preview prefixes and page coordinates are not semantic identity.
+        # Preserve complete source wording, headings, numbers and unit case;
+        # later review still decides whether each mechanism actually applies.
+        body = next((c[key] for key in ("chunk_full", "text", "snippet")
+                     if isinstance(c.get(key), str) and c[key].strip()), "")
+        txt = re.sub(r"\s+", " ", body).strip()
         return (
-            f"{str(c.get('bubble_document_id') or '').strip()}|"
-            f"{int(c.get('page_from') or 0)}|"
-            f"{int(c.get('page_to') or 0)}|"
-            f"{txt}"
+            str(c.get("company_id") or "").strip(),
+            str(c.get("machine_id") or "").strip(),
+            str(c.get("source_type") or "").strip(),
+            str(c.get("bubble_document_id") or "").strip(),
+            int(c.get("page_from") or 0), int(c.get("page_to") or 0), txt,
         )
 
     best = {}
