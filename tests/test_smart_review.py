@@ -112,6 +112,7 @@ class SmartReviewTests(unittest.TestCase):
         out, _, _ = self.resolve(rejected=(1, 2, 3))
         self.assertEqual(out['hypotheses'][0]['probability_pct'], 100)
         self.assertIn('not statistical certainty or a confirmed diagnosis', out['operator_summary'])
+        self.assertIn('not statistical certainty or a confirmed diagnosis', out['question']['why_asked'])
 
     def test_root_default_rejects_smart_question_and_excess_proposals(self):
         manifest = {'proposals': self.prepared['references']['frozen']['proposals'],
@@ -171,6 +172,53 @@ class SmartReviewTests(unittest.TestCase):
         parsed = parsed_review(prepared, rejected=(1,))
         with self.assertRaisesRegex(review.SmartReviewError, 'question_has_no_supported_target'):
             review.resolve(prepared=prepared, parsed=parsed, probability_band=self.band)
+
+    def test_exact_server_safety_policy_is_frozen_without_erasing_public_note(self):
+        for language in ('en', 'it'):
+            with self.subTest(language=language):
+                self.step['question']['safety_note'] = review.SAFETY_POLICY_TEXT[language]
+                prepared = review.prepare(step=self.step, packet=self.packet, symptom_text='Stop', history=[], language=language)
+                question = prepared['references']['frozen']['proposals'][-1]
+                self.assertEqual(question['application_safety_policy'], {
+                    'version': review.SAFETY_POLICY_VERSION, 'text': review.SAFETY_POLICY_TEXT[language]})
+                self.assertEqual(json.loads(question['checks'][1]['text']), {
+                    'safety_level': 'caution', 'source_safety_note': ''})
+                self.assertIn(review.SAFETY_POLICY_TEXT[language], review.generation_safety_instruction(language))
+                out, _, _ = review.resolve(prepared=prepared, parsed=parsed_review(prepared), probability_band=self.band)
+                self.assertEqual(out['question']['safety_note'], review.SAFETY_POLICY_TEXT[language])
+                altered = copy.deepcopy(prepared)
+                altered['references']['frozen']['proposals'][-1]['application_safety_policy']['text'] = 'Enter the guarded area'
+                with self.assertRaises(refs.ReferenceError):
+                    review.resolve(prepared=altered, parsed=parsed_review(prepared), probability_band=self.band)
+
+    def test_custom_or_spoofed_safety_notes_always_require_source_proof(self):
+        canonical = review.SAFETY_POLICY_TEXT['en']
+        notes = ['Observe from the operator position.', 'Isolate every energy source before physical inspection.',
+                 canonical + ' Then inspect while energized.', ' ' + canonical, canonical + '.',
+                 canonical.replace('guards,', 'guards, '), review.SAFETY_POLICY_TEXT['it']]
+        for note in notes:
+            with self.subTest(note=note):
+                self.step['question'].update(safety_note=note, application_safety_policy={
+                    'version': review.SAFETY_POLICY_VERSION, 'text': canonical})
+                prepared = review.prepare(step=self.step, packet=self.packet, symptom_text='Stop', history=[], language='en')
+                question = prepared['references']['frozen']['proposals'][-1]
+                self.assertIsNone(question['application_safety_policy'])
+                self.assertEqual(json.loads(question['checks'][1]['text'])['source_safety_note'], note)
+                parsed = parsed_review(prepared)
+                parsed['decisions'][-1]['proofs'][0]['check_indices'] = [0, 2]
+                with self.assertRaisesRegex(refs.ReferenceError, 'not_all_checks_supported'):
+                    review.resolve(prepared=prepared, parsed=parsed, probability_band=self.band)
+
+    def test_policy_cannot_override_reviewer_rejection_for_missing_isolation(self):
+        self.step['question']['safety_note'] = review.SAFETY_POLICY_TEXT['en']
+        self.step['hypotheses'][0]['checks'] = ['Under approved safe conditions, physically inspect the sensor.']
+        prepared = review.prepare(step=self.step, packet=self.packet, symptom_text='Stop', history=[])
+        parsed = parsed_review(prepared, rejected=(0, 1, 2, 3), reject_question=True)
+        parsed['decisions'][0]['note'] = 'The source requires energy isolation before physical inspection; it is missing.'
+        with self.assertRaisesRegex(review.SmartReviewError, 'question_not_supported'):
+            review.resolve(prepared=prepared, parsed=parsed, probability_band=self.band)
+        self.assertIn('required isolation', review.INSTRUCTION)
+        self.assertIn('cannot replace', review.generation_safety_instruction('en'))
 
     def test_capture_reports_when_redaction_or_size_prevents_exact_replay(self):
         grounding = smart_evidence.build(self.sources, scope=self.scope)
@@ -304,6 +352,7 @@ class SmartReviewEndpointTests(unittest.TestCase):
         for name, value in [('AI_INTERNAL_SECRET', 'offline-smart-review-only'), ('SMART_DIAGNOSTIC_ENABLED', True), ('ASSISTANT_CORE_V2_ENABLED', True)]:
             self.patches.enter_context(patch.object(self.m, name, value))
         self.patches.enter_context(patch.object(self.m, '_build_rg_links', return_value=[]))
+        self.real_enrich = self.m._sd_enrich_state_evidence_from_answer
         self.patches.enter_context(patch.object(self.m, '_sd_enrich_state_evidence_from_answer', side_effect=lambda **kw: kw['state']))
         self.sources, self.raw = fixture()
         self.patches.enter_context(patch.object(self.m, '_sd_llm_step_start', side_effect=lambda **kw: copy.deepcopy(self.raw)))
@@ -346,6 +395,8 @@ class SmartReviewEndpointTests(unittest.TestCase):
     def test_emitted_signed_start_answer_finalize_and_repeated_finalize(self):
         start = self.start()
         self.assertEqual(len(start['hypotheses']), 3)
+        disclaimer = 'Relative hypothesis weights are indicative, not statistical certainty or a confirmed diagnosis.'
+        self.assertEqual(start['why_asked'].count(disclaimer), 1)
         answer_step = copy.deepcopy(self.raw)
         answer_step['hypotheses'] = start['hypotheses']
         answer_step['question']['question_text'] = 'Does the HMI show the material detection signal?'
@@ -356,10 +407,12 @@ class SmartReviewEndpointTests(unittest.TestCase):
         self.assertEqual(r.status_code, 200, r.text)
         answer = r.json()
         self.assertEqual(answer['question_number'], 2)
+        self.assertEqual(answer['why_asked'].count(disclaimer), 1)
         before = self.provider.call_count
         final = self.post('finalize', answer['session_state_json'])
         self.assertEqual(final.status_code, 200, final.text)
         self.assertTrue(final.json()['final_ready'], final.text)
+        self.assertEqual(final.json()['final_summary_text'].count(disclaimer), 1)
         self.assertEqual(self.provider.call_count, before)
         again = self.post('finalize', final.json()['session_state_json'])
         self.assertEqual(again.status_code, 200, again.text)
@@ -379,6 +432,51 @@ class SmartReviewEndpointTests(unittest.TestCase):
             r = self.post('finalize', signed)
             self.assertEqual(r.status_code, 409, r.text)
             self.assertEqual(self.provider.call_count, before)
+
+    def test_start_paths_preserve_distinct_complete_safety_tails_and_public_ids(self):
+        prefix = 'Observe the documented signal without entering the machine. ' * 12
+        for index, source in enumerate(self.sources):
+            source.update(citation_id=f'manual:p1-1:c{index + 1}', page_from=1, page_to=1,
+                          chunk_full=prefix + f'Before physical inspection isolate energy circuit {index + 1}.')
+        for h in self.raw['hypotheses']:
+            h['evidence_ids'] = [self.sources[0]['citation_id']]
+        display = self.m._sanitize_citations_for_response(self.sources, company_id='fixture-company')
+        self.assertEqual(len(self.m._sd_prepare_citations_for_response(display, max_items=8)), 1)
+        starts = [self.start()]
+        with patch.object(self.m, 'ASSISTANT_CORE_V2_ENABLED', False), \
+             patch.object(self.m, '_diagnostic_evidence_pipeline', return_value={'citations': self.sources}), \
+             patch.object(self.m, '_v13_deterministic_evidence_state', return_value=('supported', {})), \
+             patch.object(self.m, '_sd_semantic_evidence_gate', return_value={'accepted': True, 'decision': 'supported'}), \
+             patch.object(self.m, '_sd_run_retrieval_assurance', return_value=(True, self.sources, {})):
+            starts.append(self.start())
+        expected_ids = {s['citation_id'] for s in self.sources}
+        for start in starts:
+            state = json.loads(start['session_state_json'])
+            self.assertEqual({e['citation_id'] for e in state['evidence']}, expected_ids)
+            self.assertEqual({c['citation_id'] for c in start['citations']}, expected_ids)
+            records = smart_evidence.review_packet(state['grounding_packet'])['validator_records']
+            self.assertEqual({r['text'] for r in records}, {s['chunk_full'] for s in self.sources})
+            self.assertEqual({r['citation_id'] for r in records}, expected_ids)
+
+    def test_answer_enrichment_selects_complete_sources_before_display_dedup(self):
+        start = self.start()
+        state = json.loads(start['session_state_json'])
+        prefix = 'New admitted operating context. ' * 30
+        additions = [{**self.sources[0], 'citation_id': f'manual:p3-3:c{i}', 'page_from': 3, 'page_to': 3,
+                      'chunk_full': prefix + f'Retain isolation condition {i}.'} for i in (1, 2, 3, 4)]
+        with patch.object(self.m, 'SMART_DIAGNOSTIC_RETRIEVAL_ASSURANCE_ENABLED', True), \
+             patch.object(self.m, 'SMART_DIAGNOSTIC_RETRIEVAL_ASSURANCE_MAX_NEW_EVIDENCE', 4), \
+             patch.object(self.m, '_sd_answer_retrieval_signal', return_value=('New reported signal', ['signal'])), \
+             patch.object(self.m, '_v13_apply_retrieval_assurance', return_value=(
+                 {'citations': additions}, {'adopted': True, 'new_candidates_admitted': 2})):
+            updated = self.real_enrich(state=state, company_id='fixture-company', machine_id='fixture-machine',
+                language='en', current_question=state['current_question'], answer={'api_value': 'present'})
+        expected_ids = {s['citation_id'] for s in self.sources + additions[:3]}
+        self.assertEqual({e['citation_id'] for e in updated['evidence']}, expected_ids)
+        self.assertEqual({e['citation_id'] for e in updated['citations']}, expected_ids)
+        records = smart_evidence.review_packet(updated['grounding_packet'])['validator_records']
+        self.assertEqual({r['text'] for r in records}, {s['chunk_full'] for s in self.sources + additions[:3]})
+        self.assertEqual(len(json.loads(start['session_state_json'])['evidence']), len(state['evidence']))
 
     def test_old_title_only_state_requires_restart_before_generation(self):
         start = self.start()
@@ -586,16 +684,19 @@ class SmartReviewEndpointTests(unittest.TestCase):
             self.m._V13_BUDGET_CTX.reset(token)
 
     def test_final_public_citations_keep_seven_proof_selected_ids(self):
-        citations = [{'citation_id': f'source{i}:p1', 'bubble_document_id': f'source{i}', 'source_type': 'document',
-                      'display_title': f'Source {i}', 'display_label': f'Source {i} page1', 'page_from': 1, 'page_to': 1,
-                      'snippet': f'Distinct support record number {i}.'} for i in range(7)]
+        citations = [{'citation_id': f'manual:p1-1:c{i}', 'bubble_document_id': 'manual', 'source_type': 'document',
+                      'display_title': 'Manual', 'display_label': 'Manual page1', 'page_from': 1, 'page_to': 1,
+                      'snippet': 'Shared display prefix. ' * 30 + f'Distinct safety continuation {i}.'} for i in range(7)]
+        packet = smart_evidence.build(citations, scope={'company_id': 'fixture-company',
+            'machine_id': 'fixture-machine', 'ai_scope': 'machine_all'}, allow_raw_snippet=True)
         hyps = copy.deepcopy(self.raw['hypotheses'])
         for h, source_range in zip(hyps, ((0, 1), (2, 3), (4, 5), (6,))):
             h['evidence_ids'] = [citations[i]['citation_id'] for i in source_range]
         step = self.m._sd_terminal_reviewed_step({'hypotheses': hyps}, language='en', question_number=1)
         response = self.m._sd_response_from_step(session_id='fixture-session', company_id='fixture-company',
             machine_id='fixture-machine', symptom_text='Reported stop.', language='en',
-            state={'grounding_review': {'policy_version': review.POLICY_VERSION}, 'evidence': citations},
+            state={'grounding_review': {'policy_version': review.POLICY_VERSION},
+                   'grounding_packet': packet, 'evidence': citations},
             step=step, citations=citations, rg_links=[])
         public_ids = {c['citation_id'] for c in response['citations']}
         self.assertEqual(len(public_ids), 7)

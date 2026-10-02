@@ -4,6 +4,7 @@ Only the server's admitted raw retrieval producer may call build/enrichment.
 Fingerprinting detects mutation; it is NOT authorization or a replacement for
 state HMAC verification. Legacy display snippets cannot reconstruct this packet.
 No I/O, model calls, relevance ranking, title-derived evidence or text clipping.
+Selection precedes display projection and can coalesce only identical full bodies.
 """
 from __future__ import annotations
 
@@ -16,6 +17,7 @@ VERSION = "smart-grounding-packet-v1"
 MAX_CHARS = 22000
 MAX_SOURCES = 14
 MAX_NEW_SOURCES = 3
+MAX_SELECTED_SOURCES = 8
 _SOURCE_KEYS = {
     "citation_id", "bubble_document_id", "source_id", "source_type",
     "page_from", "page_to", "machine_relation", "body_id", "start", "end",
@@ -101,6 +103,45 @@ def _normalize(row: Any, scope: dict, allow_raw_snippet: bool) -> tuple[dict, st
 def _owner(source: dict) -> str:
     return canonical({k: v for k, v in source.items()
                       if k not in {"citation_id", "body_id", "start", "end"}})
+
+
+def select_complete_sources(raw_rows: list[dict], *, scope: dict, max_items: int,
+                            allow_raw_snippet: bool = False) -> list[dict]:
+    """Select ordered raw representatives without comparing display projections.
+
+    Only a server-admitted producer can supply these rows and opt into snippet
+    as its full-record field, exactly as for build(). A shared title, first 520
+    characters, normalized text or containment never makes records equivalent.
+    Exact aliases with identical provenance/body keep the first original ID;
+    selection occurs before planner/review references exist. Incoming signed
+    state's old IDs must instead remain intact through update_enrichment().
+
+    Validate the complete input before the bounded selection: conflicting uses
+    of one ID or a foreign row cannot hide after an alias or the selected cap.
+    The existing serialized/expanded 22k limit remains enforced by build().
+    """
+    bound = _scope(scope)
+    _require(type(max_items) is int and 0 <= max_items <= MAX_SELECTED_SOURCES,
+             "evidence_selection_limit_invalid")
+    _require(type(allow_raw_snippet) is bool, "evidence_raw_mode_invalid")
+    _require(isinstance(raw_rows, list), "evidence_row_invalid")
+    by_id: dict[str, tuple[str, str]] = {}
+    seen_complete: set[tuple[str, str]] = set()
+    selected: list[dict] = []
+    for row in raw_rows:
+        source, body = _normalize(row, bound, allow_raw_snippet)
+        cid = source["citation_id"]
+        complete = (_owner(source), body)
+        if cid in by_id:
+            _require(by_id[cid] == complete, "evidence_duplicate_citation_conflict")
+        else:
+            by_id[cid] = complete
+        if complete in seen_complete:
+            continue
+        seen_complete.add(complete)
+        if len(selected) < max_items:
+            selected.append(deepcopy(row))
+    return selected
 
 
 def _text(packet: dict, source: dict) -> str:

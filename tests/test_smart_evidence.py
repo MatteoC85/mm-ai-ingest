@@ -35,6 +35,89 @@ class SmartEvidenceTests(unittest.TestCase):
         with self.assertRaisesRegex(evidence.SmartEvidenceError, "^" + code + "$"):
             function(*args, **kwargs)
 
+    def test_selection_keeps_distinct_safety_tails_after_shared_520_char_prefix(self):
+        prefix = "Record the isolated sensor condition without changing settings.\n" * 15
+        rows = [row("manual-A:p20-20:c1", prefix + "If active, STOP and retain isolation."),
+                row("manual-A:p20-20:c2", prefix + "If absent, inspect the connector before any reset.")]
+        # Their actual raw text differs; the display fields deliberately match.
+        self.assertEqual(rows[0]["snippet_clean"], rows[1]["snippet_clean"])
+        self.assertEqual(rows[0]["chunk_full"][:520], rows[1]["chunk_full"][:520])
+        selected = evidence.select_complete_sources(rows, scope=SCOPE, max_items=8)
+        self.assertEqual([r["citation_id"] for r in selected], [r["citation_id"] for r in rows])
+        packet = evidence.build(selected, scope=SCOPE)
+        full = evidence.review_packet(packet)["validator_records"]
+        self.assertEqual([r["text"] for r in full], [r["chunk_full"] for r in rows])
+
+    def test_selection_exact_alias_keeps_first_real_id_and_frees_a_slot(self):
+        first = row("ps:synthetic:p1-1:c1")
+        alias = {**deepcopy(first), "citation_id": "ps:synthetic:p1-1:v13page", "snippet_clean": "Other display"}
+        distinct = row("ps:synthetic:p1-1:c2", "A different complete safety instruction.")
+        rows = [first, alias, distinct]
+        before = deepcopy(rows)
+        selected = evidence.select_complete_sources(rows, scope=SCOPE, max_items=2)
+        self.assertEqual([r["citation_id"] for r in selected], [first["citation_id"], distinct["citation_id"]])
+        self.assertEqual(rows, before)
+        selected[0]["chunk_full"] = "caller mutation"
+        self.assertEqual(rows, before)
+
+    def test_selection_does_not_merge_containment_or_whitespace_differences(self):
+        rows = [row("same:p1-1:c1", "Preserve this warning."),
+                row("same:p1-1:c2", "Heading\nPreserve this warning.\nClosing safety note."),
+                row("same:p1-1:c3", "Preserve  this warning."),
+                row("same:p1-1:c4", "Preserve this warning.\n")]
+        selected = evidence.select_complete_sources(rows, scope=SCOPE, max_items=8)
+        self.assertEqual([r["citation_id"] for r in selected], [r["citation_id"] for r in rows])
+
+    def test_selection_exact_text_different_provenance_is_retained(self):
+        first = row("same:p1-1:c1")
+        rows = [first,
+                {**first, "citation_id": "other:p1-1:c1", "bubble_document_id": "other", "source_id": "other"},
+                {**first, "citation_id": "same:p2-2:c1", "page_from": 2, "page_to": 2},
+                {**first, "citation_id": "same:p1-1:general", "machine_id": ""},
+                {**first, "citation_id": "same:p1-1:document", "source_type": "document"}]
+        selected = evidence.select_complete_sources(rows, scope=SCOPE, max_items=8)
+        self.assertEqual([r["citation_id"] for r in selected], [r["citation_id"] for r in rows])
+
+    def test_selection_conflicting_id_fails_even_after_cap_or_duplicate_alias(self):
+        first = row("same:p1-1:c1")
+        alias = {**first, "citation_id": "same:p1-1:alias"}
+        for changed in ({**first, "chunk_full": "Conflicting complete body."},
+                        {**alias, "page_from": 2, "page_to": 2}):
+            self.assert_error("evidence_duplicate_citation_conflict", evidence.select_complete_sources,
+                [first, alias, changed], scope=SCOPE, max_items=1)
+        selected = evidence.select_complete_sources([first, deepcopy(first)], scope=SCOPE, max_items=8)
+        self.assertEqual([r["citation_id"] for r in selected], [first["citation_id"]])
+
+    def test_selection_validates_scope_even_after_selected_limit(self):
+        for field, code in (("company_id", "evidence_company_mismatch"), ("machine_id", "evidence_machine_mismatch")):
+            foreign = row("foreign", **{field: "foreign"})
+            self.assert_error(code, evidence.select_complete_sources, [row(), foreign], scope=SCOPE, max_items=1)
+
+    def test_selection_snippet_mode_is_explicit_server_argument(self):
+        raw = row(allow_raw_snippet=True)
+        raw.pop("chunk_full")
+        raw["snippet"] = "Producer's complete raw record.\nPreserve final safety."
+        self.assert_error("full_admitted_text_required", evidence.select_complete_sources,
+                          [raw], scope=SCOPE, max_items=8)
+        selected = evidence.select_complete_sources([raw], scope=SCOPE, max_items=8, allow_raw_snippet=True)
+        packet = evidence.build(selected, scope=SCOPE, allow_raw_snippet=True)
+        self.assertEqual(evidence.review_packet(packet)["validator_records"][0]["text"], raw["snippet"])
+
+    def test_selection_original_order_and_eight_source_cap_remain(self):
+        rows = [row("source-%d" % i, "Complete body %d" % i) for i in range(10)]
+        selected = evidence.select_complete_sources(rows, scope=SCOPE, max_items=8)
+        self.assertEqual(selected, rows[:8])
+        self.assertEqual(evidence.select_complete_sources(rows, scope=SCOPE, max_items=0), [])
+        for limit in (9, -1, True, 8.0):
+            self.assert_error("evidence_selection_limit_invalid", evidence.select_complete_sources,
+                              rows, scope=SCOPE, max_items=limit)
+
+    def test_selection_never_clips_to_fit_packet_capacity(self):
+        raw = row(text="x" * evidence.MAX_CHARS + "FINAL SAFETY")
+        selected = evidence.select_complete_sources([raw], scope=SCOPE, max_items=8)
+        self.assertEqual(selected[0]["chunk_full"], raw["chunk_full"])
+        self.assert_error("evidence_packet_capacity_exceeded", evidence.build, selected, scope=SCOPE)
+
     def test_full_body_tail_and_whitespace_survive_all_turn_representations(self):
         text = " \n" + "Middle sentence.\n" * 100 + "SAFETY: keep isolation; restore the guide before use.\n "
         raw = row(text=text)

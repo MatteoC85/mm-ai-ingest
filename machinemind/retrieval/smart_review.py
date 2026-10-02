@@ -10,9 +10,14 @@ import re
 
 from . import review_references as refs
 
-POLICY_VERSION = 'smart-reviewed-proposals-v1'
+POLICY_VERSION = 'smart-reviewed-proposals-v2'
 MAX_CHECK_CHARS = 2000
 WIRE_VERSION = 'smart-review-wire-v1'
+SAFETY_POLICY_VERSION = 'smart-restrictive-safety-v1'
+SAFETY_POLICY_TEXT = {
+    'en': 'Do not enter guarded areas or bypass guards, interlocks or safety devices; if the observation cannot be made safely under the approved procedure, choose Unknown',
+    'it': 'Non entrare nelle aree protette e non bypassare ripari, interblocchi o dispositivi di sicurezza; se la verifica non è possibile in sicurezza secondo la procedura approvata, scegli Non so',
+}
 
 # Only the transport representation changes. The private seal and the Root
 # validator continue to use the complete, descriptive reference contract.
@@ -51,8 +56,18 @@ invent a new target or accept a question after all its declared targets are reje
 An abstention_control is an exact SERVER-CANONICAL unknown/cannot-check button:
 it is an interface choice to withhold an observation, not a machine fact requiring
 manual wording. It remains immutable and visible. All technical alternatives,
-question/why claims, operating instructions and safety notes still need support;
+question/why claims, operating instructions and source_safety_note still need support;
 this distinction never exempts their source proofs or complete check coverage.
+An application_safety_policy is a versioned, exact SERVER-OWNED restriction, not
+a statement from the manual and never permission to operate, enter, move, change
+parameters or inspect energized equipment. Its prohibitions/abstention need not
+be repeated verbatim in a machine source. Still reject a question that conflicts
+with a source safety requirement. Every question check, including safety_level
+and any source_safety_note, needs the applicable technical/context source proof.
+No arbitrary generated safety note receives policy provenance. Do not replace
+required isolation, access conditions, speed limits or other source prerequisites
+with this policy or vague 'approved safe conditions'; dependent checks must
+explicitly retain the applicable prerequisites or be rejected.
 For causes, the original causal-proof requirement remains mandatory.
 Evidence IDs originally chosen by the generator are unvalidated: you may bind a
 proposal to another source ONLY within this packet and with valid support units.
@@ -124,11 +139,13 @@ def prepare(*, step, packet, symptom_text, history, language='en'):
         q = step.get('question') or {}
         require(isinstance(q.get('question_text'), str) and q['question_text'].strip(), 'question_missing')
         question_index = len(proposals)
+        safety, application_policy = question_safety_roles(q, language=language)
         texts = [refs.canonical({'question_text': q['question_text'], 'why_asked': q.get('why_asked', '')}),
-                 refs.canonical({'safety_level': q.get('safety_level'), 'safety_note': q.get('safety_note', '')}),
+                 refs.canonical(safety),
                  refs.canonical(question_option_roles(q.get('options') or []))]
         proposals.append({'proposal_index': question_index, 'kind': 'diagnostic_question',
                           'target_hypotheses': list(q.get('target_hypotheses') or []),
+                          'application_safety_policy': application_policy,
                           'cause': 'Current closed diagnostic question',
                           'why': 'Check every field and all options against the sources and the hypotheses you accept.',
                           'checks': [{'check_index': i, 'text': s} for i, s in enumerate(texts)]})
@@ -142,6 +159,27 @@ def prepare(*, step, packet, symptom_text, history, language='en'):
     return {'step': deepcopy(step), 'packet': packet, 'references': references, 'language': language,
             'observed_query': observed, 'question_index': question_index,
             'context_digest': refs.digest({'symptom_text': symptom_text, 'history': history or []})}
+
+
+def question_safety_roles(question, *, language):
+    """Only literal equality grants policy provenance; preserve all other notes."""
+    note = question.get('safety_note', '')
+    canonical_note = SAFETY_POLICY_TEXT.get(language)
+    policy = ({'version': SAFETY_POLICY_VERSION, 'text': canonical_note}
+              if canonical_note is not None and note == canonical_note else None)
+    return ({'safety_level': question.get('safety_level'),
+             'source_safety_note': '' if policy else note}, policy)
+
+
+def generation_safety_instruction(language):
+    """Give the planner the same server text; never discard source precautions."""
+    text = SAFETY_POLICY_TEXT.get(language, SAFETY_POLICY_TEXT['it'])
+    return ('Application safety policy (' + SAFETY_POLICY_VERSION + '): ' + refs.canonical(text) + '. '
+            'You may use this EXACT text as safety_note only when no additional machine-specific precaution is needed. '
+            'Otherwise retain all applicable source precautions in safety_note and the dependent checks/question; '
+            'do not omit them to match this policy. Physical inspections must explicitly preserve required isolation '
+            'and other source prerequisites; vague approved safe conditions cannot replace them. '
+            'The policy imposes prohibitions and abstention only; it grants no operational permission. ')
 
 
 def question_option_roles(options):
@@ -312,7 +350,12 @@ def resolve(*, prepared, parsed, probability_band):
         caution = ('Relative hypothesis weights are indicative, not statistical certainty or a confirmed diagnosis.'
                    if prepared['language'] == 'en' else
                    'I pesi relativi delle ipotesi sono indicativi, non certezze statistiche o una diagnosi confermata.')
-        out['operator_summary'] = (q.get('why_asked') or q['question_text']) + '\n' + caution
+        # The client displays why_asked beside the numeric weights. This fixed
+        # application statement adds no machine claim and is bound by the output
+        # digest below; the original explanation/proof remains in input_step.
+        why = q.get('why_asked') or q['question_text']
+        q['why_asked'] = why if caution in why else why + '\n' + caution
+        out['operator_summary'] = q['why_asked']
     seal = {'policy_version': POLICY_VERSION, 'input_step': deepcopy(original),
             'decisions': deepcopy(parsed), 'context_digest': prepared['context_digest'],
             'output_claims_digest': claims_digest(out),

@@ -19593,7 +19593,7 @@ def _sd_align_rg_links_with_citations(rg_links: list[dict], citations: list[dict
     return out
 
 
-def _sd_prepare_citations_for_response(citations: list[dict], max_items: int = 6) -> list[dict]:
+def _sd_prepare_citations_for_response(citations: list[dict], max_items: int = 6, *, preserve_evidence_ids: bool = False) -> list[dict]:
     """Clean, cluster and deduplicate citations only for Smart Diagnostic responses.
 
     ASK, Root Cause and Draft P&S are not affected: this function is only called
@@ -19612,13 +19612,15 @@ def _sd_prepare_citations_for_response(citations: list[dict], max_items: int = 6
         if cleaned:
             c["snippet_clean"] = cleaned
 
-        exact_key = _sd_citation_dedup_key(c)
+        # Once full source bodies have selected the evidence IDs, presentation
+        # prefixes cannot decide which safety/source continuation survives.
+        exact_key = str(c.get("citation_id") or "") if preserve_evidence_ids else _sd_citation_dedup_key(c)
         if exact_key and exact_key in seen_exact:
             continue
 
         duplicate_index: Optional[int] = None
         for idx, kept in enumerate(out):
-            if _sd_citation_near_duplicate(c, kept):
+            if not preserve_evidence_ids and _sd_citation_near_duplicate(c, kept):
                 duplicate_index = idx
                 break
 
@@ -19660,6 +19662,19 @@ def _sd_filter_rg_links_for_citations(rg_links: list[dict], citations: list[dict
 
 def _sd_grounding_scope(company_id: str, machine_id: str) -> dict:
     return {"company_id": company_id, "machine_id": machine_id, "ai_scope": "machine_all"}
+
+
+def _sd_select_complete_citations(raw_citations: list[dict], *, company_id: str, machine_id: str, max_items: int) -> list[dict]:
+    """Select already admitted complete sources before constructing display text."""
+    try:
+        selected = _smart_evidence.select_complete_sources(raw_citations,
+            scope=_sd_grounding_scope(company_id, machine_id), max_items=max_items, allow_raw_snippet=True)
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail={"code": "SMART_DIAGNOSTIC_EVIDENCE_PACKET_INVALID",
+                                                    "reason": str(exc)}) from None
+    return _sd_prepare_citations_for_response(
+        _sanitize_citations_for_response(selected, company_id=company_id),
+        max_items=max_items, preserve_evidence_ids=True)
 
 
 def _sd_build_grounding_packet(raw_citations: list[dict], citations: list[dict], *, company_id: str, machine_id: str) -> dict:
@@ -19805,8 +19820,8 @@ def _sd_review_error_response(exc: HTTPException, language: str) -> Optional[dic
     return response
 
 
-def _sd_compact_evidence_for_state(citations: list[dict], *, max_items: int) -> list[dict]:
-    citations = _sd_prepare_citations_for_response(citations, max_items=max_items)
+def _sd_compact_evidence_for_state(citations: list[dict], *, max_items: int, preserve_evidence_ids: bool = False) -> list[dict]:
+    citations = _sd_prepare_citations_for_response(citations, max_items=max_items, preserve_evidence_ids=preserve_evidence_ids)
     out: list[dict] = []
     for c in citations[: max(1, max_items)]:
         if not isinstance(c, dict):
@@ -20341,10 +20356,19 @@ def _sd_enrich_state_evidence_from_answer(
     if not bool((assurance or {}).get("adopted")):
         return state
     admitted_enrichment = list(enhanced.get("citations") or [])
-    citations = _sanitize_citations_for_response(admitted_enrichment, company_id=company_id)
+    current_ids = {str(e.get("citation_id") or "") for e in (state.get("evidence") or []) if isinstance(e, dict)}
+    capacity = max(0, SMART_DIAGNOSTIC_MAX_EVIDENCE_IN_STATE - len(current_ids))
+    if not capacity:
+        return state
+    addition_limit = min(capacity, SMART_DIAGNOSTIC_RETRIEVAL_ASSURANCE_MAX_NEW_EVIDENCE,
+                         _smart_evidence.MAX_NEW_SOURCES)
+    citations = _sd_select_complete_citations(
+        [c for c in admitted_enrichment if str(c.get("citation_id") or "") not in current_ids],
+        company_id=company_id, machine_id=machine_id,
+        max_items=addition_limit)
     persisted_by_id = {
         str(item.get("citation_id") or "").strip(): dict(item)
-        for item in list(state.get("citations") or []) + list(state.get("evidence") or [])
+        for item in list(state.get("evidence") or []) + list(state.get("citations") or [])
         if isinstance(item, dict) and str(item.get("citation_id") or "").strip()
     }
     citations = [
@@ -20355,16 +20379,15 @@ def _sd_enrich_state_evidence_from_answer(
         for citation in citations
         if isinstance(citation, dict)
     ]
-    current_ids = {str(e.get("citation_id") or "") for e in (state.get("evidence") or []) if isinstance(e, dict)}
-    existing = list(state.get("citations") or [])
-    capacity = max(0, SMART_DIAGNOSTIC_MAX_EVIDENCE_IN_STATE - len(current_ids))
+    existing = [persisted_by_id[str(e.get("citation_id") or "")] for e in state.get("evidence") or []]
     additions = [c for c in citations if str(c.get("citation_id") or "") not in current_ids][
-        :min(capacity, SMART_DIAGNOSTIC_RETRIEVAL_ASSURANCE_MAX_NEW_EVIDENCE)]
+        :addition_limit]
     if not additions:
         return state
     citations = _sd_prepare_citations_for_response(
         existing + additions,
         max_items=SMART_DIAGNOSTIC_MAX_EVIDENCE_IN_STATE,
+        preserve_evidence_ids=True,
     )
     if not citations:
         return state
@@ -20374,7 +20397,7 @@ def _sd_enrich_state_evidence_from_answer(
             [c for c in admitted_enrichment if str(c.get("citation_id") or "") in addition_ids],
             scope=_sd_grounding_scope(company_id, machine_id),
             allowed_ids={str(c.get("citation_id") or "") for c in citations}, allow_raw_snippet=True,
-            max_new_sources=SMART_DIAGNOSTIC_RETRIEVAL_ASSURANCE_MAX_NEW_EVIDENCE)
+            max_new_sources=addition_limit)
     except ValueError:
         # Optional enrichment cannot evict or truncate an already admitted source.
         return state
@@ -20389,6 +20412,7 @@ def _sd_enrich_state_evidence_from_answer(
     updated["evidence"] = _sd_compact_evidence_for_state(
         citations,
         max_items=SMART_DIAGNOSTIC_MAX_EVIDENCE_IN_STATE,
+        preserve_evidence_ids=True,
     )
     gate_state = dict(updated.get("evidence_gate") or {})
     gate_state["accepted"] = True
@@ -20689,6 +20713,7 @@ def _sd_llm_step_start(
         "Generate up to four supported hypotheses with estimated probabilities from evidence + symptom; this is a ceiling, not a quota. "
         "Every cause, explanation and check must be supported by its cited source; omit a weak hypothesis rather than citing a merely related topic. "
         "Ask the next best closed question that separates the leading hypotheses. "
+        "If only one supported hypothesis remains, ask a documented observation testing or challenging its prerequisites; do not invent additional causes just to obtain contrast. "
         "Questions must be practical for an operator/technician and answerable as yes/no or single-choice. "
         "For single-choice questions provide at most three factual alternatives and one option with id=unknown for an unavailable or unsafe observation. "
         "Keep each option label concise and complete, at most 120 characters in each language. "
@@ -20698,6 +20723,7 @@ def _sd_llm_step_start(
         "Probabilities are evidence-based estimates, not statistical truth. "
         "Use only citation_ids present in EVIDENCE_IDS."
     )
+    system_msg += " " + _smart_review.generation_safety_instruction(language)
     user_msg = (
         f"RESPONSE_LANGUAGE: {language}\n"
         f"MAX_QUESTIONS: {max_questions}\n"
@@ -20744,6 +20770,7 @@ def _sd_llm_step_answer(*, state: dict, answer: dict, language: str, max_hypothe
         "Use ONLY the provided state, answer and indexed evidence. Do not invent machine-specific facts. "
         "Update probabilities and ask ONE next closed question, unless the diagnosis is ready to finalize. "
         "Choose the next question to discriminate the top remaining hypotheses. "
+        "If only one supported hypothesis remains, ask a documented observation testing or challenging its prerequisites; do not invent additional causes just to obtain contrast. "
         "Keep hypothesis IDs stable when updating the same cause. Explain how the latest answer changes each leading hypothesis. "
         "An unknown answer is missing information, never a positive or negative observation. "
         "For single-choice questions provide at most three factual alternatives and one option with id=unknown for an unavailable or unsafe observation. "
@@ -20755,6 +20782,7 @@ def _sd_llm_step_answer(*, state: dict, answer: dict, language: str, max_hypothe
         "Reply in the requested language for all user-facing text. "
         "Use only citation_ids present in EVIDENCE_IDS."
     )
+    system_msg += " " + _smart_review.generation_safety_instruction(language)
     user_msg = (
         f"RESPONSE_LANGUAGE: {language}\n"
         f"MAX_QUESTIONS: {max_questions}\n"
@@ -21027,6 +21055,7 @@ def _sd_response_from_step(
     citations = _sd_prepare_citations_for_response(
         citations,
         max_items=SMART_DIAGNOSTIC_MAX_EVIDENCE_IN_STATE,
+        preserve_evidence_ids=bool(state.get("grounding_packet")),
     )
     source_manifest_meta = {
         "version": SMART_DIAGNOSTIC_SOURCE_MANIFEST_VERSION,
@@ -21239,11 +21268,10 @@ def _assistant_core_synthesize_smart_start(
     max_hypotheses = int(_assistant_core_scope_value(request, "max_hypotheses", SMART_DIAGNOSTIC_MAX_HYPOTHESES) or SMART_DIAGNOSTIC_MAX_HYPOTHESES)
     context_label = str(_assistant_core_scope_value(request, "context_label") or "")
 
-    response_citations = _sanitize_citations_for_response(raw_citations, company_id=request.company_id)
-    response_citations = _sd_prepare_citations_for_response(
-        response_citations,
-        max_items=SMART_DIAGNOSTIC_MAX_EVIDENCE_IN_STATE,
-    )
+    evidence_limit = max(1, min(SMART_DIAGNOSTIC_MAX_EVIDENCE_IN_STATE, request.top_k,
+                                _smart_evidence.MAX_SELECTED_SOURCES))
+    response_citations = _sd_select_complete_citations(raw_citations,
+        company_id=request.company_id, machine_id=request.machine_id, max_items=evidence_limit)
     try:
         rg_links = _build_rg_links(request.company_id, response_citations)
     except Exception as exc:
@@ -21252,7 +21280,7 @@ def _assistant_core_synthesize_smart_start(
 
     evidence_state = _sd_compact_evidence_for_state(
         response_citations,
-        max_items=max(1, min(SMART_DIAGNOSTIC_MAX_EVIDENCE_IN_STATE, request.top_k)),
+        max_items=evidence_limit, preserve_evidence_ids=True,
     )
     state_ids = {e['citation_id'] for e in evidence_state}
     grounding_packet = _sd_build_grounding_packet(raw_citations,
@@ -21929,14 +21957,16 @@ def smart_diagnostic_start_v1(
         "retrieval_assurance": assurance_meta,
         "relevant_evidence_ids": [str(c.get("citation_id") or "") for c in raw_citations],
     }
-    response_citations = _sanitize_citations_for_response(raw_citations, company_id=company_id)
-    response_citations = _sd_prepare_citations_for_response(response_citations, max_items=SMART_DIAGNOSTIC_MAX_EVIDENCE_IN_STATE)
+    evidence_limit = max(1, min(SMART_DIAGNOSTIC_MAX_EVIDENCE_IN_STATE, top_k,
+                                _smart_evidence.MAX_SELECTED_SOURCES))
+    response_citations = _sd_select_complete_citations(raw_citations,
+        company_id=company_id, machine_id=machine_id, max_items=evidence_limit)
     try:
         rg_links = _build_rg_links(company_id, response_citations)
     except Exception as e:
         print("SMART_DIAGNOSTIC_RG_LINKS_FAIL", str(e)[:300])
         rg_links = []
-    evidence_state = _sd_compact_evidence_for_state(response_citations, max_items=max(1, min(SMART_DIAGNOSTIC_MAX_EVIDENCE_IN_STATE, top_k)))
+    evidence_state = _sd_compact_evidence_for_state(response_citations, max_items=evidence_limit, preserve_evidence_ids=True)
     state_ids = {e['citation_id'] for e in evidence_state}
     grounding_packet = _sd_build_grounding_packet(raw_citations,
         [c for c in response_citations if c['citation_id'] in state_ids], company_id=company_id, machine_id=machine_id)

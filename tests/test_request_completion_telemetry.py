@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import socket
 import sys
+import threading
 import time
 from types import SimpleNamespace
 import unittest
@@ -63,14 +64,34 @@ class CompletionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_stream_records_terminal_timeout_despite_http_200(self):
         controls = []
+        loop = asyncio.get_running_loop()
+        started, finished = asyncio.Event(), asyncio.Event()
+        release = threading.Event()
+        clock = [0.0]
         def work(payload, secret):
             controls.append(_REQUEST_CONTROL_CTX.get())
-            time.sleep(0.35)
-            return {"ok": True, "status": "answered"}
-        args = dict(self.kwargs, hard_timeout_seconds=0.015)
-        response = await execution.stream_json_response(sync_func=work,
-            heartbeat_seconds=0.005, heartbeat_bytes=1, **args)
-        body = "".join([chunk async for chunk in response.body_iterator])
+            loop.call_soon_threadsafe(started.set)
+            try:
+                release.wait()
+                return {"ok": True, "status": "answered"}
+            finally:
+                loop.call_soon_threadsafe(finished.set)
+        # Patch only the guard's clock, never asyncio's real scheduling clock.
+        # Start the worker before expiring the deadline: a queued task may
+        # legitimately time out without ever calling work, so a 15ms sleep race
+        # cannot establish the cancellation contract this test exercises.
+        with patch.object(execution, "time_module", SimpleNamespace(monotonic=lambda: clock[0])):
+            response = await execution.stream_json_response(sync_func=work,
+                heartbeat_seconds=0.005, heartbeat_bytes=1, **self.kwargs)
+            first_heartbeat = await anext(response.body_iterator)
+            try:
+                await asyncio.wait_for(started.wait(), timeout=5)  # deadlock watchdog only
+                clock[0] = self.kwargs["hard_timeout_seconds"] + 1.0
+                body = first_heartbeat + "".join([chunk async for chunk in response.body_iterator])
+            finally:
+                release.set()
+                if controls:
+                    await asyncio.wait_for(finished.wait(), timeout=5)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(json.loads(body)["status"], "timeout")
         record = self.record()
