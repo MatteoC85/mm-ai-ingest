@@ -3,7 +3,7 @@
 Only the server's admitted raw retrieval producer may call build/enrichment.
 Fingerprinting detects mutation; it is NOT authorization or a replacement for
 state HMAC verification. Legacy display snippets cannot reconstruct this packet.
-No I/O, model calls, relevance ranking, title-derived evidence or text clipping.
+No I/O, model calls, relevance scoring, title-derived evidence or text clipping.
 Selection precedes display projection and can coalesce only identical full bodies.
 """
 from __future__ import annotations
@@ -106,7 +106,7 @@ def _owner(source: dict) -> str:
 
 
 def select_complete_sources(raw_rows: list[dict], *, scope: dict, max_items: int,
-                            allow_raw_snippet: bool = False) -> list[dict]:
+                            allow_raw_snippet: bool = False, relevant_ids=()) -> list[dict]:
     """Select ordered raw representatives without comparing display projections.
 
     Only a server-admitted producer can supply these rows and opt into snippet
@@ -125,17 +125,24 @@ def select_complete_sources(raw_rows: list[dict], *, scope: dict, max_items: int
              "evidence_selection_limit_invalid")
     _require(type(allow_raw_snippet) is bool, "evidence_raw_mode_invalid")
     _require(isinstance(raw_rows, list), "evidence_row_invalid")
+    _require(isinstance(relevant_ids, (list, tuple, set, frozenset)), "evidence_priority_invalid")
+    priority = {_identifier(cid) for cid in relevant_ids}
     by_id: dict[str, tuple[str, str]] = {}
-    seen_complete: set[tuple[str, str]] = set()
-    selected: list[dict] = []
+    validated = []
     for row in raw_rows:
         source, body = _normalize(row, bound, allow_raw_snippet)
         cid = source["citation_id"]
         complete = (_owner(source), body)
         if cid in by_id:
             _require(by_id[cid] == complete, "evidence_duplicate_citation_conflict")
-        else:
-            by_id[cid] = complete
+        by_id[cid] = complete
+        validated.append((row, cid, complete))
+    # Trusted router IDs affect priority only, never admission. Stable order
+    # within both groups preserves the retrieval producer's existing ranking.
+    validated.sort(key=lambda item: item[1] not in priority)
+    seen_complete: set[tuple[str, str]] = set()
+    selected: list[dict] = []
+    for row, cid, complete in validated:
         if complete in seen_complete:
             continue
         seen_complete.add(complete)

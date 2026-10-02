@@ -83,6 +83,22 @@ class SmartReviewTests(unittest.TestCase):
     def resolve(self, **kw):
         return review.resolve(prepared=self.prepared, parsed=parsed_review(self.prepared, **kw), probability_band=self.band)
 
+    def test_temporal_and_retrospective_prompt_contract_does_not_exempt_question_proofs(self):
+        instruction = review.generation_hypothesis_instruction()
+        self.assertIn('no change AFTER an event', instruction)
+        self.assertIn('BEFORE that event', instruction)
+        self.assertIn('explicitly allow Unknown', instruction)
+        self.assertIn('retrospection grants no safety exemption', instruction)
+        self.assertIn('Reject that unsupported temporal inference', review.INSTRUCTION)
+        self.step['question'].update(question_text='What had you already observed before the stop?',
+            why_asked='Distinguish an unknown observation; do not inspect now.', safety_note='')
+        self.prepared = review.prepare(step=self.step, packet=self.packet,
+            symptom_text='No parameter was changed since the stop.', history=[])
+        parsed = parsed_review(self.prepared, rejected=())
+        parsed['decisions'][-1]['proofs'] = []
+        with self.assertRaises(refs.ReferenceError):
+            review.resolve(prepared=self.prepared, parsed=parsed, probability_band=self.band)
+
     def test_four_to_three_retains_independently_supported_question(self):
         out, seal, meta = self.resolve()
         self.assertEqual([h['id'] for h in out['hypotheses']], ['H1', 'H3', 'H4'])
@@ -576,6 +592,117 @@ class SmartReviewEndpointTests(unittest.TestCase):
         records = smart_evidence.review_packet(updated['grounding_packet'])['validator_records']
         self.assertEqual({r['text'] for r in records}, {s['chunk_full'] for s in self.sources + additions[:3]})
         self.assertEqual(len(json.loads(start['session_state_json'])['evidence']), len(state['evidence']))
+
+    def test_start_context_survives_both_paths_and_repeated_finalize_without_more_reads(self):
+        additions = [{**self.sources[0], 'citation_id': f'step:context{i}:p1-1:smart-context',
+            'bubble_document_id': f'step:context{i}', 'source_type': 'step', 'source_id': f'context{i}',
+            'chunk_full': f'Complete predecessor {i}. Keep source-specific isolation and training precautions.'}
+            for i in range(1, 4)]
+        metadata = {'reason': 'context_admitted', 'read_calls': 2,
+                    'added_ids': [r['citation_id'] for r in additions], 'omitted_ids': []}
+        with patch.object(self.m, 'SMART_DIAGNOSTIC_RETRIEVAL_ASSURANCE_ENABLED', True), \
+             patch.object(self.m._smart_context, 'acquire', return_value=(additions, metadata)) as acquire:
+            starts = [self.start()]
+            with patch.object(self.m, 'ASSISTANT_CORE_V2_ENABLED', False), \
+                 patch.object(self.m, '_diagnostic_evidence_pipeline', return_value={'citations': self.sources}), \
+                 patch.object(self.m, '_v13_deterministic_evidence_state', return_value=('supported', {})), \
+                 patch.object(self.m, '_sd_semantic_evidence_gate', return_value={'accepted': True, 'decision': 'supported'}), \
+                 patch.object(self.m, '_sd_run_retrieval_assurance', return_value=(True, self.sources, {})):
+                starts.append(self.start())
+            self.assertEqual(acquire.call_count, 2)
+            before = self.provider.call_count
+            for start in starts:
+                state = json.loads(start['session_state_json'])
+                records = smart_evidence.review_packet(state['grounding_packet'])['validator_records']
+                self.assertEqual({r['text'] for r in records}, {r['chunk_full'] for r in self.sources + additions})
+                self.assertEqual(len(state['evidence']), 5)
+                self.assertEqual(state['retrieval_assurance']['canonical_context']['read_calls'], 2)
+                for _ in range(2):
+                    response = self.post('finalize', start['session_state_json'])
+                    self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(acquire.call_count, 2)
+            self.assertEqual(self.provider.call_count, before)
+
+    def test_optional_start_context_capacity_failure_retains_exact_base_packet(self):
+        additions = [{**self.sources[0], 'citation_id': 'huge', 'chunk_full': 'X' * 22000}]
+        budget = self.m._assistant_core_new_budget('smart_diagnostic', company_id='fixture-company')
+        token = self.m._V13_BUDGET_CTX.set(budget)
+        try:
+            with patch.object(self.m, 'SMART_DIAGNOSTIC_RETRIEVAL_ASSURANCE_ENABLED', True), \
+                 patch.object(self.m._smart_context, 'acquire', return_value=(additions,
+                    {'read_calls': 2, 'added_ids': ['huge'], 'omitted_ids': []})):
+                citations, packet, meta = self.m._sd_prepare_start_grounding(self.sources,
+                    company_id='fixture-company', machine_id='fixture-machine', max_items=8)
+            expected = self.m._sd_build_grounding_packet(self.sources, citations,
+                company_id='fixture-company', machine_id='fixture-machine')
+            self.assertEqual(packet, expected)
+            self.assertEqual(meta['reason'], 'context_packet_not_admitted')
+            self.assertEqual(meta['omitted_ids'], ['huge'])
+            self.assertEqual(meta['added_ids'], [])
+            with patch.object(budget, 'remaining', return_value=33), \
+                 patch.object(self.m._smart_context, 'acquire', side_effect=denied):
+                _, small, meta = self.m._sd_prepare_start_grounding(self.sources,
+                    company_id='fixture-company', machine_id='fixture-machine', max_items=8)
+            self.assertEqual(small, expected)
+            self.assertEqual(meta['read_calls'], 0)
+        finally:
+            self.m._V13_BUDGET_CTX.reset(token)
+
+    def test_start_context_shared_operation_deadline_restores_outer_budget(self):
+        from machinemind.infrastructure import request_budget
+        budget = self.m._assistant_core_new_budget('smart_diagnostic', company_id='fixture-company')
+        token = self.m._V13_BUDGET_CTX.set(budget)
+        prior_control = request_budget._REQUEST_CONTROL_CTX.get()
+        clock = [self.m.time_module.monotonic()]
+        observations = []
+        def acquire(*args, ensure_time, **kwargs):
+            control = request_budget._REQUEST_CONTROL_CTX.get()
+            observations.append(control)
+            self.assertFalse(control.permits_llm())
+            self.assertLessEqual(budget.remaining(), 3.0)
+            ensure_time()
+            clock[0] += 2.25  # First read consumed the same operation window.
+            with self.assertRaises(self.m._V13BudgetExceeded):
+                ensure_time()
+            return [], {'reason': 'context_read_unavailable', 'read_calls': 1, 'added_ids': [], 'omitted_ids': []}
+        try:
+            with patch.object(self.m, 'SMART_DIAGNOSTIC_RETRIEVAL_ASSURANCE_ENABLED', True), \
+                 patch.object(self.m.time_module, 'monotonic', side_effect=lambda: clock[0]), \
+                 patch.object(self.m._smart_context, 'acquire', side_effect=acquire):
+                citations, packet, meta = self.m._sd_prepare_start_grounding(self.sources,
+                    company_id='fixture-company', machine_id='fixture-machine', max_items=8)
+                self.assertGreater(budget.remaining(), 32)
+                self.assertIs(request_budget._REQUEST_CONTROL_CTX.get(), prior_control)
+            expected = self.m._sd_build_grounding_packet(self.sources, citations,
+                company_id='fixture-company', machine_id='fixture-machine')
+            self.assertEqual(packet, expected)
+            self.assertEqual(meta['read_calls'], 1)
+            self.assertEqual(len(observations), 1)
+        finally:
+            self.m._V13_BUDGET_CTX.reset(token)
+
+    def test_optional_context_exhausting_turn_cannot_dispatch_generator(self):
+        budget = self.m._assistant_core_new_budget('smart_diagnostic', company_id='fixture-company')
+        token = self.m._V13_BUDGET_CTX.set(budget)
+        clock = [self.m.time_module.monotonic()]
+        def acquire(*args, ensure_time, **kwargs):
+            clock[0] += 1000
+            with self.assertRaises(self.m._V13BudgetExceeded):
+                ensure_time()
+            return [], {'reason': 'context_read_unavailable', 'read_calls': 1, 'added_ids': [], 'omitted_ids': []}
+        before = self.provider.call_count
+        try:
+            with patch.object(self.m, 'SMART_DIAGNOSTIC_RETRIEVAL_ASSURANCE_ENABLED', True), \
+                 patch.object(self.m.time_module, 'monotonic', side_effect=lambda: clock[0]), \
+                 patch.object(self.m._smart_context, 'acquire', side_effect=acquire):
+                self.m._sd_prepare_start_grounding(self.sources,
+                    company_id='fixture-company', machine_id='fixture-machine', max_items=8)
+                with self.assertRaisesRegex(RuntimeError, 'bounded Smart Diagnostic model attempts failed'):
+                    self.m._assistant_core_sd_json_models([], json_schema={'name': 'offline', 'schema': {}},
+                                                          timeout=70, phase='start')
+            self.assertEqual(self.provider.call_count, before)
+        finally:
+            self.m._V13_BUDGET_CTX.reset(token)
 
     def test_old_title_only_state_requires_restart_before_generation(self):
         start = self.start()

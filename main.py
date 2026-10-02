@@ -192,6 +192,7 @@ from machinemind.retrieval import review_decisions as _retrieval_review_decision
 from machinemind.retrieval import review_references as _retrieval_review_references
 from machinemind.retrieval import smart_review as _smart_review
 from machinemind.retrieval import smart_evidence as _smart_evidence
+from machinemind.retrieval import smart_context as _smart_context
 
 
 _PRECISION_FACT_RUNTIME = lambda: _retrieval_precision_facts.PrecisionFactRuntime(
@@ -19664,17 +19665,68 @@ def _sd_grounding_scope(company_id: str, machine_id: str) -> dict:
     return {"company_id": company_id, "machine_id": machine_id, "ai_scope": "machine_all"}
 
 
-def _sd_select_complete_citations(raw_citations: list[dict], *, company_id: str, machine_id: str, max_items: int) -> list[dict]:
+def _sd_select_complete_citations(raw_citations: list[dict], *, company_id: str, machine_id: str, max_items: int, relevant_ids=()) -> list[dict]:
     """Select already admitted complete sources before constructing display text."""
     try:
         selected = _smart_evidence.select_complete_sources(raw_citations,
-            scope=_sd_grounding_scope(company_id, machine_id), max_items=max_items, allow_raw_snippet=True)
+            scope=_sd_grounding_scope(company_id, machine_id), max_items=max_items,
+            allow_raw_snippet=True, relevant_ids=relevant_ids)
     except ValueError as exc:
         raise HTTPException(status_code=502, detail={"code": "SMART_DIAGNOSTIC_EVIDENCE_PACKET_INVALID",
                                                     "reason": str(exc)}) from None
     return _sd_prepare_citations_for_response(
         _sanitize_citations_for_response(selected, company_id=company_id),
         max_items=max_items, preserve_evidence_ids=True)
+
+
+def _sd_prepare_start_grounding(raw_citations: list[dict], *, company_id: str, machine_id: str,
+                                max_items: int, relevant_ids=()) -> tuple[list[dict], dict, dict]:
+    """Select before display, then optionally add exact bounded procedure context."""
+    citations = _sd_select_complete_citations(raw_citations, company_id=company_id,
+        machine_id=machine_id, max_items=max_items, relevant_ids=relevant_ids)
+    packet = _sd_build_grounding_packet(raw_citations, citations,
+        company_id=company_id, machine_id=machine_id)
+    meta = {'policy': 'smart-canonical-context-v1', 'read_calls': 0, 'added_ids': [],
+            'omitted_ids': [], 'reason': 'context_time_unavailable',
+            'base_ids': [c['citation_id'] for c in citations]}
+    budget = _v13_current_budget()
+    reserve = max(_smart_review.MAX_REVIEW_SECONDS + _smart_review.FINALIZATION_RESERVE_SECONDS,
+                  V13_RETRIEVAL_ASSURANCE_RESERVE_FINAL_SECONDS_ROOT_CAUSE)
+    seconds = min(3.0, float(budget.remaining()) - reserve) if budget is not None else 0.0
+    if seconds < 1.5 or not SMART_DIAGNOSTIC_RETRIEVAL_ASSURANCE_ENABLED:
+        return citations, packet, meta
+    raw_by_id = {str(c.get('citation_id') or ''): c for c in raw_citations}
+    selected = [raw_by_id[c['citation_id']] for c in citations]
+    runtimes = _assistant_core_authority_reader_runtimes()
+    control, token = _v13_push_operation_limits(seconds=seconds, allow_llm=False)
+    try:
+        additions, context_meta = _smart_context.acquire(selected,
+            scope=_sd_grounding_scope(company_id, machine_id),
+            parent_reader=lambda **kwargs: _retrieval_document_readers.read_parent_procedure_page_evidence(
+                **kwargs, runtime=runtimes['read_parent_procedure_page_evidence']),
+            step_reader=lambda **kwargs: _retrieval_structured.read_related_step_page_evidence(
+                **kwargs, runtime=runtimes['read_related_step_page_evidence']),
+            ensure_time=lambda: budget.ensure_time(1.0))
+        meta.update(context_meta)
+        if not additions:
+            return citations, packet, meta
+        added = _sd_select_complete_citations(additions, company_id=company_id,
+            machine_id=machine_id, max_items=_smart_evidence.MAX_NEW_SOURCES)
+        next_citations = citations + added
+        if len(next_citations) > SMART_DIAGNOSTIC_MAX_EVIDENCE_IN_STATE:
+            raise ValueError('context_state_capacity')
+        next_packet = _smart_evidence.update_enrichment(packet, additions,
+            scope=_sd_grounding_scope(company_id, machine_id),
+            allowed_ids={c['citation_id'] for c in next_citations}, allow_raw_snippet=True,
+            max_new_sources=_smart_evidence.MAX_NEW_SOURCES)
+        return next_citations, next_packet, meta
+    except (ValueError, HTTPException):
+        # Optional context is atomic: a capacity/display conflict never clips or
+        # evicts the base packet and is visible as an omission, not a full family.
+        meta.update(reason='context_packet_not_admitted', omitted_ids=meta.get('added_ids', []), added_ids=[])
+        return citations, packet, meta
+    finally:
+        _v13_pop_operation_limits(token)
 
 
 def _sd_build_grounding_packet(raw_citations: list[dict], citations: list[dict], *, company_id: str, machine_id: str) -> dict:
@@ -20081,7 +20133,8 @@ def _sd_review_rejected_response(*, state: dict, language: str, session_id: str,
     response.update(ok=False, message=message, operator_summary=message, result_code=RESULT_NO_MACHINE_EVIDENCE,
                     error_message=message, error_code="SMART_DIAGNOSTIC_REVIEW_REJECTED")
     response["meta"].update(reason="smart_review_rejected", smart_review=summary,
-                            cacheable=False, semantic_cacheable=False)
+                            cacheable=False, semantic_cacheable=False,
+                            retrieval_assurance=dict(state.get("retrieval_assurance") or {}))
     if isinstance(state.get("grounding_review_debug"), dict):
         response["debug"] = {"smart_review": state["grounding_review_debug"]}
     return response
@@ -21285,8 +21338,9 @@ def _assistant_core_synthesize_smart_start(
 
     evidence_limit = max(1, min(SMART_DIAGNOSTIC_MAX_EVIDENCE_IN_STATE, request.top_k,
                                 _smart_evidence.MAX_SELECTED_SOURCES))
-    response_citations = _sd_select_complete_citations(raw_citations,
-        company_id=request.company_id, machine_id=request.machine_id, max_items=evidence_limit)
+    response_citations, grounding_packet, context_meta = _sd_prepare_start_grounding(raw_citations,
+        company_id=request.company_id, machine_id=request.machine_id, max_items=evidence_limit,
+        relevant_ids=list(decision.relevant_evidence_ids or []))
     try:
         rg_links = _build_rg_links(request.company_id, response_citations)
     except Exception as exc:
@@ -21295,12 +21349,11 @@ def _assistant_core_synthesize_smart_start(
 
     evidence_state = _sd_compact_evidence_for_state(
         response_citations,
-        max_items=evidence_limit, preserve_evidence_ids=True,
+        max_items=SMART_DIAGNOSTIC_MAX_EVIDENCE_IN_STATE, preserve_evidence_ids=True,
     )
     state_ids = {e['citation_id'] for e in evidence_state}
-    grounding_packet = _sd_build_grounding_packet(raw_citations,
-        [c for c in response_citations if c['citation_id'] in state_ids],
-        company_id=request.company_id, machine_id=request.machine_id)
+    _smart_evidence.validate(grounding_packet, scope=_sd_grounding_scope(request.company_id, request.machine_id),
+                             allowed_ids=state_ids)
     evidence_block = _smart_evidence.evidence_block(grounding_packet)
     evidence_ids = [
         str(c.get("citation_id") or "").strip()
@@ -21328,7 +21381,8 @@ def _assistant_core_synthesize_smart_start(
         return _sd_generation_rejected_response(language=request.response_language, session_id=session_id,
             symptom_text=request.query, parsed=parsed, step=step, grounding_packet=grounding_packet,
             gate_result={"accepted": True, "decision": decision.evidence_state, "confidence": decision.confidence,
-                         "reason_code": "evidence_sufficient"}, history=[], debug=request.debug)
+                         "reason_code": "evidence_sufficient",
+                         "retrieval_assurance": {"canonical_context": context_meta}}, history=[], debug=request.debug)
     if not bool(step.get("final_ready")) and not str((step.get("question") or {}).get("question_text") or "").strip():
         raise HTTPException(
             status_code=502,
@@ -21367,7 +21421,7 @@ def _assistant_core_synthesize_smart_start(
             "similarity_max": (retrieval.get("metrics") or {}).get("top_similarity"),
             "assistant_core_request_kind": decision.request_kind,
         },
-        "retrieval_assurance": {},
+        "retrieval_assurance": {"canonical_context": context_meta},
     }
     step, state = _sd_review_step(step=step, state=state, language=request.response_language,
                                  debug=request.debug, raw_draft=parsed)
@@ -21965,6 +22019,7 @@ def smart_diagnostic_start_v1(
         evidence_gate = {**dict(evidence_gate or {}), "retrieval_assurance": assurance_meta}
         return _sd_no_sources_response(language, session_id, symptom_text, debug=bool(payload.debug), gate_result=evidence_gate)
     raw_citations = assured_citations
+    relevant_ids = list((evidence_gate or {}).get("relevant_evidence_ids") or [])
     evidence_gate = {
         **dict(evidence_gate or {}),
         "accepted": True,
@@ -21974,17 +22029,19 @@ def smart_diagnostic_start_v1(
     }
     evidence_limit = max(1, min(SMART_DIAGNOSTIC_MAX_EVIDENCE_IN_STATE, top_k,
                                 _smart_evidence.MAX_SELECTED_SOURCES))
-    response_citations = _sd_select_complete_citations(raw_citations,
-        company_id=company_id, machine_id=machine_id, max_items=evidence_limit)
+    response_citations, grounding_packet, context_meta = _sd_prepare_start_grounding(raw_citations,
+        company_id=company_id, machine_id=machine_id, max_items=evidence_limit, relevant_ids=relevant_ids)
+    assurance_meta = {**dict(assurance_meta or {}), "canonical_context": context_meta}
+    evidence_gate["retrieval_assurance"] = assurance_meta
     try:
         rg_links = _build_rg_links(company_id, response_citations)
     except Exception as e:
         print("SMART_DIAGNOSTIC_RG_LINKS_FAIL", str(e)[:300])
         rg_links = []
-    evidence_state = _sd_compact_evidence_for_state(response_citations, max_items=evidence_limit, preserve_evidence_ids=True)
+    evidence_state = _sd_compact_evidence_for_state(response_citations,
+        max_items=SMART_DIAGNOSTIC_MAX_EVIDENCE_IN_STATE, preserve_evidence_ids=True)
     state_ids = {e['citation_id'] for e in evidence_state}
-    grounding_packet = _sd_build_grounding_packet(raw_citations,
-        [c for c in response_citations if c['citation_id'] in state_ids], company_id=company_id, machine_id=machine_id)
+    _smart_evidence.validate(grounding_packet, scope=_sd_grounding_scope(company_id, machine_id), allowed_ids=state_ids)
     evidence_block = _smart_evidence.evidence_block(grounding_packet)
     evidence_ids = [e['citation_id'] for e in evidence_state]
     context_label = str(payload.context.context_label or payload.context.context_type or "").strip() if payload.context else ""

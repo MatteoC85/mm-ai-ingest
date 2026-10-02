@@ -49,7 +49,10 @@ supports its mechanism, explanation AND every check. Symptom restatements and
 juxtaposed checklist items are not causal links. Retain real negative observations
 and operational omissions; unknown/cannot-check is missing evidence, not yes/no.
 Historical cases and simulations are not current field observations. No parameter
-change since a stop does not validate settings made before that stop.
+change since a stop does not validate settings made before that stop. Preserve
+every reported time qualifier in explanations and weight changes: absence of
+changes AFTER an event does not lower a configuration-cause hypothesis that could
+already have existed BEFORE it. Reject that unsupported temporal inference.
 
 Qualified support is not confirmation of the current cause. A bounded_inference
 may connect a documented applicable mechanism to a compatible REPORTED trigger
@@ -235,6 +238,11 @@ def generation_hypothesis_instruction():
             'do not assert that the unobserved mechanism or condition has occurred. '
             'Unknown is neither a positive nor a negative observation. Do not transfer observations or recurrence '
             'from historical/simulated cases to the current machine event or use them as measured probabilities. '
+            'Preserve every reported time qualifier in why and probability updates: no change AFTER an event '
+            'does not lower the possibility of a configuration fault already present BEFORE that event. '
+            'A retrospective question must ask only what the operator already observed, explicitly allow Unknown '
+            'when it was not observed, and require no new inspection or operation. If a new check is needed, '
+            'ask it separately with its documented role and prerequisites; retrospection grants no safety exemption. '
             'Every proposed check and all of its source safety prerequisites must remain supported. '
             'Keep mode-specific tests conditional when the active mode is unknown; first obtain the prerequisite '
             'observation instead of assuming every mode requires the same signal transition or operating condition. ')

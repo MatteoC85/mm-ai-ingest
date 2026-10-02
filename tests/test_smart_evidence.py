@@ -35,6 +35,24 @@ class SmartEvidenceTests(unittest.TestCase):
         with self.assertRaisesRegex(evidence.SmartEvidenceError, "^" + code + "$"):
             function(*args, **kwargs)
 
+    def test_relevant_late_raw_source_precedes_cap_without_authorizing_missing_ids(self):
+        rows = [row(f'source-{i}', f'Complete distinct body {i}.') for i in range(9)]
+        selected = evidence.select_complete_sources(rows, scope=SCOPE, max_items=8,
+                                                     relevant_ids=['source-8', 'not-admitted'])
+        self.assertEqual([r['citation_id'] for r in selected], ['source-8'] + [f'source-{i}' for i in range(7)])
+        self.assertEqual(rows[-1]['citation_id'], 'source-8')
+        foreign = row('foreign', company_id='other-company')
+        self.assert_error('evidence_company_mismatch', evidence.select_complete_sources,
+            rows + [foreign], scope=SCOPE, max_items=8, relevant_ids=['source-8'])
+
+    def test_priority_exact_alias_keeps_requested_real_id_but_no_partial_body_dedup(self):
+        first = row('old')
+        alias = {**first, 'citation_id': 'relevant'}
+        tail = row('distinct', first['chunk_full'] + 'Retain additional isolation.')
+        selected = evidence.select_complete_sources([first, alias, tail], scope=SCOPE, max_items=2,
+                                                     relevant_ids=['relevant'])
+        self.assertEqual([r['citation_id'] for r in selected], ['relevant', 'distinct'])
+
     def test_selection_keeps_distinct_safety_tails_after_shared_520_char_prefix(self):
         prefix = "Record the isolated sensor condition without changing settings.\n" * 15
         rows = [row("manual-A:p20-20:c1", prefix + "If active, STOP and retain isolation."),
