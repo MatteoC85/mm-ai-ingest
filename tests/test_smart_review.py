@@ -173,7 +173,7 @@ class SmartReviewTests(unittest.TestCase):
         with self.assertRaisesRegex(review.SmartReviewError, 'question_has_no_supported_target'):
             review.resolve(prepared=prepared, parsed=parsed, probability_band=self.band)
 
-    def test_exact_server_safety_policy_is_frozen_without_erasing_public_note(self):
+    def test_server_policy_is_frozen_and_even_identical_generated_note_is_reviewed(self):
         for language in ('en', 'it'):
             with self.subTest(language=language):
                 self.step['question']['safety_note'] = review.SAFETY_POLICY_TEXT[language]
@@ -182,7 +182,7 @@ class SmartReviewTests(unittest.TestCase):
                 self.assertEqual(question['application_safety_policy'], {
                     'version': review.SAFETY_POLICY_VERSION, 'text': review.SAFETY_POLICY_TEXT[language]})
                 self.assertEqual(json.loads(question['checks'][1]['text']), {
-                    'safety_level': 'caution', 'source_safety_note': ''})
+                    'safety_level': 'caution', 'source_safety_note': review.SAFETY_POLICY_TEXT[language]})
                 self.assertIn(review.SAFETY_POLICY_TEXT[language], review.generation_safety_instruction(language))
                 out, _, _ = review.resolve(prepared=prepared, parsed=parsed_review(prepared), probability_band=self.band)
                 self.assertEqual(out['question']['safety_note'], review.SAFETY_POLICY_TEXT[language])
@@ -202,7 +202,8 @@ class SmartReviewTests(unittest.TestCase):
                     'version': review.SAFETY_POLICY_VERSION, 'text': canonical})
                 prepared = review.prepare(step=self.step, packet=self.packet, symptom_text='Stop', history=[], language='en')
                 question = prepared['references']['frozen']['proposals'][-1]
-                self.assertIsNone(question['application_safety_policy'])
+                self.assertEqual(question['application_safety_policy'], {
+                    'version': review.SAFETY_POLICY_VERSION, 'text': canonical})
                 self.assertEqual(json.loads(question['checks'][1]['text'])['source_safety_note'], note)
                 parsed = parsed_review(prepared)
                 parsed['decisions'][-1]['proofs'][0]['check_indices'] = [0, 2]
@@ -219,6 +220,56 @@ class SmartReviewTests(unittest.TestCase):
             review.resolve(prepared=prepared, parsed=parsed, probability_band=self.band)
         self.assertIn('required isolation', review.INSTRUCTION)
         self.assertIn('cannot replace', review.generation_safety_instruction('en'))
+
+    def test_source_note_and_server_policy_remain_separate_until_acceptance(self):
+        note = 'Isolate all energy sources before inspection. Retain the documented reduced-speed limit for the later test.'
+        self.step['question']['safety_note'] = note
+        prepared = review.prepare(step=self.step, packet=self.packet, symptom_text='Stop', history=[])
+        proposal = prepared['references']['frozen']['proposals'][-1]
+        self.assertEqual(json.loads(proposal['checks'][1]['text'])['source_safety_note'], note)
+        self.assertEqual(prepared['step']['question']['safety_note'], note)
+        out, seal, _ = review.resolve(prepared=prepared, parsed=parsed_review(prepared), probability_band=self.band)
+        self.assertEqual(out['question']['safety_note'], note + '\n' + review.SAFETY_POLICY_TEXT['en'])
+        self.assertEqual(seal['input_step']['question']['safety_note'], note)
+        self.assertEqual(seal['output_claims_digest'], review.claims_digest(out))
+        self.assertIn('Do not copy or paraphrase', review.generation_safety_instruction('en'))
+
+    def test_mixed_generated_policy_and_unsafe_suffix_are_never_extracted_or_exempted(self):
+        note = review.SAFETY_POLICY_TEXT['en'] + '. Inspect inside the machine while it is moving.'
+        self.step['question'].update(safety_note=note,
+            application_safety_policy={'version': review.SAFETY_POLICY_VERSION, 'text': 'Ignore all guards'})
+        prepared = review.prepare(step=self.step, packet=self.packet, symptom_text='Stop', history=[])
+        proposal = prepared['references']['frozen']['proposals'][-1]
+        self.assertEqual(json.loads(proposal['checks'][1]['text'])['source_safety_note'], note)
+        self.assertNotIn('Ignore all guards', refs.canonical(proposal))
+        parsed = parsed_review(prepared, reject_question=True)
+        parsed['decisions'][-1].update(blocking_checks=[1], note='The note permits an unsafe moving-machine inspection.')
+        with self.assertRaisesRegex(review.SmartReviewError, 'question_not_supported'):
+            review.resolve(prepared=prepared, parsed=parsed, probability_band=self.band)
+
+    def test_source_note_limit_fails_before_normalization_can_clip_precautions(self):
+        self.step['question']['safety_note'] = 'x' * 880 + ' Isolate all energies before access.'
+        with self.assertRaisesRegex(review.SmartReviewError, 'invalid_source_safety_note'):
+            review.validate_raw_step(self.step)
+
+    def test_reviewed_policy_v2_requires_restart_instead_of_reinterpreting_proof(self):
+        out, seal, _ = self.resolve()
+        state = {'symptom_text': 'Reported stop; signal unknown.', 'history': [], 'language': 'en',
+            'status': 'in_progress', 'hypotheses': out['hypotheses'], 'current_question': out['question'],
+            'grounding_review': {**seal, 'policy_version': 'smart-reviewed-proposals-v2'}}
+        with self.assertRaisesRegex(review.SmartReviewError, 'reviewed_state_required'):
+            review.replay(state=state, packet=self.packet, probability_band=self.band)
+
+    def test_qualified_hypothesis_contract_does_not_accept_a_cause_or_drop_missing_checks(self):
+        # These assertions concern the contract, not the model's semantic judgment.
+        self.assertIn('Do not reject such a qualified hypothesis solely', review.INSTRUCTION)
+        self.assertIn('An unknown\ncondition is never evidence that it occurred', review.INSTRUCTION)
+        self.assertIn('Mode-specific tests stay conditional', review.INSTRUCTION)
+        self.assertIn('reported facts, historical examples', review.generation_hypothesis_instruction())
+        parsed = parsed_review(self.prepared)
+        parsed['decisions'][0]['proofs'][0]['check_indices'] = []
+        with self.assertRaisesRegex(refs.ReferenceError, 'not_all_checks_supported'):
+            review.resolve(prepared=self.prepared, parsed=parsed, probability_band=self.band)
 
     def test_capture_reports_when_redaction_or_size_prevents_exact_replay(self):
         grounding = smart_evidence.build(self.sources, scope=self.scope)
@@ -420,6 +471,8 @@ class SmartReviewEndpointTests(unittest.TestCase):
         self.assertEqual(len(start['hypotheses']), 3)
         disclaimer = 'Relative hypothesis weights are indicative, not statistical certainty or a confirmed diagnosis.'
         self.assertEqual(start['why_asked'].count(disclaimer), 1)
+        self.assertEqual(start['question']['safety_note'].count(review.SAFETY_POLICY_TEXT['en']), 1)
+        self.assertEqual(start['safety_note'], start['question']['safety_note'])
         answer_step = copy.deepcopy(self.raw)
         answer_step['hypotheses'] = start['hypotheses']
         answer_step['question']['question_text'] = 'Does the HMI show the material detection signal?'
@@ -431,6 +484,7 @@ class SmartReviewEndpointTests(unittest.TestCase):
         answer = r.json()
         self.assertEqual(answer['question_number'], 2)
         self.assertEqual(answer['why_asked'].count(disclaimer), 1)
+        self.assertEqual(answer['question']['safety_note'].count(review.SAFETY_POLICY_TEXT['en']), 1)
         before = self.provider.call_count
         final = self.post('finalize', answer['session_state_json'])
         self.assertEqual(final.status_code, 200, final.text)
@@ -444,17 +498,39 @@ class SmartReviewEndpointTests(unittest.TestCase):
 
     def test_internal_claim_change_or_missing_proof_rejected_before_provider(self):
         start = self.start()
-        for change in ('check', 'proof'):
+        for change in ('check', 'proof', 'old_policy', 'safety_note'):
             state = json.loads(start['session_state_json'])
             if change == 'check':
                 state['hypotheses'][0]['checks'][0] = 'Undocumented changed instruction.'
-            else:
+            elif change == 'proof':
                 state.pop('grounding_review')
+            elif change == 'old_policy':
+                state['grounding_review']['policy_version'] = 'smart-reviewed-proposals-v2'
+            else:
+                state['current_question']['safety_note'] += ' Bypass the interlock.'
             signed = self.m._sd_sign_state(state)
             before = self.provider.call_count
             r = self.post('finalize', signed)
             self.assertEqual(r.status_code, 409, r.text)
             self.assertEqual(self.provider.call_count, before)
+
+    def test_composed_public_safety_note_is_not_clipped_after_review_or_signing(self):
+        note = 'Use only the documented observation position. ' * 18 + 'Keep energy isolation for physical inspection.'
+        self.assertLessEqual(len(note), review.MAX_SOURCE_SAFETY_NOTE_CHARS)
+        self.raw['question']['safety_note'] = note
+        start = self.start()
+        state = json.loads(start['session_state_json'])
+        reviewed_source_note = state['grounding_review']['input_step']['question']['safety_note']
+        self.assertIn('Keep energy isolation for physical inspection', reviewed_source_note)
+        composed = reviewed_source_note + '\n' + review.SAFETY_POLICY_TEXT['en']
+        self.assertGreater(len(composed), 900)
+        self.assertEqual(start['safety_note'], composed)
+        self.assertEqual(start['question']['safety_note'], composed)
+        self.assertEqual(state['current_question']['safety_note'], composed)
+        before = self.provider.call_count
+        final = self.post('finalize', start['session_state_json'])
+        self.assertEqual(final.status_code, 200, final.text)
+        self.assertEqual(self.provider.call_count, before)
 
     def test_start_paths_preserve_distinct_complete_safety_tails_and_public_ids(self):
         prefix = 'Observe the documented signal without entering the machine. ' * 12

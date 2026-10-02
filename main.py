@@ -20736,6 +20736,7 @@ def _sd_llm_step_start(
         "Probabilities are evidence-based estimates, not statistical truth. "
         "Use only citation_ids present in EVIDENCE_IDS."
     )
+    system_msg += " " + _smart_review.generation_hypothesis_instruction()
     system_msg += " " + _smart_review.generation_safety_instruction(language)
     user_msg = (
         f"RESPONSE_LANGUAGE: {language}\n"
@@ -20795,6 +20796,7 @@ def _sd_llm_step_answer(*, state: dict, answer: dict, language: str, max_hypothe
         "Reply in the requested language for all user-facing text. "
         "Use only citation_ids present in EVIDENCE_IDS."
     )
+    system_msg += " " + _smart_review.generation_hypothesis_instruction()
     system_msg += " " + _smart_review.generation_safety_instruction(language)
     user_msg = (
         f"RESPONSE_LANGUAGE: {language}\n"

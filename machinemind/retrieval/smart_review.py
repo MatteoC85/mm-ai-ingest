@@ -10,8 +10,9 @@ import re
 
 from . import review_references as refs
 
-POLICY_VERSION = 'smart-reviewed-proposals-v2'
+POLICY_VERSION = 'smart-reviewed-proposals-v3'
 MAX_CHECK_CHARS = 2000
+MAX_SOURCE_SAFETY_NOTE_CHARS = 900
 WIRE_VERSION = 'smart-review-wire-v1'
 INPUT_VERSION = 'smart-review-table-input-v1'
 MAX_REVIEW_SECONDS = 30
@@ -50,6 +51,22 @@ and operational omissions; unknown/cannot-check is missing evidence, not yes/no.
 Historical cases and simulations are not current field observations. No parameter
 change since a stop does not validate settings made before that stop.
 
+Qualified support is not confirmation of the current cause. A bounded_inference
+may connect a documented applicable mechanism to a compatible REPORTED trigger
+or symptom while its distinguishing condition remains unknown. The label,
+description and explanation must clearly present that condition as possible or
+conditional and distinguish reported facts, historical examples and observations
+still needed. Do not reject such a qualified hypothesis solely because the
+discriminating observation has not yet been made: its safe documented check is
+what the guided question can test. Still require the mechanism, applicability,
+reported compatibility and EVERY check/prerequisite to be supported. An unknown
+condition is never evidence that it occurred. Reject an unverified present-tense
+assertion, a merely related topic, a symptom restatement or a mechanism contradicted
+by reported observations. Historical/simulated outcomes cannot establish current
+conditions or numerical confidence. Mode-specific tests stay conditional until
+the applicable operating mode is known; do not assume all modes require the same
+signal transition or operating condition.
+
 Scope: selected-machine context resolves unqualified 'the machine', not component
 identity, document correctness or dependency. Reject wrong/unidentified targets.
 Use only admitted sources, including any valid rebind of unvalidated generator IDs.
@@ -82,8 +99,12 @@ never invent targets. Reject explanations depending on rejected causes. Alternat
 are possible answers, not observations. ALL question checks need k=c proofs with
 o=[]; no causal proof is required for this one proposal. Technical alternatives,
 operating instructions, safety_level and source_safety_note still need applicable
-technical/context source proofs. Only exact server-canonical abstention_controls
-and versioned application_safety_policy have application provenance: withholding
+technical/context source proofs. The complete generated source_safety_note is
+immutable and needs source support, even if it quotes an application prohibition;
+never strip a clause or use the application policy to excuse an unsupported
+technical instruction or a missing source prerequisite. Only exact server-canonical
+abstention_controls and the separately supplied, server-owned versioned
+application_safety_policy have application provenance: withholding
 an unsafe/unavailable observation and restrictive prohibitions need not repeat
 manual wording. These controls remain visible/immutable, grant NO permission to
 operate, enter, move, change parameters or inspect energized equipment, and never
@@ -111,6 +132,11 @@ def require(value, code):
 def validate_raw_step(parsed):
     """Reject excess checks before legacy normalization could silently drop them."""
     require(isinstance(parsed, dict), 'invalid_step')
+    question = parsed.get('question') or {}
+    require(isinstance(question, dict), 'invalid_question')
+    source_note = question.get('safety_note', '')
+    require(isinstance(source_note, str) and len(source_note) <= MAX_SOURCE_SAFETY_NOTE_CHARS,
+            'invalid_source_safety_note')
     hypotheses = parsed.get('hypotheses') or []
     require(isinstance(hypotheses, list) and len(hypotheses) <= 4, 'invalid_hypothesis_count')
     for hypothesis in hypotheses:
@@ -180,22 +206,49 @@ def prepare(*, step, packet, symptom_text, history, language='en'):
 
 
 def question_safety_roles(question, *, language):
-    """Only literal equality grants policy provenance; preserve all other notes."""
+    """Every generated note remains source-reviewed; policy comes only from code."""
     note = question.get('safety_note', '')
-    canonical_note = SAFETY_POLICY_TEXT.get(language)
-    policy = ({'version': SAFETY_POLICY_VERSION, 'text': canonical_note}
-              if canonical_note is not None and note == canonical_note else None)
+    policy = application_safety_policy(language)
     return ({'safety_level': question.get('safety_level'),
-             'source_safety_note': '' if policy else note}, policy)
+             'source_safety_note': note}, policy)
+
+
+def application_safety_policy(language):
+    require(language in SAFETY_POLICY_TEXT, 'unsupported_safety_policy_language')
+    return {'version': SAFETY_POLICY_VERSION, 'text': SAFETY_POLICY_TEXT[language]}
+
+
+def public_safety_note(source_note, *, language):
+    """Compose only after review; do not extract or discard generated clauses."""
+    policy_text = application_safety_policy(language)['text']
+    # Exact whole-note equality avoids repeating identical text, after that whole
+    # source note has already passed review. Substrings never grant provenance.
+    return source_note if source_note == policy_text else '\n'.join(x for x in (source_note, policy_text) if x)
+
+
+def generation_hypothesis_instruction():
+    return ('Hypotheses are qualified possibilities, not confirmed current faults. '
+            'Use explicitly possible or conditional wording in labels and descriptions. '
+            'In why, connect a documented applicable mechanism to the reported trigger or symptom, '
+            'and distinguish reported facts, historical examples and the discriminating observations still unknown. '
+            'A reported compatible trigger can justify investigating a documented possible mechanism; '
+            'do not assert that the unobserved mechanism or condition has occurred. '
+            'Unknown is neither a positive nor a negative observation. Do not transfer observations or recurrence '
+            'from historical/simulated cases to the current machine event or use them as measured probabilities. '
+            'Every proposed check and all of its source safety prerequisites must remain supported. '
+            'Keep mode-specific tests conditional when the active mode is unknown; first obtain the prerequisite '
+            'observation instead of assuming every mode requires the same signal transition or operating condition. ')
 
 
 def generation_safety_instruction(language):
-    """Give the planner the same server text; never discard source precautions."""
-    text = SAFETY_POLICY_TEXT.get(language, SAFETY_POLICY_TEXT['it'])
-    return ('Application safety policy (' + SAFETY_POLICY_VERSION + '): ' + refs.canonical(text) + '. '
-            'You may use this EXACT text as safety_note only when no additional machine-specific precaution is needed. '
-            'Otherwise retain all applicable source precautions in safety_note and the dependent checks/question; '
-            'do not omit them to match this policy. Physical inspections must explicitly preserve required isolation '
+    """Draft only source-specific notes; the server adds its own policy on accept."""
+    policy = application_safety_policy(language)
+    return ('The server will independently append application safety policy (' + policy['version'] + '): '
+            + refs.canonical(policy['text']) + '. Do not copy or paraphrase it into safety_note. '
+            'The draft safety_note contains ONLY applicable source-specific precautions, or an empty string '
+            'when no additional source precaution is required. It is reviewed in its entirety against the sources. '
+            'Retain all applicable source precautions in safety_note and the dependent checks/question; '
+            'do not omit them because the server will add its policy. Physical inspections must explicitly preserve required isolation '
             'and other source prerequisites; vague approved safe conditions cannot replace them. '
             'The policy imposes prohibitions and abstention only; it grants no operational permission. ')
 
@@ -374,6 +427,9 @@ def resolve(*, prepared, parsed, probability_band):
         accepted_ids = {h['id'] for h in active}
         q['target_hypotheses'] = [hid for hid in q.get('target_hypotheses') or [] if hid in accepted_ids]
         usable(bool(q['target_hypotheses']), 'question_has_no_supported_target')
+        # Server-only restrictive policy is composed after all generated note
+        # fields passed review, before the signed output digest is calculated.
+        q['safety_note'] = public_safety_note(q.get('safety_note', ''), language=prepared['language'])
         # This exact explanation was included in the question review. No prose
         # referring to a rejected hypothesis survives via the generator summary.
         caution = ('Relative hypothesis weights are indicative, not statistical certainty or a confirmed diagnosis.'
