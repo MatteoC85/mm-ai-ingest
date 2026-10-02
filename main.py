@@ -16734,6 +16734,7 @@ def _v13_attach_runtime_meta(response: dict, budget: _V13RequestBudget, *, debug
             "V13_REQUEST",
             json.dumps(
                 {
+                    "request_id": budget.request_id,
                     "mode": budget.mode,
                     "route": budget.route,
                     "status": str(response.get("status") or ""),
@@ -16751,6 +16752,7 @@ def _v13_attach_runtime_meta(response: dict, budget: _V13RequestBudget, *, debug
                 },
                 separators=(",", ":"),
             ),
+            flush=True,
         )
     except Exception:
         pass

@@ -409,6 +409,36 @@ class V13GateCandidateBlockRuntime:
     re: Any
 
 
+def _gate_query_excerpts(q: str, by_id: dict, *, runtime: V13GateCandidateBlockRuntime) -> dict:
+    """Keep a late matching passage visible within the existing excerpt budget.
+
+    Prefix matches only select verbatim source windows; they never establish
+    evidence support. Corpus frequency keeps common query words from displacing
+    a rarer match. No machine vocabulary or translated facts are introduced.
+    """
+    terms = list(dict.fromkeys(runtime.re.findall(r"[^\W_]{4,}", str(q or "").casefold())))[:24]
+    patterns = [runtime.re.compile(r"(?<!\w)" + runtime.re.escape(term), runtime.re.IGNORECASE)
+                for term in terms]
+    positions = {cid: [match.start() if (match := pattern.search(text)) else None
+                      for pattern in patterns] for cid, (_, text) in by_id.items()}
+    frequencies = [sum(row[index] is not None for row in positions.values())
+                   for index in range(len(patterns))]
+    excerpts = {}
+    for cid, (_, text) in by_id.items():
+        excerpt = text[:1200]
+        hits = [(frequencies[index], position) for index, position in enumerate(positions[cid])
+                if position is not None]
+        if len(text) > 1200 and hits:
+            _, anchor = min(hits)
+            if anchor >= 1200:
+                head_chars, marker = 240, " […] "
+                window_chars = 1200 - head_chars - len(marker)
+                start = max(head_chars, min(anchor - window_chars // 4, len(text) - window_chars))
+                excerpt = text[:head_chars] + marker + text[start:start + window_chars]
+        excerpts[cid] = excerpt
+    return excerpts
+
+
 def v13_gate_candidate_block(q: str, candidates: list[dict], *, runtime: V13GateCandidateBlockRuntime) -> tuple[str, list[dict]]:
     V13_EVIDENCE_GATE_MAX_CANDIDATES = runtime.V13_EVIDENCE_GATE_MAX_CANDIDATES
     _clean_display_text = runtime._clean_display_text
@@ -418,14 +448,42 @@ def v13_gate_candidate_block(q: str, candidates: list[dict], *, runtime: V13Gate
     json = runtime.json
     re = runtime.re
     summary = _v13_evidence_signal_summary(q, candidates)
-    selected = list(summary.get("candidates") or [])[:V13_EVIDENCE_GATE_MAX_CANDIDATES]
-    parts: list[str] = []
-    total = 0
-    for c in selected:
+    # Keep bounded representation of the incoming retrieval order as well as
+    # the signal ranking. Lexical overlap must not replace hybrid recall.
+    by_id = {}
+    for c in summary.get("candidates") or []:
+        if not isinstance(c, dict):
+            continue
         cid = str(c.get("citation_id") or "").strip()
         text = re.sub(r"\s+", " ", _v13_candidate_text(c)).strip()
-        if not cid or not text:
+        if cid and text and cid not in by_id:
+            by_id[cid] = (c, text)
+    retrieval_ids = []
+    retrieval_seen = set()
+    for c in candidates or []:
+        if not isinstance(c, dict):
             continue
+        cid = str(c.get("citation_id") or "").strip()
+        if cid in by_id and cid not in retrieval_seen:
+            retrieval_ids.append(cid)
+            retrieval_seen.add(cid)
+    signal_ids = list(by_id)
+    ordered_ids = []
+    seen = set()
+    for index in range(max(len(retrieval_ids), len(signal_ids))):
+        for ranking in (retrieval_ids, signal_ids):
+            if index < len(ranking) and ranking[index] not in seen:
+                ordered_ids.append(ranking[index])
+                seen.add(ranking[index])
+    excerpts = _gate_query_excerpts(q, by_id, runtime=runtime)
+    parts: list[str] = []
+    supplied: list[dict] = []
+    total = 0
+    limit = max(0, int(V13_EVIDENCE_GATE_MAX_CANDIDATES))
+    for cid in ordered_ids:
+        if len(supplied) >= limit:
+            break
+        c, text = by_id[cid]
         source_type = str(c.get("source_type") or _source_type_from_document_id(c.get("bubble_document_id") or ""))
         title_match = float(c.get("structured_title_match_score") or 0.0)
         title_value = _clean_display_text(c.get("structured_title") or "", max_len=180)
@@ -437,13 +495,15 @@ def v13_gate_candidate_block(q: str, candidates: list[dict], *, runtime: V13Gate
         part = (
             f"[{cid}] source_type={source_type}; semantic_similarity={float(c.get('gate_similarity') or 0.0):.4f}; "
             f"lexical_overlap={float(c.get('gate_overlap') or 0.0):.4f}; "
-            f"exact_identifier={str(bool(c.get('gate_exact_code_hit'))).lower()}{title_meta}\n{text[:1200]}\n"
+            f"exact_identifier={str(bool(c.get('gate_exact_code_hit'))).lower()}{title_meta}\n{excerpts[cid]}\n"
         )
-        if total + len(part) > 14000:
-            break
+        separator_size = 1 if parts else 0
+        if total + separator_size + len(part) > 14000:
+            continue
         parts.append(part)
-        total += len(part)
-    return "\n".join(parts).strip(), selected
+        total += separator_size + len(part)
+        supplied.append(c)
+    return "\n".join(parts).strip(), supplied
 
 
 @dataclass(frozen=True)

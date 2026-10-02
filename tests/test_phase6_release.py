@@ -284,11 +284,82 @@ class QualityCloud(FakeCloud):
 
 
 class QualityReleaseTests(unittest.TestCase):
-    def execute(self, cloud, expected=QualityCloud.SHA):
+    def execute(self, cloud, expected=QualityCloud.SHA, *, operation='deploy'):
         with patch.object(guard, 'gcloud', side_effect=cloud.gcloud), \
              patch.object(guard, 'health', side_effect=cloud.health), \
              contextlib.redirect_stdout(io.StringIO()):
-            return guard.execute(guard.PROJECT, COMMIT, BUILD, 'deploy', expected, preserve_active=True)
+            return guard.execute(guard.PROJECT, COMMIT, BUILD, operation, expected, preserve_active=True,
+                                 expected_current_revision=cloud.BASE, expected_current_digest=cloud.BASE_DIGEST)
+
+    def preflight(self, service, revision):
+        return guard.quality_preflight(service, revision, expected_current=QualityCloud.SHA,
+                                       expected_current_revision=QualityCloud.BASE,
+                                       expected_current_digest=QualityCloud.BASE_DIGEST)
+
+    def test_preflight_uses_only_control_plane_reads_without_image_or_health_calls(self):
+        allowed = {('run', 'services', 'describe'), ('run', 'revisions', 'describe'),
+                   ('run', 'revisions', 'list')}
+        for dirty in (False, True):
+            with self.subTest(dirty=dirty):
+                cloud = QualityCloud(dirty=dirty)
+
+                def read_only_gcloud(*args):
+                    self.assertIn(args[:3], allowed)
+                    return cloud.gcloud(*args)
+
+                with patch.object(guard, 'gcloud', side_effect=read_only_gcloud), \
+                     patch.object(guard, 'health', side_effect=AssertionError('No service requests')), \
+                     patch.object(guard.urllib.request, 'build_opener', side_effect=AssertionError('No service HTTP')), \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    result = guard.execute(guard.PROJECT, COMMIT, BUILD, 'preflight', cloud.SHA,
+                                           preserve_active=True, expected_current_revision=cloud.BASE,
+                                           expected_current_digest=cloud.BASE_DIGEST)
+                self.assertEqual(result['status'], 'PASS_REQUIRED_PREFLIGHT')
+                self.assertEqual(result['revision'], cloud.BASE)
+                self.assertEqual(result['runtime_commit_sha'], cloud.SHA)
+                self.assertEqual(result['image_digest'], cloud.BASE_DIGEST)
+                self.assertEqual(result['known_usage_cleanup_required'], dirty)
+                self.assertFalse(result['new_revision'])
+                self.assertEqual(cloud.events, [])
+                self.assertEqual([args[:3] for args in cloud.commands],
+                                 [('run', 'services', 'describe'), ('run', 'revisions', 'describe'),
+                                  ('run', 'revisions', 'list')])
+
+    def test_preflight_stale_identity_or_configuration_fails_without_mutation(self):
+        for fault, code in (('sha', 'RUNTIME_SHA_MISMATCH'),
+                            ('authority', 'AUTHORITY_MUST_REMAIN_REQUIRED'),
+                            ('usage', 'QUALITY_ACTIVE_USAGE_CONFIGURATION_CHANGED')):
+            with self.subTest(fault=fault):
+                cloud = QualityCloud(dirty=False)
+                if fault == 'sha':
+                    cloud.before_spec['containers'][0]['env'][0]['value'] = 'f' * 40
+                elif fault == 'authority':
+                    cloud.before_spec['containers'][0]['env'][1]['value'] = 'off'
+                else:
+                    cloud.before_spec['containers'][0]['env'].append(
+                        {'name': 'MM_USAGE_ENFORCEMENT', 'value': 'required'})
+                with self.assertRaisesRegex(guard.GuardError, '^' + code + '$'):
+                    self.execute(cloud, operation='preflight')
+                self.assertEqual(cloud.events, [])
+                self.assertTrue(all(args[:3] in {('run', 'services', 'describe'),
+                                               ('run', 'revisions', 'describe')}
+                                    for args in cloud.commands))
+
+    def test_successful_preflight_does_not_bypass_fresh_deploy_identity_check(self):
+        cloud = QualityCloud(dirty=False)
+        self.execute(cloud, operation='preflight')
+        cloud.before_spec['containers'][0]['env'][0]['value'] = 'f' * 40
+        cloud.commands.clear()
+        with self.assertRaisesRegex(guard.GuardError, '^RUNTIME_SHA_MISMATCH$'):
+            self.execute(cloud)
+        self.assertEqual(cloud.events, [])
+        self.assertEqual([args[:3] for args in cloud.commands],
+                         [('run', 'services', 'describe'), ('run', 'revisions', 'describe')])
+
+    def test_preflight_cannot_use_less_restrictive_legacy_mode(self):
+        with patch.object(guard, 'gcloud', side_effect=AssertionError('Must fail before I/O')):
+            with self.assertRaisesRegex(guard.GuardError, '^PREFLIGHT_REQUIRES_ACTIVE_PRESERVATION$'):
+                guard.execute(guard.PROJECT, COMMIT, BUILD, 'preflight', QualityCloud.SHA)
 
     def test_failed_latest_is_restored_from_ready_active_without_usage_migration(self):
         cloud = QualityCloud()
@@ -337,13 +408,13 @@ class QualityReleaseTests(unittest.TestCase):
             # latestCreated failed, although the fixed serving revision is Ready.
             with self.assertRaisesRegex(guard.GuardError, '^RESOURCE_NOT_READY$'):
                 guard.pinned_traffic(before)
-            self.assertTrue(guard.quality_preflight(before, revision))
+            self.assertTrue(self.preflight(before, revision))
             for label, mutate in mutations.items():
                 with self.subTest(label=label):
                     service, active = copy.deepcopy(before), copy.deepcopy(revision)
                     mutate(service, active)
                     with self.assertRaises(guard.GuardError):
-                        guard.quality_preflight(service, active)
+                        self.preflight(service, active)
 
     def test_active_usage_configuration_is_never_downgraded(self):
         for row in (
@@ -404,7 +475,8 @@ class QualityReleaseTests(unittest.TestCase):
         with patch.object(guard, 'gcloud', side_effect=cloud.gcloud), \
              patch.object(guard, 'health', side_effect=cloud.health), \
              contextlib.redirect_stdout(io.StringIO()):
-            result = guard.execute(guard.PROJECT, COMMIT, BUILD, 'rollback', COMMIT, preserve_active=True)
+            result = guard.execute(guard.PROJECT, COMMIT, BUILD, 'rollback', COMMIT, preserve_active=True,
+                                   expected_current_revision=CANDIDATE, expected_current_digest=DIGEST)
         self.assertEqual(result['revision'], cloud.BASE)
         self.assertEqual(result['runtime_commit_sha'], cloud.SHA)
         self.assertEqual(result['image_digest'], cloud.BASE_DIGEST)
@@ -418,10 +490,91 @@ class QualityReleaseTests(unittest.TestCase):
         self.assertEqual(guard.BASELINE_REVISION, QualityCloud.BASE)
         self.assertEqual(guard.BASELINE_COMMIT, QualityCloud.SHA)
         self.assertEqual(guard.BASELINE_DIGEST, QualityCloud.BASE_DIGEST)
-        with patch.object(guard, 'execute', return_value={}) as execute, \
+        env = {'MM_P6_EXPECTED_CURRENT_SHA': QualityCloud.SHA,
+               'MM_P6_EXPECTED_CURRENT_REVISION': QualityCloud.BASE,
+               'MM_P6_EXPECTED_CURRENT_DIGEST': QualityCloud.BASE_DIGEST}
+        with patch.dict(guard.os.environ, env, clear=True), \
+             patch.object(guard, 'execute', return_value={}) as execute, \
              contextlib.redirect_stdout(io.StringIO()):
             guard.main()
-        self.assertEqual(execute.call_args.kwargs, {'preserve_active': True})
+        self.assertEqual(execute.call_args.kwargs, {'preserve_active': True,
+                         'expected_current_revision': QualityCloud.BASE,
+                         'expected_current_digest': QualityCloud.BASE_DIGEST})
+        self.assertEqual(execute.call_args.args[4], QualityCloud.SHA)
+
+    def test_next_release_accepts_explicit_verified_current_identity(self):
+        class LaterQualityCloud(QualityCloud):
+            BASE = guard.SERVICE + '-later-verified'
+            SHA = '3' * 40
+            BASE_DIGEST = 'sha256:' + 'c' * 64
+
+        cloud = LaterQualityCloud(dirty=False)
+        result = self.execute(cloud, expected=cloud.SHA)
+        self.assertEqual(result['previous_revision'], cloud.BASE)
+        self.assertEqual(cloud.events, ['stage', 'health', 'promote', 'health'])
+        self.assertEqual(guard.unaffected_spec(cloud.before_spec), guard.unaffected_spec(cloud.candidate_spec))
+        deploy = next(args for args in cloud.commands if args[:2] == ('run', 'deploy'))
+        self.assertFalse(any(arg.startswith(('--remove-env-vars=', '--remove-secrets=', '--update-secrets='))
+                             for arg in deploy))
+
+    def test_expected_identity_inputs_are_required_before_any_cloud_call(self):
+        defaults = {'expected_current': QualityCloud.SHA,
+                    'expected_current_revision': QualityCloud.BASE,
+                    'expected_current_digest': QualityCloud.BASE_DIGEST}
+        cases = (
+            ({'expected_current': None}, 'EXPECTED_CURRENT_SHA_INVALID'),
+            ({'expected_current': 'a' * 39}, 'EXPECTED_CURRENT_SHA_INVALID'),
+            ({'expected_current': 'A' * 40}, 'EXPECTED_CURRENT_SHA_INVALID'),
+            ({'expected_current': 'z' * 40}, 'EXPECTED_CURRENT_SHA_INVALID'),
+            ({'expected_current_revision': None}, 'EXPECTED_CURRENT_REVISION_INVALID'),
+            ({'expected_current_revision': ''}, 'EXPECTED_CURRENT_REVISION_INVALID'),
+            ({'expected_current_revision': 'other-service-b123'}, 'EXPECTED_CURRENT_REVISION_INVALID'),
+            ({'expected_current_revision': QualityCloud.BASE + '/bad'}, 'EXPECTED_CURRENT_REVISION_INVALID'),
+            ({'expected_current_digest': None}, 'EXPECTED_CURRENT_DIGEST_INVALID'),
+            ({'expected_current_digest': ''}, 'EXPECTED_CURRENT_DIGEST_INVALID'),
+            ({'expected_current_digest': 'sha256:not-a-digest'}, 'EXPECTED_CURRENT_DIGEST_INVALID'),
+        )
+        with patch.object(guard, 'gcloud', side_effect=AssertionError('Must fail before I/O')):
+            for changed, code in cases:
+                with self.subTest(changed=changed), self.assertRaisesRegex(guard.GuardError, '^' + code + '$'):
+                    guard.execute(guard.PROJECT, COMMIT, BUILD, 'deploy', preserve_active=True,
+                                  **{**defaults, **changed})
+
+    def test_current_identity_mismatches_stop_before_stage(self):
+        cases = (
+            ({'expected_current': 'f' * 40}, 'RUNTIME_SHA_MISMATCH'),
+            ({'expected_current_revision': guard.SERVICE + '-unexpected'}, 'EXPECTED_CURRENT_REVISION_MISMATCH'),
+            ({'expected_current_digest': 'sha256:' + 'f' * 64}, 'EXPECTED_CURRENT_DIGEST_MISMATCH'),
+        )
+        for changed, code in cases:
+            cloud = QualityCloud(dirty=False)
+            expected = {'expected_current': cloud.SHA, 'expected_current_revision': cloud.BASE,
+                        'expected_current_digest': cloud.BASE_DIGEST}
+            with self.subTest(changed=changed), \
+                 patch.object(guard, 'gcloud', side_effect=cloud.gcloud), \
+                 contextlib.redirect_stdout(io.StringIO()), \
+                 self.assertRaisesRegex(guard.GuardError, '^' + code + '$'):
+                guard.execute(guard.PROJECT, COMMIT, BUILD, 'deploy', preserve_active=True,
+                              **{**expected, **changed})
+            self.assertNotIn('stage', cloud.events)
+
+    def test_expected_digest_requires_matching_immutable_image_reference(self):
+        cloud = QualityCloud(dirty=False)
+        cloud.before_spec['containers'][0]['image'] = guard.IMAGE_ROOT + ':mutable-tag'
+        with self.assertRaisesRegex(guard.GuardError, '^EXPECTED_CURRENT_IMAGE_MISMATCH$'):
+            self.execute(cloud)
+        self.assertNotIn('stage', cloud.events)
+
+    def test_failed_template_cleanup_remains_limited_to_historical_baseline(self):
+        class LaterQualityCloud(QualityCloud):
+            BASE = guard.SERVICE + '-later-verified'
+            SHA = '3' * 40
+            BASE_DIGEST = 'sha256:' + 'c' * 64
+
+        cloud = LaterQualityCloud(dirty=True)
+        with self.assertRaisesRegex(guard.GuardError, '^QUALITY_CLEANUP_BASELINE_MISMATCH$'):
+            self.execute(cloud, expected=cloud.SHA)
+        self.assertNotIn('stage', cloud.events)
 
 
 class HealthSmokeTests(unittest.TestCase):

@@ -13,6 +13,7 @@ import json
 import math
 import threading
 import time as _time
+import uuid
 from collections.abc import Mapping
 from typing import Any, Optional
 
@@ -51,6 +52,8 @@ class _RequestControl:
         self.deadline = _monotonic() + value
         self.allow_llm = bool(allow_llm)
         self.parent = parent
+        # Generated internally; never copy caller identifiers or credentials into logs.
+        self.request_id = parent.request_id if parent is not None else uuid.uuid4().hex
         self.stopped = threading.Event()
 
     def remaining(self) -> float:
@@ -145,6 +148,7 @@ class _V13RequestBudget:
         self.retrieval_assurance: dict = {}
         self._lock = threading.RLock()
         self._control = _REQUEST_CONTROL_CTX.get()
+        self.request_id = self._control.request_id if self._control is not None else uuid.uuid4().hex
         self._cancelled = threading.Event()
         self._retry_credited: set[int] = set()
         self.accounting_anomalies: list[str] = []

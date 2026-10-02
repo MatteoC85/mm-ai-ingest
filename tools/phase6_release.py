@@ -1,6 +1,6 @@
 """Quality deployment through the GitHub-triggered Cloud Build.
 
-New commit -> immutable image -> no traffic -> config/health -> exact promotion.
+Read-only preflight -> new image -> no traffic -> config/health -> exact promotion.
 Preserve the verified active configuration and ASK authority. No provider, secret
 retrieval or schema writes. Never invoke manually in Cloud Shell. Import is inert.
 """
@@ -257,27 +257,41 @@ def image_digest(revision):
     return digest
 
 
-def quality_preflight(service, prior_revision, *, deployment=True):
+def expected_current_identity(commit, revision, digest):
+    """Validate the reviewed release inputs without deriving trust from live state."""
+    require(type(commit) is str and re.fullmatch('[0-9a-f]{40}', commit),
+            'EXPECTED_CURRENT_SHA_INVALID')
+    require(type(revision) is str and len(revision) <= 63
+            and re.fullmatch(re.escape(SERVICE) + r'-[a-z0-9](?:[a-z0-9-]*[a-z0-9])?', revision),
+            'EXPECTED_CURRENT_REVISION_INVALID')
+    require(type(digest) is str and re.fullmatch('sha256:[0-9a-f]{64}', digest),
+            'EXPECTED_CURRENT_DIGEST_INVALID')
+
+
+def quality_preflight(service, prior_revision, *, expected_current=None,
+                      expected_current_revision=None, expected_current_digest=None):
     """Read-only check of supplied metadata; return whether known Usage must be removed.
 
     The only permitted cleanup is the exact failed 201 template above. The
     serving revision's absent Usage configuration is never inferred from it.
     """
+    expected_current_identity(expected_current, expected_current_revision, expected_current_digest)
     prior = pinned_traffic(service, allow_failed_latest=True)
     ready(prior_revision)
     require(prior_revision.get('metadata', {}).get('name') == prior, 'ACTIVE_REVISION_MISMATCH')
     active_spec = prior_revision.get('spec', {})
-    active_commit = required_configuration(active_spec)
-    if deployment:
-        require(prior == BASELINE_REVISION and active_commit == BASELINE_COMMIT
-                and image_digest(prior_revision) == BASELINE_DIGEST, 'QUALITY_BASELINE_IDENTITY_MISMATCH')
-        require(active_spec['containers'][0].get('image') == IMAGE_ROOT + '@' + BASELINE_DIGEST,
-                'QUALITY_BASELINE_IMAGE_MISMATCH')
+    active_commit = required_configuration(active_spec, expected_current)
+    require(prior == expected_current_revision, 'EXPECTED_CURRENT_REVISION_MISMATCH')
+    require(image_digest(prior_revision) == expected_current_digest, 'EXPECTED_CURRENT_DIGEST_MISMATCH')
+    require(active_spec['containers'][0].get('image') == IMAGE_ROOT + '@' + expected_current_digest,
+            'EXPECTED_CURRENT_IMAGE_MISMATCH')
     require(not (USAGE_ENV & environment(active_spec).keys()), 'QUALITY_ACTIVE_USAGE_CONFIGURATION_CHANGED')
     current_spec = template(service)
     current_commit = required_configuration(current_spec)
     current_usage = USAGE_ENV & environment(current_spec).keys()
     if current_usage or service.get('status', {}).get('latestCreatedRevisionName') == FAILED_REVISION:
+        require(prior == BASELINE_REVISION and active_commit == BASELINE_COMMIT
+                and expected_current_digest == BASELINE_DIGEST, 'QUALITY_CLEANUP_BASELINE_MISMATCH')
         require(current_usage == USAGE_ENV
                 and service.get('status', {}).get('latestCreatedRevisionName') == FAILED_REVISION
                 and current_commit == FAILED_COMMIT
@@ -362,16 +376,20 @@ def validate_candidate(before_spec, service, revision, name, commit, digest, usa
     require(image_digest(revision) == digest, 'CANDIDATE_DIGEST_MISMATCH')
 
 
-def execute(project, commit, build, operation, expected_current, *, usage_required=False, preserve_active=False):
+def execute(project, commit, build, operation, expected_current, *, usage_required=False, preserve_active=False,
+            expected_current_revision=None, expected_current_digest=None):
     require(project == PROJECT, 'WRONG_PROJECT')
     require(type(commit) is str and re.fullmatch('[0-9a-f]{40}', commit), 'COMMIT_SHA_INVALID')
     require(type(expected_current) is str and re.fullmatch('[0-9a-f]{40}', expected_current),
             'EXPECTED_CURRENT_SHA_INVALID')
     require(type(build) is str and re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', build),
             'BUILD_ID_INVALID')
-    require(operation in {'deploy', 'rollback'}, 'OPERATION_INVALID')
+    require(operation in {'preflight', 'deploy', 'rollback'}, 'OPERATION_INVALID')
+    require(operation != 'preflight' or preserve_active, 'PREFLIGHT_REQUIRES_ACTIVE_PRESERVATION')
     require(not (preserve_active and usage_required), 'QUALITY_USAGE_MIGRATION_FORBIDDEN')
     require(not usage_required or operation=='deploy', 'LEGACY_ROLLBACK_REQUIRES_MAINTENANCE')
+    if preserve_active:
+        expected_current_identity(expected_current, expected_current_revision, expected_current_digest)
     phase('validate_current_required')
     before = resource('services', SERVICE)
     prior = pinned_traffic(before, allow_failed_latest=preserve_active)
@@ -383,7 +401,9 @@ def execute(project, commit, build, operation, expected_current, *, usage_requir
     # only image/COMMIT differences; all other settings remain identical.
     remove_usage = False
     if preserve_active:
-        remove_usage = quality_preflight(before, prior_revision, deployment=operation == 'deploy')
+        remove_usage = quality_preflight(before, prior_revision, expected_current=expected_current,
+                                        expected_current_revision=expected_current_revision,
+                                        expected_current_digest=expected_current_digest)
     else:
         required_configuration(template(before))
         require(unaffected_spec(template(before),usage_required) == unaffected_spec(prior_revision.get('spec', {}),usage_required),
@@ -397,6 +417,14 @@ def execute(project, commit, build, operation, expected_current, *, usage_requir
     names_before = revision_names()
     routing_before = routing_configuration(before)
     require(prior in names_before, 'PRIOR_REVISION_MISSING')
+    if operation == 'preflight':
+        # Only control-plane reads above. Deployment repeats these checks after
+        # building, so this result never authorizes promotion from stale state.
+        phase('read_only_preflight_complete')
+        return {'status': 'PASS_REQUIRED_PREFLIGHT', 'revision': prior,
+                'runtime_commit_sha': expected_current, 'image_digest': expected_current_digest,
+                'authority_mode': 'required', 'new_revision': False,
+                'active_configuration_preserved': True, 'known_usage_cleanup_required': remove_usage}
     if operation == 'rollback':
         phase('validate_pinned_required_rollback')
         target = resource('revisions', BASELINE_REVISION)
@@ -484,9 +512,11 @@ def main():
     try:
         result = execute(os.environ.get('MM_CB_PROJECT'), os.environ.get('MM_CB_COMMIT'),
                          os.environ.get('MM_CB_BUILD'), os.environ.get('MM_P6_OPERATION'),
-                         os.environ.get('MM_P6_EXPECTED_CURRENT_SHA'), preserve_active=True)
+                         os.environ.get('MM_P6_EXPECTED_CURRENT_SHA'), preserve_active=True,
+                         expected_current_revision=os.environ.get('MM_P6_EXPECTED_CURRENT_REVISION'),
+                         expected_current_digest=os.environ.get('MM_P6_EXPECTED_CURRENT_DIGEST'))
         print(json.dumps({**result, 'ask_calls': 0, 'provider_calls': 0,
-                          'automatic_rollback': False, 'guard_version': 'phase6-quality-preserve-active-v1'}, sort_keys=True))
+                          'automatic_rollback': False, 'guard_version': 'phase6-quality-preserve-active-v2'}, sort_keys=True))
     except GuardError as exc:
         print(json.dumps({'status': 'FAIL_REQUIRED_RELEASE', 'phase': PHASE,
                           'code': str(exc), 'automatic_rollback': False,

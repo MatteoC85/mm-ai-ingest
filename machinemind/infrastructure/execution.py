@@ -18,6 +18,36 @@ from fastapi.responses import StreamingResponse
 from machinemind.infrastructure.request_budget import _RequestControl, _REQUEST_CONTROL_CTX
 
 
+def _log_completion(*, control, mode, started, result, transport, exception_type=None):
+    """A streamed HTTP 200 does not imply an answer: record the terminal state.
+
+    Only internal identifiers and bounded enums enter this log. Never include
+    prompts, answers, source identifiers, exception text or supplied headers.
+    """
+    statuses = {"answered", "no_sources", "needs_clarification", "out_of_scope",
+                "safety_refusal", "timeout", "error", "budget_exceeded"}
+    status = result.get("status") if isinstance(result, dict) else "cancelled"
+    if not isinstance(status, str) or status not in statuses | {"cancelled"}:
+        status = "other"
+    try:
+        record = {
+            "event": "AI_REQUEST_COMPLETED", "request_id": control.request_id,
+            "mode": mode if mode in {"ask", "root_cause", "smart_diagnostic"} else "other",
+            "status": status, "transport": transport,
+            "elapsed_seconds": round(max(0.0, time_module.monotonic() - started), 3),
+            "hard_timeout": bool(isinstance(result, dict)
+                and isinstance(result.get("meta"), dict)
+                and result["meta"].get("hard_timeout") is True),
+        }
+        # This name comes from a caught Python exception class, never its message.
+        if isinstance(exception_type, str) and exception_type.isidentifier() and len(exception_type) <= 80:
+            record["exception_type"] = exception_type
+        print(json.dumps(record, separators=(",", ":")), flush=True)
+    except Exception:
+        # Logging must never replace the response or interrupt cancellation.
+        pass
+
+
 def _controlled_call(control, func, payload, secret):
     """The same event is visible to the waiting task and the synchronous worker."""
     token = _REQUEST_CONTROL_CTX.set(control)
@@ -58,6 +88,8 @@ async def stream_json_response(
     )
 
     async def stream_json():
+        result = None
+        exception_type = None
         result_task = asyncio.create_task(
             asyncio.to_thread(_controlled_call, control, sync_func, payload, x_ai_internal_secret)
         )
@@ -124,6 +156,7 @@ async def stream_json_response(
                     yield heartbeat
                     continue
                 except Exception as exc:
+                    exception_type = type(exc).__name__
                     result = error_payload(mode, exc)
     
                 if not isinstance(result, dict):
@@ -149,6 +182,8 @@ async def stream_json_response(
             control.cancel()
             if not result_task.done():
                 result_task.cancel()
+            _log_completion(control=control, mode=mode, started=stream_started,
+                            result=result, transport="stream_json", exception_type=exception_type)
 
     return StreamingResponse(
         stream_json(),
@@ -184,6 +219,9 @@ async def json_with_hard_timeout(
         preferred=getattr(payload, "language", None),
     )
     control = _RequestControl(float(hard_timeout_seconds), parent=_REQUEST_CONTROL_CTX.get())
+    started = time_module.monotonic()
+    result = None
+    exception_type = None
     try:
         result = await asyncio.wait_for(
             asyncio.to_thread(_controlled_call, control, sync_func, payload, x_ai_internal_secret),
@@ -226,11 +264,16 @@ async def json_with_hard_timeout(
             )
         else:
             common["answer"] = message
-        return common
+        result = common
+        return result
     except Exception as exc:
-        return error_payload(mode, exc)
+        exception_type = type(exc).__name__
+        result = error_payload(mode, exc)
+        return result
     finally:
         control.cancel()
+        _log_completion(control=control, mode=mode, started=started,
+                        result=result, transport="json", exception_type=exception_type)
 
 
 def run_sync_with_hard_timeout(
