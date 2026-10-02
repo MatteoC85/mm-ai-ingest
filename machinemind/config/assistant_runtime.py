@@ -207,10 +207,10 @@ ASSISTANT_CORE_ROUTER_FALLBACK_MODEL = (
     os.environ.get("MM_ASSISTANT_CORE_ROUTER_FALLBACK_MODEL") or V13_PLANNER_MODEL
 ).strip()
 ASSISTANT_CORE_ROUTER_EFFORT = (os.environ.get("MM_ASSISTANT_CORE_ROUTER_EFFORT") or "medium").strip()
-# Smart Diagnostic uses one quality-oriented Responses API call after routing.
-# Keeping it inside the 5.6 model family gives real usage accounting and an
-# enforceable max_output_tokens/cost ceiling, unlike the legacy chat fallback.
-ASSISTANT_CORE_SMART_MODEL = (os.environ.get("MM_ASSISTANT_CORE_SMART_MODEL") or V13_HEAVY_MODEL).strip()
+# Smart uses one fast generation followed by independent source review. Keep an
+# explicit deployment override; a failed dispatched generation is never retried
+# automatically against another paid model within the turn.
+ASSISTANT_CORE_SMART_MODEL = (os.environ.get("MM_ASSISTANT_CORE_SMART_MODEL") or V13_FAST_MODEL).strip()
 ASSISTANT_CORE_SMART_EFFORT = (os.environ.get("MM_ASSISTANT_CORE_SMART_EFFORT") or "medium").strip()
 ASSISTANT_CORE_ROUTER_TIMEOUT_SECONDS = max(8, min(18, int(os.environ.get("MM_ASSISTANT_CORE_ROUTER_TIMEOUT_SECONDS", "15"))))
 ASSISTANT_CORE_ROUTER_MAX_OUTPUT_TOKENS = max(1400, min(3600, int(os.environ.get("MM_ASSISTANT_CORE_ROUTER_MAX_OUTPUT_TOKENS", "3000"))))
@@ -228,7 +228,7 @@ ASSISTANT_CORE_GENERAL_KNOWLEDGE_ENABLED = (os.environ.get("MM_ASSISTANT_CORE_GE
 # are deliberately a little wider than the first proposal in favour of consistency.
 # Per-mode internal deadlines remain bounded even though the outer safety ceiling is
 # widened. ASK does not receive a two-minute reasoning budget; Root Cause and Smart
-# Diagnostic get enough room for one quality model plus one bounded fallback.
+# Diagnostic retain their existing deadlines; Smart reserves its final review.
 ASSISTANT_CORE_ASK_DEADLINE_SECONDS = max(50, min(85, int(os.environ.get("MM_ASSISTANT_CORE_ASK_DEADLINE_SECONDS", "74"))))
 ASSISTANT_CORE_ROOT_CAUSE_DEADLINE_SECONDS = max(65, min(105, int(os.environ.get("MM_ASSISTANT_CORE_ROOT_CAUSE_DEADLINE_SECONDS", "92"))))
 ASSISTANT_CORE_SMART_START_DEADLINE_SECONDS = max(70, min(110, int(os.environ.get("MM_ASSISTANT_CORE_SMART_START_DEADLINE_SECONDS", "96"))))

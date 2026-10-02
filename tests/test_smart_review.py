@@ -781,7 +781,7 @@ class SmartReviewEndpointTests(unittest.TestCase):
                  patch.object(self.m._smart_context, 'acquire', side_effect=acquire):
                 self.m._sd_prepare_start_grounding(self.sources,
                     company_id='fixture-company', machine_id='fixture-machine', max_items=8)
-                with self.assertRaisesRegex(RuntimeError, 'bounded Smart Diagnostic model attempts failed'):
+                with self.assertRaisesRegex(self.m._V13BudgetExceeded, 'smart_generation_deadline_reserve'):
                     self.m._assistant_core_sd_json_models([], json_schema={'name': 'offline', 'schema': {}},
                                                           timeout=70, phase='start')
             self.assertEqual(self.provider.call_count, before)
@@ -1011,16 +1011,17 @@ class SmartReviewEndpointTests(unittest.TestCase):
         self.assertFalse(body['meta']['evidence_gate']['accepted'])
         self.assertEqual(self.provider.call_count, before)
 
-    def test_each_planner_fallback_keeps_review_time_and_call_slot(self):
+    def test_single_planner_attempt_keeps_review_time_and_call_slot(self):
         budget = self.m._assistant_core_new_budget('smart_diagnostic', company_id='fixture-company')
         token = self.m._V13_BUDGET_CTX.set(budget)
         try:
             with patch.object(budget, 'remaining', return_value=45.0), \
                  patch.object(self.m, '_v13_json_models', side_effect=[RuntimeError('offline first model failure'), ({}, 'second')]) as provider:
-                result = self.m._assistant_core_sd_json_models([], json_schema={'name': 'fixture', 'schema': {}}, timeout=70, phase='start')
-            self.assertEqual(result, {})
-            self.assertEqual(provider.call_count, 2)
-            self.assertTrue(all(call.kwargs['timeout'] <= 24 for call in provider.call_args_list))
+                with self.assertRaisesRegex(RuntimeError, 'offline first model failure'):
+                    self.m._assistant_core_sd_json_models([], json_schema={'name': 'fixture', 'schema': {}}, timeout=70, phase='start')
+            self.assertEqual(provider.call_count, 1)
+            self.assertLessEqual(provider.call_args.kwargs['timeout'], 13)
+            self.assertEqual(budget.retry_allowance_calls, 0)
         finally:
             self.m._V13_BUDGET_CTX.reset(token)
 

@@ -18451,74 +18451,76 @@ def _assistant_core_sd_json_models(
     timeout: int = 60,
     phase: str = "answer",
 ) -> dict:
-    """Run Smart Diagnostic with quality-first, time-reserved model fallbacks.
+    """One Smart generation with time left for its mandatory independent review.
 
-    Sol remains the preferred quality model. Terra and Luna are reserved fallbacks;
-    each attempt receives its own bounded timeout so a slow first provider cannot
-    consume the entire Smart turn. The shared request time/cost ceilings still apply.
+    No model fallback: a timeout may still be billable, even without usable usage.
+    The configured model override and original cost/output/deadline caps remain.
+    Review cost is admitted conservatively only once its actual draft is known;
+    this scheduling reserve is time, not a promise of future monetary admission.
     """
     budget = _v13_current_budget()
     if not (budget is not None and isinstance(json_schema, dict)):
-        return _openai_chat_json_models(
-            messages, models=models, json_schema=json_schema, timeout=timeout
-        )
-
+        raise RuntimeError("Smart generation requires its request budget and schema")
     phase_key = str(phase or "answer").strip().lower()
-    candidate_models = _dedup_text_values(
-        [ASSISTANT_CORE_SMART_MODEL, V13_FAST_MODEL, V13_PLANNER_MODEL]
-        + list(models or []),
-        limit=4,
-    )
-    if phase_key == "start":
-        timeout_caps = [40, 28, 16, 12]
-    elif phase_key == "finalize":
-        timeout_caps = [36, 26, 16, 12]
+    timeout_cap = 40 if phase_key == "start" else 36 if phase_key == "finalize" else 38
+    review_reserve = _smart_review.MAX_REVIEW_SECONDS + _smart_review.FINALIZATION_RESERVE_SECONDS
+    remaining = budget.remaining()
+    if remaining < review_reserve + 7.0:
+        raise _V13BudgetExceeded("smart_generation_deadline_reserve")
+    if budget.llm_calls >= budget.max_llm_calls - 1:
+        raise _V13BudgetExceeded("Smart generation call budget reserved for review")
+    parsed, _model_used = _v13_json_models(
+        messages, models=[ASSISTANT_CORE_SMART_MODEL], json_schema=json_schema,
+        effort=ASSISTANT_CORE_SMART_EFFORT, reasoning_mode="",
+        timeout=min(int(timeout or 60), timeout_cap, int(remaining - review_reserve)),
+        max_output_tokens=ASSISTANT_CORE_SMART_MAX_OUTPUT_TOKENS,
+        company_id=str(getattr(budget, "company_id", "") or "smart_diagnostic"),
+        purpose=f"{str(json_schema.get('name') or 'smart_diagnostic_reasoning')}:{phase_key}")
+    return parsed
+
+
+def _sd_budget_guard_diagnostic(exc: Exception, budget) -> dict:
+    """Bounded Smart-only diagnostics; no provider/source/error text is returned."""
+    message = str(exc).lower()
+    if "deadline" in message or "time" in message:
+        category = "deadline"
+    elif "call budget" in message or "call_budget" in message:
+        category = "call_limit"
+    elif "insufficient reserved cost" in message or "reservation would exceed" in message:
+        category = "insufficient_reservation"
+    elif getattr(budget, "accounting_anomalies", []):
+        category = "accounting_anomaly"
+    elif "cost budget exhausted" in message:
+        category = "cost_limit"
     else:
-        timeout_caps = [38, 28, 16, 12]
+        category = "budget_guard"
 
-    errors: list[str] = []
-    for index, model in enumerate(candidate_models):
-        # Every generator attempt leaves room for the single independent source
-        # review. Model fallbacks share this reserve and the original ledger.
-        review_reserve = 21.0
-        if budget.remaining() < review_reserve + 7.0 or budget.llm_calls >= budget.max_llm_calls - 1:
-            break
-        per_model_timeout = min(
-            int(timeout or 60),
-            timeout_caps[min(index, len(timeout_caps) - 1)],
-            max(6, int(budget.remaining() - review_reserve)),
-        )
-        try:
-            parsed, _model_used = _v13_json_models(
-                messages,
-                models=[model],
-                json_schema=json_schema,
-                effort=ASSISTANT_CORE_SMART_EFFORT,
-                reasoning_mode="",
-                timeout=per_model_timeout,
-                max_output_tokens=ASSISTANT_CORE_SMART_MAX_OUTPUT_TOKENS,
-                company_id=str(getattr(budget, "company_id", "") or "smart_diagnostic"),
-                purpose=f"{str(json_schema.get('name') or 'smart_diagnostic_reasoning')}:{phase_key}",
-            )
-            return parsed
-        except _V13BudgetExceeded as exc:
-            errors.append(f"{model}:budget:{str(exc)[:240]}")
-            break
-        except Exception as exc:
-            errors.append(f"{model}:{str(exc)[:420]}")
-            # A provider/model failure is an infrastructure retry, not a completed
-            # diagnostic reasoning stage. Restore exactly one bounded call slot so
-            # the next model can still run, without extending time or cost ceilings.
-            budget.grant_retry_allowance(
-                failed_attempts=1,
-                reason=f"smart_diagnostic_{phase_key}_model_failure:{model}",
-            )
+    def number(value):
+        return round(float(value), 8) if type(value) in (int, float) and math.isfinite(value) and 0 <= value <= 1e9 else None
+
+    purposes = {"assistant_core_v2_semantic_router", "smart_diagnostic_independent_review",
+                "smart_diagnostic_step_v1:start", "smart_diagnostic_step_v1:answer",
+                "smart_diagnostic_step_v1:finalize"}
+    models = {"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"}
+    states = {"pending", "uncertain", "not_sent", "settled"}
+    rows = []
+    for row in list(getattr(budget, "call_log", []) or [])[:6]:
+        if not isinstance(row, dict):
             continue
-
-    raise RuntimeError(
-        "All bounded Smart Diagnostic model attempts failed: "
-        + " | ".join(errors)[:1800]
-    )
+        safe = {}
+        for key, allowed in (("purpose", purposes), ("model", models), ("accounting_state", states)):
+            value = row.get(key)
+            safe[key] = value if isinstance(value, str) and value in allowed else "unknown"
+        safe["dispatched"] = row.get("dispatched") if type(row.get("dispatched")) is bool else None
+        for key in ("call", "reserved_cost_usd", "estimated_cost_usd", "timeout_seconds", "max_output_tokens"):
+            safe[key] = number(row.get(key))
+        rows.append(safe)
+    return {"version": "smart-budget-guard-diagnostic-v1", "category": category,
+            "calls": rows, "elapsed_seconds": number(budget.elapsed()),
+            "remaining_seconds": number(budget.remaining()),
+            "max_estimated_cost_usd": number(budget.max_estimated_cost_usd),
+            "committed_cost_usd": number(budget.committed_cost_usd),
+            "remaining_cost_usd": number(budget.remaining_cost_usd)}
 
 
 
@@ -20818,7 +20820,7 @@ def _sd_llm_step_start(
     except _V13BudgetExceeded:
         raise
     except Exception as e:
-        print("SMART_DIAGNOSTIC_START_LLM_FAIL", str(e)[:500])
+        print("SMART_DIAGNOSTIC_START_LLM_FAIL")
         raise HTTPException(status_code=502, detail={"code": "SMART_DIAGNOSTIC_GENERATION_FAILED", "message": "Smart Diagnostic could not generate an evidence-grounded first step."})
 
 
@@ -20882,7 +20884,7 @@ def _sd_llm_step_answer(*, state: dict, answer: dict, language: str, max_hypothe
     except _V13BudgetExceeded:
         raise
     except Exception as e:
-        print("SMART_DIAGNOSTIC_ANSWER_LLM_FAIL", str(e)[:500])
+        print("SMART_DIAGNOSTIC_ANSWER_LLM_FAIL")
         raise HTTPException(status_code=502, detail={"code": "SMART_DIAGNOSTIC_GENERATION_FAILED", "message": "Smart Diagnostic could not update the evidence-grounded session."})
 
 
@@ -20919,7 +20921,7 @@ def _sd_llm_finalize(*, state: dict, language: str) -> dict:
     except _V13BudgetExceeded:
         raise
     except Exception as e:
-        print("SMART_DIAGNOSTIC_FINALIZE_LLM_FAIL", str(e)[:500])
+        print("SMART_DIAGNOSTIC_FINALIZE_LLM_FAIL")
         raise HTTPException(status_code=502, detail={"code": "SMART_DIAGNOSTIC_FINALIZE_FAILED", "message": "Smart Diagnostic could not finalize an evidence-grounded conclusion."})
 
 
@@ -21662,7 +21664,8 @@ def _assistant_core_smart_start_sync(
             "rg_links": [],
             "operator_summary": message,
             "message": message,
-            "meta": {"cacheable": False, "semantic_cacheable": False},
+            "meta": {"cacheable": False, "semantic_cacheable": False,
+                     "smart_budget_guard": _sd_budget_guard_diagnostic(exc, budget)},
         }
         _sd_flatten_question(response, response["question"])
         _sd_flatten_hypotheses(response, [])
@@ -21896,7 +21899,8 @@ def _assistant_core_budgeted_sd_turn(turn_kind: str):
                     "rg_links": [],
                     "operator_summary": message,
                     "message": message,
-                    "meta": {"cacheable": False, "semantic_cacheable": False},
+                    "meta": {"cacheable": False, "semantic_cacheable": False,
+                             "smart_budget_guard": _sd_budget_guard_diagnostic(exc, budget)},
                 }
                 _sd_flatten_question(response, response["question"])
                 _sd_flatten_hypotheses(response, [])
