@@ -268,7 +268,11 @@ def validate(*, parsed: dict[str,Any], frozen: dict[str,Any], records: list[dict
                 resolved[label]=[deepcopy(units[i]) for i in ids]
             proposal_audit.append({'proposal_index':pi,'citation_id':cid,'decision':deepcopy(p),
                                    'resolved_contiguous_units':resolved})
-        if not cause_count:raise ReferenceError('mechanism_not_supported')
+        check_only = (draft.get('kind') == 'diagnostic_question'
+                      and frozen.get('allow_diagnostic_question') is True)
+        if check_only:
+            if cause_count:raise ReferenceError('question_proof_must_be_check_only')
+        elif not cause_count:raise ReferenceError('mechanism_not_supported')
         if covered!=check_ids:raise ReferenceError('not_all_checks_supported')
         accepted.append((pi,{'cause':draft['cause'],'why':draft['why'],
             'checks':[c['text'] for c in draft['checks']],'citations':citations}))
@@ -291,7 +295,7 @@ MAX_REFERENCE_PACKET_CHARS = MAX_BASE_PACKET_CHARS + MAX_REFERENCE_OVERHEAD_CHAR
 
 def prepare(*, packet: dict[str, Any], proposal_manifest: dict[str, Any],
             records: list[dict[str, Any]], original_query: str,
-            observed_query: str) -> dict[str, Any]:
+            observed_query: str, smart_question: bool = False) -> dict[str, Any]:
     """Annotate an already scoped, bounded packet without dropping any material.
 
     IDs, blocks and offsets belong only to this invocation. The existing packet
@@ -314,7 +318,10 @@ def prepare(*, packet: dict[str, Any], proposal_manifest: dict[str, Any],
         raise ReferenceError('invalid_source_count')
     if not isinstance(contexts, list) or not isinstance(records, list):
         raise ReferenceError('invalid_source_contexts')
-    if not isinstance(proposals, list) or not 1 <= len(proposals) <= MAX_PROPOSALS:
+    if type(smart_question) is not bool:
+        raise ReferenceError('invalid_review_mode')
+    limit = 5 if smart_question else MAX_PROPOSALS
+    if not isinstance(proposals, list) or not 1 <= len(proposals) <= limit:
         raise ReferenceError('invalid_proposal_count')
     if not isinstance(source_manifest, list) or len(records) != len(raw_sources) or any(not isinstance(r, dict) for r in records + source_manifest):
         raise ReferenceError('source_manifest_mismatch')
@@ -332,12 +339,18 @@ def prepare(*, packet: dict[str, Any], proposal_manifest: dict[str, Any],
             raise ReferenceError('invalid_proposal_identity')
         if any(not isinstance(proposal.get(k), str) or not proposal[k].strip() for k in ('cause', 'why')):
             raise ReferenceError('incomplete_draft')
+        kind = proposal.get('kind', 'cause')
+        if kind not in {'cause', 'diagnostic_question'} or (kind == 'diagnostic_question' and not smart_question):
+            raise ReferenceError('invalid_proposal_kind')
         checks = proposal.get('checks')
         if not isinstance(checks, list) or len(checks) > MAX_CHECKS:
             raise ReferenceError('invalid_draft_checks')
         for ci, check in enumerate(checks):
             if not isinstance(check, dict) or type(check.get('check_index')) is not int or check['check_index'] != ci or not isinstance(check.get('text'), str) or not check['text'].strip():
                 raise ReferenceError('invalid_draft_checks')
+    question_count = sum(p.get('kind') == 'diagnostic_question' for p in proposals)
+    if question_count > 1 or (smart_question and len(proposals) - question_count > 4):
+        raise ReferenceError('invalid_smart_proposal_count')
     units: list[dict[str, Any]] = []
     blocks: list[dict[str, Any]] = []
 
@@ -402,6 +415,8 @@ def prepare(*, packet: dict[str, Any], proposal_manifest: dict[str, Any],
         'source_sets': source_sets, 'target_sets': target_sets,
         'observed_ids': [u[0] for u in observed_units], 'original_query': original_query,
     }
+    if smart_question:
+        frozen['allow_diagnostic_question'] = True
     frozen['fingerprint'] = digest(frozen)
     encoded = canonical(rendered)
     overhead = len(encoded) - len(base_encoded)

@@ -190,6 +190,8 @@ from machinemind.retrieval import precision_facts as _retrieval_precision_facts
 from machinemind.retrieval import review_packet as _retrieval_review_packet
 from machinemind.retrieval import review_decisions as _retrieval_review_decisions
 from machinemind.retrieval import review_references as _retrieval_review_references
+from machinemind.retrieval import smart_review as _smart_review
+from machinemind.retrieval import smart_evidence as _smart_evidence
 
 
 _PRECISION_FACT_RUNTIME = lambda: _retrieval_precision_facts.PrecisionFactRuntime(
@@ -18453,7 +18455,7 @@ def _assistant_core_sd_json_models(
     consume the entire Smart turn. The shared request time/cost ceilings still apply.
     """
     budget = _v13_current_budget()
-    if not (ASSISTANT_CORE_V2_ENABLED and budget is not None and isinstance(json_schema, dict)):
+    if not (budget is not None and isinstance(json_schema, dict)):
         return _openai_chat_json_models(
             messages, models=models, json_schema=json_schema, timeout=timeout
         )
@@ -18473,12 +18475,15 @@ def _assistant_core_sd_json_models(
 
     errors: list[str] = []
     for index, model in enumerate(candidate_models):
-        if budget.remaining() < 7.0 or budget.llm_calls >= budget.max_llm_calls:
+        # Every generator attempt leaves room for the single independent source
+        # review. Model fallbacks share this reserve and the original ledger.
+        review_reserve = 21.0
+        if budget.remaining() < review_reserve + 7.0 or budget.llm_calls >= budget.max_llm_calls - 1:
             break
         per_model_timeout = min(
             int(timeout or 60),
             timeout_caps[min(index, len(timeout_caps) - 1)],
-            max(6, int(budget.remaining() - 3.0)),
+            max(6, int(budget.remaining() - review_reserve)),
         )
         try:
             parsed, _model_used = _v13_json_models(
@@ -19653,6 +19658,111 @@ def _sd_filter_rg_links_for_citations(rg_links: list[dict], citations: list[dict
     ordered = [by_id[cid] for cid in wanted_ids if cid in by_id]
     return _sd_align_rg_links_with_citations(ordered, citations)
 
+def _sd_grounding_scope(company_id: str, machine_id: str) -> dict:
+    return {"company_id": company_id, "machine_id": machine_id, "ai_scope": "machine_all"}
+
+
+def _sd_build_grounding_packet(raw_citations: list[dict], citations: list[dict], *, company_id: str, machine_id: str) -> dict:
+    # This seam receives trusted retrieval rows before any display sanitization.
+    raw_by_id = {str(c.get("citation_id") or ""): c for c in raw_citations}
+    ids = [str(c.get("citation_id") or "") for c in citations]
+    if any(not cid or cid not in raw_by_id for cid in ids):
+        raise HTTPException(status_code=502, detail={"code": "SMART_DIAGNOSTIC_EVIDENCE_PACKET_INVALID"})
+    try:
+        return _smart_evidence.build([raw_by_id[cid] for cid in ids],
+            scope=_sd_grounding_scope(company_id, machine_id),
+            max_chars=SMART_DIAGNOSTIC_MAX_CONTEXT_CHARS, allow_raw_snippet=True)
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail={"code": "SMART_DIAGNOSTIC_EVIDENCE_PACKET_INVALID",
+                                                    "reason": str(exc)}) from None
+
+
+def _sd_require_grounding_packet(state: dict) -> dict:
+    # HMAC/scope validation must run before this function on incoming state.
+    packet = state.get("grounding_packet")
+    if not isinstance(packet, dict):
+        raise HTTPException(status_code=409, detail={"code": "SMART_DIAGNOSTIC_SESSION_RESTART_REQUIRED",
+            "message": "Start a new diagnostic session to retain complete source evidence."})
+    try:
+        _smart_evidence.validate(packet,
+            scope=_sd_grounding_scope(str(state.get("company_id") or ""), str(state.get("machine_id") or "")),
+            allowed_ids={str(e.get("citation_id") or "") for e in state.get("evidence") or []})
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail={"code": "SMART_DIAGNOSTIC_EVIDENCE_PACKET_INVALID",
+                                                    "reason": str(exc)}) from None
+    return packet
+
+
+def _sd_review_step(*, step: dict, state: dict, language: str) -> tuple[dict, dict]:
+    packet = _smart_evidence.review_packet(_sd_require_grounding_packet(state))
+    budget = _v13_current_budget()
+    if budget is None or budget.remaining() < 8.0 or budget.llm_calls >= budget.max_llm_calls:
+        raise _V13BudgetExceeded("smart_review_deadline_or_call_budget")
+    try:
+        prepared = _smart_review.prepare(step=step, packet=packet,
+            symptom_text=str(state.get("symptom_text") or ""), history=state.get("history") or [], language=language)
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail={"code": "SMART_DIAGNOSTIC_REVIEW_INVALID",
+                                                    "reason": str(exc)}) from None
+    started = time_module.monotonic()
+    # A single independent review. No model fallback, retry allowance, new
+    # retrieval or fresh budget; transport reservation uses this request ledger.
+    try:
+        parsed, model = _v13_json_models(
+            _smart_review.messages(prepared, language=language,
+                symptom_text=str(state.get("symptom_text") or ""), history=state.get("history") or []),
+            models=[V13_FAST_MODEL], json_schema=_retrieval_review_references.schema(prepared["references"]["frozen"]),
+            effort=V13_FAST_EFFORT, reasoning_mode="", timeout=min(20, int(budget.remaining() - 1)),
+            max_output_tokens=min(4200, V13_FAST_MAX_OUTPUT_TOKENS),
+            company_id=str(state.get("company_id") or ""), purpose="smart_diagnostic_independent_review")
+    except _V13BudgetExceeded:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail={"code": "SMART_DIAGNOSTIC_REVIEW_FAILED",
+                                                    "reason": type(exc).__name__}) from None
+    try:
+        reviewed, seal, summary = _smart_review.resolve(prepared=prepared, parsed=parsed,
+                                                       probability_band=_sd_probability_band)
+    except _smart_review.SmartReviewError as exc:
+        if str(exc) in {"question_not_supported", "no_supported_hypotheses", "question_has_no_supported_target", "no_positive_supported_hypothesis"}:
+            return {"status": "no_sources", "final_ready": False, "hypotheses": [],
+                    "question": _sd_empty_question(0), "final_result": {}, "operator_summary": ""}, state
+        raise HTTPException(status_code=502, detail={"code": "SMART_DIAGNOSTIC_REVIEW_INVALID", "reason": str(exc)}) from None
+    except _retrieval_review_references.ReferenceError as exc:
+        raise HTTPException(status_code=502, detail={"code": "SMART_DIAGNOSTIC_REVIEW_INVALID", "reason": str(exc)}) from None
+    if reviewed.get("final_ready"):
+        reviewed["final_result"] = _sd_canonicalize_final_result({}, reviewed["hypotheses"], language)
+        reviewed["operator_summary"] = reviewed["final_result"]["summary"]
+    updated = dict(state)
+    updated["grounding_review"] = seal
+    updated["grounding_review_meta"] = {"policy_version": _smart_review.POLICY_VERSION,
+        "outcome": "completed", "decision_validated": True, "attempt_limit": 1, "model": model,
+        "elapsed_seconds": round(time_module.monotonic() - started, 3),
+        "accepted_hypothesis_ids": summary["accepted_hypothesis_ids"],
+        "rebound_hypothesis_ids": summary["rebound_hypothesis_ids"],
+        "question_validated": summary["question_validated"], "claims_digest": summary["claims_digest"],
+        "all_checks_covered": True, "semantic_truth_verified_by_code": False}
+    return reviewed, updated
+
+
+def _sd_review_error_response(exc: HTTPException, language: str) -> Optional[dict]:
+    detail = exc.detail if isinstance(exc.detail, dict) else {}
+    code = str(detail.get("code") or "")
+    if not code.startswith("SMART_DIAGNOSTIC_REVIEW_"):
+        return None
+    message = ("The source review could not be completed; no unverified diagnostic is returned."
+               if language == "en" else "Non è stato possibile completare la verifica delle fonti della diagnosi.")
+    response = {"ok": False, "status": "error", "result_code": RESULT_TECHNICAL_ERROR,
+                "final_ready": False, "language": language, "operator_summary": message,
+                "question": _sd_empty_question(0), "hypotheses": [], "citations": [], "rg_links": [],
+                "session_state_json": "", "detail": {"code": code, "reason": str(detail.get("reason") or "")},
+                "meta": {"cacheable": False, "smart_review": {"outcome": "error", "attempt_limit": 1}}}
+    _sd_flatten_question(response, response["question"])
+    _sd_flatten_hypotheses(response, [])
+    _sd_flatten_citations(response, [], [])
+    return response
+
+
 def _sd_compact_evidence_for_state(citations: list[dict], *, max_items: int) -> list[dict]:
     citations = _sd_prepare_citations_for_response(citations, max_items=max_items)
     out: list[dict] = []
@@ -19768,7 +19878,7 @@ def _sd_schema(max_hypotheses: int = 4, max_options: int = 4) -> dict:
                             "probability_pct": {"type": "number"},
                             "probability_band": {"type": "string", "enum": ["high", "medium", "low", "very_low", "unknown"]},
                             "status": {"type": "string", "enum": ["open", "likely", "unlikely", "excluded"]},
-                            "checks": {"type": "array", "items": {"type": "string"}, "maxItems": 5},
+                            "checks": {"type": "array", "items": {"type": "string", "maxLength": 2000}, "maxItems": 5},
                             "evidence_ids": {"type": "array", "items": {"type": "string"}, "maxItems": 5},
                         },
                         "required": [
@@ -20149,7 +20259,8 @@ def _sd_enrich_state_evidence_from_answer(
         _V13_BUDGET_CTX.reset(token)
     if not bool((assurance or {}).get("adopted")):
         return state
-    citations = _sanitize_citations_for_response(enhanced.get("citations") or [], company_id=company_id)
+    admitted_enrichment = list(enhanced.get("citations") or [])
+    citations = _sanitize_citations_for_response(admitted_enrichment, company_id=company_id)
     persisted_by_id = {
         str(item.get("citation_id") or "").strip(): dict(item)
         for item in list(state.get("citations") or []) + list(state.get("evidence") or [])
@@ -20164,19 +20275,34 @@ def _sd_enrich_state_evidence_from_answer(
         if isinstance(citation, dict)
     ]
     current_ids = {str(e.get("citation_id") or "") for e in (state.get("evidence") or []) if isinstance(e, dict)}
-    existing = [c for c in citations if str(c.get("citation_id") or "") in current_ids]
-    additions = [c for c in citations if str(c.get("citation_id") or "") not in current_ids][:SMART_DIAGNOSTIC_RETRIEVAL_ASSURANCE_MAX_NEW_EVIDENCE]
+    existing = list(state.get("citations") or [])
+    capacity = max(0, SMART_DIAGNOSTIC_MAX_EVIDENCE_IN_STATE - len(current_ids))
+    additions = [c for c in citations if str(c.get("citation_id") or "") not in current_ids][
+        :min(capacity, SMART_DIAGNOSTIC_RETRIEVAL_ASSURANCE_MAX_NEW_EVIDENCE)]
+    if not additions:
+        return state
     citations = _sd_prepare_citations_for_response(
         existing + additions,
         max_items=SMART_DIAGNOSTIC_MAX_EVIDENCE_IN_STATE,
     )
     if not citations:
         return state
+    addition_ids = {str(c.get("citation_id") or "") for c in additions}
+    try:
+        grounding_packet = _smart_evidence.update_enrichment(_sd_require_grounding_packet(state),
+            [c for c in admitted_enrichment if str(c.get("citation_id") or "") in addition_ids],
+            scope=_sd_grounding_scope(company_id, machine_id),
+            allowed_ids={str(c.get("citation_id") or "") for c in citations}, allow_raw_snippet=True,
+            max_new_sources=SMART_DIAGNOSTIC_RETRIEVAL_ASSURANCE_MAX_NEW_EVIDENCE)
+    except ValueError:
+        # Optional enrichment cannot evict or truncate an already admitted source.
+        return state
     try:
         links = _build_rg_links(company_id, citations)
     except Exception:
         links = list(state.get("rg_links") or [])
     updated = dict(state)
+    updated["grounding_packet"] = grounding_packet
     updated["citations"] = citations
     updated["rg_links"] = _sd_filter_rg_links_for_citations(links, citations)
     updated["evidence"] = _sd_compact_evidence_for_state(
@@ -20352,7 +20478,11 @@ def _sd_normalize_hypotheses(
         if not hid or hid in used:
             hid = f"H{idx}"
         pct = max(0.0, min(100.0, float(raw.get("probability_pct") or 0.0)))
-        checks = _unique_non_empty_strings([_sd_clean_text(x, 180) for x in (raw.get("checks") or [])], limit=5)
+        raw_checks = raw.get("checks") or []
+        if (not isinstance(raw_checks, list) or len(raw_checks) > 5
+                or any(not isinstance(x, str) or not x.strip() or len(x) > _smart_review.MAX_CHECK_CHARS for x in raw_checks)):
+            raise HTTPException(status_code=502, detail={"code": "SMART_DIAGNOSTIC_CHECK_CONTRACT_INVALID"})
+        checks = _unique_non_empty_strings([x.strip() for x in raw_checks], limit=5)
         evidence_ids = _unique_non_empty_strings([str(x or "").strip() for x in (raw.get("evidence_ids") or [])], limit=5)
         if allowed is not None:
             evidence_ids = [cid for cid in evidence_ids if cid in allowed]
@@ -20383,6 +20513,10 @@ def _sd_normalize_step(
     parsed: dict, *, language: str, question_number_default: int,
     max_hypotheses: int, allowed_evidence_ids: Optional[set[str]] = None,
 ) -> dict:
+    try:
+        _smart_review.validate_raw_step(parsed)
+    except _smart_review.SmartReviewError as exc:
+        raise HTTPException(status_code=502, detail={"code": "SMART_DIAGNOSTIC_CHECK_CONTRACT_INVALID", "reason": str(exc)}) from None
     parsed = dict(parsed or {})
     status = str(parsed.get("status") or "in_progress").strip().lower()
     if status not in {"in_progress", "completed", "no_sources"}:
@@ -20471,7 +20605,8 @@ def _sd_llm_step_start(
         "You are MachineMind Smart Diagnostic, a guided diagnostic engine for industrial machinery. "
         "You are NOT a free chat. You must create a professional guided diagnostic session with one closed question at a time. "
         "Use ONLY the provided indexed machine evidence. Do not invent machine-specific facts. "
-        "Generate 2-4 plausible hypotheses with estimated probabilities from evidence + symptom. "
+        "Generate up to four supported hypotheses with estimated probabilities from evidence + symptom; this is a ceiling, not a quota. "
+        "Every cause, explanation and check must be supported by its cited source; omit a weak hypothesis rather than citing a merely related topic. "
         "Ask the next best closed question that separates the leading hypotheses. "
         "Questions must be practical for an operator/technician and answerable as yes/no or single-choice. "
         "For single-choice questions provide at most three factual alternatives and one option with id=unknown for an unavailable or unsafe observation. "
@@ -20517,7 +20652,7 @@ def _sd_llm_step_answer(*, state: dict, answer: dict, language: str, max_hypothe
     history = list(state.get("history") or [])
     evidence = list(state.get("evidence") or [])
     evidence_ids = [str(e.get("citation_id") or "") for e in evidence if isinstance(e, dict)]
-    evidence_block = _sd_evidence_block_from_state_evidence(evidence)
+    evidence_block = _smart_evidence.evidence_block(_sd_require_grounding_packet(state))
     current_hypotheses = list(state.get("hypotheses") or [])
     current_question = dict(state.get("current_question") or {})
     question_number_default = _sd_clamp_int(current_question.get("question_number"), len(history) + 1, 1, 99) + 1
@@ -20826,12 +20961,23 @@ def _sd_response_from_step(
         ),
     }
     if final_ready and status != "no_sources":
-        citations, source_manifest_meta = _sd_curate_final_source_manifest(
-            citations=citations,
-            state_evidence=list((state or {}).get("evidence") or []),
-            step=step,
-            max_items=SMART_DIAGNOSTIC_FINAL_SOURCE_LIMIT,
-        )
+        if state.get("grounding_review"):
+            # A proof-selected citation cannot be substituted by a nearby page
+            # or silently evicted by the presentation's six-slot preference.
+            by_id = {str(c.get("citation_id") or ""): c for c in citations}
+            wanted = list(dict.fromkeys(str(cid) for h in hypotheses for cid in h.get("evidence_ids") or []))
+            if not wanted or any(cid not in by_id for cid in wanted):
+                raise HTTPException(status_code=502, detail={"code": "SMART_DIAGNOSTIC_REVIEW_CITATION_MISSING"})
+            citations = [by_id[cid] for cid in wanted]
+            source_manifest_meta = {"version": SMART_DIAGNOSTIC_SOURCE_MANIFEST_VERSION,
+                "hypothesis_scoped": True, "reviewer_proof_bound": True, "citation_count": len(citations)}
+        else:
+            citations, source_manifest_meta = _sd_curate_final_source_manifest(
+                citations=citations,
+                state_evidence=list((state or {}).get("evidence") or []),
+                step=step,
+                max_items=SMART_DIAGNOSTIC_FINAL_SOURCE_LIMIT,
+            )
         try:
             rg_links = _sd_align_rg_links_with_citations(
                 _build_rg_links(company_id, citations),
@@ -20891,6 +21037,7 @@ def _sd_response_from_step(
         "meta": {
             "mode": "smart_diagnostic_v1",
             "model": SMART_DIAGNOSTIC_MODEL,
+            "smart_review": dict(current_state.get("grounding_review_meta") or {}),
             "max_questions": _safe_int(current_state.get("max_questions"), SMART_DIAGNOSTIC_MAX_QUESTIONS),
             "max_hypotheses": len(hypotheses),
             "evidence_gate": {
@@ -21024,14 +21171,14 @@ def _assistant_core_synthesize_smart_start(
         response_citations,
         max_items=max(1, min(SMART_DIAGNOSTIC_MAX_EVIDENCE_IN_STATE, request.top_k)),
     )
-    evidence_block = _build_sources_block_from_citations(
-        raw_citations,
-        max_context_chars=SMART_DIAGNOSTIC_MAX_CONTEXT_CHARS,
-        prefer_chunk_full=True,
-    )
+    state_ids = {e['citation_id'] for e in evidence_state}
+    grounding_packet = _sd_build_grounding_packet(raw_citations,
+        [c for c in response_citations if c['citation_id'] in state_ids],
+        company_id=request.company_id, machine_id=request.machine_id)
+    evidence_block = _smart_evidence.evidence_block(grounding_packet)
     evidence_ids = [
         str(c.get("citation_id") or "").strip()
-        for c in raw_citations
+        for c in evidence_state
         if str(c.get("citation_id") or "").strip()
     ]
 
@@ -21076,6 +21223,7 @@ def _assistant_core_synthesize_smart_start(
         "top_k": request.top_k,
         "history": [],
         "evidence": evidence_state,
+        "grounding_packet": grounding_packet,
         "evidence_gate": {
             "accepted": True,
             "decision": decision.evidence_state,
@@ -21092,6 +21240,9 @@ def _assistant_core_synthesize_smart_start(
         },
         "retrieval_assurance": {},
     }
+    step, state = _sd_review_step(step=step, state=state, language=request.response_language)
+    if step.get("status") == "no_sources":
+        return _assistant_core_smart_no_evidence(request, decision, retrieval)
     response = _sd_response_from_step(
         session_id=session_id,
         company_id=request.company_id,
@@ -21268,6 +21419,12 @@ def _assistant_core_smart_start_sync(
 
         budget.route = "assistant_core_smart_diagnostic"
         return _assistant_core_attach_runtime_meta(final, budget, debug=bool(payload.debug))
+    except HTTPException as exc:
+        response = _sd_review_error_response(exc, language)
+        if response is None:
+            raise
+        budget.route = "assistant_core_smart_review_error"
+        return _assistant_core_attach_runtime_meta(response, budget, debug=False)
     except _AuthorityError as exc:
         response = {**_application_authority.public_error(exc),
             "final_ready": False, "language": language, "hypotheses": [],
@@ -21466,8 +21623,6 @@ def _assistant_core_budgeted_sd_turn(turn_kind: str):
     def decorator(func):
         @functools.wraps(func)
         def wrapped(payload, x_ai_internal_secret: Optional[str] = None):
-            if not ASSISTANT_CORE_V2_ENABLED:
-                return func(payload, x_ai_internal_secret)
             company_id = str(getattr(payload, "company_id", "") or "").strip()
             language = _sd_language(getattr(payload, "language", "it"), "")
             budget = _assistant_core_new_budget(MODE_SMART_DIAGNOSTIC, company_id=company_id)
@@ -21506,6 +21661,12 @@ def _assistant_core_budgeted_sd_turn(turn_kind: str):
                         debug=bool(getattr(payload, "debug", False)),
                     )
                 return result
+            except HTTPException as exc:
+                response = _sd_review_error_response(exc, language)
+                if response is None:
+                    raise
+                budget.route = f"assistant_core_smart_{turn_kind}_review_error"
+                return _assistant_core_attach_runtime_meta(response, budget, debug=False)
             except _AuthorityError as exc:
                 response = {**_application_authority.public_error(exc),
                     "final_ready": False, "language": language, "hypotheses": [],
@@ -21565,6 +21726,20 @@ def smart_diagnostic_start_v1(
             x_ai_internal_secret,
             turn_kind="start",
         )
+    if _v13_current_budget() is None:
+        # Legacy START uses the same ledger for generation and independent review.
+        budget = _assistant_core_new_budget(MODE_SMART_DIAGNOSTIC, company_id=str(payload.company_id or ""))
+        token = _V13_BUDGET_CTX.set(budget)
+        try:
+            try:
+                result = smart_diagnostic_start_v1(payload, x_ai_internal_secret)
+            except HTTPException as exc:
+                result = _sd_review_error_response(exc, _sd_language(payload.language, payload.symptom_text))
+                if result is None:
+                    raise
+            return _assistant_core_attach_runtime_meta(result, budget, debug=bool(payload.debug))
+        finally:
+            _V13_BUDGET_CTX.reset(token)
     _sd_auth_guard(x_ai_internal_secret)
     company_id = (payload.company_id or "").strip()
     machine_id = (payload.machine_id or "").strip()
@@ -21669,8 +21844,11 @@ def smart_diagnostic_start_v1(
         print("SMART_DIAGNOSTIC_RG_LINKS_FAIL", str(e)[:300])
         rg_links = []
     evidence_state = _sd_compact_evidence_for_state(response_citations, max_items=max(1, min(SMART_DIAGNOSTIC_MAX_EVIDENCE_IN_STATE, top_k)))
-    evidence_block = _build_sources_block_from_citations(raw_citations, max_context_chars=SMART_DIAGNOSTIC_MAX_CONTEXT_CHARS, prefer_chunk_full=True)
-    evidence_ids = [str(c.get("citation_id") or "").strip() for c in raw_citations if c.get("citation_id")]
+    state_ids = {e['citation_id'] for e in evidence_state}
+    grounding_packet = _sd_build_grounding_packet(raw_citations,
+        [c for c in response_citations if c['citation_id'] in state_ids], company_id=company_id, machine_id=machine_id)
+    evidence_block = _smart_evidence.evidence_block(grounding_packet)
+    evidence_ids = [e['citation_id'] for e in evidence_state]
     context_label = str(payload.context.context_label or payload.context.context_type or "").strip() if payload.context else ""
     parsed = _sd_llm_step_start(
         symptom_text=symptom_text, language=language, max_questions=max_questions,
@@ -21693,7 +21871,7 @@ def smart_diagnostic_start_v1(
         "symptom_text": symptom_text,
         "context": payload.context.dict() if payload.context else {},
         "max_questions": max_questions, "max_hypotheses": max_hypotheses,
-        "top_k": top_k, "history": [], "evidence": evidence_state,
+        "top_k": top_k, "history": [], "evidence": evidence_state, "grounding_packet": grounding_packet,
         "evidence_gate": {
             "accepted": True,
             "decision": str(evidence_gate.get("decision") or "supported"),
@@ -21710,6 +21888,9 @@ def smart_diagnostic_start_v1(
         },
         "retrieval_assurance": dict(assurance_meta or {}),
     }
+    step, state = _sd_review_step(step=step, state=state, language=language)
+    if step.get("status") == "no_sources":
+        return _sd_no_sources_response(language, session_id, symptom_text, debug=bool(payload.debug), gate_result=evidence_gate)
     return _sd_response_from_step(
         session_id=session_id, company_id=company_id, machine_id=machine_id,
         symptom_text=symptom_text, language=language, state=state, step=step,
@@ -21740,6 +21921,7 @@ def smart_diagnostic_answer_v1(
     language = _sd_language(payload.language or state.get("language"), symptom_text)
     if not _sd_state_has_admitted_evidence(state):
         return _sd_no_sources_response(language, session_id, symptom_text, debug=bool(payload.debug), gate_result=dict(state.get("evidence_gate") or {}))
+    _sd_require_grounding_packet(state)
     max_hypotheses = _sd_clamp_int(state.get("max_hypotheses"), SMART_DIAGNOSTIC_MAX_HYPOTHESES, 2, 4)
     answer_api_value = str(payload.answer.api_value or payload.answer.value or "").strip()
     current_question = dict(state.get("current_question") or {})
@@ -21796,6 +21978,9 @@ def smart_diagnostic_answer_v1(
                 status_code=502,
                 detail={"code": "SMART_DIAGNOSTIC_REPEATED_QUESTION", "message": "Smart Diagnostic did not produce a new discriminating question. Retry this answer."},
             )
+    step, state = _sd_review_step(step=step, state=state, language=language)
+    if step.get("status") == "no_sources":
+        return _sd_no_sources_response(language, session_id, symptom_text, debug=bool(payload.debug), gate_result=dict(state.get("evidence_gate") or {}))
     response_citations = list(state.get("citations") or [])
     if not response_citations and state.get("evidence"):
         response_citations = [
@@ -21848,31 +22033,40 @@ def _sd_canonicalize_final_result(final_raw: dict, hypotheses: list[dict], langu
         )[0]
 
     label = _sd_clean_text(selected.get("label") or selected.get("id") or "", 180)
-    why = _sd_clean_text(selected.get("why") or selected.get("description") or "", 700)
+    why = str(selected.get("why") or selected.get("description") or "").strip()
     pct = max(0.0, min(100.0, float(selected.get("probability_pct") or 0.0)))
     checks = _unique_non_empty_strings(
-        [_sd_clean_text(x, 180) for x in (selected.get("checks") or [])],
+        [str(x).strip() for x in (selected.get("checks") or [])],
         limit=8,
     )
     allowed_checks = {re.sub(r"\s+", " ", check).strip().casefold(): check for check in checks}
     selected_checks = [
         allowed_checks[key]
         for raw_check in ((final_raw or {}).get("recommended_checks") or [])
-        if (key := re.sub(r"\s+", " ", _sd_clean_text(raw_check, 180)).strip().casefold()) in allowed_checks
+        if (key := re.sub(r"\s+", " ", str(raw_check)).strip().casefold()) in allowed_checks
     ]
     checks = _unique_non_empty_strings(selected_checks, limit=8) or checks
     if str(language or "").lower().startswith("en"):
         summary = f"Most supported hypothesis: {label}." + (f" {why}" if why else "")
+        summary += " Relative hypothesis weights are indicative, not statistical certainty or a confirmed diagnosis."
     else:
         summary = f"Ipotesi più supportata: {label}." + (f" {why}" if why else "")
+        summary += " I pesi relativi delle ipotesi sono indicativi, non certezze statistiche o una diagnosi confermata."
     return {
-        "summary": _sd_clean_text(summary, 1200),
+        "summary": summary,
         "most_likely_hypothesis_id": str(selected.get("id") or ""),
         "most_likely_label": label,
         "probability_pct": round(pct, 1),
         "probability_band": _sd_normalize_band(selected.get("probability_band"), pct),
         "recommended_checks": checks,
     }
+
+
+def _sd_terminal_reviewed_step(reviewed: dict, *, language: str, question_number: int) -> dict:
+    final = _sd_canonicalize_final_result({}, reviewed.get("hypotheses") or [], language)
+    return {"status": "completed", "final_ready": True, "operator_summary": final.get("summary", ""),
+            "question": _sd_empty_question(question_number), "hypotheses": list(reviewed.get("hypotheses") or []),
+            "final_result": final}
 
 
 @app.post("/v1/ai/smart-diagnostic/finalize")
@@ -21897,40 +22091,24 @@ def smart_diagnostic_finalize_v1(
     language = _sd_language(payload.language or state.get("language"), symptom_text)
     if not _sd_state_has_admitted_evidence(state):
         return _sd_no_sources_response(language, session_id, symptom_text, debug=bool(payload.debug), gate_result=dict(state.get("evidence_gate") or {}))
-    allowed_ids = {str(e.get("citation_id") or "").strip() for e in (state.get("evidence") or []) if isinstance(e, dict) and str(e.get("citation_id") or "").strip()}
-    hyps = _sd_normalize_hypotheses(
-        state.get("hypotheses") or [], language=language,
-        max_hypotheses=_sd_clamp_int(state.get("max_hypotheses"), 4, 2, 4),
-        allowed_evidence_ids=allowed_ids,
-    )
-    if not hyps or not any(h.get("status") != "excluded" for h in hyps):
-        return _sd_no_sources_response(language, session_id, symptom_text, debug=bool(payload.debug), gate_result=dict(state.get("evidence_gate") or {}))
-    state["hypotheses"] = hyps
-    final_raw = _sd_llm_finalize(state=state, language=language)
-    final = _sd_canonicalize_final_result(final_raw, hyps, language)
-    if not final:
-        return _sd_no_sources_response(
-            language, session_id, symptom_text, debug=bool(payload.debug),
-            gate_result=dict(state.get("evidence_gate") or {}),
-        )
-    step = _sd_normalize_step(
-        {
-            "status": "completed", "final_ready": True,
-            "operator_summary": str(final.get("summary") or ""),
-            "question": _sd_empty_question(_safe_int(state.get("current_step_number"), 0)),
-            "hypotheses": hyps,
-            "final_result": {
-                "summary": final.get("summary") or "",
-                "most_likely_hypothesis_id": final.get("most_likely_hypothesis_id") or "",
-                "most_likely_label": final.get("most_likely_label") or "",
-                "probability_pct": final.get("probability_pct") or 0,
-                "probability_band": final.get("probability_band") or "unknown",
-                "recommended_checks": final.get("recommended_checks") or [],
-            },
-        },
-        language=language, question_number_default=_safe_int(state.get("current_step_number"), 0),
-        max_hypotheses=len(hyps) or 4, allowed_evidence_ids=allowed_ids,
-    )
+    if not any(h.get("status") != "excluded" for h in state.get("hypotheses") or []):
+        return _sd_no_sources_response(language, session_id, symptom_text, debug=bool(payload.debug),
+                                       gate_result=dict(state.get("evidence_gate") or {}))
+    packet = _smart_evidence.review_packet(_sd_require_grounding_packet(state))
+    project_terminal = lambda reviewed: _sd_terminal_reviewed_step(reviewed, language=language,
+                                      question_number=_safe_int(state.get("current_step_number"), 0))
+    try:
+        reviewed, summary = _smart_review.replay(state=state, packet=packet,
+            probability_band=_sd_probability_band, terminal_projection=project_terminal)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail={"code": "SMART_DIAGNOSTIC_SESSION_RESTART_REQUIRED",
+            "message": "The complete source review cannot be replayed; start a new diagnostic session.", "reason": str(exc)}) from None
+    # Concluding with the same observations selects the strongest reviewed
+    # hypothesis. No provider call can invent a different explanation or check.
+    step = project_terminal(reviewed)
+    state["grounding_review_meta"] = {**dict(state.get("grounding_review_meta") or {}),
+        "finalization_mode": "deterministic_reviewed_state", "review_replayed": True,
+        "finalization_provider_calls": 0}
     return _sd_response_from_step(
         session_id=session_id, company_id=company_id, machine_id=machine_id,
         symptom_text=symptom_text, language=language, state=state, step=step,

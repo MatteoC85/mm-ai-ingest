@@ -15,6 +15,7 @@ from contextlib import ExitStack
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
 def denied(*args, **kwargs):
@@ -69,13 +70,50 @@ class SmartDiagnosticQualityTests(unittest.TestCase):
             {"citation_id": "manual:p7", "bubble_document_id": "manual", "source_type": "document", "display_title": "Operator manual", "display_label": "Operator manual - p. 7", "page_from": 7, "page_to": 7, "snippet": "Low supply pressure prevents motion."},
             {"citation_id": "manual:p8", "bubble_document_id": "manual", "source_type": "document", "display_title": "Operator manual", "display_label": "Operator manual - p. 8", "page_from": 8, "page_to": 8, "snippet": "Position confirmation is required."},
         ]}
+        # This suite exercises UI/state/security contracts. Its independent review
+        # verdict is simulated; real review validation and emitted-state replay
+        # have dedicated adversarial coverage in test_smart_review.py.
+        self.patches.enter_context(patch.object(self.m, "_sd_review_step", side_effect=self.review_fixture))
+
+    def review_fixture(self, *, step, state, language):
+        from test_smart_review import parsed_review
+        packet = self.m._smart_evidence.review_packet(state["grounding_packet"])
+        prepared = self.m._smart_review.prepare(step=step, packet=packet, symptom_text=state["symptom_text"],
+                                                history=state.get("history") or [], language=language)
+        parsed = parsed_review(prepared, rejected=())
+        frozen = prepared["references"]["frozen"]
+        source_ids = [r["citation_id"] for r in packet["validator_records"]]
+        for index, h in enumerate(step["hypotheses"]):
+            source_index = source_ids.index(h["evidence_ids"][0])
+            proof = parsed["decisions"][index]["proofs"][0]
+            proof.update(source_index=source_index, source_units=frozen["source_sets"][source_index][:1],
+                         target_units=frozen["target_sets"][source_index][:1])
+        reviewed, seal, meta = self.m._smart_review.resolve(prepared=prepared, parsed=parsed,
+                                                           probability_band=self.m._sd_probability_band)
+        if reviewed.get("final_ready"):
+            reviewed["final_result"] = self.m._sd_canonicalize_final_result({}, reviewed["hypotheses"], language)
+            reviewed["operator_summary"] = reviewed["final_result"]["summary"]
+        return reviewed, {**state, "grounding_review": seal}
 
     def parsed_step(self, **kw):
         q = {**self.question, "question_id": "Q2", "question_number": 2, "question_text": "Does the HMI show position confirmation?"}
         return {"status": "in_progress", "final_ready": False, "operator_summary": "Pressure checked; inspect the position signal.", "question": q, "hypotheses": copy.deepcopy(self.hyps), "final_result": {}, **kw}
 
     def post(self, kind, *, state=None, answer=None, **kw):
-        data = {"company_id": "fixture-company", "machine_id": "fixture-machine", "session_id": "fixture-session", "language": "en", "state_json": self.m._sd_sign_state(copy.deepcopy(state or self.state))}
+        state = copy.deepcopy(state or self.state)
+        state.setdefault("citations", copy.deepcopy(state["evidence"]))
+        state["grounding_packet"] = self.m._smart_evidence.build(
+            [{**e, "text": e["snippet"]} for e in state["evidence"]],
+            scope={"company_id": state["company_id"], "machine_id": state["machine_id"], "ai_scope": "machine_all"})
+        if state.get("status") == "in_progress" and any(h.get("status") != "excluded" for h in state["hypotheses"]):
+            initial = self.m._sd_normalize_step({"status": "in_progress", "final_ready": False,
+                "question": state["current_question"], "hypotheses": state["hypotheses"], "final_result": {}},
+                language=state["language"], question_number_default=state["current_step_number"], max_hypotheses=4,
+                allowed_evidence_ids={e["citation_id"] for e in state["evidence"]})
+            reviewed, state = self.review_fixture(step=initial, state=state, language=state["language"])
+            state["hypotheses"] = reviewed["hypotheses"]
+            state["current_question"] = reviewed["question"]
+        data = {"company_id": "fixture-company", "machine_id": "fixture-machine", "session_id": "fixture-session", "language": "en", "state_json": self.m._sd_sign_state(state)}
         if kind == "answer":
             data.update(question_id="Q1", answer=answer or {"value": "yes", "api_value": "yes", "label": "Yes", "free_text": ""})
         data.update(kw)
@@ -99,7 +137,7 @@ class SmartDiagnosticQualityTests(unittest.TestCase):
         body = response.json()
         self.assertEqual(body["final_result"]["most_likely_hypothesis_id"], "H2")
         self.assertEqual(body["operator_summary"], body["final_summary_text"])
-        self.assertEqual(body["final_result"]["recommended_checks"], ["Observe the position input on the HMI"])
+        self.assertEqual(body["final_result"]["recommended_checks"], ["Observe the position input on the HMI."])
 
     def test_all_excluded_does_not_manufacture_a_final_diagnosis(self):
         for h in self.hyps:
@@ -304,8 +342,8 @@ class SmartDiagnosticQualityTests(unittest.TestCase):
         with patch.object(self.m, "_sd_llm_finalize", return_value={"most_likely_hypothesis_id": "H2", "most_likely_label": "Invented", "probability_pct": 100, "recommended_checks": ["Invented operation"]}):
             response = self.post("finalize")
         body = response.json()
-        self.assertEqual(body["final_most_likely_label"], "Position signal absent")
-        self.assertEqual(body["final_probability_pct"], 40)
+        self.assertEqual(body["final_most_likely_label"], "Supply pressure loss")
+        self.assertEqual(body["final_probability_pct"], 60)
         self.assertEqual(json.loads(body["final_result_json"]), body["final_result"])
         self.assertEqual(json.loads(body["citations_json"]), body["citations"])
         self.assertIn("manual:p8", {c["citation_id"] for c in body["citations"]})
