@@ -16,7 +16,7 @@ or refusal results; technical errors cannot be converted to successful absence.
 """
 from __future__ import annotations
 
-from copy import deepcopy
+from ..evidence.copying import deepcopy
 from dataclasses import dataclass, replace
 from typing import Any, Callable
 

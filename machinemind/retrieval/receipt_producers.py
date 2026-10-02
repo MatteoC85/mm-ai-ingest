@@ -17,46 +17,7 @@ still need producers before main enables canonical ASK. This is not full intake.
 """
 from __future__ import annotations
 
-from copy import deepcopy as _generic_deepcopy, _keep_alive as _copy_keep_alive
-
-def deepcopy(value, memo=None):
-    """Detached copy with the same alias semantics for bounded legacy JSON.
-
-    Exact built-in scalars need no dispatcher lookup. Unknown classes retain
-    copy.deepcopy (including their hooks); no new type is admitted by this helper.
-    """
-    if memo is not None and type(memo) is not dict:
-        return _generic_deepcopy(value, memo)
-    typ = type(value)
-    if value is None or typ in (str, bool, int, float, bytes):
-        if memo is not None and id(value) in memo:
-            return _generic_deepcopy(value, memo)
-        return value
-    if memo is None:
-        memo = {}
-    if id(value) in memo:
-        return memo[id(value)]
-    if typ is dict:
-        out = {}
-        memo[id(value)] = out
-        for key, item in value.items():
-            out[deepcopy(key, memo)] = deepcopy(item, memo)
-        _copy_keep_alive(value, memo)
-        return out
-    if typ is list:
-        if value and all(type(x) is float for x in value):
-            out = value.copy()
-            memo[id(value)] = out
-            _copy_keep_alive(value, memo)
-            return out
-        out = []
-        memo[id(value)] = out
-        out.extend(deepcopy(item, memo) for item in value)
-        _copy_keep_alive(value, memo)
-        return out
-    return _generic_deepcopy(value, memo)
-
-
+from ..evidence.copying import deepcopy
 from dataclasses import replace
 from math import isfinite
 from typing import Any, Callable
@@ -460,7 +421,7 @@ class _PreparationTrace:
                                         _LegacyWitness.capture(item.record, self.limits.legacy)), evidence)
         return evidence
 
-    def add(self, record, parents, *, context=None, copy_entry=None):
+    def add(self, record, parents, *, context=None, copy_entry=None, root_copy=False):
         self.check()
         if type(record) is not dict or type(parents) is not tuple or not parents:
             raise EvidenceProductionError("explicit preparation record and origins required")
@@ -474,7 +435,14 @@ class _PreparationTrace:
         # witness. Identity comes from this trace's registered occurrence, never
         # an ID/text match. Compare ALL mutable fields again before reusing it.
         # The existing per-occurrence allocation charge is deliberately retained.
-        if copy_entry is not None:
+        if root_copy:
+            if copy_entry is not None or len(parents) != 1:
+                raise EvidenceProductionError("one explicit materialized parent required")
+            parent = self.roots[parents[0]].record
+            if type(parent) is not _LegacyWitness or not parent.matches(record):
+                raise EvidenceProductionError("materialized copy differs from its immutable parent")
+            witness = parent
+        elif copy_entry is not None:
             if (self.entry(copy_entry[0]) is not copy_entry or parents != copy_entry[2]
                     or not _same_value(record, copy_entry[1])):
                 raise EvidenceProductionError("copy differs from its registered occurrence")
@@ -499,6 +467,11 @@ class _PreparationTrace:
             # Only pure adaptation is reused. Current authorization and every
             # parent/locator check below still execute at their original sites.
             evidence = cached[3]
+        elif root_copy and ctx == contexts[0].context:
+            # The checked copy contains every parent field, including scores and
+            # unconsumed metadata. Reuse only its pure conversion; all locator,
+            # occurrence and allocation checks below remain in force.
+            evidence = self._parent_evidence(parents[0])
         else:
             evidence = adapt_candidate(record, context=ctx, limits=self.limits.adapter).entry.evidence
         parent_evidence = tuple(self._parent_evidence(h) for h in parents)
@@ -541,7 +514,7 @@ class _PreparationTrace:
             parent = _LegacyWitness.capture(item.record, self.limits.legacy)
             self.roots[h] = replace(item, record=parent)
             value = deepcopy(item.record)
-            self.add(value, (h,), context=item.context)
+            self.add(value, (h,), context=item.context, root_copy=True)
             out.append(value)
         return out
 

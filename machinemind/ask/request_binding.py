@@ -16,7 +16,7 @@ separate integration gates. No transport or new retrieval/model call lives here.
 """
 from __future__ import annotations
 
-from copy import deepcopy
+from ..evidence.copying import deepcopy
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 

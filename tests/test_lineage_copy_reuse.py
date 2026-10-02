@@ -50,6 +50,51 @@ def copy_once(trace, source, *, reuse):
 
 
 class LineageCopyReuseTests(unittest.TestCase):
+    def test_materialization_captures_once_and_reuses_exact_parent_witness(self):
+        with patch.object(_LegacyWitness, 'capture', wraps=_LegacyWitness.capture) as capture, \
+             patch.object(production, 'adapt_candidate', wraps=production.adapt_candidate) as adapt, \
+             patch.object(production, '_check_derived_locator', wraps=production._check_derived_locator) as locator:
+            trace, records = fixture(3, vector_size=4)
+        self.assertEqual(capture.call_count, 3)
+        self.assertEqual(adapt.call_count, 3)
+        self.assertEqual(locator.call_count, 3)
+        for record in records:
+            entry = trace.entry(record)
+            self.assertIs(entry[1], trace.roots[entry[2][0]].record)
+        self.assertEqual(trace._witness_budget.logical_bytes,
+                         sum(trace.entry(row)[1].size_bytes for row in records))
+
+    def test_root_copy_cannot_change_any_parent_field_or_origin(self):
+        for field, value in (('embedding', [9.0]*4), ('chunk_full', 'unsafe injected'),
+                             ('page_from', 90), ('similarity', True)):
+            with self.subTest(field=field):
+                trace, rows = fixture(vector_size=4)
+                entry = trace.entry(rows[0])
+                changed = production.deepcopy(rows[0])
+                changed[field] = value
+                with self.assertRaisesRegex(production.EvidenceProductionError, 'immutable parent'):
+                    trace.add(changed, entry[2], root_copy=True)
+        trace, rows = fixture(vector_size=4)
+        entry = trace.entry(rows[0])
+        with self.assertRaisesRegex(production.EvidenceProductionError, 'one explicit'):
+            trace.add(dict(rows[0]), entry[2]*2, root_copy=True)
+        rows[0]['embedding'][2] = 7.0
+        with self.assertRaises(production.EvidenceProductionError):
+            trace.entry(rows[0])
+
+    def test_root_copy_preserves_bounds_and_changed_context_conversion(self):
+        trace, rows = fixture(vector_size=4)
+        entry = trace.entry(rows[0])
+        trace.max_bytes = trace.bytes
+        with self.assertRaisesRegex(production.EvidenceProductionError, 'byte limit'):
+            trace.add(dict(rows[0]), entry[2], root_copy=True)
+        trace.max_bytes = 128_000_000
+        context = replace(trace.roots[entry[2][0]].context,
+                          provenance=Provenance('another-provider', 'another-reference'))
+        with patch.object(production, 'adapt_candidate', wraps=production.adapt_candidate) as adapt:
+            trace.add(dict(rows[0]), entry[2], context=context, root_copy=True)
+        self.assertEqual(adapt.call_count, 1)
+
     def test_real_outer_copy_event_keeps_same_origins_and_detects_later_change(self):
         base, records = fixture(vector_size=4)
         # Exercise the exact event method; authority/session collaborators are
