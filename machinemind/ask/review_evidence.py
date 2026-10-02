@@ -59,6 +59,8 @@ class ReviewEvidencePacket:
             "source_sha256": hashlib.sha256(self.sources.encode("utf-8")).hexdigest(),
             "source_characters": len(self.sources),
             "required_records": self.required_count,
+            "required_citation_ids": [str(row["citation_id"]) for row in self.rows[:self.required_count]],
+            "emitted_citation_ids": [str(row["citation_id"]) for row in self.rows],
             "emitted_required_records": self.required_count,
             "available_occurrences": self.available_count,
             "unique_citation_views": self.unique_count,

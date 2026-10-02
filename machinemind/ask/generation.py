@@ -410,6 +410,7 @@ class GenericGenerationEvidence:
         self.selected, self.rendered = (), ()
         self.input_handles = ()
         self.provider_handles = None
+        self.generation_packet = None
         self.retrieval = self.retrieval_snapshot = None
         self.sources = ResidualSourceAdapters(request=request, session=session,
             readers=readers, authorize=authorize, invoke=self.invoke)
@@ -484,8 +485,10 @@ class GenericGenerationEvidence:
                 max_records, max_chars = complete_limits(rows, render=self.runtime._v13_sources_block,
                     max_records=len(rows), max_context_chars=parameters["max_context_chars"],
                     max_bytes=bounds.legacy.max_bytes)
-                result = compile_packet(primary=rows, extension=[], render=self.runtime._v13_sources_block,
-                    max_records=max_records, max_context_chars=max_chars).sources
+                packet = compile_packet(primary=rows, extension=[], render=self.runtime._v13_sources_block,
+                    max_records=max_records, max_context_chars=max_chars)
+                self.generation_packet = packet.diagnostic(reused=False)
+                result = packet.sources
             else:
                 result = self.runtime._v13_sources_block(rows, **parameters)
             self.handles(rows)
@@ -655,6 +658,8 @@ class GenericGenerationEvidence:
                 self.session.admission(request=self.request,
                     retrieval={"citations":result.get("citations",[])}, selections=selection,
                     current_allowed_sources=self.current())
+                if self.generation_packet is not None:
+                    result.setdefault("meta", {})["generation_evidence"] = dict(self.generation_packet)
                 return result, selection
             return self.invoke(work, self.request)
         finally:
@@ -662,4 +667,5 @@ class GenericGenerationEvidence:
             self.refs.clear(); self.link_refs.clear()
             self.input_handles = self.selected = self.rendered = ()
             self.provider_handles = None
+            self.generation_packet = None
             self.retrieval = self.retrieval_snapshot = None

@@ -83,6 +83,35 @@ class TaskSynthesisRuntime:
     roles: families.V12MarkStructuredRolesRuntime
     copy_fn: Any = None
     preserve_complete: bool = False
+    _procedure_ui_sections: Any = None
+    _v12_query_range_anchors: Any = None
+
+
+def admitted_segment_anchors(complete_steps, seed_citations, *, runtime):
+    """Select anchors inside the proven family from the original admitted seeds.
+
+    IDs match selection membership only: every returned record was already read
+    and admitted by the family owner. Newly fetched family siblings cannot seed
+    their own relevance. Safety setup is restored separately, never an endpoint
+    that pulls unrelated preceding operations into a segment.
+    """
+    seed_keys = {str(row.get("bubble_document_id") or "").strip()
+                 for row in seed_citations if runtime._v12_evidence_role(row) == "step"}
+    anchors = []
+    for step in complete_steps:
+        key = str(step.get("bubble_document_id") or "").strip()
+        if not key or key not in seed_keys:
+            continue
+        fields = runtime._procedure_ui_fields(step)
+        sections = (runtime._procedure_ui_sections(fields.get("description") or "")
+                    if runtime._procedure_ui_sections is not None else {})
+        # A warning in SAFETY NOTE does not make the operational action a safety
+        # prerequisite. Use the existing section parser, not new domain vocabulary.
+        action = str(sections.get("instruction") or sections.get("body") or "")
+        if runtime._procedure_ui_is_safety_setup(str(fields.get("title") or "") + " " + action):
+            continue
+        anchors.append(str(step.get("citation_id") or key))
+    return anchors
 
 def structured_ask(
     *,
@@ -228,6 +257,20 @@ def structured_ask(
                 q=q,
                 planner=planner,
             )
+            if (not selected_steps and runtime.preserve_complete
+                    and runtime._v12_query_range_anchors is not None
+                    and runtime._v12_query_range_anchors(q) == ("", "")):
+                # Colloquial/multilingual questions can have zero literal overlap
+                # with a correctly retrieved family. Retain the already-admitted
+                # semantic anchors and let the existing contiguous-span/closure
+                # policy fill intervening Steps; do not revert to sparse synthesis.
+                # An unresolved explicit start/end remains unresolved: seed
+                # relevance cannot substitute the user's requested boundaries.
+                anchors = admitted_segment_anchors(complete_steps, seed_citations or [], runtime=runtime)
+                if anchors:
+                    selected_steps = _v12_select_response_steps(
+                        all_steps=complete_steps, selected_step_ids=anchors,
+                        model_used_citations=[], q=q, planner=planner)
         if not selected_steps:
             return None
 
@@ -477,6 +520,13 @@ def structured_ask(
                 "expanded_step_numbers": expanded_step_numbers,
                 "selected_step_numbers": selected_step_numbers,
             }
+        }
+    if runtime.preserve_complete:
+        resp["meta"]["procedure_source_selection"] = {
+            "version": "admitted-procedure-segment-v1",
+            "seed_citation_ids": [str(c.get("citation_id") or "") for c in seed_citations or []],
+            "selected_step_numbers": selected_step_numbers,
+            "generation_citation_ids": [str(c.get("citation_id") or "") for c in all_evidence],
         }
     return _finalize_ask_response_for_ui(resp, language=response_language)
 
