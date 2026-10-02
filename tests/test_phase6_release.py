@@ -113,12 +113,22 @@ class FakeCloud:
 
 
 class ReleaseTests(unittest.TestCase):
-    def execute(self, cloud):
+    def execute(self, cloud, *, operation='deploy'):
         with patch.object(guard, 'gcloud', side_effect=cloud.gcloud), \
              patch.object(guard, 'health', side_effect=cloud.health), \
              contextlib.redirect_stdout(io.StringIO()):
-            return guard.execute(guard.PROJECT, COMMIT, BUILD, 'deploy', PRIOR_COMMIT,
+            return guard.execute(guard.PROJECT, COMMIT, BUILD, operation, PRIOR_COMMIT,
                                  usage_required=True)
+
+    def test_stage_preserves_legacy_usage_health_without_promoting(self):
+        cloud = FakeCloud()
+        result = self.execute(cloud, operation='stage')
+        self.assertEqual(result['status'], 'PASS_REQUIRED_STAGED')
+        self.assertEqual(cloud.events, ['stage', 'health'])
+        self.assertTrue(result['usage_native_health_verified'])
+        self.assertFalse(cloud.promoted)
+        self.assertFalse(any(args[:3] == ('run', 'services', 'update-traffic')
+                             for args in cloud.commands))
 
     def test_required_deploy_checks_health_before_exact_promotion(self):
         cloud = FakeCloud()
@@ -360,6 +370,70 @@ class QualityReleaseTests(unittest.TestCase):
         with patch.object(guard, 'gcloud', side_effect=AssertionError('Must fail before I/O')):
             with self.assertRaisesRegex(guard.GuardError, '^PREFLIGHT_REQUIRES_ACTIVE_PRESERVATION$'):
                 guard.execute(guard.PROJECT, COMMIT, BUILD, 'preflight', QualityCloud.SHA)
+
+    def test_stage_returns_verified_candidate_and_previous_identity_at_zero_traffic(self):
+        class CurrentQualityCloud(QualityCloud):
+            BASE = guard.SERVICE + '-current-verified'
+            SHA = '3' * 40
+            BASE_DIGEST = 'sha256:' + 'c' * 64
+
+        for cloud in (QualityCloud(), CurrentQualityCloud(dirty=False)):
+            with self.subTest(previous_revision=cloud.BASE):
+                result = self.execute(cloud, expected=cloud.SHA, operation='stage')
+                self.assertEqual(result['status'], 'PASS_REQUIRED_STAGED')
+                self.assertEqual(result['revision'], CANDIDATE)
+                self.assertEqual(result['runtime_commit_sha'], COMMIT)
+                self.assertEqual(result['image_digest'], DIGEST)
+                self.assertEqual(result['candidate_url'], 'https://candidate.example.run.app')
+                self.assertEqual(result['candidate_traffic_percent'], 0)
+                self.assertEqual(result['previous_revision'], cloud.BASE)
+                self.assertEqual(result['previous_runtime_commit_sha'], cloud.SHA)
+                self.assertEqual(result['previous_image_digest'], cloud.BASE_DIGEST)
+                self.assertEqual(result['previous_traffic_percent'], 100)
+                self.assertTrue(result['active_configuration_preserved'])
+                self.assertTrue(result['candidate_health_verified'])
+                self.assertFalse(result['promoted'])
+                self.assertEqual(cloud.traffic_revision, cloud.BASE)
+                self.assertEqual(cloud.events, ['stage', 'health'])
+                self.assertEqual(guard.PHASE, 'candidate_ready_no_traffic')
+                self.assertFalse(any(args[:3] == ('run', 'services', 'update-traffic')
+                                     for args in cloud.commands))
+
+    def test_stage_rechecks_candidate_tag_after_health_without_promoting(self):
+        for fault in ('missing', 'other_revision', 'other_url', 'duplicate'):
+            with self.subTest(fault=fault):
+                class ChangedTagCloud(QualityCloud):
+                    def service(self):
+                        obj = super().service()
+                        if self.staged and 'health' in self.events:
+                            tags = obj['status']['traffic']
+                            if fault == 'missing':
+                                tags.pop()
+                            elif fault == 'other_revision':
+                                tags[-1]['revisionName'] = self.BASE
+                            elif fault == 'other_url':
+                                tags[-1]['url'] = 'https://other.example.run.app'
+                            else:
+                                tags.append(dict(tags[-1]))
+                        return obj
+
+                cloud = ChangedTagCloud(dirty=False)
+                with self.assertRaisesRegex(guard.GuardError, '^CANDIDATE_TAG_CHANGED$'):
+                    self.execute(cloud, operation='stage')
+                self.assertEqual(cloud.events, ['stage', 'health'])
+                self.assertFalse(any(args[:3] == ('run', 'services', 'update-traffic')
+                                     for args in cloud.commands))
+
+    def test_stage_validation_faults_fail_without_promoting(self):
+        for fault in ('deploy', 'traffic', 'config', 'annotations', 'revision_annotations',
+                      'revision_ingress', 'service_ingress', 'not_ready', 'concurrent_revision',
+                      'usage_reintroduced', 'late_usage', 'health'):
+            with self.subTest(fault=fault):
+                cloud = QualityCloud(fault)
+                with self.assertRaises(guard.GuardError):
+                    self.execute(cloud, operation='stage')
+                self.assertFalse(any(args[:3] == ('run', 'services', 'update-traffic')
+                                     for args in cloud.commands))
 
     def test_failed_latest_is_restored_from_ready_active_without_usage_migration(self):
         cloud = QualityCloud()

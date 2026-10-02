@@ -1,6 +1,7 @@
 """Quality deployment through the GitHub-triggered Cloud Build.
 
-Read-only preflight -> new image -> no traffic -> config/health -> exact promotion.
+Read-only preflight -> new image -> no traffic -> config/health. Stage stops here;
+the legacy deploy operation continues to exact promotion.
 Preserve the verified active configuration and ASK authority. No provider, secret
 retrieval or schema writes. Never invoke manually in Cloud Shell. Import is inert.
 """
@@ -384,10 +385,10 @@ def execute(project, commit, build, operation, expected_current, *, usage_requir
             'EXPECTED_CURRENT_SHA_INVALID')
     require(type(build) is str and re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', build),
             'BUILD_ID_INVALID')
-    require(operation in {'preflight', 'deploy', 'rollback'}, 'OPERATION_INVALID')
+    require(operation in {'preflight', 'stage', 'deploy', 'rollback'}, 'OPERATION_INVALID')
     require(operation != 'preflight' or preserve_active, 'PREFLIGHT_REQUIRES_ACTIVE_PRESERVATION')
     require(not (preserve_active and usage_required), 'QUALITY_USAGE_MIGRATION_FORBIDDEN')
-    require(not usage_required or operation=='deploy', 'LEGACY_ROLLBACK_REQUIRES_MAINTENANCE')
+    require(not usage_required or operation in {'stage', 'deploy'}, 'LEGACY_ROLLBACK_REQUIRES_MAINTENANCE')
     if preserve_active:
         expected_current_identity(expected_current, expected_current_revision, expected_current_digest)
     phase('validate_current_required')
@@ -491,6 +492,27 @@ def execute(project, commit, build, operation, expected_current, *, usage_requir
             'CONCURRENT_CHANGE_BEFORE_PROMOTION')
     require(routing_configuration(latest) == routing_before, 'UNRELATED_ANNOTATIONS_CHANGED')
     validate_candidate(validation_spec, latest, resource('revisions', name), name, commit, digest, usage_required, **validation_options)
+    if operation == 'stage':
+        # Health can take time: report a usable candidate only if its verified
+        # URL still routes to that exact revision after the final state checks.
+        final_tags = [r for r in latest.get('status', {}).get('traffic', [])
+                      if r.get('tag') == 'p6-candidate']
+        require(len(final_tags) == 1 and final_tags[0].get('revisionName') == name
+                and final_tags[0].get('url') == tags[0].get('url')
+                and final_tags[0].get('percent', 0) == 0, 'CANDIDATE_TAG_CHANGED')
+        final_traffic = traffic(latest, 'status')
+        phase('candidate_ready_no_traffic')
+        return {'status': 'PASS_REQUIRED_STAGED', 'revision': name,
+                'runtime_commit_sha': commit, 'image_digest': digest,
+                'candidate_url': final_tags[0]['url'],
+                'candidate_traffic_percent': final_traffic.get(name, 0),
+                'previous_revision': prior, 'previous_runtime_commit_sha': expected_current,
+                'previous_image_digest': image_digest(prior_revision),
+                'previous_traffic_percent': final_traffic[prior],
+                'authority_mode': 'required', 'new_revision': True, 'promoted': False,
+                'candidate_health_verified': True, 'unrelated_spec_preserved': True,
+                'usage_required': usage_required, 'usage_native_health_verified': usage_required,
+                'active_configuration_preserved': preserve_active}
     phase('promote_exact_revision')
     gcloud('run', 'services', 'update-traffic', SERVICE, '--project=' + PROJECT,
            '--region=' + REGION, '--to-revisions=' + name + '=100', '--quiet')
