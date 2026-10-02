@@ -994,7 +994,7 @@ class SmartReviewEndpointTests(unittest.TestCase):
     def test_initial_no_citations_is_explicit_failure_without_provider(self):
         def run(request):
             decision = SimpleNamespace(effective_mode=self.m.MODE_SMART_DIAGNOSTIC, confidence=0,
-                                       relevant_evidence_ids=[], evidence_state='unsupported')
+                                       relevant_evidence_ids=[], evidence_state='unsupported', degraded=False)
             response = self.m._assistant_core_synthesize_smart_start(request, {'citations': []}, decision)
             response['effective_mode'] = self.m.MODE_SMART_DIAGNOSTIC
             return response

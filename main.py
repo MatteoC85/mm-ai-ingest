@@ -193,6 +193,7 @@ from machinemind.retrieval import review_references as _retrieval_review_referen
 from machinemind.retrieval import smart_review as _smart_review
 from machinemind.retrieval import smart_evidence as _smart_evidence
 from machinemind.retrieval import smart_context as _smart_context
+from machinemind.retrieval import smart_routing as _smart_routing
 
 
 _PRECISION_FACT_RUNTIME = lambda: _retrieval_precision_facts.PrecisionFactRuntime(
@@ -13807,6 +13808,12 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
     router_models = _dedup_text_values(
         [ASSISTANT_CORE_ROUTER_MODEL, ASSISTANT_CORE_ROUTER_FALLBACK_MODEL], limit=2,
     )
+    router_effort = _ask_routing_runtime.router_effort(request.requested_mode, ASSISTANT_CORE_ROUTER_EFFORT)
+    if request.requested_mode == MODE_SMART_DIAGNOSTIC:
+        smart_plan = _smart_routing.attempt_plan(ASSISTANT_CORE_ROUTER_MODEL,
+            effort_override=os.environ.get(_smart_routing.EFFORT_ENV))
+        router_models = smart_plan["models"]
+        router_effort = smart_plan["effort"]
     router_timeout = ASSISTANT_CORE_ROUTER_TIMEOUT_SECONDS
     router_execution = None
     if is_root_cause:
@@ -13832,7 +13839,7 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
                     if request.requested_mode == MODE_ASK else build_router_schema(allowed_modes)
                 )
             ),
-            effort=_ask_routing_runtime.router_effort(request.requested_mode, ASSISTANT_CORE_ROUTER_EFFORT),
+            effort=router_effort,
             reasoning_mode="",
             timeout=router_timeout,
             max_output_tokens=ASSISTANT_CORE_ROUTER_MAX_OUTPUT_TOKENS,
@@ -13859,6 +13866,12 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
         out = _assistant_core_relax_diagnostic_router_contract(out, request)
         out["router_model"] = model_used
     except Exception as exc:
+        if request.requested_mode == MODE_SMART_DIAGNOSTIC:
+            if isinstance(request.metadata, dict):
+                request.metadata["smart_router_error_class"] = _sd_diagnostic_error_class(type(exc).__name__)
+            # Core's existing degraded branch stops before evidence admission.
+            # Do not reinterpret nearby retrieved text after routing failed.
+            raise _smart_routing.SmartRouterUnavailable() from None
         if router_execution is not None:
             router_execution.update(
                 outcome=("processing_error" if router_execution["provider_response_received"] else "provider_error"),
@@ -18462,7 +18475,6 @@ def _assistant_core_sd_json_models(
     if not (budget is not None and isinstance(json_schema, dict)):
         raise RuntimeError("Smart generation requires its request budget and schema")
     phase_key = str(phase or "answer").strip().lower()
-    timeout_cap = 40 if phase_key == "start" else 36 if phase_key == "finalize" else 38
     review_reserve = _smart_review.MAX_REVIEW_SECONDS + _smart_review.FINALIZATION_RESERVE_SECONDS
     remaining = budget.remaining()
     if remaining < review_reserve + 7.0:
@@ -18472,11 +18484,49 @@ def _assistant_core_sd_json_models(
     parsed, _model_used = _v13_json_models(
         messages, models=[ASSISTANT_CORE_SMART_MODEL], json_schema=json_schema,
         effort=ASSISTANT_CORE_SMART_EFFORT, reasoning_mode="",
-        timeout=min(int(timeout or 60), timeout_cap, int(remaining - review_reserve)),
+        timeout=min(int(timeout or 60), int(remaining - review_reserve)),
         max_output_tokens=ASSISTANT_CORE_SMART_MAX_OUTPUT_TOKENS,
         company_id=str(getattr(budget, "company_id", "") or "smart_diagnostic"),
         purpose=f"{str(json_schema.get('name') or 'smart_diagnostic_reasoning')}:{phase_key}")
     return parsed
+
+
+def _sd_diagnostic_number(value):
+    return round(float(value), 8) if type(value) in (int, float) and math.isfinite(value) and 0 <= value <= 1e9 else None
+
+
+def _sd_diagnostic_error_class(value) -> str:
+    allowed = {"ReadTimeout", "ConnectTimeout", "Timeout", "TimeoutError", "ConnectionError", "JSONDecodeError",
+               "RuntimeError", "ValueError", "TypeError", "KeyError", "NameError", "AttributeError", "HTTPError"}
+    return value if isinstance(value, str) and value in allowed else "unknown"
+
+
+def _sd_provider_call_diagnostics(budget) -> list[dict]:
+    """Fixed stage/class/numeric fields only; never echo errors or provider bodies."""
+    purposes = {"assistant_core_v2_semantic_router", "smart_diagnostic_independent_review",
+                "smart_diagnostic_step_v1:start", "smart_diagnostic_step_v1:answer",
+                "smart_diagnostic_step_v1:finalize", "smart_diagnostic_finalize_v1:finalize"}
+    models = {"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"}
+    states = {"pending", "uncertain", "not_sent", "settled"}
+    rows = []
+    for row in list(getattr(budget, "call_log", []) or [])[:6]:
+        if not isinstance(row, dict):
+            continue
+        safe = {}
+        for key, allowed in (("purpose", purposes), ("model", models), ("accounting_state", states)):
+            value = row.get(key)
+            safe[key] = value if isinstance(value, str) and value in allowed else "unknown"
+        safe["dispatched"] = row.get("dispatched") if type(row.get("dispatched")) is bool else None
+        for key in ("call", "reserved_cost_usd", "estimated_cost_usd", "timeout_seconds", "max_output_tokens"):
+            safe[key] = _sd_diagnostic_number(row.get(key))
+        safe["error_class"] = _sd_diagnostic_error_class(row.get("error"))
+        safe["status"] = ("failed" if row.get("failed") is True else "returned" if
+                          safe["accounting_state"] == "settled" else safe["accounting_state"])
+        start = _sd_diagnostic_number(row.get("started_at_elapsed_seconds"))
+        finish = _sd_diagnostic_number(row.get("completed_at_elapsed_seconds"))
+        safe["elapsed_seconds"] = _sd_diagnostic_number(finish - start) if start is not None and finish is not None else None
+        rows.append(safe)
+    return rows
 
 
 def _sd_budget_guard_diagnostic(exc: Exception, budget) -> dict:
@@ -18494,33 +18544,31 @@ def _sd_budget_guard_diagnostic(exc: Exception, budget) -> dict:
         category = "cost_limit"
     else:
         category = "budget_guard"
-
-    def number(value):
-        return round(float(value), 8) if type(value) in (int, float) and math.isfinite(value) and 0 <= value <= 1e9 else None
-
-    purposes = {"assistant_core_v2_semantic_router", "smart_diagnostic_independent_review",
-                "smart_diagnostic_step_v1:start", "smart_diagnostic_step_v1:answer",
-                "smart_diagnostic_step_v1:finalize"}
-    models = {"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"}
-    states = {"pending", "uncertain", "not_sent", "settled"}
-    rows = []
-    for row in list(getattr(budget, "call_log", []) or [])[:6]:
-        if not isinstance(row, dict):
-            continue
-        safe = {}
-        for key, allowed in (("purpose", purposes), ("model", models), ("accounting_state", states)):
-            value = row.get(key)
-            safe[key] = value if isinstance(value, str) and value in allowed else "unknown"
-        safe["dispatched"] = row.get("dispatched") if type(row.get("dispatched")) is bool else None
-        for key in ("call", "reserved_cost_usd", "estimated_cost_usd", "timeout_seconds", "max_output_tokens"):
-            safe[key] = number(row.get(key))
-        rows.append(safe)
     return {"version": "smart-budget-guard-diagnostic-v1", "category": category,
-            "calls": rows, "elapsed_seconds": number(budget.elapsed()),
-            "remaining_seconds": number(budget.remaining()),
-            "max_estimated_cost_usd": number(budget.max_estimated_cost_usd),
-            "committed_cost_usd": number(budget.committed_cost_usd),
-            "remaining_cost_usd": number(budget.remaining_cost_usd)}
+            "calls": _sd_provider_call_diagnostics(budget), "elapsed_seconds": _sd_diagnostic_number(budget.elapsed()),
+            "remaining_seconds": _sd_diagnostic_number(budget.remaining()),
+            "max_estimated_cost_usd": _sd_diagnostic_number(budget.max_estimated_cost_usd),
+            "committed_cost_usd": _sd_diagnostic_number(budget.committed_cost_usd),
+            "remaining_cost_usd": _sd_diagnostic_number(budget.remaining_cost_usd)}
+
+
+def _sd_generation_failure_diagnostic(*, budget, phase: str, error_class) -> dict:
+    phase = phase if isinstance(phase, str) and phase in {"start", "answer", "finalize", "router"} else "unknown"
+    calls = _sd_provider_call_diagnostics(budget)
+    expected = ({"assistant_core_v2_semantic_router"} if phase == "router" else
+                {f"smart_diagnostic_step_v1:{phase}", f"smart_diagnostic_finalize_v1:{phase}"})
+    row = next((r for r in reversed(calls) if r["purpose"] in expected), None)
+    # The transport records the original typed failure before json_models wraps
+    # it. A router failure is never attributed to the later generation stage.
+    failure = row["error_class"] if row and row["error_class"] != "unknown" else _sd_diagnostic_error_class(error_class)
+    category = ("timeout" if failure in {"ReadTimeout", "ConnectTimeout", "Timeout", "TimeoutError"} else
+                "connection" if failure == "ConnectionError" else
+                "response_format" if failure == "JSONDecodeError" else
+                ("router_contract" if phase == "router" else "generation_contract") if failure in {"ValueError", "TypeError", "KeyError", "NameError", "AttributeError"} else
+                "provider_or_contract" if failure in {"RuntimeError", "HTTPError"} else "unclassified")
+    return {"version": "smart-stage-failure-v1", "stage": phase, "category": category,
+            "error_class": failure, ("router_attempt_recorded" if phase == "router" else "generation_attempt_recorded"): row is not None,
+            "attempt_limit": 1, "calls": calls}
 
 
 
@@ -19889,6 +19937,38 @@ def _sd_review_error_response(exc: HTTPException, language: str) -> Optional[dic
     return response
 
 
+def _sd_error_response(exc: HTTPException, language: str, *, budget, phase: str) -> Optional[dict]:
+    """Keep generation failures on the same request ledger through publication."""
+    detail = exc.detail if isinstance(exc.detail, dict) else {}
+    code = detail.get("code")
+    if code not in ("SMART_DIAGNOSTIC_GENERATION_FAILED", "SMART_DIAGNOSTIC_FINALIZE_FAILED", _smart_routing.FAILURE_CODE):
+        return _sd_review_error_response(exc, language)
+    router_failed = code == _smart_routing.FAILURE_CODE
+    message = ("The diagnostic response could not be generated; no unverified result is returned."
+               if language == "en" else "Non è stato possibile generare la risposta diagnostica; nessun risultato non verificato viene restituito.")
+    if router_failed:
+        message = ("The diagnostic request could not be interpreted; no unverified result is returned."
+                   if language == "en" else "Non è stato possibile interpretare la richiesta diagnostica; nessun risultato non verificato viene restituito.")
+    response = {"ok": False, "status": "error", "result_code": RESULT_TECHNICAL_ERROR,
+                "error_code": code, "error_message": message, "operator_summary": message,
+                "final_ready": False, "language": language, "question": _sd_empty_question(0),
+                "hypotheses": [], "citations": [], "rg_links": [], "session_state_json": "",
+                "detail": {"code": code},
+                "meta": {"cacheable": False, "semantic_cacheable": False,
+                    ("smart_router" if router_failed else "smart_generation"): _sd_generation_failure_diagnostic(budget=budget, phase="router" if router_failed else phase,
+                        error_class=detail.get("generation_error_class"))}}
+    _sd_flatten_question(response, response["question"])
+    _sd_flatten_hypotheses(response, [])
+    _sd_flatten_citations(response, [], [])
+    return response
+
+
+def _sd_error_stage(response: dict) -> str:
+    code = response.get("error_code")
+    return ("router" if code == _smart_routing.FAILURE_CODE else "generation" if code in
+            ("SMART_DIAGNOSTIC_GENERATION_FAILED", "SMART_DIAGNOSTIC_FINALIZE_FAILED") else "review")
+
+
 def _sd_compact_evidence_for_state(citations: list[dict], *, max_items: int, preserve_evidence_ids: bool = False) -> list[dict]:
     citations = _sd_prepare_citations_for_response(citations, max_items=max_items, preserve_evidence_ids=preserve_evidence_ids)
     out: list[dict] = []
@@ -20821,7 +20901,8 @@ def _sd_llm_step_start(
         raise
     except Exception as e:
         print("SMART_DIAGNOSTIC_START_LLM_FAIL")
-        raise HTTPException(status_code=502, detail={"code": "SMART_DIAGNOSTIC_GENERATION_FAILED", "message": "Smart Diagnostic could not generate an evidence-grounded first step."})
+        raise HTTPException(status_code=502, detail={"code": "SMART_DIAGNOSTIC_GENERATION_FAILED",
+            "generation_error_class": _sd_diagnostic_error_class(type(e).__name__)}) from None
 
 
 def _sd_llm_step_answer(*, state: dict, answer: dict, language: str, max_hypotheses: int) -> dict:
@@ -20885,7 +20966,8 @@ def _sd_llm_step_answer(*, state: dict, answer: dict, language: str, max_hypothe
         raise
     except Exception as e:
         print("SMART_DIAGNOSTIC_ANSWER_LLM_FAIL")
-        raise HTTPException(status_code=502, detail={"code": "SMART_DIAGNOSTIC_GENERATION_FAILED", "message": "Smart Diagnostic could not update the evidence-grounded session."})
+        raise HTTPException(status_code=502, detail={"code": "SMART_DIAGNOSTIC_GENERATION_FAILED",
+            "generation_error_class": _sd_diagnostic_error_class(type(e).__name__)}) from None
 
 
 def _sd_llm_finalize(*, state: dict, language: str) -> dict:
@@ -20922,7 +21004,8 @@ def _sd_llm_finalize(*, state: dict, language: str) -> dict:
         raise
     except Exception as e:
         print("SMART_DIAGNOSTIC_FINALIZE_LLM_FAIL")
-        raise HTTPException(status_code=502, detail={"code": "SMART_DIAGNOSTIC_FINALIZE_FAILED", "message": "Smart Diagnostic could not finalize an evidence-grounded conclusion."})
+        raise HTTPException(status_code=502, detail={"code": "SMART_DIAGNOSTIC_FINALIZE_FAILED",
+            "generation_error_class": _sd_diagnostic_error_class(type(e).__name__)}) from None
 
 
 
@@ -21257,6 +21340,10 @@ def _assistant_core_smart_no_evidence(
     decision: AssistantCoreDecision,
     retrieval: dict,
 ) -> dict:
+    if request.requested_mode == MODE_SMART_DIAGNOSTIC and decision.degraded:
+        raise HTTPException(status_code=502, detail={"code": _smart_routing.FAILURE_CODE,
+            "generation_error_class": _sd_diagnostic_error_class(
+                (request.metadata or {}).get("smart_router_error_class"))}) from None
     if decision.effective_mode != MODE_SMART_DIAGNOSTIC:
         return _assistant_core_build_no_evidence(request, decision, retrieval)
     session_id = str(_assistant_core_scope_value(request, "session_id") or "")
@@ -21611,10 +21698,10 @@ def _assistant_core_smart_start_sync(
         budget.route = "assistant_core_smart_diagnostic"
         return _assistant_core_attach_runtime_meta(final, budget, debug=bool(payload.debug))
     except HTTPException as exc:
-        response = _sd_review_error_response(exc, language)
+        response = _sd_error_response(exc, language, budget=budget, phase="start")
         if response is None:
             raise
-        budget.route = "assistant_core_smart_review_error"
+        budget.route = f"assistant_core_smart_{_sd_error_stage(response)}_error"
         return _assistant_core_attach_runtime_meta(response, budget, debug=False)
     except _AuthorityError as exc:
         response = {**_application_authority.public_error(exc),
@@ -21857,10 +21944,10 @@ def _assistant_core_budgeted_sd_turn(turn_kind: str):
                     )
                 return result
             except HTTPException as exc:
-                response = _sd_review_error_response(exc, language)
+                response = _sd_error_response(exc, language, budget=budget, phase=turn_kind)
                 if response is None:
                     raise
-                budget.route = f"assistant_core_smart_{turn_kind}_review_error"
+                budget.route = f"assistant_core_smart_{turn_kind}_{_sd_error_stage(response)}_error"
                 return _assistant_core_attach_runtime_meta(response, budget, debug=False)
             except _AuthorityError as exc:
                 response = {**_application_authority.public_error(exc),
@@ -21932,9 +22019,10 @@ def smart_diagnostic_start_v1(
             try:
                 result = smart_diagnostic_start_v1(payload, x_ai_internal_secret)
             except HTTPException as exc:
-                result = _sd_review_error_response(exc, _sd_language(payload.language, payload.symptom_text))
+                result = _sd_error_response(exc, _sd_language(payload.language, payload.symptom_text), budget=budget, phase="start")
                 if result is None:
                     raise
+                budget.route = f"assistant_core_smart_start_{_sd_error_stage(result)}_error"
             return _assistant_core_attach_runtime_meta(result, budget, debug=bool(payload.debug))
         finally:
             _V13_BUDGET_CTX.reset(token)
