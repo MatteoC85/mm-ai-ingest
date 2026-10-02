@@ -813,6 +813,11 @@ def validate_response(
                 complete_review = bool(semantic_contract_pass
                     and required_facets.issubset(semantic_contract.get("covered_facets") or [])
                     and required_types.issubset(semantic_contract.get("covered_answer_types") or []))
+                boundary = semantic_contract.get("operation_boundary_validation") or {}
+                complete_review = bool(complete_review and boundary.get("complete") is True
+                    and boundary.get("version") == "ask-operation-boundary-v1"
+                    and boundary.get("answer_sha256") == _procedure_review.digest(
+                        str(semantic_contract.get("answer") or "").strip()))
                 if not complete_review:
                     answer_contract_result.update(passed=False, complete=False,
                         reason="manual_procedure_semantic_review_incomplete")

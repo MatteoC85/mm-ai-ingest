@@ -126,9 +126,14 @@ def generate_ask_response(
     overview_catalog_requested = bool(contract.get("overview_catalog_requested"))
     machine_catalog_digest = str(contract.get("machine_catalog_digest") or "").strip()
     candidates = list(retrieval.get("citations") or retrieval.get("candidates") or [])
-    evidence_limit = 24 if overview_catalog_requested else V13_MAX_EVIDENCE_ITEMS_ASK
-    candidates = candidates[:evidence_limit]
     information_task = str(contract.get("information_task") or INFO_OTHER).strip().lower()
+    complete_procedure_context = bool(runtime.preserve_procedure_points
+        and information_task in {INFO_PROCEDURE_FULL, INFO_PROCEDURE_SEGMENT})
+    evidence_limit = 24 if overview_catalog_requested else V13_MAX_EVIDENCE_ITEMS_ASK
+    # Preparation already bounds and admits this selection. A second display
+    # cap can discard the closing actions of an operation selected for its start.
+    if not complete_procedure_context:
+        candidates = candidates[:evidence_limit]
     required_answer_types = {
         str(x or "").strip().lower()
         for x in (contract.get("required_answer_types") or [])
@@ -197,6 +202,16 @@ def generate_ask_response(
         system_msg += " Include directly applicable authorization or safety conditions without replacing the requested technical answer."
     if runtime.preserve_procedure_points and information_task in {INFO_PROCEDURE_FULL, INFO_PROCEDURE_SEGMENT}:
         system_msg += " Each grounded_points.text contains action prose only; do not prefix it with a numbered list heading. The server numbers the ordered points."
+        system_msg += (
+            " A requested procedure segment must include the source-documented closure of every operation "
+            "you start: restore temporarily changed pressure, clamps, guards, modes, settings or guides, "
+            "and state any required final check before readiness. Read the continuation of each source "
+            "operation, even when router facets mention only its entry/path/safety. Do not stop at an "
+            "intermediate physical destination after instructing a temporary change. Include only closures "
+            "causally required by your selected operations, not unrelated preceding/following procedures. "
+            "Never invent a restoration or re-energization; if the documented terminal state is safe "
+            "isolation or an explicit hold, preserve it. Combine related prose as needed within the "
+            "existing point limit without dropping closing actions or precautions.")
     if overview_catalog_requested:
         system_msg += (
             " For a machine overview, MACHINE_CATALOG is the authoritative recall inventory. "
@@ -461,7 +476,18 @@ class GenericGenerationEvidence:
                    for item in self.records(handles)):
                 raise GenerationEvidenceError("canonical structured synthesis composition pending")
             self.provider_handles = handles
-            result = self.runtime._v13_sources_block(rows, **parameters)
+            task = str((self.retrieval.get("assistant_core_contract") or {}).get("information_task") or "")
+            if task in {self.runtime.INFO_PROCEDURE_FULL, self.runtime.INFO_PROCEDURE_SEGMENT}:
+                from .review_evidence import complete_limits, compile_packet
+                _, bounds = self.session.read_contract(request=self.request,
+                    current_allowed_sources=self.current())
+                max_records, max_chars = complete_limits(rows, render=self.runtime._v13_sources_block,
+                    max_records=len(rows), max_context_chars=parameters["max_context_chars"],
+                    max_bytes=bounds.legacy.max_bytes)
+                result = compile_packet(primary=rows, extension=[], render=self.runtime._v13_sources_block,
+                    max_records=max_records, max_context_chars=max_chars).sources
+            else:
+                result = self.runtime._v13_sources_block(rows, **parameters)
             self.handles(rows)
             if not isinstance(result, str):
                 raise GenerationEvidenceError("generation source block must be text")

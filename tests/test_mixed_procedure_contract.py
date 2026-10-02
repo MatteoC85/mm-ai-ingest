@@ -15,6 +15,7 @@ import socket
 import sys
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from machinemind.ask import execution, generation, procedure_review, validation
@@ -68,6 +69,11 @@ class MixedProcedureContractTests(unittest.TestCase):
             calls.append(kwargs)
             result = deepcopy(f["verdict"])
             result.update(outcome=outcome, answer=answer, citation_ids=[c["citation_id"] for c in rows])
+            # This suite fixes a reviewed semantic verdict; source-quote/order
+            # validation itself is exercised in test_operation_boundary.py.
+            result["operation_boundary_validation"] = {
+                "version": "ask-operation-boundary-v1", "complete": True,
+                "answer_sha256": procedure_review.digest(answer.strip())}
             if missing:
                 result["missing_facets"] = [missing]
             if omit_safety_coverage:
@@ -210,6 +216,63 @@ class MixedProcedureContractTests(unittest.TestCase):
         result = generation._procedure_point_bodies(points)
         self.assertEqual(result[0], points[0])
         self.assertEqual(result[1]["text"], "Isolate.\n4. Verify zero energy.")
+
+    def test_generic_procedure_keeps_prepared_closure_source_after_default_eight(self):
+        rows = [{"citation_id": f"offline:{i}", "source_type": "document", "bubble_document_id": "manual",
+                 "snippet": f"Operation {i}.", "chunk_full": f"Operation {i}."} for i in range(12)]
+        rows[-1]["chunk_full"] = "Restore the clamp after inserting the material."
+        calls = []
+        def provider(messages, **kw):
+            calls.append(messages)
+            return {"answer_status": "answered", "grounded_points": [
+                {"text": "Insert material, then restore the clamp.", "citation_ids": ["offline:11"]}]}, "offline-model"
+        runtime = replace(self.m._assistant_core_generation_runtime(),
+            V13_MAX_EVIDENCE_ITEMS_ASK=8, preserve_procedure_points=True,
+            _v13_choose_ask_model=lambda *a, **kw: ("offline-model", "low", ""),
+            _v13_json_models=provider, _sanitize_citations_for_response=lambda items, **kw: list(items),
+            _build_rg_links=lambda *a, **kw: [])
+        result = generation.generate_ask_response(q="Describe the procedure.", company_id="offline-company",
+            response_language="en", top_k=8, narrow_scope=True, debug=False,
+            retrieval={"citations": rows, "assistant_core_contract": {
+                "information_task": "procedure_segment", "fail_closed": True}}, runtime=runtime)
+        self.assertEqual(len(calls), 1)
+        self.assertIn(rows[-1]["chunk_full"], calls[0][1]["content"])
+        self.assertEqual(result["status"], "answered")
+        self.assertEqual(result["citations"][0]["citation_id"], "offline:11")
+
+    def test_existing_reviewer_repairs_closure_with_one_call_and_bound_audit(self):
+        m = self.m
+        draft = "1. Open the guide.\n2. Insert material."
+        closure = "Close the guide before feeding."
+        rows = [{"citation_id": "manual:one", "source_type": "document", "bubble_document_id": "manual",
+                 "chunk_full": draft + "\n" + closure}]
+        request = m.AssistantCoreRequest(query="Describe the operation.", requested_mode="ask",
+            response_language="en", company_id="offline-company", machine_id="offline-machine", ai_scope="machine_all", top_k=8)
+        decision = m.AssistantCoreDecision(request_kind=m.KIND_PROCEDURE, effective_mode="ask", confidence=.99,
+            requested_mode_fit=True, evidence_state=m.EVIDENCE_SUPPORTED, evidence_policy="evidence_required",
+            information_task="procedure_segment", required_answer_types=(m.REQ_ORDERED_ACTIONS,))
+        calls = []
+        def provider(messages, **kw):
+            calls.append(kw)
+            return {"outcome": "rewrite", "reply_mode": "replace", "answer": draft + "\n3. " + closure,
+                "edits": [], "covered_facets": [], "missing_facets": [], "covered_answer_types": [m.REQ_ORDERED_ACTIONS],
+                "missing_answer_types": [], "missing_list_items": [], "citation_ids": ["manual:one"],
+                "operation_boundary": {"complete": True, "checked_blocks": ["step_1", "step_2"], "changes": [{
+                    "block_id": "step_1", "action_quote": "Open the guide.", "resolution": "restored",
+                    "closing_source_citation_id": "manual:one", "closing_source_quote": closure,
+                    "closing_answer_quote": closure}]}}, "offline-model"
+        runtime = replace(m._assistant_core_ask_execution_runtime(), evidence_admission=denied,
+            _v13_json_models=provider, _v13_current_budget=lambda: SimpleNamespace(
+                llm_calls=0, max_llm_calls=3, remaining=lambda: 30))
+        observation = procedure_review.observe_structure(draft, [], fields=lambda c: {}, notes=(),
+            notes_present=lambda *a: True, source_ordered=False)
+        with patch.object(execution, "_admit_input", side_effect=lambda q, data, d, **kw: data):
+            result = execution.verify_or_repair_answer(request=request, decision=decision, answer=draft,
+                candidates=rows, repair_context={"procedure_structure": observation}, runtime=runtime)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("operation_boundary", calls[0]["json_schema"]["schema"]["required"])
+        self.assertTrue(result["operation_boundary_validation"]["complete"])
+        self.assertEqual(result["answer"], draft + "\n3. " + closure)
 
 
 if __name__ == "__main__":

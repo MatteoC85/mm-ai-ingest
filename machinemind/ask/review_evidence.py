@@ -13,12 +13,31 @@ import sys
 from typing import Callable
 
 from ..evidence.contracts import EvidenceContractError
+from ..infrastructure.request_budget import _V13BudgetExceeded
 
 VERSION = "ask-procedure-review-evidence-v1"
 
 
 class ReviewEvidenceError(EvidenceContractError):
     """Invalid/incomplete representation; must not be relabelled source absence."""
+
+
+def complete_limits(primary, *, render, max_records, max_context_chars, max_bytes):
+    """Preserve selected source bodies within canonical bytes and provider cost caps."""
+    required, _ = _unique(primary, [])
+    chars = size = 0
+    for row in required:
+        part = render([row], max_context_chars=sys.maxsize)
+        if not isinstance(part, str) or not part:
+            raise ReviewEvidenceError("producer review record has no rendered body")
+        if chars:
+            chars += 2
+            size += 2
+        chars += len(part)
+        size += len(part.encode("utf-8"))
+        if size > max_bytes:
+            raise _V13BudgetExceeded("procedure_review_evidence_capacity")
+    return max(max_records, len(required)), max(max_context_chars, chars)
 
 
 @dataclass(frozen=True, slots=True)

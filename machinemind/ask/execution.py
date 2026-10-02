@@ -597,12 +597,18 @@ def verify_or_repair_answer(
         and (repair_context.get("procedure_structure") or {}).get("usable")
         and (repair_context.get("procedure_structure") or {}).get("answer_sha256") == _procedure_review.digest(answer))
     layout = _procedure_review.block_layout(answer) if compact_review else None
+    operation_boundary = bool(compact_review
+        and (repair_context.get("procedure_structure") or {}).get("source_sequence_required") is False)
     review_facets = list(dict.fromkeys(list(decision.required_facets) + [
         item.facet for item in decision.facet_queries if item.must_cover]))
     verifier_schema = _assistant_core_contract_verifier_schema()
     if compact_review:
-        verifier_schema = _procedure_review.review_schema(verifier_schema, layout, review_facets, requirements)
+        verifier_schema = _procedure_review.review_schema(verifier_schema, layout, review_facets, requirements,
+            operation_boundary=operation_boundary,
+            operation_source_ids=[str(c.get("citation_id") or "").strip() for c in ordered_candidates])
         system_msg += _procedure_review.PROTOCOL_INSTRUCTIONS
+        if operation_boundary:
+            system_msg += _procedure_review.OPERATION_BOUNDARY_INSTRUCTIONS
         # Digests stay in the server-side binding/audit. The verifier needs the
         # source-to-number mapping, not hexadecimal hashes repeated as tokens.
         observation = repair_context["procedure_structure"]
@@ -669,11 +675,7 @@ def verify_or_repair_answer(
         for cid in (out.get("citation_ids") or [])
         if str(cid or "").strip() in valid_ids
     ]
-    required_type_set = {
-        str(x or "").strip().lower()
-        for x in decision.required_answer_types
-        if str(x or "").strip()
-    }
+    required_type_set = set(requirements)
     out["covered_answer_types"] = _dedup_text_values(
         [
             str(item or "").strip().lower()
@@ -691,6 +693,10 @@ def verify_or_repair_answer(
         limit=10,
     )
     out["answer"] = _assistant_core_redact_internal_text(out.get("answer") or "")
+    if operation_boundary:
+        out = _procedure_review.verify_operation_boundary(out, layout=layout,
+            source_texts={str(c.get("citation_id") or "").strip(): _assistant_core_candidate_evidence_text(c)
+                          for c in ordered_candidates})
     if reviewed_draft is not None and "reviewed_draft_binding" in out:
         # The same existing redaction projection is applied exactly once. The
         # final validator must still bind this output to the grounded answer.

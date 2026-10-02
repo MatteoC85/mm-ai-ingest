@@ -14,7 +14,6 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import replace
-import sys
 
 from assistant_core_v2 import (
     _choose_monotonic_response, _finish_ask_validation, _clean_text,
@@ -23,7 +22,6 @@ from assistant_core_v2 import (
 from . import review_evidence
 from . import phase_trace
 from .request_completion import current as _completion
-from ..infrastructure.request_budget import _V13BudgetExceeded
 from .task_generation import TaskGenerationEvidence
 from .generation import GenerationEvidenceError
 from ..evidence.ask_input import _same_value, apply_ask_evidence_input
@@ -40,20 +38,8 @@ def _complete_review_limits(primary, *, render, max_records, max_context_chars, 
     The existing canonical allocation remains a hard cap. This function neither
     grants sources nor changes model/schema/output token/cost limits.
     """
-    required, _ = review_evidence._unique(primary, [])
-    chars = size = 0
-    for row in required:
-        part = render([row], max_context_chars=sys.maxsize)
-        if not isinstance(part, str) or not part:
-            raise review_evidence.ReviewEvidenceError("producer review record has no rendered body")
-        if chars:
-            chars += 2
-            size += 2
-        chars += len(part)
-        size += len(part.encode("utf-8"))
-        if size > max_bytes:
-            raise _V13BudgetExceeded("procedure_review_evidence_capacity")
-    return max(max_records, len(required)), max(max_context_chars, chars)
+    return review_evidence.complete_limits(primary, render=render, max_records=max_records,
+        max_context_chars=max_context_chars, max_bytes=max_bytes)
 
 
 class ResponseEvidenceError(GenerationEvidenceError):
@@ -351,7 +337,12 @@ class ResponseEvidenceFlow(TaskGenerationEvidence):
             original, _, handles = self.synthesis
             primary = original.get("_assistant_core_validation_evidence", [])
             if not primary:
-                return None
+                # Manual/mixed synthesis has no ProcedureBundle manifest. Its
+                # first admitted verifier input is the complete prepared source
+                # selection, not the model's chosen output citations. Preserve
+                # that selection with its existing positional handles as well.
+                primary = list(rows)
+                handles = self.handles(primary)
             # Re-admit the exact snapshot with its declared positional handles.
             # No lookup by text/citation ID supplies or reconstructs an origin.
             self._seed({"candidates": primary}, (AskSelection("candidates", handles),))

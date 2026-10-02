@@ -128,7 +128,9 @@ def _edited_block(original: str, value: str) -> str:
     return prefix + body + separator
 
 
-def review_schema(legacy: dict, layout: dict, facets: list[str], types: list[str]) -> dict:
+def review_schema(legacy: dict, layout: dict, facets: list[str], types: list[str], *,
+                  operation_boundary: bool = False,
+                  operation_source_ids: list[str] | None = None) -> dict:
     result = deepcopy(legacy)
     result["name"] = legacy["name"]  # backwards-readable verifier envelope
     schema = result["schema"]
@@ -150,7 +152,105 @@ def review_schema(legacy: dict, layout: dict, facets: list[str], types: list[str
                 "precaution, condition, numeric value, and citation required in this block."}},
         "required": ["block_id", "text"]}, "maxItems": len(layout["blocks"])}
     schema["required"] = list(schema["required"]) + ["reply_mode", "edits"]
+    if operation_boundary:
+        if not operation_source_ids:
+            raise ValueError("operation_boundary_requires_admitted_sources")
+        block_ids = [b["block_id"] for b in layout["blocks"]]
+        fields = {key: {"type": "string"} for key in (
+            "action_quote", "closing_source_citation_id", "closing_source_quote", "closing_answer_quote")}
+        fields.update(block_id={"type": "string", "enum": block_ids},
+                      resolution={"type": "string", "enum": ["restored", "documented_terminal_state", "unresolved"]})
+        fields["closing_source_citation_id"]["enum"] = list(dict.fromkeys(operation_source_ids))
+        schema["properties"]["operation_boundary"] = {
+            "type": "object", "additionalProperties": False,
+            "properties": {"complete": {"type": "boolean"},
+                "checked_blocks": {"type": "array", "items": {"type": "string", "enum": block_ids},
+                                   "maxItems": len(block_ids)},
+                "changes": {"type": "array", "maxItems": 16, "items": {
+                    "type": "object", "additionalProperties": False,
+                    "properties": fields, "required": list(fields)}}},
+            "required": ["complete", "checked_blocks", "changes"]}
+        schema["required"].append("operation_boundary")
     return result
+
+
+OPERATION_BOUNDARY_INSTRUCTIONS = (
+    "\nOPERATION BOUNDARY CHECK (mandatory for this manual/mixed procedure): Check every PROCEDURE_BLOCK "
+    "against the complete source operation, including its continuation beyond router facets. Return "
+    "operation_boundary.checked_blocks containing every block_id once. For every temporary state change "
+    "introduced by the answer (for example loosening, opening, releasing pressure, disabling, changing "
+    "mode or adjustment), add a changes entry. block_id identifies its original draft block; action_quote "
+    "is an exact phrase in your final resolved answer. Resolve it with the source-documented restoration "
+    "or documented safe terminal/hold state, not an invented restart. closing_source_citation_id and "
+    "closing_source_quote must identify an exact quote in SOURCES; closing_answer_quote is an exact "
+    "phrase of the final answer that carries out that closure. A restoration must follow action_quote; "
+    "a documented terminal hold may be stated in the same instruction. Use resolution=restored "
+    "or documented_terminal_state only when supported. If a closing action is missing but documented, "
+    "rewrite to include it now, including its prerequisites, before claiming completion/readiness. "
+    "Use replace if adding steps changes the block structure. If a necessary closing state is unknown, "
+    "use unresolved, complete=false and outcome=no_sources. Complete=true requires every introduced "
+    "temporary change resolved. Do not force unrelated operations into a segment. An empty changes list "
+    "is correct only after checking every block and finding no introduced temporary state. "
+    "Standing safety prerequisites such as isolation, keeping STOP pressed and wearing PPE are invariants "
+    "to maintain, not temporary operational changes requiring reversal. Do not invent re-energization, "
+    "restart or release of a safety prerequisite. Respect explicit before-only boundaries and documented "
+    "safe hold states; do not perform an operation that the user explicitly excluded."
+)
+
+
+def _quote_text(value: str) -> str:
+    # Typography/line wrapping only; keep case, negations, numbers and units.
+    return " ".join(value.translate(str.maketrans({"\u2018": "'", "\u2019": "'",
+        "\u201c": '"', "\u201d": '"'})).split())
+
+
+def verify_operation_boundary(parsed: dict, *, layout: dict, source_texts: dict[str, str]) -> dict:
+    """Validate a same-call semantic closure audit, never infer physical safety."""
+    out = deepcopy(parsed)
+    audit = out.get("operation_boundary")
+    expected = [b["block_id"] for b in layout["blocks"]]
+    answer = str(out.get("answer") or "")
+    body = _quote_text(answer)
+    reason = "operation_boundary_incomplete"
+    valid = (type(audit) is dict and audit.get("complete") is True
+        and type(audit.get("checked_blocks")) is list
+        and all(type(x) is str for x in audit["checked_blocks"])
+        and len(audit["checked_blocks"]) == len(expected)
+        and set(audit["checked_blocks"]) == set(expected)
+        and type(audit.get("changes")) is list and len(audit["changes"]) <= 16)
+    if valid:
+        for change in audit["changes"]:
+            if (type(change) is not dict or change.get("block_id") not in expected
+                    or change.get("resolution") not in {"restored", "documented_terminal_state"}
+                    or any(type(change.get(k)) is not str or not change[k].strip() for k in
+                           ("action_quote", "closing_source_citation_id", "closing_source_quote", "closing_answer_quote"))):
+                valid = False
+                break
+            source = source_texts.get(change["closing_source_citation_id"])
+            action = _quote_text(change["action_quote"])
+            closure = _quote_text(change["closing_answer_quote"])
+            action_at = body.find(action)
+            closure_start = (action_at if change["resolution"] == "documented_terminal_state"
+                             else action_at + len(action))
+            closure_at = body.find(closure, closure_start) if action_at >= 0 else -1
+            if (source is None or _quote_text(change["closing_source_quote"]) not in _quote_text(source)
+                    or action_at < 0 or closure_at < 0):
+                valid = False
+                reason = "operation_boundary_quote_or_order_invalid"
+                break
+    out["operation_boundary_validation"] = {"version": "ask-operation-boundary-v1",
+        "complete": bool(valid), "answer_sha256": digest(answer.strip()),
+        "checked_blocks": len(expected), "temporary_changes": len(audit["changes"]) if valid else None}
+    if valid:
+        # The reviewer explicitly cited these admitted records in its closure
+        # audit. Carry those same references through normal allowed-citation
+        # reconstruction; do not require it to repeat the IDs in a second list.
+        out["citation_ids"] = list(dict.fromkeys(list(out.get("citation_ids") or []) + [
+            change["closing_source_citation_id"] for change in audit["changes"]]))
+    if not valid and out.get("outcome") in {"pass", "rewrite"}:
+        out["outcome"] = "no_sources"
+        out["reason"] = reason
+    return out
 
 
 PROTOCOL_INSTRUCTIONS = (
