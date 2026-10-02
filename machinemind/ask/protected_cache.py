@@ -3,8 +3,8 @@
 Reuses the production semantic-cache SQL/TTL/quality/knowledge-version policies
 in a separate scope namespace. Protected hits require the EXACT query/selectors;
 semantic similarity is not a proof that a previously validated answer answers a
-new question. No model/embedding call is added for caching. OFF/RC keep their
-existing cache unchanged.
+new question. No model/embedding call is added for caching. This owner applies only
+to protected ASK; shared ASK storage also isolates releases on the legacy path.
 
 A domain-separated HMAC authenticates the server-produced cache artifact, NOT
 permissions. Every reuse separately checks the current application allowance for
@@ -41,7 +41,7 @@ from ..retrieval.document_readers import (FetchDocumentFileMapRuntime,
 from ..retrieval.supplemental_evidence import storage_key
 from ..infrastructure import semantic_cache
 
-PROTECTED_CACHE_VERSION = "ask-canonical-exact-cache-phase6-closure-v6"
+PROTECTED_CACHE_VERSION = "ask-canonical-exact-cache-phase6-closure-v7"
 ARTIFACT_KEY = "_mm_canonical_cache_artifact"
 MAX_ARTIFACT_BYTES = 2 * 1024 * 1024
 MAX_DEPENDENCIES = 8192
@@ -125,6 +125,10 @@ class ProtectedCacheOwner:
         self.scope, self.flow, self.cache = authorized.scope, flow_runtime, dict(cache_runtime)
         self.file_runtime, self.limits = file_runtime, limits
         self._key = hmac.new(signing_key.encode("ascii"), _DOMAIN, hashlib.sha256).digest()
+        # The deployment sets COMMIT_SHA (also exposed by /version). Capturing
+        # it here binds every signed artifact to this request's code release;
+        # neither a client selector nor cached response metadata can supply it.
+        self._commit_sha = semantic_cache.runtime_commit_sha()
         self._active, self._fault = True, None
         self._context = self._parameters = None
         self._epoch = 0
@@ -185,7 +189,7 @@ class ProtectedCacheOwner:
                 or scope.get("_v13_top_k") != max(1, min(int(p.top_k or 5), self.flow.ASK_MAX_TOP_K))):
             self._fail("AUTHORITY_CACHE_SCOPE_CHANGED")
         context = {**expected, "scope": deepcopy(scope), "version": PROTECTED_CACHE_VERSION,
-                   "engine": self.cache["V13_ENGINE_KEY"]}
+                   "engine": self.cache["V13_ENGINE_KEY"], "commit_sha": self._commit_sha}
         if self._context is not None and self._context != context:
             self._fail("AUTHORITY_CACHE_SCOPE_CHANGED")
         self._context = context
@@ -279,6 +283,7 @@ class ProtectedCacheOwner:
             if (type(seal) is not str or not seal.isascii()
                     or not hmac.compare_digest(seal, hmac.new(self._key, _json(value), hashlib.sha256).hexdigest())
                     or proof["version"] != PROTECTED_CACHE_VERSION
+                    or self._commit_sha is None
                     or proof["context"] != self._context
                     or type(proof["knowledge_version"]) is not int
                     or proof["knowledge_version"] != self._epoch or self._epoch < 1
@@ -346,6 +351,12 @@ class ProtectedCacheOwner:
         if self._context is not None or source_guard_fn != self.lookup:
             self._fail("AUTHORITY_CACHE_LOOKUP_INVALID")
         self._set_context(parameters)
+        if self._commit_sha is None:
+            self._mode = "miss_release_identity_no_store"
+            budget = self.cache["_v13_current_budget"]()
+            if budget is not None:
+                budget.semantic_cache = "bypass_release_identity"
+            return None
         result = semantic_cache.cache_lookup(**parameters, runtime_globals=self._runtime(),
                                              source_guard_fn=self.lookup)
         self.check()  # cache infrastructure may swallow a latched error
@@ -384,6 +395,7 @@ class ProtectedCacheOwner:
                     self._fail("AUTHORITY_CACHE_KNOWLEDGE_CHANGED")
             elif (self._epoch > 0 and self._dependencies
                     and self._accounting_allows_store()
+                    and self._commit_sha is not None
                     and (semantic_cache.assistant_core_cache_certified("ask", out)
                          and response_contract_bound(out))
                     and out.get("meta", {}).get("cacheable") is not False
@@ -423,6 +435,8 @@ class ProtectedCacheOwner:
         if source_guard_fn != self.store:
             self._fail("AUTHORITY_CACHE_STORE_INVALID")
         self._set_context(parameters)
+        if self._commit_sha is None:
+            return None
         if ARTIFACT_KEY not in response.get("meta", {}):
             return None
         if not self._accounting_allows_store():
@@ -491,6 +505,7 @@ class ProtectedCacheOwner:
         out = deepcopy(out)
         out.setdefault("meta", {}).pop(ARTIFACT_KEY, None)
         out["meta"]["protected_cache"] = {"version": PROTECTED_CACHE_VERSION,
+            "commit_sha": self._commit_sha,
             "mode": "exact_request", "outcome": self._mode,
             "worker_cacheable": False, "canonical_activation_certified": False}
         return out

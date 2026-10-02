@@ -11,15 +11,33 @@ wrappers in ``main`` pass their live globals mapping on every call.  That preser
 * the mutable bootstrap state previously held by ``main``.
 
 No cache threshold, SQL statement, compatibility guard, quality formula or response
-shape is intentionally changed by this extraction.
+shape is intentionally changed by this extraction. ASK cache scopes additionally
+bind the trusted runtime commit, so old answers cannot cross code/contract releases.
+Without a valid deploy identity, ASK caching is bypassed; request execution continues.
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from collections.abc import Mapping, MutableMapping
 from typing import Any, Callable, Optional
+
+
+def runtime_commit_sha() -> str | None:
+    """Trusted deploy identity, never a selector or response metadata value."""
+    value = os.environ.get("COMMIT_SHA", "").lower()
+    return value if re.fullmatch(r"[0-9a-f]{40}", value) else None
+
+
+def _release_scope_key(mode: str, base: str, commit: str | None) -> str:
+    # All ASK paths (exact, semantic and protected) share read/write isolation.
+    # Existing tenant, machine, document and knowledge-version keys still apply.
+    if mode != "ask":
+        return base
+    return hashlib.sha256(json.dumps(["ask-release-cache-v1", commit, base],
+        separators=(",", ":")).encode("utf-8")).hexdigest()[:40]
 
 
 class _Runtime:
@@ -471,6 +489,11 @@ def cache_lookup(
     budget = rt.call("_v13_current_budget")
     if budget is not None:
         budget.semantic_cache = "bypass_debug" if debug else "miss"
+    commit = runtime_commit_sha() if mode == "ask" else None
+    if mode == "ask" and commit is None:
+        if budget is not None:
+            budget.semantic_cache = "bypass_release_identity"
+        return None
     if debug or not rt.require("V13_SEMANTIC_CACHE_ENABLED") or not rt.call("_v13_cache_bootstrap"):
         return None
 
@@ -478,7 +501,7 @@ def cache_lookup(
     if knowledge_version <= 0:
         return None
 
-    scope_key_value = rt.call("_v13_scope_key", scope)
+    scope_key_value = _release_scope_key(mode, rt.call("_v13_scope_key", scope), commit)
     ai_scope = str(scope.get("ai_scope") or "machine_all")
     machine_key = str(machine_id or "")
 
@@ -749,6 +772,9 @@ def cache_store(
     source_guard_fn: Optional[Callable[[dict], dict]] = None,
 ) -> None:
     rt = _Runtime(runtime_globals)
+    commit = runtime_commit_sha() if mode == "ask" else None
+    if mode == "ask" and commit is None:
+        return
     if debug or not rt.require("V13_SEMANTIC_CACHE_ENABLED") or not rt.call("_v13_cache_bootstrap"):
         return
     if source_guard_fn is not None:
@@ -798,7 +824,7 @@ def cache_store(
         (rt.require("V13_ENGINE_KEY") + "\n" + normalized_q).encode("utf-8")
     ).hexdigest()
     ai_scope = str(scope.get("ai_scope") or "machine_all")
-    scope_key_value = rt.call("_v13_scope_key", scope)
+    scope_key_value = _release_scope_key(mode, rt.call("_v13_scope_key", scope), commit)
     machine_key = str(machine_id or "")
 
     stored_response = dict(response)
