@@ -12,6 +12,7 @@ be wired to the SAME request session before production canonical activation.
 """
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from functools import wraps
 from inspect import signature
@@ -21,6 +22,7 @@ from . import procedure_review as _procedure_review
 from . import final_contract as _final_contract
 from . import phase_trace
 from .request_completion import current as _current_completion
+from .request_completion import synthesis_review_reserve as _synthesis_review_reserve
 from ..evidence.ask_input import AskEvidenceAdmission, apply_ask_evidence_input, ask_request_key
 from ..evidence.contracts import EvidenceContractError, SourceIdentity
 from ..retrieval.ask_composition import AskEvidenceSession, AskSelection
@@ -384,15 +386,21 @@ def synthesize_ask(
             return _assistant_core_build_no_evidence(request, decision, retrieval)
 
     retrieval = _admit_input(request, retrieval, decision, runtime=runtime, stage="synthesis.generate")
-    response = _v13_generate_ask_response(
-        q=request.query,
-        company_id=request.company_id,
-        response_language=request.response_language,
-        top_k=request.top_k,
-        retrieval=retrieval,
-        narrow_scope=request.narrow_scope,
-        debug=request.debug,
-    )
+    # A manual procedure has no completed ProcedureBundle to prove every step.
+    # Preserve the existing bounded repair window without forcing a verifier or
+    # changing structured/legacy synthesis or their review policy.
+    with (_synthesis_review_reserve(required=True)
+          if _guarded(runtime, request, decision) and structured_procedure_task
+          else nullcontext()):
+        response = _v13_generate_ask_response(
+            q=request.query,
+            company_id=request.company_id,
+            response_language=request.response_language,
+            top_k=request.top_k,
+            retrieval=retrieval,
+            narrow_scope=request.narrow_scope,
+            debug=request.debug,
+        )
     degraded_reason = str((response.get("meta") or {}).get("degraded_reason") or "")
     failed_first_synthesis = (
         str(response.get("status") or "").strip().lower() != "answered"

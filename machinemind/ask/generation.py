@@ -1,6 +1,6 @@
 """Existing generic ASK synthesis with explicit call-time collaborators.
 
-The algorithm and prompts are extracted unchanged from main. The optional
+The legacy algorithm and prompts are extracted unchanged from main. The optional
 request binding below consumes existing admitted occurrences and registered file
 references; it does not invent authority or create another Core/session. Dedicated
 structured/overview synthesis, validation/repair and cache remain separate gates.
@@ -57,6 +57,8 @@ class AskGenerationRuntime:
     _v13_json_models: Callable
     _v13_sources_block: Callable
     json: Any
+    # Internal session binding only; never selected by request payload metadata.
+    preserve_procedure_points: bool = False
 
 
 def generate_ask_response(
@@ -240,6 +242,12 @@ def generate_ask_response(
                 ),
             ),
         )
+        if (runtime.preserve_procedure_points
+                and information_task in {INFO_PROCEDURE_FULL, INFO_PROCEDURE_SEGMENT}):
+            # The generic schema already bounds the answer to eight points.
+            # Unlike ProcedureBundle, a manual answer has no deterministic Step
+            # reconstruction after rendering: the UI cap must not delete actions.
+            dynamic_max_points = 8
         answer, final_citations = _render_grounded_answer_points(
             grounded_points=list(parsed.get("grounded_points") or []),
             citations=candidates,
@@ -583,7 +591,8 @@ class GenericGenerationEvidence:
                     _v13_json_models=self._model, _render_grounded_answer_points=self._render,
                     _sanitize_citations_for_response=self._sanitize, _build_rg_links=self._links,
                     _finalize_ask_response_for_ui=self._finalize,
-                    _v13_extractive_fallback_answer=self._no_extractive_fallback)
+                    _v13_extractive_fallback_answer=self._no_extractive_fallback,
+                    preserve_procedure_points=True)
                 result = generate_ask_response(q=self.request.query,
                     company_id=self.request.company_id, response_language=self.request.response_language,
                     top_k=self.request.top_k, retrieval=retrieval,

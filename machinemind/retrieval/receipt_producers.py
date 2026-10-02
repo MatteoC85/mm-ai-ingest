@@ -404,6 +404,7 @@ class _PreparationTrace:
         self.entries = {}
         self.roots = {}
         self._adapted_roots = {}
+        self._adapted_views = {}
         self.bytes = 0
         self._witness_budget = _WitnessBudget(limits.legacy)
         self.active = True
@@ -459,7 +460,7 @@ class _PreparationTrace:
                                         _LegacyWitness.capture(item.record, self.limits.legacy)), evidence)
         return evidence
 
-    def add(self, record, parents, *, context=None):
+    def add(self, record, parents, *, context=None, copy_entry=None):
         self.check()
         if type(record) is not dict or type(parents) is not tuple or not parents:
             raise EvidenceProductionError("explicit preparation record and origins required")
@@ -469,7 +470,17 @@ class _PreparationTrace:
             raise EvidenceProductionError("preparation occurrence already registered")
         if len(self.entries) >= self.max_records:
             raise EvidenceProductionError("preparation trace record limit exceeded")
-        witness = _LegacyWitness.capture(record, self.limits.legacy)
+        # An explicit unchanged copy can share the source's private immutable
+        # witness. Identity comes from this trace's registered occurrence, never
+        # an ID/text match. Compare ALL mutable fields again before reusing it.
+        # The existing per-occurrence allocation charge is deliberately retained.
+        if copy_entry is not None:
+            if (self.entry(copy_entry[0]) is not copy_entry or parents != copy_entry[2]
+                    or not _same_value(record, copy_entry[1])):
+                raise EvidenceProductionError("copy differs from its registered occurrence")
+            witness = copy_entry[1]
+        else:
+            witness = _LegacyWitness.capture(record, self.limits.legacy)
         budget = getattr(self, "_witness_budget", None)
         if budget is None:
             budget = _WitnessBudget.from_witnesses(
@@ -482,15 +493,31 @@ class _PreparationTrace:
         if any(value.context.source != source for value in contexts):
             raise EvidenceProductionError("preparation cannot merge different sources")
         ctx = context or contexts[0].context
-        evidence = adapt_candidate(record, context=ctx, limits=self.limits.adapter).entry.evidence
+        cached = self._adapted_views.get(id(witness)) if copy_entry is not None else None
+        if (cached is not None and cached[0] is witness and cached[1] == ctx
+                and cached[2] == self.limits.adapter):
+            # Only pure adaptation is reused. Current authorization and every
+            # parent/locator check below still execute at their original sites.
+            evidence = cached[3]
+        else:
+            evidence = adapt_candidate(record, context=ctx, limits=self.limits.adapter).entry.evidence
         parent_evidence = tuple(self._parent_evidence(h) for h in parents)
         _check_derived_locator(evidence.locator, parent_evidence)
         self.entries[id(record)] = (record, witness, parents)
+        old_view = self._adapted_views.get(id(witness))
+        references = old_view[4] + 1 if old_view is not None and old_view[0] is witness else 1
+        self._adapted_views[id(witness)] = (witness, ctx, self.limits.adapter, evidence, references)
         budget.add(witness)
         self._witness_budget = budget
         self.bytes = budget.size
 
     def release_witness(self, witness):
+        adapted = self._adapted_views.get(id(witness))
+        if adapted is not None and adapted[0] is witness:
+            if adapted[4] <= 1:
+                del self._adapted_views[id(witness)]
+            else:
+                self._adapted_views[id(witness)] = (*adapted[:4], adapted[4] - 1)
         budget = getattr(self, "_witness_budget", None)
         if budget is None:
             self.bytes -= _witness_size(witness, self.limits.legacy)
@@ -544,7 +571,7 @@ class _PreparationTrace:
             entry = self.entry(source)
             if stage == "copy" and not _same_value(source, view):
                 raise EvidenceProductionError("copy changed evidence without transformation")
-            self.add(view, entry[2])
+            self.add(view, entry[2], copy_entry=entry if stage == "copy" else None)
             if stage == "score":
                 self.scored.append(view)
 
@@ -803,7 +830,7 @@ def prepare_records(*, request: Any, session: AskEvidenceSession,
             journal.active = False
             journal.entries.clear()
             journal._witness_budget.clear()
-            journal.roots.clear(); journal._adapted_roots.clear()
+            journal.roots.clear(); journal._adapted_roots.clear(); journal._adapted_views.clear()
             journal.scored.clear()
 
     return invoke(work, request)
@@ -1067,7 +1094,7 @@ def retrieve_initial_records(*, request: Any, session: AskEvidenceSession,
                             AskSelection("citations", result_handles[:cap]))
         finally:
             journal.active = False
-            journal.entries.clear(); journal._witness_budget.clear(); journal.roots.clear(); journal._adapted_roots.clear(); dense_tokens.clear(); flags.clear()
+            journal.entries.clear(); journal._witness_budget.clear(); journal.roots.clear(); journal._adapted_roots.clear(); journal._adapted_views.clear(); dense_tokens.clear(); flags.clear()
 
     return invoke(work, request)
 
@@ -1127,6 +1154,12 @@ class _OuterRetrievalTrace(_PreparationTrace):
         if size > self.max_bytes or len(kept) > self.max_records:
             raise EvidenceProductionError("retained outer scratch exceeds its original bounds")
         self.entries = kept
+        live_witnesses = {}
+        for entry in kept.values():
+            key = id(entry[1])
+            live_witnesses[key] = live_witnesses.get(key, 0) + 1
+        self._adapted_views = {key: (*item[:4], live_witnesses[key])
+                               for key, item in self._adapted_views.items() if key in live_witnesses}
         self._witness_budget = budget
         self.bytes = size
 
@@ -1287,7 +1320,7 @@ class _OuterRetrievalTrace(_PreparationTrace):
                 entry = self.entry(source)
                 if not _same_value(source, value):
                     raise EvidenceProductionError("outer copy changed input")
-                self.add(value, entry[2])
+                self.add(value, entry[2], copy_entry=entry)
                 return value
             if stage == "annotation_before":
                 source, value = args
@@ -1370,7 +1403,7 @@ class _OuterRetrievalTrace(_PreparationTrace):
 
     def dispose(self):
         self.active = False
-        self.entries.clear(); self.roots.clear(); self._adapted_roots.clear(); self.pending.clear(); self.completed = None
+        self.entries.clear(); self.roots.clear(); self._adapted_roots.clear(); self._adapted_views.clear(); self.pending.clear(); self.completed = None
         budget = getattr(self, "_witness_budget", None)
         if budget is not None:
             budget.clear()

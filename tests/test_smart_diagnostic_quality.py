@@ -185,6 +185,24 @@ class SmartDiagnosticQualityTests(unittest.TestCase):
                 self.assertEqual(returned["current_question"], {})
                 self.assertEqual(returned["state_signature"], self.m._sd_state_signature(returned))
 
+    def test_single_choice_always_keeps_safe_unknown_with_four_buttons(self):
+        options = [{"id": oid, "label_it": oid, "label_en": oid} for oid in ("a", "b", "c", "d")]
+        actual = self.m._sd_normalize_options(options, "single_choice", "it")
+        self.assertEqual([o["id"] for o in actual], ["a", "b", "c", "unknown"])
+        self.assertIn("sicurezza", actual[-1]["label_it"])
+        self.assertIn("safely", actual[-1]["label_en"])
+        self.assertEqual(self.m._sd_normalize_options(actual, "single_choice", "en"), actual)
+
+    def test_single_choice_unknown_answer_preserved_in_signed_history(self):
+        self.question.update(question_type="single_choice", options=self.m._sd_normalize_options(
+            [{"id": oid, "label_it": oid, "label_en": oid} for oid in ("a", "b", "c", "d")], "single_choice", "en"))
+        with patch.object(self.m, "_sd_llm_step_answer", return_value=self.parsed_step()) as provider:
+            response = self.post("answer", answer={"value": "unknown", "api_value": "unknown", "label": "Unknown / cannot check safely", "free_text": "The gripper cannot be observed without opening a guard."})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(provider.call_args.kwargs["answer"]["api_value"], "unknown")
+        state = json.loads(response.json()["session_state_json"])
+        self.assertEqual(state["history"][-1]["answer"]["api_value"], "unknown")
+
     def test_unknown_option_is_rejected_before_provider(self):
         with patch.object(self.m, "_sd_llm_step_answer", return_value=self.parsed_step()) as provider:
             response = self.post("answer", answer={"value": "invented", "api_value": "invented"})

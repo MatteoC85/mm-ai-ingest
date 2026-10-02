@@ -1276,6 +1276,15 @@ class V13SourcesBlockRuntime:
     _v13_candidate_text: Callable[..., Any]
 
 
+def v13_root_sources_packet(citations: list[dict], *, max_context_chars: int,
+                            runtime: V13SourcesBlockRuntime) -> dict:
+    """Root-only fair allocation; shared ASK source packing remains unchanged."""
+    from .root_source_packet import build
+    return build(citations=citations, max_chars=max_context_chars,
+                 candidate_text=runtime._v13_candidate_text,
+                 source_type_from_document_id=runtime._source_type_from_document_id)
+
+
 def v13_sources_block(citations: list[dict], *, max_context_chars: int, runtime: V13SourcesBlockRuntime) -> str:
     _source_type_from_document_id = runtime._source_type_from_document_id
     _v13_candidate_text = runtime._v13_candidate_text
