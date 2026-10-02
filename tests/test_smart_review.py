@@ -745,6 +745,78 @@ class SmartReviewEndpointTests(unittest.TestCase):
         self.assertEqual({r['text'] for r in records}, {s['chunk_full'] for s in self.sources + additions[:3]})
         self.assertEqual(len(json.loads(start['session_state_json'])['evidence']), len(state['evidence']))
 
+    def test_unknown_answer_preserves_packet_and_note_without_technical_retrieval(self):
+        start = self.start()
+        original = json.loads(start['session_state_json'])
+        next_step = copy.deepcopy(self.raw)
+        next_step['hypotheses'] = start['hypotheses']
+        next_step['question']['question_text'] = 'Was the documented prerequisite already observed?'
+        next_step['question']['target_hypotheses'] = [h['id'] for h in start['hypotheses']]
+        for note in ('', 'Not checked because the guarded area cannot be accessed.',
+                     'Non verificato: non posso osservare in sicurezza.', 'Additional note: pressure indicator 2.1 bar.'):
+            with self.subTest(note=note), \
+                 patch.object(self.m, 'SMART_DIAGNOSTIC_RETRIEVAL_ASSURANCE_ENABLED', True), \
+                 patch.object(self.m, '_sd_enrich_state_evidence_from_answer', side_effect=self.real_enrich), \
+                 patch.object(self.m, '_v13_apply_retrieval_assurance', side_effect=denied) as retrieval, \
+                 patch.object(self.m, '_sd_llm_step_answer', return_value=next_step) as generator:
+                response = self.post('answer', start['session_state_json'], question_id='Q1',
+                    answer={'value': 'unknown', 'api_value': 'unknown', 'free_text': note})
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertTrue(response.json()['ok'])
+            retrieval.assert_not_called()
+            supplied = generator.call_args.kwargs
+            self.assertEqual(supplied['state']['grounding_packet'], original['grounding_packet'])
+            self.assertEqual(supplied['answer']['api_value'], 'unknown')
+            self.assertEqual(supplied['answer']['free_text'], note)
+            state = json.loads(response.json()['session_state_json'])
+            self.assertEqual(state['grounding_packet'], original['grounding_packet'])
+            self.assertEqual(state['history'][-1]['answer']['free_text'], note)
+            self.assertEqual(review.observation_text(state['symptom_text'], state['history']),
+                             review.observation_text(state['symptom_text'], []))
+            self.assertEqual(self.prepared[-1]['packet']['validator_records'],
+                             smart_evidence.review_packet(original['grounding_packet'])['validator_records'])
+
+    def test_factual_answer_still_admits_optional_retrieval_from_new_observation(self):
+        state = json.loads(self.start()['session_state_json'])
+        answer = {'api_value': 'present', 'value': 'present', 'label': 'Present',
+                  'free_text': 'Pressure indicator reads 2.1 bar and alarm ZX993 is displayed.'}
+        query, facets = self.m._sd_answer_retrieval_signal(state, state['current_question'], answer)
+        self.assertIn(answer['free_text'], query)
+        self.assertTrue(facets)
+        with patch.object(self.m, 'SMART_DIAGNOSTIC_RETRIEVAL_ASSURANCE_ENABLED', True), \
+             patch.object(self.m, '_v13_apply_retrieval_assurance', return_value=(
+                 {'citations': []}, {'adopted': False})) as retrieval:
+            result = self.real_enrich(state=state, company_id='fixture-company', machine_id='fixture-machine',
+                language='en', current_question=state['current_question'], answer=answer)
+        self.assertIs(result, state)
+        self.assertEqual(retrieval.call_count, 1)
+        self.assertEqual(retrieval.call_args.kwargs['q'], query)
+
+    def test_unknown_does_not_bypass_signed_scope_or_packet_validation(self):
+        start = self.start()
+        original = json.loads(start['session_state_json'])
+        for mutation in ('signature', 'scope', 'packet'):
+            state = copy.deepcopy(original)
+            if mutation == 'signature':
+                state['symptom_text'] += ' altered'
+                signed = json.dumps(state)
+            elif mutation == 'scope':
+                state['machine_id'] = 'other-machine'
+                signed = self.m._sd_sign_state(state)
+            else:
+                state['grounding_packet']['bodies'][0]['text'] += ' altered'
+                signed = self.m._sd_sign_state(state)
+            before = self.provider.call_count
+            with self.subTest(mutation=mutation), \
+                 patch.object(self.m, '_sd_enrich_state_evidence_from_answer', side_effect=denied) as enrichment, \
+                 patch.object(self.m, '_sd_llm_step_answer', side_effect=denied) as generator:
+                response = self.post('answer', signed, question_id='Q1',
+                    answer={'value': 'unknown', 'api_value': 'unknown'})
+            self.assertIn(response.status_code, (400, 409), response.text)
+            enrichment.assert_not_called()
+            generator.assert_not_called()
+            self.assertEqual(self.provider.call_count, before)
+
     def test_start_context_survives_both_paths_and_repeated_finalize_without_more_reads(self):
         additions = [{**self.sources[0], 'citation_id': f'step:context{i}:p1-1:smart-context',
             'bubble_document_id': f'step:context{i}', 'source_type': 'step', 'source_id': f'context{i}',
@@ -915,7 +987,8 @@ class SmartReviewEndpointTests(unittest.TestCase):
 
     def test_review_timeout_uses_existing_headroom_and_rechecks_after_preparation(self):
         state = json.loads(self.start()['session_state_json'])
-        for initial, dispatch, expected in ((100, 100, 30), (32.01, 32.01, 30),
+        for initial, dispatch, expected in ((100, 100, 45), (47, 47, 45), (47, 46.99, 44),
+                                            (40, 40, 38), (32.01, 32.01, 30),
                                             (32, 31.99, 29), (27.5, 27.5, 25),
                                             (22, 22, 20), (8, 8, 6), (7.99, 7.99, None),
                                             (9, 7.99, None)):

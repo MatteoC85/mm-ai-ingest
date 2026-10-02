@@ -18475,7 +18475,7 @@ def _assistant_core_sd_json_models(
     if not (budget is not None and isinstance(json_schema, dict)):
         raise RuntimeError("Smart generation requires its request budget and schema")
     phase_key = str(phase or "answer").strip().lower()
-    review_reserve = _smart_review.MAX_REVIEW_SECONDS + _smart_review.FINALIZATION_RESERVE_SECONDS
+    review_reserve = _smart_review.RESERVED_REVIEW_SECONDS + _smart_review.FINALIZATION_RESERVE_SECONDS
     remaining = budget.remaining()
     if remaining < review_reserve + 7.0:
         raise _V13BudgetExceeded("smart_generation_deadline_reserve")
@@ -19742,7 +19742,7 @@ def _sd_prepare_start_grounding(raw_citations: list[dict], *, company_id: str, m
             'omitted_ids': [], 'reason': 'context_time_unavailable',
             'base_ids': [c['citation_id'] for c in citations]}
     budget = _v13_current_budget()
-    reserve = max(_smart_review.MAX_REVIEW_SECONDS + _smart_review.FINALIZATION_RESERVE_SECONDS,
+    reserve = max(_smart_review.RESERVED_REVIEW_SECONDS + _smart_review.FINALIZATION_RESERVE_SECONDS,
                   V13_RETRIEVAL_ASSURANCE_RESERVE_FINAL_SECONDS_ROOT_CAUSE)
     seconds = min(3.0, float(budget.remaining()) - reserve) if budget is not None else 0.0
     if seconds < 1.5 or not SMART_DIAGNOSTIC_RETRIEVAL_ASSURANCE_ENABLED:
@@ -19829,7 +19829,8 @@ def _sd_review_step(*, step: dict, state: dict, language: str, debug: bool = Fal
     schema = _smart_review.wire_schema(prepared)
     # Preparation does not extend the turn. Recheck immediately before dispatch,
     # allowing this one review to use existing headroom and leaving two seconds
-    # for validation/projection. Thirty seconds requires at least 32 remaining.
+    # for validation/projection. The generator reserves thirty review seconds;
+    # unused turn headroom may extend this one attempt up to forty-five.
     remaining = budget.remaining()
     if remaining < 8.0 or budget.llm_calls >= budget.max_llm_calls:
         raise _V13BudgetExceeded("smart_review_deadline_or_call_budget")
@@ -20380,6 +20381,11 @@ def _sd_run_retrieval_assurance(
 
 
 def _sd_answer_retrieval_signal(state: dict, current_question: dict, answer: dict) -> tuple[str, list[str]]:
+    # The validated closed answer declares this observation unavailable. Its
+    # button label and optional note remain in history/generation, but are not
+    # a new technical observation authorizing evidence enrichment.
+    if str(answer.get("api_value") or answer.get("value") or "").strip().casefold() == "unknown":
+        return "", []
     answer_text = " ".join(
         str(x or "").strip()
         for x in (answer.get("free_text"), answer.get("label"), answer.get("api_value"), answer.get("value"))

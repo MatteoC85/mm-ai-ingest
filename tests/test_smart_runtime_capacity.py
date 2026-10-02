@@ -83,7 +83,8 @@ class RuntimeCapacityTests(unittest.TestCase):
         env = {
             '_sd_select_complete_citations': select, '_sd_build_grounding_packet': build,
             '_v13_current_budget': lambda: Budget(),
-            '_smart_review': types.SimpleNamespace(MAX_REVIEW_SECONDS=30, FINALIZATION_RESERVE_SECONDS=2),
+            '_smart_review': types.SimpleNamespace(RESERVED_REVIEW_SECONDS=30, MAX_REVIEW_SECONDS=45,
+                                                  FINALIZATION_RESERVE_SECONDS=2),
             'V13_RETRIEVAL_ASSURANCE_RESERVE_FINAL_SECONDS_ROOT_CAUSE': 32,
             'SMART_DIAGNOSTIC_RETRIEVAL_ASSURANCE_ENABLED': True,
             'SMART_DIAGNOSTIC_MAX_EVIDENCE_IN_STATE': configured_limit() if limit is None else limit,
