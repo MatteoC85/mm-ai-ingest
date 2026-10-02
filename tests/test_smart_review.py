@@ -62,6 +62,16 @@ def parsed_review(prepared, *, rejected=(1,), reject_question=False):
     return {'decisions': decisions}
 
 
+def wire_review(parsed):
+    """Test-only inverse, with no evidence synthesis or defaults."""
+    kinds = {'documented_mechanism': 'm', 'bounded_inference': 'i', 'documented_check': 'c'}
+    applicability = {'same_target': 's', 'documented_dependency': 'd'}
+    return {'decisions': [{'p': d['proposal_index'], 'r': d['reason'], 'b': d['blocking_checks'], 'n': d['note'],
+        'e': [{'c': p['check_indices'], 'v': {'s': p['source_index'], 'k': kinds[p['support_type']], 'o': p['observation_units'],
+               'u': p['source_units'], 't': p['target_units'], 'a': applicability[p['applicability']],
+               }} for p in d['proofs']]} for d in parsed['decisions']]}
+
+
 class SmartReviewTests(unittest.TestCase):
     def setUp(self):
         self.sources, self.step = fixture()
@@ -137,6 +147,80 @@ class SmartReviewTests(unittest.TestCase):
         with self.assertRaisesRegex(refs.ReferenceError, 'not_all_checks_supported'):
             review.resolve(prepared=self.prepared, parsed=parsed, probability_band=self.band)
 
+    def test_wire_roundtrip_preserves_accept_reject_rebinding_and_replay(self):
+        parsed = parsed_review(self.prepared)
+        decoded = review.decode_wire(wire_review(parsed))
+        self.assertEqual(decoded, parsed)
+        expected = review.resolve(prepared=self.prepared, parsed=parsed, probability_band=self.band)
+        self.assertEqual(review.resolve(prepared=self.prepared, parsed=decoded, probability_band=self.band), expected)
+        # A valid rebind to another ADMITTED source survives exactly, including its
+        # source-local unit ownership. This is not semantic acceptance by this test.
+        proof = parsed['decisions'][0]['proofs'][0]
+        proof.update(source_index=1, source_units=self.prepared['references']['frozen']['source_sets'][1][:1],
+                     target_units=self.prepared['references']['frozen']['target_sets'][1][:1])
+        self.assertEqual(review.decode_wire(wire_review(parsed)), parsed)
+
+    def test_wire_rejects_invalid_fields_codes_and_reference_locality(self):
+        wire = wire_review(parsed_review(self.prepared))
+        for mutate in (lambda w: w.update(extra=True),
+                       lambda w: w['decisions'][0].pop('n'),
+                       lambda w: w['decisions'][0]['e'][0]['v'].update(k='unknown')):
+            bad = copy.deepcopy(wire)
+            mutate(bad)
+            with self.assertRaises(review.SmartReviewError):
+                review.decode_wire(bad)
+        for mutate in (lambda w: w['decisions'][0].update(p=True),
+                       lambda w: w['decisions'][0].update(p=99),
+                       lambda w: w['decisions'][0]['e'][0]['v'].update(s=True),
+                       lambda w: w['decisions'][0]['e'][0]['v'].update(u=[999]),
+                       lambda w: w['decisions'][0]['e'][0]['v'].update(u=self.prepared['references']['frozen']['source_sets'][1]),
+                       lambda w: w['decisions'][0]['e'][0].update(c=[4]),
+                       lambda w: w['decisions'][0]['e'][0].update(c=[0, 0]),
+                       lambda w: w['decisions'].__setitem__(1, copy.deepcopy(w['decisions'][0]))):
+            bad = copy.deepcopy(wire)
+            mutate(bad)
+            with self.assertRaises((review.SmartReviewError, refs.ReferenceError)):
+                review.resolve(prepared=self.prepared, parsed=review.decode_wire(bad), probability_band=self.band)
+        # The provider schema itself still constrains each source to its own units.
+        shape = review.wire_schema(self.prepared)['schema']
+        branches = shape['$defs']['proof']['anyOf']
+        self.assertEqual(branches[0]['properties']['u']['items']['enum'],
+                         self.prepared['references']['frozen']['source_sets'][0])
+        decisions = shape['properties']['decisions']['items']['anyOf']
+        self.assertEqual(decisions[0]['properties']['e']['items']['properties']['c']['items']['enum'], [0])
+
+    def test_eight_source_wire_reduces_schema_and_output_without_dropping_material(self):
+        sources = []
+        for i in range(8):
+            source = copy.deepcopy(self.sources[i % 2])
+            source.update(citation_id=f'fixture:{i}', page_from=i + 1, page_to=i + 1,
+                          chunk_full=(source['chunk_full'] + '\n') * 5)
+            sources.append(source)
+        step = copy.deepcopy(self.step)
+        for hypothesis, count in zip(step['hypotheses'], [3, 2, 3, 2]):
+            hypothesis['checks'] = [f'Check {j}: Observe safely from the authorized position.' for j in range(count)]
+        packet = smart_evidence.review_packet(smart_evidence.build(sources, scope=self.scope))
+        prepared = review.prepare(step=step, packet=packet, symptom_text='Reported stop; signal unknown.', history=[])
+        old_schema = refs.schema(prepared['references']['frozen'])
+        new_schema = review.wire_schema(prepared)
+        parsed = parsed_review(prepared, rejected=())
+        self.assertLess(len(refs.canonical(new_schema)), len(refs.canonical(old_schema)) * .5)
+        self.assertLess(len(refs.canonical(wire_review(parsed))), len(refs.canonical(parsed)) * .6)
+        self.assertEqual(review.decode_wire(wire_review(parsed)), parsed)
+        self.assertEqual(len(packet['validator_records']), 8)
+        self.assertEqual([r['text'] for r in packet['validator_records']], [s['chunk_full'] for s in sources])
+        self.assertEqual(len(prepared['references']['frozen']['proposals']), 5)
+        self.assertTrue(all(len(p['checks']) == n for p, n in zip(prepared['references']['frozen']['proposals'], [3, 2, 3, 2, 3])))
+
+    def test_failure_diagnostic_never_exposes_error_body_or_source_text(self):
+        detail = review.failure_diagnostic(RuntimeError('OpenAI provider returned HTTP 429 PRIVATE_TOKEN_RAW_BODY'),
+            call_rows=[{'purpose': 'smart_diagnostic_independent_review', 'error': 'RuntimeError',
+                        'accounting_state': 'uncertain', 'raw_body': 'PRIVATE_SOURCE'}], elapsed_seconds=1.25)
+        self.assertEqual(detail['category'], 'provider_http')
+        self.assertEqual(detail['http_status'], 429)
+        self.assertEqual(set(detail), {'category', 'error_class', 'elapsed_seconds', 'accounting_state', 'http_status'})
+        self.assertNotIn('PRIVATE', refs.canonical(detail))
+
 
 class SmartReviewEndpointTests(unittest.TestCase):
     @classmethod
@@ -189,7 +273,7 @@ class SmartReviewEndpointTests(unittest.TestCase):
             self.assertEqual(kw['models'], [self.m.V13_FAST_MODEL])
             self.assertLessEqual(kw['timeout'], 20)
             rejected = (1,) if len(self.prepared[-1]['step']['hypotheses']) == 4 else ()
-            return parsed_review(self.prepared[-1], rejected=rejected), 'offline-review'
+            return wire_review(parsed_review(self.prepared[-1], rejected=rejected)), 'offline-review'
         self.provider = self.patches.enter_context(patch.object(self.m, '_v13_json_models', side_effect=provider))
         self.patches.enter_context(patch.object(self.m, '_sd_llm_finalize', side_effect=denied))
 
@@ -284,6 +368,10 @@ class SmartReviewEndpointTests(unittest.TestCase):
                 self.assertEqual(body['meta']['v13_accounting_complete'], mode == 'malformed')
                 if mode == 'timeout':
                     self.assertGreater(body['meta']['v13_uncertain_cost_usd'], 0)
+                    diagnostic = body['meta']['smart_review']['transport']
+                    self.assertEqual(diagnostic['category'], 'timeout')
+                    self.assertEqual(diagnostic['error_class'], 'ReadTimeout')
+                    self.assertEqual(diagnostic['accounting_state'], 'uncertain')
 
     def test_each_planner_fallback_keeps_review_time_and_call_slot(self):
         budget = self.m._assistant_core_new_budget('smart_diagnostic', company_id='fixture-company')

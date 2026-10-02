@@ -19711,7 +19711,7 @@ def _sd_review_step(*, step: dict, state: dict, language: str) -> tuple[dict, di
         parsed, model = _v13_json_models(
             _smart_review.messages(prepared, language=language,
                 symptom_text=str(state.get("symptom_text") or ""), history=state.get("history") or []),
-            models=[V13_FAST_MODEL], json_schema=_retrieval_review_references.schema(prepared["references"]["frozen"]),
+            models=[V13_FAST_MODEL], json_schema=_smart_review.wire_schema(prepared),
             effort=V13_FAST_EFFORT, reasoning_mode="", timeout=min(20, int(budget.remaining() - 1)),
             max_output_tokens=min(4200, V13_FAST_MAX_OUTPUT_TOKENS),
             company_id=str(state.get("company_id") or ""), purpose="smart_diagnostic_independent_review")
@@ -19719,9 +19719,10 @@ def _sd_review_step(*, step: dict, state: dict, language: str) -> tuple[dict, di
         raise
     except Exception as exc:
         raise HTTPException(status_code=502, detail={"code": "SMART_DIAGNOSTIC_REVIEW_FAILED",
-                                                    "reason": type(exc).__name__}) from None
+            "reason": type(exc).__name__, "review_diagnostic": _smart_review.failure_diagnostic(
+                exc, call_rows=budget.call_log, elapsed_seconds=time_module.monotonic() - started)}) from None
     try:
-        reviewed, seal, summary = _smart_review.resolve(prepared=prepared, parsed=parsed,
+        reviewed, seal, summary = _smart_review.resolve(prepared=prepared, parsed=_smart_review.decode_wire(parsed),
                                                        probability_band=_sd_probability_band)
     except _smart_review.SmartReviewError as exc:
         if str(exc) in {"question_not_supported", "no_supported_hypotheses", "question_has_no_supported_target", "no_positive_supported_hypothesis"}:
@@ -19737,6 +19738,7 @@ def _sd_review_step(*, step: dict, state: dict, language: str) -> tuple[dict, di
     updated["grounding_review"] = seal
     updated["grounding_review_meta"] = {"policy_version": _smart_review.POLICY_VERSION,
         "outcome": "completed", "decision_validated": True, "attempt_limit": 1, "model": model,
+        "wire_version": _smart_review.WIRE_VERSION,
         "elapsed_seconds": round(time_module.monotonic() - started, 3),
         "accepted_hypothesis_ids": summary["accepted_hypothesis_ids"],
         "rebound_hypothesis_ids": summary["rebound_hypothesis_ids"],
@@ -19757,6 +19759,8 @@ def _sd_review_error_response(exc: HTTPException, language: str) -> Optional[dic
                 "question": _sd_empty_question(0), "hypotheses": [], "citations": [], "rg_links": [],
                 "session_state_json": "", "detail": {"code": code, "reason": str(detail.get("reason") or "")},
                 "meta": {"cacheable": False, "smart_review": {"outcome": "error", "attempt_limit": 1}}}
+    if isinstance(detail.get("review_diagnostic"), dict):
+        response["meta"]["smart_review"]["transport"] = detail["review_diagnostic"]
     _sd_flatten_question(response, response["question"])
     _sd_flatten_hypotheses(response, [])
     _sd_flatten_citations(response, [], [])

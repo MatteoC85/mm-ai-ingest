@@ -5,11 +5,31 @@ module enforces source ownership, complete checks, question coverage and replay.
 """
 from copy import deepcopy
 import json
+import re
 
 from . import review_references as refs
 
 POLICY_VERSION = 'smart-reviewed-proposals-v1'
 MAX_CHECK_CHARS = 2000
+WIRE_VERSION = 'smart-review-wire-v1'
+
+# Only the transport representation changes. The private seal and the Root
+# validator continue to use the complete, descriptive reference contract.
+WIRE_INSTRUCTION = """
+WIRE FORMAT (use these keys in your response, not the long names above):
+Return {"decisions":[...]}. Each decision is {p,r,b,n,e}:
+p=proposal_index; r=reason (supported means accept, every other reason reject);
+b=blocking_checks; n=note; e=proofs. For supported: b=[], n="".
+Each proof is {c,v}: c=check_indices, v={s,k,o,u,t,a}. Within v: s=source_index;
+k=support_type with m=documented_mechanism, i=bounded_inference, c=documented_check;
+o=observation_units; u=source_units; t=target_units;
+a=applicability with s=same_target, d=documented_dependency.
+k=m/i explicitly asserts supports_cause=true; k=c asserts false.
+AUTHORIZATION rows are [source_index, source_units, target_units]; check rows are
+[proposal_index, check_indices]. All IDs keep their exact original meaning.
+One proof may cover several checks only when its source actually supports each.
+Do not repeat equivalent proofs. Do not return rewritten claims or copied quotes.
+""".strip()
 
 INSTRUCTION = refs.INSTRUCTION + """
 
@@ -114,13 +134,106 @@ def prepare(*, step, packet, symptom_text, history, language='en'):
 def messages(prepared, *, language, symptom_text, history):
     references = prepared['references']
     frozen = references['frozen']
-    return [{'role': 'system', 'content': INSTRUCTION}, {'role': 'user', 'content':
+    authorized = refs.authorized_references(frozen)
+    # Lossless text-free authorization index; no source/observation is omitted.
+    compact_authorized = {
+        'sources': [[s['source_index'], s['source_units'], s['target_units']] for s in authorized['sources']],
+        'checks': [[p['proposal_index'], p['check_indices']] for p in authorized['proposals']],
+        'observation_units': authorized['observation_units'],
+    }
+    return [{'role': 'system', 'content': INSTRUCTION + '\n\n' + WIRE_INSTRUCTION}, {'role': 'user', 'content':
         f'RESPONSE_LANGUAGE: {language}\nDECLARED_CONTEXT: {refs.canonical(symptom_text)}\n'
         f'ANSWER_HISTORY: {refs.canonical(history or [])}\n'
         f'PROPOSALS: {refs.canonical(frozen["proposals"])}\n'
         f'OBSERVED_UNITS: {refs.canonical(references["observed_units"])}\n'
-        f'AUTHORIZED_REFERENCES: {refs.canonical(refs.authorized_references(frozen))}\n'
+        f'AUTHORIZATION: {refs.canonical(compact_authorized)}\n'
         f'REVIEW_PACKET: {references["model_json"]}\nReturn decisions only.'}]
+
+
+def wire_schema(prepared):
+    """Share source-scoped proof branches across ALL proposal/check counts.
+
+    A small proposal-local wrapper owns check indices. Source/target ownership
+    and local checks both remain constrained in the provider schema itself.
+    """
+    authorized = refs.authorized_references(prepared['references']['frozen'])
+    obj = lambda props: dict(type='object', additionalProperties=False, properties=props, required=list(props))
+    def ids(values, limit):
+        return (dict(type='array', maxItems=limit, items=dict(type='integer', enum=values)) if values
+                else dict(type='array', maxItems=0, items=dict(type='integer')))
+    proofs = []
+    for source in authorized['sources']:
+        proofs.append(obj({
+            's': dict(type='integer', enum=[source['source_index']]),
+            'k': dict(type='string', enum=['m', 'i', 'c']),
+            'o': ids(authorized['observation_units'], 4),
+            'u': ids(source['source_units'], 6),
+            't': ids(source['target_units'], 4),
+            'a': dict(type='string', enum=['s', 'd']),
+        }))
+    decisions = []
+    for proposal in authorized['proposals']:
+        decisions.append(obj({
+            'p': dict(type='integer', enum=[proposal['proposal_index']]),
+            'r': dict(type='string', enum=list(refs.REASONS)),
+            'b': ids(proposal['check_indices'], refs.MAX_CHECKS),
+            'n': dict(type='string', maxLength=220),
+            'e': dict(type='array', maxItems=refs.MAX_PROOFS, items=obj({
+                'c': ids(proposal['check_indices'], refs.MAX_CHECKS), 'v': {'$ref': '#/$defs/proof'}})),
+        }))
+    shape = obj({'decisions': dict(type='array', minItems=len(decisions), maxItems=len(decisions),
+                                  items={'anyOf': decisions})})
+    shape['$defs'] = {'proof': {'anyOf': proofs}}
+    return dict(name='machinemind_smart_review_wire_v1', strict=True, schema=shape)
+
+
+def decode_wire(parsed):
+    """Strict, lossless expansion; never fill in missing evidence or decisions."""
+    require(isinstance(parsed, dict) and set(parsed) == {'decisions'}, 'wire_envelope')
+    require(isinstance(parsed['decisions'], list), 'wire_decisions')
+    result = []
+    kinds = {'m': 'documented_mechanism', 'i': 'bounded_inference', 'c': 'documented_check'}
+    applicability = {'s': 'same_target', 'd': 'documented_dependency'}
+    for decision in parsed['decisions']:
+        require(isinstance(decision, dict) and set(decision) == {'p', 'r', 'b', 'n', 'e'}, 'wire_decision_keys')
+        require(isinstance(decision['r'], str) and decision['r'] in refs.REASONS, 'wire_reason')
+        require(isinstance(decision['e'], list), 'wire_proofs')
+        proofs = []
+        for wrapped in decision['e']:
+            require(isinstance(wrapped, dict) and set(wrapped) == {'c', 'v'}, 'wire_check_proof_keys')
+            proof = wrapped['v']
+            require(isinstance(proof, dict) and set(proof) == {'s', 'k', 'o', 'u', 't', 'a'}, 'wire_proof_keys')
+            require(isinstance(proof['k'], str) and proof['k'] in kinds, 'wire_support_type')
+            require(isinstance(proof['a'], str) and proof['a'] in applicability, 'wire_applicability')
+            proofs.append({'source_index': proof['s'], 'supports_cause': proof['k'] != 'c',
+                           'support_type': kinds[proof['k']], 'observation_units': deepcopy(proof['o']),
+                           'source_units': deepcopy(proof['u']), 'target_units': deepcopy(proof['t']),
+                           'applicability': applicability[proof['a']], 'check_indices': deepcopy(wrapped['c'])})
+        result.append({'proposal_index': decision['p'], 'verdict': 'accept' if decision['r'] == 'supported' else 'reject',
+                       'reason': decision['r'], 'blocking_checks': deepcopy(decision['b']),
+                       'note': decision['n'], 'proofs': proofs})
+    return {'decisions': result}
+
+
+def failure_diagnostic(error, *, call_rows, elapsed_seconds):
+    """Only categorized transport metadata; never expose exception/provider text."""
+    rows = [r for r in call_rows if r.get('purpose') == 'smart_diagnostic_independent_review']
+    row = rows[-1] if rows else {}
+    error_class = row.get('error')
+    known = {'ReadTimeout', 'ConnectTimeout', 'Timeout', 'ConnectionError', 'JSONDecodeError', 'RuntimeError'}
+    error_class = error_class if error_class in known else 'unclassified'
+    category = ('timeout' if error_class in {'ReadTimeout', 'ConnectTimeout', 'Timeout'} else
+                'connection' if error_class == 'ConnectionError' else
+                'response_format' if error_class == 'JSONDecodeError' else 'provider_or_transport')
+    # This exact phrase is generated by our transport from an integer status.
+    status = re.search(r'OpenAI provider returned HTTP ([1-5][0-9]{2})(?:\D|$)', str(error))
+    result = {'category': 'provider_http' if status else category, 'error_class': error_class,
+              'elapsed_seconds': round(elapsed_seconds, 3),
+              'accounting_state': row.get('accounting_state') if row.get('accounting_state') in
+                  {'settled', 'uncertain', 'not_sent', 'pending'} else 'unknown'}
+    if status:
+        result['http_status'] = int(status.group(1))
+    return result
 
 
 def resolve(*, prepared, parsed, probability_band):
