@@ -35,12 +35,16 @@ def _numbers(text: str) -> list[int]:
 
 
 def observe_structure(answer: str, occurrences: list[dict], *, fields: Callable,
-                      notes: tuple[dict, ...], notes_present: Callable) -> dict:
-    """Observe the selected, admitted Step occurrences, not words in a facet.
+                      notes: tuple[dict, ...], notes_present: Callable,
+                      source_ordered: bool = True) -> dict:
+    """Observe admitted Steps without conflating them with synthesized actions.
 
     A malformed/ambiguous selection never becomes a guessed 1..N range. Sparse
     selections keep their actual source numbers. The digest binds the text
     inspected, but is not an authorization or an authenticity token.
+    Only an explicit source-ordered producer requires visible source ordinals.
+    A manual/mixed answer needs independent semantic order/coverage review;
+    retrieved Step ordinals are diagnostic data, never a guessed action list.
     """
     units = []
     seen = set()
@@ -49,20 +53,25 @@ def observe_structure(answer: str, occurrences: list[dict], *, fields: Callable,
         cid = str(occurrence.get("citation_id") or "").strip()
         raw = str(data.get("step_number") or "").strip()
         if not cid or cid in seen or not re.fullmatch(r"[1-9][0-9]*", raw):
-            return {"version": VERSION, "usable": False, "reason": "ambiguous_step_selection"}
+            if source_ordered:
+                return {"version": VERSION, "usable": False, "reason": "ambiguous_step_selection"}
+            continue
         seen.add(cid)
         units.append({"citation_id": cid, "number": int(raw),
                       "description_sha256": digest(str(data.get("description") or "")),
                       "title_sha256": digest(str(data.get("title") or ""))})
     expected = [u["number"] for u in units]
-    usable = bool(expected and expected == sorted(set(expected)))
+    usable = bool(expected and expected == sorted(set(expected))) if source_ordered else bool(answer.strip())
     visible = _numbers(answer)
     present = bool(all(notes_present(answer, t) for n in notes for t in n["texts"]))
     return {"version": VERSION, "usable": usable,
-            "basis": "admitted_step_occurrences_not_facet_word_overlap",
+            "basis": ("admitted_step_occurrences_not_facet_word_overlap" if source_ordered
+                      else "answer_local_numbering_requires_semantic_order_review"),
+            "source_sequence_required": source_ordered,
             "answer_sha256": digest(answer), "units": units,
-            "expected_numbers": expected, "visible_numbers": visible,
-            "sequence_complete": bool(usable and visible == expected),
+            "source_numbers": expected,
+            "expected_numbers": expected if source_ordered else [], "visible_numbers": visible,
+            "sequence_complete": bool(usable and visible == expected) if source_ordered else None,
             "source_notes": len(notes), "source_notes_present": present,
             "semantic_coverage_proven": False}
 
@@ -149,6 +158,10 @@ PROTOCOL_INSTRUCTIONS = (
     "Check every mandatory facet, source instruction, precaution, numeric value, condition, and translation. "
     "PROCEDURE_STRUCTURE describes only source-occurrence numbers and literal source-note retention; "
     "it does not prove relevance, translation, or semantic coverage. Verify those against SOURCES. "
+    "When source_sequence_required=false, CURRENT_ANSWER is a manual or mixed-source synthesis: its "
+    "numbers are local presentation order, not the numbers of retrieved Step citations. Independently "
+    "check that every requested operation is present in the correct source-supported operational order, "
+    "with all prerequisites and precautions; sparse retrieved Step numbers do not define that sequence. "
     "A requirement is an obligation, not text that must be echoed: an ordered source sequence can "
     "satisfy 'all steps in order' without repeating that phrase. Never rewrite merely to echo a requirement. "
     "If CURRENT_ANSWER is fully correct, set outcome=pass, reply_mode=retain, answer='', edits=[]. "

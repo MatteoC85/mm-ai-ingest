@@ -1,0 +1,50 @@
+{
+  "origin": "Synthetic/minimized regression from ASK003 metadata shape: mixed 7-action answer, sparse Step citations, one body-only review edit. No customer identifiers or source contents.",
+  "answer": "1. 1. Stop the machine and isolate the supply.\n2. 2. Keep the stop button pressed and wear gloves and eye protection.\n3. Move the material manually through guide A, then guide B.\n4. 4. Align the material without twisting it; keep clear of the enabled machine.\n5. 5. Release the roller pressure using the lever; qualified operators only.\n6. 6. Feed the material into the clamp; keep clear of edges and moving parts.\n7. 7. Lock the lever, adjust the guide and verify free movement; do not apply excessive pressure.\n\nStep notes and safety precautions - original wording\n\nStep 1\n> Isolate the supply before starting.\n\nStep 5\n> Keep the stop button pressed; wear gloves and eye protection.\n\nStep 6\n> Keep clear of the enabled machine.\n\nStep 7\n> Qualified operators only.\n\nStep 8\n> Keep clear of edges and moving parts.\n\nStep 9\n> Do not apply excessive pressure.",
+  "verdict": {
+    "outcome": "rewrite",
+    "covered_facets": [
+      "Complete requested actions in safe order",
+      "Required safety precautions"
+    ],
+    "missing_facets": [],
+    "covered_answer_types": [
+      "ordered_actions",
+      "safety_conditions"
+    ],
+    "missing_answer_types": [],
+    "missing_list_items": [],
+    "reply_mode": "edit",
+    "edits": [
+      {
+        "block_id": "step_3",
+        "text": "Move the material manually through guide A, then guide B."
+      }
+    ]
+  },
+  "source_numbers": [
+    1,
+    5,
+    6,
+    7,
+    8,
+    9
+  ],
+  "visible_numbers": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "source_notes": {
+    "1": "Isolate the supply before starting.",
+    "5": "Keep the stop button pressed; wear gloves and eye protection.",
+    "6": "Keep clear of the enabled machine.",
+    "7": "Qualified operators only.",
+    "8": "Keep clear of edges and moving parts.",
+    "9": "Do not apply excessive pressure."
+  }
+}

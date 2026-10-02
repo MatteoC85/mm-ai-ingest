@@ -453,6 +453,8 @@ def validate_response(
              or getattr(decision, "request_kind", None) == runtime.KIND_PROCEDURE)
         and callable(runtime.source_fields) and callable(runtime.source_sections)
     )
+    source_ordered_procedure = bool(protected_procedure
+        and out.get("_assistant_core_source_ordered_procedure") is True)
     # These occurrences have just passed the same request admission as synthesis.
     # Preserve source-owned notes even when a free-text reviewer shortens prose.
     procedure_occurrences = [allowed[cid] for cid in
@@ -600,7 +602,8 @@ def validate_response(
                     out.pop("answer_html", None)
             procedure_structure = _procedure_review.observe_structure(answer, procedure_occurrences,
                 fields=runtime.source_fields, notes=source_notes,
-                notes_present=_final_contract.source_note_present)
+                notes_present=_final_contract.source_note_present,
+                source_ordered=source_ordered_procedure)
         if (
             not semantic_contract_pass
             and str(out.get("status") or "").lower() == "answered"
@@ -608,6 +611,7 @@ def validate_response(
             and (
                 _assistant_core_should_semantic_verify_answer(decision)
                 or bool(out.get("_assistant_core_force_semantic_verify"))
+                or (protected_procedure and not source_ordered_procedure)
             )
         ):
             semantic_contract = _assistant_core_verify_or_repair_answer(
@@ -782,14 +786,36 @@ def validate_response(
                     semantic_complete=semantic_contract_pass,
                     semantic_partial=semantic_contract_partial, source_proof=source_proof,
                     final_answer=answer, grounding_proof=grounding_proof)
+            if source_ordered_procedure and not procedure_structure.get("usable"):
+                # The bundle promises source numbering. Missing, duplicated or
+                # malformed Step ordinals cannot silently fall back to a generic
+                # text threshold, even if the upstream renderer was expected to
+                # provide a complete manifest.
+                answer_contract_result.update(passed=False, complete=False,
+                    reason="source_step_structure_unverifiable")
             if procedure_structure.get("usable"):
                 final_structure = _procedure_review.observe_structure(answer, procedure_occurrences,
                     fields=runtime.source_fields, notes=source_notes,
-                    notes_present=_final_contract.source_note_present)
+                    notes_present=_final_contract.source_note_present,
+                    source_ordered=source_ordered_procedure)
                 answer_contract_result["procedure_structure"] = final_structure
-                if not final_structure.get("sequence_complete") or not final_structure.get("source_notes_present"):
+                if ((source_ordered_procedure and not final_structure.get("sequence_complete"))
+                        or not final_structure.get("source_notes_present")):
                     answer_contract_result.update(passed=False, complete=False,
                         reason="source_step_sequence_or_notes_incomplete")
+            if protected_procedure and not source_ordered_procedure:
+                # A generic/manual answer cannot inherit a completeness proof
+                # from incidental Step citations, or from a deterministic text
+                # threshold when the independent order/safety review is absent.
+                required_facets = set(decision.required_facets) | {
+                    item.facet for item in decision.facet_queries if item.must_cover}
+                required_types = set(decision.required_answer_types) | {REQ_ORDERED_ACTIONS}
+                complete_review = bool(semantic_contract_pass
+                    and required_facets.issubset(semantic_contract.get("covered_facets") or [])
+                    and required_types.issubset(semantic_contract.get("covered_answer_types") or []))
+                if not complete_review:
+                    answer_contract_result.update(passed=False, complete=False,
+                        reason="manual_procedure_semantic_review_incomplete")
             semantic_rejected_with_evidence = bool(
                 out.pop("_assistant_core_semantic_rejected_with_evidence", False)
             )
@@ -947,6 +973,7 @@ def validate_response(
     if not repair_pending:
         out.pop("_assistant_core_validation_evidence", None)
         out.pop("_assistant_core_force_semantic_verify", None)
+        out.pop("_assistant_core_source_ordered_procedure", None)
         out.pop("_assistant_core_repair_context", None)
         out.pop("_assistant_core_repair_needed", None)
         out.pop("_assistant_core_repair_attempted", None)

@@ -8,6 +8,7 @@ structured/overview synthesis, validation/repair and cache remain separate gates
 from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass, replace
+import re
 from typing import Any, Callable
 from ..evidence.ask_input import _same_value, ask_request_key
 from ..evidence.contracts import EvidenceContractError, SourceType
@@ -17,6 +18,19 @@ from ..retrieval.residual_producers import ResidualSourceAdapters
 from ..retrieval.supplemental_evidence import storage_key
 
 GENERATION_VERSION = "ask-generic-generation-evidence-p6b4o-v1"
+
+
+def _procedure_point_bodies(points: list[dict]) -> list[dict]:
+    """The generic renderer owns list ordinals; keep action text and citations."""
+    output = []
+    for point in points:
+        if not isinstance(point, dict):
+            output.append(point)
+            continue
+        text = str(point.get("text") or "")
+        body = re.sub(r"^[ \t]*(?:\*\*|__)?[1-9][0-9]*[.)](?:\*\*|__)?(?:[ \t]+|\r?\n)", "", text, count=1)
+        output.append({**point, "text": body})
+    return output
 
 @dataclass(frozen=True, slots=True, repr=False)
 class AskGenerationRuntime:
@@ -181,6 +195,8 @@ def generate_ask_response(
         system_msg += " Include the requested practical checks as a compact checklist grounded in the sources."
     if REQ_SAFETY_CONDITIONS in required_answer_types:
         system_msg += " Include directly applicable authorization or safety conditions without replacing the requested technical answer."
+    if runtime.preserve_procedure_points and information_task in {INFO_PROCEDURE_FULL, INFO_PROCEDURE_SEGMENT}:
+        system_msg += " Each grounded_points.text contains action prose only; do not prefix it with a numbered list heading. The server numbers the ordered points."
     if overview_catalog_requested:
         system_msg += (
             " For a machine overview, MACHINE_CATALOG is the authoritative recall inventory. "
@@ -248,8 +264,11 @@ def generate_ask_response(
             # Unlike ProcedureBundle, a manual answer has no deterministic Step
             # reconstruction after rendering: the UI cap must not delete actions.
             dynamic_max_points = 8
+        points = list(parsed.get("grounded_points") or [])
+        if runtime.preserve_procedure_points and information_task in {INFO_PROCEDURE_FULL, INFO_PROCEDURE_SEGMENT}:
+            points = _procedure_point_bodies(points)
         answer, final_citations = _render_grounded_answer_points(
-            grounded_points=list(parsed.get("grounded_points") or []),
+            grounded_points=points,
             citations=candidates,
             max_points=dynamic_max_points,
             q=q,

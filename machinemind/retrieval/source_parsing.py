@@ -104,6 +104,21 @@ def procedure_ui_fields(citation: dict, *, runtime: ProcedureUiFieldsRuntime) ->
     if not raw:
         return {}
 
+    # Structured Step ingestion uses the shared section chunker, which emits
+    # `SECTION: <heading>` immediately before the original <heading>. Collapsing
+    # those chunks retains both lines. The section reader otherwise treats the
+    # wrapper's `SECTION:` prefix as the end of the preceding safety note.
+    # Remove only that exact duplicated wrapper in a canonical Step envelope;
+    # retain the original heading, all content, unmatched markers and inline
+    # uses of SECTION. This is representation parsing, not semantic cleaning.
+    if re.search(r"(?m)^SOURCE_TYPE:[ \t]*step[ \t]*$", raw):
+        lines = [line for line in raw.split("\n") if line.strip()]
+        raw = "\n".join(
+            line for index, line in enumerate(lines)
+            if not (line.strip().startswith("SECTION: ") and index + 1 < len(lines)
+                    and line.strip()[len("SECTION: "):].strip() == lines[index + 1].strip())
+        )
+
     known = {
         "source_type", "title", "procedure_type", "short_description",
         "step_number", "description", "category", "solution", "notes",

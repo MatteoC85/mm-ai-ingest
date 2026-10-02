@@ -522,6 +522,10 @@ def verify_or_repair_answer(
         for x in decision.required_answer_types
         if str(x or "").strip()
     })
+    if (_guarded(runtime, request, decision)
+            and (decision.information_task in {runtime.INFO_PROCEDURE_FULL, runtime.INFO_PROCEDURE_SEGMENT}
+                 or decision.request_kind == "procedure")):
+        requirements = sorted(set(requirements) | {REQ_ORDERED_ACTIONS})
     hard_requirements = sorted(set(requirements) & {
         REQ_NUMERIC_VALUE,
         REQ_INTERFACE_LOCATIONS,
@@ -605,6 +609,7 @@ def verify_or_repair_answer(
         review_view = {k: observation[k] for k in ("usable", "basis", "expected_numbers",
             "visible_numbers", "sequence_complete", "source_notes", "source_notes_present",
             "semantic_coverage_proven")}
+        review_view["source_sequence_required"] = observation.get("source_sequence_required", True)
         review_view["units"] = [{"citation_id": u["citation_id"], "number": u["number"]}
             for u in observation["units"]]
         user_msg += "\n\nPROCEDURE_STRUCTURE:\n" + json.dumps(review_view, ensure_ascii=False)

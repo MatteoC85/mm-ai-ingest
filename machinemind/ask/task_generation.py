@@ -440,6 +440,11 @@ def structured_ask(
         # expansion) and must survive Assistant Core validation even when they
         # were not part of the original semantic retrieval top-k.
         "_assistant_core_validation_evidence": [_copy_candidate(c) for c in final_citations],
+        # Server-owned synthesis provenance, never inferred from retrieved Step
+        # citations or a model verdict. Only the deterministic bundle renderer
+        # promises that visible ordinals reproduce the selected source Steps.
+        **({"_assistant_core_source_ordered_procedure": True}
+           if runtime.preserve_complete and procedure_sequence_mode and sectioned_answer else {}),
         # Sparse procedural checklists combine non-contiguous conditions. Their
         # semantic completeness cannot be judged reliably by phrase overlap alone,
         # so the existing bounded third-call verifier is enabled only for this mode.
