@@ -5,6 +5,7 @@ module enforces source ownership, complete checks, question coverage and replay.
 """
 from copy import deepcopy
 import json
+import math
 import re
 
 from . import review_references as refs
@@ -44,6 +45,14 @@ after your rejected hypotheses are removed. Alternatives are possible answers,
 not observations. Every question check needs an applicable documented_check
 proof with supports_cause=false, observation_units=[]; it needs no causal proof.
 Reject a question whose explanation depends on an unsupported/rejected cause.
+Each cause has its immutable hypothesis_id; the question lists target_hypotheses.
+At least one of those targets must be an ACCEPTED, non-excluded hypothesis; never
+invent a new target or accept a question after all its declared targets are rejected.
+An abstention_control is an exact SERVER-CANONICAL unknown/cannot-check button:
+it is an interface choice to withhold an observation, not a machine fact requiring
+manual wording. It remains immutable and visible. All technical alternatives,
+question/why claims, operating instructions and safety notes still need support;
+this distinction never exempts their source proofs or complete check coverage.
 For causes, the original causal-proof requirement remains mandatory.
 Evidence IDs originally chosen by the generator are unvalidated: you may bind a
 proposal to another source ONLY within this packet and with valid support units.
@@ -56,7 +65,9 @@ No parameter change since a stop does not validate settings made before the stop
 
 
 class SmartReviewError(ValueError):
-    pass
+    def __init__(self, code, *, validated_summary=None):
+        super().__init__(code)
+        self.validated_summary = validated_summary
 
 
 def require(value, code):
@@ -103,7 +114,8 @@ def prepare(*, step, packet, symptom_text, history, language='en'):
     proposals = []
     for index, h in enumerate(hypotheses):
         require(all(isinstance(h.get(k), str) and h[k].strip() for k in ('id', 'label', 'why')), 'incomplete_hypothesis')
-        proposals.append({'proposal_index': index, 'kind': 'cause',
+        proposals.append({'proposal_index': index, 'kind': 'cause', 'hypothesis_id': h['id'],
+                          'hypothesis_status': h.get('status', 'open'),
                           'cause': h['label'] + ('\n' + h['description'] if h.get('description') else ''),
                           'why': h['why'],
                           'checks': [{'check_index': i, 'text': s} for i, s in enumerate(h.get('checks') or [])]})
@@ -114,8 +126,9 @@ def prepare(*, step, packet, symptom_text, history, language='en'):
         question_index = len(proposals)
         texts = [refs.canonical({'question_text': q['question_text'], 'why_asked': q.get('why_asked', '')}),
                  refs.canonical({'safety_level': q.get('safety_level'), 'safety_note': q.get('safety_note', '')}),
-                 refs.canonical({'options': q.get('options') or []})]
+                 refs.canonical(question_option_roles(q.get('options') or []))]
         proposals.append({'proposal_index': question_index, 'kind': 'diagnostic_question',
+                          'target_hypotheses': list(q.get('target_hypotheses') or []),
                           'cause': 'Current closed diagnostic question',
                           'why': 'Check every field and all options against the sources and the hypotheses you accept.',
                           'checks': [{'check_index': i, 'text': s} for i, s in enumerate(texts)]})
@@ -129,6 +142,17 @@ def prepare(*, step, packet, symptom_text, history, language='en'):
     return {'step': deepcopy(step), 'packet': packet, 'references': references, 'language': language,
             'observed_query': observed, 'question_index': question_index,
             'context_digest': refs.digest({'symptom_text': symptom_text, 'history': history or []})}
+
+
+def question_option_roles(options):
+    """Tag only exact server-canonical abstention labels; preserve every option."""
+    canonical_controls = [
+        {'id': 'unknown', 'label_it': 'Non so', 'label_en': "I don't know"},
+        {'id': 'unknown', 'label_it': 'Non so / non verificabile in sicurezza',
+         'label_en': 'Unknown / cannot check safely'},
+    ]
+    return {'options': [deepcopy(option) for option in options if option not in canonical_controls],
+            'abstention_controls': [deepcopy(option) for option in options if option in canonical_controls]}
 
 
 def messages(prepared, *, language, symptom_text, history):
@@ -239,12 +263,17 @@ def failure_diagnostic(error, *, call_rows, elapsed_seconds):
 def resolve(*, prepared, parsed, probability_band):
     result = refs.validate(parsed=parsed, frozen=prepared['references']['frozen'],
                            records=prepared['packet']['validator_records'], observed_query=prepared['observed_query'])
+    def usable(value, code):
+        if not value:
+            # Preserve a VALID semantic rejection separately from transport or
+            # malformed-proof errors. Never expose its rejected draft as an answer.
+            raise SmartReviewError(code, validated_summary=result['summary'])
     accepted_indices = [v['input_index'] for v in result['summary']['verdicts'] if v['accepted']]
     by_index = dict(zip(accepted_indices, result['causes']))
     original = prepared['step']
     question_index = prepared['question_index']
     if question_index is not None:
-        require(question_index in by_index, 'question_not_supported')
+        usable(question_index in by_index, 'question_not_supported')
     accepted = []
     for index, h in enumerate(original['hypotheses']):
         if index not in by_index:
@@ -255,9 +284,9 @@ def resolve(*, prepared, parsed, probability_band):
                    citations_json=json.dumps(ids, ensure_ascii=False))
         accepted.append(row)
     active = [h for h in accepted if h.get('status') != 'excluded']
-    require(bool(active), 'no_supported_hypotheses')
+    usable(bool(active), 'no_supported_hypotheses')
     total = sum(float(h.get('probability_pct') or 0) for h in active)
-    require(total > 0, 'no_positive_supported_hypothesis')
+    usable(total > 0, 'no_positive_supported_hypothesis')
     accumulated = 0.0
     for index, h in enumerate(active):
         pct = round(100.0 - accumulated, 1) if index == len(active) - 1 else round(float(h['probability_pct']) * 100.0 / total, 1)
@@ -277,7 +306,7 @@ def resolve(*, prepared, parsed, probability_band):
         q = out['question']
         accepted_ids = {h['id'] for h in active}
         q['target_hypotheses'] = [hid for hid in q.get('target_hypotheses') or [] if hid in accepted_ids]
-        require(bool(q['target_hypotheses']), 'question_has_no_supported_target')
+        usable(bool(q['target_hypotheses']), 'question_has_no_supported_target')
         # This exact explanation was included in the question review. No prose
         # referring to a rejected hypothesis survives via the generator summary.
         caution = ('Relative hypothesis weights are indicative, not statistical certainty or a confirmed diagnosis.'
@@ -296,6 +325,89 @@ def resolve(*, prepared, parsed, probability_band):
                                           if i in by_index and h.get('evidence_ids') != by_index[i]['citations']],
                'claims_digest': seal['output_claims_digest']}
     return out, seal, summary
+
+
+def rejection_diagnostic(error, *, prepared):
+    """Text-free public explanation for a fully validated but unusable review."""
+    summary = error.validated_summary
+    require(isinstance(summary, dict), 'validated_rejection_required')
+    proposals = prepared['references']['frozen']['proposals']
+    verdicts = []
+    for verdict in summary['verdicts']:
+        index = verdict['input_index']
+        verdicts.append({'proposal_index': index, 'kind': proposals[index]['kind'],
+                         'accepted': verdict['accepted'], 'reason': verdict['reason'],
+                         'blocking_checks': list(verdict.get('blocking_checks') or [])})
+    return {'policy_version': POLICY_VERSION, 'wire_version': WIRE_VERSION,
+            'outcome': 'rejected', 'decision_validated': True, 'usable_turn': False,
+            'failure_reason': str(error), 'attempt_limit': 1,
+            'accepted_proposals': summary['accepted_causes'], 'rejected_proposals': summary['rejected_causes'],
+            'question_proposal_index': prepared['question_index'], 'verdicts': verdicts,
+            'admitted_source_count': len(prepared['packet']['validator_records']),
+            'reference_fingerprint': prepared['references']['frozen']['fingerprint'],
+            'semantic_truth_verified_by_code': False}
+
+
+def debug_capture(*, stage, grounding_packet, raw_draft, normalized_draft, symptom_text,
+                  history, language, parsed_review=None, reference_fingerprint=None, review_format='expanded'):
+    """Opt-in replay data from admitted evidence, never headers or signed state.
+
+    If redaction would change exact evidence or the bounded capture is too large,
+    say explicitly that replay is unavailable; never present clipped data as exact.
+    """
+    def public(value):
+        if isinstance(value, str):
+            value = re.sub(r'https?://[^\s"<>]+', '[link omitted]', value, flags=re.I)
+            return re.sub(r'\b(?:sk-|Bearer\s+)[A-Za-z0-9._-]+', '[credential-like text omitted]', value, flags=re.I)
+        if isinstance(value, list):
+            return [public(v) for v in value]
+        if isinstance(value, dict):
+            forbidden = {'authorization', 'headers', 'api_key', 'password', 'access_token',
+                         'refresh_token', 'state_signature', 'session_state_json'}
+            return {k: '[sensitive field omitted]' if str(k).lower() in forbidden else public(v)
+                    for k, v in value.items()}
+        if isinstance(value, float) and not math.isfinite(value):
+            return '[non-finite value omitted]'
+        return value if value is None or isinstance(value, (bool, int, float)) else '[non-JSON value omitted]'
+    capture = {'schema': 'smart-diagnostic-replay-v1', 'policy_version': POLICY_VERSION,
+               'stage': stage, 'grounding_packet': deepcopy(grounding_packet),
+               'raw_draft': deepcopy(raw_draft), 'normalized_draft': deepcopy(normalized_draft),
+               'symptom_text': symptom_text, 'history': deepcopy(history or []), 'language': language,
+               'parsed_review': deepcopy(parsed_review), 'review_format': review_format,
+               'reference_fingerprint': reference_fingerprint}
+    try:
+        original_fingerprint = refs.digest(capture)
+    except (TypeError, ValueError):
+        original_fingerprint = None  # A malformed provider value must not mask the original error.
+    safe = public(capture)
+    changed = safe != capture or original_fingerprint is None
+    result = {'diagnostic_only': True, 'usable_turn': False, 'capture_fingerprint': original_fingerprint,
+              'exact_replay_available': not changed, 'capture_limit_chars': 100000,
+              'redacted': changed, 'capture': safe}
+    if changed:
+        result['capture_unavailable_reason'] = 'sensitive_or_non_json_text_requires_redaction'
+    if len(refs.canonical(safe)) > result['capture_limit_chars']:
+        # Keep the stage, proposals and verdicts even when complete evidence does
+        # not fit. This preview cannot be passed off as an exact source replay.
+        def preview(value):
+            if isinstance(value, str):
+                return value[:1000] + (' [preview truncated]' if len(value) > 1000 else '')
+            if isinstance(value, list):
+                return [preview(v) for v in value[:32]]
+            if isinstance(value, dict):
+                return {k: preview(v) for k, v in list(value.items())[:32]}
+            return value
+        packet = safe['grounding_packet']
+        safe['grounding_packet'] = {'sources': packet.get('sources', []),
+                                    'fingerprint': packet.get('fingerprint'), 'source_text_omitted_for_size': True}
+        result.update(exact_replay_available=False, capture_unavailable_reason='debug_capture_exceeds_limit',
+                      capture=preview(safe), bounded_preview=True)
+        if len(refs.canonical(result['capture'])) > result['capture_limit_chars']:
+            result['capture']['history'] = []
+            result['capture']['history_omitted_for_size'] = True
+        if len(refs.canonical(result['capture'])) > result['capture_limit_chars']:
+            result['capture']['raw_draft'] = {'omitted_for_size': True}
+    return result
 
 
 def claims_digest(step):

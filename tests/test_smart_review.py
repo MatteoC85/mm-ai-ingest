@@ -94,8 +94,15 @@ class SmartReviewTests(unittest.TestCase):
         self.assertTrue(meta['question_validated'])
 
     def test_question_rejection_or_only_rejected_targets_fails(self):
-        with self.assertRaisesRegex(review.SmartReviewError, 'question_not_supported'):
+        with self.assertRaisesRegex(review.SmartReviewError, 'question_not_supported') as caught:
             self.resolve(reject_question=True)
+        diagnostic = review.rejection_diagnostic(caught.exception, prepared=self.prepared)
+        self.assertEqual(diagnostic['failure_reason'], 'question_not_supported')
+        self.assertEqual(diagnostic['accepted_proposals'], 3)
+        self.assertEqual(diagnostic['verdicts'][-1]['kind'], 'diagnostic_question')
+        self.assertEqual(diagnostic['verdicts'][-1]['reason'], 'unsupported_check')
+        self.assertEqual(diagnostic['verdicts'][-1]['blocking_checks'], [0])
+        self.assertNotIn('note', diagnostic['verdicts'][-1])
         self.step['question']['target_hypotheses'] = ['H2']
         self.prepared = review.prepare(step=self.step, packet=self.packet, symptom_text='Stop', history=[])
         with self.assertRaisesRegex(review.SmartReviewError, 'question_has_no_supported_target'):
@@ -146,6 +153,51 @@ class SmartReviewTests(unittest.TestCase):
         parsed['decisions'][-1]['proofs'][0]['check_indices'] = [0, 1]
         with self.assertRaisesRegex(refs.ReferenceError, 'not_all_checks_supported'):
             review.resolve(prepared=self.prepared, parsed=parsed, probability_band=self.band)
+
+    def test_question_targets_and_only_exact_canonical_abstention_are_visible(self):
+        canonical = {'id': 'unknown', 'label_it': 'Non so / non verificabile in sicurezza',
+                     'label_en': 'Unknown / cannot check safely'}
+        invented = {'id': 'unknown', 'label_it': 'Riavvia', 'label_en': 'Restart the machine'}
+        self.step['question']['options'] = [canonical, invented]
+        self.step['question']['target_hypotheses'] = ['H2']
+        prepared = review.prepare(step=self.step, packet=self.packet, symptom_text='Reported stop.', history=[])
+        proposals = prepared['references']['frozen']['proposals']
+        self.assertEqual([p['hypothesis_id'] for p in proposals[:-1]], ['H1', 'H2', 'H3', 'H4'])
+        self.assertEqual(proposals[-1]['target_hypotheses'], ['H2'])
+        options = json.loads(proposals[-1]['checks'][2]['text'])
+        self.assertEqual(options['abstention_controls'], [canonical])
+        self.assertEqual(options['options'], [invented])
+        self.assertIn('Restart the machine', refs.canonical(options))
+        parsed = parsed_review(prepared, rejected=(1,))
+        with self.assertRaisesRegex(review.SmartReviewError, 'question_has_no_supported_target'):
+            review.resolve(prepared=prepared, parsed=parsed, probability_band=self.band)
+
+    def test_capture_reports_when_redaction_or_size_prevents_exact_replay(self):
+        grounding = smart_evidence.build(self.sources, scope=self.scope)
+        kwargs = dict(stage='review_rejected', grounding_packet=grounding, raw_draft=self.step,
+                      normalized_draft=self.step, symptom_text='Stop', history=[], language='en')
+        self.assertTrue(review.debug_capture(**kwargs)['exact_replay_available'])
+        sensitive = copy.deepcopy(self.step)
+        sensitive['operator_summary'] = 'See https://example.test/?signed=private-token'
+        capture = review.debug_capture(**{**kwargs, 'raw_draft': sensitive})
+        self.assertFalse(capture['exact_replay_available'])
+        self.assertEqual(capture['capture_unavailable_reason'], 'sensitive_or_non_json_text_requires_redaction')
+        self.assertNotIn('private-token', refs.canonical(capture))
+        self.assertEqual(capture['capture']['stage'], 'review_rejected')
+        self.assertEqual(capture['capture']['normalized_draft'], self.step)
+        capture = review.debug_capture(**{**kwargs, 'raw_draft': {**self.step, 'headers': {'Authorization': 'private'}}})
+        self.assertFalse(capture['exact_replay_available'])
+        self.assertNotIn('private', refs.canonical(capture))
+        huge = copy.deepcopy(self.step)
+        huge['operator_summary'] = 'x' * 100001
+        capture = review.debug_capture(**{**kwargs, 'raw_draft': huge})
+        self.assertEqual(capture['capture_unavailable_reason'], 'debug_capture_exceeds_limit')
+        self.assertTrue(capture['bounded_preview'])
+        self.assertEqual(capture['capture']['grounding_packet']['sources'], grounding['sources'])
+        self.assertLess(len(refs.canonical(capture['capture'])), 100000)
+        malformed = review.debug_capture(**{**kwargs, 'parsed_review': {'value': float('nan')}})
+        self.assertFalse(malformed['exact_replay_available'])
+        self.assertIn('non-finite value omitted', refs.canonical(malformed))
 
     def test_wire_roundtrip_preserves_accept_reject_rebinding_and_replay(self):
         parsed = parsed_review(self.prepared)
@@ -358,7 +410,7 @@ class SmartReviewEndpointTests(unittest.TestCase):
                 with patch.object(self.m, '_v13_json_models', self.real_json_models), \
                      patch('machinemind.authority.request_admission.before_egress', return_value=None), \
                      patch.object(self.m.requests, 'post', side_effect=http) as post:
-                    response = self.post('start', symptom_text='Reported stop; signal unknown.')
+                    response = self.post('start', symptom_text='Reported stop; signal unknown.', debug=True)
                 self.assertEqual(response.status_code, 200, response.text)
                 body = response.json()
                 self.assertEqual(body['result_code'], 'TECHNICAL_ERROR')
@@ -366,12 +418,159 @@ class SmartReviewEndpointTests(unittest.TestCase):
                 self.assertEqual(body['meta']['v13_llm_calls'], 1)
                 self.assertGreater(body['meta']['v13_committed_cost_usd'], 0)
                 self.assertEqual(body['meta']['v13_accounting_complete'], mode == 'malformed')
+                capture = body['debug']['smart_review']
+                self.assertTrue(capture['exact_replay_available'])
+                self.assertEqual(capture['capture']['stage'], 'review_transport_failed' if mode == 'timeout' else 'review_contract_invalid')
+                if mode == 'malformed':
+                    self.assertEqual(capture['capture']['parsed_review'], {'decisions': []})
+                    self.assertEqual(capture['capture']['review_format'], 'wire')
                 if mode == 'timeout':
                     self.assertGreater(body['meta']['v13_uncertain_cost_usd'], 0)
                     diagnostic = body['meta']['smart_review']['transport']
                     self.assertEqual(diagnostic['category'], 'timeout')
                     self.assertEqual(diagnostic['error_class'], 'ReadTimeout')
                     self.assertEqual(diagnostic['accounting_state'], 'uncertain')
+
+    def test_valid_rejection_retains_reason_and_admission_on_start_legacy_and_answer(self):
+        def rejected(*args, **kwargs):
+            return wire_review(parsed_review(self.prepared[-1], rejected=(), reject_question=True)), 'offline-review'
+        start = self.start()
+        with patch.object(self.m, '_v13_json_models', side_effect=rejected):
+            responses = [self.post('start', symptom_text='Reported stop; actual signal unknown.', debug=True)]
+            with patch.object(self.m, 'ASSISTANT_CORE_V2_ENABLED', False), \
+                 patch.object(self.m, '_diagnostic_evidence_pipeline', return_value={'citations': self.sources}), \
+                 patch.object(self.m, '_v13_deterministic_evidence_state', return_value=('supported', {})), \
+                 patch.object(self.m, '_sd_semantic_evidence_gate', return_value={'accepted': True, 'decision': 'supported'}), \
+                 patch.object(self.m, '_sd_run_retrieval_assurance', return_value=(True, self.sources, {})):
+                responses.append(self.post('start', symptom_text='Reported stop; actual signal unknown.'))
+            answer_step = copy.deepcopy(self.raw)
+            answer_step['question']['question_text'] = 'Does the HMI show the actual signal?'
+            with patch.object(self.m, '_sd_llm_step_answer', return_value=answer_step):
+                responses.append(self.post('answer', start['session_state_json'], question_id='Q1',
+                    answer={'value': 'unknown', 'api_value': 'unknown', 'label': 'Unknown'}))
+        for response in responses:
+            self.assertEqual(response.status_code, 200, response.text)
+            body = response.json()
+            self.assertFalse(body['ok'])
+            self.assertEqual(body['status'], 'no_sources')
+            self.assertEqual(body['error_code'], 'SMART_DIAGNOSTIC_REVIEW_REJECTED')
+            self.assertEqual(body['error_message'], body['operator_summary'])
+            self.assertEqual(body['hypotheses'], [])
+            self.assertEqual(body['meta']['reason'], 'smart_review_rejected')
+            self.assertTrue(body['meta']['evidence_gate']['accepted'])
+            self.assertEqual(body['meta']['smart_review']['failure_reason'], 'question_not_supported')
+            self.assertEqual(len(body['meta']['smart_review']['verdicts']), 5)
+            self.assertFalse(body['meta']['cacheable'])
+            self.assertNotIn('cannot find enough', body['operator_summary'])
+            self.assertNotIn('grounding_packet', json.loads(body['session_state_json']))
+        capture = responses[0].json()['debug']['smart_review']
+        self.assertTrue(capture['exact_replay_available'])
+        data = capture['capture']
+        packet = smart_evidence.review_packet(data['grounding_packet'])
+        prepared = review.prepare(step=data['normalized_draft'], packet=packet,
+            symptom_text=data['symptom_text'], history=data['history'], language=data['language'])
+        self.assertEqual(prepared['references']['frozen']['fingerprint'], data['reference_fingerprint'])
+        with self.assertRaisesRegex(review.SmartReviewError, 'question_not_supported'):
+            review.resolve(prepared=prepared, parsed=data['parsed_review'], probability_band=self.m._sd_probability_band)
+        for response in responses[1:]:
+            self.assertNotIn('debug', response.json())
+
+    def test_generation_no_sources_capture_precedes_reviewer(self):
+        empty = {**self.raw, 'hypotheses': [], 'status': 'in_progress'}
+        with patch.object(self.m, '_sd_llm_step_start', return_value=empty):
+            before = self.provider.call_count
+            result = self.post('start', symptom_text='Reported stop.', debug=True).json()
+        self.assertEqual(self.provider.call_count, before)
+        self.assertEqual(result['meta']['reason'], 'smart_generation_no_sources')
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['error_code'], 'SMART_DIAGNOSTIC_GENERATION_REJECTED')
+        self.assertEqual(result['error_message'], result['operator_summary'])
+        self.assertFalse(result['meta']['smart_generation']['reviewer_dispatched'])
+        self.assertTrue(result['meta']['evidence_gate']['accepted'])
+        data = result['debug']['smart_review']['capture']
+        self.assertEqual(data['stage'], 'generation_no_sources')
+        self.assertEqual(data['raw_draft'], empty)
+        self.assertEqual(data['normalized_draft']['status'], 'no_sources')
+        self.assertIsNone(data['parsed_review'])
+        self.assertTrue(data['grounding_packet']['bodies'])
+
+    def test_successful_debug_capture_does_not_propagate_into_signed_state(self):
+        start = self.post('start', symptom_text='Reported stop.', debug=True).json()
+        self.assertTrue(start['debug']['smart_review']['exact_replay_available'])
+        state = json.loads(start['session_state_json'])
+        self.assertNotIn('_review_debug', state)
+        self.assertNotIn('grounding_review_debug', state)
+        self.assertNotIn('smart-diagnostic-replay-v1', start['session_state_json'])
+        result = self.post('finalize', start['session_state_json']).json()
+        self.assertTrue(result['final_ready'])
+        self.assertNotIn('debug', result)
+
+    def test_smart_hard_timeout_enters_existing_error_branch_for_every_turn(self):
+        start = self.start()
+        before = self.provider.call_count
+        def timeout(func, payload, secret, **kwargs):
+            return kwargs['on_timeout'](payload, kwargs['hard_timeout_seconds'])
+        with patch.object(self.m, '_infra_run_sync_with_hard_timeout', side_effect=timeout):
+            responses = [self.post('start', symptom_text='Reported stop.'),
+                         self.post('answer', start['session_state_json'], question_id='Q1',
+                                   answer={'value': 'unknown', 'api_value': 'unknown'}),
+                         self.post('finalize', start['session_state_json'])]
+        self.assertEqual(self.provider.call_count, before)
+        for index, response in enumerate(responses):
+            self.assertEqual(response.status_code, 200, response.text)
+            body = response.json()
+            self.assertFalse(body['ok'])  # Worker/Bubble's existing error/busy-release branch.
+            self.assertEqual(body['status'], 'timeout')
+            self.assertEqual(body['result_code'], self.m.RESULT_TIMEOUT)
+            self.assertEqual(body['error_code'], 'SMART_DIAGNOSTIC_TIMEOUT')
+            self.assertEqual(body['error_message'], body['operator_summary'])
+            self.assertFalse(body['final_ready'])
+            self.assertTrue(body['meta']['hard_timeout'])
+            if index:
+                self.assertEqual(body['session_state_json'], start['session_state_json'])
+
+    def test_smart_deadline_and_cost_guard_do_not_report_success(self):
+        start = self.start()
+        before = self.provider.call_count
+        for reason, status in [('request deadline exhausted', 'timeout'), ('request cost exhausted', 'budget_exceeded')]:
+            with self.subTest(status=status):
+                error = self.m._V13BudgetExceeded(reason)
+                with patch.object(self.m._ASSISTANT_CORE_SMART_ENGINE, 'run', side_effect=error):
+                    responses = [self.post('start', symptom_text='Reported stop.')]
+                with patch.object(self.m, '_sd_llm_step_answer', side_effect=error):
+                    responses.append(self.post('answer', start['session_state_json'], question_id='Q1',
+                        answer={'value': 'unknown', 'api_value': 'unknown'}))
+                with patch.object(review, 'replay', side_effect=error):
+                    responses.append(self.post('finalize', start['session_state_json']))
+                for response in responses:
+                    self.assertEqual(response.status_code, 200, response.text)
+                    body = response.json()
+                    self.assertFalse(body['ok'])
+                    self.assertEqual(body['status'], status)
+                    self.assertEqual(body['error_code'], 'SMART_DIAGNOSTIC_' + status.upper())
+                    self.assertTrue(body['error_message'])
+                    self.assertEqual(body['meta']['v13_llm_calls'], 0)
+        self.assertEqual(self.provider.call_count, before)
+
+    def test_initial_no_citations_is_explicit_failure_without_provider(self):
+        def run(request):
+            decision = SimpleNamespace(effective_mode=self.m.MODE_SMART_DIAGNOSTIC, confidence=0,
+                                       relevant_evidence_ids=[], evidence_state='unsupported')
+            response = self.m._assistant_core_synthesize_smart_start(request, {'citations': []}, decision)
+            response['effective_mode'] = self.m.MODE_SMART_DIAGNOSTIC
+            return response
+        before = self.provider.call_count
+        with patch.object(self.m._ASSISTANT_CORE_SMART_ENGINE, 'run', side_effect=run), \
+             patch.object(self.m, '_sd_llm_step_start', side_effect=denied):
+            response = self.post('start', symptom_text='Reported stop.')
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertFalse(body['ok'])
+        self.assertEqual(body['status'], 'no_sources')
+        self.assertEqual(body['error_code'], 'NO_MACHINE_EVIDENCE')
+        self.assertEqual(body['error_message'], body['operator_summary'])
+        self.assertFalse(body['meta']['evidence_gate']['accepted'])
+        self.assertEqual(self.provider.call_count, before)
 
     def test_each_planner_fallback_keeps_review_time_and_call_slot(self):
         budget = self.m._assistant_core_new_budget('smart_diagnostic', company_id='fixture-company')

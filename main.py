@@ -19693,7 +19693,8 @@ def _sd_require_grounding_packet(state: dict) -> dict:
     return packet
 
 
-def _sd_review_step(*, step: dict, state: dict, language: str) -> tuple[dict, dict]:
+def _sd_review_step(*, step: dict, state: dict, language: str, debug: bool = False,
+                    raw_draft: Optional[dict] = None) -> tuple[dict, dict]:
     packet = _smart_evidence.review_packet(_sd_require_grounding_packet(state))
     budget = _v13_current_budget()
     if budget is None or budget.remaining() < 8.0 or budget.llm_calls >= budget.max_llm_calls:
@@ -19718,19 +19719,47 @@ def _sd_review_step(*, step: dict, state: dict, language: str) -> tuple[dict, di
     except _V13BudgetExceeded:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=502, detail={"code": "SMART_DIAGNOSTIC_REVIEW_FAILED",
+        detail = {"code": "SMART_DIAGNOSTIC_REVIEW_FAILED",
             "reason": type(exc).__name__, "review_diagnostic": _smart_review.failure_diagnostic(
-                exc, call_rows=budget.call_log, elapsed_seconds=time_module.monotonic() - started)}) from None
+                exc, call_rows=budget.call_log, elapsed_seconds=time_module.monotonic() - started)}
+        if debug:
+            detail["review_debug"] = _smart_review.debug_capture(stage="review_transport_failed",
+                grounding_packet=state["grounding_packet"], raw_draft=raw_draft or step, normalized_draft=step,
+                symptom_text=state.get("symptom_text", ""), history=state.get("history") or [], language=language,
+                reference_fingerprint=prepared["references"]["frozen"]["fingerprint"])
+        raise HTTPException(status_code=502, detail=detail) from None
     try:
-        reviewed, seal, summary = _smart_review.resolve(prepared=prepared, parsed=_smart_review.decode_wire(parsed),
+        decoded = _smart_review.decode_wire(parsed)
+        reviewed, seal, summary = _smart_review.resolve(prepared=prepared, parsed=decoded,
                                                        probability_band=_sd_probability_band)
     except _smart_review.SmartReviewError as exc:
         if str(exc) in {"question_not_supported", "no_supported_hypotheses", "question_has_no_supported_target", "no_positive_supported_hypothesis"}:
+            rejected_state = dict(state)
+            rejected_state["grounding_review_meta"] = {
+                **_smart_review.rejection_diagnostic(exc, prepared=prepared),
+                "model": model, "elapsed_seconds": round(time_module.monotonic() - started, 3)}
+            if debug:
+                rejected_state["grounding_review_debug"] = _smart_review.debug_capture(stage="review_rejected",
+                    grounding_packet=state["grounding_packet"], raw_draft=raw_draft or step, normalized_draft=step,
+                    symptom_text=state.get("symptom_text", ""), history=state.get("history") or [], language=language,
+                    parsed_review=decoded, reference_fingerprint=prepared["references"]["frozen"]["fingerprint"])
             return {"status": "no_sources", "final_ready": False, "hypotheses": [],
-                    "question": _sd_empty_question(0), "final_result": {}, "operator_summary": ""}, state
-        raise HTTPException(status_code=502, detail={"code": "SMART_DIAGNOSTIC_REVIEW_INVALID", "reason": str(exc)}) from None
+                    "question": _sd_empty_question(0), "final_result": {}, "operator_summary": ""}, rejected_state
+        detail = {"code": "SMART_DIAGNOSTIC_REVIEW_INVALID", "reason": str(exc)}
+        if debug:
+            detail["review_debug"] = _smart_review.debug_capture(stage="review_contract_invalid",
+                grounding_packet=state["grounding_packet"], raw_draft=raw_draft or step, normalized_draft=step,
+                symptom_text=state.get("symptom_text", ""), history=state.get("history") or [], language=language,
+                parsed_review=parsed, review_format="wire", reference_fingerprint=prepared["references"]["frozen"]["fingerprint"])
+        raise HTTPException(status_code=502, detail=detail) from None
     except _retrieval_review_references.ReferenceError as exc:
-        raise HTTPException(status_code=502, detail={"code": "SMART_DIAGNOSTIC_REVIEW_INVALID", "reason": str(exc)}) from None
+        detail = {"code": "SMART_DIAGNOSTIC_REVIEW_INVALID", "reason": str(exc)}
+        if debug:
+            detail["review_debug"] = _smart_review.debug_capture(stage="review_contract_invalid",
+                grounding_packet=state["grounding_packet"], raw_draft=raw_draft or step, normalized_draft=step,
+                symptom_text=state.get("symptom_text", ""), history=state.get("history") or [], language=language,
+                parsed_review=parsed, review_format="wire", reference_fingerprint=prepared["references"]["frozen"]["fingerprint"])
+        raise HTTPException(status_code=502, detail=detail) from None
     if reviewed.get("final_ready"):
         reviewed["final_result"] = _sd_canonicalize_final_result({}, reviewed["hypotheses"], language)
         reviewed["operator_summary"] = reviewed["final_result"]["summary"]
@@ -19744,6 +19773,13 @@ def _sd_review_step(*, step: dict, state: dict, language: str) -> tuple[dict, di
         "rebound_hypothesis_ids": summary["rebound_hypothesis_ids"],
         "question_validated": summary["question_validated"], "claims_digest": summary["claims_digest"],
         "all_checks_covered": True, "semantic_truth_verified_by_code": False}
+    if debug:
+        # This is response-only data. _sd_response_from_step never copies step
+        # extensions into signed state, so unreviewed drafts do not propagate.
+        reviewed["_review_debug"] = _smart_review.debug_capture(stage="review_completed",
+            grounding_packet=state["grounding_packet"], raw_draft=raw_draft or step, normalized_draft=step,
+            symptom_text=state.get("symptom_text", ""), history=state.get("history") or [], language=language,
+            parsed_review=decoded, reference_fingerprint=prepared["references"]["frozen"]["fingerprint"])
     return reviewed, updated
 
 
@@ -19761,6 +19797,8 @@ def _sd_review_error_response(exc: HTTPException, language: str) -> Optional[dic
                 "meta": {"cacheable": False, "smart_review": {"outcome": "error", "attempt_limit": 1}}}
     if isinstance(detail.get("review_diagnostic"), dict):
         response["meta"]["smart_review"]["transport"] = detail["review_diagnostic"]
+    if isinstance(detail.get("review_debug"), dict):
+        response["debug"] = {"smart_review": detail["review_debug"]}
     _sd_flatten_question(response, response["question"])
     _sd_flatten_hypotheses(response, [])
     _sd_flatten_citations(response, [], [])
@@ -19986,7 +20024,8 @@ def _sd_no_sources_response(
         "evidence_gate": dict(gate_result or {}),
     }
     return {
-        "ok": True, "status": "no_sources", "final_ready": False,
+        "ok": False, "status": "no_sources", "final_ready": False,
+        "error_code": "NO_MACHINE_EVIDENCE", "error_message": msg,
         "language": language, "session_state_json": _sd_json_dumps(state),
         "question": _sd_empty_question(0), "hypotheses": [],
         "citations": [], "rg_links": [], "citations_json": "[]", "rg_links_json": "[]",
@@ -20001,6 +20040,44 @@ def _sd_no_sources_response(
             },
         },
     }
+
+
+def _sd_review_rejected_response(*, state: dict, language: str, session_id: str, symptom_text: str) -> dict:
+    """Keep the admission result distinct from the later proposal rejection."""
+    response = _sd_no_sources_response(language, session_id, symptom_text,
+        gate_result=dict(state.get("evidence_gate") or {}))
+    summary = dict(state.get("grounding_review_meta") or {})
+    message = ("The available sources do not support a complete, safe diagnostic turn from the proposed hypotheses and question."
+               if language == "en" else
+               "Le fonti disponibili non supportano un turno diagnostico completo e sicuro con le ipotesi e la domanda proposte.")
+    response.update(ok=False, message=message, operator_summary=message, result_code=RESULT_NO_MACHINE_EVIDENCE,
+                    error_message=message, error_code="SMART_DIAGNOSTIC_REVIEW_REJECTED")
+    response["meta"].update(reason="smart_review_rejected", smart_review=summary,
+                            cacheable=False, semantic_cacheable=False)
+    if isinstance(state.get("grounding_review_debug"), dict):
+        response["debug"] = {"smart_review": state["grounding_review_debug"]}
+    return response
+
+
+def _sd_generation_rejected_response(*, language: str, session_id: str, symptom_text: str,
+        parsed: dict, step: dict, grounding_packet: dict, gate_result: dict, history: list, debug: bool) -> dict:
+    response = _sd_no_sources_response(language, session_id, symptom_text, gate_result=gate_result)
+    generation = {"stage": "generation", "reviewer_dispatched": False,
+        "reason": "generator_no_sources" if parsed.get("status") == "no_sources" else "normalization_no_sources",
+        "admitted_source_count": len(grounding_packet["sources"]),
+        "packet_fingerprint": grounding_packet["fingerprint"]}
+    message = ("The available sources did not produce a complete diagnostic turn; no unverified question or hypothesis is returned."
+               if language == "en" else
+               "Le fonti disponibili non hanno prodotto un turno diagnostico completo; non vengono restituite ipotesi o domande non verificate.")
+    response.update(ok=False, message=message, operator_summary=message, result_code=RESULT_NO_MACHINE_EVIDENCE,
+                    error_message=message, error_code="SMART_DIAGNOSTIC_GENERATION_REJECTED")
+    response["meta"].update(reason="smart_generation_no_sources", smart_generation=generation,
+                            cacheable=False, semantic_cacheable=False)
+    if debug:
+        response["debug"] = {"smart_review": _smart_review.debug_capture(stage="generation_no_sources",
+            grounding_packet=grounding_packet, raw_draft=parsed, normalized_draft=step,
+            symptom_text=symptom_text, history=history, language=language)}
+    return response
 
 
 def _sd_semantic_evidence_gate(*, symptom_text: str, language: str, citations: list[dict]) -> dict:
@@ -21063,6 +21140,8 @@ def _sd_response_from_step(
             "evidence_count": len(current_state.get("evidence") or []),
             "citation_count": len(citations or []),
         }
+        if isinstance(step.get("_review_debug"), dict):
+            resp["debug"]["smart_review"] = step["_review_debug"]
     return resp
 
 
@@ -21203,7 +21282,10 @@ def _assistant_core_synthesize_smart_start(
         allowed_evidence_ids=set(evidence_ids),
     )
     if str(step.get("status") or "").strip().lower() == "no_sources":
-        return _assistant_core_smart_no_evidence(request, decision, retrieval)
+        return _sd_generation_rejected_response(language=request.response_language, session_id=session_id,
+            symptom_text=request.query, parsed=parsed, step=step, grounding_packet=grounding_packet,
+            gate_result={"accepted": True, "decision": decision.evidence_state, "confidence": decision.confidence,
+                         "reason_code": "evidence_sufficient"}, history=[], debug=request.debug)
     if not bool(step.get("final_ready")) and not str((step.get("question") or {}).get("question_text") or "").strip():
         raise HTTPException(
             status_code=502,
@@ -21244,9 +21326,11 @@ def _assistant_core_synthesize_smart_start(
         },
         "retrieval_assurance": {},
     }
-    step, state = _sd_review_step(step=step, state=state, language=request.response_language)
+    step, state = _sd_review_step(step=step, state=state, language=request.response_language,
+                                 debug=request.debug, raw_draft=parsed)
     if step.get("status") == "no_sources":
-        return _assistant_core_smart_no_evidence(request, decision, retrieval)
+        return _sd_review_rejected_response(state=state, language=request.response_language,
+            session_id=session_id, symptom_text=request.query)
     response = _sd_response_from_step(
         session_id=session_id,
         company_id=request.company_id,
@@ -21460,9 +21544,11 @@ def _assistant_core_smart_start_sync(
             "evidence": [],
         }
         response = {
-            "ok": True,
+            "ok": False,
             "status": "timeout" if timed_out else "budget_exceeded",
             "result_code": RESULT_TIMEOUT if timed_out else RESULT_BUDGET_EXCEEDED,
+            "error_code": "SMART_DIAGNOSTIC_TIMEOUT" if timed_out else "SMART_DIAGNOSTIC_BUDGET_EXCEEDED",
+            "error_message": message,
             "requested_mode": MODE_SMART_DIAGNOSTIC,
             "effective_mode": MODE_SMART_DIAGNOSTIC,
             "routed": False,
@@ -21551,9 +21637,10 @@ def _assistant_core_smart_hard_timeout_response(
         session_state_json = _sd_json_dumps(state)
 
     response = {
-        "ok": True,
+        "ok": False,
         "status": "timeout",
         "result_code": RESULT_TIMEOUT,
+        "error_code": "SMART_DIAGNOSTIC_TIMEOUT", "error_message": message,
         "requested_mode": MODE_SMART_DIAGNOSTIC,
         "effective_mode": MODE_SMART_DIAGNOSTIC,
         "routed": False,
@@ -21692,9 +21779,11 @@ def _assistant_core_budgeted_sd_turn(turn_kind: str):
                     "The protected AI-cost limit was reached. Please retry."
                 )
                 response = {
-                    "ok": True,
+                    "ok": False,
                     "status": "timeout" if timed_out else "budget_exceeded",
                     "result_code": RESULT_TIMEOUT if timed_out else RESULT_BUDGET_EXCEEDED,
+                    "error_code": "SMART_DIAGNOSTIC_TIMEOUT" if timed_out else "SMART_DIAGNOSTIC_BUDGET_EXCEEDED",
+                    "error_message": message,
                     "requested_mode": MODE_SMART_DIAGNOSTIC,
                     "effective_mode": MODE_SMART_DIAGNOSTIC,
                     "routed": False,
@@ -21865,7 +21954,9 @@ def smart_diagnostic_start_v1(
         max_hypotheses=max_hypotheses, allowed_evidence_ids=allowed_ids,
     )
     if str(step.get("status") or "").strip().lower() == "no_sources":
-        return _sd_no_sources_response(language, session_id, symptom_text, debug=bool(payload.debug), gate_result=evidence_gate)
+        return _sd_generation_rejected_response(language=language, session_id=session_id, symptom_text=symptom_text,
+            parsed=parsed, step=step, grounding_packet=grounding_packet, gate_result=evidence_gate,
+            history=[], debug=bool(payload.debug))
     if not bool(step.get("final_ready")) and not str((step.get("question") or {}).get("question_text") or "").strip():
         raise HTTPException(status_code=502, detail={"code": "SMART_DIAGNOSTIC_GENERATION_FAILED", "message": "Smart Diagnostic did not generate a valid evidence-grounded question."})
     state = {
@@ -21892,9 +21983,10 @@ def smart_diagnostic_start_v1(
         },
         "retrieval_assurance": dict(assurance_meta or {}),
     }
-    step, state = _sd_review_step(step=step, state=state, language=language)
+    step, state = _sd_review_step(step=step, state=state, language=language, debug=bool(payload.debug), raw_draft=parsed)
     if step.get("status") == "no_sources":
-        return _sd_no_sources_response(language, session_id, symptom_text, debug=bool(payload.debug), gate_result=evidence_gate)
+        return _sd_review_rejected_response(state=state, language=language,
+            session_id=session_id, symptom_text=symptom_text)
     return _sd_response_from_step(
         session_id=session_id, company_id=company_id, machine_id=machine_id,
         symptom_text=symptom_text, language=language, state=state, step=step,
@@ -21968,7 +22060,9 @@ def smart_diagnostic_answer_v1(
         # A terminal turn reports the last answered question, not an unasked next one.
         step["question"] = _sd_empty_question(min(len(history), max_questions))
     if str(step.get("status") or "").strip().lower() == "no_sources":
-        return _sd_no_sources_response(language, session_id, symptom_text, debug=bool(payload.debug), gate_result=dict(state.get("evidence_gate") or {}))
+        return _sd_generation_rejected_response(language=language, session_id=session_id, symptom_text=symptom_text,
+            parsed=parsed, step=step, grounding_packet=state["grounding_packet"],
+            gate_result=dict(state.get("evidence_gate") or {}), history=history, debug=bool(payload.debug))
     if not bool(step.get("final_ready")) and not str((step.get("question") or {}).get("question_text") or "").strip():
         raise HTTPException(status_code=502, detail={"code": "SMART_DIAGNOSTIC_GENERATION_FAILED", "message": "Smart Diagnostic did not generate a valid evidence-grounded question."})
     if not bool(step.get("final_ready")):
@@ -21982,9 +22076,10 @@ def smart_diagnostic_answer_v1(
                 status_code=502,
                 detail={"code": "SMART_DIAGNOSTIC_REPEATED_QUESTION", "message": "Smart Diagnostic did not produce a new discriminating question. Retry this answer."},
             )
-    step, state = _sd_review_step(step=step, state=state, language=language)
+    step, state = _sd_review_step(step=step, state=state, language=language, debug=bool(payload.debug), raw_draft=parsed)
     if step.get("status") == "no_sources":
-        return _sd_no_sources_response(language, session_id, symptom_text, debug=bool(payload.debug), gate_result=dict(state.get("evidence_gate") or {}))
+        return _sd_review_rejected_response(state=state, language=language,
+            session_id=session_id, symptom_text=symptom_text)
     response_citations = list(state.get("citations") or [])
     if not response_citations and state.get("evidence"):
         response_citations = [

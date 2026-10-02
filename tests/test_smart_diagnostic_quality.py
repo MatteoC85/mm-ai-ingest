@@ -75,7 +75,7 @@ class SmartDiagnosticQualityTests(unittest.TestCase):
         # have dedicated adversarial coverage in test_smart_review.py.
         self.patches.enter_context(patch.object(self.m, "_sd_review_step", side_effect=self.review_fixture))
 
-    def review_fixture(self, *, step, state, language):
+    def review_fixture(self, *, step, state, language, debug=False, raw_draft=None):
         from test_smart_review import parsed_review
         packet = self.m._smart_evidence.review_packet(state["grounding_packet"])
         prepared = self.m._smart_review.prepare(step=step, packet=packet, symptom_text=state["symptom_text"],
