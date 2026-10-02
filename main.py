@@ -19720,23 +19720,33 @@ def _sd_review_step(*, step: dict, state: dict, language: str, debug: bool = Fal
     except ValueError as exc:
         raise HTTPException(status_code=502, detail={"code": "SMART_DIAGNOSTIC_REVIEW_INVALID",
                                                     "reason": str(exc)}) from None
+    messages = _smart_review.messages(prepared, language=language,
+        symptom_text=str(state.get("symptom_text") or ""), history=state.get("history") or [])
+    schema = _smart_review.wire_schema(prepared)
+    # Preparation does not extend the turn. Recheck immediately before dispatch,
+    # allowing this one review to use existing headroom and leaving two seconds
+    # for validation/projection. Thirty seconds requires at least 32 remaining.
+    remaining = budget.remaining()
+    if remaining < 8.0 or budget.llm_calls >= budget.max_llm_calls:
+        raise _V13BudgetExceeded("smart_review_deadline_or_call_budget")
+    review_timeout = min(_smart_review.MAX_REVIEW_SECONDS,
+                         int(remaining - _smart_review.FINALIZATION_RESERVE_SECONDS))
     started = time_module.monotonic()
     # A single independent review. No model fallback, retry allowance, new
     # retrieval or fresh budget; transport reservation uses this request ledger.
     try:
         parsed, model = _v13_json_models(
-            _smart_review.messages(prepared, language=language,
-                symptom_text=str(state.get("symptom_text") or ""), history=state.get("history") or []),
-            models=[V13_FAST_MODEL], json_schema=_smart_review.wire_schema(prepared),
-            effort=V13_FAST_EFFORT, reasoning_mode="", timeout=min(20, int(budget.remaining() - 1)),
+            messages, models=[V13_FAST_MODEL], json_schema=schema,
+            effort=V13_FAST_EFFORT, reasoning_mode="", timeout=review_timeout,
             max_output_tokens=min(4200, V13_FAST_MAX_OUTPUT_TOKENS),
             company_id=str(state.get("company_id") or ""), purpose="smart_diagnostic_independent_review")
     except _V13BudgetExceeded:
         raise
     except Exception as exc:
         detail = {"code": "SMART_DIAGNOSTIC_REVIEW_FAILED",
-            "reason": type(exc).__name__, "review_diagnostic": _smart_review.failure_diagnostic(
-                exc, call_rows=budget.call_log, elapsed_seconds=time_module.monotonic() - started)}
+            "reason": type(exc).__name__, "review_diagnostic": {
+                **_smart_review.failure_diagnostic(exc, call_rows=budget.call_log,
+                    elapsed_seconds=time_module.monotonic() - started), "timeout_seconds": review_timeout}}
         if debug:
             detail["review_debug"] = _smart_review.debug_capture(stage="review_transport_failed",
                 grounding_packet=state["grounding_packet"], raw_draft=raw_draft or step, normalized_draft=step,
@@ -19752,7 +19762,8 @@ def _sd_review_step(*, step: dict, state: dict, language: str, debug: bool = Fal
             rejected_state = dict(state)
             rejected_state["grounding_review_meta"] = {
                 **_smart_review.rejection_diagnostic(exc, prepared=prepared),
-                "model": model, "elapsed_seconds": round(time_module.monotonic() - started, 3)}
+                "model": model, "elapsed_seconds": round(time_module.monotonic() - started, 3),
+                "timeout_seconds": review_timeout, "input_version": _smart_review.INPUT_VERSION}
             if debug:
                 rejected_state["grounding_review_debug"] = _smart_review.debug_capture(stage="review_rejected",
                     grounding_packet=state["grounding_packet"], raw_draft=raw_draft or step, normalized_draft=step,
@@ -19783,6 +19794,7 @@ def _sd_review_step(*, step: dict, state: dict, language: str, debug: bool = Fal
     updated["grounding_review_meta"] = {"policy_version": _smart_review.POLICY_VERSION,
         "outcome": "completed", "decision_validated": True, "attempt_limit": 1, "model": model,
         "wire_version": _smart_review.WIRE_VERSION,
+        "input_version": _smart_review.INPUT_VERSION, "timeout_seconds": review_timeout,
         "elapsed_seconds": round(time_module.monotonic() - started, 3),
         "accepted_hypothesis_ids": summary["accepted_hypothesis_ids"],
         "rebound_hypothesis_ids": summary["rebound_hypothesis_ids"],
@@ -19806,6 +19818,7 @@ def _sd_review_error_response(exc: HTTPException, language: str) -> Optional[dic
     message = ("The source review could not be completed; no unverified diagnostic is returned."
                if language == "en" else "Non è stato possibile completare la verifica delle fonti della diagnosi.")
     response = {"ok": False, "status": "error", "result_code": RESULT_TECHNICAL_ERROR,
+                "error_code": code, "error_message": message,
                 "final_ready": False, "language": language, "operator_summary": message,
                 "question": _sd_empty_question(0), "hypotheses": [], "citations": [], "rg_links": [],
                 "session_state_json": "", "detail": {"code": code, "reason": str(detail.get("reason") or "")},
