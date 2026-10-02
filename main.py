@@ -105,6 +105,7 @@ app.add_middleware(InteractiveUsageMiddleware)
 # The historical names remain available in ``main`` for compatibility.
 from machinemind.config.runtime import *  # noqa: F401,F403
 from machinemind.ask import application_authority as _application_authority
+from machinemind.authority import service_files as _service_file_links
 from machinemind.authority.contracts import AuthorityError as _AuthorityError
 from machinemind.authority.policy import RequestAuthority as _RequestAuthority
 from machinemind.retrieval.production_adapters import ProductionReaderAdapters as _ProductionReaderAdapters
@@ -15270,6 +15271,7 @@ def _assistant_core_adjudicate_root_cause_grounded(
         f"PROPOSALS (unvalidated, immutable):\n{json.dumps(frozen['proposals'], ensure_ascii=False, separators=(',', ':'))}\n\n"
         f"SOURCE_INDEX:\n{json.dumps(proposal_manifest['sources'], ensure_ascii=False, separators=(',', ':'))}\n"
         f"\nOBSERVED_UNITS:\n{_retrieval_review_references.canonical(references['observed_units'])}"
+        f"\nAUTHORIZED_REFERENCES:\n{_retrieval_review_references.canonical(_retrieval_review_references.authorized_references(frozen))}"
         f"\nREVIEW_PACKET:\n{references['model_json']}"
         "\nReturn decisions only, using unit IDs; never rewrite any proposal."
     )
@@ -15291,7 +15293,7 @@ def _assistant_core_adjudicate_root_cause_grounded(
         parsed, model_used = _v13_json_models(
             [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
             models=[V13_FAST_MODEL],
-            json_schema=_retrieval_review_references.schema(),
+            json_schema=_retrieval_review_references.schema(frozen),
             effort=V13_FAST_EFFORT, reasoning_mode="",
             timeout=min(20, V13_FAST_TIMEOUT_SECONDS),
             max_output_tokens=min(3400, V13_FAST_MAX_OUTPUT_TOKENS),
@@ -15322,6 +15324,8 @@ def _assistant_core_adjudicate_root_cause_grounded(
             parsed=parsed, frozen=frozen, records=records, observed_query=observed)
     except _retrieval_review_references.ReferenceError as exc:
         # Provider usage remains settled even if its semantic payload is unusable.
+        if exc.reference_failure is not None:
+            review_execution["invalid_reference"] = exc.reference_failure
         return unavailable("review_decision_" + str(exc))
     review_execution["decision_validated"] = True
     meta = {**dict(response.get("meta") or {}),
@@ -16700,7 +16704,17 @@ def _assistant_core_ask_sync(payload: AskRequest, x_ai_internal_secret: Optional
 
 
 def _assistant_core_root_cause_sync(payload: RootCauseRequest, x_ai_internal_secret: Optional[str]) -> dict:
-    return _assistant_core_sync(payload, x_ai_internal_secret, requested_mode=MODE_ROOT_CAUSE)
+    result = _assistant_core_sync(payload, x_ai_internal_secret, requested_mode=MODE_ROOT_CAUSE)
+    if isinstance(result, dict) and result.get("rg_links"):
+        try:
+            result = {**result, "rg_links": _service_file_links.refresh_diagnostic_links(
+                company_id=payload.company_id, machine_id=payload.machine_id,
+                citations=list(result.get("citations") or []), rg_links=result["rg_links"],
+                env=os.environ)}
+        except _AuthorityError as exc:
+            exc.execution_accounting = _application_authority._accounting_after_execution(result)
+            return _application_authority.public_error(exc)
+    return result
 
 
 # -----------------------------------------------------------------------------
@@ -20827,6 +20841,12 @@ def _sd_response_from_step(
     else:
         rg_links = _sd_filter_rg_links_for_citations(rg_links, citations)
 
+    # Refresh before signing the next state and flattening Bubble's cN_url fields.
+    # The native file endpoint retains the user's browser-session privacy gate.
+    rg_links = _service_file_links.refresh_diagnostic_links(
+        company_id=company_id, machine_id=machine_id, citations=citations,
+        rg_links=rg_links, env=os.environ)
+
     current_state = dict(state or {})
     current_state.update(
         {
@@ -21246,6 +21266,14 @@ def _assistant_core_smart_start_sync(
 
         budget.route = "assistant_core_smart_diagnostic"
         return _assistant_core_attach_runtime_meta(final, budget, debug=bool(payload.debug))
+    except _AuthorityError as exc:
+        response = {**_application_authority.public_error(exc),
+            "final_ready": False, "language": language, "hypotheses": [],
+            "question": _sd_empty_question(0), "session_state_json": ""}
+        _sd_flatten_question(response, response["question"])
+        _sd_flatten_hypotheses(response, [])
+        _sd_flatten_citations(response, [], [])
+        return _assistant_core_attach_runtime_meta(response, budget, debug=False)
     except _V13BudgetExceeded as exc:
         budget.route = "assistant_core_smart_budget_guard"
         timed_out = "deadline" in str(exc).lower() or "time" in str(exc).lower()
@@ -21476,6 +21504,14 @@ def _assistant_core_budgeted_sd_turn(turn_kind: str):
                         debug=bool(getattr(payload, "debug", False)),
                     )
                 return result
+            except _AuthorityError as exc:
+                response = {**_application_authority.public_error(exc),
+                    "final_ready": False, "language": language, "hypotheses": [],
+                    "question": _sd_empty_question(0), "session_state_json": ""}
+                _sd_flatten_question(response, response["question"])
+                _sd_flatten_hypotheses(response, [])
+                _sd_flatten_citations(response, [], [])
+                return _assistant_core_attach_runtime_meta(response, budget, debug=False)
             except _V13BudgetExceeded as exc:
                 budget.route = f"assistant_core_smart_{turn_kind}_budget_guard"
                 timed_out = "deadline" in str(exc).lower() or "time" in str(exc).lower()

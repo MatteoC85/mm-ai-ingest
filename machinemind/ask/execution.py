@@ -609,7 +609,8 @@ def verify_or_repair_answer(
             for u in observation["units"]]
         user_msg += "\n\nPROCEDURE_STRUCTURE:\n" + json.dumps(review_view, ensure_ascii=False)
         # Blocks are lossless spans of CURRENT_ANSWER, not additional sources.
-        user_msg += "\n\nPROCEDURE_BLOCKS:\n" + json.dumps([{"block_id": b["block_id"], "first_line": b["text"].splitlines()[0] if b["text"] else ""} for b in layout["blocks"]], ensure_ascii=False)
+        user_msg += "\n\nPROCEDURE_BLOCKS:\n" + json.dumps(
+            _procedure_review.review_blocks(layout), ensure_ascii=False)
     _admit_input(request, {"candidates": ordered_candidates if packet is not None else candidates}, decision,
         runtime=runtime, stage="verifier.provider")
     # Snapshot the exact CURRENT_ANSWER at the provider boundary. Neither a

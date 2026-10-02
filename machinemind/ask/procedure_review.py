@@ -16,8 +16,14 @@ import hashlib
 import re
 from typing import Any, Callable
 
-VERSION = "ask-procedure-review-v1"
+VERSION = "ask-procedure-review-v2"
 _NUMBERED = re.compile(r"(?m)^(?P<number>[1-9][0-9]*)[.)][ \t]+")
+# Reviewers can reproduce a heading with Markdown, indentation, or a line
+# break after its number. Recognize those forms before accepting an edit so
+# formatting cannot accidentally become a new or changed procedure step.
+_EDIT_NUMBERED = re.compile(
+    r"(?m)^[ \t]*(?:\*\*|__)?(?P<number>[1-9][0-9]*)[.)]"
+    r"(?:\*\*|__)?(?:[ \t]+|\r?\n|$)")
 
 
 def digest(text: str) -> str:
@@ -78,6 +84,41 @@ def block_layout(answer: str) -> dict:
     return {"version": VERSION, "answer_sha256": digest(answer), "blocks": blocks}
 
 
+def _block_parts(text: str) -> tuple[str, str, str]:
+    """Keep the source step header and inter-block whitespace server-owned."""
+    heading = _NUMBERED.match(text)
+    prefix = heading.group(0) if heading else ""
+    content = text[len(prefix):]
+    body = content.rstrip()
+    return prefix, body, content[len(body):]
+
+
+def review_blocks(layout: dict) -> list[dict]:
+    """Unambiguous edit targets; ordinals in block IDs are not step numbers."""
+    result = []
+    for block in layout["blocks"]:
+        prefix, body, _ = _block_parts(block["text"])
+        result.append({"block_id": block["block_id"],
+            "step_number": _numbers(prefix)[0] if prefix else None,
+            "body_first_line": body.splitlines()[0] if body else ""})
+    return result
+
+
+def _edited_block(original: str, value: str) -> str:
+    prefix, _, separator = _block_parts(original)
+    body = value.strip()
+    # Accept a repeated heading only when it identifies the same original
+    # step. Otherwise the wire contract is the complete corrected body alone.
+    heading = _EDIT_NUMBERED.match(body)
+    if heading:
+        if not prefix or int(heading.group("number")) != _numbers(prefix)[0]:
+            raise ValueError("procedure_review_edit_changes_step_sequence")
+        body = body[heading.end():].strip()
+    if not body or _EDIT_NUMBERED.search(body):
+        raise ValueError("procedure_review_edit_changes_step_sequence")
+    return prefix + body + separator
+
+
 def review_schema(legacy: dict, layout: dict, facets: list[str], types: list[str]) -> dict:
     result = deepcopy(legacy)
     result["name"] = legacy["name"]  # backwards-readable verifier envelope
@@ -94,7 +135,10 @@ def review_schema(legacy: dict, layout: dict, facets: list[str], types: list[str
         "type": "object", "additionalProperties": False,
         "properties": {
             "block_id": {"type": "string", "enum": [b["block_id"] for b in layout["blocks"]]},
-            "text": {"type": "string"}},
+            "text": {"type": "string", "description":
+                "Complete corrected body of this block only; omit the step number and trailing "
+                "block separators, which the server preserves. Keep every source instruction, "
+                "precaution, condition, numeric value, and citation required in this block."}},
         "required": ["block_id", "text"]}, "maxItems": len(layout["blocks"])}
     schema["required"] = list(schema["required"]) + ["reply_mode", "edits"]
     return result
@@ -111,8 +155,11 @@ PROTOCOL_INSTRUCTIONS = (
     "Do not re-emit an unchanged answer. For this protocol, a complete replacement means the complete "
     "result after applying the selected mode, not mandatory transmission of unchanged blocks. "
     "For a local correction, use outcome=rewrite, reply_mode=edit, "
-    "answer='', and only changed blocks from PROCEDURE_BLOCKS, preserving their step number, complete "
-    "instruction, source precautions, and block separators. Never exchange instructions between Steps. "
+    "answer='', and only changed blocks from PROCEDURE_BLOCKS. Each edit.text must contain the complete "
+    "corrected body of that block, WITHOUT its numbered heading or trailing block separators; the server "
+    "preserves the original heading and separators. block_id is an opaque edit target; step_number gives "
+    "the actual source step number. Preserve every instruction, source precaution, condition, numeric "
+    "value, and citation. Never exchange instructions between Steps or add numbered steps inside a body. "
     "Use reply_mode=replace with a full answer and edits=[] when a safe correction needs a different "
     "block structure, missing steps, or extensive rewriting. For partial/no_sources use replace and "
     "report the unresolved requirements honestly. Keep all covered/missing contract keys verbatim. "
@@ -168,9 +215,7 @@ def resolve_reply(parsed: dict, *, answer: str, layout: dict,
             key, value = edit["block_id"], edit["text"]
             if type(key) is not str or key not in originals or key in replacements or type(value) is not str:
                 raise ValueError("procedure_review_edit_identity_invalid")
-            if _numbers(value) != _numbers(originals[key]):
-                raise ValueError("procedure_review_edit_changes_step_sequence")
-            replacements[key] = value
+            replacements[key] = _edited_block(originals[key], value)
         reviewed = "".join(replacements.get(b["block_id"], b["text"]) for b in layout["blocks"])
         if _numbers(reviewed) != _numbers(answer) or not reviewed.strip():
             raise ValueError("procedure_review_edit_changes_layout")

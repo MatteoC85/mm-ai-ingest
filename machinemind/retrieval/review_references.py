@@ -39,6 +39,11 @@ within the same original block have offsets in the server registry. Different
 context fragments/pages must NEVER be treated as continuous text across a gap.
 Choose unit identifiers instead of copying quotes. Select only the units necessary
 to substantiate the proposal. Use multiple units when support is non-contiguous.
+All unit identifiers are GLOBAL IDs, not positions within a source or fragment.
+Copy the first integer of a [unit_id, text] pair exactly; never renumber from zero.
+AUTHORIZED_REFERENCES lists the exact allowed IDs for each source and proposal.
+Choose source_index first, then use only that source's authorized source/target
+IDs. A context unit is never an excerpt unit merely because the wording matches.
 source_units must belong to the chosen source excerpt. target_units may belong to
 that excerpt or its explicitly linked context fragments; context alone cannot
 become new causal evidence. observation_units must refer to OBSERVED_UNITS, never
@@ -64,7 +69,9 @@ list their indices. A syntactically valid rejection is NOT a successful diagnosi
 """.strip()
 
 class ReferenceError(ValueError):
-    pass
+    def __init__(self, code: str, *, reference_failure: dict | None = None):
+        super().__init__(code)
+        self.reference_failure = reference_failure
 # Alias for callers handling review contract errors uniformly.
 ReviewDecisionError = ReferenceError
 
@@ -85,7 +92,29 @@ def _ints(max_items: int, high: int) -> dict[str, Any]:
     return dict(type='array',maxItems=max_items,items=dict(type='integer',minimum=0,maximum=high))
 
 
-def schema() -> dict[str, Any]:
+def _enum_refs(ids: list[int], limit: int) -> dict[str, Any]:
+    # Empty authorization means only [], never a made-up sentinel reference.
+    if not ids:
+        return dict(type='array', maxItems=0, items=dict(type='integer'))
+    return dict(type='array', maxItems=limit, items=dict(type='integer', enum=list(ids)))
+
+
+def authorized_references(frozen: dict[str, Any]) -> dict[str, Any]:
+    """A text-free prompt index of the same immutable sets the validator enforces."""
+    if not isinstance(frozen, dict) or frozen.get('policy_version') != POLICY_VERSION:
+        raise ReferenceError('wrong_policy')
+    if digest({k:v for k,v in frozen.items() if k!='fingerprint'}) != frozen.get('fingerprint'):
+        raise ReferenceError('manifest_altered')
+    return {'unit_id_kind': 'global_registry_id_not_array_position',
+            'observation_units': list(frozen['observed_ids']),
+            'sources': [{'source_index': si, 'source_units': list(ids),
+                         'target_units': list(frozen['target_sets'][si])}
+                        for si, ids in enumerate(frozen['source_sets'])],
+            'proposals': [{'proposal_index': pi, 'check_indices': list(range(len(p['checks'])))}
+                          for pi, p in enumerate(frozen['proposals'])]}
+
+
+def schema(frozen: dict[str, Any] | None = None) -> dict[str, Any]:
     proof=_object({
         'source_index':dict(type='integer',minimum=0,maximum=MAX_SOURCES-1),
         'supports_cause':dict(type='boolean'),
@@ -104,8 +133,40 @@ def schema() -> dict[str, Any]:
         'note':dict(type='string',maxLength=220),
         'proofs':dict(type='array',maxItems=MAX_PROOFS,items=proof),
     })
-    return dict(name='machinemind_root_review_references_v1',strict=True,
-                schema=_object({'decisions':dict(type='array',maxItems=MAX_PROPOSALS,items=decision)}))
+    result = dict(name='machinemind_root_review_references_v1',strict=True,
+                  schema=_object({'decisions':dict(type='array',maxItems=MAX_PROPOSALS,items=decision)}))
+    if frozen is None:
+        return result  # Stable key contract for local validation and old callers.
+    authorized = authorized_references(frozen)
+    # Each branch binds a source index to its exact excerpt/context sets. Merely
+    # using a global union would still allow references borrowed from a neighbor.
+    # $defs avoids repeating identical proof branches for multiple proposals.
+    definitions = {}
+    decisions = []
+    for proposal in authorized['proposals']:
+        check_ids = proposal['check_indices']
+        definition_name = 'proof_checks_' + str(len(check_ids))
+        if definition_name not in definitions:
+            proofs = []
+            for source in authorized['sources']:
+                scoped = deepcopy(proof)
+                props = scoped['properties']
+                props['source_index'] = dict(type='integer', enum=[source['source_index']])
+                props['source_units'] = _enum_refs(source['source_units'], 6)
+                props['target_units'] = _enum_refs(source['target_units'], 4)
+                props['observation_units'] = _enum_refs(authorized['observation_units'], 4)
+                props['check_indices'] = _enum_refs(check_ids, MAX_CHECKS)
+                proofs.append(scoped)
+            definitions[definition_name] = {'anyOf': proofs}
+        scoped = deepcopy(decision)
+        props = scoped['properties']
+        props['proposal_index'] = dict(type='integer', enum=[proposal['proposal_index']])
+        props['blocking_checks'] = _enum_refs(check_ids, MAX_CHECKS)
+        props['proofs']['items'] = {'$ref': '#/$defs/' + definition_name}
+        decisions.append(scoped)
+    result['schema']['properties']['decisions'].update(maxItems=len(decisions), items={'anyOf': decisions})
+    result['schema']['$defs'] = definitions
+    return result
 
 
 def slices(text: str) -> list[tuple[int,int]]:
@@ -127,10 +188,13 @@ def _int(value: Any, length: int, error: str) -> int:
     return value
 
 
-def _refs(values: Any, allowed: set[int], limit: int, *, empty: bool=False) -> list[int]:
+def _refs(values: Any, allowed: set[int], limit: int, *, empty: bool=False, field: str='') -> list[int]:
     if not isinstance(values,list) or len(values)>limit or (not values and not empty):
         raise ReferenceError('reference_count_invalid')
-    if any(type(i) is not int or i not in allowed for i in values):raise ReferenceError('reference_outside_authorized_set')
+    if any(type(i) is not int or i not in allowed for i in values):
+        raise ReferenceError('reference_outside_authorized_set', reference_failure={
+            'field': field, 'submitted_integer_ids': [i for i in values if type(i) is int],
+            'non_integer_count': sum(type(i) is not int for i in values), 'allowed_ids': sorted(allowed)})
     if len(set(values))!=len(values):raise ReferenceError('duplicate_reference')
     return values
 
@@ -170,7 +234,7 @@ def validate(*, parsed: dict[str,Any], frozen: dict[str,Any], records: list[dict
         pi=_int(d['proposal_index'],len(proposals),'unknown_proposal')
         if pi in seen:raise ReferenceError('duplicate_decision')
         seen.add(pi);draft=proposals[pi];check_ids=set(range(len(draft['checks'])))
-        blocks=_refs(d['blocking_checks'],check_ids,MAX_CHECKS,empty=True)
+        blocks=_refs(d['blocking_checks'],check_ids,MAX_CHECKS,empty=True,field=f'proposal_{pi}.blocking_checks')
         if d['reason'] not in REASONS or d['verdict'] not in ('accept','reject'):raise ReferenceError('unknown_verdict')
         if not isinstance(d['note'],str) or len(d['note'])>220:raise ReferenceError('invalid_note')
         if not isinstance(d['proofs'],list) or len(d['proofs'])>MAX_PROOFS:raise ReferenceError('proof_count')
@@ -182,15 +246,16 @@ def validate(*, parsed: dict[str,Any], frozen: dict[str,Any], records: list[dict
             continue
         if d['reason']!='supported' or blocks or d['note'] or not d['proofs']:raise ReferenceError('invalid_acceptance')
         cause_count=0;covered=set();citations=[];proposal_audit=[]
-        for p in d['proofs']:
+        for proof_index, p in enumerate(d['proofs']):
             if not isinstance(p,dict) or set(p)!=pkeys:raise ReferenceError('proof_keys')
             si=_int(p['source_index'],len(records),'unknown_source')
             if type(p['supports_cause']) is not bool:raise ReferenceError('invalid_support_flag')
             if p['applicability'] not in ('same_target','documented_dependency'):raise ReferenceError('applicability_not_established')
-            src=_refs(p['source_units'],set(frozen['source_sets'][si]),6)
-            target=_refs(p['target_units'],set(frozen['target_sets'][si]),4)
-            observed=_refs(p['observation_units'],set(frozen['observed_ids']),4,empty=not p['supports_cause'])
-            checks=_refs(p['check_indices'],check_ids,MAX_CHECKS,empty=True)
+            prefix=f'proposal_{pi}.proof_{proof_index}.source_{si}.'
+            src=_refs(p['source_units'],set(frozen['source_sets'][si]),6,field=prefix+'source_units')
+            target=_refs(p['target_units'],set(frozen['target_sets'][si]),4,field=prefix+'target_units')
+            observed=_refs(p['observation_units'],set(frozen['observed_ids']),4,empty=not p['supports_cause'],field=prefix+'observation_units')
+            checks=_refs(p['check_indices'],check_ids,MAX_CHECKS,empty=True,field=prefix+'check_indices')
             if p['supports_cause']:
                 if p['support_type'] not in ('documented_mechanism','bounded_inference'):raise ReferenceError('checklist_is_not_causal_evidence')
                 cause_count+=1
