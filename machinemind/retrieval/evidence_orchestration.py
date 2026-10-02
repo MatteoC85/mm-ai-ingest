@@ -127,6 +127,9 @@ class V13InitialRetrievalRuntime:
 
 
 def v13_initial_retrieval(*, q: str, company_id: str, machine_id: str, doc_ids: Optional[list[str]], bubble_document_id: Optional[str], ai_scope: str, response_language: str, mode: str, plan: Optional[dict]=None, runtime: V13InitialRetrievalRuntime, lineage: Optional[Callable[..., None]]=None) -> dict:
+    preserve_complete = mode == "smart_neutral"
+    if preserve_complete:
+        mode = "neutral"
     V13_DENSE_QUERY_LIMIT = runtime.V13_DENSE_QUERY_LIMIT
     V13_LEXICAL_QUERY_LIMIT = runtime.V13_LEXICAL_QUERY_LIMIT
     V13_MAX_EVIDENCE_ITEMS_ASK = runtime.V13_MAX_EVIDENCE_ITEMS_ASK
@@ -314,10 +317,14 @@ def v13_initial_retrieval(*, q: str, company_id: str, machine_id: str, doc_ids: 
             except Exception as exc:
                 print("V13_STRUCTURED_DIRECT_RETRIEVAL_FAIL", str(exc)[:600])
 
-    merged = _v13_merge_candidates(
-        [identifier_hits, preferred_hits, structured_direct_hits, structured_semantic_hits, page_hits, dense_candidates, prefix_hits, exact_hits]
-    )
-    scored = _v13_score_candidates(q, merged)
+    groups = [identifier_hits, preferred_hits, structured_direct_hits, structured_semantic_hits,
+              page_hits, dense_candidates, prefix_hits, exact_hits]
+    # Preserve the existing SQL-scoped producer merge: readers expose different
+    # bounded projections of one chunk. Smart's complete-input guarantee starts
+    # at its received producer pool, not at pre-merge database occurrences.
+    merged = _v13_merge_candidates(groups)
+    scored = (_v13_score_candidates(q, merged, preserve_complete=True) if preserve_complete
+              else _v13_score_candidates(q, merged))
     if mode == "root_cause":
         scored = _v13_rescore_root_candidates(q, scored)
 
@@ -562,6 +569,7 @@ def assistant_core_retrieve_neutral(request: AssistantCoreRequest, *, runtime: A
     is_root_cause = (
         str(request.requested_mode or "").strip().lower() == MODE_ROOT_CAUSE
     )
+    is_smart = str(request.requested_mode or "").strip().lower() == "smart_diagnostic"
     profile = (
         _retrieval_diagnostic_query.analyze_diagnostic_query(
             request.query, response_language=request.response_language
@@ -581,7 +589,7 @@ def assistant_core_retrieve_neutral(request: AssistantCoreRequest, *, runtime: A
         bubble_document_id=str(bubble_document_id or "").strip() or None,
         ai_scope=request.ai_scope,
         response_language=request.response_language,
-        mode="neutral",
+        mode="smart_neutral" if is_smart else "neutral",
         plan=plan,
     )
     # A bounded title/description probe improves source discovery without deciding
@@ -597,8 +605,8 @@ def assistant_core_retrieve_neutral(request: AssistantCoreRequest, *, runtime: A
         )
         if title_candidates:
             retrieval = _v13_merge_source_title_candidates(
-                retrieval_query, retrieval, title_candidates
-            )
+                retrieval_query, retrieval, title_candidates,
+                **({"preserve_complete": True} if is_smart else {}))
     except Exception as exc:
         print("ASSISTANT_CORE_TITLE_PROBE_FAIL", str(exc)[:500])
     if profile is not None:
@@ -648,6 +656,10 @@ def assistant_core_refine_retrieval(request: AssistantCoreRequest, retrieval: di
     _v13_fallback_plan = runtime._v13_fallback_plan
     _v13_initial_retrieval = runtime._v13_initial_retrieval
     _v13_score_candidates = runtime._v13_score_candidates
+    is_smart = str(decision.effective_mode or "").strip().lower() == "smart_diagnostic"
+    if is_smart:
+        score_complete = _v13_score_candidates
+        _v13_score_candidates = lambda q, rows: score_complete(q, rows, preserve_complete=True)
     retrieval_query = _assistant_core_retrieval_query(request)
     budget = _v13_current_budget()
     if budget is not None and budget.remaining() < 18.0:
@@ -716,7 +728,7 @@ def assistant_core_refine_retrieval(request: AssistantCoreRequest, retrieval: di
                     bubble_document_id=str(bubble_document_id or "").strip() or None,
                     ai_scope=request.ai_scope,
                     response_language=request.response_language,
-                    mode="neutral",
+                    mode="smart_neutral" if is_smart else "neutral",
                     plan=facet_plan,
                 )
                 current_candidates = _v13_score_candidates(
@@ -805,7 +817,7 @@ def assistant_core_refine_retrieval(request: AssistantCoreRequest, retrieval: di
             bubble_document_id=str(bubble_document_id or "").strip() or None,
             ai_scope=request.ai_scope,
             response_language=request.response_language,
-            mode="neutral",
+            mode="smart_neutral" if is_smart else "neutral",
             plan=plan,
         )
         candidate_lists.append(list(refined.get("candidates") or []))
@@ -1262,6 +1274,26 @@ def assistant_core_prepare_evidence(request: AssistantCoreRequest, retrieval: di
     re = runtime.re
     time_module = runtime.time_module
     retrieval_query = _assistant_core_retrieval_query(request)
+    if decision.effective_mode == MODE_SMART_DIAGNOSTIC:
+        from . import smart_sources
+        # Smart questions need observation/legend/Step evidence even when it
+        # carries no causal assertion. Select from the complete scoped producer
+        # pool before Root Cause's causal filter and irreversible top-24 dedup.
+        raw = list(retrieval.get("candidates") or retrieval.get("citations") or [])
+        selected, selection = smart_sources.select(raw, request=request, decision=decision,
+            term_set=_content_term_set, candidate_text=_v13_candidate_text,
+            max_items=max(1, min(8, request.top_k)))
+        supported = bool(selected and not decision.degraded and decision.evidence_state in {
+            EVIDENCE_SUPPORTED, EVIDENCE_PARTIAL, EVIDENCE_REFINE})
+        return {"supported": supported, "retrieval": {**dict(retrieval or {}),
+            "candidates": selected if supported else [],
+            "citations": selected if supported else [],
+            "metrics": _v13_evidence_metrics(selected if supported else []),
+            "assistant_core_smart_source_selection": selection,
+            "assistant_core_decision": {"supported": supported,
+                "effective_mode": MODE_SMART_DIAGNOSTIC,
+                "router_evidence_state": decision.evidence_state,
+                "smart_source_selection": selection}}}
     retrieval = _assistant_core_root_diagnostic_evidence_assurance(
         request, retrieval, decision
     )

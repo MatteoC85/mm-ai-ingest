@@ -236,6 +236,9 @@ def generation_hypothesis_instruction():
             'and distinguish reported facts, historical examples and the discriminating observations still unknown. '
             'A reported compatible trigger can justify investigating a documented possible mechanism; '
             'do not assert that the unobserved mechanism or condition has occurred. '
+            'An item listed for inspection is not itself a documented failure mechanism. Keep indicators and '
+            'inspection subjects in checks unless the source explicitly supports their causal link; do not '
+            'turn each item in a checklist into an alternative cause. '
             'Unknown is neither a positive nor a negative observation. Do not transfer observations or recurrence '
             'from historical/simulated cases to the current machine event or use them as measured probabilities. '
             'Preserve every reported time qualifier in why and probability updates: no change AFTER an event '
@@ -244,7 +247,8 @@ def generation_hypothesis_instruction():
             'when it was not observed, and require no new inspection or operation. If a new check is needed, '
             'ask it separately with its documented role and prerequisites; retrospection grants no safety exemption. '
             'Every proposed check and all of its source safety prerequisites must remain supported. '
-            'Keep mode-specific tests conditional when the active mode is unknown; first obtain the prerequisite '
+            'Keep mode-specific claims conditional in descriptions, why, checks and questions when the active '
+            'mode is unknown; first obtain the prerequisite '
             'observation instead of assuming every mode requires the same signal transition or operating condition. ')
 
 

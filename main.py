@@ -11885,10 +11885,11 @@ def _v13_merge_candidates(candidate_lists: list[list[dict]]) -> list[dict]:
     )
 
 
-def _v13_score_candidates(q: str, candidates: list[dict]) -> list[dict]:
+def _v13_score_candidates(q: str, candidates: list[dict], *, preserve_complete: bool = False) -> list[dict]:
     return _retrieval_candidate_ranking.v13_score_candidates(
         q,
         candidates,
+        preserve_complete=preserve_complete,
         runtime=_retrieval_candidate_ranking.V13ScoreCandidatesRuntime(
             V13_SOURCE_RETRIEVAL_MIN_TITLE_SCORE=V13_SOURCE_RETRIEVAL_MIN_TITLE_SCORE,
             _candidate_source_bias=_candidate_source_bias,
@@ -12220,11 +12221,12 @@ def _v13_fetch_structured_title_candidates(
     )
 
 
-def _v13_merge_source_title_candidates(q: str, retrieval: dict, title_candidates: list[dict]) -> dict:
+def _v13_merge_source_title_candidates(q: str, retrieval: dict, title_candidates: list[dict], *, preserve_complete: bool = False) -> dict:
     return _retrieval_candidate_ranking.v13_merge_source_title_candidates(
         q,
         retrieval,
         title_candidates,
+        preserve_complete=preserve_complete,
         runtime=_retrieval_candidate_ranking.V13MergeSourceTitleCandidatesRuntime(
             V13_MAX_EVIDENCE_ITEMS_ASK=V13_MAX_EVIDENCE_ITEMS_ASK,
             V13_SOURCE_RETRIEVAL_MAX_CANDIDATES=V13_SOURCE_RETRIEVAL_MAX_CANDIDATES,
@@ -21341,6 +21343,8 @@ def _assistant_core_synthesize_smart_start(
     response_citations, grounding_packet, context_meta = _sd_prepare_start_grounding(raw_citations,
         company_id=request.company_id, machine_id=request.machine_id, max_items=evidence_limit,
         relevant_ids=list(decision.relevant_evidence_ids or []))
+    if retrieval.get("assistant_core_smart_source_selection"):
+        context_meta["source_selection"] = dict(retrieval["assistant_core_smart_source_selection"])
     try:
         rg_links = _build_rg_links(request.company_id, response_citations)
     except Exception as exc:

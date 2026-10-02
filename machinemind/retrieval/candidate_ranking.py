@@ -623,7 +623,7 @@ class V13ScoreCandidatesRuntime:
     _v13_real_semantic_similarity: Callable[..., Any]
 
 
-def v13_score_candidates(q: str, candidates: list[dict], *, runtime: V13ScoreCandidatesRuntime, lineage: Optional[Callable[..., None]]=None) -> list[dict]:
+def v13_score_candidates(q: str, candidates: list[dict], *, runtime: V13ScoreCandidatesRuntime, lineage: Optional[Callable[..., None]]=None, preserve_complete: bool=False) -> list[dict]:
     V13_SOURCE_RETRIEVAL_MIN_TITLE_SCORE = runtime.V13_SOURCE_RETRIEVAL_MIN_TITLE_SCORE
     _candidate_source_bias = runtime._candidate_source_bias
     _candidate_specificity_score = runtime._candidate_specificity_score
@@ -737,6 +737,13 @@ def v13_score_candidates(q: str, candidates: list[dict], *, runtime: V13ScoreCan
             int(c.get("chunk_index") or 0),
         )
     )
+    if preserve_complete:
+        # Explicit Smart discovery only: preserve complete received producer
+        # records before display-oriented dedup. Existing SQL producer merges
+        # and their bounded projections are outside this selection boundary.
+        if lineage is not None:
+            lineage(tuple(_origins[id(c)] for c in out))
+        return out
     if lineage is not None:
         _parents = tuple(_origins[id(c)] for c in out)
         _before_selection = tuple(out)
@@ -858,7 +865,7 @@ class V13MergeSourceTitleCandidatesRuntime:
     _v13_score_candidates: Callable[..., Any]
 
 
-def v13_merge_source_title_candidates(q: str, retrieval: dict, title_candidates: list[dict], *, runtime: V13MergeSourceTitleCandidatesRuntime) -> dict:
+def v13_merge_source_title_candidates(q: str, retrieval: dict, title_candidates: list[dict], *, runtime: V13MergeSourceTitleCandidatesRuntime, preserve_complete: bool=False) -> dict:
     V13_MAX_EVIDENCE_ITEMS_ASK = runtime.V13_MAX_EVIDENCE_ITEMS_ASK
     V13_SOURCE_RETRIEVAL_MAX_CANDIDATES = runtime.V13_SOURCE_RETRIEVAL_MAX_CANDIDATES
     _v13_evidence_metrics = runtime._v13_evidence_metrics
@@ -870,7 +877,8 @@ def v13_merge_source_title_candidates(q: str, retrieval: dict, title_candidates:
     merged = _v13_merge_candidates(
         [list(original.get("candidates") or []), list(title_candidates or [])]
     )
-    scored = _v13_score_candidates(q, merged)
+    scored = (_v13_score_candidates(q, merged, preserve_complete=True) if preserve_complete
+              else _v13_score_candidates(q, merged))
     out = dict(original)
     out["candidates"] = scored
     out["citations"] = scored[:V13_MAX_EVIDENCE_ITEMS_ASK]
