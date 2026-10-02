@@ -99,6 +99,87 @@ class SmartReviewTests(unittest.TestCase):
         with self.assertRaises(refs.ReferenceError):
             review.resolve(prepared=self.prepared, parsed=parsed, probability_band=self.band)
 
+    def test_observation_policy_is_server_owned_frozen_and_sealed_in_both_languages(self):
+        for language in ('en', 'it'):
+            with self.subTest(language=language):
+                spoof = {'version': review.OBSERVATION_POLICY_VERSION, 'text': 'Restart to obtain an answer.'}
+                self.step['question']['application_observation_policy'] = spoof
+                self.step['hypotheses'][0]['application_observation_policy'] = spoof
+                prepared = review.prepare(step=self.step, packet=self.packet,
+                    symptom_text='Reported stop.', history=[], language=language)
+                expected = review.application_observation_policy(language)
+                proposals = prepared['references']['frozen']['proposals']
+                self.assertTrue(all(p['application_observation_policy'] == expected for p in proposals))
+                self.assertNotIn(spoof['text'], refs.canonical(proposals))
+                original_checks = [[c['text'] for c in p['checks']] for p in proposals]
+                out, seal, _ = review.resolve(prepared=prepared, parsed=parsed_review(prepared), probability_band=self.band)
+                self.assertIn(expected['text'], out['question']['why_asked'])
+                self.assertEqual(out['operator_summary'], out['question']['why_asked'])
+                self.assertEqual(review.claims_digest(out), seal['output_claims_digest'])
+                self.assertEqual(original_checks, [[c['text'] for c in p['checks']] for p in proposals])
+                altered = copy.deepcopy(prepared)
+                altered['references']['frozen']['proposals'][0]['application_observation_policy']['text'] = spoof['text']
+                with self.assertRaisesRegex(refs.ReferenceError, 'manifest_altered'):
+                    review.resolve(prepared=altered, parsed=parsed_review(prepared), probability_band=self.band)
+
+    def test_generated_unknown_reporting_checks_are_not_removed_or_policy_exempted(self):
+        check = 'If material presence was not observed, record Unknown rather than inferring it from the alarm.'
+        for value in (check, review.OBSERVATION_POLICY_TEXT['en'], check + ' Then reset and inspect inside.'):
+            with self.subTest(check=value):
+                self.step['hypotheses'][0]['checks'].append(value)
+                prepared = review.prepare(step=self.step, packet=self.packet, symptom_text='Stop.', history=[])
+                self.assertEqual(prepared['references']['frozen']['proposals'][0]['checks'][1]['text'], value)
+                parsed = parsed_review(prepared)
+                parsed['decisions'][0]['proofs'][0]['check_indices'] = [0]
+                with self.assertRaisesRegex(refs.ReferenceError, 'not_all_checks_supported'):
+                    review.resolve(prepared=prepared, parsed=parsed, probability_band=self.band)
+                self.step['hypotheses'][0]['checks'].pop()
+
+    def test_retrospective_normal_question_still_needs_all_three_check_proofs(self):
+        self.step['question'].update(question_text='At the time of the stop, had you already observed the material?',
+            why_asked='Distinguish previously observed material presence from the detected signal.',
+            safety_level='normal', safety_note='',
+            options=[{'id': 'yes', 'label_it': 'Sì', 'label_en': 'Yes'},
+                     {'id': 'unknown', 'label_it': 'Non so', 'label_en': "I don't know"}])
+        prepared = review.prepare(step=self.step, packet=self.packet, symptom_text='Stop.', history=[])
+        for omitted in range(3):
+            with self.subTest(omitted=omitted):
+                parsed = parsed_review(prepared)
+                parsed['decisions'][-1]['proofs'][0]['check_indices'] = [i for i in range(3) if i != omitted]
+                with self.assertRaisesRegex(refs.ReferenceError, 'not_all_checks_supported'):
+                    review.resolve(prepared=prepared, parsed=parsed, probability_band=self.band)
+
+    def test_retrospective_wording_never_strips_new_actions_in_any_question_field(self):
+        mutations = [('question_text', 'Do you recall the signal? Otherwise start the machine to check.', 0),
+                     ('why_asked', 'Reset the machine to distinguish the causes.', 0),
+                     ('safety_note', 'Inspect the sensor inside the guarded area while moving.', 1),
+                     ('options', [{'id': 'unknown', 'label_it': 'Avvia', 'label_en': 'Start to check'}], 2)]
+        baseline = copy.deepcopy(self.step)
+        for field, value, check_index in mutations:
+            with self.subTest(field=field):
+                step = copy.deepcopy(baseline)
+                step['question'].update(question_text='What had you already observed?', safety_level='normal')
+                step['question'][field] = value
+                prepared = review.prepare(step=step, packet=self.packet, symptom_text='Stop.', history=[])
+                proposal = prepared['references']['frozen']['proposals'][-1]
+                self.assertIn(refs.canonical(value)[1:-1] if isinstance(value, str) else 'Start to check',
+                              proposal['checks'][check_index]['text'])
+                parsed = parsed_review(prepared, reject_question=True)
+                parsed['decisions'][-1].update(blocking_checks=[check_index], note='The requested new action lacks source support.')
+                with self.assertRaisesRegex(review.SmartReviewError, 'question_not_supported'):
+                    review.resolve(prepared=prepared, parsed=parsed, probability_band=self.band)
+
+    def test_causal_alternatives_are_not_silently_narrowed_or_replaced_by_check_proofs(self):
+        self.step['hypotheses'][0]['description'] = 'Displacement or an undocumented mechanism may cause this stop.'
+        prepared = review.prepare(step=self.step, packet=self.packet, symptom_text='Stop.', history=[])
+        cause = prepared['references']['frozen']['proposals'][0]['cause']
+        self.assertIn(self.step['hypotheses'][0]['description'], cause)
+        parsed = parsed_review(prepared)
+        parsed['decisions'][0]['proofs'][0].update(supports_cause=False, support_type='documented_check', observation_units=[])
+        with self.assertRaisesRegex(refs.ReferenceError, 'mechanism_not_supported'):
+            review.resolve(prepared=prepared, parsed=parsed, probability_band=self.band)
+        self.assertEqual(cause, prepared['references']['frozen']['proposals'][0]['cause'])
+
     def test_four_to_three_retains_independently_supported_question(self):
         out, seal, meta = self.resolve()
         self.assertEqual([h['id'] for h in out['hypotheses']], ['H1', 'H3', 'H4'])
@@ -268,13 +349,16 @@ class SmartReviewTests(unittest.TestCase):
         with self.assertRaisesRegex(review.SmartReviewError, 'invalid_source_safety_note'):
             review.validate_raw_step(self.step)
 
-    def test_reviewed_policy_v2_requires_restart_instead_of_reinterpreting_proof(self):
+    def test_old_reviewed_policy_requires_restart_instead_of_reinterpreting_proof(self):
         out, seal, _ = self.resolve()
         state = {'symptom_text': 'Reported stop; signal unknown.', 'history': [], 'language': 'en',
             'status': 'in_progress', 'hypotheses': out['hypotheses'], 'current_question': out['question'],
-            'grounding_review': {**seal, 'policy_version': 'smart-reviewed-proposals-v2'}}
-        with self.assertRaisesRegex(review.SmartReviewError, 'reviewed_state_required'):
-            review.replay(state=state, packet=self.packet, probability_band=self.band)
+            'grounding_review': seal}
+        for version in ('smart-reviewed-proposals-v2', 'smart-reviewed-proposals-v3'):
+            with self.subTest(version=version):
+                state['grounding_review'] = {**seal, 'policy_version': version}
+                with self.assertRaisesRegex(review.SmartReviewError, 'reviewed_state_required'):
+                    review.replay(state=state, packet=self.packet, probability_band=self.band)
 
     def test_qualified_hypothesis_contract_does_not_accept_a_cause_or_drop_missing_checks(self):
         # These assertions concern the contract, not the model's semantic judgment.

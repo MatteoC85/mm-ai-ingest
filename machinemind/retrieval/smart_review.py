@@ -10,7 +10,7 @@ import re
 
 from . import review_references as refs
 
-POLICY_VERSION = 'smart-reviewed-proposals-v3'
+POLICY_VERSION = 'smart-reviewed-proposals-v4'
 MAX_CHECK_CHARS = 2000
 MAX_SOURCE_SAFETY_NOTE_CHARS = 900
 WIRE_VERSION = 'smart-review-wire-v1'
@@ -18,6 +18,11 @@ INPUT_VERSION = 'smart-review-table-input-v1'
 MAX_REVIEW_SECONDS = 30
 FINALIZATION_RESERVE_SECONDS = 2
 SAFETY_POLICY_VERSION = 'smart-restrictive-safety-v1'
+OBSERVATION_POLICY_VERSION = 'smart-observation-reporting-v1'
+OBSERVATION_POLICY_TEXT = {
+    'en': 'Report only what was actually observed. If an observation was not made or is unavailable, choose Unknown; do not infer it from an alarm or a hypothesis. This reporting rule requests no new inspection, movement or operation.',
+    'it': 'Riporta soltanto ciò che è stato realmente osservato. Se una verifica non è stata fatta o il suo esito non è disponibile, scegli Non so; non dedurlo da un allarme o da una ipotesi. Questa regola di risposta non richiede nuove ispezioni, movimenti o operazioni.',
+}
 SAFETY_POLICY_TEXT = {
     'en': 'Do not enter guarded areas or bypass guards, interlocks or safety devices; if the observation cannot be made safely under the approved procedure, choose Unknown',
     'it': 'Non entrare nelle aree protette e non bypassare ripari, interblocchi o dispositivi di sicurezza; se la verifica non è possibile in sicurezza secondo la procedura approvata, scegli Non so',
@@ -69,6 +74,12 @@ by reported observations. Historical/simulated outcomes cannot establish current
 conditions or numerical confidence. Mode-specific tests stay conditional until
 the applicable operating mode is known; do not assume all modes require the same
 signal transition or operating condition.
+Every distinct mechanism or causal alternative in the label, description and why
+must be supported independently, including alternatives joined by 'or' or hidden
+inside a qualified 'may'. A proof for one mechanism cannot validate additional
+mechanisms. An item merely listed for inspection, an indicator or an adjustment
+is not evidence that its failure causes this symptom. Reject the whole cause if
+any proposed causal link lacks support; never silently narrow its wording.
 
 Scope: selected-machine context resolves unqualified 'the machine', not component
 identity, document correctness or dependency. Reject wrong/unidentified targets.
@@ -101,8 +112,18 @@ useful observation and at least one accepted, non-excluded declared target ID;
 never invent targets. Reject explanations depending on rejected causes. Alternatives
 are possible answers, not observations. ALL question checks need k=c proofs with
 o=[]; no causal proof is required for this one proposal. Technical alternatives,
-operating instructions, safety_level and source_safety_note still need applicable
-technical/context source proofs. The complete generated source_safety_note is
+operating instructions and source_safety_note still need applicable technical/context
+source proofs. Review safety_level against the action actually requested by ALL
+question fields and options. For a strictly retrospective question asking only
+for an already made observation, normal classifies recollection/answering, not
+the machine activity being recalled. It can be appropriate without a manual
+calling recollection 'normal' ONLY if the complete question requests no new
+inspection, movement, reset, parameter change or other operation and allows
+Unknown for an unobserved/unavailable result. The source proof must still support
+the technical subject, applicability and diagnostic distinction; all question
+checks still require proofs. A retrospective opening never excuses a new action
+in the question, why, safety note or any option. New actions require their actual
+source-supported role, safety level and complete precautions. The complete generated source_safety_note is
 immutable and needs source support, even if it quotes an application prohibition;
 never strip a clause or use the application policy to excuse an unsupported
 technical instruction or a missing source prerequisite. Only exact server-canonical
@@ -113,6 +134,13 @@ manual wording. These controls remain visible/immutable, grant NO permission to
 operate, enter, move, change parameters or inspect energized equipment, and never
 replace source prerequisites. Reject conflicts with source safety requirements;
 arbitrary generated safety notes have no policy exemption.
+The separately supplied application_observation_policy is also server-owned,
+versioned application provenance. Its reporting/Unknown rule is not a machine
+mechanism, technical check or assertion that a condition occurred. Do not require
+a machine manual to prescribe that application rule. This role applies ONLY to
+the separate canonical policy: every generated hypothesis check, even a
+paraphrase of it or a mixed reporting/technical instruction, remains immutable
+and source-reviewed in full. Never drop a check or excuse an unsupported action.
 
 Accept with r=supported,b=[],n="". Reject with r!=supported,e=[] and one short
 factual explanation in n, not a reasoning transcript. For unsupported_check,
@@ -174,10 +202,12 @@ def prepare(*, step, packet, symptom_text, history, language='en'):
     require(1 <= len(hypotheses) <= 4, 'invalid_hypothesis_count')
     require(len({h.get('id') for h in hypotheses}) == len(hypotheses), 'duplicate_hypothesis')
     proposals = []
+    observation_policy = application_observation_policy(language)
     for index, h in enumerate(hypotheses):
         require(all(isinstance(h.get(k), str) and h[k].strip() for k in ('id', 'label', 'why')), 'incomplete_hypothesis')
         proposals.append({'proposal_index': index, 'kind': 'cause', 'hypothesis_id': h['id'],
                           'hypothesis_status': h.get('status', 'open'),
+                          'application_observation_policy': deepcopy(observation_policy),
                           'cause': h['label'] + ('\n' + h['description'] if h.get('description') else ''),
                           'why': h['why'],
                           'checks': [{'check_index': i, 'text': s} for i, s in enumerate(h.get('checks') or [])]})
@@ -193,6 +223,7 @@ def prepare(*, step, packet, symptom_text, history, language='en'):
         proposals.append({'proposal_index': question_index, 'kind': 'diagnostic_question',
                           'target_hypotheses': list(q.get('target_hypotheses') or []),
                           'application_safety_policy': application_policy,
+                          'application_observation_policy': deepcopy(observation_policy),
                           'cause': 'Current closed diagnostic question',
                           'why': 'Check every field and all options against the sources and the hypotheses you accept.',
                           'checks': [{'check_index': i, 'text': s} for i, s in enumerate(texts)]})
@@ -221,6 +252,11 @@ def application_safety_policy(language):
     return {'version': SAFETY_POLICY_VERSION, 'text': SAFETY_POLICY_TEXT[language]}
 
 
+def application_observation_policy(language):
+    require(language in OBSERVATION_POLICY_TEXT, 'unsupported_observation_policy_language')
+    return {'version': OBSERVATION_POLICY_VERSION, 'text': OBSERVATION_POLICY_TEXT[language]}
+
+
 def public_safety_note(source_note, *, language):
     """Compose only after review; do not extract or discard generated clauses."""
     policy_text = application_safety_policy(language)['text']
@@ -239,6 +275,8 @@ def generation_hypothesis_instruction():
             'An item listed for inspection is not itself a documented failure mechanism. Keep indicators and '
             'inspection subjects in checks unless the source explicitly supports their causal link; do not '
             'turn each item in a checklist into an alternative cause. '
+            'Prefer one documented mechanism per hypothesis. Every additional causal alternative in the label, '
+            'description or why must have its own supporting causal relationship, not merely appear in the source. '
             'Unknown is neither a positive nor a negative observation. Do not transfer observations or recurrence '
             'from historical/simulated cases to the current machine event or use them as measured probabilities. '
             'Preserve every reported time qualifier in why and probability updates: no change AFTER an event '
@@ -246,6 +284,14 @@ def generation_hypothesis_instruction():
             'A retrospective question must ask only what the operator already observed, explicitly allow Unknown '
             'when it was not observed, and require no new inspection or operation. If a new check is needed, '
             'ask it separately with its documented role and prerequisites; retrospection grants no safety exemption. '
+            'The server supplies and displays a separate application observation-reporting policy. '
+            'Hypothesis checks contain ONLY source-documented technical verifications and their prerequisites; '
+            'do not put reporting instructions such as record Unknown, do not infer, or answer only what was observed '
+            'in checks. Do not copy or paraphrase the application policy into checks, why or safety_note. '
+            'For the Unknown option use exactly id=unknown, label_it=Non so, label_en=I don\'t know. '
+            'A strictly retrospective question may use safety_level=normal only when its entire text, why and '
+            'options require no new inspection, movement or operation. This classification permits recollection '
+            'only, never the machine activity being recalled. '
             'Every proposed check and all of its source safety prerequisites must remain supported. '
             'Keep mode-specific claims conditional in descriptions, why, checks and questions when the active '
             'mode is unknown; first obtain the prerequisite '
@@ -452,6 +498,7 @@ def resolve(*, prepared, parsed, probability_band):
         # digest below; the original explanation/proof remains in input_step.
         why = q.get('why_asked') or q['question_text']
         q['why_asked'] = why if caution in why else why + '\n' + caution
+        q['why_asked'] += '\n' + application_observation_policy(prepared['language'])['text']
         out['operator_summary'] = q['why_asked']
     seal = {'policy_version': POLICY_VERSION, 'input_step': deepcopy(original),
             'decisions': deepcopy(parsed), 'context_digest': prepared['context_digest'],

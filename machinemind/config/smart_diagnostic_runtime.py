@@ -5,6 +5,7 @@ import os
 
 from machinemind.config.assistant_runtime import V13_EVIDENCE_GATE_MODEL
 from machinemind.config.runtime import ROOT_CAUSE_RESPONSE_MODEL
+from machinemind.retrieval.smart_evidence import MAX_SOURCES as _SMART_EVIDENCE_MAX_SOURCES
 
 __all__ = [
     "SMART_DIAGNOSTIC_ENABLED",
@@ -32,7 +33,11 @@ SMART_DIAGNOSTIC_MAX_QUESTIONS = int(os.environ.get("MM_SMART_DIAGNOSTIC_MAX_QUE
 SMART_DIAGNOSTIC_MAX_HYPOTHESES = int(os.environ.get("MM_SMART_DIAGNOSTIC_MAX_HYPOTHESES", "4"))
 SMART_DIAGNOSTIC_TOP_K = int(os.environ.get("MM_SMART_DIAGNOSTIC_TOP_K", "8"))
 SMART_DIAGNOSTIC_MAX_CONTEXT_CHARS = int(os.environ.get("MM_SMART_DIAGNOSTIC_MAX_CONTEXT_CHARS", "22000"))
-SMART_DIAGNOSTIC_MAX_EVIDENCE_IN_STATE = int(os.environ.get("MM_SMART_DIAGNOSTIC_MAX_EVIDENCE_IN_STATE", "8"))
+# START still selects at most eight base records. The signed state also needs
+# room for bounded canonical context and later admitted evidence; the packet's
+# source-count and 22k text limits remain authoritative. Respect lower overrides.
+SMART_DIAGNOSTIC_MAX_EVIDENCE_IN_STATE = max(1, min(_SMART_EVIDENCE_MAX_SOURCES,
+    int(os.environ.get("MM_SMART_DIAGNOSTIC_MAX_EVIDENCE_IN_STATE", str(_SMART_EVIDENCE_MAX_SOURCES)))))
 SMART_DIAGNOSTIC_SOURCE_MANIFEST_VERSION = "smart-source-manifest-v1-20260831"
 SMART_DIAGNOSTIC_FINAL_SOURCE_LIMIT = max(
     2,
