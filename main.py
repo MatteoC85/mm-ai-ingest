@@ -20020,7 +20020,7 @@ def _sd_evidence_block_from_state_evidence(evidence: list[dict], max_context_cha
 def _sd_schema(max_hypotheses: int = 4, max_options: int = 4) -> dict:
     max_hypotheses = max(1, min(int(max_hypotheses or 4), 4))
     max_options = max(1, min(int(max_options or 4), 4))
-    return {
+    schema = {
         "name": "smart_diagnostic_step_v1",
         "strict": True,
         "schema": {
@@ -20055,7 +20055,7 @@ def _sd_schema(max_hypotheses: int = 4, max_options: int = 4) -> dict:
                                 "required": ["id", "label_it", "label_en"],
                             },
                         },
-                        "target_hypotheses": {"type": "array", "items": {"type": "string"}, "maxItems": max_hypotheses},
+                        "target_hypotheses": {"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": 128}, "maxItems": max_hypotheses},
                     },
                     "required": [
                         "question_id",
@@ -20076,7 +20076,7 @@ def _sd_schema(max_hypotheses: int = 4, max_options: int = 4) -> dict:
                         "type": "object",
                         "additionalProperties": False,
                         "properties": {
-                            "id": {"type": "string"},
+                            "id": {"type": "string", "minLength": 1, "maxLength": 128},
                             "rank": {"type": "integer"},
                             "label": {"type": "string"},
                             "description": {"type": "string"},
@@ -20106,7 +20106,7 @@ def _sd_schema(max_hypotheses: int = 4, max_options: int = 4) -> dict:
                     "additionalProperties": False,
                     "properties": {
                         "summary": {"type": "string"},
-                        "most_likely_hypothesis_id": {"type": "string"},
+                        "most_likely_hypothesis_id": {"type": "string", "maxLength": 128},
                         "most_likely_label": {"type": "string"},
                         "probability_pct": {"type": "number"},
                         "probability_band": {"type": "string", "enum": ["high", "medium", "low", "very_low", "unknown"]},
@@ -20118,6 +20118,12 @@ def _sd_schema(max_hypotheses: int = 4, max_options: int = 4) -> dict:
             "required": ["status", "final_ready", "operator_summary", "question", "hypotheses", "final_result"],
         },
     }
+    # Generate the documented mechanisms before their dependent question and
+    # summary. This changes only JSON property order, not required public fields.
+    properties = schema["schema"]["properties"]
+    schema["schema"]["properties"] = {key: properties[key] for key in (
+        "hypotheses", "question", "status", "final_ready", "operator_summary", "final_result")}
+    return schema
 
 
 def _sd_finalize_schema() -> dict:
@@ -20129,7 +20135,7 @@ def _sd_finalize_schema() -> dict:
             "additionalProperties": False,
             "properties": {
                 "summary": {"type": "string"},
-                "most_likely_hypothesis_id": {"type": "string"},
+                "most_likely_hypothesis_id": {"type": "string", "maxLength": 128},
                 "most_likely_label": {"type": "string"},
                 "probability_pct": {"type": "number"},
                 "probability_band": {"type": "string", "enum": ["high", "medium", "low", "very_low", "unknown"]},
@@ -20141,7 +20147,7 @@ def _sd_finalize_schema() -> dict:
                         "type": "object",
                         "additionalProperties": False,
                         "properties": {
-                            "id": {"type": "string"},
+                            "id": {"type": "string", "minLength": 1, "maxLength": 128},
                             "label": {"type": "string"},
                             "probability_pct": {"type": "number"},
                             "probability_band": {"type": "string", "enum": ["high", "medium", "low", "very_low", "unknown"]},
@@ -20729,9 +20735,12 @@ def _sd_normalize_hypotheses(
     for idx, raw in enumerate(items or [], start=1):
         if not isinstance(raw, dict):
             continue
-        hid = _sd_clean_text(raw.get("id") or f"H{idx}", 40)
-        if not hid or hid in used:
-            hid = f"H{idx}"
+        # IDs are opaque references, not display text. Clipping them changes the
+        # graph linking question targets, hypotheses and the final selection.
+        hid = raw.get("id")
+        if not isinstance(hid, str) or not hid.strip() or len(hid) > 128 or hid != hid.strip() or hid in used:
+            raise HTTPException(status_code=502, detail={"code": "SMART_DIAGNOSTIC_GENERATION_FAILED",
+                "generation_error_class": "ValueError"})
         pct = max(0.0, min(100.0, float(raw.get("probability_pct") or 0.0)))
         raw_checks = raw.get("checks") or []
         if (not isinstance(raw_checks, list) or len(raw_checks) > 5
@@ -20860,9 +20869,9 @@ def _sd_llm_step_start(
         "You are MachineMind Smart Diagnostic, a guided diagnostic engine for industrial machinery. "
         "You are NOT a free chat. You must create a professional guided diagnostic session with one closed question at a time. "
         "Use ONLY the provided indexed machine evidence. Do not invent machine-specific facts. "
-        "Generate up to four supported hypotheses with estimated probabilities from evidence + symptom; this is a ceiling, not a quota. "
+        "Return only hypotheses with a documented causal mechanism compatible with the reported symptom; MAX_HYPOTHESES is only a ceiling. "
         "Every cause, explanation and check must be supported by its cited source; omit a weak hypothesis rather than citing a merely related topic. "
-        "Ask the next best closed question that separates the leading hypotheses. "
+        "Resolve unknown applicability prerequisites before asking a question that tests a conditional mechanism. "
         "If only one supported hypothesis remains, ask a documented observation testing or challenging its prerequisites; do not invent additional causes just to obtain contrast. "
         "Questions must be practical for an operator/technician and answerable as yes/no or single-choice. "
         "For single-choice questions provide at most three factual alternatives and one option with id=unknown for an unavailable or unsafe observation. "
@@ -20883,7 +20892,7 @@ def _sd_llm_step_start(
         f"SYMPTOM:\n{symptom_text}\n\n"
         f"EVIDENCE_IDS:\n{json.dumps(evidence_ids, ensure_ascii=False)}\n\n"
         f"INDEXED_MACHINE_EVIDENCE:\n{evidence_block}\n\n"
-        "Return JSON. Start the guided diagnostic. The first question should be the most discriminating safe observation. "
+        "Return JSON. Start with the first unknown applicability prerequisite, or a safe discriminating observation when applicability is known. "
         "If evidence is insufficient, return no_sources."
     )
     try:
@@ -20921,7 +20930,7 @@ def _sd_llm_step_answer(*, state: dict, answer: dict, language: str, max_hypothe
         "You are NOT a free chat. Update the diagnostic session after the user's closed answer. "
         "Use ONLY the provided state, answer and indexed evidence. Do not invent machine-specific facts. "
         "Update probabilities and ask ONE next closed question, unless the diagnosis is ready to finalize. "
-        "Choose the next question to discriminate the top remaining hypotheses. "
+        "Resolve unknown applicability prerequisites before testing or comparing the remaining hypotheses. "
         "If only one supported hypothesis remains, ask a documented observation testing or challenging its prerequisites; do not invent additional causes just to obtain contrast. "
         "Keep hypothesis IDs stable when updating the same cause. Explain how the latest answer changes each leading hypothesis. "
         "An unknown answer is missing information, never a positive or negative observation. "

@@ -596,6 +596,74 @@ class SmartReviewEndpointTests(unittest.TestCase):
         self.assertEqual(again.json()['final_result'], final.json()['final_result'])
         self.assertEqual(self.provider.call_count, before)
 
+    def test_opaque_long_ids_keep_targets_and_signed_start_answer_final_links(self):
+        # Distinct source claims may have IDs sharing much more than the old
+        # display-text limit. Identity must not depend on a visible abbreviation.
+        prefix = 'hypothesis_for_a_documented_conditional_mechanism_' + 'x' * 77
+        ids = [prefix + suffix for suffix in ('A', 'B')]
+        self.assertEqual([len(x) for x in ids], [128, 128])
+        self.raw['hypotheses'] = self.raw['hypotheses'][:2]
+        for hypothesis, hid in zip(self.raw['hypotheses'], ids):
+            hypothesis['id'] = hid
+        self.raw['question']['target_hypotheses'] = ids[:]
+        start = self.start()
+        self.assertEqual([h['id'] for h in start['hypotheses']], ids)
+        self.assertEqual(start['question']['target_hypotheses'], ids)
+        start_state = json.loads(start['session_state_json'])
+        self.assertEqual(start_state['current_question']['target_hypotheses'], ids)
+        answer_step = copy.deepcopy(self.raw)
+        answer_step['question']['question_text'] = 'Was the documented operating condition already observed?'
+        with patch.object(self.m, '_sd_llm_step_answer', return_value=answer_step) as generator:
+            response = self.post('answer', start['session_state_json'], question_id='Q1',
+                                 answer={'value': 'unknown', 'api_value': 'unknown'})
+        self.assertEqual(response.status_code, 200, response.text)
+        answer = response.json()
+        self.assertEqual([h['id'] for h in generator.call_args.kwargs['state']['hypotheses']], ids)
+        self.assertEqual([h['id'] for h in answer['hypotheses']], ids)
+        self.assertEqual(answer['question']['target_hypotheses'], ids)
+        before = self.provider.call_count
+        final = self.post('finalize', answer['session_state_json'])
+        self.assertEqual(final.status_code, 200, final.text)
+        self.assertEqual(final.json()['final_result']['most_likely_hypothesis_id'], ids[0])
+        again = self.post('finalize', final.json()['session_state_json'])
+        self.assertEqual(again.status_code, 200, again.text)
+        self.assertEqual(again.json()['final_result'], final.json()['final_result'])
+        self.assertEqual(self.provider.call_count, before)
+
+    def test_invalid_or_duplicate_hypothesis_ids_fail_before_review_with_accounting(self):
+        original = copy.deepcopy(self.raw)
+        for bad in ('', 'x' * 129, ' H1 ', 41, None, 'H2'):
+            with self.subTest(bad=bad):
+                self.raw = copy.deepcopy(original)
+                self.raw['hypotheses'][0]['id'] = bad
+                before = self.provider.call_count
+                response = self.post('start', symptom_text='Reported stop; condition unknown.')
+                self.assertEqual(response.status_code, 200, response.text)
+                body = response.json()
+                self.assertFalse(body['ok'])
+                self.assertEqual(body['error_code'], 'SMART_DIAGNOSTIC_GENERATION_FAILED')
+                self.assertEqual(body['meta']['v13_route'], 'assistant_core_smart_generation_error')
+                self.assertTrue(body['meta']['v13_accounting_complete'])
+                self.assertEqual(body['hypotheses'], [])
+                self.assertEqual(self.provider.call_count, before)
+
+    def test_hypothesis_identity_schema_limits_match_all_reference_fields(self):
+        schema = self.m._sd_schema()['schema']
+        step = schema['properties']
+        expected = {'hypotheses', 'question', 'status', 'final_ready', 'operator_summary', 'final_result'}
+        self.assertEqual(set(step), expected)
+        self.assertEqual(set(schema['required']), expected)
+        self.assertEqual(list(step)[:2], ['hypotheses', 'question'])
+        final = self.m._sd_finalize_schema()['schema']['properties']
+        fields = [step['hypotheses']['items']['properties']['id'],
+                  step['question']['properties']['target_hypotheses']['items'],
+                  step['final_result']['properties']['most_likely_hypothesis_id'],
+                  final['most_likely_hypothesis_id'],
+                  final['alternative_hypotheses']['items']['properties']['id']]
+        self.assertTrue(all(f['type'] == 'string' and f['maxLength'] == 128 for f in fields))
+        self.assertEqual(fields[0]['minLength'], 1)
+        self.assertEqual(fields[1]['minLength'], 1)
+
     def test_internal_claim_change_or_missing_proof_rejected_before_provider(self):
         start = self.start()
         for change in ('check', 'proof', 'old_policy', 'safety_note'):
