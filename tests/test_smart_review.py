@@ -234,6 +234,61 @@ class SmartReviewTests(unittest.TestCase):
         with self.assertRaisesRegex(refs.ReferenceError, 'reference_outside_authorized_set'):
             review.resolve(prepared=self.prepared, parsed=parsed, probability_band=self.band)
 
+    def test_checkless_recalled_prerequisite_still_needs_cause_and_complete_question_proofs(self):
+        source = copy.deepcopy(self.sources[0])
+        source['chunk_full'] = ('In a documented mechanical-stop case, tool replacement displaced the fixture '
+            'and prevented the expected limit detection. Before investigating that conditional mechanism '
+            'after setup, establish from the already-known setup record whether tool replacement occurred. '
+            'No machine operation is required to answer about that prior event.')
+        packet = smart_evidence.review_packet(smart_evidence.build([source], scope=self.scope))
+        self.step['hypotheses'] = [self.step['hypotheses'][0]]
+        self.step['hypotheses'][0].update(checks=[], label='Possible fixture displacement after tool replacement',
+            description='If a tool was replaced, the fixture may have moved.',
+            why='The stop is reported, but whether tool replacement occurred is not yet known.')
+        self.step['question'].update(question_text='Did the preceding setup include tool replacement?',
+            why_asked='Establish the documented prerequisite from an already-known setup event.',
+            safety_level='normal', safety_note='', target_hypotheses=['H1'])
+        prepared = review.prepare(step=self.step, packet=packet, symptom_text='Reported mechanical stop.', history=[])
+        self.assertEqual(prepared['references']['frozen']['proposals'][0]['checks'], [])
+        parsed = parsed_review(prepared, rejected=())
+        # Verdicts are test inputs. This demonstrates proof requirements, not
+        # semantic approval of the example by a live reviewer.
+        out, _, _ = review.resolve(prepared=prepared, parsed=parsed, probability_band=self.band)
+        self.assertEqual(out['hypotheses'][0]['checks'], [])
+        self.assertFalse(out['final_ready'])
+        for mutation in ('no_causal_proof', 'no_observed_compatibility', 'missing_question_field'):
+            altered = copy.deepcopy(parsed)
+            if mutation == 'no_causal_proof':
+                altered['decisions'][0]['proofs'] = []
+            elif mutation == 'no_observed_compatibility':
+                altered['decisions'][0]['proofs'][0]['observation_units'] = []
+            else:
+                altered['decisions'][-1]['proofs'][0]['check_indices'] = [0, 2]
+            with self.subTest(mutation=mutation), self.assertRaises(refs.ReferenceError):
+                review.resolve(prepared=prepared, parsed=altered, probability_band=self.band)
+
+    def test_future_operation_missing_controls_is_preserved_and_cannot_escape_review(self):
+        source = copy.deepcopy(self.sources[0])
+        source['chunk_full'] = ('A replaced mechanical fixture can shift the position stop. '
+            'First establish whether the fixture was replaced. Only after qualified personnel restore '
+            'alignment, a test stroke may run in setup mode at reduced speed using the prescribed two-hand '
+            'controls, with guards closed. Stop immediately if the expected limit signal is absent.')
+        packet = smart_evidence.review_packet(smart_evidence.build([source], scope=self.scope))
+        step = copy.deepcopy(self.step)
+        step['hypotheses'] = [step['hypotheses'][0]]
+        operation = 'After alignment, run a test stroke in setup mode at reduced speed with guards closed.'
+        step['hypotheses'][0]['checks'] = [operation]
+        step['question'].update(question_text='Was the fixture replaced during setup?',
+            safety_level='normal', safety_note='', target_hypotheses=['H1'])
+        original = copy.deepcopy(step)
+        prepared = review.prepare(step=step, packet=packet, symptom_text='Reported position stop.', history=[])
+        self.assertEqual(prepared['references']['frozen']['proposals'][0]['checks'][0]['text'], operation)
+        parsed = parsed_review(prepared, rejected=(0,), reject_question=True)
+        parsed['decisions'][0]['note'] = 'The operation omits prescribed two-hand controls and the stop condition.'
+        with self.assertRaises(review.SmartReviewError):
+            review.resolve(prepared=prepared, parsed=parsed, probability_band=self.band)
+        self.assertEqual(step, original)  # No current-question regex repair or post-generation check deletion.
+
     def test_sixth_check_not_silently_truncated_and_unknown_not_observation(self):
         self.step['hypotheses'][0]['checks'] = ['Observe safely.'] * 5 + ['Unsupported sixth check.']
         with self.assertRaisesRegex(review.SmartReviewError, 'invalid_check_count'):
@@ -756,6 +811,132 @@ class SmartReviewEndpointTests(unittest.TestCase):
         before = self.provider.call_count
         final = self.post('finalize', start['session_state_json'])
         self.assertEqual(final.status_code, 200, final.text)
+        self.assertEqual(self.provider.call_count, before)
+
+    def test_checkless_start_final_retains_explanation_without_inventing_operating_guidance(self):
+        for source in self.sources:
+            source['chunk_full'] = ('A documented mechanical-stop case followed fixture replacement: '
+                'the fixture shifted and prevented limit detection. Establish whether fixture replacement '
+                'occurred from the already-known setup record before investigating this conditional mechanism. '
+                'Do not operate the machine to answer about that previous event.')
+        self.raw['hypotheses'] = [self.raw['hypotheses'][0]]
+        self.raw['hypotheses'][0].update(checks=[], label='Possible fixture displacement after replacement',
+            description='If the fixture was replaced, its position may have changed.',
+            why='The source documents the conditional mechanism, but fixture replacement remains unknown.')
+        self.raw['question'].update(question_text='Did the preceding setup include fixture replacement?',
+            why_asked='Establish an already-known prerequisite before investigating the conditional mechanism.',
+            safety_level='normal', safety_note='', target_hypotheses=['H1'])
+        start = self.start()
+        self.assertEqual(start['hypotheses'][0]['checks'], [])
+        before = self.provider.call_count
+        response = self.post('finalize', start['session_state_json'])
+        self.assertEqual(response.status_code, 200, response.text)
+        final = response.json()
+        self.assertTrue(final['final_ready'])
+        self.assertEqual(final['final_result']['most_likely_hypothesis_id'], 'H1')
+        self.assertIn('replacement remains unknown', final['final_result']['summary'])
+        self.assertIn('not statistical certainty or a confirmed diagnosis', final['final_result']['summary'])
+        self.assertTrue(final['citations'])
+        # No new operating recommendation is inferred. The outstanding reviewed
+        # question is retained verbatim as unresolved information instead.
+        self.assertEqual(final['final_result']['recommended_checks'], [])
+        self.assertEqual(final['question_text'], '')
+        self.assertIn(start['question']['question_text'], final['final_summary_text'])
+        self.assertIn(start['question']['why_asked'], final['final_summary_text'])
+        self.assertIn('The diagnosis is not confirmed', final['final_summary_text'])
+        self.assertIn('an Unknown answer remains missing information', final['final_summary_text'])
+        self.assertEqual(self.provider.call_count, before)
+
+    def test_checkless_final_copies_reviewed_question_and_its_provenance_in_both_languages(self):
+        for hypothesis in self.raw['hypotheses']:
+            hypothesis['checks'] = []
+        self.raw['question']['safety_note'] = ('Observe only from the documented position. ' * 18
+                                               + 'Keep all required guards closed.')
+        def provider(messages, **kwargs):
+            prepared = self.prepared[-1]
+            decisions = parsed_review(prepared, rejected=(1,))
+            decisions['decisions'][1].update(reason='unsupported', blocking_checks=[],
+                note='The source does not support this proposed mechanism.')
+            proof = decisions['decisions'][-1]['proofs'][0]
+            frozen = prepared['references']['frozen']
+            proof.update(source_index=1, source_units=frozen['source_sets'][1][:1],
+                         target_units=frozen['target_sets'][1][:1])
+            return wire_review(decisions), 'offline-review'
+        def links(company, citations):
+            return [{'citation_id': row['citation_id'], 'url': 'https://example.test/' + row['citation_id']}
+                    for row in citations]
+        with patch.object(self.m, '_v13_json_models', side_effect=provider), \
+             patch.object(self.m, '_build_rg_links', side_effect=links), \
+             patch.object(self.m._service_file_links, 'refresh_diagnostic_links', side_effect=lambda **kw: kw['rg_links']):
+            for language in ('en', 'it'):
+                with self.subTest(language=language):
+                    self.raw['question']['question_text'] = ('Did setup include fixture replacement?' if language == 'en'
+                                                             else 'La preparazione comprendeva la sostituzione del supporto?')
+                    self.raw['question']['why_asked'] = ('The prerequisite remains unknown.' if language == 'en'
+                                                        else 'Il prerequisito resta sconosciuto.')
+                    start_response = self.post('start', symptom_text='Reported stop; prerequisite unknown.', language=language)
+                    self.assertEqual(start_response.status_code, 200, start_response.text)
+                    start = start_response.json()
+                    self.assertEqual(len(start['hypotheses']), 3)  # One earlier proposal was rejected.
+                    self.assertEqual({cid for h in start['hypotheses'] for cid in h['evidence_ids']}, {'manual:p1'})
+                    before = self.provider.call_count
+                    response = self.post('finalize', start['session_state_json'], language=language)
+                    self.assertEqual(response.status_code, 200, response.text)
+                    final = response.json()
+                    summary = final['final_summary_text']
+                    question = start['question']
+                    for field in ('question_text', 'why_asked', 'safety_note'):
+                        self.assertIn(question[field], summary)
+                    for option in question['options']:
+                        self.assertIn(option['label_' + language], summary)
+                    self.assertIn('Prima di confermare resta da chiarire' if language == 'it'
+                                  else 'Before confirming, this remains to be clarified', summary)
+                    self.assertEqual({c['citation_id'] for c in final['citations']}, {'manual:p1', 'manual:p2'})
+                    self.assertEqual({x['citation_id'] for x in final['rg_links']}, {'manual:p1', 'manual:p2'})
+                    self.assertTrue(all(x['url'] for x in final['rg_links']))
+                    self.assertEqual(final['final_result']['recommended_checks'], [])
+                    again = self.post('finalize', final['session_state_json'], language=language)
+                    self.assertEqual(again.status_code, 200, again.text)
+                    self.assertEqual(again.json()['final_result'], final['final_result'])
+                    self.assertEqual(again.json()['citations'], final['citations'])
+                    self.assertEqual(again.json()['rg_links'], final['rg_links'])
+                    self.assertEqual(self.provider.call_count, before)
+                    # Even a server-signed extraneous state field cannot supply
+                    # public question citations: only replay's proof audit does.
+                    spoof = json.loads(start['session_state_json'])
+                    spoof['reviewed_question_citation_ids'] = ['manual:unproved']
+                    result = self.post('finalize', self.m._sd_sign_state(spoof), language=language)
+                    self.assertEqual(result.status_code, 200, result.text)
+                    self.assertEqual({c['citation_id'] for c in result.json()['citations']}, {'manual:p1', 'manual:p2'})
+                    missing = json.loads(start['session_state_json'])
+                    missing['citations'] = [c for c in missing['citations'] if c['citation_id'] != 'manual:p2']
+                    failed = self.post('finalize', self.m._sd_sign_state(missing), language=language)
+                    self.assertFalse(failed.json()['ok'])
+                    self.assertEqual(failed.json()['error_code'], 'SMART_DIAGNOSTIC_REVIEW_CITATION_MISSING')
+
+    def test_pending_question_tamper_fails_before_terminal_projection_and_old_final_fails_closed(self):
+        self.raw['hypotheses'] = self.raw['hypotheses'][:1]
+        self.raw['question']['target_hypotheses'] = ['H1']
+        for hypothesis in self.raw['hypotheses']:
+            hypothesis['checks'] = []
+        start = self.start()
+        for field in ('question_text', 'why_asked', 'safety_note', 'options'):
+            state = json.loads(start['session_state_json'])
+            if field == 'options':
+                state['current_question'][field][0]['label_en'] += ' altered'
+            else:
+                state['current_question'][field] += ' altered'
+            with self.subTest(field=field), patch.object(self.m, '_sd_terminal_reviewed_step', side_effect=denied) as project:
+                result = self.post('finalize', self.m._sd_sign_state(state))
+            self.assertEqual(result.status_code, 409, result.text)
+            project.assert_not_called()
+        old = json.loads(start['session_state_json'])
+        old.update(status='completed', current_question={},
+                   final_result=self.m._sd_canonicalize_final_result({}, old['hypotheses'], 'en'))
+        before = self.provider.call_count
+        result = self.post('finalize', self.m._sd_sign_state(old))
+        self.assertEqual(result.status_code, 409, result.text)
+        self.assertEqual(result.json()['detail']['code'], 'SMART_DIAGNOSTIC_SESSION_RESTART_REQUIRED')
         self.assertEqual(self.provider.call_count, before)
 
     def test_start_paths_preserve_distinct_complete_safety_tails_and_public_ids(self):

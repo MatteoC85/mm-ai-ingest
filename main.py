@@ -20085,7 +20085,8 @@ def _sd_schema(max_hypotheses: int = 4, max_options: int = 4) -> dict:
                             "probability_pct": {"type": "number"},
                             "probability_band": {"type": "string", "enum": ["high", "medium", "low", "very_low", "unknown"]},
                             "status": {"type": "string", "enum": ["open", "likely", "unlikely", "excluded"]},
-                            "checks": {"type": "array", "items": {"type": "string", "maxLength": 2000}, "maxItems": 5},
+                            "checks": {"type": "array", "items": {"type": "string", "maxLength": 2000}, "maxItems": 5,
+                                "description": "Only source-documented technical verifications needed for the next question or immediate decision, with all applicable safety and operating prerequisites. For a question only recalling an already-known event, return []. No reporting-policy filler, premature repair, later trial cycles or post-repair validation. Reassess checks each turn rather than copying a permanent plan."},
                             "evidence_ids": {"type": "array", "items": {"type": "string"}, "maxItems": 5},
                         },
                         "required": [
@@ -21211,6 +21212,7 @@ def _sd_response_from_step(
     citations: list[dict],
     rg_links: list[dict],
     debug: bool = False,
+    reviewed_question_citation_ids: Optional[list[str]] = None,
 ) -> dict:
     status = str(step.get("status") or "in_progress").strip().lower()
     final_ready = bool(step.get("final_ready")) or status == "completed"
@@ -21245,12 +21247,15 @@ def _sd_response_from_step(
             # A proof-selected citation cannot be substituted by a nearby page
             # or silently evicted by the presentation's six-slot preference.
             by_id = {str(c.get("citation_id") or ""): c for c in citations}
-            wanted = list(dict.fromkeys(str(cid) for h in hypotheses for cid in h.get("evidence_ids") or []))
+            wanted = list(dict.fromkeys(
+                [str(cid) for h in hypotheses for cid in h.get("evidence_ids") or []]
+                + list(reviewed_question_citation_ids or [])))
             if not wanted or any(cid not in by_id for cid in wanted):
                 raise HTTPException(status_code=502, detail={"code": "SMART_DIAGNOSTIC_REVIEW_CITATION_MISSING"})
             citations = [by_id[cid] for cid in wanted]
             source_manifest_meta = {"version": SMART_DIAGNOSTIC_SOURCE_MANIFEST_VERSION,
-                "hypothesis_scoped": True, "reviewer_proof_bound": True, "citation_count": len(citations)}
+                "hypothesis_scoped": not bool(reviewed_question_citation_ids), "reviewer_proof_bound": True,
+                "question_proof_bound": bool(reviewed_question_citation_ids), "citation_count": len(citations)}
         else:
             citations, source_manifest_meta = _sd_curate_final_source_manifest(
                 citations=citations,
@@ -22374,8 +22379,42 @@ def _sd_canonicalize_final_result(final_raw: dict, hypotheses: list[dict], langu
     }
 
 
+def _sd_pending_reviewed_question(reviewed: dict, final: dict) -> dict:
+    # The caller must supply the output reconstructed by source-proof replay.
+    # A question is never recovered from raw state or a model's final summary.
+    if reviewed.get("final_ready") or final.get("recommended_checks"):
+        return {}
+    question = reviewed.get("question") or {}
+    if not str(question.get("question_id") or "").strip() or not str(question.get("question_text") or "").strip():
+        return {}
+    return question
+
+
 def _sd_terminal_reviewed_step(reviewed: dict, *, language: str, question_number: int) -> dict:
     final = _sd_canonicalize_final_result({}, reviewed.get("hypotheses") or [], language)
+    pending = _sd_pending_reviewed_question(reviewed, final)
+    if pending:
+        is_en = language == "en"
+        fields = ("Question", "Why this matters", "Safety level", "Safety precautions", "Available answers") if is_en else (
+            "Domanda", "Perché serve chiarirlo", "Livello di sicurezza", "Precauzioni di sicurezza", "Risposte disponibili")
+        levels = ({"normal": "Normal", "caution": "Caution", "stop": "Stop", "qualified_personnel": "Qualified personnel"}
+                  if is_en else {"normal": "Normale", "caution": "Attenzione", "stop": "Arresto", "qualified_personnel": "Personale qualificato"})
+        level = levels.get(pending.get("safety_level"))
+        labels = [option.get("label_en" if is_en else "label_it") for option in pending.get("options") or []]
+        if level is None or any(not isinstance(label, str) or not label.strip() for label in labels):
+            raise HTTPException(status_code=409, detail={"code": "SMART_DIAGNOSTIC_SESSION_RESTART_REQUIRED"})
+        heading = ("Before confirming, this remains to be clarified. The diagnosis is not confirmed; an Unknown answer remains missing information."
+                   if is_en else "Prima di confermare resta da chiarire quanto segue. La diagnosi non è confermata; una risposta Non so resta un'informazione mancante.")
+        # Copy the complete reviewed fields without clipping, paraphrasing or
+        # converting an unanswered question into an operating recommendation.
+        final["summary"] += "\n\n" + "\n".join([
+            heading,
+            fields[0] + ": " + pending["question_text"],
+            fields[1] + ": " + str(pending.get("why_asked") or ""),
+            fields[2] + ": " + level,
+            fields[3] + ": " + str(pending.get("safety_note") or ""),
+            fields[4] + ":\n" + "\n".join("- " + label for label in labels),
+        ])
     return {"status": "completed", "final_ready": True, "operator_summary": final.get("summary", ""),
             "question": _sd_empty_question(question_number), "hypotheses": list(reviewed.get("hypotheses") or []),
             "final_result": final}
@@ -22418,6 +22457,19 @@ def smart_diagnostic_finalize_v1(
     # Concluding with the same observations selects the strongest reviewed
     # hypothesis. No provider call can invent a different explanation or check.
     step = project_terminal(reviewed)
+    question_citation_ids = []
+    if _sd_pending_reviewed_question(reviewed, step["final_result"]):
+        # The last immutable proposal is the question, after ALL input causes
+        # including rejected ones. This count/proof list comes from validated
+        # replay, never the client, current filtered hypotheses or source text.
+        proposal_count = summary.get("input_causes")
+        if summary.get("question_validated") is not True or type(proposal_count) is not int or proposal_count < 2:
+            raise HTTPException(status_code=502, detail={"code": "SMART_DIAGNOSTIC_REVIEW_CITATION_MISSING"})
+        question_citation_ids = list(dict.fromkeys(
+            proof["citation_id"] for proof in summary.get("support_proofs") or []
+            if proof.get("proposal_index") == proposal_count - 1))
+        if not question_citation_ids:
+            raise HTTPException(status_code=502, detail={"code": "SMART_DIAGNOSTIC_REVIEW_CITATION_MISSING"})
     state["grounding_review_meta"] = {**dict(state.get("grounding_review_meta") or {}),
         "finalization_mode": "deterministic_reviewed_state", "review_replayed": True,
         "finalization_provider_calls": 0}
@@ -22426,4 +22478,5 @@ def smart_diagnostic_finalize_v1(
         symptom_text=symptom_text, language=language, state=state, step=step,
         citations=list(state.get("citations") or []), rg_links=list(state.get("rg_links") or []),
         debug=bool(payload.debug),
+        reviewed_question_citation_ids=question_citation_ids,
     )
