@@ -354,7 +354,7 @@ class SmartReviewTests(unittest.TestCase):
         state = {'symptom_text': 'Reported stop; signal unknown.', 'history': [], 'language': 'en',
             'status': 'in_progress', 'hypotheses': out['hypotheses'], 'current_question': out['question'],
             'grounding_review': seal}
-        for version in ('smart-reviewed-proposals-v2', 'smart-reviewed-proposals-v3'):
+        for version in ('smart-reviewed-proposals-v2', 'smart-reviewed-proposals-v3', 'smart-reviewed-proposals-v4'):
             with self.subTest(version=version):
                 state['grounding_review'] = {**seal, 'policy_version': version}
                 with self.assertRaisesRegex(review.SmartReviewError, 'reviewed_state_required'):
@@ -363,13 +363,71 @@ class SmartReviewTests(unittest.TestCase):
     def test_qualified_hypothesis_contract_does_not_accept_a_cause_or_drop_missing_checks(self):
         # These assertions concern the contract, not the model's semantic judgment.
         self.assertIn('Do not reject such a qualified hypothesis solely', review.INSTRUCTION)
-        self.assertIn('An unknown\ncondition is never evidence that it occurred', review.INSTRUCTION)
+        self.assertIn('An unknown condition is never evidence\nthat it occurred', review.INSTRUCTION)
         self.assertIn('Mode-specific tests stay conditional', review.INSTRUCTION)
         self.assertIn('reported facts, historical examples', review.generation_hypothesis_instruction())
         parsed = parsed_review(self.prepared)
         parsed['decisions'][0]['proofs'][0]['check_indices'] = []
         with self.assertRaisesRegex(refs.ReferenceError, 'not_all_checks_supported'):
             review.resolve(prepared=self.prepared, parsed=parsed, probability_band=self.band)
+
+    def test_conditional_occurrence_requires_real_symptom_proof_and_excludes_unknown_facts(self):
+        # This is a proof-contract fixture, not a simulated claim of LLM semantic
+        # accuracy. The historical mechanism and current missing fact stay distinct.
+        source = copy.deepcopy(self.sources[0])
+        source['chunk_full'] = (
+            'A documented actuator-stop case followed fixture replacement: the position-switch bracket '
+            'had shifted and prevented the expected detection. The fault chart requires establishing '
+            'whether fixture replacement occurred before inspecting that conditional mechanism. '
+            'Ask for the already-known setup record; do not operate the machine to answer. '
+            'Physical inspection requires energy isolation and qualified personnel.')
+        packet = smart_evidence.review_packet(smart_evidence.build([source], scope=self.scope))
+        step = copy.deepcopy(self.step)
+        step['hypotheses'] = [{**self.step['hypotheses'][0],
+            'label': 'Possible position-switch displacement during fixture replacement',
+            'description': 'If fixture replacement occurred, the bracket may have shifted and prevented detection.',
+            'why': 'The source documents that historical mechanism. An actuator stop after service is reported; '
+                   'fixture replacement and bracket displacement remain unknown in the current event.',
+            'checks': ['Establish whether fixture replacement occurred from the already-known setup record.']}]
+        step['question'].update(question_text='Did the preceding service include fixture replacement?',
+            why_asked='Establish the unknown prerequisite before investigating this conditional mechanism.',
+            safety_level='normal', safety_note='', target_hypotheses=['H1'],
+            options=[{'id': 'yes', 'label_it': 'Sì', 'label_en': 'Yes'},
+                     {'id': 'no', 'label_it': 'No', 'label_en': 'No'},
+                     {'id': 'unknown', 'label_it': 'Non so', 'label_en': "I don't know"}])
+        symptom = 'Actuator stops after service; the operating mode has not been read.'
+        history = [{'question': {'question_text': 'Which mode was selected?'}, 'answer': {
+            'api_value': 'unknown', 'label': 'Unknown / cannot check safely',
+            'free_text': 'The sensor moved during replacement.'}}]
+        prepared = review.prepare(step=step, packet=packet, symptom_text=symptom, history=history)
+        self.assertEqual(prepared['observed_query'], review.observation_text(symptom, []))
+        self.assertNotIn(history[0]['answer']['free_text'], prepared['observed_query'])
+        self.assertIn('SOURCE APPLICABILITY must be established', review.INSTRUCTION)
+        self.assertIn('CURRENT OCCURRENCE need not be established', review.INSTRUCTION)
+        self.assertIn('NOT an invented activation condition', review.INSTRUCTION)
+        parsed = parsed_review(prepared, rejected=())
+        out, seal, _ = review.resolve(prepared=prepared, parsed=parsed, probability_band=self.band)
+        self.assertEqual(out['hypotheses'][0]['description'], step['hypotheses'][0]['description'])
+        self.assertIn('remain unknown', out['hypotheses'][0]['why'])
+        self.assertEqual(out['hypotheses'][0]['status'], 'open')
+        self.assertFalse(out['final_ready'])
+        self.assertEqual(seal['policy_version'], 'smart-reviewed-proposals-v5')
+        for mutation in ('missing_observation', 'historical_unit_as_observation', 'missing_check'):
+            invalid = copy.deepcopy(parsed)
+            proof = invalid['decisions'][0]['proofs'][0]
+            if mutation == 'missing_observation':
+                proof['observation_units'] = []
+            elif mutation == 'historical_unit_as_observation':
+                proof['observation_units'] = prepared['references']['frozen']['source_sets'][0][:1]
+            else:
+                proof['check_indices'] = []
+            with self.subTest(mutation=mutation), self.assertRaises(refs.ReferenceError):
+                review.resolve(prepared=prepared, parsed=invalid, probability_band=self.band)
+        # A recorded semantic rejection is never turned into acceptance just
+        # because the proposal uses conditional words or was accepted earlier.
+        rejected = parsed_review(prepared, rejected=(0,), reject_question=True)
+        with self.assertRaises(review.SmartReviewError):
+            review.resolve(prepared=prepared, parsed=rejected, probability_band=self.band)
 
     def test_capture_reports_when_redaction_or_size_prevents_exact_replay(self):
         grounding = smart_evidence.build(self.sources, scope=self.scope)

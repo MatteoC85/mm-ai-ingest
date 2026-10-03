@@ -10,7 +10,7 @@ import re
 
 from . import review_references as refs
 
-POLICY_VERSION = 'smart-reviewed-proposals-v4'
+POLICY_VERSION = 'smart-reviewed-proposals-v5'
 MAX_CHECK_CHARS = 2000
 MAX_SOURCE_SAFETY_NOTE_CHARS = 900
 WIRE_VERSION = 'smart-review-wire-v1'
@@ -60,21 +60,37 @@ every reported time qualifier in explanations and weight changes: absence of
 changes AFTER an event does not lower a configuration-cause hypothesis that could
 already have existed BEFORE it. Reject that unsupported temporal inference.
 
-Qualified support is not confirmation of the current cause. A bounded_inference
-may connect a documented applicable mechanism to a compatible REPORTED trigger
-or symptom while its distinguishing condition remains unknown. The label,
-description and explanation must clearly present that condition as possible or
-conditional and distinguish reported facts, historical examples and observations
-still needed. Do not reject such a qualified hypothesis solely because the
-discriminating observation has not yet been made: its safe documented check is
-what the guided question can test. Still require the mechanism, applicability,
-reported compatibility and EVERY check/prerequisite to be supported. An unknown
-condition is never evidence that it occurred. Reject an unverified present-tense
-assertion, a merely related topic, a symptom restatement or a mechanism contradicted
-by reported observations. Historical/simulated outcomes cannot establish current
-conditions or numerical confidence. Mode-specific tests stay conditional until
-the applicable operating mode is known; do not assume all modes require the same
-signal transition or operating condition.
+Qualified support is not confirmation of the current cause. For each open
+diagnostic hypothesis distinguish TWO obligations:
+1. SOURCE APPLICABILITY must be established: the admitted source documents the
+mechanism for the selected target/subsystem, and a genuine REPORTED symptom or
+trigger is compatible with investigating it. Shared vocabulary, a checklist or
+machine membership alone is insufficient. The causal proof must identify both
+those source units and the compatible REPORTED observation units.
+2. CURRENT OCCURRENCE need not be established: a documented mechanism can remain
+a bounded_inference while its activation condition or distinguishing observation
+is explicitly unknown. This is allowed only when the complete proposal presents
+the mechanism conditionally, separates historical examples from current facts,
+and supplies a safe source-supported question/check to establish the missing
+prerequisite rather than assume it. A missing occurrence/activation fact is not
+a missing source-to-target relation. The proof's observation IDs must identify
+the compatible reported symptom/trigger, NOT an invented activation condition.
+Do not reject such a qualified hypothesis solely because that condition has not
+been reported or because its documented mechanism comes from a historical case.
+An Unknown answer neither confirms nor excludes that condition or strengthens
+the hypothesis. Reassess the entire immutable proposal and every check anyway;
+an earlier accepted ID or verdict is never authority to accept the new turn.
+Read the label, description and why together: a short nominal hypothesis label
+does not by itself assert occurrence when its description and explanation are
+explicitly conditional. Reject an explicit claim of current/observed/confirmed
+occurrence without reported support, even if another field is qualified. Do not
+silently repair contradictory wording. An unknown condition is never evidence
+that it occurred. Reject unrelated mechanisms, symptom restatements, and a
+condition contradicted by reported observations. Historical/simulated outcomes
+cannot establish current conditions or numerical confidence. EVERY check and
+its source prerequisites still need support. Mode-specific tests stay conditional
+until the applicable operating mode is known; never apply a conditional operation
+or interpret a signal as correct/incorrect before establishing its prerequisite.
 Every distinct mechanism or causal alternative in the label, description and why
 must be supported independently, including alternatives joined by 'or' or hidden
 inside a qualified 'may'. A proof for one mechanism cannot validate additional
@@ -272,6 +288,8 @@ def generation_hypothesis_instruction():
         '1. SOURCE MECHANISM: Select a causal relationship actually documented in the supplied source. '
         'Each hypothesis represents exactly ONE mechanism. Its label, description and why must all refer '
         'to that same mechanism; do not broaden it with an alternative or an umbrella fault. '
+        'Every open-hypothesis label must explicitly mark uncertainty in the response language '
+        '(for example Possible in English or Possibile in Italian), with matching conditional description and why. '
         'A list of inspections or configuration fields is not a list of causes. Keep such items in checks; '
         'do not convert them into a causal alternative. One well-supported hypothesis is sufficient.\n'
         '2. APPLICABILITY: Distinguish reported facts, historical examples and observations still unknown. '
