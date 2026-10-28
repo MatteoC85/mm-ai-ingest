@@ -106,6 +106,39 @@ class SmartReviewTests(unittest.TestCase):
         with self.assertRaises(refs.ReferenceError):
             review.resolve(prepared=self.prepared, parsed=parsed, probability_band=self.band)
 
+    def test_existing_information_instruction_does_not_waive_source_safety_rejection(self):
+        instruction = review.generation_hypothesis_instruction()
+        self.assertIn('existing-information scope explicit', instruction)
+        self.assertIn('in question_text itself', instruction)
+        self.assertIn('no new screen navigation', instruction)
+        self.assertIn('governing source', instruction)
+        # General counterexample matching the failure class, not a machine rule:
+        # a current-setting question can request a new consultation even though
+        # its intended subject is a valid diagnostic prerequisite.
+        self.sources[0]['chunk_full'] += ' Governing procedure: high safety level; qualified personnel only.'
+        packet = smart_evidence.review_packet(smart_evidence.build(self.sources, scope=self.scope))
+        for text in ('Which control type is configured on the display?',
+                     'From information already recorded, do you know the configured control type?'):
+            step = copy.deepcopy(self.step)
+            step['question'].update(question_text=text, safety_level='normal', safety_note='',
+                why_asked='The configured control is a prerequisite. Otherwise start a cycle to obtain it.')
+            prepared = review.prepare(step=step, packet=packet, symptom_text='Reported stop.', history=[])
+            checks = prepared['references']['frozen']['proposals'][-1]['checks']
+            self.assertIn('Otherwise start a cycle', checks[0]['text'])
+            self.assertIn('normal', checks[1]['text'])
+            rejected = parsed_review(prepared, reject_question=True)
+            rejected['decisions'][-1].update(blocking_checks=[1],
+                note='The governing procedure requires qualified personnel; this request omits required conditions.')
+            with self.assertRaisesRegex(review.SmartReviewError, 'question_not_supported'):
+                review.resolve(prepared=prepared, parsed=rejected, probability_band=self.band)
+            accepted, seal, summary = review.resolve(prepared=prepared, parsed=rejected,
+                probability_band=self.band, continuity_policy=review.continuity.POLICY_VERSION)
+            self.assertTrue(summary['rejected_question_discarded'])
+            self.assertEqual(accepted['question']['application_reporting_version'], review.continuity.REPORTING_VERSION)
+            self.assertNotEqual(accepted['question']['question_text'], text)
+            self.assertEqual(seal['input_step']['question']['question_text'], text)
+            self.assertNotIn('Otherwise start a cycle', accepted['question']['why_asked'])
+
     def test_observation_policy_is_server_owned_frozen_and_sealed_in_both_languages(self):
         for language in ('en', 'it'):
             with self.subTest(language=language):
