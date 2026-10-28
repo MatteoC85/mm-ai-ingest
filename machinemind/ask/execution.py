@@ -620,11 +620,14 @@ def verify_or_repair_answer(
     operation_boundary = bool(compact_review)
     review_facets = list(dict.fromkeys(list(decision.required_facets) + [
         item.facet for item in decision.facet_queries if item.must_cover]))
+    wire_aliases = (_procedure_review.review_wire_aliases(layout,
+        [str(c.get("citation_id") or "").strip() for c in ordered_candidates]) if source_ordered_review else None)
     verifier_schema = _assistant_core_contract_verifier_schema()
     if compact_review:
         verifier_schema = _procedure_review.review_schema(verifier_schema, layout, review_facets, requirements,
             operation_boundary=operation_boundary, source_ordered=source_ordered_review,
-            operation_source_ids=[str(c.get("citation_id") or "").strip() for c in ordered_candidates])
+            operation_source_ids=[str(c.get("citation_id") or "").strip() for c in ordered_candidates],
+            wire_aliases=wire_aliases)
         system_msg += _procedure_review.PROTOCOL_INSTRUCTIONS
         if operation_boundary:
             system_msg += (_procedure_review.SOURCE_ORDERED_BOUNDARY_INSTRUCTIONS if source_ordered_review
@@ -638,10 +641,18 @@ def verify_or_repair_answer(
         review_view["source_sequence_required"] = observation.get("source_sequence_required", True)
         review_view["units"] = [{"citation_id": u["citation_id"], "number": u["number"]}
             for u in observation["units"]]
+        block_view = _procedure_review.review_blocks(layout)
+        if wire_aliases is not None:
+            source_names = {cid: alias for alias, cid in wire_aliases["sources"].items()}
+            block_names = {bid: alias for alias, bid in wire_aliases["blocks"].items()}
+            for unit in review_view["units"]:
+                unit["citation_id"] = source_names[unit["citation_id"]]
+            for block in block_view:
+                block["block_id"] = block_names[block["block_id"]]
+            user_msg += "\n\nPROCEDURE_SOURCE_ALIASES:\n" + json.dumps(wire_aliases["sources"], ensure_ascii=False)
         user_msg += "\n\nPROCEDURE_STRUCTURE:\n" + json.dumps(review_view, ensure_ascii=False)
         # Blocks are lossless spans of CURRENT_ANSWER, not additional sources.
-        user_msg += "\n\nPROCEDURE_BLOCKS:\n" + json.dumps(
-            _procedure_review.review_blocks(layout), ensure_ascii=False)
+        user_msg += "\n\nPROCEDURE_BLOCKS:\n" + json.dumps(block_view, ensure_ascii=False)
     _admit_input(request, {"candidates": ordered_candidates if packet is not None else candidates}, decision,
         runtime=runtime, stage="verifier.provider")
     # Snapshot the exact CURRENT_ANSWER at the provider boundary. Neither a
@@ -676,13 +687,27 @@ def verify_or_repair_answer(
         return {"outcome": "unavailable", "answer": answer, "reason": str(exc)[:300]}
 
     out = dict(parsed or {})
+    try:
+        if wire_aliases is not None:
+            out = _procedure_review.decode_review_wire_aliases(out, wire_aliases)
+        if compact_review:
+            out = _procedure_review.resolve_reply(out, answer=answer, layout=layout,
+                required_facets=review_facets, required_types=requirements,
+                source_ordered=source_ordered_review,
+                source_notes=tuple(repair_context.get("procedure_notes") or ()))
+    except ValueError:
+        if not source_ordered_review:
+            raise
+        # Invalid identities/layout are a terminal wire-protocol failure, never
+        # source authority, a 500, or permission for another model call.
+        return {"outcome": "no_sources", "answer": "", "citation_ids": [],
+            "covered_facets": [], "missing_facets": review_facets,
+            "covered_answer_types": [], "missing_answer_types": requirements,
+            "missing_list_items": [], "reason": "procedure_review_protocol_invalid",
+            "_terminal_review_failure": True, "model": model_used,
+            **({"review_evidence": review_evidence_diagnostic} if review_evidence_diagnostic else {})}
     if review_evidence_diagnostic:
         out["review_evidence"] = review_evidence_diagnostic
-    if compact_review:
-        out = _procedure_review.resolve_reply(out, answer=answer, layout=layout,
-            required_facets=review_facets, required_types=requirements,
-            source_ordered=source_ordered_review,
-            source_notes=tuple(repair_context.get("procedure_notes") or ()))
     if reviewed_draft is not None:
         out = _final_contract.resolve_unchanged_pass(out, draft=reviewed_draft,
             request_key=ask_request_key(request))

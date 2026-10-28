@@ -954,6 +954,8 @@ def validate_response(
                     decision.effective_mode == MODE_ASK
                     and evidence_complete
                     and not repair_attempted
+                    and not (protected_procedure and source_ordered_procedure
+                             and semantic_contract.get("_terminal_review_failure") is True)
                 ):
                     budget_for_repair = _v13_current_budget()
                     if (

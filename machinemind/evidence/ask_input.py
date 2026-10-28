@@ -215,7 +215,7 @@ def _same_value(left: Any, right: Any) -> bool:
     if typ in (list, tuple):
         if len(left) != len(right):
             return False
-        if len(left) >= 8 and all(type(x) is float for x in left) and all(type(x) is float for x in right):
+        if len(left) >= 8 and set(map(type, left)) == {float} and set(map(type, right)) == {float}:
             # Binary double comparison preserves every finite float bit, notably
             # signed zero. NaNs retain the original hex()-based comparison below.
             if array("d", left).tobytes() == array("d", right).tobytes():

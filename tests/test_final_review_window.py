@@ -61,9 +61,13 @@ class FinalReviewWindowTests(unittest.TestCase):
                 'covered_facets':['inspection'],'missing_facets':[],
                 'covered_answer_types':[m.REQ_ORDERED_ACTIONS],'missing_answer_types':[],
                 'missing_list_items':[],'citation_ids':['step:one']}
-            if compact:result.update(reply_mode='retain',edits=[],operation_boundary={
-                'complete':True,'checked_blocks':[b['block_id']for b in layout['blocks']],
-                'change_edges':[],'precedence':[]})
+            props=kwargs['json_schema']['schema']['properties']
+            if 'edits' in props:
+                result['citation_ids']=props['citation_ids']['items'].get('enum',['step:one'])
+                result.update(reply_mode='retain',edits=[],operation_boundary={
+                    'complete':True,'checked_blocks':props['edits']['items']['properties']['block_id']['enum'],
+                    'change_edges':[],'precedence':[]})
+            else:result['answer']=answer
             return result,'offline-model'
         runtime=replace(m._assistant_core_ask_execution_runtime(),evidence_admission=denied if protected else None,
             review_uses_remaining_window=explicit_timeout is None,

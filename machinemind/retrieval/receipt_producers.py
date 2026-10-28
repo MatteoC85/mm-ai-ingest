@@ -541,9 +541,15 @@ class _PreparationTrace:
             if type(pair) is not tuple or len(pair) != 2:
                 raise EvidenceProductionError("explicit source/view pair required")
             source, view = pair
-            entry = self.entry(source)
-            if stage == "copy" and not _same_value(source, view):
-                raise EvidenceProductionError("copy changed evidence without transformation")
+            if stage == "copy":
+                # add(copy_entry=...) checks BOTH the original mutable record
+                # and its new copy against the same immutable witness. There is
+                # no collaborator between lookup and that complete check.
+                entry = self.entries.get(id(source))
+                if entry is None or entry[0] is not source:
+                    raise EvidenceProductionError("untracked preparation copy")
+            else:
+                entry = self.entry(source)
             self.add(view, entry[2], copy_entry=entry if stage == "copy" else None)
             if stage == "score":
                 self.scored.append(view)
@@ -556,6 +562,15 @@ class _PreparationTrace:
         if (type(result) is not list or len(traces) != 1
                 or type(traces[0]) is not tuple or len(traces[0]) != len(result)):
             raise EvidenceProductionError("missing preparation operator lineage")
+        # The collaborator has returned. Recheck every original once before
+        # reusing it in this pure local loop, including unselected inputs. A
+        # repeated parent position does not require rewalking the same vector.
+        checked = set()
+        for group in originals:
+            for entry in group:
+                if id(entry[0]) not in checked:
+                    self.entry(entry[0])
+                    checked.add(id(entry[0]))
         for record, positions in zip(result, traces[0]):
             if type(positions) is not tuple or not positions:
                 raise EvidenceProductionError("explicit preparation parent positions required")
@@ -567,7 +582,6 @@ class _PreparationTrace:
                         or not 0 <= pos[1] < len(groups[pos[0]])):
                     raise EvidenceProductionError("invalid preparation parent position")
                 entry = originals[pos[0]][pos[1]]
-                self.entry(entry[0])
                 if len(parents) + len(entry[2]) > self.limits.assembly.max_occurrences:
                     raise EvidenceProductionError("too many preparation merge origins")
                 parents.extend(entry[2])
@@ -1146,7 +1160,20 @@ class _OuterRetrievalTrace(_PreparationTrace):
         return allowed
 
     def snapshot(self, value):
-        witness = _LegacyWitness.capture(value, self.limits.legacy)
+        # Metrics/merge helpers receive a list of exact tracked occurrences.
+        # Their private immutable witnesses already contain every numeric bit.
+        # Recheck the mutable inputs now, then compose those trees instead of
+        # serializing the same vectors again. Arbitrary/untracked collections
+        # retain the original capture path; the post-callback check is unchanged.
+        if (type(value) in (list, tuple) and value and all(type(v) is dict
+                and id(v) in self.entries and self.entries[id(v)][0] is v
+                and type(self.entries[id(v)][1]) is _LegacyWitness
+                and self.entries[id(v)][1]._limits_profile is not None for v in value)):
+            witnesses = tuple(self.entry(v)[1] for v in value)
+            witness = _LegacyWitness.sequence("list" if type(value) is list else "tuple",
+                                               witnesses, self.limits.legacy)
+        else:
+            witness = _LegacyWitness.capture(value, self.limits.legacy)
         if witness.size_bytes > self.max_bytes:
             raise EvidenceProductionError("outer retrieval snapshot byte limit exceeded")
         return witness
@@ -1251,8 +1278,16 @@ class _OuterRetrievalTrace(_PreparationTrace):
                         for group, index in parents:
                             item = self.entry(groups[group][index])
                             context = self.roots[item[2][0]].context
-                            locations.append(adapt_candidate(item[1], context=context,
-                                limits=self.limits.adapter).entry.evidence.locator)
+                            cached = self._adapted_views.get(id(item[1]))
+                            if (cached is not None and cached[0] is item[1]
+                                    and cached[1] == context and cached[2] == self.limits.adapter):
+                                # entry() above still checks the actual mutable
+                                # record. Only its pure immutable conversion is
+                                # reused; locator equality below is unchanged.
+                                locations.append(cached[3].locator)
+                            else:
+                                locations.append(adapt_candidate(item[1], context=context,
+                                    limits=self.limits.adapter).entry.evidence.locator)
                         if any(loc != locations[0] for loc in locations[1:]):
                             raise EvidenceProductionError("outer merge combines different locators")
                 emit(positions)
@@ -1290,9 +1325,11 @@ class _OuterRetrievalTrace(_PreparationTrace):
                 raise EvidenceProductionError("event after outer retrieval completion")
             if stage == "copy":
                 source, value = args
-                entry = self.entry(source)
-                if not _same_value(source, value):
-                    raise EvidenceProductionError("outer copy changed input")
+                entry = self.entries.get(id(source))
+                if entry is None or entry[0] is not source:
+                    raise EvidenceProductionError("untracked outer copy")
+                # add() performs the exact original-and-copy checks. Do not
+                # perform a second full vector walk before that same boundary.
                 self.add(value, entry[2], copy_entry=entry)
                 return value
             if stage == "annotation_before":

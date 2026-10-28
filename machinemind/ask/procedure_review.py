@@ -162,9 +162,67 @@ def _edited_block(original: str, value: str) -> str:
     return prefix + body + separator
 
 
+def review_wire_aliases(layout: dict, source_ids: list[str]) -> dict:
+    """Request-local names encode existing identities; they grant no authority."""
+    sources = list(dict.fromkeys(source_ids))
+    blocks = [b["block_id"] for b in layout["blocks"]]
+    if (not sources or any(type(cid) is not str or not cid for cid in sources)
+            or len(set(blocks)) != len(blocks)):
+        raise ValueError("procedure_review_alias_catalog_invalid")
+    return {"sources": {f"s{i+1}": cid for i, cid in enumerate(sources)},
+            "blocks": {f"b{i+1}": bid for i, bid in enumerate(blocks)}}
+
+
+_WIRE_EDGE_FIELDS = {"from": "before_block_id", "action": "before_answer_quote",
+    "to": "after_block_id", "next": "after_answer_quote", "source": "source_citation_id",
+    "proof": "source_quote"}
+
+
+def decode_review_wire_aliases(parsed: dict, aliases: dict) -> dict:
+    """Lossless expansion before the existing layout/source/order validators.
+
+    Only explicit identity fields are decoded. Source quotes and answer text are
+    never rewritten, and an unknown name cannot become a new citation or block.
+    """
+    out = deepcopy(parsed)
+    sources, blocks = aliases["sources"], aliases["blocks"]
+    def identity(value, catalog):
+        if type(value) is not str or value not in catalog:
+            raise ValueError("procedure_review_wire_alias_unknown")
+        return catalog[value]
+    citations = out.get("citation_ids", [])
+    if type(citations) is not list:
+        raise ValueError("procedure_review_wire_citations_invalid")
+    out["citation_ids"] = [identity(cid, sources) for cid in citations]
+    edits = out.get("edits", [])
+    if type(edits) is not list or any(type(edit) is not dict for edit in edits):
+        raise ValueError("procedure_review_wire_edits_invalid")
+    for edit in edits:
+        edit["block_id"] = identity(edit.get("block_id"), blocks)
+    audit = out.get("operation_boundary")
+    if type(audit) is not dict:
+        raise ValueError("procedure_review_wire_boundary_invalid")
+    if type(audit) is dict:
+        checked, edges = audit.get("checked_blocks"), audit.get("precedence")
+        if type(checked) is not list or type(edges) is not list:
+            raise ValueError("procedure_review_wire_boundary_invalid")
+        audit["checked_blocks"] = [identity(bid, blocks) for bid in checked]
+        decoded = []
+        for edge in edges:
+            if type(edge) is not dict or set(edge) != set(_WIRE_EDGE_FIELDS):
+                raise ValueError("procedure_review_wire_edge_invalid")
+            canonical = {_WIRE_EDGE_FIELDS[key]: deepcopy(value) for key, value in edge.items()}
+            canonical["before_block_id"] = identity(edge["from"], blocks)
+            canonical["after_block_id"] = identity(edge["to"], blocks)
+            canonical["source_citation_id"] = identity(edge["source"], sources)
+            decoded.append(canonical)
+        audit["precedence"] = decoded
+    return out
+
+
 def review_schema(legacy: dict, layout: dict, facets: list[str], types: list[str], *,
                   operation_boundary: bool = False, source_ordered: bool = False,
-                  operation_source_ids: list[str] | None = None) -> dict:
+                  operation_source_ids: list[str] | None = None, wire_aliases: dict | None = None) -> dict:
     result = deepcopy(legacy)
     result["name"] = legacy["name"]  # backwards-readable verifier envelope
     schema = result["schema"]
@@ -236,6 +294,24 @@ def review_schema(legacy: dict, layout: dict, facets: list[str], types: list[str
             boundary["required"].append("change_edges")
 
         schema["required"].append("operation_boundary")
+    if wire_aliases is not None:
+        if not (source_ordered and operation_boundary):
+            raise ValueError("procedure_review_aliases_require_source_ordered_audit")
+        source_names, block_names = list(wire_aliases["sources"]), list(wire_aliases["blocks"])
+        if (list(wire_aliases["sources"].values()) != list(dict.fromkeys(operation_source_ids))
+                or list(wire_aliases["blocks"].values()) != [b["block_id"] for b in layout["blocks"]]):
+            raise ValueError("procedure_review_alias_catalog_drift")
+        schema["properties"]["citation_ids"]["items"] = {"type": "string", "enum": source_names}
+        schema["properties"]["edits"]["items"]["properties"]["block_id"]["enum"] = block_names
+        boundary = schema["properties"]["operation_boundary"]
+        boundary["properties"]["checked_blocks"]["items"]["enum"] = block_names
+        edge = boundary["properties"]["precedence"]["items"]
+        fields = edge["properties"]
+        fields["before_block_id"]["enum"] = block_names
+        fields["after_block_id"]["enum"] = block_names
+        fields["source_citation_id"]["enum"] = source_names
+        edge["properties"] = {wire: fields[canonical] for wire, canonical in _WIRE_EDGE_FIELDS.items()}
+        edge["required"] = list(_WIRE_EDGE_FIELDS)
     return result
 
 
@@ -264,16 +340,19 @@ OPERATION_BOUNDARY_INSTRUCTIONS = (
 
 
 SOURCE_ORDERED_BOUNDARY_INSTRUCTIONS = (
-    "\nSOURCE-ORDERED OPERATION AUDIT: Check every FINAL resolved block against the complete source "
+    "\nSOURCE-ORDERED OPERATION AUDIT: Use PROCEDURE_SOURCE_ALIASES for citation_ids and edge source; "
+    "use the block aliases shown in PROCEDURE_BLOCKS for edits, checked_blocks and edge from/to. These "
+    "are encodings of the same admitted sources and immutable blocks, not new evidence. Check every FINAL "
+    "resolved block against the complete source "
     "operation, including continuation beyond router facets. Return checked_blocks with every "
     "PROCEDURE_BLOCK block_id exactly once. For each introduced/changed operation, include its source "
     "preparation, positioning, mode/energy conditions, locking, intermediate stages and terminal/restoration "
     "conditions. Re-establish prerequisites invalidated by intervening actions. Reduced speed is not proof "
     "of safety. Restore required protections BEFORE EACH dependent movement/test, not just final restart. "
     "operation_boundary.precedence lists every required prerequisite-to-action, temporary-change-to-closure "
-    "and restoration-to-dependent-operation relation. Each edge names before_block_id, after_block_id, "
-    "exact before_answer_quote/after_answer_quote from those FINAL blocks and source_citation_id/source_quote "
-    "proving the dependency. Use short, unique-in-block spans (maximum400characters), never full answers "
+    "and restoration-to-dependent-operation relation. In each edge, from/to are the earlier/later block "
+    "aliases; action/next are exact answer quotes from those FINAL blocks; source is the admitted source "
+    "alias and proof is its exact source quote proving the dependency. Use short, unique-in-block spans (maximum400characters), never full answers "
     "or sources. At most16edges: reject if necessary proof cannot fit. Every materially edited block must "
     "participate in a proved edge. For each temporary change (opening, releasing, adjustment, disabling, "
     "mode change, etc.), change_edges references the zero-based precedence edge_index connecting its action "

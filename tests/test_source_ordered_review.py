@@ -102,7 +102,7 @@ class WiredSourceOrderedReviewTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.guards.close()
 
-    def run_review(self, reject=False, note_mutation=None):
+    def run_review(self, reject=False, note_mutation=None, unknown_alias=False, malformed=None):
         m=self.m
         numbers=[2,7,11]
         actions=['Isolate and verify zero energy.','Feed material through the guide.','Close the guide and secure the lever.']
@@ -129,11 +129,22 @@ class WiredSourceOrderedReviewTests(unittest.TestCase):
                 'missing_answer_types':[],'expected_list_items':[],'covered_list_items':[],'missing_list_items':[],
                 'operation_boundary':{'complete':not reject,'checked_blocks':['step_1','step_2','step_3'],
                     'change_edges':[],'precedence':[]}}
+            props=kwargs['json_schema']['schema']['properties']
+            source_aliases=props['citation_ids']['items']['enum']
+            block_aliases=props['edits']['items']['properties']['block_id']['enum']
+            result['citation_ids']=source_aliases
+            result['operation_boundary']['checked_blocks']=block_aliases
+            for edit in result['edits']:
+                edit['block_id']=block_aliases[int(edit['block_id'].split('_')[1])-1]
             if note_mutation == 'delete':
                 result['edits'][1]['text']=actions[1]
             elif note_mutation == 'swap':
                 result['edits'][0]['text']=actions[0]+'\n'+notes[1]
                 result['edits'][1]['text']=actions[1]+'\n'+notes[0]
+            if unknown_alias:result['citation_ids']=['foreign-source']
+            if malformed=='reply_mode':result['reply_mode']='unknown-mode'
+            if malformed=='missing_audit':result.pop('operation_boundary')
+            if malformed=='null_audit':result['operation_boundary']=None
             return result,'offline-model'
         eruntime=replace(m._assistant_core_ask_execution_runtime(),evidence_admission=denied,
             _v13_current_budget=lambda:m._assistant_core_new_budget('ask'),_v13_json_models=provider,
@@ -189,6 +200,31 @@ class WiredSourceOrderedReviewTests(unittest.TestCase):
                 self.assertEqual(contract['semantic_verifier']['outcome'],'no_sources')
                 self.assertEqual(contract['semantic_verifier']['reason'],'source_step_note_binding_incomplete')
                 self.assertFalse(contract['semantic_verifier']['procedure_review']['source_note_bindings_complete'])
+
+    def test_unknown_wire_alias_returns_controlled_failure_without_retry_or_draft(self):
+        result,calls,answer=self.run_review(unknown_alias=True)
+        self.assertEqual(len(calls),1)
+        self.assertEqual(result['status'],'no_sources')
+        self.assertEqual(result['result_code'],'INCOMPLETE_ANSWER_CONTRACT')
+        self.assertFalse(result.get('_assistant_core_repair_needed'))
+        self.assertNotEqual(result.get('answer'),answer)
+        self.assertNotIn('Feed material through the guide.',result.get('answer',''))
+        self.assertEqual(result['citations'],[])
+        self.assertFalse(result['meta']['assistant_core_validation']['answer_contract']['passed'])
+        self.assertEqual(result['meta']['assistant_core_validation']['answer_contract']['semantic_verifier']['reason'],
+                         'procedure_review_protocol_invalid')
+
+    def test_malformed_source_ordered_protocol_is_terminal_controlled_failure(self):
+        for kind in ('reply_mode','missing_audit','null_audit'):
+            with self.subTest(kind=kind):
+                result,calls,answer=self.run_review(malformed=kind)
+                self.assertEqual(len(calls),1)
+                self.assertEqual(result['status'],'no_sources')
+                self.assertEqual(result['result_code'],'INCOMPLETE_ANSWER_CONTRACT')
+                self.assertFalse(result.get('_assistant_core_repair_needed'))
+                self.assertNotEqual(result.get('answer'),answer)
+                self.assertEqual(result['citations'],[])
+                self.assertFalse(result['meta']['assistant_core_validation']['answer_contract']['passed'])
 
     def test_native_renderer_keeps_distinct_structured_notes_inside_their_step(self):
         from machinemind.presentation import responses

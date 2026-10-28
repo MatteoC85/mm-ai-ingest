@@ -194,11 +194,14 @@ class _Freezer:
         self.limits = limits
         self.nodes = 0
         self.scalar_bytes = 0
+        self.max_depth_seen = 0
         self.ancestors: set[int] = set()
 
     def freeze(self, value: Any, depth: int = 0) -> _Frozen:
         if depth > self.limits.max_depth:
             raise EvidenceAssemblyError("legacy depth budget exceeded")
+        if depth > self.max_depth_seen:
+            self.max_depth_seen = depth
         self.nodes += 1
         if self.nodes > self.limits.max_nodes:
             raise EvidenceAssemblyError("legacy node budget exceeded")
@@ -232,6 +235,7 @@ class _Freezer:
             except (ValueError, OverflowError) as exc:
                 raise EvidenceAssemblyError("non-finite legacy value") from exc
             self.nodes += len(value)
+            self.max_depth_seen = max(self.max_depth_seen, depth + 1)
             self.scalar_bytes += packed.scalar_bytes
             if self.scalar_bytes > self.limits.max_bytes:
                 raise EvidenceAssemblyError("legacy byte budget exceeded")
@@ -367,6 +371,9 @@ def _thaw(node: _Frozen) -> Any:
     return node.value
 
 
+_SCALAR_TYPES = {"null": type(None), "str": str, "bool": bool, "int": int, "float": float}
+
+
 def _matches_frozen(value: Any, node: _Frozen) -> bool:
     """Exact mutable-input comparison to a private immutable witness.
 
@@ -375,8 +382,14 @@ def _matches_frozen(value: Any, node: _Frozen) -> bool:
     """
     typ = type(value)
     if node.kind == "map":
-        return (typ is dict and tuple(value) == tuple(k for k, _ in node.value)
-                and all(_matches_frozen(v, n) for v, (_, n) in zip(value.values(), node.value)))
+        if typ is not dict or len(value) != len(node.value):
+            return False
+        # Check insertion order and every mutable value in one pass. Avoid
+        # allocating two key tuples and another generator at each journal use.
+        for (key, item), (expected_key, child) in zip(value.items(), node.value):
+            if key != expected_key or not _matches_frozen(item, child):
+                return False
+        return True
     if node.kind in ("list", "tuple"):
         if typ is not (list if node.kind == "list" else tuple):
             return False
@@ -386,7 +399,7 @@ def _matches_frozen(value: Any, node: _Frozen) -> bool:
                     and array("d", value).tobytes() == node.value.binary)
         return len(value) == len(node.value) and all(
             _matches_frozen(v, n) for v, n in zip(value, node.value))
-    expected = {"null": type(None), "str": str, "bool": bool, "int": int, "float": float}[node.kind]
+    expected = _SCALAR_TYPES[node.kind]
     if typ is not expected:
         return False
     if typ is float:
@@ -405,6 +418,7 @@ class _LegacyWitness(Mapping):
     size_bytes: int
     retained_metadata_bytes: int = field(init=False, repr=False)
     numeric_payloads: tuple = field(init=False, repr=False, compare=False)
+    _limits_profile: tuple[int, int, int] | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self):
         size, payloads = _retained_witness_profile(self._tree)
@@ -413,8 +427,36 @@ class _LegacyWitness(Mapping):
 
     @classmethod
     def capture(cls, value, limits):
-        tree = _Freezer(limits).freeze(value)
-        return cls(tree, _frozen_canonical_size(tree))
+        freezer = _Freezer(limits)
+        tree = freezer.freeze(value)
+        return cls(tree, _frozen_canonical_size(tree),
+                   (freezer.nodes, freezer.scalar_bytes, freezer.max_depth_seen))
+
+    @classmethod
+    def sequence(cls, kind, witnesses, limits):
+        """Compose already-checked immutable occurrences without recapturing.
+
+        The caller must compare every mutable occurrence immediately before
+        this pure operation. This retains no mutable reference or source grant.
+        Every repeated occurrence is still charged at full logical size and
+        all original node/depth/scalar bounds apply to the assembled sequence.
+        """
+        if (kind not in ("list", "tuple") or type(witnesses) is not tuple
+                or any(type(w) is not cls or w._limits_profile is None for w in witnesses)):
+            raise EvidenceAssemblyError("bounded immutable sequence witnesses required")
+        nodes = 1 + sum(w._limits_profile[0] for w in witnesses)
+        scalars = sum(w._limits_profile[1] for w in witnesses)
+        depth = max((1 + w._limits_profile[2] for w in witnesses), default=0)
+        if nodes > limits.max_nodes:
+            raise EvidenceAssemblyError("legacy node budget exceeded")
+        if depth > limits.max_depth:
+            raise EvidenceAssemblyError("legacy depth budget exceeded")
+        if scalars > limits.max_bytes:
+            raise EvidenceAssemblyError("legacy byte budget exceeded")
+        tree = _Frozen(kind, tuple(w._tree for w in witnesses))
+        size = (len('{"kind":"' + kind + '","value":[]}')
+                + max(0, len(witnesses) - 1) + sum(w.size_bytes for w in witnesses))
+        return cls(tree, size, (nodes, scalars, depth))
 
     def matches(self, value):
         return _matches_frozen(value, self._tree)
