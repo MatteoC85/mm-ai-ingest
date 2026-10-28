@@ -77,6 +77,27 @@ def _guarded(runtime: AskValidationRuntime, request: Any, decision: Any) -> bool
             and execution._guarded(runtime.execution_runtime, request, decision))
 
 
+def _procedure_review_payload(value: Any) -> dict:
+    """Reject malformed required-review output before any provisional PASS.
+
+    This normalization is restricted to semantically selected procedural bundles;
+    legacy validation keeps its existing behavior. Schema validity is necessary,
+    while the final source-order audit and coverage checks remain authoritative.
+    """
+    if type(value) is not dict:
+        return {"outcome": "unavailable", "reason": "required_review_payload_invalid"}
+    sequence_fields = ("covered_facets", "covered_answer_types", "missing_facets",
+                       "missing_answer_types", "missing_list_items", "citation_ids")
+    invalid = any(k in value and (type(value[k]) is not list
+        or any(type(item) is not str for item in value[k])) for k in sequence_fields)
+    invalid = invalid or any(k in value and type(value[k]) is not str
+                            for k in ("answer", "outcome"))
+    invalid = invalid or ("procedure_review" in value and type(value["procedure_review"]) is not dict)
+    if invalid:
+        return {"outcome": "unavailable", "reason": "required_review_payload_invalid"}
+    return dict(value)
+
+
 def _admit(request: Any, data: dict, decision: Any, *,
            runtime: AskValidationRuntime, stage: str) -> dict:
     """Keep a pre-callback snapshot; admission cannot rewrite its own reference.
@@ -456,6 +477,8 @@ def validate_response(
     )
     source_ordered_procedure = bool(protected_procedure
         and out.get("_assistant_core_source_ordered_procedure") is True)
+    required_family_review = bool(protected_procedure
+        and out.get("_assistant_core_procedure_family_review_required") is True)
     # These occurrences have just passed the same request admission as synthesis.
     # Preserve source-owned notes even when a free-text reviewer shortens prose.
     procedure_occurrences = [allowed[cid] for cid in
@@ -577,7 +600,9 @@ def validate_response(
         answer = _assistant_core_media_metadata_only(answer, citations, request.response_language)
         out["answer"] = answer
 
-        semantic_contract: dict = dict(out.pop("_assistant_core_semantic_verified", {}) or {})
+        semantic_value = out.pop("_assistant_core_semantic_verified", {})
+        semantic_contract: dict = (_procedure_review_payload(semantic_value) if required_family_review
+                                   else dict(semantic_value or {}))
         semantic_contract_pass = bool(
             semantic_contract
             and str(semantic_contract.get("outcome") or "").strip().lower() in {"pass", "rewrite"}
@@ -612,6 +637,7 @@ def validate_response(
             and (
                 _assistant_core_should_semantic_verify_answer(decision)
                 or bool(out.get("_assistant_core_force_semantic_verify"))
+                or required_family_review
                 or (protected_procedure and not source_ordered_procedure)
             )
         ):
@@ -624,6 +650,8 @@ def validate_response(
                                    "procedure_notes": source_notes if source_ordered_procedure else ()}}
                    if procedure_structure.get("usable") else {}),
             )
+            if required_family_review:
+                semantic_contract = _procedure_review_payload(semantic_contract)
             outcome = str(semantic_contract.get("outcome") or "").strip().lower()
             repaired_answer = _assistant_core_redact_internal_text(semantic_contract.get("answer") or "")
             hard_requirements = {
@@ -732,7 +760,7 @@ def validate_response(
                 out["rg_links"] = _build_rg_links(request.company_id, citations)
             answer, source_proof = _final_contract.preserve_source_notes(
                 answer, source_notes, language=request.response_language,
-                sentence_initial_equivalence=(semantic_contract.get("procedure_review") or {}).get("reply_mode") in {"retain", "edit"})
+                sentence_initial_equivalence=(semantic_contract.get("procedure_review") or {}).get("reply_mode") in ("retain", "edit"))
             out["answer"] = answer
             if answer != reviewed_body:
                 # Never render a pre-review UI model over the final bound text.
@@ -805,7 +833,7 @@ def validate_response(
                         or not final_structure.get("source_notes_present")):
                     answer_contract_result.update(passed=False, complete=False,
                         reason="source_step_sequence_or_notes_incomplete")
-            if protected_procedure and not source_ordered_procedure:
+            if protected_procedure and (not source_ordered_procedure or required_family_review):
                 # A generic/manual answer cannot inherit a completeness proof
                 # from incidental Step citations, or from a deterministic text
                 # threshold when the independent order/safety review is absent.
@@ -815,14 +843,31 @@ def validate_response(
                 complete_review = bool(semantic_contract_pass
                     and required_facets.issubset(semantic_contract.get("covered_facets") or [])
                     and required_types.issubset(semantic_contract.get("covered_answer_types") or []))
-                boundary = semantic_contract.get("operation_boundary_validation") or {}
-                complete_review = bool(complete_review and boundary.get("complete") is True
-                    and boundary.get("version") == "ask-operation-boundary-v1"
-                    and boundary.get("answer_sha256") == _procedure_review.digest(
-                        str(semantic_contract.get("answer") or "").strip()))
+                if required_family_review and source_ordered_procedure:
+                    # Only resolve_reply creates this audit after the independent
+                    # review of the actual canonical draft. A model choice, an
+                    # unavailable/empty review or a lexical PASS cannot replace it.
+                    audit = semantic_contract.get("procedure_review") or {}
+                    complete_review = bool(complete_review
+                        and answer_contract_result.get("semantic_answer_bound") is True
+                        and audit.get("version") == _procedure_review.VERSION
+                        and type(audit.get("reply_mode")) is str
+                        and audit.get("reply_mode") in {"retain", "edit"}
+                        and audit.get("independent_semantic_review") is True
+                        and audit.get("source_sequence_immutable") is True
+                        and audit.get("source_note_bindings_complete") is True
+                        and audit.get("output_answer_sha256") == _procedure_review.digest(
+                            str(semantic_contract.get("answer") or "")))
+                else:
+                    boundary = semantic_contract.get("operation_boundary_validation") or {}
+                    complete_review = bool(complete_review and boundary.get("complete") is True
+                        and boundary.get("version") == "ask-operation-boundary-v1"
+                        and boundary.get("answer_sha256") == _procedure_review.digest(
+                            str(semantic_contract.get("answer") or "").strip()))
                 if not complete_review:
                     answer_contract_result.update(passed=False, complete=False,
-                        reason="manual_procedure_semantic_review_incomplete")
+                        reason=("procedure_family_semantic_review_incomplete" if required_family_review
+                                else "manual_procedure_semantic_review_incomplete"))
             semantic_rejected_with_evidence = bool(
                 out.pop("_assistant_core_semantic_rejected_with_evidence", False)
             )
@@ -962,6 +1007,20 @@ def validate_response(
         out.pop("answer_html", None)
         out.pop("_assistant_ui_model", None)
 
+    if (decision.effective_mode == MODE_ASK and allowed
+            and str(out.get("status") or "").strip().lower() == "no_sources"
+            and str(out.get("result_code") or "").strip().upper() == RESULT_INCOMPLETE_ANSWER_CONTRACT):
+        # Admitted material exists, but this answer failed completion/review.
+        # Do not mislabel that as missing indexed sources or expose the rejected
+        # draft. Presence of sources does not assert their semantic adequacy.
+        out["answer"] = (
+            "I found authorized sources, but could not complete and verify a reliable answer to your question."
+            if str(request.response_language or "").lower().startswith("en") else
+            "Ho trovato fonti autorizzate, ma non sono riuscito a completare e verificare una risposta affidabile alla tua domanda."
+        )
+        out.pop("answer_html", None)
+        out.pop("_assistant_ui_model", None)
+
     meta = dict(out.get("meta") or {})
     meta["assistant_core_validation"] = {
         "valid_citation_count": len(out.get("citations") or []),
@@ -983,6 +1042,7 @@ def validate_response(
         out.pop("_assistant_core_validation_evidence", None)
         out.pop("_assistant_core_force_semantic_verify", None)
         out.pop("_assistant_core_source_ordered_procedure", None)
+        out.pop("_assistant_core_procedure_family_review_required", None)
         out.pop("_assistant_core_repair_context", None)
         out.pop("_assistant_core_repair_needed", None)
         out.pop("_assistant_core_repair_attempted", None)

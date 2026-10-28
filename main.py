@@ -5891,13 +5891,13 @@ def _v12_procedure_selection_mode(q: str, planner: Optional[dict]) -> str:
         for row in _v12_family_facet_queries(planner)
     }
     combined = required_types | facet_types
-    # A request for conditions/checks plus ordered actions is a procedural
-    # checklist. Relevant Steps may be non-contiguous (for example initial safety,
-    # safety reset and final deliberate start). Physical "from...to..." ranges were
-    # already handled above and remain contiguous.
-    if "checklist" in combined and (
-        "safety_conditions" in combined or "ordered_actions" in combined
-    ):
+    # Ordered operations and state transitions retain the intervening source
+    # sequence even when the request ALSO asks for a checklist or precautions.
+    # Only a checks-only request may select independent, non-contiguous Steps.
+    # Explicit physical ranges were handled above and remain authoritative.
+    if combined & {"ordered_actions", "state_sequence"}:
+        return "contiguous_span"
+    if "checklist" in combined and "safety_conditions" in combined:
         return "sparse_ordered_steps"
     return "contiguous_span"
 
@@ -6036,6 +6036,44 @@ def _v12_select_sparse_ordered_steps(
     return sorted(selected, key=_v12_step_sort_key)
 
 
+
+def _v12_compound_operation_anchor_numbers(
+    *, all_steps: list[dict], q: str, planner: Optional[dict],
+) -> set[int]:
+    """Keep operation anchors from each mandatory part of a compound request.
+
+    Router facets already carry multilingual query variants. A match selects
+    a span boundary, never proves that the requested operation is covered.
+    Pure safety facets remain prerequisite context, not a reason to include all
+    unrelated operations between an early safety Step and the requested span.
+    """
+    facets = [row for row in _v12_family_facet_queries(planner)
+              if row.get("must_cover") is True]
+    types = {str(value or "").strip().lower()
+             for value in ((planner or {}).get("required_answer_types") or [])}
+    types.update(str(row.get("answer_type") or "").strip().lower() for row in facets)
+    if len(facets) < 2 or not types & {"ordered_actions", "state_sequence"}:
+        return set()
+    anchors: set[int] = set()
+    for facet in facets:
+        if facet.get("answer_type") not in {
+            "ordered_actions", "state_sequence", "explanation", "checklist",
+        }:
+            continue
+        scored = [(_v12_step_sort_key(step)[0], _v12_step_facet_score(step, facet, q))
+                  for step in all_steps]
+        # Query-only relevance cannot masquerade as this facet's anchor.
+        matching = [(number, float(metrics.get("score") or 0.0))
+                    for number, metrics in scored if 0 < number < 9999
+                    and (float(metrics.get("phrase_score") or 0.0) > 0.035
+                         or bool(metrics.get("matched_exact_terms")))]
+        best = max((score for _, score in matching), default=0.0)
+        if best > 0.035:
+            threshold = max(0.035, best * 0.60)
+            anchors.update(number for number, score in matching if score >= threshold)
+    return anchors
+
+
 def _v12_select_response_steps(
     *,
     all_steps: list[dict],
@@ -6111,6 +6149,11 @@ def _v12_select_response_steps(
             if first_no <= _v12_step_sort_key(step)[0] <= last_no
         ]
 
+    if _v12_query_range_anchors(q) != ("", ""):
+        # An unresolved explicit endpoint stays unresolved. Broad query/facet
+        # matches must not silently substitute a different requested segment.
+        return []
+
     scored = [(_v12_step_sort_key(step)[0], _v12_step_direct_query_score(step, q), step) for step in steps]
     max_direct = max((score for _, score, _ in scored), default=0.0)
     direct_numbers: set[int] = set()
@@ -6133,6 +6176,12 @@ def _v12_select_response_steps(
         if model_is_overbroad:
             use_numbers = set(direct_numbers)
 
+    # Combine the original query anchors with every mandatory operational
+    # facet before selecting the interval. This prevents a well-matched check
+    # or component name from erasing an earlier requested loading/insertion
+    # operation expressed with different vocabulary in the admitted sources.
+    use_numbers.update(_v12_compound_operation_anchor_numbers(
+        all_steps=steps, q=q, planner=planner))
     if not use_numbers:
         return []
 
@@ -16448,9 +16497,15 @@ def _assistant_core_should_semantic_verify_answer(
     decision: AssistantCoreDecision,
 ) -> bool:
     if decision.information_task in {INFO_PROCEDURE_FULL, INFO_PROCEDURE_SEGMENT}:
-        # ProcedureBundle already has a deterministic completeness gate and should
-        # not spend a third model call merely to rephrase ordered Step records.
-        return False
+        # A compound sequence-plus-checklist used to request the independent
+        # verifier through sparse selection. Keep that obligation when preserving
+        # its intervening operations; lexical span anchors are not coverage proof.
+        procedure_types = {
+            str(value or "").strip().lower()
+            for value in decision.required_answer_types
+        } | {str(item.answer_type or "").strip().lower() for item in decision.facet_queries}
+        return bool("checklist" in procedure_types
+                    and procedure_types & {"ordered_actions", "state_sequence"})
     requirements = {
         str(x or "").strip().lower()
         for x in decision.required_answer_types

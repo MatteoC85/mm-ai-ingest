@@ -613,6 +613,13 @@ def _ask_structured_direct_fetch_sources_impl(*, company_id: str, machine_id: st
         return []
 
     intent = _ask_structured_direct_intent(q, planner=planner)
+    # Server-owned protected procedure discovery: expose parent descriptions to
+    # the already-budgeted semantic selector before locking one family. A long
+    # competing family's repeated Step labels must not crowd every other parent
+    # out of the same bounded result allocation.
+    family_catalog = bool((planner or {}).get("_ask_procedure_family_catalog") is True)
+    if family_catalog:
+        intent = {**intent, "enabled": True, "prefixes": ["procedure", "step"]}
     if not intent.get("enabled"):
         return []
 
@@ -678,7 +685,7 @@ def _ask_structured_direct_fetch_sources_impl(*, company_id: str, machine_id: st
     # semantic/planner term, so relevant records cannot be pushed out by alphabetical
     # ordering. If inflection/translation prevents a lexical hit, fall back to the
     # bounded full structured scan and score in Python.
-    rows = fetch_rows(require_term_match=bool(terms and not broad_overview))
+    rows = fetch_rows(require_term_match=bool(terms and not broad_overview and not family_catalog))
     if not rows and terms and not broad_overview:
         rows = fetch_rows(require_term_match=False)
 
@@ -700,9 +707,10 @@ def _ask_structured_direct_fetch_sources_impl(*, company_id: str, machine_id: st
             terms=terms,
             broad_overview=broad_overview,
         )
-        if score <= 0.0:
+        parent_catalog_record = family_catalog and st == "procedure"
+        if score <= 0.0 and not parent_catalog_record:
             continue
-        if terms and not broad_overview and not any(
+        if terms and not broad_overview and not parent_catalog_record and not any(
             t in _normalize_unicode_advanced(txt).lower() for t in terms
         ):
             continue
@@ -747,6 +755,13 @@ def _ask_structured_direct_fetch_sources_impl(*, company_id: str, machine_id: st
     )
 
     max_items = max(1, int(ASK_STRUCTURED_DIRECT_MAX_ITEMS or 12))
+    if family_catalog:
+        parents = [row for row in scored if row["source_type"] == "procedure"]
+        rest = [row for row in scored if row["source_type"] != "procedure"]
+        # The read bound, text projection and result count remain unchanged.
+        selected_parents = _dedup_citations_by_snippet(parents, max_items=max_items)
+        remaining = max_items - len(selected_parents)
+        return selected_parents + (_dedup_citations_by_snippet(rest, max_items=remaining) if remaining > 0 else [])
     if broad_overview:
         out: list[dict] = []
         used_ids: set[str] = set()
