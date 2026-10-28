@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from array import array
+from operator import is_
 from contextlib import contextmanager
 from contextvars import ContextVar
 from threading import RLock
@@ -196,6 +197,12 @@ class _Freezer:
         self.scalar_bytes = 0
         self.max_depth_seen = 0
         self.ancestors: set[int] = set()
+        # Exact profiles of the private tree being built. Counting here avoids
+        # two later traversals and repeated scalar JSON escaping; these are the
+        # same logical/canonical and retained-reference representations.
+        self.canonical_bytes = 0
+        self.retained_bytes = 0
+        self.numeric_payloads = {}
 
     def freeze(self, value: Any, depth: int = 0) -> _Frozen:
         if depth > self.limits.max_depth:
@@ -215,11 +222,15 @@ class _Freezer:
                 raise EvidenceAssemblyError("legacy byte budget exceeded")
             try:
                 # ensure_ascii guarantees ASCII; same wire length as [kind,value].
-                self.scalar_bytes += len(_json(value)) + len(kind) + 5
+                encoded_length = len(_json(value))
+                self.scalar_bytes += encoded_length + len(kind) + 5
             except (ValueError, OverflowError) as exc:
                 raise EvidenceAssemblyError("unserializable legacy scalar") from exc
             if self.scalar_bytes > self.limits.max_bytes:
                 raise EvidenceAssemblyError("legacy byte budget exceeded")
+            size = len('{"kind":"' + kind + '","value":}') + encoded_length
+            self.canonical_bytes += size
+            self.retained_bytes += size
             return _Frozen(kind, value)
         if not isinstance(value, Mapping) and typ not in (list, tuple):
             raise EvidenceAssemblyError("unsupported legacy value; no implicit conversion")
@@ -239,16 +250,38 @@ class _Freezer:
             self.scalar_bytes += packed.scalar_bytes
             if self.scalar_bytes > self.limits.max_bytes:
                 raise EvidenceAssemblyError("legacy byte budget exceeded")
-            return _Frozen("list" if typ is list else "tuple", packed)
+            kind = "list" if typ is list else "tuple"
+            self.canonical_bytes += (len('{"kind":"' + kind + '","value":[]}')
+                                     + packed.canonical_children_bytes())
+            self.retained_bytes += len(_json({"kind": kind, "value": {
+                "numeric_payload_ref": packed.reference_id,
+                "components": len(packed.values)}}))
+            self.numeric_payloads[id(packed)] = packed
+            return _Frozen(kind, packed)
         self.ancestors.add(id(value))
         try:
+            kind = "map" if isinstance(value, Mapping) else ("list" if typ is list else "tuple")
+            size = len('{"kind":"' + kind + '","value":[]}')
+            if kind != "map":
+                size += max(0, len(value) - 1)
+            self.canonical_bytes += size
+            self.retained_bytes += size
             if isinstance(value, Mapping):
                 pairs = []
                 for key, item in value.items():
                     if type(key) is not str:
                         raise EvidenceAssemblyError("legacy mapping keys must be strings")
-                    self.freeze(key, depth + 1)  # Account for keys as well as values.
+                    self.freeze(key, depth + 1)  # Same key allocation/depth checks.
+                    # The tree stores a raw escaped key inside [key,child], not
+                    # the tagged scalar used while validating/accounting it.
+                    adjustment = 3 - len('{"kind":"str","value":}')
+                    self.canonical_bytes += adjustment
+                    self.retained_bytes += adjustment
                     pairs.append((key, self.freeze(item, depth + 1)))
+                # Mapping.items() defines the tree even for an implementation
+                # whose reported length differs from its actual item iterator.
+                self.canonical_bytes += max(0, len(pairs) - 1)
+                self.retained_bytes += max(0, len(pairs) - 1)
                 return _Frozen("map", tuple(pairs))
             return _Frozen("list" if typ is list else "tuple",
                            tuple(self.freeze(item, depth + 1) for item in value))
@@ -394,8 +427,15 @@ def _matches_frozen(value: Any, node: _Frozen) -> bool:
         if typ is not (list if node.kind == "list" else tuple):
             return False
         if type(node.value) is _PackedFloats:
-            return (len(value) == len(node.value.values)
-                    and set(map(type, value)) == {float}
+            if len(value) != len(node.value.values):
+                return False
+            # Recheck EVERY current component. A float is immutable, so the
+            # exact private component object also proves its type and bits.
+            # No mutable-container identity or prior result is cached. Distinct
+            # component objects retain the original strict type/IEEE fallback.
+            if all(map(is_, value, node.value.values)):
+                return True
+            return (set(map(type, value)) == {float}
                     and array("d", value).tobytes() == node.value.binary)
         return len(value) == len(node.value) and all(
             _matches_frozen(v, n) for v, n in zip(value, node.value))
@@ -429,8 +469,21 @@ class _LegacyWitness(Mapping):
     def capture(cls, value, limits):
         freezer = _Freezer(limits)
         tree = freezer.freeze(value)
-        return cls(tree, _frozen_canonical_size(tree),
-                   (freezer.nodes, freezer.scalar_bytes, freezer.max_depth_seen))
+        return cls._from_profile(tree, freezer.canonical_bytes,
+            (freezer.nodes, freezer.scalar_bytes, freezer.max_depth_seen),
+            freezer.retained_bytes, tuple(freezer.numeric_payloads.values()))
+
+    @classmethod
+    def _from_profile(cls, tree, size, limits_profile, retained, payloads):
+        # Only the validated freezer or composition of private immutable
+        # witnesses calls this. Normal construction keeps its original oracle.
+        witness = object.__new__(cls)
+        for name, value in (("_tree", tree), ("size_bytes", size),
+                            ("_limits_profile", limits_profile),
+                            ("retained_metadata_bytes", retained),
+                            ("numeric_payloads", payloads)):
+            object.__setattr__(witness, name, value)
+        return witness
 
     @classmethod
     def sequence(cls, kind, witnesses, limits):
@@ -456,7 +509,15 @@ class _LegacyWitness(Mapping):
         tree = _Frozen(kind, tuple(w._tree for w in witnesses))
         size = (len('{"kind":"' + kind + '","value":[]}')
                 + max(0, len(witnesses) - 1) + sum(w.size_bytes for w in witnesses))
-        return cls(tree, size, (nodes, scalars, depth))
+        retained = (len('{"kind":"' + kind + '","value":[]}')
+                    + max(0, len(witnesses) - 1)
+                    + sum(w.retained_metadata_bytes for w in witnesses))
+        payloads = {}
+        for witness in witnesses:
+            for payload in witness.numeric_payloads:
+                payloads[id(payload)] = payload
+        return cls._from_profile(tree, size, (nodes, scalars, depth),
+                                 retained, tuple(payloads.values()))
 
     def matches(self, value):
         return _matches_frozen(value, self._tree)

@@ -2,7 +2,8 @@
 
 The assignments below are mechanically extracted from the certified production
 monolith. Defaults, clamps, markers, release identifiers and engine-key generation
-remain unchanged except for explicit reservation accounting and honoring lower cost limits.
+remain unchanged except for reservation accounting, lower cost limits and the
+explicitly bounded protected ASK completion window.
 """
 from __future__ import annotations
 
@@ -223,20 +224,17 @@ ASSISTANT_CORE_FACET_SUPPORT_THRESHOLD = max(0.20, min(0.60, float(os.environ.ge
 ASSISTANT_CORE_REPAIR_MAX_OUTPUT_TOKENS = max(1600, min(6000, int(os.environ.get("MM_ASSISTANT_CORE_REPAIR_MAX_OUTPUT_TOKENS", "3600"))))
 ASSISTANT_CORE_GENERAL_KNOWLEDGE_ENABLED = (os.environ.get("MM_ASSISTANT_CORE_GENERAL_KNOWLEDGE_ENABLED") or "1").strip() != "0"
 
-# End-to-end target: normal responses should finish well below these values; the
-# hard stream guard returns an explicit TIMEOUT before 75 seconds. The monetary caps
-# are deliberately a little wider than the first proposal in favour of consistency.
-# Per-mode internal deadlines remain bounded even though the outer safety ceiling is
-# widened. ASK does not receive a two-minute reasoning budget; Root Cause and Smart
-# Diagnostic retain their existing deadlines; Smart reserves its final review.
-# Keep the existing 85-second ceiling and explicit overrides. The default must
-# accommodate synthesis, independent review, a required repair and publication
-# within the existing 115-second Worker transport bound; the cost cap is unchanged.
-ASSISTANT_CORE_ASK_DEADLINE_SECONDS = max(50, min(85, int(os.environ.get("MM_ASSISTANT_CORE_ASK_DEADLINE_SECONDS", "85"))))
+# Protected ASK owns one clock from entry through final publication. Allow its
+# mandatory independent review to use the remaining window, while retaining a
+# configured 15-second margin between duration ceilings (100 versus 115 seconds).
+# Gateway/ledger overhead outside this clock still needs end-to-end measurement.
+# Explicit shorter ASK limits remain shorter. Calls, tokens, cost caps and retries
+# are unchanged; longer time is not proof of live correctness or a latency SLA.
+ASSISTANT_CORE_HARD_TIMEOUT_SECONDS = max(95, min(120, int(os.environ.get("MM_ASSISTANT_CORE_HARD_TIMEOUT_SECONDS", "115"))))
+ASSISTANT_CORE_ASK_DEADLINE_SECONDS = max(50, min(100, ASSISTANT_CORE_HARD_TIMEOUT_SECONDS - 15, int(os.environ.get("MM_ASSISTANT_CORE_ASK_DEADLINE_SECONDS", "100"))))
 ASSISTANT_CORE_ROOT_CAUSE_DEADLINE_SECONDS = max(65, min(105, int(os.environ.get("MM_ASSISTANT_CORE_ROOT_CAUSE_DEADLINE_SECONDS", "92"))))
 ASSISTANT_CORE_SMART_START_DEADLINE_SECONDS = max(70, min(110, int(os.environ.get("MM_ASSISTANT_CORE_SMART_START_DEADLINE_SECONDS", "96"))))
 ASSISTANT_CORE_SMART_TURN_DEADLINE_SECONDS = max(60, min(105, int(os.environ.get("MM_ASSISTANT_CORE_SMART_TURN_DEADLINE_SECONDS", "86"))))
-ASSISTANT_CORE_HARD_TIMEOUT_SECONDS = max(95, min(120, int(os.environ.get("MM_ASSISTANT_CORE_HARD_TIMEOUT_SECONDS", "115"))))
 ASSISTANT_CORE_MAX_LLM_CALLS_ASK = max(3, min(4, int(os.environ.get("MM_ASSISTANT_CORE_MAX_LLM_CALLS_ASK", "4"))))
 ASSISTANT_CORE_MAX_LLM_CALLS_ROOT_CAUSE = max(3, min(4, int(os.environ.get("MM_ASSISTANT_CORE_MAX_LLM_CALLS_ROOT_CAUSE", "4"))))
 ASSISTANT_CORE_MAX_LLM_CALLS_SMART_START = max(3, min(4, int(os.environ.get("MM_ASSISTANT_CORE_MAX_LLM_CALLS_SMART_START", "4"))))
