@@ -145,22 +145,77 @@ def source_safety_notes(candidates: list[dict], *, fields: Callable,
     return tuple(out)
 
 
+_SOURCE_NOTE_HEADINGS = (
+    "Step notes and safety precautions — original wording",
+    "Note e precauzioni degli Step — testo originale",
+)
+
+
+def _source_note_match_views(answer: str) -> tuple[str, ...]:
+    """Match literal prose plus this module's exact source-quote wrapper.
+
+    Strip one outer ``> `` only in a complete, labelled supplement emitted by
+    preserve_source_notes. Do not normalize arbitrary Markdown or source text:
+    an embedded ``>``, number, identifier, negation or technical unit survives.
+    Each source block stays separate; notes cannot match across Step labels.
+    """
+    raw = str(answer).replace("\r\n", "\n").replace("\r", "\n")
+    views = [" ".join(raw.split())]
+    lines = raw.splitlines()
+    for start, line in enumerate(lines):
+        if line not in _SOURCE_NOTE_HEADINGS:
+            continue
+        if (start and lines[start - 1].strip()) or start + 1 >= len(lines) or lines[start + 1]:
+            continue
+        i, blocks, valid = start + 2, [], True
+        while i < len(lines):
+            if not lines[i].startswith(("Step ", "Passo ")):
+                valid = False
+                break
+            i += 1
+            quoted = []
+            while i < len(lines) and lines[i].startswith("> "):
+                quoted.append(lines[i][2:])
+                i += 1
+            if not quoted:
+                valid = False
+                break
+            blocks.append(" ".join("\n".join(quoted).split()))
+            if i < len(lines) and lines[i]:
+                valid = False
+                break
+            while i < len(lines) and not lines[i]:
+                i += 1
+        if valid and i == len(lines) and blocks:
+            # Do not let the wrapper marker itself satisfy a literal source
+            # symbol: match the answer prefix and unwrapped blocks separately.
+            return (" ".join("\n".join(lines[:start]).split()), *blocks)
+    return tuple(views)
+
+
+def _literal_source_note_present(answer: str, note: str) -> bool:
+    text = " ".join(str(note).split())
+    return any(text in body for body in _source_note_match_views(answer))
+
+
 def source_note_present(answer: str, note: str) -> bool:
     """Literal note retention, allowing only prose sentence-initial casing.
 
     Do NOT casefold technical text: mA/MA, mW/MW and identifiers are distinct.
     A lowercase initial prose word may match its title-cased source spelling;
-    the remainder, negation, numbers, punctuation and units stay exact.
+    the remainder, negation, numbers, punctuation and units stay exact. The
+    source-only supplement may contribute its exact rendered quotation text.
     """
-    body, text = " ".join(str(answer).split()), " ".join(str(note).split())
-    if text in body:
+    text = " ".join(str(note).split())
+    views = _source_note_match_views(answer)
+    if any(text in body for body in views):
         return True
     word = re.match(r"[^\W\d_]{3,}\b", text, flags=re.UNICODE)
     if not word or not word.group().istitle():
         return False
     variant = text[0].lower() + text[1:]
     # A substring inside a different word is not a retained source note.
-    return re.search(r"(?<!\w)" + re.escape(variant), body) is not None
+    return any(re.search(r"(?<!\w)" + re.escape(variant), body) is not None for body in views)
 
 
 def preserve_source_notes(answer: str, notes: tuple[dict, ...], *,
@@ -173,9 +228,8 @@ def preserve_source_notes(answer: str, notes: tuple[dict, ...], *,
     """
     answer = str(answer or "").strip()
     original_answer = answer
-    normal = " ".join(answer.split())
     present = (source_note_present if sentence_initial_equivalence else
-               lambda a, t: " ".join(str(t).split()) in " ".join(str(a).split()))
+               _literal_source_note_present)
     missing = []
     for note in notes:
         texts = [str(x) for x in note["texts"] if not present(answer, str(x))]
@@ -189,8 +243,7 @@ def preserve_source_notes(answer: str, notes: tuple[dict, ...], *,
         # top-level actions. The existing HTML renderer escapes source content.
         blocks.append(label + "\n" + "\n".join("> " + line for text in texts for line in text.splitlines()))
     if blocks:
-        heading = ("Step notes and safety precautions — original wording" if english
-                   else "Note e precauzioni degli Step — testo originale")
+        heading = _SOURCE_NOTE_HEADINGS[0 if english else 1]
         answer += "\n\n" + heading + "\n\n" + "\n\n".join(blocks)
     proof = {"basis": "admitted_source_fields",
              "input_answer_sha256": answer_digest(original_answer),

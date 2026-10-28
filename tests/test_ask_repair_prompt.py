@@ -140,7 +140,10 @@ class AskRepairPromptTests(unittest.TestCase):
         try:
             contract={'outcome':'no_sources','reason':'operation_boundary_quote_or_order_invalid',
                 'answer':'PRIVATE_MODEL_RESPONSE','missing_facets':['PRIVATE_FACET'],
-                'operation_boundary_validation':{'complete':False,'source':'PRIVATE_SOURCE'}}
+                'operation_boundary_validation':{'complete':False,'source':'PRIVATE_SOURCE'},
+                'procedure_structure':{'source_sequence_required':True,'sequence_complete':False,
+                    'source_notes_present':True,'visible_numbers':[2,7],'expected_numbers':[2,7,11],
+                    'source':'PRIVATE_SOURCE'},'procedure_review':{'reply_mode':'edit','answer':'PRIVATE_TEXT'}}
             original=deepcopy(contract)
             request_completion.record_contract_observation('semantic_review',contract)
             request_completion.record_contract_observation(['PRIVATE_STAGE'],{'outcome':{},'reason':'PRIVATE_SECRET','passed':False})
@@ -151,6 +154,11 @@ class AskRepairPromptTests(unittest.TestCase):
             self.assertEqual(len(observations),8)
             self.assertEqual(observations[0]['reason'],'operation_boundary_quote_or_order_invalid')
             self.assertEqual(observations[0]['missing_facets_count'],1)
+            self.assertEqual(observations[0]['visible_numbers_count'],2)
+            self.assertEqual(observations[0]['expected_numbers_count'],3)
+            self.assertFalse(observations[0]['sequence_complete'])
+            self.assertTrue(observations[0]['source_notes_present'])
+            self.assertEqual(observations[0]['review_reply_mode'],'edit')
             self.assertEqual(observations[1]['stage'],'other')
             self.assertEqual(observations[1]['reason'],'other')
             self.assertNotIn('PRIVATE_',json.dumps(observations))

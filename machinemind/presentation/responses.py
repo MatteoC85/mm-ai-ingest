@@ -76,7 +76,10 @@ def build_structured_procedure_ui_model(*, structured_citations: list[dict], man
         step_title = _runtime.procedure_ui_clean(fields.get('title') or '') or f'Step {source_no}'
         sections = _runtime.procedure_ui_sections(fields.get('description') or '')
         instruction = excerpt(sections.get('instruction') or sections.get('body') or fields.get('description') or '', max_chars=1500)
-        safety = excerpt(sections.get('safety') or '', max_chars=800)
+        # Both description safety sections and structured Step notes belong to
+        # this operation. Keep every source-owned note inside its original Step.
+        safety = excerpt('\n'.join(dict.fromkeys(str(x).strip() for x in (
+            sections.get('safety'), fields.get('notes')) if str(x or '').strip())), max_chars=800)
         cid = str(citation.get('citation_id') or '').strip()
         grounded = max(grounded_by_citation.get(cid) or [''], key=len)
         if grounded and instruction and (not _runtime.looks_like_target_language(instruction, response_language)):

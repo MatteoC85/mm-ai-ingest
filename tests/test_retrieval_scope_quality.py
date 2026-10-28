@@ -1,6 +1,7 @@
 """Real local PostgreSQL/pgvector retrieval checks with deterministic vectors.
 
-Requires the disposable p6_validation database on 127.0.0.1:55436. This test
+Requires disposable p6_validation on loopback (port 55436 by default, or the
+runner-selected MM_NATIVE_TEST_PORT). This test
 never starts a database or contacts an embedding/provider API. Every fixture
 connection rolls back, including fixture DDL, before closing.
 """
@@ -75,11 +76,15 @@ class RetrievalScopeQualityTests(unittest.TestCase):
         if not dsn:
             raise unittest.SkipTest("P6_NATIVE_TEST_DSN required for real local PostgreSQL tests")
         parsed = parse_dsn(dsn)
-        if parsed.get("host") != "127.0.0.1" or str(parsed.get("port")) != "55436" or parsed.get("dbname") != "p6_validation":
-            raise RuntimeError("Retrieval tests require the disposable loopback p6_validation database on port 55436")
+        expected_port = os.environ.get("MM_NATIVE_TEST_PORT", "55436")
+        if not expected_port.isdigit() or not 1024 < int(expected_port) <= 65535:
+            raise RuntimeError("Invalid disposable database port")
+        if parsed.get("host") != "127.0.0.1" or str(parsed.get("port")) != expected_port or parsed.get("dbname") != "p6_validation":
+            raise RuntimeError("Retrieval tests require the disposable loopback p6_validation database on the selected local port")
         if parsed.get("hostaddr") not in (None, "", "127.0.0.1") or parsed.get("service"):
             raise RuntimeError("Remote or indirect database addressing is forbidden in retrieval tests")
         cls.dsn = dsn
+        cls.local_port = int(expected_port)
 
     def setUp(self):
         self.connections = []
@@ -111,7 +116,7 @@ class RetrievalScopeQualityTests(unittest.TestCase):
                 cur.execute("SET LOCAL statement_timeout = '10s'")
                 cur.execute("SET LOCAL lock_timeout = '2s'")
                 cur.execute("SELECT current_database(), host(inet_server_addr()), inet_server_port()")
-                if cur.fetchone() != ("p6_validation", "127.0.0.1", 55436):
+                if cur.fetchone() != ("p6_validation", "127.0.0.1", self.local_port):
                     raise RuntimeError("Database server is outside the disposable offline fixture")
                 cur.execute("SELECT to_regclass('public.document_chunks')")
                 if cur.fetchone()[0] is None:

@@ -128,6 +128,7 @@ def record_contract_observation(stage: str, contract: dict) -> None:
         "manual_procedure_semantic_review_incomplete", "source_step_sequence_or_notes_incomplete",
         "semantic_contract_rejected_grounded_answer", "semantic_contract_incomplete_grounded_answer",
         "missing_supported_list_items", "procedure_review_coverage_not_complete",
+        "source_step_note_binding_incomplete",
     }
     outcome = contract.get("outcome")
     if type(outcome) is not str or outcome not in {"pass", "rewrite", "partial", "no_sources", "unavailable"}:
@@ -142,6 +143,17 @@ def record_contract_observation(stage: str, contract: dict) -> None:
         row[key + "_count"] = min(len(value), 100) if isinstance(value, (list, tuple)) else None
     boundary = contract.get("operation_boundary_validation")
     row["operation_boundary_complete"] = (boundary.get("complete") is True) if isinstance(boundary, dict) else None
+    structure = contract.get("procedure_structure")
+    if isinstance(structure, dict):
+        for key in ("source_sequence_required", "sequence_complete", "source_notes_present"):
+            row[key] = structure.get(key) if type(structure.get(key)) is bool else None
+        for key in ("visible_numbers", "expected_numbers"):
+            numbers = structure.get(key)
+            row[key + "_count"] = min(len(numbers), 100) if isinstance(numbers, (list, tuple)) else None
+    review = contract.get("procedure_review")
+    if isinstance(review, dict):
+        mode = review.get("reply_mode")
+        row["review_reply_mode"] = mode if type(mode) is str and mode in {"retain", "edit", "replace", "reject"} else "other"
     owner.contract_checks.append(row)
 
 

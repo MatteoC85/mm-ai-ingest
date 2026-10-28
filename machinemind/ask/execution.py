@@ -599,6 +599,8 @@ def verify_or_repair_answer(
         and (repair_context.get("procedure_structure") or {}).get("usable")
         and (repair_context.get("procedure_structure") or {}).get("answer_sha256") == _procedure_review.digest(answer))
     layout = _procedure_review.block_layout(answer) if compact_review else None
+    source_ordered_review = bool(compact_review
+        and (repair_context.get("procedure_structure") or {}).get("source_sequence_required") is True)
     operation_boundary = bool(compact_review
         and (repair_context.get("procedure_structure") or {}).get("source_sequence_required") is False)
     review_facets = list(dict.fromkeys(list(decision.required_facets) + [
@@ -606,7 +608,7 @@ def verify_or_repair_answer(
     verifier_schema = _assistant_core_contract_verifier_schema()
     if compact_review:
         verifier_schema = _procedure_review.review_schema(verifier_schema, layout, review_facets, requirements,
-            operation_boundary=operation_boundary,
+            operation_boundary=operation_boundary, source_ordered=source_ordered_review,
             operation_source_ids=[str(c.get("citation_id") or "").strip() for c in ordered_candidates])
         system_msg += _procedure_review.PROTOCOL_INSTRUCTIONS
         if operation_boundary:
@@ -662,7 +664,9 @@ def verify_or_repair_answer(
         out["review_evidence"] = review_evidence_diagnostic
     if compact_review:
         out = _procedure_review.resolve_reply(out, answer=answer, layout=layout,
-            required_facets=review_facets, required_types=requirements)
+            required_facets=review_facets, required_types=requirements,
+            source_ordered=source_ordered_review,
+            source_notes=tuple(repair_context.get("procedure_notes") or ()))
     if reviewed_draft is not None:
         out = _final_contract.resolve_unchanged_pass(out, draft=reviewed_draft,
             request_key=ask_request_key(request))

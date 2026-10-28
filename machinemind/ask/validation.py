@@ -620,7 +620,8 @@ def validate_response(
                 decision=decision,
                 answer=answer,
                 candidates=list(allowed.values()),
-                **({"repair_context": {"procedure_structure": procedure_structure}}
+                **({"repair_context": {"procedure_structure": procedure_structure,
+                                   "procedure_notes": source_notes if source_ordered_procedure else ()}}
                    if procedure_structure.get("usable") else {}),
             )
             outcome = str(semantic_contract.get("outcome") or "").strip().lower()
@@ -938,7 +939,8 @@ def validate_response(
                         # The existing bounded repair may retain/edit the draft;
                         # this does not create another verifier call or alter its
                         # triggering conditions. Bind the actual final text.
-                        **({"procedure_structure": dict(answer_contract_result["procedure_structure"])}
+                        **({"procedure_structure": dict(answer_contract_result["procedure_structure"]),
+                            "procedure_notes": source_notes if source_ordered_procedure else ()}
                            if answer_contract_result.get("procedure_structure", {}).get("usable") else {}),
                     }
                 else:

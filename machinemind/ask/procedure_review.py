@@ -16,6 +16,8 @@ import hashlib
 import re
 from typing import Any, Callable
 
+from .final_contract import source_note_present
+
 VERSION = "ask-procedure-review-v2"
 _NUMBERED = re.compile(r"(?m)^(?P<number>[1-9][0-9]*)[.)][ \t]+")
 # Reviewers can reproduce a heading with Markdown, indentation, or a line
@@ -161,7 +163,7 @@ def _edited_block(original: str, value: str) -> str:
 
 
 def review_schema(legacy: dict, layout: dict, facets: list[str], types: list[str], *,
-                  operation_boundary: bool = False,
+                  operation_boundary: bool = False, source_ordered: bool = False,
                   operation_source_ids: list[str] | None = None) -> dict:
     result = deepcopy(legacy)
     result["name"] = legacy["name"]  # backwards-readable verifier envelope
@@ -173,7 +175,13 @@ def review_schema(legacy: dict, layout: dict, facets: list[str], types: list[str
         field = schema["properties"].get(key)
         if field is not None:
             field["maxItems"] = max(int(field.get("maxItems", 0)), len(set(facets)))
-    schema["properties"]["reply_mode"] = {"type": "string", "enum": ["replace", "retain", "edit"]}
+    # A source-authored Step sequence owns its headings. The reviewer may
+    # rewrite every body, but cannot replace that sequence with a free-text
+    # numbered list. Unsupported or incomplete evidence remains a rejection.
+    schema["properties"]["reply_mode"] = {"type": "string", "enum": (
+        ["retain", "edit", "reject"] if source_ordered else ["replace", "retain", "edit"])}
+    if source_ordered:
+        schema["properties"]["answer"] = {"type": "string", "enum": [""]}
     schema["properties"]["edits"] = {"type": "array", "items": {
         "type": "object", "additionalProperties": False,
         "properties": {
@@ -305,16 +313,57 @@ PROTOCOL_INSTRUCTIONS = (
     "preserves the original heading and separators. block_id is an opaque edit target; step_number gives "
     "the actual source step number. Preserve every instruction, source precaution, condition, numeric "
     "value, and citation. Never exchange instructions between Steps or add numbered steps inside a body. "
-    "Use reply_mode=replace with a full answer and edits=[] when a safe correction needs a different "
-    "block structure, missing steps, or extensive rewriting. For partial/no_sources use replace and "
-    "report the unresolved requirements honestly. Keep all covered/missing contract keys verbatim. "
+    "When source_sequence_required=false, use reply_mode=replace with a full answer and edits=[] "
+    "when a safe correction needs a different block structure, missing steps, or extensive rewriting. "
+    "For partial/no_sources in that manual/mixed mode, use replace and report the unresolved requirements. "
+    "When source_sequence_required=true, the schema permits only retain, edit or reject and answer must "
+    "always be empty. Source-authored Step numbers and order are server-owned. Even an extensive "
+    "correction must use edit with all affected blocks, preserving every source instruction and safety "
+    "condition in its own Step. Source-authored notes and warnings must remain verbatim in their original "
+    "Step body; never omit, paraphrase, or move them even if your coverage verdict is complete. "
+    "Never renumber sparse source Steps or turn a Step into a separate heading. "
+    "If the admitted Step set cannot satisfy the request without changing its structure, return "
+    "reply_mode=reject, outcome=no_sources (or partial only where otherwise permitted), answer='', "
+    "edits=[], and the unresolved requirements. Never claim successful coverage of an omitted Step. "
+    "Keep all covered/missing contract keys verbatim. "
     "Every successful reply must cover every mandatory requirement. All original evidence, scope, "
     "safety, and no-invention rules above remain in force."
 )
 
 
+
+def _source_notes_preserved(notes: tuple[dict, ...], *, layout: dict, reviewed: str) -> bool:
+    """Check already-admitted, source-authored notes in their original Step.
+
+    Coverage assertions from the model cannot delete a warning or move it to a
+    different operation. This function only rejects; it never edits reviewed
+    text or invents a substitute source note.
+    """
+    original_blocks = {str(_numbers(b["text"])[0]): b["text"] for b in layout["blocks"]
+                       if _NUMBERED.match(b["text"])}
+    final_blocks = {str(_numbers(b["text"])[0]): b["text"] for b in block_layout(reviewed)["blocks"]
+                    if _NUMBERED.match(b["text"])}
+    for note in notes:
+        number = str(note.get("source_number") or "")
+        texts = note.get("texts")
+        if (number not in original_blocks or number not in final_blocks
+                or not isinstance(texts, (list, tuple)) or not texts
+                or any(type(text) is not str or not text for text in texts)):
+            return False
+        for text in texts:
+            if (not source_note_present(original_blocks[number], text)
+                    or not source_note_present(final_blocks[number], text)):
+                return False
+            for other, block in final_blocks.items():
+                if (other != number and source_note_present(block, text)
+                        and not source_note_present(original_blocks.get(other, ""), text)):
+                    return False
+    return True
+
+
 def resolve_reply(parsed: dict, *, answer: str, layout: dict,
-                  required_facets: list[str], required_types: list[str]) -> dict:
+                  required_facets: list[str], required_types: list[str],
+                  source_ordered: bool = False, source_notes: tuple[dict, ...] = ()) -> dict:
     """Apply a complete review to exactly its input; no provider retry on errors.
 
     Absent reply_mode is a legacy full-answer response. It follows the existing
@@ -323,6 +372,8 @@ def resolve_reply(parsed: dict, *, answer: str, layout: dict,
     """
     out = deepcopy(parsed)
     if "reply_mode" not in out:
+        if source_ordered:
+            raise ValueError("procedure_review_source_sequence_protocol_required")
         return out
     if layout.get("answer_sha256") != digest(answer) or "".join(
             b["text"] for b in layout["blocks"]) != answer:
@@ -330,10 +381,13 @@ def resolve_reply(parsed: dict, *, answer: str, layout: dict,
     mode = out.get("reply_mode")
     outcome = out.get("outcome")
     edits = out.get("edits")
-    if mode not in {"retain", "edit", "replace"} or type(edits) is not list:
+    modes = {"retain", "edit", "reject"} if source_ordered else {"retain", "edit", "replace"}
+    if mode not in modes or type(edits) is not list:
         raise ValueError("procedure_review_protocol_invalid")
     if outcome not in {"pass", "rewrite", "partial", "no_sources"}:
         raise ValueError("procedure_review_outcome_invalid")
+    if source_ordered and out.get("answer") != "":
+        raise ValueError("procedure_review_source_sequence_answer_not_empty")
     complete = outcome in {"pass", "rewrite"}
     if complete and mode != "replace":
         if any(out.get(k) for k in ("missing_facets", "missing_answer_types", "missing_list_items")):
@@ -345,7 +399,11 @@ def resolve_reply(parsed: dict, *, answer: str, layout: dict,
                 raise ValueError("procedure_review_coverage_shape_invalid")
             if not set(required).issubset(set(values)):
                 raise ValueError("procedure_review_coverage_not_complete")
-    if mode == "retain":
+    if mode == "reject":
+        if outcome not in {"partial", "no_sources"} or edits or out.get("answer") != "":
+            raise ValueError("procedure_review_reject_invalid")
+        reviewed = ""
+    elif mode == "retain":
         if outcome != "pass" or edits or out.get("answer") != "":
             raise ValueError("procedure_review_retain_invalid")
         reviewed = answer
@@ -372,8 +430,15 @@ def resolve_reply(parsed: dict, *, answer: str, layout: dict,
             raise ValueError("procedure_review_empty_success")
         if outcome == "pass" and reviewed != answer:
             raise ValueError("procedure_review_pass_changes_answer")
+    notes_preserved = bool(not source_ordered or not complete or _source_notes_preserved(
+        source_notes, layout=layout, reviewed=reviewed))
+    if not notes_preserved:
+        out.update(outcome="no_sources", reason="source_step_note_binding_incomplete")
+        reviewed = ""
     out["answer"] = reviewed
     out["procedure_review"] = {"version": VERSION, "reply_mode": mode,
         "input_answer_sha256": digest(answer), "output_answer_sha256": digest(reviewed),
-        "edited_blocks": len(edits), "independent_semantic_review": True}
+        "edited_blocks": len(edits), "independent_semantic_review": True,
+        "source_sequence_immutable": source_ordered,
+        "source_note_bindings_complete": notes_preserved if source_ordered else None}
     return out
