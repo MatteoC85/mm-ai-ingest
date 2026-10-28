@@ -32,7 +32,7 @@ class FamilyHarness:
                 {'facet':'cartridge installation','answer_type':'ordered_actions','must_cover':True,
                  'dense_queries':['insert cartridge and secure housing'],'lexical_queries':['cartridge installation'],'exact_terms':[]}]}
         self.provider_calls=[];self.sql_reads=[];self.expansions=[];self.finalize_calls=[]
-        self.forced_id=None;self.no_steps=False
+        self.forced_id=None;self.no_steps=False;self.parent_lookup=False
         self.rows=[];self.children={}
         for p in procedures:
             key='procedure:'+p['procedure_id']
@@ -77,9 +77,21 @@ class FamilyHarness:
         if self.no_steps:return []
         return list(self.children[key])
 
+    def parent_rows(self,**kwargs):
+        assert kwargs['company_id']==self.company and kwargs['machine_id']==self.machine
+        if not self.parent_lookup:return []
+        result=[]
+        for parent,children in self.children.items():
+            for child in children:
+                if child[0] not in kwargs['child_source_keys']:continue
+                parent_row=next(row for row in self.rows if row[0]==parent)
+                result.append({'child_source_key':child[0],'parent_source_key':parent,
+                    'ordinal':child[1],'machine_id':self.machine,'page_number':1,'parent_text':parent_row[3]})
+        return result
+
     def curate(self,**kwargs):
         expansion=replace(self.tasks.expansion,_db_fetch_related_step_pages=self.related,_db_conn=denied)
-        family=replace(self.tasks.family,_db_fetch_parent_procedure_pages_for_steps=lambda **kw:[],
+        family=replace(self.tasks.family,_db_fetch_parent_procedure_pages_for_steps=self.parent_rows,
             _v12_expand_primary_procedure_steps=lambda **kw:structured.v12_expand_primary_procedure_steps(**kw,runtime=expansion))
         curation=replace(self.tasks.curation,_v12_choose_primary_procedure_family=lambda **kw:
             procedure_families.v12_choose_primary_procedure_family(**kw,runtime=family))
@@ -195,6 +207,18 @@ class SemanticProcedureFamilyTests(unittest.TestCase):
         self.assertEqual(h.provider_calls,[])
         self.assertEqual(h.expansions,[])
 
+    def test_parent_recovered_from_seed_still_requires_review_and_boundary(self):
+        h=self.harness();h.parent_lookup=True
+        def generic_provider(messages,**kwargs):
+            h.provider_calls.append((messages,kwargs))
+            return {'answer_status':'no_sources','grounded_points':[]},'offline-model'
+        result=h.run(_ask_structured_direct_fetch_sources=lambda **kw:[],_v13_json_models=generic_provider)
+        self.assertEqual(h.expansions,['procedure:gamma'])
+        self.assertEqual(len(h.provider_calls),1)
+        self.assertTrue(result['_assistant_core_source_ordered_procedure'])
+        self.assertTrue(result['_assistant_core_force_semantic_verify'])
+        self.assertTrue(result['_assistant_core_procedure_family_review_required'])
+
     def test_post_selection_missing_bundle_cannot_trigger_a_second_provider(self):
         for changes in ({'_v12_curate_structured_sources':lambda **kw:[]},
                         {'_procedure_ui_model_to_text':lambda *a,**kw:''},
@@ -232,13 +256,20 @@ class SemanticProcedureFamilyTests(unittest.TestCase):
     def valid_review(self,kw):
         # Use the real source-ordered resolver: the mock supplies only a wire
         # verdict. Audit bindings are minted by the server, not the test model.
-        return procedure_review.resolve_reply({'outcome':'pass','answer':'','reply_mode':'retain','edits':[],
+        resolved=procedure_review.resolve_reply({'outcome':'pass','answer':'','reply_mode':'retain','edits':[],
             'covered_facets':['cartridge installation'],'missing_facets':[],
             'covered_answer_types':[self.m.REQ_ORDERED_ACTIONS],'missing_answer_types':[],
             'missing_list_items':[],'citation_ids':[c['citation_id']for c in kw['candidates']]},
             answer=kw['answer'],layout=procedure_review.block_layout(kw['answer']),
             required_facets=['cartridge installation'],required_types=[self.m.REQ_ORDERED_ACTIONS],
             source_ordered=True,source_notes=kw['repair_context']['procedure_notes'])
+        resolved['operation_boundary']={'complete':True,'checked_blocks':[
+            b['block_id']for b in procedure_review.block_layout(kw['answer'])['blocks']],
+            'changes':[],'precedence':[]}
+        return procedure_review.verify_operation_boundary(resolved,
+            layout=procedure_review.block_layout(kw['answer']),
+            source_texts={c['citation_id']:self.m._assistant_core_candidate_evidence_text(c)for c in kw['candidates']},
+            source_ordered=True)
 
     def test_simple_procedure_reviewer_receives_expanded_actual_draft_and_manifest(self):
         h=self.harness();result=h.run();calls=[];rows=result['_assistant_core_validation_evidence']
@@ -286,7 +317,7 @@ class SemanticProcedureFamilyTests(unittest.TestCase):
         self.assertEqual(contract['reason'],'procedure_family_semantic_review_incomplete')
 
     def test_required_review_audit_must_bind_resolved_answer_after_repair(self):
-        for broken in ('digest','coverage','audit_mode','unchanged'):
+        for broken in ('digest','coverage','audit_mode','boundary_missing','boundary_digest','unchanged'):
             with self.subTest(broken=broken):
                 h=self.harness();result=h.run();reviews=[]
                 def verify(**kw):reviews.append(deepcopy(kw));return self.valid_review(kw)
@@ -295,6 +326,8 @@ class SemanticProcedureFamilyTests(unittest.TestCase):
                 if broken=='digest':verified['procedure_review']['output_answer_sha256']='0'*64
                 if broken=='coverage':verified['covered_facets']=[]
                 if broken=='audit_mode':verified['procedure_review']['reply_mode']={}
+                if broken=='boundary_missing':verified.pop('operation_boundary_validation')
+                if broken=='boundary_digest':verified['operation_boundary_validation']['answer_sha256']='0'*64
                 result['_assistant_core_repair_attempted']=True
                 result['_assistant_core_semantic_verified']=verified
                 final=self.validate_bundle(h,result,denied)

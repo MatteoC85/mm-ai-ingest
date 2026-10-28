@@ -575,16 +575,18 @@ def structured_ask(
         # promises that visible ordinals reproduce the selected source Steps.
         **({"_assistant_core_source_ordered_procedure": True}
            if runtime.preserve_complete and procedure_sequence_mode and sectioned_answer else {}),
-        # A semantic family choice is not a verified operational answer. This
-        # server-owned obligation survives the one bounded repair and cannot be
-        # satisfied by deterministic layout/phrase checks if review is unavailable.
-        "_assistant_core_procedure_family_review_required": selected_parent is not None,
+        # A protected canonical bundle is not a verified operational answer,
+        # including when its parent was recovered from a related seed Step.
+        # This obligation survives repair; layout/phrase checks cannot satisfy it.
+        "_assistant_core_procedure_family_review_required": bool(selected_parent is not None
+            or (runtime.preserve_complete and procedure_sequence_mode and sectioned_answer)),
         # Sparse procedural checklists combine non-contiguous conditions. Their
         # semantic completeness cannot be judged reliably by phrase overlap alone,
         # so they also retain the existing bounded independent review. The new
         # semantic family path requires it even for a simple procedure question.
         "_assistant_core_force_semantic_verify": bool(
             selected_parent is not None
+            or (runtime.preserve_complete and procedure_sequence_mode and sectioned_answer)
             or (procedure_sequence_mode
                 and _v12_procedure_selection_mode(q, planner) == "sparse_ordered_steps")
         ),

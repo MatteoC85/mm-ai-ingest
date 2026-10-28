@@ -848,7 +848,14 @@ def validate_response(
                     # review of the actual canonical draft. A model choice, an
                     # unavailable/empty review or a lexical PASS cannot replace it.
                     audit = semantic_contract.get("procedure_review") or {}
+                    boundary = semantic_contract.get("operation_boundary_validation") or {}
                     complete_review = bool(complete_review
+                        and type(boundary) is dict
+                        and boundary.get("complete") is True
+                        and boundary.get("precedence_checked") is True
+                        and boundary.get("version") == "ask-operation-boundary-v1"
+                        and boundary.get("answer_sha256") == _procedure_review.digest(
+                            str(semantic_contract.get("answer") or "").strip())
                         and answer_contract_result.get("semantic_answer_bound") is True
                         and audit.get("version") == _procedure_review.VERSION
                         and type(audit.get("reply_mode")) is str

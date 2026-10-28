@@ -601,8 +601,7 @@ def verify_or_repair_answer(
     layout = _procedure_review.block_layout(answer) if compact_review else None
     source_ordered_review = bool(compact_review
         and (repair_context.get("procedure_structure") or {}).get("source_sequence_required") is True)
-    operation_boundary = bool(compact_review
-        and (repair_context.get("procedure_structure") or {}).get("source_sequence_required") is False)
+    operation_boundary = bool(compact_review)
     review_facets = list(dict.fromkeys(list(decision.required_facets) + [
         item.facet for item in decision.facet_queries if item.must_cover]))
     verifier_schema = _assistant_core_contract_verifier_schema()
@@ -613,6 +612,8 @@ def verify_or_repair_answer(
         system_msg += _procedure_review.PROTOCOL_INSTRUCTIONS
         if operation_boundary:
             system_msg += _procedure_review.OPERATION_BOUNDARY_INSTRUCTIONS
+            if source_ordered_review:
+                system_msg += _procedure_review.SOURCE_ORDERED_BOUNDARY_INSTRUCTIONS
         # Digests stay in the server-side binding/audit. The verifier needs the
         # source-to-number mapping, not hexadecimal hashes repeated as tokens.
         observation = repair_context["procedure_structure"]
@@ -702,7 +703,7 @@ def verify_or_repair_answer(
     if operation_boundary:
         out = _procedure_review.verify_operation_boundary(out, layout=layout,
             source_texts={str(c.get("citation_id") or "").strip(): _assistant_core_candidate_evidence_text(c)
-                          for c in ordered_candidates})
+                          for c in ordered_candidates}, source_ordered=source_ordered_review)
     if reviewed_draft is not None and "reviewed_draft_binding" in out:
         # The same existing redaction projection is applied exactly once. The
         # final validator must still bind this output to the grounded answer.

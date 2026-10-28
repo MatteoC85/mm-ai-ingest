@@ -210,12 +210,25 @@ def review_schema(legacy: dict, layout: dict, facets: list[str], types: list[str
                     "type": "object", "additionalProperties": False,
                     "properties": fields, "required": list(fields)}}},
             "required": ["complete", "checked_blocks", "changes"]}
+        if source_ordered:
+            # Compact source-backed partial-order edges, not copies of the draft
+            # or source body. IDs target the immutable resolved block layout.
+            edge_fields = {key: {"type": "string", "maxLength": 400} for key in
+                           ("before_answer_quote", "after_answer_quote", "source_quote")}
+            edge_fields.update(before_block_id={"type": "string", "enum": block_ids},
+                               after_block_id={"type": "string", "enum": block_ids},
+                               source_citation_id={"type": "string", "enum": list(dict.fromkeys(operation_source_ids))})
+            boundary = schema["properties"]["operation_boundary"]
+            boundary["properties"]["precedence"] = {"type": "array", "maxItems": 16,
+                "items": {"type": "object", "additionalProperties": False,
+                          "properties": edge_fields, "required": list(edge_fields)}}
+            boundary["required"].append("precedence")
         schema["required"].append("operation_boundary")
     return result
 
 
 OPERATION_BOUNDARY_INSTRUCTIONS = (
-    "\nOPERATION BOUNDARY CHECK (mandatory for this manual/mixed procedure): Check every PROCEDURE_BLOCK "
+    "\nOPERATION BOUNDARY CHECK (mandatory for this reviewed procedure): Check every PROCEDURE_BLOCK "
     "against the complete source operation, including its continuation beyond router facets. Return "
     "operation_boundary.checked_blocks containing every block_id once. For every temporary state change "
     "introduced by the answer (for example loosening, opening, releasing pressure, disabling, changing "
@@ -227,7 +240,7 @@ OPERATION_BOUNDARY_INSTRUCTIONS = (
     "a documented terminal hold may be stated in the same instruction. Use resolution=restored "
     "or documented_terminal_state only when supported. If a closing action is missing but documented, "
     "rewrite to include it now, including its prerequisites, before claiming completion/readiness. "
-    "Use replace if adding steps changes the block structure. If a necessary closing state is unknown, "
+    "For a manual/mixed draft only, use replace if adding steps changes the block structure. For a source-ordered draft preserve its immutable Step structure; if it cannot hold the required safe sequence, reject. If a necessary closing state is unknown, "
     "use unresolved, complete=false and outcome=no_sources. Complete=true requires every introduced "
     "temporary change resolved. Do not force unrelated operations into a segment. An empty changes list "
     "is correct only after checking every block and finding no introduced temporary state. "
@@ -238,13 +251,44 @@ OPERATION_BOUNDARY_INSTRUCTIONS = (
 )
 
 
+SOURCE_ORDERED_BOUNDARY_INSTRUCTIONS = (
+    "\nSOURCE-ORDERED OPERATION DEPENDENCIES: Review the resolved answer after your edits, not only the "
+    "original Step notes. For each operational action introduced or changed by an edit, include its "
+    "complete source-documented preparation, positioning, mode/energy conditions, locking/holding, "
+    "intermediate actions and terminal/restoration conditions. Never treat reduced speed as proof of "
+    "safety. A prior prerequisite does not survive an intervening action that changes that state: "
+    "re-establish it before the new operation when required by SOURCES. Restore required protective "
+    "conditions BEFORE each dependent movement/test, not only before the final automatic restart. "
+    "Return operation_boundary.precedence with compact edges for every source-required prerequisite "
+    "before its dependent action, and every restoration before its next dependent operation. The edge list "
+    "must also cover each operation_boundary.changes action-to-restoration relation using the same "
+    "quotes and original block_id. A documented unchanged terminal hold may be one instruction. Each edge "
+    "has before_block_id/after_block_id from PROCEDURE_BLOCKS, exact before_answer_quote and "
+    "after_answer_quote in those FINAL resolved blocks, and source_citation_id/source_quote proving "
+    "that dependency. Quotes must be non-empty and unique within the indicated block; choose short "
+    "distinctive spans, at most 400 characters, never duplicate full answers or sources. List at most "
+    "16 edges; if complete proof cannot fit, reject rather than omit an obligation. Every materially "
+    "edited block must participate in at least one proved edge. Preserve original source notes in "
+    "their own Step; an additional prerequisite may be stated earlier in that Step when required, "
+    "without moving or weakening the original note. Complete=true requires all dependencies audited; "
+    "an empty list is allowed only for an unchanged/typography-only draft with no necessary dependency. "
+    "Do not add a corrective intervention merely because a manual describes it beside a requested "
+    "check. If it is necessary to answer the request, include its complete documented subprocedure; "
+    "if that cannot be done faithfully in the admitted sequence, reject. When a requested path, route "
+    "or process has documented intermediate stages, identify each necessary intermediate stage and "
+    "its source-prescribed order. Generic component categories do not replace an explicit sequence; "
+    "never infer a route or an order absent from SOURCES."
+)
+
+
 def _quote_text(value: str) -> str:
     # Typography/line wrapping only; keep case, negations, numbers and units.
     return " ".join(value.translate(str.maketrans({"\u2018": "'", "\u2019": "'",
         "\u201c": '"', "\u201d": '"'})).split())
 
 
-def verify_operation_boundary(parsed: dict, *, layout: dict, source_texts: dict[str, str]) -> dict:
+def verify_operation_boundary(parsed: dict, *, layout: dict, source_texts: dict[str, str],
+                              source_ordered: bool = False) -> dict:
     """Validate a same-call semantic closure audit, never infer physical safety."""
     out = deepcopy(parsed)
     audit = out.get("operation_boundary")
@@ -278,15 +322,75 @@ def verify_operation_boundary(parsed: dict, *, layout: dict, source_texts: dict[
                 valid = False
                 reason = "operation_boundary_quote_or_order_invalid"
                 break
+    edge_sources = []
+    edge_count = None
+    if valid and source_ordered:
+        # This proves exact quoted spans and their declared order. It does not
+        # infer semantic completeness or machine state: that remains the same
+        # independent reviewer's obligation against all admitted sources.
+        edges = audit.get("precedence")
+        final_layout = block_layout(answer)
+        resolved_ids = [b["block_id"] for b in final_layout["blocks"]]
+        valid = (type(edges) is list and len(edges) <= 16 and resolved_ids == expected)
+        spans, position = {}, 0
+        for block in final_layout["blocks"]:
+            text = _quote_text(block["text"])
+            spans[block["block_id"]] = (position, text)
+            position += len(text) + 1
+        touched = set()
+        if valid:
+            for edge in edges:
+                keys = ("before_block_id", "after_block_id", "before_answer_quote",
+                        "after_answer_quote", "source_citation_id", "source_quote")
+                if (type(edge) is not dict or any(type(edge.get(k)) is not str or not edge[k].strip() for k in keys)
+                        or edge["before_block_id"] not in spans or edge["after_block_id"] not in spans
+                        or any(len(edge[k]) > 400 for k in ("before_answer_quote", "after_answer_quote", "source_quote"))):
+                    valid = False
+                    break
+                before_base, before_body = spans[edge["before_block_id"]]
+                after_base, after_body = spans[edge["after_block_id"]]
+                before = _quote_text(edge["before_answer_quote"])
+                after = _quote_text(edge["after_answer_quote"])
+                source = source_texts.get(edge["source_citation_id"])
+                if (source is None or _quote_text(edge["source_quote"]) not in _quote_text(source)
+                        or before_body.count(before) != 1 or after_body.count(after) != 1
+                        or before_base + before_body.find(before) + len(before) > after_base + after_body.find(after)):
+                    valid = False
+                    break
+                touched.update((edge["before_block_id"], edge["after_block_id"]))
+                edge_sources.append(edge["source_citation_id"])
+        if valid:
+            for change in audit["changes"]:
+                action, closure = _quote_text(change["action_quote"]), _quote_text(change["closing_answer_quote"])
+                original_block = spans.get(change["block_id"])
+                same_hold = bool(change["resolution"] == "documented_terminal_state"
+                    and action == closure and original_block is not None
+                    and original_block[1].count(action) == 1)
+                proved_edge = any(edge["before_block_id"] == change["block_id"]
+                    and _quote_text(edge["before_answer_quote"]) == action
+                    and _quote_text(edge["after_answer_quote"]) == closure for edge in edges)
+                if not (same_hold or proved_edge):
+                    valid = False
+                    break
+        if valid:
+            originals = {b["block_id"]: _quote_text(b["text"]) for b in layout["blocks"]}
+            changed = {bid for bid, (_, text) in spans.items() if text != originals[bid]}
+            valid = changed.issubset(touched)
+        if not valid:
+            reason = "operation_precedence_missing_ambiguous_or_invalid"
+        else:
+            edge_count = len(edges)
     out["operation_boundary_validation"] = {"version": "ask-operation-boundary-v1",
         "complete": bool(valid), "answer_sha256": digest(answer.strip()),
-        "checked_blocks": len(expected), "temporary_changes": len(audit["changes"]) if valid else None}
+        "checked_blocks": len(expected), "temporary_changes": len(audit["changes"]) if valid else None,
+        **({"precedence_checked": bool(valid), "precedence_edges": edge_count}
+           if source_ordered else {})}
     if valid:
         # The reviewer explicitly cited these admitted records in its closure
         # audit. Carry those same references through normal allowed-citation
         # reconstruction; do not require it to repeat the IDs in a second list.
         out["citation_ids"] = list(dict.fromkeys(list(out.get("citation_ids") or []) + [
-            change["closing_source_citation_id"] for change in audit["changes"]]))
+            change["closing_source_citation_id"] for change in audit["changes"]] + edge_sources))
     if not valid and out.get("outcome") in {"pass", "rewrite"}:
         out["outcome"] = "no_sources"
         out["reason"] = reason

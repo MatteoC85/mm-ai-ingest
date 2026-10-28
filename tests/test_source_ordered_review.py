@@ -126,7 +126,9 @@ class WiredSourceOrderedReviewTests(unittest.TestCase):
                 'reason':'source insufficient' if reject else 'body reviewed','citation_ids':[r['citation_id'] for r in rows],
                 'covered_facets':['sequence','safety'],'missing_facets':['safety'] if reject else [],
                 'covered_answer_types':[m.REQ_ORDERED_ACTIONS,m.REQ_SAFETY_CONDITIONS],
-                'missing_answer_types':[],'expected_list_items':[],'covered_list_items':[],'missing_list_items':[]}
+                'missing_answer_types':[],'expected_list_items':[],'covered_list_items':[],'missing_list_items':[],
+                'operation_boundary':{'complete':not reject,'checked_blocks':['step_1','step_2','step_3'],
+                    'changes':[],'precedence':[]}}
             if note_mutation == 'delete':
                 result['edits'][1]['text']=actions[1]
             elif note_mutation == 'swap':
@@ -163,9 +165,12 @@ class WiredSourceOrderedReviewTests(unittest.TestCase):
         props=calls[0][1]['json_schema']['schema']['properties']
         self.assertEqual(props['reply_mode']['enum'],['retain','edit','reject'])
         self.assertEqual(props['answer']['enum'],[''])
+        self.assertIn('precedence',props['operation_boundary']['required'])
+        self.assertEqual(calls[0][1]['max_output_tokens'],3200)
         contract=result['meta']['assistant_core_validation']['answer_contract']
         self.assertTrue(contract['passed'])
         self.assertTrue(contract['complete'])
+        self.assertTrue(contract['semantic_verifier']['operation_boundary_validation']['precedence_checked'])
         self.assertTrue(contract['procedure_structure']['sequence_complete'])
         self.assertTrue(contract['procedure_structure']['source_notes_present'])
         self.assertEqual(contract['procedure_structure']['visible_numbers'],[2,7,11])
