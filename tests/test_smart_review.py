@@ -63,13 +63,20 @@ def parsed_review(prepared, *, rejected=(1,), reject_question=False):
 
 
 def wire_review(parsed):
-    """Test-only inverse, with no evidence synthesis or defaults."""
+    """Test-only inverse: every proof/check edge is explicitly represented."""
     kinds = {'documented_mechanism': 'm', 'bounded_inference': 'i', 'documented_check': 'c'}
     applicability = {'same_target': 's', 'documented_dependency': 'd'}
-    return {'decisions': [{'p': d['proposal_index'], 'r': d['reason'], 'b': d['blocking_checks'], 'n': d['note'],
-        'e': [{'c': p['check_indices'], 'v': {'s': p['source_index'], 'k': kinds[p['support_type']], 'o': p['observation_units'],
-               'u': p['source_units'], 't': p['target_units'], 'a': applicability[p['applicability']],
-               }} for p in d['proofs']]} for d in parsed['decisions']]}
+    decisions = []
+    for d in parsed['decisions']:
+        coverage = {}
+        for index, proof in enumerate(d['proofs']):
+            for check in proof['check_indices']:
+                coverage.setdefault(str(check), []).append(index)
+        decisions.append({'p': d['proposal_index'], 'r': d['reason'], 'b': d['blocking_checks'], 'n': d['note'],
+            'e': [{'s': p['source_index'], 'k': kinds[p['support_type']], 'o': p['observation_units'],
+                   'u': p['source_units'], 't': p['target_units'], 'a': applicability[p['applicability']]}
+                  for p in d['proofs']], 'c': coverage})
+    return {'decisions': decisions}
 
 
 class SmartReviewTests(unittest.TestCase):
@@ -528,18 +535,18 @@ class SmartReviewTests(unittest.TestCase):
         wire = wire_review(parsed_review(self.prepared))
         for mutate in (lambda w: w.update(extra=True),
                        lambda w: w['decisions'][0].pop('n'),
-                       lambda w: w['decisions'][0]['e'][0]['v'].update(k='unknown')):
+                       lambda w: w['decisions'][0]['e'][0].update(k='unknown')):
             bad = copy.deepcopy(wire)
             mutate(bad)
             with self.assertRaises(review.SmartReviewError):
                 review.decode_wire(bad)
         for mutate in (lambda w: w['decisions'][0].update(p=True),
                        lambda w: w['decisions'][0].update(p=99),
-                       lambda w: w['decisions'][0]['e'][0]['v'].update(s=True),
-                       lambda w: w['decisions'][0]['e'][0]['v'].update(u=[999]),
-                       lambda w: w['decisions'][0]['e'][0]['v'].update(u=self.prepared['references']['frozen']['source_sets'][1]),
-                       lambda w: w['decisions'][0]['e'][0].update(c=[4]),
-                       lambda w: w['decisions'][0]['e'][0].update(c=[0, 0]),
+                       lambda w: w['decisions'][0]['e'][0].update(s=True),
+                       lambda w: w['decisions'][0]['e'][0].update(u=[999]),
+                       lambda w: w['decisions'][0]['e'][0].update(u=self.prepared['references']['frozen']['source_sets'][1]),
+                       lambda w: w['decisions'][0]['c'].update({'4':[0]}),
+                       lambda w: w['decisions'][0]['c'].update({'0':[0,0]}),
                        lambda w: w['decisions'].__setitem__(1, copy.deepcopy(w['decisions'][0]))):
             bad = copy.deepcopy(wire)
             mutate(bad)
@@ -551,7 +558,67 @@ class SmartReviewTests(unittest.TestCase):
         self.assertEqual(branches[0]['properties']['u']['items']['enum'],
                          self.prepared['references']['frozen']['source_sets'][0])
         decisions = shape['properties']['decisions']['items']['anyOf']
-        self.assertEqual(decisions[0]['properties']['e']['items']['properties']['c']['items']['enum'], [0])
+        self.assertEqual(decisions[0]['properties']['c']['required'], ['0'])
+        self.assertEqual(decisions[0]['properties']['c']['properties']['0']['minItems'], 1)
+        self.assertEqual(decisions[1]['properties']['c']['properties'], {})
+
+    def test_wire_v2_requires_each_question_check_in_provider_schema(self):
+        parsed = parsed_review(self.prepared, rejected=())
+        wire = wire_review(parsed)
+        schema = review.wire_schema(self.prepared)['schema']
+        question_schema = next(branch for branch in schema['properties']['decisions']['items']['anyOf']
+            if branch['properties']['p']['enum'] == [self.prepared['question_index']]
+            and branch['properties']['r']['enum'] == ['supported'])['properties']['c']
+        self.assertFalse(question_schema['additionalProperties'])
+        self.assertEqual(set(question_schema['required']), {'0', '1', '2'})
+        self.assertTrue(all(prop['minItems'] == 1 for prop in question_schema['properties'].values()))
+        question = wire['decisions'][-1]
+        self.assertEqual(set(question['c']), {'0', '1', '2'})
+        for omitted in ('0', '1', '2'):
+            bad = copy.deepcopy(wire)
+            bad['decisions'][-1]['c'].pop(omitted)
+            with self.subTest(omitted=omitted):
+                self.assertEqual(set(question_schema['required']) - set(bad['decisions'][-1]['c']), {omitted})
+        # Removing the final key could leave a contiguous map, but the unchanged
+        # canonical validator still refuses to infer its missing source support.
+        bad = copy.deepcopy(wire)
+        bad['decisions'][-1]['c'].pop('2')
+        with self.assertRaisesRegex(refs.ReferenceError, 'not_all_checks_supported'):
+            review.resolve(prepared=self.prepared, parsed=review.decode_wire(bad), probability_band=self.band)
+
+    def test_wire_v2_rejects_missing_duplicate_bool_and_foreign_proof_edges(self):
+        wire = wire_review(parsed_review(self.prepared))
+        for links in ([], [True], [-1], [1], [0, 0], '0', None):
+            bad = copy.deepcopy(wire)
+            bad['decisions'][0]['c']['0'] = links
+            with self.subTest(links=links), self.assertRaises(review.SmartReviewError):
+                review.decode_wire(bad)
+        for key in ('01', '-1', '999', 0):
+            bad = copy.deepcopy(wire)
+            bad['decisions'][0]['c'] = {key:[0]}
+            with self.subTest(key=key), self.assertRaises(review.SmartReviewError):
+                review.decode_wire(bad)
+        bad = copy.deepcopy(wire)
+        bad['decisions'][1]['c'] = {'0':[0]}  # A rejection cannot retain evidence.
+        with self.assertRaises(review.SmartReviewError): review.decode_wire(bad)
+
+    def test_wire_v2_preserves_unassigned_causal_proof_but_not_unassigned_check(self):
+        parsed = parsed_review(self.prepared)
+        causal = parsed['decisions'][0]['proofs'][0]
+        check = copy.deepcopy(causal)
+        check.update(supports_cause=False, support_type='documented_check', observation_units=[])
+        causal['check_indices'] = []
+        parsed['decisions'][0]['proofs'].append(check)
+        wire = wire_review(parsed)
+        self.assertEqual(wire['decisions'][0]['c'], {'0':[1]})
+        decoded = review.decode_wire(wire)
+        self.assertEqual(decoded,parsed)
+        review.resolve(prepared=self.prepared, parsed=decoded, probability_band=self.band)
+        # Every check-only proof still needs a check. An explicit coverage map
+        # cannot launder an unused proof, foreign unit or cause applicability.
+        wire['decisions'][0]['e'].append(copy.deepcopy(wire['decisions'][0]['e'][1]))
+        with self.assertRaisesRegex(refs.ReferenceError, 'invalid_check_proof'):
+            review.resolve(prepared=self.prepared, parsed=review.decode_wire(wire), probability_band=self.band)
 
     def test_eight_source_wire_reduces_schema_and_output_without_dropping_material(self):
         sources = []
@@ -568,7 +635,9 @@ class SmartReviewTests(unittest.TestCase):
         old_schema = refs.schema(prepared['references']['frozen'])
         new_schema = review.wire_schema(prepared)
         parsed = parsed_review(prepared, rejected=())
-        self.assertLess(len(refs.canonical(new_schema)), len(refs.canonical(old_schema)) * .5)
+        # Explicit mandatory maps cost schema bytes; source definitions remain
+        # shared and the v2 schema stays smaller than the descriptive contract.
+        self.assertLess(len(refs.canonical(new_schema)), len(refs.canonical(old_schema)) * .65)
         self.assertLess(len(refs.canonical(wire_review(parsed))), len(refs.canonical(parsed)) * .6)
         self.assertEqual(review.decode_wire(wire_review(parsed)), parsed)
         self.assertEqual(len(packet['validator_records']), 8)

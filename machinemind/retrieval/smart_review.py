@@ -13,7 +13,7 @@ from . import review_references as refs, smart_continuity as continuity
 POLICY_VERSION = 'smart-reviewed-proposals-v5'
 MAX_CHECK_CHARS = 2000
 MAX_SOURCE_SAFETY_NOTE_CHARS = 900
-WIRE_VERSION = 'smart-review-wire-v1'
+WIRE_VERSION = 'smart-review-wire-v2'
 INPUT_VERSION = 'smart-review-table-input-v1'
 RESERVED_REVIEW_SECONDS = 30
 MAX_REVIEW_SECONDS = 45
@@ -33,16 +33,23 @@ SAFETY_POLICY_TEXT = {
 # validator continue to use the complete, descriptive reference contract.
 WIRE_INSTRUCTION = """
 WIRE FORMAT:
-Return {"decisions":[...]}. Each decision is {p,r,b,n,e}:
+Return {"decisions":[...]}. Each decision is {p,r,b,n,e,c}:
 p=proposal_index; r=reason (supported means accept, every other reason reject);
-b=blocking_checks; n=note; e=proofs. For supported: b=[], n="".
-Each proof is {c,v}: c=check_indices, v={s,k,o,u,t,a}. Within v: s=source_index;
+b=blocking_checks; n=note; e=proofs; c=explicit check-to-proof coverage.
+For supported: b=[], n="", e has at least one proof. c must contain EVERY check
+index from that proposal as a string key ("0", "1", ...); each value is a nonempty
+list of zero-based indices into THIS decision's e array. Name only proofs that
+actually support that complete check. If any check cannot be supported, reject
+this entire proposal; do not claim coverage to satisfy the shape.
+For rejection: e=[], c={}, n gives the reason; b localizes unsupported checks.
+Each proof is {s,k,o,u,t,a}: s=source_index;
 k=support_type with m=documented_mechanism, i=bounded_inference, c=documented_check;
 o=observation_units; u=source_units; t=target_units;
 a=applicability with s=same_target, d=documented_dependency.
 k=m/i explicitly asserts supports_cause=true; k=c asserts false.
 AUTHORIZATION rows are [source_index, source_units, target_units]; check rows are
 [proposal_index, check_indices]. All IDs keep their exact original meaning.
+A causal proof can have no check assignment; every check-only proof must be used.
 One proof may cover several checks only when its source actually supports each.
 Do not repeat equivalent proofs. Do not return rewritten claims or copied quotes.
 """.strip()
@@ -114,7 +121,7 @@ observations, not unknown information or statements from historical cases.
 
 Proofs: every accepted cause needs at least one causal proof. Causal k=m/i
 requires nonempty observation IDs and supports mechanism AND
-explanation. Check-only k=c requires o=[] and nonempty c. Every check needs source
+explanation. Check-only k=c requires o=[] and assignment to at least one check. Every check needs source
 support with applicable target context; checks may be supported while a cause is
 not. Use the necessary units, including multiple units for non-contiguous support.
 Reject the whole proposal if any required check/prerequisite is unsupported or
@@ -395,10 +402,11 @@ def compact_source_table(packet):
 
 
 def wire_schema(prepared):
-    """Share source-scoped proof branches across ALL proposal/check counts.
+    """Require an explicit proof assignment for every accepted proposal check.
 
-    A small proposal-local wrapper owns check indices. Source/target ownership
-    and local checks both remain constrained in the provider schema itself.
+    This is a wire constraint, not entailment. Source-scoped proof branches and
+    the unchanged canonical validator still decide structural validity; only the
+    independent reviewer can judge whether a cited source supports each check.
     """
     authorized = refs.authorized_references(prepared['references']['frozen'])
     obj = lambda props: dict(type='object', additionalProperties=False, properties=props, required=list(props))
@@ -417,42 +425,67 @@ def wire_schema(prepared):
         }))
     decisions = []
     for proposal in authorized['proposals']:
-        decisions.append(obj({
-            'p': dict(type='integer', enum=[proposal['proposal_index']]),
-            'r': dict(type='string', enum=list(refs.REASONS)),
-            'b': ids(proposal['check_indices'], refs.MAX_CHECKS),
-            'n': dict(type='string', maxLength=220),
-            'e': dict(type='array', maxItems=refs.MAX_PROOFS, items=obj({
-                'c': ids(proposal['check_indices'], refs.MAX_CHECKS), 'v': {'$ref': '#/$defs/proof'}})),
+        check_map = obj({str(index): dict(type='array', minItems=1, maxItems=refs.MAX_PROOFS,
+            items=dict(type='integer', minimum=0, maximum=refs.MAX_PROOFS - 1))
+            for index in proposal['check_indices']})
+        common = {'p': dict(type='integer', enum=[proposal['proposal_index']])}
+        decisions.append(obj({**common,
+            'r': dict(type='string', enum=['supported']),
+            'b': ids([], 0), 'n': dict(type='string', enum=['']),
+            'e': dict(type='array', minItems=1, maxItems=refs.MAX_PROOFS, items={'$ref':'#/$defs/proof'}),
+            'c': check_map,
         }))
-    shape = obj({'decisions': dict(type='array', minItems=len(decisions), maxItems=len(decisions),
+        decisions.append(obj({**common,
+            'r': dict(type='string', enum=[r for r in refs.REASONS if r != 'supported']),
+            'b': ids(proposal['check_indices'], refs.MAX_CHECKS),
+            'n': dict(type='string', minLength=1, maxLength=220),
+            'e': dict(type='array', maxItems=0, items={'$ref':'#/$defs/proof'}),
+            'c': obj({}),
+        }))
+    count = len(authorized['proposals'])
+    shape = obj({'decisions': dict(type='array', minItems=count, maxItems=count,
                                   items={'anyOf': decisions})})
     shape['$defs'] = {'proof': {'anyOf': proofs}}
-    return dict(name='machinemind_smart_review_wire_v1', strict=True, schema=shape)
+    return dict(name='machinemind_smart_review_wire_v2', strict=True, schema=shape)
 
 
 def decode_wire(parsed):
-    """Strict, lossless expansion; never fill in missing evidence or decisions."""
+    """Expand only the model's explicit links; never infer a missing proof.
+
+    Exact proposal/check/source coverage is revalidated against the frozen input
+    by refs.validate. The wire map cannot create a source, claim or permission.
+    """
     require(isinstance(parsed, dict) and set(parsed) == {'decisions'}, 'wire_envelope')
     require(isinstance(parsed['decisions'], list), 'wire_decisions')
     result = []
     kinds = {'m': 'documented_mechanism', 'i': 'bounded_inference', 'c': 'documented_check'}
     applicability = {'s': 'same_target', 'd': 'documented_dependency'}
     for decision in parsed['decisions']:
-        require(isinstance(decision, dict) and set(decision) == {'p', 'r', 'b', 'n', 'e'}, 'wire_decision_keys')
+        require(isinstance(decision, dict) and set(decision) == {'p', 'r', 'b', 'n', 'e', 'c'}, 'wire_decision_keys')
         require(isinstance(decision['r'], str) and decision['r'] in refs.REASONS, 'wire_reason')
-        require(isinstance(decision['e'], list), 'wire_proofs')
+        require(isinstance(decision['e'], list) and len(decision['e']) <= refs.MAX_PROOFS, 'wire_proofs')
+        coverage = decision['c']
+        require(type(coverage) is dict and len(coverage) <= refs.MAX_CHECKS, 'wire_check_coverage')
+        require(set(coverage) == {str(i) for i in range(len(coverage))}, 'wire_check_coverage_keys')
+        if decision['r'] != 'supported':
+            require(not coverage and not decision['e'], 'wire_rejection_proofs')
+        assignments = [[] for _ in decision['e']]
+        for check_index in range(len(coverage)):
+            links = coverage[str(check_index)]
+            require(type(links) is list and 1 <= len(links) <= refs.MAX_PROOFS, 'wire_check_proof_missing')
+            require(all(type(i) is int and 0 <= i < len(assignments) for i in links), 'wire_check_proof_index')
+            require(len(set(links)) == len(links), 'wire_check_proof_duplicate')
+            for proof_index in links:
+                assignments[proof_index].append(check_index)
         proofs = []
-        for wrapped in decision['e']:
-            require(isinstance(wrapped, dict) and set(wrapped) == {'c', 'v'}, 'wire_check_proof_keys')
-            proof = wrapped['v']
+        for proof_index, proof in enumerate(decision['e']):
             require(isinstance(proof, dict) and set(proof) == {'s', 'k', 'o', 'u', 't', 'a'}, 'wire_proof_keys')
             require(isinstance(proof['k'], str) and proof['k'] in kinds, 'wire_support_type')
             require(isinstance(proof['a'], str) and proof['a'] in applicability, 'wire_applicability')
             proofs.append({'source_index': proof['s'], 'supports_cause': proof['k'] != 'c',
                            'support_type': kinds[proof['k']], 'observation_units': deepcopy(proof['o']),
                            'source_units': deepcopy(proof['u']), 'target_units': deepcopy(proof['t']),
-                           'applicability': applicability[proof['a']], 'check_indices': deepcopy(wrapped['c'])})
+                           'applicability': applicability[proof['a']], 'check_indices': assignments[proof_index]})
         result.append({'proposal_index': decision['p'], 'verdict': 'accept' if decision['r'] == 'supported' else 'reject',
                        'reason': decision['r'], 'blocking_checks': deepcopy(decision['b']),
                        'note': decision['n'], 'proofs': proofs})
