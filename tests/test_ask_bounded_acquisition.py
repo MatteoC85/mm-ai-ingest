@@ -18,7 +18,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from assistant_core_v2 import AssistantCoreDecision, AssistantCoreFacetQuery, AssistantCoreHooks, AssistantCoreRequest, AssistantCoreV2
-from machinemind.ask import execution, request_binding, request_completion
+from machinemind.ask import core_intake, execution, request_binding, request_completion
 from machinemind.retrieval import evidence_orchestration as orchestration
 
 
@@ -223,10 +223,52 @@ class AskBoundedAcquisitionTests(unittest.TestCase):
                     self.assertEqual(trace.completed[0], "complete")
                     self.assertTrue(trace.bonus_done)
                     self.assertTrue(result["candidates"])
+                    # None of these synthetic source passages supports a facet.
+                    # They stay available, without one derived view per non-hit.
+                    self.assertEqual(len(result["candidates"]), len(rows))
+                    self.assertEqual(trace._live_outer_records, {})
+                    self.assertTrue(all(not row["assistant_core_facet_hits"] for row in result["candidates"]))
                     for row in result["candidates"]:
                         origins = trace.entry(row)[2]
                         self.assertTrue(origins)
                         self.assertTrue(all(origin in trace.roots for origin in origins))
+
+    def test_real_intake_rebinding_preserves_synthesis_and_deadline_observers(self):
+        request, _, _ = self.fixture()
+        hooks = AssistantCoreHooks(retrieve_neutral=denied, route_semantically=denied,
+            prepare_evidence=denied, synthesize_ask=denied, synthesize_root_cause=denied,
+            synthesize_general=denied, build_no_evidence=denied, build_clarification=denied,
+            build_out_of_scope=denied, build_safety_refusal=denied)
+        check = lambda: None
+        runtimes = request_binding.AskRuntimeFactories(
+            execution=self.m._assistant_core_ask_execution_runtime,
+            validation=self.m._assistant_core_ask_validation_runtime,
+            check=check, synthesis=request_completion.synthesize_observed)
+        intake = core_intake._CoreIntake.__new__(core_intake._CoreIntake)
+        intake.used, intake.active, intake.request = False, False, request
+        intake.core, intake.runtimes, intake.generation = AssistantCoreV2(hooks), runtimes, object()
+        intake.session, intake.consumers, intake._response_flow = object(), False, None
+        intake._task_input, intake._task_used = {}, set()
+        intake._check = lambda req: None
+        intake.authorize = lambda req: frozenset()
+        intake.owner_invoke = lambda fn, req: fn()
+        captured = []
+        def bound_run(req, *, core, runtimes, evidence, acquisition):
+            captured.append(runtimes)
+            runtimes.synthesis(lambda: request_completion.provider_timeout('ask_structured_synthesis', 60), lambda: True)
+            return {'ok': True}
+        owner = request_completion.RequestCompletion(runtime=self.m._assistant_core_request_flow_runtime(),
+            payload=SimpleNamespace(company_id=request.company_id), started=time.monotonic())
+        try:
+            with patch.object(core_intake, 'AskRequestEvidence', lambda **kw: SimpleNamespace(**kw)), \
+                 patch.object(core_intake, 'run_core_request', bound_run):
+                self.assertEqual(intake.run(request), {'ok': True})
+            self.assertIs(captured[0].check, check)
+            self.assertIs(captured[0].synthesis, runtimes.synthesis)
+            self.assertEqual(owner.provider_schedules[0]['review_reserve_seconds'], 10.5)
+            self.assertFalse(intake.active)
+        finally:
+            owner.close()
 
     def test_protected_binding_reserves_review_even_when_initial_procedure_policy_says_false(self):
         m = self.m

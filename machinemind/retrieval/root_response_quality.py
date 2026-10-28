@@ -13,18 +13,46 @@ from . import review_references
 POLICY_VERSION = "root-response-quality-v2"
 
 SYNTHESIS_INSTRUCTION = """
-A root-cause answer is a diagnostic decision aid, not a repair procedure. For each
-hypothesis, explain the documented mechanism, the reported observation it could
-explain, and what remains unverified. Unknown checks must never become observed
-facts. Prefer one or two high-information, independently understandable checks;
+A root-cause answer is a diagnostic decision aid, not a repair procedure.
+Before choosing hypotheses, compare the COMPLETE abnormal observation against the
+conditional consequences documented in EVERY source. Distinguish a source that
+explicitly says a particular condition produces the observed combination of
+behaviors from a source that merely describes normal operation or a routine setup
+check. Prioritize the former when the condition is possible and not ruled out.
+A component that moves normally while its intended downstream effect is absent
+is discriminating evidence: preserve both observations when comparing mechanisms.
+Use this general comparison for any subsystem; do not substitute keyword overlap,
+retrieval rank or a generic operating sequence for the documented causal link.
+
+An unknown enabling condition does NOT disqualify a documented mechanism: state
+it as a conditional hypothesis and explicitly say that condition is unverified.
+Do not turn unknown information into a positive or negative finding. Preserve
+distinct supported mechanisms that can explain the observations; do not collapse
+one into a different mechanism simply because both concern the same subsystem.
+A broad sequence/configuration hypothesis must not crowd out an explicit failure
+mechanism with a closer documented consequence. Return only supported causes,
+within the existing cause limit; do not fill slots with weaker unrelated cases.
+
+For each hypothesis, explain the documented mechanism, the reported observation
+it could explain, and what remains unverified. Prefer one or two high-information,
+independently understandable checks;
 the check limit is a ceiling, not a quota. Each check must discriminate this
 hypothesis using an observable state or relationship actually documented in its
 cited source. State what result would support or weaken the hypothesis when that
 relationship is documented. Do not append a generic corrective-action checklist.
 
-Start with information already available and non-invasive observations. Do not
-prescribe a reset, restoration, adjustment, replacement, bypass, disassembly or
-new machine cycle merely because a source describes a possible fault or repair.
+Start by asking for relevant observations, recorded states or readings ALREADY
+available. When the user expressly says a discriminating condition has not been
+checked, acknowledge that it remains unknown; if helpful, ask whether an existing
+observation or record can resolve it, without asking for a new cycle, reach into
+the machine, touch test or physical intervention. Say that it can remain unknown
+when no such observation is available. A retrospective question must concern the
+specific source-documented condition, not an invented measurement or reference.
+It is not necessary to produce an executable test for every hypothesis: checks=[]
+is preferable to an operation whose prerequisites cannot be established.
+
+Do not prescribe a reset, restoration, adjustment, replacement, bypass, disassembly
+or new machine cycle merely because a source describes a possible fault or repair.
 If a physical action or powered observation is genuinely necessary, include all
 applicable source-documented operating mode, personnel, protective and isolation
 conditions in that same check; do not move prerequisites to another check or a
@@ -50,8 +78,12 @@ ranked_proposal_indices: every accepted original proposal_index exactly once, in
 descending diagnostic priority; use [] when none was accepted. Exclude all
 rejected proposals. Rank by how well each documented mechanism explains the
 actual observations, discriminating facts and recent changes, not by retrieval
-order or general frequency. Preserve uncertainty and the original immutable
-wording. If a proposal's explanation asserts a comparative priority incompatible
+order or general frequency. Give priority to an explicit source-documented
+conditional consequence matching the abnormal combination of observations over a
+general normal-operation sequence, unless the condition is contradicted. An
+unverified condition remains unknown and may support a qualified hypothesis; it
+must not be treated as an observed fact or as automatically excluded. Preserve
+uncertainty and the original immutable wording. If a proposal's explanation asserts a comparative priority incompatible
 with the resulting order, reject that inconsistent proposal rather than silently
 rewriting its explanation. Ranking never grants permission to accept an unsafe
 check or to remove a prerequisite needed by a retained action.
@@ -80,6 +112,14 @@ selected_check_indices=[], safe_check_subset=false and proofs=[]; normal rejecti
 rules apply. For acceptance, provide proofs for EVERY retained check, using its
 ORIGINAL check index. No proof may cover a discarded check. A cause without
 causal proof must be rejected even if one of its checks is generally sensible.
+A retrospective clarification can be supported by the source's documented
+condition/consequence even if that source does not phrase it as a question: it
+must ask only for an already available observation of that specific condition,
+without inventing a reading, interface or method, or requiring a new operation.
+Do not accept a powered observation merely because it is in manual mode or at low
+speed: any applicable personnel, protection and operating prerequisites must be
+explicit and supported. Otherwise omit that action and retain a supported causal
+hypothesis without checks when justified; never invent missing prerequisites.
 """.strip()
 
 

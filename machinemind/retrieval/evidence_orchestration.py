@@ -747,6 +747,9 @@ def assistant_core_refine_retrieval(request: AssistantCoreRequest, retrieval: di
             print("ASSISTANT_CORE_ASK_FACET_BATCH_FAIL", type(exc).__name__)
         shared_facet_candidates = _assistant_core_merge_facet_candidates([
             shared_facet_candidates, list(retrieval.get("candidates") or [])])
+        # Keep the complete shared pool once, including unsupported candidates.
+        # Per-facet derived views below add only independently supported hits.
+        candidate_lists = [shared_facet_candidates]
     if facet_queries:
         for index, facet_query in enumerate(facet_queries, start=1):
             if not is_ask and budget is not None and budget.remaining() < 13.0:
@@ -803,10 +806,10 @@ def assistant_core_refine_retrieval(request: AssistantCoreRequest, retrieval: di
                 annotated: list[dict] = []
                 for rank, raw in enumerate(current_candidates, start=1):
                     c = dict(raw)
-                    if lineage is not None:
+                    if lineage is not None and not is_ask:
                         lineage("annotation_before", raw, c)
                     support = _assistant_core_facet_candidate_confidence(
-                        candidate=c,
+                        candidate=raw if is_ask else c,
                         facet=facet,
                         answer_type=facet_query.answer_type,
                         dense_queries=dense,
@@ -828,6 +831,13 @@ def assistant_core_refine_retrieval(request: AssistantCoreRequest, retrieval: di
                         support = {**support, "shared_batch_contextual": contextual,
                                    "credible": bool(support.get("credible")) and contextual}
                     credible_hit = bool(support.get("credible"))
+                    if is_ask and not credible_hit:
+                        # A failed facet assessment adds no evidence annotation.
+                        # Its source remains in the shared pool; do not serialize
+                        # a full duplicate vector/text witness for a non-hit.
+                        continue
+                    if lineage is not None and is_ask:
+                        lineage("annotation_before", raw, c)
                     facet_score = float(support.get("score") or 0.0)
                     c["assistant_core_facet_hits"] = [facet] if credible_hit else []
                     c["assistant_core_facet_answer_types"] = [facet_query.answer_type] if credible_hit else []
@@ -850,7 +860,7 @@ def assistant_core_refine_retrieval(request: AssistantCoreRequest, retrieval: di
                         "dense_queries": list(dense),
                         "lexical_queries": list(lexical),
                         "exact_terms": list(exact),
-                        "candidate_count": len(annotated),
+                        "candidate_count": len(current_candidates) if is_ask else len(annotated),
                         "credible_candidate_count": sum(1 for c in annotated if c.get("assistant_core_facet_hits")),
                         "status": "completed",
                         **({"acquisition": "shared_ask_batch",

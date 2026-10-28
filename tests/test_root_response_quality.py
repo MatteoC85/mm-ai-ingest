@@ -308,5 +308,34 @@ class RootReviewMainIntegrationTests(unittest.TestCase):
         self.assertEqual(len(self.calls), 1)
         self.assertIn('invalid_check_selection_indices', out['meta']['root_review_execution']['validation_error'])
 
+    def test_real_root_stage_preserves_supported_hypothesis_without_executable_checks(self):
+        decision = self.parsed['decisions'][0]
+        decision.update(selected_check_indices=[], blocking_checks=[0, 1, 2],
+            note='Only mechanism supported; no independently safe operation established.')
+        decision['proofs'][0]['check_indices'] = []
+        self.parsed['ranked_proposal_indices'] = [0, 1]
+        out = self.run_response()
+        self.assertTrue(out['ok'])
+        self.assertEqual(out['possible_causes'][0]['cause'], self.draft['possible_causes'][0]['cause'])
+        self.assertEqual(out['possible_causes'][0]['why'], self.draft['possible_causes'][0]['why'])
+        self.assertEqual(out['possible_causes'][0]['checks'], [])
+        self.assertTrue(out['possible_causes'][0]['citations'])
+        self.assertEqual(out['recommended_next_checks'], self.draft['possible_causes'][1]['checks'])
+        self.assertEqual(len(self.calls), 1)
+
+    def test_retrospective_unknown_question_is_preserved_without_synthesized_action(self):
+        clarification = ('If a pressure reading is already recorded, what was it? '
+                         'Otherwise leave the pressure unknown; do not start a new cycle to obtain it.')
+        self.draft['possible_causes'][0]['checks'] = [clarification]
+        decision = self.parsed['decisions'][0]
+        decision.update(selected_check_indices=[0], blocking_checks=[], note='')
+        decision['proofs'][0]['check_indices'] = [0]
+        out = self.run_response()
+        self.assertTrue(out['ok'])
+        self.assertEqual(out['possible_causes'][0]['checks'], [clarification])
+        self.assertEqual(out['possible_causes'][0]['why'], self.draft['possible_causes'][0]['why'])
+        self.assertIn('pressure is unknown', out['possible_causes'][0]['why'])
+        self.assertEqual(len(self.calls), 1)
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

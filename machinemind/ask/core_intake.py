@@ -571,8 +571,8 @@ class _CoreIntake:
                     finalize=self._finalize_core if self.consumers else None)
                 return run_core_request(request, core=local_core,
                     runtimes=(self.runtimes if self.generation is None else
-                        AskRuntimeFactories(execution=self._execution_factory,
-                                            validation=self._validation_factory)),
+                        replace(self.runtimes, execution=self._execution_factory,
+                                validation=self._validation_factory)),
                     evidence=binding, acquisition=None)
             finally:
                 if self._response_flow is not None:

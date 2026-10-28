@@ -229,7 +229,10 @@ ASSISTANT_CORE_GENERAL_KNOWLEDGE_ENABLED = (os.environ.get("MM_ASSISTANT_CORE_GE
 # Per-mode internal deadlines remain bounded even though the outer safety ceiling is
 # widened. ASK does not receive a two-minute reasoning budget; Root Cause and Smart
 # Diagnostic retain their existing deadlines; Smart reserves its final review.
-ASSISTANT_CORE_ASK_DEADLINE_SECONDS = max(50, min(85, int(os.environ.get("MM_ASSISTANT_CORE_ASK_DEADLINE_SECONDS", "74"))))
+# Keep the existing 85-second ceiling and explicit overrides. The default must
+# accommodate synthesis, independent review, a required repair and publication
+# within the existing 115-second Worker transport bound; the cost cap is unchanged.
+ASSISTANT_CORE_ASK_DEADLINE_SECONDS = max(50, min(85, int(os.environ.get("MM_ASSISTANT_CORE_ASK_DEADLINE_SECONDS", "85"))))
 ASSISTANT_CORE_ROOT_CAUSE_DEADLINE_SECONDS = max(65, min(105, int(os.environ.get("MM_ASSISTANT_CORE_ROOT_CAUSE_DEADLINE_SECONDS", "92"))))
 ASSISTANT_CORE_SMART_START_DEADLINE_SECONDS = max(70, min(110, int(os.environ.get("MM_ASSISTANT_CORE_SMART_START_DEADLINE_SECONDS", "96"))))
 ASSISTANT_CORE_SMART_TURN_DEADLINE_SECONDS = max(60, min(105, int(os.environ.get("MM_ASSISTANT_CORE_SMART_TURN_DEADLINE_SECONDS", "86"))))
