@@ -128,7 +128,7 @@ class WiredSourceOrderedReviewTests(unittest.TestCase):
                 'covered_answer_types':[m.REQ_ORDERED_ACTIONS,m.REQ_SAFETY_CONDITIONS],
                 'missing_answer_types':[],'expected_list_items':[],'covered_list_items':[],'missing_list_items':[],
                 'operation_boundary':{'complete':not reject,'checked_blocks':['step_1','step_2','step_3'],
-                    'changes':[],'precedence':[]}}
+                    'change_edges':[],'precedence':[]}}
             if note_mutation == 'delete':
                 result['edits'][1]['text']=actions[1]
             elif note_mutation == 'swap':
@@ -166,6 +166,8 @@ class WiredSourceOrderedReviewTests(unittest.TestCase):
         self.assertEqual(props['reply_mode']['enum'],['retain','edit','reject'])
         self.assertEqual(props['answer']['enum'],[''])
         self.assertIn('precedence',props['operation_boundary']['required'])
+        self.assertIn('change_edges',props['operation_boundary']['required'])
+        self.assertNotIn('changes',props['operation_boundary']['properties'])
         self.assertEqual(calls[0][1]['max_output_tokens'],3200)
         contract=result['meta']['assistant_core_validation']['answer_contract']
         self.assertTrue(contract['passed'])

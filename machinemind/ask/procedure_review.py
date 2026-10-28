@@ -223,6 +223,18 @@ def review_schema(legacy: dict, layout: dict, facets: list[str], types: list[str
                 "items": {"type": "object", "additionalProperties": False,
                           "properties": edge_fields, "required": list(edge_fields)}}
             boundary["required"].append("precedence")
+            # The same action/closure/source quote already exists in an edge.
+            # Send only its index; reconstruct the legacy canonical change below
+            # before running the unchanged source/closure validation.
+            boundary["properties"].pop("changes")
+            boundary["required"].remove("changes")
+            boundary["properties"]["change_edges"] = {"type": "array", "maxItems": 16,
+                "items": {"type": "object", "additionalProperties": False,
+                    "properties": {"edge_index": {"type": "integer", "minimum": 0, "maximum": 15},
+                        "resolution": {"type": "string", "enum": ["restored", "documented_terminal_state", "unresolved"]}},
+                    "required": ["edge_index", "resolution"]}}
+            boundary["required"].append("change_edges")
+
         schema["required"].append("operation_boundary")
     return result
 
@@ -252,32 +264,32 @@ OPERATION_BOUNDARY_INSTRUCTIONS = (
 
 
 SOURCE_ORDERED_BOUNDARY_INSTRUCTIONS = (
-    "\nSOURCE-ORDERED OPERATION DEPENDENCIES: Review the resolved answer after your edits, not only the "
-    "original Step notes. For each operational action introduced or changed by an edit, include its "
-    "complete source-documented preparation, positioning, mode/energy conditions, locking/holding, "
-    "intermediate actions and terminal/restoration conditions. Never treat reduced speed as proof of "
-    "safety. A prior prerequisite does not survive an intervening action that changes that state: "
-    "re-establish it before the new operation when required by SOURCES. Restore required protective "
-    "conditions BEFORE each dependent movement/test, not only before the final automatic restart. "
-    "Return operation_boundary.precedence with compact edges for every source-required prerequisite "
-    "before its dependent action, and every restoration before its next dependent operation. The edge list "
-    "must also cover each operation_boundary.changes action-to-restoration relation using the same "
-    "quotes and original block_id. A documented unchanged terminal hold may be one instruction. Each edge "
-    "has before_block_id/after_block_id from PROCEDURE_BLOCKS, exact before_answer_quote and "
-    "after_answer_quote in those FINAL resolved blocks, and source_citation_id/source_quote proving "
-    "that dependency. Quotes must be non-empty and unique within the indicated block; choose short "
-    "distinctive spans, at most 400 characters, never duplicate full answers or sources. List at most "
-    "16 edges; if complete proof cannot fit, reject rather than omit an obligation. Every materially "
-    "edited block must participate in at least one proved edge. Preserve original source notes in "
-    "their own Step; an additional prerequisite may be stated earlier in that Step when required, "
-    "without moving or weakening the original note. Complete=true requires all dependencies audited; "
-    "an empty list is allowed only for an unchanged/typography-only draft with no necessary dependency. "
-    "Do not add a corrective intervention merely because a manual describes it beside a requested "
-    "check. If it is necessary to answer the request, include its complete documented subprocedure; "
-    "if that cannot be done faithfully in the admitted sequence, reject. When a requested path, route "
-    "or process has documented intermediate stages, identify each necessary intermediate stage and "
-    "its source-prescribed order. Generic component categories do not replace an explicit sequence; "
-    "never infer a route or an order absent from SOURCES."
+    "\nSOURCE-ORDERED OPERATION AUDIT: Check every FINAL resolved block against the complete source "
+    "operation, including continuation beyond router facets. Return checked_blocks with every "
+    "PROCEDURE_BLOCK block_id exactly once. For each introduced/changed operation, include its source "
+    "preparation, positioning, mode/energy conditions, locking, intermediate stages and terminal/restoration "
+    "conditions. Re-establish prerequisites invalidated by intervening actions. Reduced speed is not proof "
+    "of safety. Restore required protections BEFORE EACH dependent movement/test, not just final restart. "
+    "operation_boundary.precedence lists every required prerequisite-to-action, temporary-change-to-closure "
+    "and restoration-to-dependent-operation relation. Each edge names before_block_id, after_block_id, "
+    "exact before_answer_quote/after_answer_quote from those FINAL blocks and source_citation_id/source_quote "
+    "proving the dependency. Use short, unique-in-block spans (maximum400characters), never full answers "
+    "or sources. At most16edges: reject if necessary proof cannot fit. Every materially edited block must "
+    "participate in a proved edge. For each temporary change (opening, releasing, adjustment, disabling, "
+    "mode change, etc.), change_edges references the zero-based precedence edge_index connecting its action "
+    "to documented closure, with resolution=restored or documented_terminal_state. No repeated quotes in "
+    "change_edges. A documented terminal hold may have identical before/after quotes in one block; otherwise "
+    "the action must precede its closure. Unknown closure: complete=false, outcome=no_sources. Complete=true "
+    "means every dependency and temporary change has been audited/resolved; empty lists are allowed only "
+    "when no corresponding obligation exists, and no substantive edit may have empty precedence. "
+    "Standing isolation/STOP/PPE prerequisites are invariants, not changes requiring reversal. Never invent "
+    "re-energization/restart or safety release. Respect before-only requests and documented safe holds. Keep "
+    "source Step structure and original notes; add a required prerequisite earlier without moving its note. "
+    "Reject if this layout cannot hold a complete safe sequence. Do not introduce an extra corrective "
+    "intervention merely because a manual describes it alongside the requested check. If necessary, include "
+    "its complete documented subprocedure. For a requested path/process, state every necessary documented "
+    "intermediate stage in its prescribed order; generic categories cannot replace the sequence. Never "
+    "invent an order absent from SOURCES."
 )
 
 
@@ -287,11 +299,44 @@ def _quote_text(value: str) -> str:
         "\u201c": '"', "\u201d": '"'})).split())
 
 
+def _canonical_boundary(audit: Any) -> dict | None:
+    """Expand source-ordered wire references; indices add no source authority."""
+    if type(audit) is not dict:
+        return None
+    if "change_edges" not in audit:
+        return deepcopy(audit)  # internal canonical/legacy representation
+    refs, edges = audit.get("change_edges"), audit.get("precedence")
+    if ("changes" in audit or type(refs) is not list or len(refs) > 16 or type(edges) is not list):
+        return None
+    changes, seen = [], set()
+    for ref in refs:
+        if (type(ref) is not dict or set(ref) != {"edge_index", "resolution"}
+                or type(ref.get("edge_index")) is not int or not 0 <= ref["edge_index"] < len(edges)
+                or type(ref.get("resolution")) is not str
+                or ref["resolution"] not in {"restored", "documented_terminal_state", "unresolved"}
+                or ref["edge_index"] in seen):
+            return None
+        edge = edges[ref["edge_index"]]
+        keys = ("before_block_id", "before_answer_quote", "after_block_id", "after_answer_quote",
+                "source_citation_id", "source_quote")
+        if type(edge) is not dict or any(type(edge.get(k)) is not str for k in keys):
+            return None
+        seen.add(ref["edge_index"])
+        changes.append({"block_id": edge["before_block_id"], "action_quote": edge["before_answer_quote"],
+            "closing_source_citation_id": edge["source_citation_id"], "closing_source_quote": edge["source_quote"],
+            "closing_answer_quote": edge["after_answer_quote"], "resolution": ref["resolution"]})
+    result = {k: deepcopy(v) for k, v in audit.items() if k != "change_edges"}
+    result["changes"] = changes
+    return result
+
+
 def verify_operation_boundary(parsed: dict, *, layout: dict, source_texts: dict[str, str],
                               source_ordered: bool = False) -> dict:
     """Validate a same-call semantic closure audit, never infer physical safety."""
     out = deepcopy(parsed)
-    audit = out.get("operation_boundary")
+    audit = _canonical_boundary(out.get("operation_boundary")) if source_ordered else out.get("operation_boundary")
+    if source_ordered and audit is not None:
+        out["operation_boundary"] = audit
     expected = [b["block_id"] for b in layout["blocks"]]
     answer = str(out.get("answer") or "")
     body = _quote_text(answer)
@@ -352,9 +397,15 @@ def verify_operation_boundary(parsed: dict, *, layout: dict, source_texts: dict[
                 before = _quote_text(edge["before_answer_quote"])
                 after = _quote_text(edge["after_answer_quote"])
                 source = source_texts.get(edge["source_citation_id"])
+                same_terminal_hold = bool(edge["before_block_id"] == edge["after_block_id"]
+                    and before == after and any(change["resolution"] == "documented_terminal_state"
+                        and change["block_id"] == edge["before_block_id"]
+                        and _quote_text(change["action_quote"]) == before
+                        and _quote_text(change["closing_answer_quote"]) == after for change in audit["changes"]))
                 if (source is None or _quote_text(edge["source_quote"]) not in _quote_text(source)
                         or before_body.count(before) != 1 or after_body.count(after) != 1
-                        or before_base + before_body.find(before) + len(before) > after_base + after_body.find(after)):
+                        or (not same_terminal_hold and before_base + before_body.find(before) + len(before)
+                            > after_base + after_body.find(after))):
                     valid = False
                     break
                 touched.update((edge["before_block_id"], edge["after_block_id"]))

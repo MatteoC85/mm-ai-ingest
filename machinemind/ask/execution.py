@@ -85,6 +85,22 @@ class AskExecutionRuntime:
     json: Any
     evidence_admission: Optional[Callable[[Any, dict, Any, str], AskEvidenceAdmission]] = None
     evidence_observer: Any = None
+    review_uses_remaining_window: bool = False
+
+
+def _review_timeout(runtime: AskExecutionRuntime, budget: Any, *, protected: bool, compact: bool) -> int:
+    """Use the already-owned final review window; never extend its deadline.
+
+    The transport still clamps this request against RequestCompletion's observed
+    publication reserve immediately before dispatch. Explicit FAST timeouts stay
+    caps; the historical twenty-second cap remains for nonprotected consumers.
+    """
+    configured = max(12, int(runtime.V13_FAST_TIMEOUT_SECONDS))
+    if not (protected and compact):
+        return min(20, configured)
+    if runtime.review_uses_remaining_window:
+        return max(1, int(budget.remaining()))
+    return configured
 
 
 def _observe_consumer(function):
@@ -611,9 +627,8 @@ def verify_or_repair_answer(
             operation_source_ids=[str(c.get("citation_id") or "").strip() for c in ordered_candidates])
         system_msg += _procedure_review.PROTOCOL_INSTRUCTIONS
         if operation_boundary:
-            system_msg += _procedure_review.OPERATION_BOUNDARY_INSTRUCTIONS
-            if source_ordered_review:
-                system_msg += _procedure_review.SOURCE_ORDERED_BOUNDARY_INSTRUCTIONS
+            system_msg += (_procedure_review.SOURCE_ORDERED_BOUNDARY_INSTRUCTIONS if source_ordered_review
+                           else _procedure_review.OPERATION_BOUNDARY_INSTRUCTIONS)
         # Digests stay in the server-side binding/audit. The verifier needs the
         # source-to-number mapping, not hexadecimal hashes repeated as tokens.
         observation = repair_context["procedure_structure"]
@@ -645,7 +660,7 @@ def verify_or_repair_answer(
             json_schema=verifier_schema,
             effort=V13_FAST_EFFORT,
             reasoning_mode="",
-            timeout=min(20, max(12, V13_FAST_TIMEOUT_SECONDS)),
+            timeout=_review_timeout(runtime, budget, protected=protected_budget, compact=compact_review),
             max_output_tokens=min(4000, max(3200, V13_FAST_MAX_OUTPUT_TOKENS)),
             company_id=request.company_id,
             purpose="assistant_core_answer_contract_verifier",

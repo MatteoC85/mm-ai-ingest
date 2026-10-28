@@ -15136,6 +15136,9 @@ def _assistant_core_ask_execution_runtime() -> _ask_execution.AskExecutionRuntim
         V13_FAST_MAX_OUTPUT_TOKENS=V13_FAST_MAX_OUTPUT_TOKENS,
         V13_FAST_MODEL=V13_FAST_MODEL,
         V13_FAST_TIMEOUT_SECONDS=V13_FAST_TIMEOUT_SECONDS,
+        # Only the protected final procedure review may consume its remaining
+        # request window. An operator-specified FAST timeout remains a cap.
+        review_uses_remaining_window="MM_V13_FAST_TIMEOUT_SECONDS" not in os.environ,
         V13_PLANNER_MODEL=V13_PLANNER_MODEL,
         _V13BudgetExceeded=_V13BudgetExceeded,
         _assistant_core_build_no_evidence=_assistant_core_build_no_evidence,

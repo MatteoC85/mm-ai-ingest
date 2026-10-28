@@ -117,6 +117,47 @@ class SourceOrderedBoundaryTests(unittest.TestCase):
         # A missing proof field is not equivalent to a reviewed empty list.
         value['operation_boundary'].pop('precedence');self.assert_rejected(value)
 
+    def test_compact_change_reference_is_lossless_before_existing_validation(self):
+        original=self.reply()
+        compact=deepcopy(original)
+        compact['operation_boundary'].pop('changes')
+        compact['operation_boundary']['change_edges']=[{'edge_index':1,'resolution':'restored'}]
+        normalized=review._canonical_boundary(compact['operation_boundary'])
+        self.assertEqual(normalized,original['operation_boundary'])
+        self.assertEqual(self.verify(compact),self.verify(original))
+
+    def test_invalid_compact_references_cannot_grant_a_source_or_skip_change(self):
+        for refs in ([{'edge_index':99,'resolution':'restored'}],
+                     [{'edge_index':True,'resolution':'restored'}],
+                     [{'edge_index':-1,'resolution':'restored'}],
+                     [{'edge_index':1,'resolution':'unknown'}],
+                     [{'edge_index':1,'resolution':'restored','source_citation_id':'foreign'}],
+                     [{'edge_index':1,'resolution':'restored'}]*2):
+            with self.subTest(refs=refs):
+                value=self.reply();value['operation_boundary'].pop('changes')
+                value['operation_boundary']['change_edges']=refs
+                self.assert_rejected(value)
+        value=self.reply();value['operation_boundary']['change_edges']=[]
+        self.assert_rejected(value)  # both representations may not conflict
+
+    def test_compact_documented_terminal_hold_keeps_same_instruction(self):
+        draft='1. Inspect the isolated unit.'
+        hold='Keep the supply isolated until the qualified specialist completes the repair.'
+        value={'outcome':'rewrite','answer':'1. '+hold,'operation_boundary':{
+            'complete':True,'checked_blocks':['step_1'],
+            'change_edges':[{'edge_index':0,'resolution':'documented_terminal_state'}],
+            'precedence':[{'before_block_id':'step_1','before_answer_quote':hold,
+                'after_block_id':'step_1','after_answer_quote':hold,
+                'source_citation_id':'manual:hold','source_quote':hold}]}}
+        result=review.verify_operation_boundary(value,layout=review.block_layout(draft),
+            source_texts={'manual:hold':hold},source_ordered=True)
+        self.assertEqual(result['outcome'],'rewrite')
+        self.assertTrue(result['operation_boundary_validation']['complete'])
+        value['operation_boundary']['change_edges'][0]['resolution']='restored'
+        result=review.verify_operation_boundary(value,layout=review.block_layout(draft),
+            source_texts={'manual:hold':hold},source_ordered=True)
+        self.assertFalse(result['operation_boundary_validation']['complete'])
+
     def test_schema_requires_compact_precedence_only_for_source_ordered_review(self):
         legacy={'name':'test','schema':{'properties':{},'required':[]}}
         layout=review.block_layout(self.DRAFT)
@@ -124,6 +165,8 @@ class SourceOrderedBoundaryTests(unittest.TestCase):
             operation_boundary=True,operation_source_ids=['manual:one'])['schema']
         boundary=wire['properties']['operation_boundary']
         self.assertIn('precedence',boundary['required'])
+        self.assertIn('change_edges',boundary['required'])
+        self.assertNotIn('changes',boundary['properties'])
         edges=boundary['properties']['precedence']
         self.assertEqual(edges['maxItems'],16)
         self.assertEqual(edges['items']['properties']['source_quote']['maxLength'],400)
