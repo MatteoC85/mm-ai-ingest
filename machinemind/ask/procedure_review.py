@@ -26,6 +26,38 @@ _EDIT_NUMBERED = re.compile(
     r"(?:\*\*|__)?(?:[ \t]+|\r?\n|$)")
 
 
+def repair_contract_feedback(contract: dict) -> dict:
+    """Project diagnostic feedback, never sources or the reviewed answer.
+
+    CURRENT_ANSWER, SOURCES, required facets/types and procedure structure have
+    their own complete prompt fields. Serializing the whole prior verdict here
+    duplicates those bodies and can consume the repair's reserved output budget.
+    This projection is only model guidance; final validation still consumes the
+    original unmodified contract and all of its source/answer bindings.
+    """
+    if not isinstance(contract, dict):
+        return {}
+    fields = ("passed", "complete", "reason", "missing_answer_facets",
+              "missing_evidence_facets", "missing_answer_types", "semantic_missing_answer_types",
+              "missing_list_items", "evidence_facet_coverage", "minimum_facet_coverage")
+    out = {key: deepcopy(contract[key]) for key in fields if key in contract}
+    if isinstance(contract.get("requirement_checks"), list):
+        out["requirement_checks"] = [{key: deepcopy(check[key])
+            for key in ("requirement", "passed", "reason") if key in check}
+            for check in contract["requirement_checks"] if isinstance(check, dict)]
+    prior = contract.get("semantic_verifier")
+    if isinstance(prior, dict):
+        out["semantic_verifier"] = {key: deepcopy(prior[key]) for key in (
+            "outcome", "reason", "covered_facets", "missing_facets", "covered_answer_types",
+            "missing_answer_types", "expected_list_items", "covered_list_items", "missing_list_items")
+            if key in prior}
+        boundary = prior.get("operation_boundary_validation")
+        if isinstance(boundary, dict):
+            out["semantic_verifier"]["operation_boundary_validation"] = {
+                key: deepcopy(boundary[key]) for key in ("complete", "reason") if key in boundary}
+    return out
+
+
 def digest(text: str) -> str:
     return hashlib.sha256(str(text).encode("utf-8")).hexdigest()
 

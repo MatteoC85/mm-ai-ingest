@@ -118,6 +118,33 @@ def synthesize_observed(callback, review_required):
         return callback()
 
 
+def record_contract_observation(stage: str, contract: dict) -> None:
+    """Bounded enums/counts survive errors; never retain answer or source text."""
+    owner = current()
+    if owner is None or not isinstance(contract, dict) or len(owner.contract_checks) >= 8:
+        return
+    reasons = {
+        "operation_boundary_incomplete", "operation_boundary_quote_or_order_invalid",
+        "manual_procedure_semantic_review_incomplete", "source_step_sequence_or_notes_incomplete",
+        "semantic_contract_rejected_grounded_answer", "semantic_contract_incomplete_grounded_answer",
+        "missing_supported_list_items", "procedure_review_coverage_not_complete",
+    }
+    outcome = contract.get("outcome")
+    if type(outcome) is not str or outcome not in {"pass", "rewrite", "partial", "no_sources", "unavailable"}:
+        outcome = "pass" if contract.get("passed") is True else "failed" if contract.get("passed") is False else "unknown"
+    reason = contract.get("reason")
+    row = {"stage": stage if type(stage) is str and stage in {"semantic_review", "final_contract"} else "other",
+           "outcome": outcome, "reason": reason if type(reason) is str and reason in reasons else "other",
+           "at_seconds": round(owner.budget.elapsed(), 6)}
+    for key in ("covered_facets", "missing_facets", "missing_answer_facets", "missing_evidence_facets",
+                "covered_answer_types", "missing_answer_types", "semantic_missing_answer_types", "missing_list_items"):
+        value = contract.get(key)
+        row[key + "_count"] = min(len(value), 100) if isinstance(value, (list, tuple)) else None
+    boundary = contract.get("operation_boundary_validation")
+    row["operation_boundary_complete"] = (boundary.get("complete") is True) if isinstance(boundary, dict) else None
+    owner.contract_checks.append(row)
+
+
 def provider_timeout(purpose: str, configured: int) -> int:
     owner = current()
     return configured if owner is None else owner.provider_timeout(purpose, configured)
@@ -155,6 +182,7 @@ class RequestCompletion:
         self.cache_allowance = 0.0
         self.cache_committed = False
         self.provider_schedules = []
+        self.contract_checks = []
 
     def measure(self, name, callback, /, *args, **kwargs):
         if not self.active or current() is not self:
@@ -305,6 +333,7 @@ class RequestCompletion:
             "cache_commit_observed": self.cache_committed,
             "late_success_forbidden": True,
             "provider_scheduling": list(self.provider_schedules),
+            "contract_checks": list(self.contract_checks),
             "reserve_basis": "observed_fence_wall_plus_local_allowance_not_SLA",
         }, "ask_phase_trace": self.trace.summary(), "runtime_commit_sha": commit,
             "phase6_candidate_version": PHASE6_CANDIDATE_VERSION}

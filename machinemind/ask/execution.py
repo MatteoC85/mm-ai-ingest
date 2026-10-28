@@ -22,6 +22,7 @@ from . import procedure_review as _procedure_review
 from . import final_contract as _final_contract
 from . import phase_trace
 from .request_completion import current as _current_completion
+from .request_completion import record_contract_observation as _record_contract_observation
 from .request_completion import synthesis_review_reserve as _synthesis_review_reserve
 from ..evidence.ask_input import AskEvidenceAdmission, apply_ask_evidence_input, ask_request_key
 from ..evidence.contracts import EvidenceContractError, SourceIdentity
@@ -549,7 +550,8 @@ def verify_or_repair_answer(
     repair_missing_list_items = _dedup_text_values(
         repair_context.get("missing_list_items") or [], limit=40
     )
-    repair_first_contract = dict(repair_context.get("first_answer_contract") or {})
+    repair_first_contract = _procedure_review.repair_contract_feedback(
+        repair_context.get("first_answer_contract") or {})
     deterministic_list_candidates = (
         _assistant_core_extract_enumerated_items(
             "\n".join(_assistant_core_candidate_evidence_text(c) for c in ordered_candidates),
@@ -723,6 +725,7 @@ def verify_or_repair_answer(
         out["expected_list_items"] = expected_items
         out["covered_list_items"] = _dedup_text_values(out.get("covered_list_items") or [], limit=40)
         out["missing_list_items"] = model_missing_items
+    _record_contract_observation("semantic_review", out)
     return out
 
 

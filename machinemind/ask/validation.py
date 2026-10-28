@@ -13,6 +13,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Callable, TYPE_CHECKING
 
 from . import execution
+from .request_completion import record_contract_observation as _record_contract_observation
 from . import final_contract as _final_contract
 from . import procedure_review as _procedure_review
 from ..evidence.ask_input import apply_ask_evidence_input, ask_request_key
@@ -858,6 +859,7 @@ def validate_response(
                     "missing_list_items": semantic_missing_list,
                     "semantic_verifier": dict(semantic_contract),
                 }
+            _record_contract_observation("final_contract", answer_contract_result)
             if not bool(answer_contract_result.get("passed")):
                 repair_attempted = bool(out.get("_assistant_core_repair_attempted"))
                 missing_evidence_facets = list(
