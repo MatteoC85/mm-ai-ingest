@@ -141,6 +141,9 @@ class WiredSourceOrderedReviewTests(unittest.TestCase):
             elif note_mutation == 'swap':
                 result['edits'][0]['text']=actions[0]+'\n'+notes[1]
                 result['edits'][1]['text']=actions[1]+'\n'+notes[0]
+            for i,edit in enumerate(result['edits']):
+                replacement=edit.pop('text')
+                edit.update(old_text=actions[i]+'\n'+notes[i],new_text=replacement)
             if unknown_alias:result['citation_ids']=['foreign-source']
             if malformed=='reply_mode':result['reply_mode']='unknown-mode'
             if malformed=='missing_audit':result.pop('operation_boundary')

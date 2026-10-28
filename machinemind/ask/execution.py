@@ -628,7 +628,8 @@ def verify_or_repair_answer(
             operation_boundary=operation_boundary, source_ordered=source_ordered_review,
             operation_source_ids=[str(c.get("citation_id") or "").strip() for c in ordered_candidates],
             wire_aliases=wire_aliases)
-        system_msg += _procedure_review.PROTOCOL_INSTRUCTIONS
+        system_msg += (_procedure_review.MICRO_PROTOCOL_INSTRUCTIONS if wire_aliases is not None
+                       else _procedure_review.PROTOCOL_INSTRUCTIONS)
         if operation_boundary:
             system_msg += (_procedure_review.SOURCE_ORDERED_BOUNDARY_INSTRUCTIONS if source_ordered_review
                            else _procedure_review.OPERATION_BOUNDARY_INSTRUCTIONS)
@@ -689,7 +690,7 @@ def verify_or_repair_answer(
     out = dict(parsed or {})
     try:
         if wire_aliases is not None:
-            out = _procedure_review.decode_review_wire_aliases(out, wire_aliases)
+            out = _procedure_review.decode_review_wire_aliases(out, wire_aliases, layout=layout)
         if compact_review:
             out = _procedure_review.resolve_reply(out, answer=answer, layout=layout,
                 required_facets=review_facets, required_types=requirements,

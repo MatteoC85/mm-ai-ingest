@@ -178,7 +178,7 @@ _WIRE_EDGE_FIELDS = {"from": "before_block_id", "action": "before_answer_quote",
     "proof": "source_quote"}
 
 
-def decode_review_wire_aliases(parsed: dict, aliases: dict) -> dict:
+def decode_review_wire_aliases(parsed: dict, aliases: dict, *, layout: dict | None = None) -> dict:
     """Lossless expansion before the existing layout/source/order validators.
 
     Only explicit identity fields are decoded. Source quotes and answer text are
@@ -197,8 +197,26 @@ def decode_review_wire_aliases(parsed: dict, aliases: dict) -> dict:
     edits = out.get("edits", [])
     if type(edits) is not list or any(type(edit) is not dict for edit in edits):
         raise ValueError("procedure_review_wire_edits_invalid")
+    original_blocks = {b["block_id"]: b["text"] for b in (layout or {}).get("blocks", [])}
+    reconstructed, edited_blocks = [], set()
     for edit in edits:
-        edit["block_id"] = identity(edit.get("block_id"), blocks)
+        bid = identity(edit.get("block_id"), blocks)
+        if (set(edit) != {"block_id", "old_text", "new_text"} or bid not in original_blocks
+                or bid in edited_blocks or type(edit.get("old_text")) is not str
+                or not edit["old_text"].strip() or type(edit.get("new_text")) is not str):
+            raise ValueError("procedure_review_micro_edit_invalid")
+        # Each patch targets the ORIGINAL block body, not another edit's output.
+        # Header/separators are never part of a provider-controlled replacement.
+        _, body, _ = _block_parts(original_blocks[bid])
+        old, replacement = edit["old_text"], edit["new_text"]
+        at = body.find(old)
+        if at < 0 or body.find(old, at + 1) >= 0:
+            raise ValueError("procedure_review_micro_edit_anchor_ambiguous_or_missing")
+        reconstructed.append({"block_id": bid,
+            "text": body[:at] + replacement + body[at + len(old):]})
+        edited_blocks.add(bid)
+    if "edits" in out:
+        out["edits"] = reconstructed
     audit = out.get("operation_boundary")
     if type(audit) is not dict:
         raise ValueError("procedure_review_wire_boundary_invalid")
@@ -302,7 +320,13 @@ def review_schema(legacy: dict, layout: dict, facets: list[str], types: list[str
                 or list(wire_aliases["blocks"].values()) != [b["block_id"] for b in layout["blocks"]]):
             raise ValueError("procedure_review_alias_catalog_drift")
         schema["properties"]["citation_ids"]["items"] = {"type": "string", "enum": source_names}
-        schema["properties"]["edits"]["items"]["properties"]["block_id"]["enum"] = block_names
+        schema["properties"]["edits"]["items"] = {"type": "object", "additionalProperties": False,
+            "properties": {"block_id": {"type": "string", "enum": block_names},
+                "old_text": {"type": "string", "minLength": 1,
+                    "description": "One exact unique non-empty span of the original block body, without its heading."},
+                "new_text": {"type": "string",
+                    "description": "Replacement for only that span. All other original body text is preserved by the server."}},
+            "required": ["block_id", "old_text", "new_text"]}
         boundary = schema["properties"]["operation_boundary"]
         boundary["properties"]["checked_blocks"]["items"]["enum"] = block_names
         edge = boundary["properties"]["precedence"]["items"]
@@ -340,35 +364,38 @@ OPERATION_BOUNDARY_INSTRUCTIONS = (
 
 
 SOURCE_ORDERED_BOUNDARY_INSTRUCTIONS = (
-    "\nSOURCE-ORDERED OPERATION AUDIT: Use PROCEDURE_SOURCE_ALIASES for citation_ids and edge source; "
-    "use the block aliases shown in PROCEDURE_BLOCKS for edits, checked_blocks and edge from/to. These "
-    "are encodings of the same admitted sources and immutable blocks, not new evidence. Check every FINAL "
-    "resolved block against the complete source "
-    "operation, including continuation beyond router facets. Return checked_blocks with every "
-    "PROCEDURE_BLOCK block_id exactly once. For each introduced/changed operation, include its source "
-    "preparation, positioning, mode/energy conditions, locking, intermediate stages and terminal/restoration "
-    "conditions. Re-establish prerequisites invalidated by intervening actions. Reduced speed is not proof "
-    "of safety. Restore required protections BEFORE EACH dependent movement/test, not just final restart. "
-    "operation_boundary.precedence lists every required prerequisite-to-action, temporary-change-to-closure "
-    "and restoration-to-dependent-operation relation. In each edge, from/to are the earlier/later block "
-    "aliases; action/next are exact answer quotes from those FINAL blocks; source is the admitted source "
-    "alias and proof is its exact source quote proving the dependency. Use short, unique-in-block spans (maximum400characters), never full answers "
-    "or sources. At most16edges: reject if necessary proof cannot fit. Every materially edited block must "
-    "participate in a proved edge. For each temporary change (opening, releasing, adjustment, disabling, "
-    "mode change, etc.), change_edges references the zero-based precedence edge_index connecting its action "
-    "to documented closure, with resolution=restored or documented_terminal_state. No repeated quotes in "
-    "change_edges. A documented terminal hold may have identical before/after quotes in one block; otherwise "
-    "the action must precede its closure. Unknown closure: complete=false, outcome=no_sources. Complete=true "
-    "means every dependency and temporary change has been audited/resolved; empty lists are allowed only "
-    "when no corresponding obligation exists, and no substantive edit may have empty precedence. "
-    "Standing isolation/STOP/PPE prerequisites are invariants, not changes requiring reversal. Never invent "
-    "re-energization/restart or safety release. Respect before-only requests and documented safe holds. Keep "
-    "source Step structure and original notes; add a required prerequisite earlier without moving its note. "
-    "Reject if this layout cannot hold a complete safe sequence. Do not introduce an extra corrective "
-    "intervention merely because a manual describes it alongside the requested check. If necessary, include "
-    "its complete documented subprocedure. For a requested path/process, state every necessary documented "
-    "intermediate stage in its prescribed order; generic categories cannot replace the sequence. Never "
-    "invent an order absent from SOURCES."
+    "\nSOURCE-ORDERED FULL REVIEW / DELTA PROOF: Independently verify the ENTIRE final resolved procedure "
+    "against ALL supplied sources, all obligations, every Step, safety condition and dependency, including "
+    "unchanged blocks. Source numbering and literal note retention are NOT semantic/safety proof. Return "
+    "checked_blocks containing every block alias once. Reject any unsafe, unsupported or incomplete part; "
+    "retain/edits=[] never bypasses full review. Use PROCEDURE_SOURCE_ALIASES for citation_ids/edge source, "
+    "and PROCEDURE_BLOCKS aliases for edits/checked_blocks/edge endpoints. They encode existing identities. "
+    "MICRO-EDITS in this source-ordered wire format: "
+    "each edit has block_id, old_text and new_text only. old_text is one exact, non-empty, unique span of "
+    "that ORIGINAL block's BODY (no numbered heading); new_text replaces only that span. Choose the shortest "
+    "distinctive span covering the change; retain its anchor in new_text when inserting beside it. At most "
+    "one patch per block. All patches apply atomically to originals, never sequentially to another patch. "
+    "The server preserves everything else, including headings, separators and original notes. Never "
+    "re-emit unchanged full bodies/notes or fabricate an anchor. If safe correction cannot fit, reject. "
+    "For each introduced/changed operation, include its complete source-documented preparation, position, "
+    "mode/energy conditions, locking, intermediate actions and terminal/restoration conditions. Re-establish "
+    "prerequisites invalidated by intervening actions; reduced speed is not safety proof. Restore protections "
+    "BEFORE each dependent movement/test, not only final restart. Do not add extra corrective interventions "
+    "beside a requested check; if necessary, include the complete documented subprocedure. A requested "
+    "route/process needs every necessary intermediate stage in source-prescribed order, never invented. "
+    "WIRE PROOF SCOPE: precedence/change_edges cover MATERIAL EDITS and ALL dependencies they affect, "
+    "including prerequisites, closures and dependent operations in otherwise UNCHANGED blocks. Do not "
+    "repeat proofs for unrelated unchanged operations; still review them semantically in full. Every "
+    "materially edited block must participate in proof. In each precedence edge, from/to are block aliases; "
+    "action/next are exact quotes in those FINAL resolved blocks; source is the admitted alias and proof "
+    "its exact quote supporting the relationship. Use short unique-in-block spans, maximum400characters; "
+    "at most16edges. For each affected temporary change, change_edges references its zero-based action-to-"
+    "closure edge_index, with resolution=restored or documented_terminal_state. No duplicate quotes there. "
+    "A documented terminal hold may be the same unique quote in one block; otherwise action precedes closure. "
+    "Unknown closure or proof cannot fit: complete=false/outcome=no_sources. Complete=true asserts whole-"
+    "procedure semantic review AND complete delta proof. Empty proof is allowed only with no material edits "
+    "or impacted dependencies. Isolation/STOP/PPE invariants never imply a need to reverse them. Never invent "
+    "restart, re-energization or safety release. Respect explicit before-only boundaries and safe hold states."
 )
 
 
@@ -525,6 +552,25 @@ def verify_operation_boundary(parsed: dict, *, layout: dict, source_texts: dict[
         out["outcome"] = "no_sources"
         out["reason"] = reason
     return out
+
+
+MICRO_PROTOCOL_INSTRUCTIONS = (
+    "\nPROCEDURE REVIEW PROTOCOL: You are the independent semantic and safety verifier. Check every "
+    "mandatory facet, source instruction, precaution, numeric value, condition and translation against "
+    "SOURCES. PROCEDURE_STRUCTURE proves only source-occurrence numbers and literal note retention, "
+    "never relevance, semantic completeness or safety. An obligation need not be echoed verbatim: do "
+    "not rewrite merely to repeat a requirement already satisfied. If the complete draft is correct, "
+    "use outcome=pass, reply_mode=retain, answer='', edits=[]. For required corrections use "
+    "outcome=rewrite, reply_mode=edit and the source-ordered micro-edit format below. The complete "
+    "replacement is the result after server patch application, not retransmission of unchanged text. "
+    "Source Step numbers, headings and separators are immutable. Preserve each source instruction and "
+    "verbatim note/warning in its original Step: never move, omit, paraphrase a note, renumber, exchange "
+    "instructions or add numbered Steps inside a body. If this admitted sequence cannot satisfy the "
+    "request safely and completely, use reply_mode=reject, outcome=no_sources (partial only if otherwise "
+    "allowed), answer='', edits=[] and unresolved keys. Successful coverage must never conceal an "
+    "omitted Step. Keep covered/missing contract keys verbatim. All evidence, authority, no-invention "
+    "and safety requirements remain mandatory."
+)
 
 
 PROTOCOL_INSTRUCTIONS = (

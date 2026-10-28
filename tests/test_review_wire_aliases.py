@@ -11,13 +11,17 @@ from machinemind.ask import procedure_review as review
 import test_source_ordered_boundary as boundary_fixture
 
 
-def compact_reply(canonical, aliases):
+def compact_reply(canonical, aliases, *, layout=None):
     """Test-only inverse encoder; production only decodes provider wire data."""
     result=deepcopy(canonical)
     sources={cid:name for name,cid in aliases['sources'].items()}
     blocks={bid:name for name,bid in aliases['blocks'].items()}
     result['citation_ids']=[sources[cid]for cid in result.get('citation_ids',[])]
-    for edit in result.get('edits',[]):edit['block_id']=blocks[edit['block_id']]
+    layout=layout or review.block_layout(boundary_fixture.SourceOrderedBoundaryTests.DRAFT)
+    originals={b['block_id']:review._block_parts(b['text'])[1]for b in layout['blocks']}
+    for edit in result.get('edits',[]):
+        bid=edit['block_id'];body=edit.pop('text')
+        edit.update(block_id=blocks[bid],old_text=originals[bid],new_text=body)
     audit=result['operation_boundary']
     audit['checked_blocks']=[blocks[bid]for bid in audit['checked_blocks']]
     for i,edge in enumerate(audit['precedence']):
@@ -28,6 +32,10 @@ def compact_reply(canonical, aliases):
 
 
 class ReviewWireAliasTests(unittest.TestCase):
+    def decode(self, wire, aliases):
+        return review.decode_review_wire_aliases(wire,aliases,
+            layout=review.block_layout(boundary_fixture.SourceOrderedBoundaryTests.DRAFT))
+
     def fixture(self):
         f=boundary_fixture.SourceOrderedBoundaryTests()
         canonical=f.reply()
@@ -43,7 +51,7 @@ class ReviewWireAliasTests(unittest.TestCase):
         f,source,canonical,aliases=self.fixture()
         wire=compact_reply(canonical,aliases)
         original=deepcopy(wire)
-        decoded=review.decode_review_wire_aliases(wire,aliases)
+        decoded=self.decode(wire,aliases)
         self.assertEqual(decoded,canonical)
         self.assertEqual(wire,original)
         kwargs={'layout':review.block_layout(f.DRAFT),'source_texts':{source:f.SOURCE},'source_ordered':True}
@@ -63,20 +71,20 @@ class ReviewWireAliasTests(unittest.TestCase):
             with self.subTest(mutate=mutate):
                 wire=compact_reply(canonical,aliases);mutate(wire)
                 with self.assertRaisesRegex(ValueError,'alias_unknown'):
-                    review.decode_review_wire_aliases(wire,aliases)
+                    self.decode(wire,aliases)
 
     def test_mixed_or_missing_edge_fields_are_rejected(self):
         _,_,canonical,aliases=self.fixture()
         for mutate in (lambda e:e.update(source_citation_id='s1'),lambda e:e.pop('proof'),
                        lambda e:e.update(source=['s1'])):
             wire=compact_reply(canonical,aliases);mutate(wire['operation_boundary']['precedence'][0])
-            with self.assertRaises(ValueError):review.decode_review_wire_aliases(wire,aliases)
+            with self.assertRaises(ValueError):self.decode(wire,aliases)
 
     def test_quotes_are_never_rewritten_even_if_they_contain_alias_like_text(self):
         _,_,canonical,aliases=self.fixture()
         canonical['operation_boundary']['precedence'][0]['source_quote']='Do not replace s1 or b2 in literal source text.'
         canonical['operation_boundary']['precedence'][0]['before_answer_quote']='The label reads s2.'
-        decoded=review.decode_review_wire_aliases(compact_reply(canonical,aliases),aliases)
+        decoded=self.decode(compact_reply(canonical,aliases),aliases)
         self.assertEqual(decoded,canonical)
 
     def test_schema_uses_only_admitted_aliases_and_keeps_all_proof_fields(self):
