@@ -1252,7 +1252,7 @@ class SmartReviewEndpointTests(unittest.TestCase):
 
     def test_valid_rejection_retains_reason_and_admission_on_start_legacy_and_answer(self):
         def rejected(*args, **kwargs):
-            return wire_review(parsed_review(self.prepared[-1], rejected=(), reject_question=True)), 'offline-review'
+            return wire_review(parsed_review(self.prepared[-1], rejected=(0, 1, 2, 3), reject_question=True)), 'offline-review'
         start = self.start()
         with patch.object(self.m, '_v13_json_models', side_effect=rejected):
             responses = [self.post('start', symptom_text='Reported stop; actual signal unknown.', debug=True)]
@@ -1277,11 +1277,13 @@ class SmartReviewEndpointTests(unittest.TestCase):
             self.assertEqual(body['hypotheses'], [])
             self.assertEqual(body['meta']['reason'], 'smart_review_rejected')
             self.assertTrue(body['meta']['evidence_gate']['accepted'])
-            self.assertEqual(body['meta']['smart_review']['failure_reason'], 'question_not_supported')
+            self.assertEqual(body['meta']['smart_review']['failure_reason'], 'no_supported_hypotheses')
             self.assertEqual(len(body['meta']['smart_review']['verdicts']), 5)
             self.assertFalse(body['meta']['cacheable'])
             self.assertNotIn('cannot find enough', body['operator_summary'])
-            self.assertNotIn('grounding_packet', json.loads(body['session_state_json']))
+            self.assertIn('grounding_packet', json.loads(body['session_state_json']))
+            self.assertTrue(body['meta']['session_history_preserved'])
+            self.assertIn('state_signature', json.loads(body['session_state_json']))
         capture = responses[0].json()['debug']['smart_review']
         self.assertTrue(capture['exact_replay_available'])
         data = capture['capture']

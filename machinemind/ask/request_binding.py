@@ -297,13 +297,16 @@ def run_core_request(request: Any, *, core: AssistantCoreV2,
         def synthesize(req, data, dec):
             if not execution._ask_path(req, dec):
                 return invoke(hooks.synthesize_ask, req, req, data, dec)
-            # The composition root supplies protected lifecycle observers only
-            # for protected ASK. Legacy runs do not evaluate the review predicate.
+            # A procedure initially eligible for deterministic bundle validation
+            # can fall back to a manual answer that requires semantic review.
+            # Reserve that possibility before generation, while the final verifier
+            # still decides whether a call is necessary. Only protected ASK has
+            # this observer; legacy runs keep their existing scheduling.
             if runtimes.synthesis is None:
                 return invoke(execution.synthesize_ask, req, req, data, dec, runtime=er)
             return runtimes.synthesis(
                 lambda: invoke(execution.synthesize_ask, req, req, data, dec, runtime=er),
-                lambda: bool(er._assistant_core_should_semantic_verify_answer(dec)))
+                lambda: True)
 
         @phase_trace.traced("core.validate")
         def validate(response, req, data, dec):

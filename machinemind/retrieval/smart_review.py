@@ -8,7 +8,7 @@ import json
 import math
 import re
 
-from . import review_references as refs
+from . import review_references as refs, smart_continuity as continuity
 
 POLICY_VERSION = 'smart-reviewed-proposals-v5'
 MAX_CHECK_CHARS = 2000
@@ -253,7 +253,8 @@ def prepare(*, step, packet, symptom_text, history, language='en'):
                               smart_question=True)
     return {'step': deepcopy(step), 'packet': packet, 'references': references, 'language': language,
             'observed_query': observed, 'question_index': question_index,
-            'context_digest': refs.digest({'symptom_text': symptom_text, 'history': history or []})}
+            'context_digest': refs.digest({'symptom_text': symptom_text, 'history': history or []}),
+            'history': deepcopy(history or [])}
 
 
 def question_safety_roles(question, *, language):
@@ -323,7 +324,14 @@ def generation_hypothesis_instruction():
         'inspection or operation; retrospection grants no safety exemption. It may use safety_level=normal '
         'only if its text, why and options require recollection alone, never permission for the recalled activity.\n'
         '5. IDENTITY AND UNCERTAINTY: Keep hypothesis IDs short, unique and stable; copy references exactly. '
-        'Unknown is neither a positive nor a negative observation. Historical recurrence is not a measured '
+        'Unknown is neither a positive nor a negative observation. A note supplied with Unknown is unverified; '
+        'it cannot confirm, exclude or strengthen a mechanism. Do not repeat the same unavailable prerequisite '
+        'under a different wording; ask a different already-known, source-supported prerequisite if available, '
+        'or finalize explicitly as inconclusive with what remains unknown. If the symptom already supplies '
+        'an observation, do not ask for it again or contradict it. Unknown does not license switching to a '
+        'physical operation or adding a check without its source-required conditions. '
+        'The probability_pct numbers are only relative priority weights, not calibrated event probabilities; '
+        'use probability_band=unknown when empirical confidence is unavailable. Historical recurrence is not a measured '
         'probability for this event. Preserve time qualifiers: no change AFTER an event does not lower the '
         'possibility of a configuration fault already present BEFORE that event. The server supplies a separate '
         'application observation-reporting policy; never put its reporting instructions into technical checks, '
@@ -368,7 +376,7 @@ def messages(prepared, *, language, symptom_text, history):
     }
     return [{'role': 'system', 'content': INSTRUCTION + '\n\n' + WIRE_INSTRUCTION}, {'role': 'user', 'content':
         f'RESPONSE_LANGUAGE: {language}\nDECLARED_CONTEXT: {refs.canonical(symptom_text)}\n'
-        f'ANSWER_HISTORY: {refs.canonical(history or [])}\n'
+        f'ANSWER_HISTORY: {refs.canonical(continuity.generation_history(history))}\n'
         f'PROPOSALS: {refs.canonical(frozen["proposals"])}\n'
         f'OBSERVED_UNITS: {refs.canonical(references["observed_units"])}\n'
         f'AUTHORIZATION: {refs.canonical(compact_authorized)}\n'
@@ -472,7 +480,8 @@ def failure_diagnostic(error, *, call_rows, elapsed_seconds):
     return result
 
 
-def resolve(*, prepared, parsed, probability_band):
+def resolve(*, prepared, parsed, probability_band, continuity_policy=None):
+    require(continuity_policy in (None, continuity.POLICY_VERSION), 'unsupported_continuity_policy')
     result = refs.validate(parsed=parsed, frozen=prepared['references']['frozen'],
                            records=prepared['packet']['validator_records'], observed_query=prepared['observed_query'])
     def usable(value, code):
@@ -484,8 +493,9 @@ def resolve(*, prepared, parsed, probability_band):
     by_index = dict(zip(accepted_indices, result['causes']))
     original = prepared['step']
     question_index = prepared['question_index']
-    if question_index is not None:
-        usable(question_index in by_index, 'question_not_supported')
+    question_rejected = question_index is not None and question_index not in by_index
+    if question_rejected and continuity_policy is None:
+        usable(False, 'question_not_supported')
     accepted = []
     for index, h in enumerate(original['hypotheses']):
         if index not in by_index:
@@ -501,7 +511,11 @@ def resolve(*, prepared, parsed, probability_band):
     usable(total > 0, 'no_positive_supported_hypothesis')
     accumulated = 0.0
     for index, h in enumerate(active):
-        pct = round(100.0 - accumulated, 1) if index == len(active) - 1 else round(float(h['probability_pct']) * 100.0 / total, 1)
+        if continuity_policy is None:
+            pct = round(100.0 - accumulated, 1) if index == len(active) - 1 else round(float(h['probability_pct']) * 100.0 / total, 1)
+        else:
+            # Filtering a rejected alternative adds no evidence to another cause.
+            pct = round(float(h['probability_pct']), 1)
         h['probability_pct'] = pct
         h['probability_band'] = probability_band(pct)
         h['score_raw'] = round(pct / 100.0, 4)
@@ -514,11 +528,30 @@ def resolve(*, prepared, parsed, probability_band):
             h['score_raw'] = 0.0
     out = deepcopy(original)
     out['hypotheses'] = accepted
+    recovery = None
+    if continuity_policy:
+        continuity.confidence_projection(accepted)
     if question_index is not None:
         q = out['question']
         accepted_ids = {h['id'] for h in active}
         q['target_hypotheses'] = [hid for hid in q.get('target_hypotheses') or [] if hid in accepted_ids]
-        usable(bool(q['target_hypotheses']), 'question_has_no_supported_target')
+        if continuity_policy and (question_rejected or not q['target_hypotheses']):
+            # Discard the entire failed question. Only causes accepted against
+            # THIS turn's observations survive; no prior verdict is reused.
+            # This fixed reporting control contains no machine fact or action.
+            recovery = continuity.REPORTING_VERSION
+            q = continuity.reporting_question(language=prepared['language'],
+                number=int(q.get('question_number') or len(prepared.get('history') or []) + 1),
+                hypothesis_ids=[h['id'] for h in active])
+            out['question'] = q
+            for h in accepted:
+                # Validated technical checks are unnecessary for recollection.
+                # Withhold them, rather than turning them into an operating plan.
+                h['checks'] = []
+                h['checks_json'] = '[]'
+            out['status'], out['final_ready'], out['final_result'] = 'in_progress', False, {}
+        else:
+            usable(bool(q['target_hypotheses']), 'question_has_no_supported_target')
         # Server-only restrictive policy is composed after all generated note
         # fields passed review, before the signed output digest is calculated.
         q['safety_note'] = public_safety_note(q.get('safety_note', ''), language=prepared['language'])
@@ -534,17 +567,29 @@ def resolve(*, prepared, parsed, probability_band):
         q['why_asked'] = why if caution in why else why + '\n' + caution
         q['why_asked'] += '\n' + application_observation_policy(prepared['language'])['text']
         out['operator_summary'] = q['why_asked']
+        if recovery and continuity.reporting_was_answered(prepared.get('history')):
+            # One reporting opportunity suffices. Never loop on Unknown. The
+            # endpoint derives an explicitly unconfirmed final from these same
+            # reviewed causes; no model conclusion or rejected check survives.
+            out['status'], out['final_ready'] = 'completed', True
+            out['question'] = {}
     seal = {'policy_version': POLICY_VERSION, 'input_step': deepcopy(original),
             'decisions': deepcopy(parsed), 'context_digest': prepared['context_digest'],
             'output_claims_digest': claims_digest(out),
             'packet_digest': refs.digest(prepared['packet']),
             'reference_fingerprint': prepared['references']['frozen']['fingerprint']}
+    if continuity_policy:
+        seal['continuity_policy'] = continuity_policy
     summary = {**result['summary'], 'policy_version': POLICY_VERSION,
                'question_validated': question_index is None or question_index in by_index,
                'accepted_hypothesis_ids': [h['id'] for h in accepted],
                'rebound_hypothesis_ids': [h['id'] for i, h in enumerate(original['hypotheses'])
                                           if i in by_index and h.get('evidence_ids') != by_index[i]['citations']],
                'claims_digest': seal['output_claims_digest']}
+    if continuity_policy:
+        summary.update(continuity_policy=continuity_policy, application_question=recovery,
+                       rejected_question_discarded=question_rejected,
+                       confidence_calibrated=False)
     return out, seal, summary
 
 
@@ -647,7 +692,8 @@ def replay(*, state, packet, probability_band, terminal_projection=None):
     prepared = prepare(step=seal.get('input_step'), packet=packet, symptom_text=symptom, history=history,
                        language=state.get('language', 'en'))
     require(prepared['references']['frozen']['fingerprint'] == seal.get('reference_fingerprint'), 'review_registry_changed')
-    out, verified, summary = resolve(prepared=prepared, parsed=seal.get('decisions'), probability_band=probability_band)
+    out, verified, summary = resolve(prepared=prepared, parsed=seal.get('decisions'),
+        probability_band=probability_band, continuity_policy=seal.get('continuity_policy'))
     require(verified['output_claims_digest'] == seal.get('output_claims_digest'), 'review_replay_changed')
     current = {'hypotheses': state.get('hypotheses') or [], 'question': state.get('current_question') or {},
                'final_ready': state.get('status') == 'completed'}
@@ -659,3 +705,32 @@ def replay(*, state, packet, probability_band, terminal_projection=None):
     else:
         require(claims_digest(current) == seal['output_claims_digest'], 'reviewed_claims_changed')
     return out, summary
+
+
+
+def complete_reporting_unknown(*, state, packet, answer, probability_band):
+    """Close an abstained reporting turn without a provider call or new facts.
+
+    Replay first, then revalidate the identical proofs against an observation
+    registry that MUST remain identical. Raw notes remain in signed history,
+    but Unknown cannot add an observation or establish a diagnosis.
+    """
+    require(str(answer.get('api_value') or answer.get('value') or '') == 'unknown',
+            'reporting_unknown_required')
+    reviewed, _ = replay(state=state, packet=packet, probability_band=probability_band)
+    question = reviewed.get('question') or {}
+    require(not reviewed.get('final_ready') and
+            question.get('application_reporting_version') == continuity.REPORTING_VERSION,
+            'reviewed_reporting_question_required')
+    previous = state['grounding_review']
+    history = deepcopy(state.get('history') or [])
+    history.append({'question': deepcopy(question), 'answer': deepcopy(answer)})
+    prepared = prepare(step=previous['input_step'], packet=packet,
+        symptom_text=state.get('symptom_text') or '', history=history,
+        language=state.get('language') or 'en')
+    require(prepared['references']['frozen']['fingerprint'] == previous['reference_fingerprint'],
+            'reporting_observations_changed')
+    out, seal, summary = resolve(prepared=prepared, parsed=previous['decisions'],
+        probability_band=probability_band, continuity_policy=previous.get('continuity_policy'))
+    require(out.get('final_ready'), 'reporting_completion_required')
+    return out, seal, history, summary

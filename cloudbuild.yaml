@@ -8,9 +8,9 @@ timeout: 1200s
 substitutions:
   # Keep production on its prior revision until the live checks have passed.
   _P6_OPERATION: stage
-  _P6_EXPECTED_CURRENT_SHA: d765a19aeebed6095bc1609088b16a1d0c5fedfd
-  _P6_EXPECTED_CURRENT_REVISION: mm-ai-ingest-prod-bc91cc30b30604b02a0895b9716d3231f
-  _P6_EXPECTED_CURRENT_DIGEST: sha256:c1d11ac108eb4be6030cc58a230389f293588e93ac992c54c576dc558287c519
+  _P6_EXPECTED_CURRENT_SHA: f989f245b46fc21c03d07bdaeb4bba0770e793ae
+  _P6_EXPECTED_CURRENT_REVISION: mm-ai-ingest-prod-bda3ae803c9224cf69bf61c0c9b1a667f
+  _P6_EXPECTED_CURRENT_DIGEST: sha256:bd528dc07dcce6a148735c5527b85a4d3962f82cd16ada6e18cac28185d0f159
 
 steps:
   - name: gcr.io/google.com/cloudsdktool/cloud-sdk

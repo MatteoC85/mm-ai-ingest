@@ -3,7 +3,8 @@
 This is an extraction, not a new evidence policy. The composition root supplies
 retrieval, policy, budget and presentation callbacks at call time. This module
 has no application, database, provider or web-framework import. Legacy decisions,
-ordering, exception handling and budget checks are deliberately preserved.
+ordering, exception handling and budget checks are deliberately preserved, except
+for the bounded ASK facet acquisition described at its call site.
 """
 from __future__ import annotations
 from dataclasses import dataclass
@@ -162,13 +163,20 @@ def v13_initial_retrieval(*, q: str, company_id: str, machine_id: str, doc_ids: 
         budget.ensure_time(8.0)
 
     plan = dict(plan or _v13_fallback_plan(q))
+    facet_batch = mode == "neutral" and plan.get("_ask_facet_batch") is True
+    # Refinement has already retrieved the original question in the neutral
+    # pass. Spend the same bounded query slots on distinct router facets here,
+    # rather than letting that question displace the last facet in every batch.
+    dense_seed = list(plan.get("dense_queries") or [])
+    lexical_seed = list(plan.get("lexical_queries") or [])
+    question_seed = [q, plan.get("normalized_query")]
     dense_queries = _dedup_text_values(
-        [q, plan.get("normalized_query")] + list(plan.get("dense_queries") or []),
-        limit=V13_DENSE_QUERY_LIMIT if plan.get("dense_queries") else 2,
+        dense_seed + question_seed if facet_batch else question_seed + dense_seed,
+        limit=V13_DENSE_QUERY_LIMIT if dense_seed else 2,
     )
     lexical_queries = _dedup_text_values(
-        [q, plan.get("normalized_query")] + list(plan.get("lexical_queries") or []),
-        limit=V13_LEXICAL_QUERY_LIMIT if plan.get("lexical_queries") else 2,
+        lexical_seed + question_seed if facet_batch else question_seed + lexical_seed,
+        limit=V13_LEXICAL_QUERY_LIMIT if lexical_seed else 2,
     )
 
     candidate_k = 52 if mode in {"root_cause", "neutral"} else 34
@@ -657,6 +665,8 @@ def assistant_core_refine_retrieval(request: AssistantCoreRequest, retrieval: di
     _v13_initial_retrieval = runtime._v13_initial_retrieval
     _v13_score_candidates = runtime._v13_score_candidates
     is_smart = str(decision.effective_mode or "").strip().lower() == "smart_diagnostic"
+    is_ask = (str(request.requested_mode or "").strip().lower() == "ask"
+              and str(decision.effective_mode or "").strip().lower() == "ask")
     if is_smart:
         score_complete = _v13_score_candidates
         _v13_score_candidates = lambda q, rows: score_complete(q, rows, preserve_complete=True)
@@ -684,9 +694,62 @@ def assistant_core_refine_retrieval(request: AssistantCoreRequest, retrieval: di
     facet_runs: list[dict] = []
 
     facet_queries = list(decision.facet_queries or [])[:ASSISTANT_CORE_MAX_FACETS]
+    shared_facet_candidates = None
+    shared_acquisition_failed = False
+    if facet_queries and is_ask:
+        # One request-scoped acquisition serves all ASK facets. Previously each
+        # facet repeated embeddings, document scans and structured-source reads,
+        # consuming the synthesis/review window. Coverage remains independent:
+        # every facet is scored below using its own queries and confidence gate.
+        # All database readers and lineage checks are the existing scoped ones.
+        valid_facets = [f for f in facet_queries if str(f.facet or "").strip()]
+        facet_labels = [str(f.facet).strip() for f in valid_facets]
+        dense = _dedup_text_values(facet_labels + [
+            query for f in valid_facets for query in (f.dense_queries or ())
+        ], limit=V13_DENSE_QUERY_LIMIT)
+        lexical = _dedup_text_values(facet_labels + [
+            query for f in valid_facets for query in (f.lexical_queries or ())
+        ], limit=V13_LEXICAL_QUERY_LIMIT)
+        shared_plan = {
+            **base_plan,
+            "_ask_facet_batch": True,
+            "intent": decision.request_kind,
+            "information_task": decision.information_task,
+            "required_answer_types": list(decision.required_answer_types),
+            "normalized_query": retrieval_query,
+            "dense_queries": dense,
+            "lexical_queries": lexical,
+            "exact_terms": _dedup_text_values(list(decision.exact_terms) + [
+                term for f in valid_facets for term in (f.exact_terms or ())
+            ], limit=18),
+            "required_facets": facet_labels,
+            "ambiguities": list(decision.missing_information),
+        }
+        try:
+            combined = _v13_initial_retrieval(
+                q=retrieval_query,
+                company_id=request.company_id,
+                machine_id=request.machine_id,
+                doc_ids=doc_ids if isinstance(doc_ids, list) else None,
+                bubble_document_id=str(bubble_document_id or "").strip() or None,
+                ai_scope=request.ai_scope,
+                response_language=request.response_language,
+                mode="neutral",
+                plan=shared_plan,
+            )
+            shared_facet_candidates = list(combined.get("candidates") or [])
+        except Exception as exc:
+            # Never retry the same expensive pipeline once per facet. Existing
+            # neutral evidence can still be evaluated; authority failures remain
+            # latched by the request-owned acquisition wrapper.
+            shared_acquisition_failed = True
+            shared_facet_candidates = []
+            print("ASSISTANT_CORE_ASK_FACET_BATCH_FAIL", type(exc).__name__)
+        shared_facet_candidates = _assistant_core_merge_facet_candidates([
+            shared_facet_candidates, list(retrieval.get("candidates") or [])])
     if facet_queries:
         for index, facet_query in enumerate(facet_queries, start=1):
-            if budget is not None and budget.remaining() < 13.0:
+            if not is_ask and budget is not None and budget.remaining() < 13.0:
                 facet_runs.append({
                     "facet": facet_query.facet,
                     "status": "skipped_budget",
@@ -720,17 +783,19 @@ def assistant_core_refine_retrieval(request: AssistantCoreRequest, retrieval: di
                 "ambiguities": [],
             }
             try:
-                current = _v13_initial_retrieval(
-                    q=query_for_search,
-                    company_id=request.company_id,
-                    machine_id=request.machine_id,
-                    doc_ids=doc_ids if isinstance(doc_ids, list) else None,
-                    bubble_document_id=str(bubble_document_id or "").strip() or None,
-                    ai_scope=request.ai_scope,
-                    response_language=request.response_language,
-                    mode="smart_neutral" if is_smart else "neutral",
-                    plan=facet_plan,
-                )
+                current = ({"candidates": shared_facet_candidates}
+                           if shared_facet_candidates is not None else
+                           _v13_initial_retrieval(
+                               q=query_for_search,
+                               company_id=request.company_id,
+                               machine_id=request.machine_id,
+                               doc_ids=doc_ids if isinstance(doc_ids, list) else None,
+                               bubble_document_id=str(bubble_document_id or "").strip() or None,
+                               ai_scope=request.ai_scope,
+                               response_language=request.response_language,
+                               mode="smart_neutral" if is_smart else "neutral",
+                               plan=facet_plan,
+                           ))
                 current_candidates = _v13_score_candidates(
                     query_for_search,
                     [(dict(c) if lineage is None else lineage("copy", c, dict(c))) for c in (current.get("candidates") or []) if isinstance(c, dict)],
@@ -750,6 +815,18 @@ def assistant_core_refine_retrieval(request: AssistantCoreRequest, retrieval: di
                         preferred_source_types=facet_query.preferred_source_types,
                         rank=rank,
                     )
+                    if is_ask:
+                        # Batch cosine/title scores are maxima over several
+                        # queries, not proof of this particular facet. Require
+                        # the confidence evaluator's independent facet context
+                        # (including its bilingual query variants) as well.
+                        contextual = bool(
+                            float(support.get("lexical_overlap") or 0.0) >= 0.025
+                            or float(support.get("facet_coverage") or 0.0) >= 0.50
+                            or support.get("exact_hits")
+                        )
+                        support = {**support, "shared_batch_contextual": contextual,
+                                   "credible": bool(support.get("credible")) and contextual}
                     credible_hit = bool(support.get("credible"))
                     facet_score = float(support.get("score") or 0.0)
                     c["assistant_core_facet_hits"] = [facet] if credible_hit else []
@@ -776,6 +853,8 @@ def assistant_core_refine_retrieval(request: AssistantCoreRequest, retrieval: di
                         "candidate_count": len(annotated),
                         "credible_candidate_count": sum(1 for c in annotated if c.get("assistant_core_facet_hits")),
                         "status": "completed",
+                        **({"acquisition": "shared_ask_batch",
+                            "acquisition_failed": shared_acquisition_failed} if is_ask else {}),
                     }
                 )
             except Exception as exc:
