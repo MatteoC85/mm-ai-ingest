@@ -387,22 +387,23 @@ def synthesize_ask(
         set(decision.required_answer_types)
         & {REQ_NUMERIC_VALUE, REQ_INTERFACE_LOCATIONS, REQ_STATE_SEQUENCE}
     )
-    if has_structured and not composite_nonprocedure_contract and not conditions_only and (
+    if has_structured and not composite_nonprocedure_contract and (
         decision.request_kind == "procedure"
         or structured_procedure_task
     ):
         retrieval = _admit_input(request, retrieval, decision, runtime=runtime, stage="synthesis.structured")
-        structured = _v13_structured_ask(
-            q=request.query,
-            company_id=request.company_id,
-            machine_id=request.machine_id,
-            response_language=request.response_language,
-            top_k=request.top_k,
-            planner=planner,
-            seed_citations=retrieval.get("citations") or retrieval.get("candidates") or [],
-            assurance_meta=retrieval.get("retrieval_assurance") or {},
-            debug=request.debug,
-        )
+        with (_synthesis_review_reserve(required=True) if conditions_only else nullcontext()):
+            structured = _v13_structured_ask(
+                q=request.query,
+                company_id=request.company_id,
+                machine_id=request.machine_id,
+                response_language=request.response_language,
+                top_k=request.top_k,
+                planner=planner,
+                seed_citations=retrieval.get("citations") or retrieval.get("candidates") or [],
+                assurance_meta=retrieval.get("retrieval_assurance") or {},
+                debug=request.debug,
+            )
         if isinstance(structured, dict) and structured.get("ok") is True:
             structured.setdefault("information_task", decision.information_task)
             return structured
@@ -411,9 +412,8 @@ def synthesize_ask(
             return _assistant_core_build_no_evidence(request, decision, retrieval)
 
     retrieval = _admit_input(request, retrieval, decision, runtime=runtime, stage="synthesis.generate")
-    # A prerequisites-only question uses the existing grounded writer: retrieved
-    # Steps are evidence for conditions, not an instruction to execute their
-    # entire operation. It keeps the same mandatory review and deadline reserve.
+    # Without a structured family, the admitted manual sources still use the
+    # grounded writer and the same mandatory review/deadline reserve.
     # A manual procedure has no completed ProcedureBundle to prove every step.
     # Preserve the existing bounded repair window without forcing a verifier or
     # changing structured/legacy synthesis or their review policy.
@@ -612,7 +612,12 @@ def verify_or_repair_answer(
             "The explanatory body and all actionable checks must be in RESPONSE_LANGUAGE; a "
             "labelled quotation of original safety wording is supporting evidence, not a substitute "
             "for a translated precaution. Do not introduce a temporary state change or restart "
-            "to satisfy a request limited to checks. All safety, coverage and source rules remain.")
+            "to satisfy a request limited to checks. Read the whole selected operation family, "
+            "including safety notes on later Steps, to find phase-applicable PPE, STOP/hold, "
+            "isolation and access restrictions. A later startup/reset/readiness state cannot be "
+            "imported into pre-intervention checks without source-supported phase qualification. "
+            "Do not conflate ordinary STOP, emergency stops and isolation. Router search terms "
+            "are not evidence of applicability. All safety, coverage and source rules remain.")
     user_msg = (
         f"QUESTION:\n{request.query}\n\n"
         f"RESPONSE_LANGUAGE: {request.response_language}\n"

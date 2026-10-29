@@ -1,6 +1,6 @@
-"""Existing structured + overview synthesis, with optional request-owned lineage.
-No additional semantic pipeline or provider. The extracted default algorithms and
-prompts are preserved. Evidence binding is opt-in, supplied only by the owned Core.
+"""Structured + overview synthesis with request-owned evidence lineage.
+Protected conditions use the existing family selector and grounded writer under
+the same request budget. Evidence binding is supplied only by the owned Core.
 """
 from __future__ import annotations
 from dataclasses import dataclass, replace
@@ -8,6 +8,7 @@ from copy import deepcopy
 import json
 from typing import Any, Callable, Optional
 from .generation import GenericGenerationEvidence, GenerationEvidenceError
+from .request_scope import conditions_only_contract
 from ..evidence.ask_input import _same_value, ask_request_key
 from ..evidence.contracts import EvidenceContractError, SourceType
 from ..retrieval.ask_composition import AskSelection
@@ -117,7 +118,7 @@ def admitted_segment_anchors(complete_steps, seed_citations, *, runtime):
 
 def _select_admitted_procedure_family(*, q: str, company_id: str, planner: dict,
                                       parents: list[dict], runtime: TaskSynthesisRuntime):
-    """Spend the existing synthesis call on semantic family choice, not a new call.
+    """Select the admitted operation family before acquiring its canonical Steps.
 
     The provider returns an opaque choice among already-admitted parent records.
     It cannot add a source, alter a body or grant authority. Canonical child
@@ -140,7 +141,11 @@ def _select_admitted_procedure_family(*, q: str, company_id: str, planner: dict,
             "You are the semantic procedure-family selector for MachineMind ASK. Select the one supplied "
             "Procedure that describes the primary operations the user actually wants to perform. "
             "Distinguish an operation from setup, adjustment or checks concerning the same object; shared "
-            "component nouns or repeated Step counts do not establish task applicability. Interpret the "
+            "component nouns or repeated Step counts do not establish task applicability. "
+            "For checks BEFORE an operation, choose that operation's family, not a neighboring startup, "
+            "shutdown, transport or adjustment family merely mentioning safety or the same equipment. "
+            "The question determines the requested phase; router search terms are not evidence that "
+            "a neighboring phase's actions apply. Interpret the "
             "complete question and every mandatory facet together, in Italian, English or mixed language. "
             "The server will load the chosen Procedure's canonically related Steps, preserve their order, "
             "and independently verify the full answer and applicable manual support. Your selection is "
@@ -238,6 +243,10 @@ def structured_ask(
     ]
 
     information_task = str((planner or {}).get("information_task") or INFO_OTHER).strip().lower()
+    conditions_only = bool(runtime.preserve_complete and conditions_only_contract(
+        procedure_scope=planner.get("procedure_scope"), information_task=information_task,
+        required_answer_types=planner.get("required_answer_types"),
+        facet_queries=planner.get("facet_queries")))
     protected_family_selection = bool(runtime.preserve_complete and information_task in {
         INFO_PROCEDURE_FULL, INFO_PROCEDURE_SEGMENT})
     direct = []
@@ -324,7 +333,12 @@ def structured_ask(
                 raise GenerationEvidenceError("selected_procedure_has_no_canonical_steps")
             return None
 
-        if information_task == INFO_PROCEDURE_FULL:
+        if information_task == INFO_PROCEDURE_FULL or conditions_only:
+            # Preconditions can live in the warnings of later physical actions,
+            # and their safety vocabulary need not overlap the query/facet terms.
+            # Retain the already bounded canonical family as evidence, not as an
+            # instruction to execute every Step. The grounded writer below makes
+            # a sparse checklist and the independent review sees this whole set.
             selected_steps = complete_steps
         else:
             selected_steps = _v12_select_response_steps(
@@ -398,7 +412,7 @@ def structured_ask(
         )
     all_evidence = list(structured_scope) + list(manual_support)
     sources_block = ""
-    if selected_parent is None:
+    if selected_parent is None or conditions_only:
         sources_block = _v13_sources_block(
             all_evidence,
             max_context_chars=min(V13_HEAVY_CONTEXT_CHARS, max(16000, ASK_STRUCTURED_DIRECT_MAX_CONTEXT_CHARS)),
@@ -413,9 +427,30 @@ def structured_ask(
         "For P&S records, report problem, solution and notes. For photo/video records, use title/description metadata only and never claim visual or audio inspection. "
         "Every visible point must be grounded in citation_ids from SOURCES. Do not expose raw ids in text. Reply in the requested language."
     )
+    if conditions_only:
+        system_msg += (
+            " PROCEDURE_SCOPE=conditions_only: the supplied complete family is context for the "
+            "operation named by QUESTION, not a list of actions to execute. Produce a compact, "
+            "sparse checklist of applicable checks and precautions before that operation, in "
+            "RESPONSE_LANGUAGE. Read the safety notes of EVERY Step, including later Steps, for "
+            "requirements applying to the requested phase. Preserve their negations, conditions, "
+            "STOP/hold/isolation states, PPE and access restrictions explicitly in the answer. "
+            "Do not convert a later startup/readiness/reset condition into a prerequisite for "
+            "manual intervention. Do not instruct loading, adjustment, operation, trial or restart "
+            "unless requested. Distinguish ordinary STOP, emergency stops and isolation; never "
+            "treat them as interchangeable. Explain phase applicability when a check is conditional. "
+            "Search facets are not evidence that their example values or controls apply; answer "
+            "their supported intent from this operation's sources. Each grounded point must include "
+            "its applicable precaution in the requested language, not merely an untranslated quote. "
+            "Do not emit source Step numbers as checklist ordinals; the server numbers the checks.")
     assurance_block = _v13_assurance_prompt_block({"retrieval_assurance": dict(assurance_meta or {})})
     user_msg = (
-        f"QUESTION:\n{q}\n\nRESPONSE_LANGUAGE: {response_language}\n\nSOURCES:\n{sources_block}\n\n"
+        f"QUESTION:\n{q}\n\nRESPONSE_LANGUAGE: {response_language}\n\n"
+        + (("PROCEDURE_SCOPE: conditions_only\nREQUIRED_ANSWER_TYPES: "
+            + json.dumps(planner.get("required_answer_types") or [], ensure_ascii=False)
+            + "\nREQUIRED_FACETS: " + json.dumps(planner.get("required_facets") or [], ensure_ascii=False)
+            + "\n\n") if conditions_only else "")
+        + f"SOURCES:\n{sources_block}\n\n"
         + (f"{assurance_block}\n\n" if assurance_block else "")
         + "Return JSON only. Answer from the selected structured procedure/steps first, then add a brief directly applicable manual support or safety note when present."
     )
@@ -429,7 +464,7 @@ def structured_ask(
     parsed: dict = {}
     model_used = selected_family_model or model
     model_answer, model_citations = "", []
-    if selected_parent is None:
+    if selected_parent is None or conditions_only:
         try:
             parsed, model_used = _v13_json_models(
                 [
@@ -455,9 +490,41 @@ def structured_ask(
         model_answer, model_citations = _render_grounded_answer_points(
             grounded_points=grounded_points,
             citations=all_evidence,
-            max_points=max(1, int(ASK_UI_MAX_POINTS or 5)),
+            max_points=(max(1, min(8, len(grounded_points))) if conditions_only
+                        else max(1, int(ASK_UI_MAX_POINTS or 5))),
             q=q,
         )
+    if conditions_only:
+        # This branch keeps the language writer's checklist. Rendering canonical
+        # source Steps would replace it with physical operations/source-language
+        # prose and falsely claim an ordered execution bundle.
+        writer_status = str(parsed.get("answer_status") or "")
+        if writer_status not in {"answered", "no_sources"} or (
+                writer_status == "answered" and (not model_answer or not model_citations)):
+            raise GenerationEvidenceError("procedure_conditions_synthesis_incomplete")
+        if writer_status == "no_sources":
+            # A valid semantic refusal is not a transport failure and must not
+            # fall back to unrelated initial retrieval families.
+            model_answer, model_citations = "", []
+        response_citations = _sanitize_citations_for_response(model_citations, company_id=company_id)
+        response = {
+            "ok": True, "status": writer_status, "answer": model_answer,
+            "language": response_language, "citations": response_citations,
+            "rg_links": _build_rg_links(company_id, response_citations),
+            "top_k": top_k, "chat_model": model_used,
+            "similarity_max": max((float(c.get("similarity") or 0) for c in all_evidence), default=None),
+            "_assistant_core_validation_evidence": [_copy_candidate(c) for c in all_evidence],
+            "_assistant_core_procedure_family_review_required": True,
+            "_assistant_core_force_semantic_verify": True,
+            "meta": {"cacheable": writer_status == "answered", "semantic_cacheable": writer_status == "answered",
+                "procedure_family_selection": ("admitted_catalog_semantic_choice_then_canonical_expansion"
+                    if selected_parent is not None else "canonical_family_from_admitted_sources"),
+                "procedure_source_selection": {
+                    "version": "admitted-procedure-conditions-v1",
+                    "seed_citation_ids": [str(c.get("citation_id") or "") for c in seed_citations or []],
+                    "selected_step_numbers": selected_step_numbers,
+                    "generation_citation_ids": [str(c.get("citation_id") or "") for c in all_evidence]}}}
+        return _finalize_ask_response_for_ui(response, language=response_language)
     grounded_points = list(parsed.get("grounded_points") or [])
     if procedure_sequence_mode:
         # The deterministic Procedure span is authoritative. Do not call the

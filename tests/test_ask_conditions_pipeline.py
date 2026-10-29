@@ -131,7 +131,9 @@ class AskConditionsPipelineTests(unittest.TestCase):
                 "operation_boundary": boundary}, "offline-reviewer"
 
         eruntime = replace(m._assistant_core_ask_execution_runtime(), evidence_admission=deny,
-            _v13_structured_ask=deny, _v13_generate_ask_response=generate,
+            # This fixture isolates the manual/generic fallback. The real owned
+            # structured-family branch has its own admission/SQL pipeline test.
+            _v13_structured_ask=lambda **kw:None, _v13_generate_ask_response=generate,
             _assistant_core_recover_ask_from_evidence=deny, _v13_json_models=reviewer,
             _v13_current_budget=lambda:m._assistant_core_new_budget('ask'))
         runtime = replace(m._assistant_core_ask_validation_runtime(), execution_runtime=eruntime,

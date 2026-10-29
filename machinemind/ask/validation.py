@@ -257,7 +257,11 @@ def recover_citations(
     # For a deterministic structured procedure response, preserve the exact
     # manifest used to build answer/answer_html. Do not re-rank it against the
     # original semantic retrieval and do not apply the generic 8-source cap.
-    if trusted_manifest and decision.request_kind == KIND_PROCEDURE:
+    conditions_only = conditions_only_contract(
+        procedure_scope=getattr(decision, "procedure_scope", ""),
+        information_task=decision.information_task,
+        required_answer_types=decision.required_answer_types, facet_queries=decision.facet_queries)
+    if trusted_manifest and decision.request_kind == KIND_PROCEDURE and not conditions_only:
         manifest_ids = {
             str(c.get("citation_id") or "").strip()
             for c in trusted_manifest
@@ -357,7 +361,7 @@ def recover_citations(
 
     # Procedure answers without numerical claims still need an operational source
     # manifest. Select the highest-ranked procedure/steps when synthesis omitted it.
-    if not recovered and decision.request_kind == KIND_PROCEDURE:
+    if not recovered and decision.request_kind == KIND_PROCEDURE and not conditions_only:
         for candidate in selected:
             if _assistant_core_candidate_source_type(candidate) not in {"procedure", "step", "document"}:
                 continue

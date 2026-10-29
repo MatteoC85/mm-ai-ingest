@@ -124,7 +124,7 @@ class AskPreparedScopeAdmissionTests(unittest.TestCase):
                 data = {**data, target: {**data[target], "procedure_scope": value}}
             return real_admission(req, data, dec, stage)
         runtime = replace(runtime, evidence_admission=recording_admission)
-        if structured and scope != "conditions_only":
+        if structured:
             def reached(**kw):
                 # This sentinel executes strictly AFTER the real owned structured
                 # admission. It prevents irrelevant DB/family selection in this test.
@@ -163,14 +163,13 @@ class AskPreparedScopeAdmissionTests(unittest.TestCase):
                 finally:
                     self.finish(owner, session)
 
-    def test_checks_with_structured_evidence_use_real_generic_adapter(self):
+    def test_checks_with_structured_evidence_reach_owned_family_admission(self):
         request, decision, owner, data, runtime, session, calls, stages = self.harness(structured=True)
         try:
-            result = execution.synthesize_ask(request, data, decision, runtime=runtime)
-            self.assertEqual(result["status"], "answered")
-            self.assertEqual(len(calls), 1)
-            self.assertEqual(stages, ["synthesis.input", "synthesis.generate"])
-            self.assertEqual(result["citations"][0]["bubble_document_id"], "step:fixture")
+            with self.assertRaises(StructuredBoundaryReached):
+                execution.synthesize_ask(request, data, decision, runtime=runtime)
+            self.assertEqual(calls, [])
+            self.assertEqual(stages, ["synthesis.input", "synthesis.structured"])
         finally:
             self.finish(owner, session)
 
