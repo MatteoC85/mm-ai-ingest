@@ -16,7 +16,7 @@ from . import execution
 from .request_completion import record_contract_observation as _record_contract_observation
 from . import final_contract as _final_contract
 from . import procedure_review as _procedure_review
-from .request_scope import conditions_only_contract
+from .request_scope import conditions_only_contract, family_context_contract
 from ..evidence.ask_input import apply_ask_evidence_input, ask_request_key
 from ..evidence.contracts import EvidenceContractError
 
@@ -257,11 +257,12 @@ def recover_citations(
     # For a deterministic structured procedure response, preserve the exact
     # manifest used to build answer/answer_html. Do not re-rank it against the
     # original semantic retrieval and do not apply the generic 8-source cap.
-    conditions_only = conditions_only_contract(
+    family_context = family_context_contract(
         procedure_scope=getattr(decision, "procedure_scope", ""),
+        procedure_phase=getattr(decision, "procedure_phase", ()), question=request.query,
         information_task=decision.information_task,
         required_answer_types=decision.required_answer_types, facet_queries=decision.facet_queries)
-    if trusted_manifest and decision.request_kind == KIND_PROCEDURE and not conditions_only:
+    if trusted_manifest and decision.request_kind == KIND_PROCEDURE and not family_context:
         manifest_ids = {
             str(c.get("citation_id") or "").strip()
             for c in trusted_manifest
@@ -361,7 +362,7 @@ def recover_citations(
 
     # Procedure answers without numerical claims still need an operational source
     # manifest. Select the highest-ranked procedure/steps when synthesis omitted it.
-    if not recovered and decision.request_kind == KIND_PROCEDURE and not conditions_only:
+    if not recovered and decision.request_kind == KIND_PROCEDURE and not family_context:
         for candidate in selected:
             if _assistant_core_candidate_source_type(candidate) not in {"procedure", "step", "document"}:
                 continue

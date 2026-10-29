@@ -24,6 +24,7 @@ from machinemind.evidence.ask_input import (
     AskEvidenceAdmission, apply_ask_evidence_input, ask_request_key,
 )
 from machinemind.ask.request_scope import bind_conditions_requirements_to_question
+from machinemind.ask import procedure_scope as _procedure_scope
 
 
 MODE_ASK = "ask"
@@ -239,6 +240,7 @@ class AssistantCoreDecision:
     degraded: bool = False
     degraded_reason: str = ""
     procedure_scope: str = ""
+    procedure_phase: tuple[str, str, str] = ()
 
     @property
     def routed(self) -> bool:
@@ -670,6 +672,18 @@ def normalize_decision(
         if MODE_ASK in allowed:
             effective = MODE_ASK
 
+    procedure_scope = (raw.get("procedure_scope")
+        if request.requested_mode == MODE_ASK and effective == MODE_ASK
+        and request_kind not in {KIND_UNSAFE_REQUEST, KIND_OUT_OF_SCOPE}
+        and raw.get("procedure_scope") in _procedure_scope.SCOPES else "")
+    procedure_phase = ()
+    if procedure_scope == "bounded_phase":
+        if (request_kind != KIND_AMBIGUOUS and information_task == INFO_PROCEDURE_SEGMENT
+                and evidence_state in {EVIDENCE_SUPPORTED, EVIDENCE_PARTIAL, EVIDENCE_REFINE}):
+            procedure_phase = _procedure_scope.validated_phase(raw.get("procedure_phase"), request.query)
+        if not procedure_phase:
+            procedure_scope = ""
+
     return bind_conditions_requirements_to_question(AssistantCoreDecision(
         request_kind=request_kind,
         effective_mode=effective,
@@ -698,11 +712,8 @@ def normalize_decision(
         out_of_scope_reason=_clean_text(raw.get("out_of_scope_reason"), 500),
         rationale=_clean_text(raw.get("rationale"), 700),
         router_model=_clean_text(raw.get("router_model"), 100),
-        procedure_scope=(raw.get("procedure_scope")
-            if request.requested_mode == MODE_ASK and effective == MODE_ASK
-            and request_kind not in {KIND_UNSAFE_REQUEST, KIND_OUT_OF_SCOPE}
-            and raw.get("procedure_scope") in ("conditions_only", "execution_steps", "other")
-            else ""),
+        procedure_scope=procedure_scope,
+        procedure_phase=procedure_phase,
     ))
 
 
@@ -819,6 +830,7 @@ def decorate_response(
         "required_answer_types": list(decision.required_answer_types),
         "confidence": round(decision.confidence, 4),
         **({"procedure_scope": decision.procedure_scope} if decision.procedure_scope else {}),
+        **({"procedure_phase": list(decision.procedure_phase)} if decision.procedure_phase else {}),
         "requested_mode_fit": bool(decision.requested_mode_fit),
         "evidence_state": decision.evidence_state,
         "evidence_policy": decision.evidence_policy,

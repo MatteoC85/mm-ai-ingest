@@ -21,7 +21,7 @@ from assistant_core_v2 import (
 )
 from . import review_evidence
 from . import phase_trace
-from .request_scope import conditions_only_contract
+from .request_scope import family_context_contract
 from .request_completion import current as _completion
 from .task_generation import TaskGenerationEvidence
 from .generation import GenerationEvidenceError
@@ -359,17 +359,18 @@ class ResponseEvidenceFlow(TaskGenerationEvidence):
                 # The first verifier's admitted collection contains its complete
                 # retrieval/manifest union. Keep these occurrence-bound views;
                 # a later repair prefix must not replace the stored selection.
-                # A conditions writer used this complete, observed operation
+                # A phase/conditions writer used this complete, observed operation
                 # family. Reviewing unrelated initial-search procedures would
                 # introduce new phases/requirements the writer never saw.
                 # Only the producer snapshot enables this restriction; manual
-                # fallback, execution/full procedures and legacy keep extensions.
+                # fallback, canonical execution/full and legacy keep extensions.
                 conditions_family = bool(
                     original.get("_assistant_core_procedure_family_review_required") is True
                     and original.get("_assistant_core_validation_evidence")
                     and original.get("_assistant_core_source_ordered_procedure") is not True
-                    and conditions_only_contract(
+                    and family_context_contract(
                         procedure_scope=getattr(self.decision, "procedure_scope", ""),
+                        procedure_phase=getattr(self.decision, "procedure_phase", ()), question=self.request.query,
                         information_task=self.decision.information_task,
                         required_answer_types=self.decision.required_answer_types,
                         facet_queries=self.decision.facet_queries))

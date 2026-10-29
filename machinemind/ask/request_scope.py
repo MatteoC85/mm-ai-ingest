@@ -29,6 +29,52 @@ def conditions_only_contract(*, procedure_scope, information_task,
     return bool(mandatory) and all(kind in checks for kind in mandatory)
 
 
+def bounded_phase_contract(*, procedure_scope, information_task,
+                           required_answer_types, facet_queries,
+                           procedure_phase=(), question="") -> bool:
+    """A source-backed phase answer, never lexical guesses about temporal intent.
+
+    The same router supplies exact QUESTION excerpts for completed context,
+    requested actions and later context. They identify scope, not source facts.
+    Inconsistent/legacy metadata keeps the original execution producer.
+    """
+    if procedure_scope != "bounded_phase" or information_task != "procedure_segment":
+        return False
+    if type(procedure_phase) not in {tuple, list} or len(procedure_phase) != 3:
+        return False
+    before, actions, after = procedure_phase
+    values = [value for value in procedure_phase if value]
+    if (not actions or not (before or after)
+            or any(type(value) is not str or len(value) > 240 or not value.strip() for value in values)
+            or any(type(value) is not str for value in procedure_phase)):
+        return False
+    question_text = str(question or "")
+    if (len(set(values)) != len(values)
+            or any(value not in question_text for value in values)):
+        return False
+    requirements = set(required_answer_types or ())
+    allowed = {"ordered_actions", "state_sequence", "safety_conditions", "checklist", "explanation"}
+    if "ordered_actions" not in requirements or not requirements.issubset(allowed):
+        return False
+    mandatory = []
+    for facet in facet_queries or ():
+        field = facet.get if isinstance(facet, Mapping) else lambda key, default=None: getattr(facet, key, default)
+        if field("must_cover") is True:
+            mandatory.append(field("answer_type"))
+    return bool(mandatory) and "ordered_actions" in mandatory and all(kind in allowed for kind in mandatory)
+
+
+def family_context_contract(*, procedure_scope, information_task,
+                            required_answer_types, facet_queries,
+                            procedure_phase=(), question="") -> bool:
+    return conditions_only_contract(procedure_scope=procedure_scope,
+        information_task=information_task, required_answer_types=required_answer_types,
+        facet_queries=facet_queries) or bounded_phase_contract(
+        procedure_scope=procedure_scope, information_task=information_task,
+        required_answer_types=required_answer_types, facet_queries=facet_queries,
+        procedure_phase=procedure_phase, question=question)
+
+
 def bind_conditions_requirements_to_question(decision):
     """Separate router search hypotheses from the user's answer obligation.
 

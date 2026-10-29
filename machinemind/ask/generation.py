@@ -10,7 +10,7 @@ from copy import deepcopy
 from dataclasses import dataclass, replace
 import re
 from typing import Any, Callable
-from .request_scope import conditions_only_contract
+from .request_scope import conditions_only_contract, bounded_phase_contract
 from ..evidence.ask_input import _same_value, ask_request_key
 from ..evidence.contracts import EvidenceContractError, SourceType
 from ..retrieval.ask_composition import AskEvidenceSession, AskSelection
@@ -132,6 +132,10 @@ def generate_ask_response(
         procedure_scope=contract.get("procedure_scope"), information_task=information_task,
         required_answer_types=contract.get("required_answer_types"),
         facet_queries=contract.get("facet_queries")))
+    bounded_phase = bool(runtime.preserve_procedure_points and bounded_phase_contract(
+        procedure_scope=contract.get("procedure_scope"), information_task=information_task,
+        required_answer_types=contract.get("required_answer_types"), facet_queries=contract.get("facet_queries"),
+        procedure_phase=contract.get("procedure_phase"), question=q))
     complete_procedure_context = bool(runtime.preserve_procedure_points
         and information_task in {INFO_PROCEDURE_FULL, INFO_PROCEDURE_SEGMENT})
     evidence_limit = 24 if overview_catalog_requested else V13_MAX_EVIDENCE_ITEMS_ASK
@@ -191,6 +195,7 @@ def generate_ask_response(
         "You are MachineMind ASK, an evidence-grounded industrial documentation assistant. Use only SOURCES. "
         "Answer the exact user question, not a nearby topic. Prefer exact-machine evidence over company-general evidence when relevance is comparable. "
         "For procedures, return the actual ordered operations and conditions; for lists/tables, preserve all relevant items, labels, codes, values and units; for comparisons, keep the compared facts aligned. "
+        "Copy technical identifiers, product/grade designations and codes exactly from their supporting source, including letter order and digits. Never silently correct an apparent typo or substitute a familiar standard from prior knowledge. If the source spelling is uncertain, quote it as documented and state that it needs verification; do not assert an unsupported correction. Omit an unsupported optional identifier rather than inventing one, while keeping every supported mandatory fact and explicitly stating any required information that is unavailable. "
         "Structured procedure/step/P&S records are first-class evidence. Manual text may support them, but generic legal, overview, installation or safety text cannot replace a specific answer. "
         "For photo/video records, use metadata only and never claim visual/audio inspection. Do not expose citation ids or internal Bubble ids in visible text. "
         "If SOURCES do not support the answer, return no_sources. Reply in the requested language."
@@ -215,6 +220,16 @@ def generate_ask_response(
             "Write every checklist item and its precautions in RESPONSE_LANGUAGE, preserving "
             "source labels, units, negations and applicability conditions. Standing isolation, STOP "
             "and PPE requirements remain in force; do not invent their release.")
+    if bounded_phase:
+        system_msg += (
+            " PROCEDURE_SCOPE=bounded_phase: answer only the phase requested in QUESTION and "
+            "its exact PROCEDURE_PHASE excerpts. Do not repeat already completed operations or "
+            "perform the excluded later phase. Treat all supplied operations as evidence context, "
+            "not a required list. Give requested actions in documented order with all applicable "
+            "precautions and complete restoration/closure for every action you actually propose. "
+            "Keep any source-required hold, STOP or isolation until its release is expressly "
+            "supported and part of the requested phase. If phase boundaries cannot be supported, "
+            "return no_sources rather than inventing transitions.")
     if runtime.preserve_procedure_points and information_task in {INFO_PROCEDURE_FULL, INFO_PROCEDURE_SEGMENT}:
         system_msg += (" Each grounded_points.text contains one complete check with its applicability and precautions; do not prefix it with a numbered list heading. The server numbers checklist items."
                        if conditions_only else
@@ -242,6 +257,9 @@ def generate_ask_response(
     contract_block = (
         f"INFORMATION_TASK: {information_task}\n"
         + ("PROCEDURE_SCOPE: conditions_only\n" if conditions_only else "")
+        + (("PROCEDURE_SCOPE: bounded_phase\nPROCEDURE_PHASE: " + json.dumps(dict(zip(
+            ("completed_context", "requested_actions", "later_context"), contract["procedure_phase"])),
+            ensure_ascii=False) + "\n") if bounded_phase else "")
         +
         f"REQUIRED_ANSWER_TYPES: {json.dumps(sorted(required_answer_types), ensure_ascii=False)}\n"
         f"REQUIRED_FACETS: {json.dumps(required_facets, ensure_ascii=False)}\n"

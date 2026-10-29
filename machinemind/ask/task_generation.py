@@ -8,7 +8,7 @@ from copy import deepcopy
 import json
 from typing import Any, Callable, Optional
 from .generation import GenericGenerationEvidence, GenerationEvidenceError
-from .request_scope import conditions_only_contract
+from .request_scope import conditions_only_contract, bounded_phase_contract
 from ..evidence.ask_input import _same_value, ask_request_key
 from ..evidence.contracts import EvidenceContractError, SourceType
 from ..retrieval.ask_composition import AskSelection
@@ -247,6 +247,11 @@ def structured_ask(
         procedure_scope=planner.get("procedure_scope"), information_task=information_task,
         required_answer_types=planner.get("required_answer_types"),
         facet_queries=planner.get("facet_queries")))
+    bounded_phase = bool(runtime.preserve_complete and bounded_phase_contract(
+        procedure_scope=planner.get("procedure_scope"), information_task=information_task,
+        required_answer_types=planner.get("required_answer_types"), facet_queries=planner.get("facet_queries"),
+        procedure_phase=planner.get("procedure_phase"), question=q))
+    family_context = conditions_only or bounded_phase
     protected_family_selection = bool(runtime.preserve_complete and information_task in {
         INFO_PROCEDURE_FULL, INFO_PROCEDURE_SEGMENT})
     direct = []
@@ -333,7 +338,7 @@ def structured_ask(
                 raise GenerationEvidenceError("selected_procedure_has_no_canonical_steps")
             return None
 
-        if information_task == INFO_PROCEDURE_FULL or conditions_only:
+        if information_task == INFO_PROCEDURE_FULL or family_context:
             # Preconditions can live in the warnings of later physical actions,
             # and their safety vocabulary need not overlap the query/facet terms.
             # Retain the already bounded canonical family as evidence, not as an
@@ -412,7 +417,7 @@ def structured_ask(
         )
     all_evidence = list(structured_scope) + list(manual_support)
     sources_block = ""
-    if selected_parent is None or conditions_only:
+    if selected_parent is None or family_context:
         sources_block = _v13_sources_block(
             all_evidence,
             max_context_chars=min(V13_HEAVY_CONTEXT_CHARS, max(16000, ASK_STRUCTURED_DIRECT_MAX_CONTEXT_CHARS)),
@@ -443,13 +448,31 @@ def structured_ask(
             "their supported intent from this operation's sources. Each grounded point must include "
             "its applicable precaution in the requested language, not merely an untranslated quote. "
             "Do not emit source Step numbers as checklist ordinals; the server numbers the checks.")
+    if bounded_phase:
+        system_msg += (
+            " PROCEDURE_SCOPE=bounded_phase: the complete family is evidence context, not a list "
+            "of actions to execute. QUESTION and its exact PROCEDURE_PHASE excerpts delimit the "
+            "requested phase: completed_context is already completed, requested_actions is what "
+            "the answer must explain, and later_context is not yet to be performed. Do not repeat "
+            "earlier loading, setup or intervention, and do not instruct a later trial/startup "
+            "merely because it is adjacent in the source. Explain only the requested supported "
+            "restoration/actions in their source order. Preserve every necessary closure and "
+            "precaution for actions you actually propose; read all Step notes for applicable "
+            "restrictions. Do not remove a prerequisite then retain its dependent action. "
+            "Clearly separate conditions that must remain true now from actions allowed only "
+            "after the requested phase. Ordinary STOP, emergency stop and isolation are distinct. "
+            "Reply in RESPONSE_LANGUAGE, using complete grounded points and only their supporting "
+            "citation_ids. The server numbers the answer; do not use source Step numbers as ordinals.")
     assurance_block = _v13_assurance_prompt_block({"retrieval_assurance": dict(assurance_meta or {})})
     user_msg = (
         f"QUESTION:\n{q}\n\nRESPONSE_LANGUAGE: {response_language}\n\n"
-        + (("PROCEDURE_SCOPE: conditions_only\nREQUIRED_ANSWER_TYPES: "
+        + (("PROCEDURE_SCOPE: " + str(planner.get("procedure_scope")) + "\nREQUIRED_ANSWER_TYPES: "
             + json.dumps(planner.get("required_answer_types") or [], ensure_ascii=False)
             + "\nREQUIRED_FACETS: " + json.dumps(planner.get("required_facets") or [], ensure_ascii=False)
-            + "\n\n") if conditions_only else "")
+            + ("\nPROCEDURE_PHASE: " + json.dumps(dict(zip(
+                ("completed_context", "requested_actions", "later_context"), planner["procedure_phase"])), ensure_ascii=False)
+                if bounded_phase else "")
+            + "\n\n") if family_context else "")
         + f"SOURCES:\n{sources_block}\n\n"
         + (f"{assurance_block}\n\n" if assurance_block else "")
         + "Return JSON only. Answer from the selected structured procedure/steps first, then add a brief directly applicable manual support or safety note when present."
@@ -464,7 +487,7 @@ def structured_ask(
     parsed: dict = {}
     model_used = selected_family_model or model
     model_answer, model_citations = "", []
-    if selected_parent is None or conditions_only:
+    if selected_parent is None or family_context:
         try:
             parsed, model_used = _v13_json_models(
                 [
@@ -490,14 +513,14 @@ def structured_ask(
         model_answer, model_citations = _render_grounded_answer_points(
             grounded_points=grounded_points,
             citations=all_evidence,
-            max_points=(max(1, min(8, len(grounded_points))) if conditions_only
+            max_points=(max(1, min(8, len(grounded_points))) if family_context
                         else max(1, int(ASK_UI_MAX_POINTS or 5))),
             q=q,
         )
-    if conditions_only:
-        # This branch keeps the language writer's checklist. Rendering canonical
-        # source Steps would replace it with physical operations/source-language
-        # prose and falsely claim an ordered execution bundle.
+    if family_context:
+        # Keep the language writer's checks or requested phase. Canonical source
+        # rendering would substitute the whole family for that bounded answer
+        # and falsely claim that every contextual Step must be executed.
         writer_status = str(parsed.get("answer_status") or "")
         if writer_status not in {"answered", "no_sources"} or (
                 writer_status == "answered" and (not model_answer or not model_citations)):
@@ -520,7 +543,8 @@ def structured_ask(
                 "procedure_family_selection": ("admitted_catalog_semantic_choice_then_canonical_expansion"
                     if selected_parent is not None else "canonical_family_from_admitted_sources"),
                 "procedure_source_selection": {
-                    "version": "admitted-procedure-conditions-v1",
+                    "version": ("admitted-procedure-bounded-phase-v1" if bounded_phase
+                                else "admitted-procedure-conditions-v1"),
                     "seed_citation_ids": [str(c.get("citation_id") or "") for c in seed_citations or []],
                     "selected_step_numbers": selected_step_numbers,
                     "generation_citation_ids": [str(c.get("citation_id") or "") for c in all_evidence]}}}
