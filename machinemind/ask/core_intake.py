@@ -470,6 +470,7 @@ class _CoreIntake:
         contract = {
             **dict(data.get("assistant_core_contract") or {}),
             "information_task": decision.information_task,
+            "procedure_scope": getattr(decision, "procedure_scope", ""),
             "required_answer_types": list(decision.required_answer_types),
             "required_facets": list(decision.required_facets),
             "facet_queries": [
@@ -482,6 +483,7 @@ class _CoreIntake:
         }
         planner = dict(data.get("plan") or self._execution_snapshot._v13_fallback_plan(self.request.query))
         planner["information_task"] = decision.information_task
+        planner["procedure_scope"] = contract["procedure_scope"]
         planner["required_answer_types"] = list(decision.required_answer_types)
         planner["required_facets"] = self._execution_snapshot._dedup_text_values(
             list(planner.get("required_facets") or []) + list(decision.required_facets), limit=14)
