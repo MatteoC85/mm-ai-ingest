@@ -7,6 +7,7 @@ Legacy heuristics, scores, query parameters and fallback behavior remain intact.
 """
 from __future__ import annotations
 from dataclasses import dataclass
+import re
 from typing import Any, Callable, Optional, TYPE_CHECKING
 from .page_evidence import (PAGE_BINDING_COLUMNS, PageEvidenceRead, PageReadBindingError,
                             _PageReadCapture)
@@ -1970,6 +1971,60 @@ def v13_fetch_manual_support_deterministic(*, company_id: str, machine_id: str, 
     return _v13_fetch_manual_support_deterministic_impl(company_id=company_id, machine_id=machine_id, q=q, planner=planner, structured_citations=structured_citations, runtime=runtime)
 
 
+def _manual_support_facet_selection(scored, planner, max_items, terms_for_query):
+    """Preserve the main operating page and recall missing mandatory detail.
+
+    Candidates already passed the scoped, bounded page read and operational
+    relevance floor. Facet vocabulary only selects among these candidates; it
+    supplies no facts, grants no authority and cannot assert semantic coverage.
+    The existing selected-Step filter and independent review still apply.
+    """
+    default = scored[:max_items]
+    if (len(default) < 2 or (planner or {}).get("information_task")
+            not in {"procedure_full", "procedure_segment"}):
+        return default
+    facets = (planner or {}).get("facet_queries") or []
+    if not isinstance(facets, list):
+        return default
+    # Whole words prevent a new recall preference from matching, for example,
+    # 'seal' inside 'sealed'. Short labels cannot select a page on their own.
+    vocabulary = [set(re.findall(r"[^\W_]+", str(row.get("chunk_full") or "").casefold()))
+                  for row in scored]
+    selected = [0]
+    for facet in facets[:12]:
+        if (not isinstance(facet, dict) or facet.get("must_cover") is not True
+                or facet.get("answer_type") != "ordered_actions"):
+            continue
+        variants = [facet.get("facet")]
+        for name in ("dense_queries", "lexical_queries"):
+            values = facet.get(name)
+            if isinstance(values, list):
+                variants.extend(values[:2])
+        groups = []
+        for variant in variants:
+            if not isinstance(variant, str) or not variant.strip():
+                continue
+            terms = {t.casefold() for t in terms_for_query(variant[:1200], {}, [])
+                     if len(t) >= 4 and re.fullmatch(r"[^\W_]+", t)}
+            if len(terms) >= 3:
+                groups.append(terms)
+        if not groups:
+            continue
+        def coverage(index):
+            return max((len(terms & vocabulary[index]) / len(terms)
+                        if len(terms & vocabulary[index]) >= 2 else 0.0)
+                       for terms in groups)
+        best = max(range(len(scored)), key=lambda index: (coverage(index), -index))
+        # Require substantial lexical evidence and an improvement over pages
+        # already kept. A weak or unavailable facet leaves normal top-k intact.
+        if coverage(best) >= 0.5 and coverage(best) > max(coverage(i) for i in selected):
+            selected.append(best)
+        if len(selected) >= max_items:
+            break
+    selected.extend(i for i in range(len(scored)) if i not in selected)
+    return [scored[i] for i in selected[:max_items]]
+
+
 def _v13_fetch_manual_support_deterministic_impl(*, company_id: str, machine_id: str, q: str, planner: dict, structured_citations: list[dict], runtime: V13FetchManualSupportDeterministicRuntime, _page_capture: _PageReadCapture | None=None) -> list[dict]:
     binding_columns = PAGE_BINDING_COLUMNS if _page_capture is not None else ""
     ASK_SNIPPET_CHARS = runtime.ASK_SNIPPET_CHARS
@@ -2081,7 +2136,8 @@ def _v13_fetch_manual_support_deterministic_impl(*, company_id: str, machine_id:
         )
     )
     max_items = max(0, int(ASK_STRUCTURED_DIRECT_MANUAL_SUPPORT_MAX_ITEMS or 2))
-    selected = scored[:max_items]
+    selected = _manual_support_facet_selection(
+        scored, planner, max_items, _ask_structured_manual_support_terms)
     selected = _v12_filter_linkable_manual_support(company_id, selected)
     return _v12_mark_manual_support(selected)
 
