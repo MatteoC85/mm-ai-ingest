@@ -19,6 +19,66 @@ from typing import Any, Callable
 from .final_contract import source_note_present
 
 VERSION = "ask-procedure-review-v2"
+
+
+def manual_note_projection(bindings, *, original_answer: str, reviewed_answer: str,
+                           review: dict, admitted_ids: set[str]) -> tuple[list[str], dict]:
+    """Keep references for unchanged server-bound manual excerpts, not authority.
+
+    Only an independently reviewed, byte-identical retain can restore a source
+    reference omitted by the reviewer. An edited/translated note needs the
+    independently verified block edit and its original references; this function
+    never attributes new prose to a source or grants a semantic PASS.
+    """
+    if not bindings:
+        return [], {}
+    if type(bindings) is not list:
+        raise ValueError("manual_note_binding_invalid")
+    required = []
+    for binding in bindings:
+        if type(binding) is not dict:
+            raise ValueError("manual_note_binding_invalid")
+        text, ids = binding.get("text"), binding.get("citation_ids")
+        if (type(text) is not str or not text or type(ids) is not list or not ids
+                or any(type(cid) is not str or cid not in admitted_ids for cid in ids)
+                or not source_note_present(original_answer, text)):
+            raise ValueError("manual_note_binding_invalid")
+        required.extend(ids)
+    required = list(dict.fromkeys(required))
+    audit = review.get("procedure_review") or {}
+    mode = audit.get("reply_mode")
+    if (mode == "retain" and original_answer == reviewed_answer
+            and audit.get("independent_semantic_review") is True
+            and audit.get("input_answer_sha256") == digest(original_answer)
+            and audit.get("output_answer_sha256") == digest(reviewed_answer)):
+        return required, {"version": "ask-manual-note-binding-v1", "complete": True,
+                          "basis": "unchanged_reviewed_source_excerpt", "notes": len(bindings),
+                          "citation_ids": required}
+    if mode != "edit" or not set(required).issubset(set(review.get("citation_ids") or [])):
+        raise ValueError("manual_note_binding_invalid")
+    boundary = review.get("operation_boundary_validation") or {}
+    if (audit.get("independent_semantic_review") is not True
+            or audit.get("source_sequence_immutable") is not True
+            or audit.get("input_answer_sha256") != digest(original_answer)
+            or audit.get("output_answer_sha256") != digest(reviewed_answer)
+            or boundary.get("complete") is not True
+            or boundary.get("precedence_checked") is not True
+            or boundary.get("answer_sha256") != digest(reviewed_answer)):
+        raise ValueError("manual_note_binding_invalid")
+    changed_blocks = {edit.get("block_id") for edit in review.get("edits") or [] if type(edit) is dict}
+    original_blocks = block_layout(original_answer)["blocks"]
+    for binding in bindings:
+        if source_note_present(reviewed_answer, binding["text"]):
+            continue
+        owners = [block["block_id"] for block in original_blocks
+                  if source_note_present(block["text"], binding["text"])]
+        if len(owners) != 1 or owners[0] not in changed_blocks:
+            raise ValueError("manual_note_binding_invalid")
+    return [], {"version": "ask-manual-note-binding-v1", "complete": True,
+                "basis": "reviewed_edit_with_original_source_refs", "notes": len(bindings),
+                "citation_ids": required}
+
+
 _NUMBERED = re.compile(r"(?m)^(?P<number>[1-9][0-9]*)[.)][ \t]+")
 # Reviewers can reproduce a heading with Markdown, indentation, or a line
 # break after its number. Recognize those forms before accepting an edit so

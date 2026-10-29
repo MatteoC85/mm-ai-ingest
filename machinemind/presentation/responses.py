@@ -101,16 +101,37 @@ def build_structured_procedure_ui_model(*, structured_citations: list[dict], man
         source_no = _runtime.safe_int(record.get('source_number'), fallback_no)
         record['display_number'] = source_no if source_no > 0 else fallback_no
     manual_notes: list[str] = []
+    manual_note_sources: list[dict] = []
     if manual_support_citations:
-        operation_note, safety_note = _runtime.manual_operation_and_safety_notes_from_support_citations(manual_support_citations, q=q, structured_citations=coherent, language=response_language)
+        support = _runtime.manual_operation_and_safety_notes_from_support_citations(manual_support_citations, q=q, structured_citations=coherent, language=response_language)
+        retained_ids = {str(c.get('citation_id') or '').strip() for c in manual_support_citations}
+        if isinstance(support, dict):
+            operation_note, safety_note = support.get('operation_note', ''), support.get('safety_note', '')
+            operation_ids, safety_ids = support.get('operation_citation_ids', []), support.get('safety_citation_ids', [])
+        else:
+            operation_note, safety_note = support
+            operation_ids, safety_ids = [], []
         if not safety_note:
-            safety_note = _runtime.manual_note_from_grounded_points(grounded_points, language=response_language)
+            for point in grounded_points:
+                ids = point.get('citation_ids') if isinstance(point, dict) else None
+                if not isinstance(ids, list) or not ids or not set(ids).issubset(retained_ids):
+                    continue
+                safety_note = _runtime.manual_note_from_grounded_points([point], language=response_language)
+                if safety_note:
+                    safety_ids = ids
+                    break
         existing = ' '.join([title, purpose, recipients, safety_level] + [str(r.get('instruction') or '') + ' ' + str(r.get('safety') or '') for r in records])
-        for candidate in (operation_note if not records else '', safety_note):
-            note = excerpt(candidate, max_chars=700)
+        for candidate, ids in ((operation_note, operation_ids), (safety_note, safety_ids)):
+            # Extractors supply complete, bounded notes. Do not truncate a note
+            # after its action but before its condition/restoration.
+            note = str(candidate or '').strip()
+            if isinstance(support, dict) and (not ids or not set(ids).issubset(retained_ids)):
+                continue
             if note and _runtime.procedure_ui_note_is_novel(note, existing + ' ' + ' '.join(manual_notes)):
                 manual_notes.append(note)
-    return {'kind': 'procedure', 'language': 'en' if is_en else 'it', 'title': title, 'summary': purpose, 'personnel': recipients, 'safety_level': safety_level, 'before': before, 'steps': operational, 'final_checks': final_checks, 'manual_notes': manual_notes[:2]}
+                if ids:
+                    manual_note_sources.append({'text': note, 'citation_ids': list(dict.fromkeys(ids))})
+    return {'kind': 'procedure', 'language': 'en' if is_en else 'it', 'title': title, 'summary': purpose, 'personnel': recipients, 'safety_level': safety_level, 'before': before, 'steps': operational, 'final_checks': final_checks, 'manual_notes': manual_notes[:2], 'manual_note_sources': manual_note_sources[:2]}
 
 def procedure_ui_model_to_text(model: dict, *, response_language: str, _runtime: ResponsePresentationRuntime, preserve_complete: bool=False) -> str:
     if not isinstance(model, dict) or model.get('kind') != 'procedure':
@@ -171,7 +192,7 @@ def procedure_ui_model_to_text(model: dict, *, response_language: str, _runtime:
             final_blocks.append(('Attention: ' if is_en else 'Attenzione: ') + safety)
     if final_blocks:
         parts.append(('Final check' if is_en else 'Verifica finale') + '\n' + '\n'.join(final_blocks))
-    notes = [excerpt(x, max_chars=700) for x in model.get('manual_notes') or [] if excerpt(x, max_chars=700)]
+    notes = [str(x).strip() for x in model.get('manual_notes') or [] if str(x).strip()]
     if notes:
         parts.append(('Manual support' if is_en else 'Supporto dal manuale') + '\n' + '\n'.join((f'- {x}' for x in notes)))
     return '\n\n'.join((x for x in parts if str(x or '').strip())).strip()

@@ -229,7 +229,7 @@ _RESPONSE_PRESENTATION_RUNTIME = lambda: _presentation_responses.ResponsePresent
     evidence_role=_v12_evidence_role,
     looks_like_target_language=_looks_like_target_language,
     manual_note_from_grounded_points=_manual_note_from_grounded_points,
-    manual_operation_and_safety_notes_from_support_citations=_manual_operation_and_safety_notes_from_support_citations,
+    manual_operation_and_safety_notes_from_support_citations=lambda *a, **kw: _manual_operation_and_safety_notes_from_support_citations(*a, **kw, with_bindings=True),
     strip_inline_citation_markers_for_display=_strip_inline_citation_markers_for_display,
     unique_non_empty_strings=_unique_non_empty_strings,
     source_type_from_document_id=_source_type_from_document_id,
@@ -4834,7 +4834,7 @@ def _manual_note_from_grounded_points(grounded_points: list[dict], *, language: 
         if txt and any(m in low for m in markers):
             txt = re.sub(r"^\s*(?:nota\s+(?:dal|del)\s+manuale|manual\s+safety\s+note|safety\s+note)\s*[:：-]\s*", "", txt, flags=re.IGNORECASE).strip()
             txt = re.sub(r"\s+", " ", txt).strip()
-            return _clean_display_text(txt, max_len=360)
+            return _procedure_ui_clean(txt) if len(txt) <= 2400 and not txt.endswith(("…", "...")) else ""
     return ""
 
 
@@ -4872,34 +4872,15 @@ def _manual_operation_and_safety_notes_from_support_citations(
     q: str,
     structured_citations: list[dict],
     language: str,
-) -> tuple[str, str]:
+    with_bindings: bool = False,
+) -> tuple[str, str] | dict:
     """Return (operation_note, safety_note) from selected manual support pages.
 
-    Prefer notes produced by the strict semantic selector. The older sentence
-    scoring below is only a fallback after a page has already been selected as
-    directly relevant by the selector.
+    Keep each extract inside one admitted record. Complete adjacent operational
+    sentences preserve preparation, action and restoration; presentation limits
+    must not cut an action/condition in half. Source IDs are internal bindings,
+    never inserted into the visible answer.
     """
-    llm_op = ""
-    llm_safe = ""
-    for c in citations or []:
-        if not isinstance(c, dict):
-            continue
-        if not llm_op:
-            llm_op = _clean_display_text(str(c.get("llm_operation_note") or ""), max_len=360)
-        if not llm_safe:
-            llm_safe = _clean_display_text(str(c.get("llm_safety_note") or ""), max_len=320)
-    if llm_op or llm_safe:
-        return llm_op, llm_safe
-
-    text = " ".join(str(c.get("chunk_full") or c.get("snippet") or "") for c in (citations or []) if isinstance(c, dict))
-    text = re.sub(r"\s+", " ", text).strip()
-    if not text:
-        return "", ""
-
-    sentences = [x.strip() for x in re.split(r"(?<=[\.!?])\s+", text) if x.strip()]
-    if not sentences:
-        return "", ""
-
     op_terms = _ask_structured_manual_support_terms(q, None, structured_citations)
     safety_terms = _ask_structured_manual_support_safety_terms()
 
@@ -4914,32 +4895,82 @@ def _manual_operation_and_safety_notes_from_support_citations(
         low = _normalize_unicode_advanced(sent).lower()
         return sum(1.0 for t in safety_terms if t and t in low)
 
-    op_ranked = sorted(((score_op(s), s) for s in sentences), key=lambda x: -x[0])
-    safe_ranked = sorted(((score_safe(s), s) for s in sentences), key=lambda x: -x[0])
+    def complete(value: str) -> str:
+        value = re.sub(r"\s+", " ", str(value or "")).strip()
+        # Omit an oversized/incomplete extract instead of publishing half of a
+        # safety condition. The independent review still has the admitted page.
+        if not value or len(value) > 2400 or value.endswith(("…", "...")):
+            return ""
+        return _procedure_ui_clean(value)
 
-    op_note = ""
-    if op_ranked and op_ranked[0][0] >= 1.0:
-        op_note = op_ranked[0][1]
-        # Add one adjacent operational sentence when it is also relevant and short enough.
-        try:
-            idx = sentences.index(op_note)
-            if idx + 1 < len(sentences) and score_op(sentences[idx + 1]) >= 1.0:
-                op_note = f"{op_note} {sentences[idx + 1]}"
-        except Exception:
-            pass
-
-    safety_note = ""
-    if safe_ranked and safe_ranked[0][0] >= 2.0:
-        safety_note = safe_ranked[0][1]
-        if op_note and safety_note.strip() == op_note.strip():
-            for sc, sent in safe_ranked[1:]:
-                if sc >= 2.0 and sent.strip() != op_note.strip():
-                    safety_note = sent
-                    break
-
-    op_note = _clean_display_text(re.sub(r"\s+", " ", op_note).strip(), max_len=360) if op_note else ""
-    safety_note = _clean_display_text(re.sub(r"\s+", " ", safety_note).strip(), max_len=320) if safety_note else ""
-    return op_note, safety_note
+    records = []
+    for c in citations or []:
+        if not isinstance(c, dict) or not str(c.get("citation_id") or "").strip():
+            continue
+        text = re.sub(r"\s+", " ", str(c.get("chunk_full") or c.get("snippet") or "")).strip()
+        sentences = [s.strip() for s in re.split(r"(?<=[\.!?])\s+", text) if s.strip()]
+        if sentences:
+            records.append((c, sentences))
+    ranked = sorted(((score_op(sent), ri, si) for ri, (_, sentences) in enumerate(records)
+                     for si, sent in enumerate(sentences)), key=lambda row: -row[0])
+    retained_ids = {str(c["citation_id"]).strip() for c, _ in records}
+    def semantic_ids(c, kind):
+        ids = c.get("llm_" + kind + "_citation_ids")
+        return list(dict.fromkeys(ids)) if (type(ids) is list and ids
+            and all(type(cid) is str and cid in retained_ids for cid in ids)) else []
+    op_note = safety_note = ""
+    op_ids, safety_ids = [], []
+    semantic_record = next((row for row in records if complete(row[0].get("llm_operation_note") or "")
+                            and semantic_ids(row[0], "operation")), None)
+    selected = semantic_record
+    if semantic_record:
+        op_note = complete(semantic_record[0]["llm_operation_note"])
+    elif ranked and ranked[0][0] >= 1.0:
+        _, ri, si = ranked[0]
+        selected = records[ri]
+        sentences = selected[1]
+        if si:
+            previous = sentences[si - 1]
+            query_terms = _ask_structured_manual_support_terms(q, None, [])
+            # A purpose/condition lead-in can precede the highest-scoring action.
+            # Retain it only when it names this query's operation, not merely an
+            # adjacent adjustment of the same component.
+            if (re.match(r"^(?:to\s|before\s|per\s|prima\s)", previous, re.IGNORECASE)
+                    and any(term in _normalize_unicode_advanced(previous).lower() for term in query_terms)
+                    and score_op(previous) >= 1.0):
+                si -= 1
+        chosen = [sentences[si]]
+        # Keep a bounded local action span, never cross a page or silently drop
+        # the following restoration because a display character limit was met.
+        for following in sentences[si + 1:si + 3]:
+            if score_op(following) < 1.0:
+                break
+            chosen.append(following)
+        op_note = complete(" ".join(chosen))
+    if selected:
+        citation, sentences = selected
+        cid = str(citation["citation_id"]).strip()
+        if op_note:
+            op_ids = (semantic_ids(citation, "operation")
+                      if semantic_record else [cid])
+        safety_note = complete(citation.get("llm_safety_note") or "") if semantic_ids(citation, "safety") else ""
+        if not safety_note:
+            safe_ranked = sorted(((score_safe(s), s) for s in sentences), key=lambda x: -x[0])
+            safety_note = next((complete(s) for score, s in safe_ranked
+                                if score >= 2.0 and s not in op_note and complete(s)), "")
+        if safety_note:
+            safety_ids = (semantic_ids(citation, "safety")
+                          if safety_note == complete(citation.get("llm_safety_note") or "") else [cid])
+    semantic_safety = next((c for c, _ in records if complete(c.get("llm_safety_note") or "")
+                            and semantic_ids(c, "safety")), None)
+    if semantic_safety:
+        # The strict selector may admit a separate safety page without an
+        # operational note. Keep all IDs of that selected aggregate note.
+        safety_note = complete(semantic_safety["llm_safety_note"])
+        safety_ids = semantic_ids(semantic_safety, "safety")
+    result = {"operation_note": op_note, "safety_note": safety_note,
+              "operation_citation_ids": op_ids, "safety_citation_ids": safety_ids}
+    return result if with_bindings else (op_note, safety_note)
 
 
 

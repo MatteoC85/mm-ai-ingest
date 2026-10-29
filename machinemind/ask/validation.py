@@ -595,6 +595,10 @@ def validate_response(
             )
     else:
         answer = _assistant_core_redact_internal_text(out.get("answer") or "")
+        manual_note_bindings = ((out.get("_assistant_ui_model") or {}).get("manual_note_sources") or []) if protected_procedure else []
+        manual_note_original = answer
+        manual_note_binding_invalid = False
+        manual_note_binding_proof = {}
         if citations and source_text:
             answer, removed_claims = _assistant_core_filter_unsupported_claim_sentences(answer, source_text)
         answer = _assistant_core_media_metadata_only(answer, citations, request.response_language)
@@ -630,6 +634,22 @@ def validate_response(
                 fields=runtime.source_fields, notes=source_notes,
                 notes_present=_final_contract.source_note_present,
                 source_ordered=source_ordered_procedure)
+        # The existing claim filter normalizes sentence punctuation/newlines
+        # even when it removes no claim. Bind the note to that same projection,
+        # not to a looser global text matcher. Any semantic removal fails closed.
+        projected_manual_notes = []
+        for note in manual_note_bindings:
+            if type(note) is not dict or type(note.get("text")) is not str:
+                manual_note_binding_invalid = True
+                continue
+            projected_note, dropped_note_claims = _assistant_core_filter_unsupported_claim_sentences(note["text"], source_text)
+            if (dropped_note_claims or not projected_note
+                    or not _final_contract.source_note_present(answer, projected_note)):
+                manual_note_binding_invalid = True
+                continue
+            projected_manual_notes.append({**note, "text": projected_note})
+        manual_note_bindings = projected_manual_notes
+        manual_note_original = answer
         if (
             not semantic_contract_pass
             and str(out.get("status") or "").lower() == "answered"
@@ -713,6 +733,15 @@ def validate_response(
                 for cid in (semantic_contract.get("citation_ids") or [])
                 if str(cid or "").strip() in allowed
             ]
+            if semantic_contract_pass and manual_note_bindings:
+                try:
+                    bound_ids, manual_note_binding_proof = _procedure_review.manual_note_projection(
+                        manual_note_bindings, original_answer=manual_note_original,
+                        reviewed_answer=answer, review=semantic_contract, admitted_ids=set(allowed))
+                    verifier_ids = list(dict.fromkeys(verifier_ids + bound_ids))
+                except ValueError:
+                    manual_note_binding_invalid = True
+                    semantic_contract["_terminal_review_failure"] = True
             if (semantic_contract_pass or semantic_contract_partial) and verifier_ids:
                 raw_final = [allowed[cid] for cid in verifier_ids if cid in allowed]
                 raw_final = _collection(request, raw_final, decision, runtime=runtime, stage="validation.semantic_citations")
@@ -912,6 +941,27 @@ def validate_response(
                     "missing_list_items": semantic_missing_list,
                     "semantic_verifier": dict(semantic_contract),
                 }
+            if manual_note_bindings and semantic_contract_pass:
+                final_ids = {str(c.get("citation_id") or "") for c in citations}
+                try:
+                    # The review signs its pre-grounding text. final_contract
+                    # already binds only the exact zero-removal grounding
+                    # projection (and explicit source-note preservation) to the
+                    # displayed answer; never rewrite the review's digest.
+                    if answer_contract_result.get("semantic_answer_bound") is not True:
+                        raise ValueError("manual_note_binding_invalid")
+                    _, manual_note_binding_proof = _procedure_review.manual_note_projection(
+                        manual_note_bindings, original_answer=manual_note_original,
+                        reviewed_answer=str(semantic_contract.get("answer") or ""),
+                        review=semantic_contract, admitted_ids=final_ids)
+                except ValueError:
+                    manual_note_binding_invalid = True
+                answer_contract_result["manual_note_bindings"] = manual_note_binding_proof
+            if manual_note_binding_invalid:
+                semantic_contract["_terminal_review_failure"] = True
+                answer_contract_result.update(passed=False, complete=False,
+                    reason="manual_procedure_semantic_review_incomplete",
+                    manual_note_binding_invalid=True)
             _record_contract_observation("final_contract", answer_contract_result)
             if not bool(answer_contract_result.get("passed")):
                 repair_attempted = bool(out.get("_assistant_core_repair_attempted"))

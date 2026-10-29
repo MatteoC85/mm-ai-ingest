@@ -824,8 +824,11 @@ def _ask_structured_direct_fetch_manual_support_impl(*, company_id: str, machine
     if max_items <= 0:
         return []
 
-    operation_note = _clean_display_text(str(selected_meta.get("operation_note") or ""), max_len=360)
-    safety_note = _clean_display_text(str(selected_meta.get("safety_note") or ""), max_len=320)
+    def complete_note(value):
+        text = str(value or "").strip()
+        return _clean_display_text(text, max_len=len(text) + 1) if len(text) <= 2400 else ""
+    operation_note = complete_note(selected_meta.get("operation_note"))
+    safety_note = complete_note(selected_meta.get("safety_note"))
 
     by_idx = {int(c.get("selector_index") or 0): c for c in candidates}
     selected: list[dict] = []
@@ -846,8 +849,10 @@ def _ask_structured_direct_fetch_manual_support_impl(*, company_id: str, machine
         c["retrieval_score"] = float(c["similarity"])
         if kind == "operation" and operation_note:
             c["llm_operation_note"] = operation_note
+            c["llm_operation_citation_ids"] = [str(by_idx[i].get("citation_id") or "") for i in sorted(op_indices) if i in by_idx]
         if kind == "safety" and safety_note:
             c["llm_safety_note"] = safety_note
+            c["llm_safety_citation_ids"] = [str(by_idx[i].get("citation_id") or "") for i in sorted(safety_indices) if i in by_idx]
         selected.append(c)
 
     for idx in sorted(op_indices):
