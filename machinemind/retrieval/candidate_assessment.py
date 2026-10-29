@@ -304,6 +304,58 @@ def v12_step_direct_query_score(step: dict, q: str, *, runtime: V12StepDirectQue
 
 
 @dataclass(frozen=True)
+class V12OperationInflectionScoresRuntime:
+    _content_term_set: Callable[..., Any]
+    _ask_structured_direct_stopwords: Callable[..., Any]
+    _procedure_ui_fields: Callable[..., Any]
+    _procedure_ui_sections: Callable[..., Any]
+    _v13_source_title_token_similarity: Callable[..., Any]
+
+
+def v12_operation_inflection_scores(steps: list[dict], q: str, *, runtime: V12OperationInflectionScoresRuntime) -> list[float]:
+    """Bounded lexical recall inside one already admitted Procedure family.
+
+    Query inflection must not let a well-matched prerequisite erase the requested
+    action. Reuse the conservative title comparator; this is an anchor score,
+    never semantic coverage or authority. Exact query qualifiers found anywhere
+    in the family remain mandatory on each new anchor, so a location-qualified
+    request cannot gain a similarly worded operation at another location.
+    """
+    query_terms = runtime._content_term_set(q, limit=80) - runtime._ask_structured_direct_stopwords()
+    parsed = []
+    for step in steps:
+        fields = runtime._procedure_ui_fields(step)
+        sections = runtime._procedure_ui_sections(fields.get("description") or "")
+        title = runtime._content_term_set(str(fields.get("title") or ""), limit=180)
+        action = runtime._content_term_set(str(sections.get("instruction") or sections.get("body") or ""), limit=180)
+        parsed.append((title, action))
+    family_terms = set().union(*(title | action for title, action in parsed)) if parsed else set()
+    qualifiers = query_terms & family_terms
+
+    def score(words):
+        if not query_terms or not words:
+            return 0.0
+        total, inflected = 0.0, False
+        for term in query_terms:
+            if term in words:
+                total += 1.0
+                continue
+            # Whole alphabetic tokens only; never fuzzy-match IDs, numbers or
+            # short fragments. The existing comparator rejects shared prefixes
+            # such as pressa/pressione and stampo/stampaggio.
+            best = max((runtime._v13_source_title_token_similarity(term, word)
+                        for word in words if min(len(term), len(word)) >= 5
+                        and term.isalpha() and word.isalpha() and term[:2] == word[:2]), default=0.0)
+            if best >= 0.84:
+                total += best
+                inflected = True
+        return total / (len(query_terms) * len(words)) ** 0.5 if inflected else 0.0
+
+    return [max(score(title), 0.5 * score(action)) if qualifiers <= title | action else 0.0
+            for title, action in parsed]
+
+
+@dataclass(frozen=True)
 class V12StepPhraseScoreRuntime:
     _content_term_set: Callable[..., Any]
     _normalize_unicode_advanced: Callable[..., Any]

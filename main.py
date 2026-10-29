@@ -5777,6 +5777,18 @@ def _v12_step_direct_query_score(step: dict, q: str) -> float:
     )
 
 
+def _v12_operation_inflection_scores(steps: list[dict], q: str) -> list[float]:
+    return _retrieval_candidate_assessment.v12_operation_inflection_scores(
+        steps, q, runtime=_retrieval_candidate_assessment.V12OperationInflectionScoresRuntime(
+            _content_term_set=_content_term_set,
+            _ask_structured_direct_stopwords=_ask_structured_direct_stopwords,
+            _procedure_ui_fields=_procedure_ui_fields,
+            _procedure_ui_sections=_procedure_ui_sections,
+            _v13_source_title_token_similarity=_v13_source_title_token_similarity,
+        ),
+    )
+
+
 def _v12_step_is_closing_or_verification(step: dict) -> bool:
     fields = _procedure_ui_fields(step)
     text = _normalize_unicode_advanced(
@@ -6157,7 +6169,11 @@ def _v12_select_response_steps(
         # matches must not silently substitute a different requested segment.
         return []
 
-    scored = [(_v12_step_sort_key(step)[0], _v12_step_direct_query_score(step, q), step) for step in steps]
+    # Only implicit contiguous-operation spans use this bounded inflection
+    # recall. Explicit endpoints and sparse checklists retain their own policy.
+    inflection_scores = _v12_operation_inflection_scores(steps, q)
+    scored = [(_v12_step_sort_key(step)[0], max(_v12_step_direct_query_score(step, q), inflection), step)
+              for step, inflection in zip(steps, inflection_scores)]
     max_direct = max((score for _, score, _ in scored), default=0.0)
     direct_numbers: set[int] = set()
     if max_direct >= 0.055:
