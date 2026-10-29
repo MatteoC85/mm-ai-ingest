@@ -37,6 +37,8 @@ from urllib.parse import urlparse, unquote
 
 from machinemind.ask import routing_runtime as _ask_routing_runtime
 from machinemind.ask import request_readiness as _ask_request_readiness
+from machinemind.ask import procedure_scope as _ask_procedure_scope
+from machinemind.ask import request_scope as _ask_request_scope
 
 from assistant_core_v2 import (
     response_has_rejected_answer,
@@ -13860,7 +13862,7 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
         "fault_diagnostic for abnormal-condition causes/checks; comparison for explicit comparison; general_technical for generic engineering; out_of_scope or other otherwise. "
         "A request can require several output shapes at once. Put every mandatory shape in REQUIRED_ANSWER_TYPES: numeric_value, ordered_actions, checklist, safety_conditions, interface_locations, state_sequence, diagnostic_causes, comparison, source_locations, or explanation. "
         "INFORMATION_TASK is the primary/hardest contract, not necessarily the only requirement. When the user asks for a numeric value/limit/capacity together with checks or safety conditions, use numeric_specification as the primary task and include numeric_value plus checklist and/or safety_conditions; do not reduce that composite request to procedure_segment. "
-        "When the user asks for only part of an operation, use procedure_segment plus ordered_actions. For a complete operation, use procedure_full plus ordered_actions. For HMI navigation use interface_navigation plus interface_locations. For synchronization use sequence_or_synchronization plus state_sequence. For diagnosis use fault_diagnostic plus diagnostic_causes and usually checklist. "
+        "When the user asks how to carry out only part of an operation, use procedure_segment plus ordered_actions. A request only for prerequisites, checks or safety conditions uses checklist and/or safety_conditions without adding an unrequested execution sequence. For a complete operation, use procedure_full plus ordered_actions. For HMI navigation use interface_navigation plus interface_locations. For synchronization use sequence_or_synchronization plus state_sequence. For diagnosis use fault_diagnostic plus diagnostic_causes and usually checklist. "
         "This classification is semantic and multilingual; do not depend on a fixed wording. "
         "ROOT_CAUSE is used only when the user reports an abnormal machine condition and wants plausible causes or discriminating checks. "
         "SMART_DIAGNOSTIC is used only for an abnormal condition suitable for an interactive closed-question diagnosis. "
@@ -13896,6 +13898,7 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
     elif request.requested_mode == MODE_ASK:
         system_msg += _retrieval_precision_facts.SCALAR_TARGET_INSTRUCTION
         system_msg += _ask_request_readiness.INSTRUCTION
+        system_msg += _ask_procedure_scope.INSTRUCTION
     # USER_REQUEST is supplied once, unmodified. There is no precomputed
     # "observed" block that could incorrectly override a negated clause.
     epistemic_block = ""
@@ -13939,8 +13942,10 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
                 _retrieval_diagnostic_query.router_schema_with_diagnostic_basis(
                     build_router_schema(allowed_modes)
                 ) if is_root_cause else (
-                    _ask_request_readiness.router_schema(
-                        _retrieval_precision_facts.router_schema_with_scalar_target(build_router_schema(allowed_modes))
+                    _ask_procedure_scope.router_schema(
+                        _ask_request_readiness.router_schema(
+                            _retrieval_precision_facts.router_schema_with_scalar_target(build_router_schema(allowed_modes))
+                        )
                     )
                     if request.requested_mode == MODE_ASK else build_router_schema(allowed_modes)
                 )
@@ -16397,7 +16402,13 @@ def _assistant_core_answer_contract_check(
     elif task == INFO_SEQUENCE_SYNCHRONIZATION:
         requirements.add(REQ_STATE_SEQUENCE)
     elif task in {INFO_PROCEDURE_FULL, INFO_PROCEDURE_SEGMENT}:
-        requirements.add(REQ_ORDERED_ACTIONS)
+        if not _ask_request_scope.conditions_only_contract(
+            procedure_scope=getattr(decision, "procedure_scope", ""),
+            information_task=task,
+            required_answer_types=decision.required_answer_types,
+            facet_queries=decision.facet_queries,
+        ):
+            requirements.add(REQ_ORDERED_ACTIONS)
     elif task == INFO_FAULT_DIAGNOSTIC:
         requirements.add(REQ_DIAGNOSTIC_CAUSES)
 

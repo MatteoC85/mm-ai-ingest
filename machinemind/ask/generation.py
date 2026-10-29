@@ -10,6 +10,7 @@ from copy import deepcopy
 from dataclasses import dataclass, replace
 import re
 from typing import Any, Callable
+from .request_scope import conditions_only_contract
 from ..evidence.ask_input import _same_value, ask_request_key
 from ..evidence.contracts import EvidenceContractError, SourceType
 from ..retrieval.ask_composition import AskEvidenceSession, AskSelection
@@ -127,6 +128,10 @@ def generate_ask_response(
     machine_catalog_digest = str(contract.get("machine_catalog_digest") or "").strip()
     candidates = list(retrieval.get("citations") or retrieval.get("candidates") or [])
     information_task = str(contract.get("information_task") or INFO_OTHER).strip().lower()
+    conditions_only = bool(runtime.preserve_procedure_points and conditions_only_contract(
+        procedure_scope=contract.get("procedure_scope"), information_task=information_task,
+        required_answer_types=contract.get("required_answer_types"),
+        facet_queries=contract.get("facet_queries")))
     complete_procedure_context = bool(runtime.preserve_procedure_points
         and information_task in {INFO_PROCEDURE_FULL, INFO_PROCEDURE_SEGMENT})
     evidence_limit = 24 if overview_catalog_requested else V13_MAX_EVIDENCE_ITEMS_ASK
@@ -145,7 +150,7 @@ def generate_ask_response(
         required_answer_types.add(REQ_INTERFACE_LOCATIONS)
     elif information_task == INFO_SEQUENCE_SYNCHRONIZATION:
         required_answer_types.add(REQ_STATE_SEQUENCE)
-    elif information_task in {INFO_PROCEDURE_FULL, INFO_PROCEDURE_SEGMENT}:
+    elif information_task in {INFO_PROCEDURE_FULL, INFO_PROCEDURE_SEGMENT} and not conditions_only:
         required_answer_types.add(REQ_ORDERED_ACTIONS)
     required_facets = _dedup_text_values(contract.get("required_facets") or [], limit=12)
     fail_closed = bool(contract.get("fail_closed"))
@@ -200,8 +205,20 @@ def generate_ask_response(
         system_msg += " Include the requested practical checks as a compact checklist grounded in the sources."
     if REQ_SAFETY_CONDITIONS in required_answer_types:
         system_msg += " Include directly applicable authorization or safety conditions without replacing the requested technical answer."
+    if conditions_only:
+        system_msg += (
+            " PROCEDURE_SCOPE=conditions_only: answer only the checks and safety conditions to verify "
+            "before the requested operation. Do not instruct the user to execute that operation, "
+            "load material, adjust equipment, run a trial or restart merely because those actions "
+            "occur in a retrieved procedure. Select applicable conditions from the supplied sources; "
+            "do not copy an entire Step or a neighboring installation/transport operation. "
+            "Write every checklist item and its precautions in RESPONSE_LANGUAGE, preserving "
+            "source labels, units, negations and applicability conditions. Standing isolation, STOP "
+            "and PPE requirements remain in force; do not invent their release.")
     if runtime.preserve_procedure_points and information_task in {INFO_PROCEDURE_FULL, INFO_PROCEDURE_SEGMENT}:
-        system_msg += " Each grounded_points.text contains action prose only; do not prefix it with a numbered list heading. The server numbers the ordered points."
+        system_msg += (" Each grounded_points.text contains one complete check with its applicability and precautions; do not prefix it with a numbered list heading. The server numbers checklist items."
+                       if conditions_only else
+                       " Each grounded_points.text contains action prose only; do not prefix it with a numbered list heading. The server numbers the ordered points.")
         system_msg += (
             " A requested procedure segment must include the source-documented closure of every operation "
             "you start: restore temporarily changed pressure, clamps, guards, modes, settings or guides, "
@@ -224,6 +241,8 @@ def generate_ask_response(
     assurance_block = _v13_assurance_prompt_block(retrieval)
     contract_block = (
         f"INFORMATION_TASK: {information_task}\n"
+        + ("PROCEDURE_SCOPE: conditions_only\n" if conditions_only else "")
+        +
         f"REQUIRED_ANSWER_TYPES: {json.dumps(sorted(required_answer_types), ensure_ascii=False)}\n"
         f"REQUIRED_FACETS: {json.dumps(required_facets, ensure_ascii=False)}\n"
     )

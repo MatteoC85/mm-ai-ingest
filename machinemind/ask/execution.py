@@ -21,6 +21,7 @@ from typing import Any, Callable, Optional, TYPE_CHECKING
 from . import procedure_review as _procedure_review
 from . import final_contract as _final_contract
 from . import phase_trace
+from .request_scope import conditions_only_contract
 from .request_completion import current as _current_completion
 from .request_completion import record_contract_observation as _record_contract_observation
 from .request_completion import synthesis_review_reserve as _synthesis_review_reserve
@@ -316,6 +317,7 @@ def synthesize_ask(
     contract = {
         **prepared_contract,
         "information_task": decision.information_task,
+        "procedure_scope": getattr(decision, "procedure_scope", ""),
         "required_answer_types": list(decision.required_answer_types),
         "required_facets": list(decision.required_facets),
         "facet_queries": [
@@ -339,6 +341,7 @@ def synthesize_ask(
     }
     planner = dict(retrieval.get("plan") or _v13_fallback_plan(request.query))
     planner["information_task"] = decision.information_task
+    planner["procedure_scope"] = contract["procedure_scope"]
     planner["required_answer_types"] = list(decision.required_answer_types)
     planner["required_facets"] = _dedup_text_values(
         list(planner.get("required_facets") or []) + list(decision.required_facets),
@@ -375,11 +378,16 @@ def synthesize_ask(
         INFO_PROCEDURE_FULL,
         INFO_PROCEDURE_SEGMENT,
     }
+    conditions_only = bool(_guarded(runtime, request, decision) and conditions_only_contract(
+        procedure_scope=getattr(decision, "procedure_scope", ""),
+        information_task=decision.information_task,
+        required_answer_types=decision.required_answer_types,
+        facet_queries=decision.facet_queries))
     composite_nonprocedure_contract = bool(
         set(decision.required_answer_types)
         & {REQ_NUMERIC_VALUE, REQ_INTERFACE_LOCATIONS, REQ_STATE_SEQUENCE}
     )
-    if has_structured and not composite_nonprocedure_contract and (
+    if has_structured and not composite_nonprocedure_contract and not conditions_only and (
         decision.request_kind == "procedure"
         or structured_procedure_task
     ):
@@ -403,6 +411,9 @@ def synthesize_ask(
             return _assistant_core_build_no_evidence(request, decision, retrieval)
 
     retrieval = _admit_input(request, retrieval, decision, runtime=runtime, stage="synthesis.generate")
+    # A prerequisites-only question uses the existing grounded writer: retrieved
+    # Steps are evidence for conditions, not an instruction to execute their
+    # entire operation. It keeps the same mandatory review and deadline reserve.
     # A manual procedure has no completed ProcedureBundle to prove every step.
     # Preserve the existing bounded repair window without forcing a verifier or
     # changing structured/legacy synthesis or their review policy.
@@ -534,12 +545,17 @@ def verify_or_repair_answer(
     if not sources_block:
         return {"outcome": "no_sources", "answer": "", "reason": "empty_evidence"}
 
+    conditions_only = bool(_guarded(runtime, request, decision) and conditions_only_contract(
+        procedure_scope=getattr(decision, "procedure_scope", ""),
+        information_task=decision.information_task,
+        required_answer_types=decision.required_answer_types,
+        facet_queries=decision.facet_queries))
     requirements = sorted({
         str(x or "").strip().lower()
         for x in decision.required_answer_types
         if str(x or "").strip()
     })
-    if (_guarded(runtime, request, decision)
+    if (_guarded(runtime, request, decision) and not conditions_only
             and (decision.information_task in {runtime.INFO_PROCEDURE_FULL, runtime.INFO_PROCEDURE_SEGMENT}
                  or decision.request_kind == "procedure")):
         requirements = sorted(set(requirements) | {REQ_ORDERED_ACTIONS})
@@ -588,10 +604,21 @@ def verify_or_repair_answer(
         "When repair fields are non-empty, this is the one bounded repair attempt: return a complete replacement, not an addendum, preserving all correct supported content. "
         "When MACHINE_CATALOG is present, inspect every catalog row before deriving expected_list_items; low ranking or different wording is not permission to omit an explicitly documented machine assembly or auxiliary system."
     )
+    if conditions_only:
+        system_msg += (
+            " PROCEDURE_SCOPE=conditions_only: verify a complete checklist of directly applicable "
+            "preconditions, not the execution of the later operation. Reject unrelated transport, "
+            "installation, adjustments or trial cycles even when neighboring sources mention them. "
+            "The explanatory body and all actionable checks must be in RESPONSE_LANGUAGE; a "
+            "labelled quotation of original safety wording is supporting evidence, not a substitute "
+            "for a translated precaution. Do not introduce a temporary state change or restart "
+            "to satisfy a request limited to checks. All safety, coverage and source rules remain.")
     user_msg = (
         f"QUESTION:\n{request.query}\n\n"
         f"RESPONSE_LANGUAGE: {request.response_language}\n"
         f"INFORMATION_TASK: {decision.information_task}\n"
+        + ("PROCEDURE_SCOPE: conditions_only\n" if conditions_only else "")
+        +
         f"REQUIRED_ANSWER_TYPES: {json.dumps(requirements, ensure_ascii=False)}\n"
         f"HARD_REQUIREMENTS: {json.dumps(hard_requirements, ensure_ascii=False)}\n"
         f"REQUIRED_FACETS: {json.dumps(list(decision.required_facets), ensure_ascii=False)}\n"

@@ -16,6 +16,7 @@ from . import execution
 from .request_completion import record_contract_observation as _record_contract_observation
 from . import final_contract as _final_contract
 from . import procedure_review as _procedure_review
+from .request_scope import conditions_only_contract
 from ..evidence.ask_input import apply_ask_evidence_input, ask_request_key
 from ..evidence.contracts import EvidenceContractError
 
@@ -877,7 +878,14 @@ def validate_response(
                 # threshold when the independent order/safety review is absent.
                 required_facets = set(decision.required_facets) | {
                     item.facet for item in decision.facet_queries if item.must_cover}
-                required_types = set(decision.required_answer_types) | {REQ_ORDERED_ACTIONS}
+                conditions_only = bool(not source_ordered_procedure and conditions_only_contract(
+                    procedure_scope=getattr(decision, "procedure_scope", ""),
+                    information_task=decision.information_task,
+                    required_answer_types=decision.required_answer_types,
+                    facet_queries=decision.facet_queries))
+                required_types = set(decision.required_answer_types)
+                if not conditions_only:
+                    required_types.add(REQ_ORDERED_ACTIONS)
                 complete_review = bool(semantic_contract_pass
                     and required_facets.issubset(semantic_contract.get("covered_facets") or [])
                     and required_types.issubset(semantic_contract.get("covered_answer_types") or []))

@@ -237,6 +237,7 @@ class AssistantCoreDecision:
     router_model: str = ""
     degraded: bool = False
     degraded_reason: str = ""
+    procedure_scope: str = ""
 
     @property
     def routed(self) -> bool:
@@ -696,6 +697,11 @@ def normalize_decision(
         out_of_scope_reason=_clean_text(raw.get("out_of_scope_reason"), 500),
         rationale=_clean_text(raw.get("rationale"), 700),
         router_model=_clean_text(raw.get("router_model"), 100),
+        procedure_scope=(raw.get("procedure_scope")
+            if request.requested_mode == MODE_ASK and effective == MODE_ASK
+            and request_kind not in {KIND_UNSAFE_REQUEST, KIND_OUT_OF_SCOPE}
+            and raw.get("procedure_scope") in ("conditions_only", "execution_steps", "other")
+            else ""),
     )
 
 
@@ -811,6 +817,7 @@ def decorate_response(
         "information_task": decision.information_task,
         "required_answer_types": list(decision.required_answer_types),
         "confidence": round(decision.confidence, 4),
+        **({"procedure_scope": decision.procedure_scope} if decision.procedure_scope else {}),
         "requested_mode_fit": bool(decision.requested_mode_fit),
         "evidence_state": decision.evidence_state,
         "evidence_policy": decision.evidence_policy,
