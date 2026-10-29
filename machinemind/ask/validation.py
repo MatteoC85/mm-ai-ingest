@@ -1021,13 +1021,14 @@ def validate_response(
                     and str(item.get("requirement") or "").strip()
                 ]
 
-                if (
+                repair_available = bool(
                     decision.effective_mode == MODE_ASK
                     and evidence_complete
                     and not repair_attempted
                     and not (protected_procedure and source_ordered_procedure
                              and semantic_contract.get("_terminal_review_failure") is True)
-                ):
+                )
+                if repair_available:
                     budget_for_repair = _v13_current_budget()
                     if (
                         budget_for_repair is not None
@@ -1039,9 +1040,18 @@ def validate_response(
                             failed_attempts=1,
                             reason="grounded_answer_contract_repair_stage",
                         )
-                    # Keep the first grounded response and full evidence manifest.
-                    # AssistantCoreV2 will invoke exactly one repair hook, using the
-                    # already-budgeted third call, then validate the replacement once.
+                    # Retry credit applies only to failed provider attempts. A
+                    # completed but rejected review does not authorize another call.
+                    # Preserve its semantic failure instead of scheduling a repair
+                    # that would replace it with a budget exception.
+                    if budget_for_repair is not None:
+                        repair_available = bool(
+                            budget_for_repair.llm_calls < budget_for_repair.max_llm_calls
+                            and budget_for_repair.remaining() >= 9.0
+                            and budget_for_repair.estimated_cost_usd < budget_for_repair.max_estimated_cost_usd
+                        )
+                if repair_available:
+                    # Keep the grounded response only for one admitted repair.
                     out["_assistant_core_repair_needed"] = True
                     out["_assistant_core_repair_context"] = {
                         "first_answer": answer,

@@ -589,7 +589,7 @@ def verify_or_repair_answer(
             "\n".join(_assistant_core_candidate_evidence_text(c) for c in ordered_candidates),
             limit=48,
         )
-        if enumeration_requested else []
+        if enumeration_requested and not conditions_only else []
     )
 
     system_msg = (
@@ -617,7 +617,17 @@ def verify_or_repair_answer(
             "isolation and access restrictions. A later startup/reset/readiness state cannot be "
             "imported into pre-intervention checks without source-supported phase qualification. "
             "Do not conflate ordinary STOP, emergency stops and isolation. Router search terms "
-            "are not evidence of applicability. All safety, coverage and source rules remain.")
+            "are not evidence of applicability. The complete operation family is context for "
+            "finding applicable prerequisites, not a request to enumerate every Step or perform "
+            "later actions or startup. expected_list_items must contain only supported checks "
+            "and precautions applicable to the requested phase. Write expected_list_items, "
+            "covered_list_items and missing_list_items in RESPONSE_LANGUAGE. For each covered "
+            "item, use a short exact phrase from the final resolved answer as its label, and "
+            "use that identical label across these lists. Preserve documented technical names, "
+            "modes, identifiers, quantities and units; do not translate them into unsupported "
+            "alternatives. Report genuinely missing items; never claim coverage merely to satisfy "
+            "lexical matching. Source quotes and operation-boundary evidence remain verbatim in "
+            "their original source language. All safety, coverage and source rules remain.")
     user_msg = (
         f"QUESTION:\n{request.query}\n\n"
         f"RESPONSE_LANGUAGE: {request.response_language}\n"
