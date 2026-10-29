@@ -670,7 +670,10 @@ def verify_or_repair_answer(
             ],
             models=[V13_FAST_MODEL, V13_PLANNER_MODEL],
             json_schema=verifier_schema,
-            effort=V13_FAST_EFFORT,
+            # The bounded output includes reasoning tokens. Keep room for the
+            # complete review JSON/edits without raising its token/cost/deadline
+            # ceilings. Legacy, Root and Smart have no protected ASK owner here.
+            effort="low" if protected_budget else V13_FAST_EFFORT,
             reasoning_mode="",
             timeout=_review_timeout(runtime, budget, protected=protected_budget, compact=compact_review),
             max_output_tokens=min(4000, max(3200, V13_FAST_MAX_OUTPUT_TOKENS)),
@@ -913,6 +916,20 @@ def repair_response(
         and not missing_types
         and not missing_list_items
     )
+    if complete and context.get("manual_note_sources"):
+        try:
+            restored_ids, binding_proof = _procedure_review.manual_note_projection(
+                context["manual_note_sources"], original_answer=first_answer,
+                reviewed_answer=repaired_answer, review=verified,
+                admitted_ids={str(c.get("citation_id") or "") for c in candidates})
+            verified["citation_ids"] = list(dict.fromkeys(
+                list(verified.get("citation_ids") or []) + restored_ids))
+            verified["manual_note_bindings"] = binding_proof
+        except ValueError:
+            complete = False
+            verified = {**verified, "outcome": "no_sources",
+                "reason": "manual_note_binding_invalid", "_terminal_review_failure": True}
+            outcome = "no_sources"
     repair_meta.update({
         "outcome": outcome or "unavailable",
         "reason": str(verified.get("reason") or "")[:500],

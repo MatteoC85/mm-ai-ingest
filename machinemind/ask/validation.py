@@ -430,6 +430,7 @@ def validate_response(
     _v13_current_budget = runtime._v13_current_budget
     response, retrieval = _inputs(response, request, retrieval, decision, runtime=runtime, stage="validation")
     out = dict(response or {})
+    manual_note_carrier = out.pop("_assistant_core_manual_note_sources", None)
     allowed_candidates = [
         _copy_candidate(c)
         for c in (retrieval.get("citations") or retrieval.get("candidates") or [])
@@ -595,9 +596,12 @@ def validate_response(
             )
     else:
         answer = _assistant_core_redact_internal_text(out.get("answer") or "")
-        manual_note_bindings = ((out.get("_assistant_ui_model") or {}).get("manual_note_sources") or []) if protected_procedure else []
+        manual_note_bindings = ((manual_note_carrier if manual_note_carrier is not None else
+            (out.get("_assistant_ui_model") or {}).get("manual_note_sources")) or []) if protected_procedure else []
         manual_note_original = answer
-        manual_note_binding_invalid = False
+        manual_note_binding_invalid = type(manual_note_bindings) is not list
+        if manual_note_binding_invalid:
+            manual_note_bindings = []
         manual_note_binding_proof = {}
         if citations and source_text:
             answer, removed_claims = _assistant_core_filter_unsupported_claim_sentences(answer, source_text)
@@ -640,6 +644,11 @@ def validate_response(
         projected_manual_notes = []
         for note in manual_note_bindings:
             if type(note) is not dict or type(note.get("text")) is not str:
+                manual_note_binding_invalid = True
+                continue
+            note_ids = note.get("citation_ids")
+            if (type(note_ids) is not list or not note_ids
+                    or any(type(cid) is not str or cid not in allowed for cid in note_ids)):
                 manual_note_binding_invalid = True
                 continue
             projected_note, dropped_note_claims = _assistant_core_filter_unsupported_claim_sentences(note["text"], source_text)
@@ -1024,6 +1033,9 @@ def validate_response(
                     out["_assistant_core_repair_needed"] = True
                     out["_assistant_core_repair_context"] = {
                         "first_answer": answer,
+                        # The private generation carrier has been consumed. Keep
+                        # its checked projection only for this same bounded repair.
+                        "manual_note_sources": deepcopy(manual_note_bindings),
                         "first_answer_contract": dict(answer_contract_result),
                         "missing_answer_facets": list(
                             answer_contract_result.get("missing_answer_facets") or []

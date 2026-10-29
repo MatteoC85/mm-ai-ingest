@@ -565,6 +565,11 @@ def structured_ask(
         "similarity_max": max([float(c.get("similarity") or 0.0) for c in all_evidence], default=None),
         "chat_model": model_used if synthesis_grounded else "v13_deterministic_structured_fallback",
         "_assistant_ui_model": answer_ui_model,
+        # UI finalization intentionally consumes its rendering model. Carry only
+        # the server-owned note bindings separately until final validation; the
+        # validator consumes this field and public Core cleanup strips its prefix.
+        **({"_assistant_core_manual_note_sources": deepcopy(answer_ui_model.get("manual_note_sources") or [])}
+           if runtime.preserve_complete else {}),
         # Internal, trusted evidence manifest. These citations are loaded and
         # curated deterministically by the backend (including Procedure->Step
         # expansion) and must survive Assistant Core validation even when they
