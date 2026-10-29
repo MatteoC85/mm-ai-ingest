@@ -556,6 +556,8 @@ class AskStructuredManualSupportTermsRuntime:
     _ask_structured_direct_terms: Callable[..., Any]
     _content_term_set: Callable[..., Any]
     _normalize_unicode_advanced: Callable[..., Any]
+    _procedure_ui_fields: Callable[..., Any]
+    _procedure_ui_sections: Callable[..., Any]
 
 
 def ask_structured_manual_support_terms(q: str, planner: Optional[dict], structured_citations: list[dict], *, runtime: AskStructuredManualSupportTermsRuntime) -> list[str]:
@@ -571,11 +573,26 @@ def ask_structured_manual_support_terms(q: str, planner: Optional[dict], structu
     _ask_structured_direct_terms = runtime._ask_structured_direct_terms
     _content_term_set = runtime._content_term_set
     _normalize_unicode_advanced = runtime._normalize_unicode_advanced
-    raw_terms = list(_ask_structured_direct_terms(q, planner=planner, limit=22))
-    structured_text = "\n".join(str(c.get("chunk_full") or c.get("snippet") or "") for c in (structured_citations or []))
-    raw_terms.extend(list(_content_term_set(structured_text, limit=24)))
+    # A joined-record prefix can spend the entire term allowance on a parent
+    # envelope and never reach the selected Steps. Read semantic fields with the
+    # same parser as the procedure renderer, then give each selected action a
+    # turn. This selects retrieval vocabulary only; it changes no source body,
+    # Step selection, safety note, evidence authority or provider budget.
+    step_texts: list[str] = []
+    context_texts: list[str] = []
+    for citation in structured_citations or []:
+        fields = runtime._procedure_ui_fields(citation)
+        description = str(fields.get("description") or fields.get("short_description") or "")
+        sections = runtime._procedure_ui_sections(description)
+        operation = str(sections.get("instruction") or sections.get("body") or "")
+        text = " ".join([str(fields.get("title") or ""), operation,
+                         str(fields.get("solution") or "")]).strip()
+        if not text:
+            continue
+        role = str(citation.get("source_type") or fields.get("source_type") or "")
+        (step_texts if role == "step" else context_texts).append(text)
 
-    joined = _normalize_unicode_advanced((q or "") + "\n" + structured_text).lower()
+    joined = _normalize_unicode_advanced((q or "") + "\n" + "\n".join(step_texts + context_texts)).lower()
     expansions: list[str] = []
     bilingual_groups = [
         (["coil", "bobina", "bobine"], ["coil", "bobina", "bobine"]),
@@ -599,15 +616,32 @@ def ask_structured_manual_support_terms(q: str, planner: Optional[dict], structu
         "elettrica", "electrical", "pneumatica", "pneumatic", "sezionatore",
         "disconnect", "interruttore", "switch", "lucchetto", "lock", "blocco", "lockout",
     }
+    stop = _ask_structured_direct_stopwords()
+
+    def operation_terms(text, *, planner=None, limit=44):
+        # Keep token order deterministic, and discard generic safety vocabulary
+        # before balancing records. A set iteration must not decide which of
+        # two source actions remains inside the bounded search allowance.
+        terms = []
+        for raw in _ask_structured_direct_terms(text, planner=planner, limit=limit):
+            term = _normalize_unicode_advanced(str(raw or "")).lower().strip(" -–—:;,.")
+            if len(term) >= 3 and term not in stop and term not in generic_safety:
+                terms.append(term)
+        return terms
+
+    raw_terms = operation_terms(q, planner=planner, limit=22)
+    for texts in (step_texts, context_texts):
+        groups = [operation_terms(text) for text in texts]
+        for index in range(max((len(group) for group in groups), default=0)):
+            raw_terms.extend(group[index] for group in groups if index < len(group))
     out: list[str] = []
     seen: set[str] = set()
-    stop = _ask_structured_direct_stopwords()
-    for raw in list(raw_terms) + expansions:
-        t = _normalize_unicode_advanced(str(raw or "")).lower().strip(" -–—:;,.")
-        if len(t) < 3 or t in stop or t in generic_safety or t in seen:
+    for raw in raw_terms + expansions:
+        term = _normalize_unicode_advanced(str(raw or "")).lower().strip(" -–—:;,.")
+        if len(term) < 3 or term in stop or term in generic_safety or term in seen:
             continue
-        seen.add(t)
-        out.append(t)
+        seen.add(term)
+        out.append(term)
         if len(out) >= 44:
             break
     return out

@@ -4631,6 +4631,8 @@ def _ask_structured_manual_support_terms(q: str, planner: Optional[dict], struct
             _ask_structured_direct_terms=_ask_structured_direct_terms,
             _content_term_set=_content_term_set,
             _normalize_unicode_advanced=_normalize_unicode_advanced,
+            _procedure_ui_fields=_procedure_ui_fields,
+            _procedure_ui_sections=_procedure_ui_sections,
         ),
     )
 
@@ -5288,6 +5290,7 @@ def _v12_filter_manual_support_to_selected_bundle(
         runtime=_retrieval_procedure_families.V12FilterManualSupportToSelectedBundleRuntime(
             _content_term_set=_content_term_set,
             _procedure_ui_fields=_procedure_ui_fields,
+            _procedure_ui_sections=_procedure_ui_sections,
             _procedure_ui_is_safety_setup=_procedure_ui_is_safety_setup,
             _term_overlap_score=_term_overlap_score,
             _v12_evidence_role=_v12_evidence_role,
@@ -12987,6 +12990,7 @@ def _assistant_core_task_synthesis_runtime():
         manual_filter=_retrieval_procedure_families.V12FilterManualSupportToSelectedBundleRuntime(
             _content_term_set=_content_term_set,
             _procedure_ui_fields=_procedure_ui_fields,
+            _procedure_ui_sections=_procedure_ui_sections,
             _procedure_ui_is_safety_setup=_procedure_ui_is_safety_setup,
             _term_overlap_score=_term_overlap_score,
             _v12_evidence_role=_v12_evidence_role,

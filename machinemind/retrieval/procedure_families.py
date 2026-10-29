@@ -657,6 +657,7 @@ def v12_filter_linkable_manual_support(company_id: str, citations: list[dict], *
 class V12FilterManualSupportToSelectedBundleRuntime:
     _content_term_set: Callable[..., Any]
     _procedure_ui_fields: Callable[..., Any]
+    _procedure_ui_sections: Callable[..., Any]
     _procedure_ui_is_safety_setup: Callable[..., Any]
     _term_overlap_score: Callable[..., Any]
     _v12_evidence_role: Callable[..., Any]
@@ -705,8 +706,16 @@ def v12_filter_manual_support_to_selected_bundle(
         if not text:
             continue
         all_selected_texts.append(text)
-        if role == "step" and not _procedure_ui_is_safety_setup(text):
-            operational_texts.append(text)
+        if role == "step":
+            sections = runtime._procedure_ui_sections(fields.get("description") or "")
+            action = " ".join([str(fields.get("title") or ""),
+                               str(sections.get("instruction") or sections.get("body") or "")]).strip()
+            # A safety-note heading or warning belongs to every operational Step;
+            # it does not turn that Step's action into a safety-only prerequisite.
+            # Keep full text above for safety relevance; operation matching uses
+            # the parsed action exactly as segment-anchor selection does.
+            if action and not _procedure_ui_is_safety_setup(action):
+                operational_texts.append(action)
 
     query_terms = _content_term_set(q, limit=80)
     operational_terms = _content_term_set(" ".join(operational_texts), limit=220)
