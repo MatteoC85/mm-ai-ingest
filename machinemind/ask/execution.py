@@ -637,7 +637,7 @@ def verify_or_repair_answer(
         f"REQUIRED_ANSWER_TYPES: {json.dumps(requirements, ensure_ascii=False)}\n"
         f"HARD_REQUIREMENTS: {json.dumps(hard_requirements, ensure_ascii=False)}\n"
         f"REQUIRED_FACETS: {json.dumps(list(decision.required_facets), ensure_ascii=False)}\n"
-        f"FACET_CONTRACTS: {json.dumps([{'facet': item.facet, 'answer_type': item.answer_type, 'must_cover': item.must_cover} for item in decision.facet_queries], ensure_ascii=False)}\n"
+        f"FACET_CONTRACTS: {json.dumps([{'facet': item.facet, 'answer_type': item.answer_type, 'must_cover': item.must_cover} for item in decision.facet_queries if not conditions_only or item.must_cover], ensure_ascii=False)}\n"
         f"ENUMERATION_REQUESTED: {json.dumps(bool(enumeration_requested))}\n"
         f"DETERMINISTIC_LIST_CANDIDATES: {json.dumps(deterministic_list_candidates, ensure_ascii=False)}\n"
         f"REPAIR_MISSING_FACETS: {json.dumps(repair_missing_facets, ensure_ascii=False)}\n"

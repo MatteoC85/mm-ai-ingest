@@ -23,6 +23,7 @@ from typing import Any, Callable, Mapping, MutableMapping, Optional, Sequence
 from machinemind.evidence.ask_input import (
     AskEvidenceAdmission, apply_ask_evidence_input, ask_request_key,
 )
+from machinemind.ask.request_scope import bind_conditions_requirements_to_question
 
 
 MODE_ASK = "ask"
@@ -669,7 +670,7 @@ def normalize_decision(
         if MODE_ASK in allowed:
             effective = MODE_ASK
 
-    return AssistantCoreDecision(
+    return bind_conditions_requirements_to_question(AssistantCoreDecision(
         request_kind=request_kind,
         effective_mode=effective,
         confidence=confidence,
@@ -702,7 +703,7 @@ def normalize_decision(
             and request_kind not in {KIND_UNSAFE_REQUEST, KIND_OUT_OF_SCOPE}
             and raw.get("procedure_scope") in ("conditions_only", "execution_steps", "other")
             else ""),
-    )
+    ))
 
 
 def _status_to_result_code(response: Mapping[str, Any], routed: bool) -> str:
