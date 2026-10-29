@@ -15433,7 +15433,7 @@ def _assistant_core_adjudicate_root_cause_grounded(
             [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
             models=[V13_FAST_MODEL],
             json_schema=_root_quality.review_schema(frozen),
-            effort=V13_FAST_EFFORT, reasoning_mode="",
+            effort="low", reasoning_mode="",
             timeout=min(20, V13_FAST_TIMEOUT_SECONDS),
             max_output_tokens=min(3400, V13_FAST_MAX_OUTPUT_TOKENS),
             company_id=request.company_id, purpose="assistant_core_root_cause_adjudicator",
