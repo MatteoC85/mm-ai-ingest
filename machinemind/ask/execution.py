@@ -20,6 +20,7 @@ from typing import Any, Callable, Optional, TYPE_CHECKING
 
 from . import procedure_review as _procedure_review
 from . import final_contract as _final_contract
+from . import enumeration_review as _enumeration_review
 from . import phase_trace
 from .request_scope import conditions_only_contract, bounded_phase_contract
 from .request_completion import current as _current_completion
@@ -512,6 +513,8 @@ def verify_or_repair_answer(
         return {"outcome": "unavailable", "answer": answer, "reason": "budget_unavailable"}
 
     enumeration_requested = _assistant_core_enumeration_requested(request, decision)
+    factual_list_review = _enumeration_review.applies(request, decision,
+        protected=_guarded(runtime, request, decision), enumeration=enumeration_requested)
     # The request-owned flow can provide a complete, stable procedure packet.
     # Legacy/OFF/Root Cause and nonprocedural consumers keep the old algorithm.
     context_limit = min(30000 if enumeration_requested else 24000,
@@ -662,6 +665,8 @@ def verify_or_repair_answer(
             "List coverage concerns only phase-applicable requirements; use exact phrases from "
             "the final answer in RESPONSE_LANGUAGE for covered list labels. Source quotes and "
             "boundary evidence stay literal. All semantic, source and operation proof gates apply.")
+    if factual_list_review:
+        system_msg += _enumeration_review.INSTRUCTIONS
     user_msg = (
         f"QUESTION:\n{request.query}\n\n"
         f"RESPONSE_LANGUAGE: {request.response_language}\n"
@@ -682,8 +687,10 @@ def verify_or_repair_answer(
         f"REPAIR_MISSING_LIST_ITEMS: {json.dumps(repair_missing_list_items, ensure_ascii=False)}\n"
         f"FIRST_ANSWER_CONTRACT: {json.dumps(repair_first_contract, ensure_ascii=False)}\n"
         f"MACHINE_CATALOG:\n{catalog_digest}\n\n"
-        f"CURRENT_ANSWER:\n{answer}\n\n"
-        f"SOURCES:\n{sources_block}\n\n"
+        + (f"SOURCES:\n{sources_block}\n\nCURRENT_ANSWER:\n{answer}\n\n"
+           if factual_list_review else
+           f"CURRENT_ANSWER:\n{answer}\n\nSOURCES:\n{sources_block}\n\n")
+        +
         "Return only the required JSON."
     )
     # Only the protected procedural path opts into compact independent review.
@@ -702,6 +709,8 @@ def verify_or_repair_answer(
     wire_aliases = (_procedure_review.review_wire_aliases(layout,
         [str(c.get("citation_id") or "").strip() for c in ordered_candidates]) if source_ordered_review else None)
     verifier_schema = _assistant_core_contract_verifier_schema()
+    if factual_list_review:
+        verifier_schema = _enumeration_review.source_first_schema(verifier_schema)
     if compact_review:
         verifier_schema = _procedure_review.review_schema(verifier_schema, layout, review_facets, requirements,
             operation_boundary=operation_boundary, source_ordered=source_ordered_review,
@@ -854,6 +863,8 @@ def verify_or_repair_answer(
         out["expected_list_items"] = expected_items
         out["covered_list_items"] = _dedup_text_values(out.get("covered_list_items") or [], limit=40)
         out["missing_list_items"] = model_missing_items
+    if factual_list_review:
+        out = _enumeration_review.reject_empty_inventory(out)
     _record_contract_observation("semantic_review", out)
     return out
 

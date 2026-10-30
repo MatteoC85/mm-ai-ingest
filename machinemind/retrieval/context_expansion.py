@@ -111,12 +111,21 @@ def assistant_core_enumeration_requested(
     decision: AssistantCoreDecision,
     *, runtime: AssistantCoreEnumerationRequestedRuntime,
 ) -> bool:
-    """Detect a request for an exhaustive list without machine-specific keywords.
+    """Preserve requested checklist coverage without machine-specific keywords.
 
-    The semantic router still defines the facets. This language-level signal only
-    asks retrieval/verification to preserve complete option lists instead of a few
-    representative examples. Italian and English are supported symmetrically.
+    Supported factual ASK checklists use the normalized semantic contract, so
+    completeness does not depend on a language-specific interrogative. Other
+    consumers retain the existing lexical signal. Enumeration remains scoped to
+    the actual question, including explicit limits and exclusions.
     """
+    if (getattr(request, "requested_mode", None) == "ask"
+            and getattr(decision, "effective_mode", None) == "ask"
+            and getattr(decision, "request_kind", None) == "factual"
+            and getattr(decision, "evidence_state", None) in {"supported", "partial"}
+            and getattr(decision, "information_task", None) in {
+                "document_explanation", "comparison", "numeric_specification"}
+            and "checklist" in (getattr(decision, "required_answer_types", ()) or ())):
+        return True
     _normalize_unicode_advanced = runtime._normalize_unicode_advanced
     re = runtime.re
     query = _normalize_unicode_advanced(str(request.query or "")).lower()

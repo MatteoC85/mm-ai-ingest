@@ -346,6 +346,12 @@ def review_schema(legacy: dict, layout: dict, facets: list[str], types: list[str
         field = schema["properties"].get(key)
         if field is not None:
             field["maxItems"] = max(int(field.get("maxItems", 0)), len(set(facets)))
+    # Coverage keys identify the request's obligations, not prose to translate.
+    # Missing facets remain open text so the independent whole-question review
+    # can report an omitted category that the router did not plan.
+    if facets and "covered_facets" in schema["properties"]:
+        schema["properties"]["covered_facets"]["items"] = {
+            "type": "string", "enum": list(dict.fromkeys(facets))}
     # A source-authored Step sequence owns its headings. The reviewer may
     # rewrite every body, but cannot replace that sequence with a free-text
     # numbered list. Unsupported or incomplete evidence remains a rejection.

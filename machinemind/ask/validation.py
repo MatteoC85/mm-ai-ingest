@@ -776,6 +776,38 @@ def validate_response(
                     out["rg_links"] = []
                 citations = list(out.get("citations") or [])
 
+                if (semantic_contract_pass and required_family_review
+                        and (semantic_contract.get("procedure_review") or {}).get("reply_mode") == "replace"
+                        and not source_ordered_procedure
+                        and family_context_contract(
+                            procedure_scope=getattr(decision, "procedure_scope", ""),
+                            procedure_phase=getattr(decision, "procedure_phase", ()),
+                            question=request.query, information_task=decision.information_task,
+                            required_answer_types=decision.required_answer_types,
+                            facet_queries=decision.facet_queries)
+                        and (set(decision.required_facets) | {
+                            item.facet for item in decision.facet_queries if item.must_cover
+                        }).issubset(semantic_contract.get("covered_facets") or [])
+                        and set(decision.required_answer_types).issubset(
+                            semantic_contract.get("covered_answer_types") or [])
+                        and (semantic_contract.get("procedure_review") or {}).get("independent_semantic_review") is True
+                        and (semantic_contract.get("operation_boundary_validation") or {}).get("complete") is True
+                        and (semantic_contract.get("operation_boundary_validation") or {}).get("version") == "ask-operation-boundary-v1"
+                        and (semantic_contract.get("operation_boundary_validation") or {}).get("answer_sha256") == _procedure_review.digest(
+                            str(semantic_contract.get("answer") or "").strip())):
+                    # The full admitted family was reviewed, but a replacement
+                    # can exclude an earlier draft's unrelated operation. Its
+                    # final re-admitted support owns the safety supplements;
+                    # never reintroduce a discarded Step from stale citations.
+                    # Retain/edit keep the original note bindings: omitting an
+                    # ID alone does not prove that their text was removed.
+                    procedure_occurrences = [c for c in raw_final
+                        if runtime._assistant_core_candidate_source_type(c) == "step"]
+                    source_notes = _final_contract.source_safety_notes(
+                        procedure_occurrences, fields=runtime.source_fields,
+                        sections=runtime.source_sections,
+                        source_type=runtime._assistant_core_candidate_source_type)
+
             if (semantic_contract_pass or semantic_contract_partial) and source_text:
                 answer, removed_after_repair = _assistant_core_filter_unsupported_claim_sentences(
                     answer, source_text
