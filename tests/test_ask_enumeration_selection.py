@@ -95,7 +95,7 @@ class EnumerationSelectionFixture:
         return self.session.register(request=self.request, receipt=receipt,
             current_allowed_sources=self.authorize(self.request)).records
 
-    def run(self, *, tamper_score=False, revoke_after_score=False, mutate_after_prepare=False):
+    def run(self, *, tamper_score=False, revoke_after_score=False, mutate_after_prepare=False, source_first=False):
         initial = self.register(self.base)
         values = [dict(x.record) for x in self.session.records(request=self.request,
             handles=initial, current_allowed_sources=self.authorize(self.request))]
@@ -134,7 +134,22 @@ class EnumerationSelectionFixture:
             _v13_choose_ask_model=lambda *a, **kw:(self.m.V13_FAST_MODEL, 'low', ''),
             _sanitize_citations_for_response=lambda rows, **kw:[dict(x) for x in rows],
             _build_rg_links=lambda *a, **kw:[])
+        # Keep exercising the legacy eight-source writer after the same owned
+        # preparation. Production's observed factual source-first path and its
+        # full sixteen-source review are covered by test_ask_source_first_inventory.
+        self.owner.consumers = source_first
         runtime = self.owner._execution_factory()
+        if source_first:
+            def reviewer(messages, **kwargs):
+                self.calls.append((deepcopy(messages), deepcopy(kwargs)))
+                first = self.base[0]
+                return {'outcome':'rewrite','answer':'[[FACTUAL_INVENTORY]]',
+                    'expected_list_items':[first['chunk_full']], 'covered_list_items':[], 'missing_list_items':[],
+                    'covered_facets':list(self.decision.required_facets), 'missing_facets':[],
+                    'covered_answer_types':list(self.decision.required_answer_types), 'missing_answer_types':[],
+                    'citation_ids':[first['citation_id']], 'reason':'offline fixture'}, 'offline-reviewer'
+            self.owner._response_flow.execution = replace(self.owner._response_flow.execution,
+                _v13_json_models=reviewer)
         runtime = execution.bind_ask_execution(runtime, session=self.session,
             authorize=self.authorize, select=self.owner.select)
         payload = prepared['retrieval']
@@ -184,6 +199,28 @@ class AskEnumerationSelectionTests(unittest.TestCase):
             self.assertGreater(f.authorizations, 6)
         finally:
             f.close()
+
+    def test_observed_source_first_review_receives_owned_ranked_complementary_records(self):
+        from types import SimpleNamespace
+        import time
+        from machinemind.ask import request_completion, review_source_wire
+        completion=request_completion.RequestCompletion(runtime=self.m._assistant_core_request_flow_runtime(),
+            payload=SimpleNamespace(company_id='offline-company'), started=time.monotonic())
+        f=EnumerationSelectionFixture(self.m)
+        try:
+            result=f.run(source_first=True)
+            self.assertEqual(result['status'],'answered')
+            self.assertEqual(len(f.calls),1)
+            messages,kwargs=f.calls[0]
+            self.assertEqual(kwargs['purpose'],'assistant_core_answer_contract_verifier')
+            block=review_source_wire.restore_sources_block(messages[1]['content'].split('SOURCES:\n',1)[1].split('\n\nCURRENT_ANSWER:',1)[0])
+            for row in f.base + f.sections:self.assertIn(row['chunk_full'],block)
+            self.assertIn('COMPLETE_SECTION_END',block)
+            self.assertLessEqual(len(f.prepared['retrieval']['citations']),16)
+            self.assertEqual(len(f.score_calls),2)
+            self.assertTrue(all(c['preserve_complete'] is True for c in f.score_calls))
+            self.assertIsNotNone(f.owner._response_flow.synthesis)
+        finally:f.close();completion.close()
 
     def test_newcomer_routing_scores_do_not_become_semantic_similarity(self):
         f = EnumerationSelectionFixture(self.m)

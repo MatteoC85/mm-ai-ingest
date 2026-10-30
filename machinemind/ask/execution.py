@@ -421,6 +421,19 @@ def synthesize_ask(
             return _assistant_core_build_no_evidence(request, decision, retrieval)
 
     retrieval = _admit_input(request, retrieval, decision, runtime=runtime, stage="synthesis.generate")
+    if (not overview_catalog_requested and runtime.evidence_observer is not None and _enumeration_review.applies(
+            request, decision, protected=_guarded(runtime, request, decision),
+            enumeration=runtime._assistant_core_enumeration_requested(request, decision))):
+        # The existing source-first recovery producer already performs the
+        # mandatory review and carries its verdict into final validation. A
+        # preliminary paid draft duplicates this work for factual inventories.
+        response = _assistant_core_recover_ask_from_evidence(
+            request=request, decision=decision, retrieval=retrieval,
+            reason="source_first_factual_inventory")
+        if response and not (response.get("_assistant_core_semantic_verified") or {}).get("missing_list_items"):
+            response.setdefault("information_task", decision.information_task)
+            return response
+        return _assistant_core_build_no_evidence(request, decision, retrieval)
     # Without a structured family, the admitted manual sources still use the
     # grounded writer and the same mandatory review/deadline reserve.
     # A manual procedure has no completed ProcedureBundle to prove every step.
