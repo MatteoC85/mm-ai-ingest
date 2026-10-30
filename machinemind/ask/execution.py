@@ -902,9 +902,9 @@ def verify_or_repair_answer(
                 review, review_model = _v13_json_models(messages,
                     models=[V13_FAST_MODEL, V13_PLANNER_MODEL],
                     json_schema=_factual_context_review.schema(frame), effort="low",
-                    reasoning_mode="", timeout=min(25, _review_timeout(runtime, budget,
-                        protected=protected_budget, compact=False)),
-                    max_output_tokens=1200, company_id=request.company_id,
+                    reasoning_mode="", timeout=_review_timeout(runtime, budget,
+                        protected=protected_budget, compact=False),
+                    max_output_tokens=min(4000, max(3200, V13_FAST_MAX_OUTPUT_TOKENS)), company_id=request.company_id,
                     purpose="assistant_core_answer_contract_verifier")
                 out = _factual_context_review.apply_review(out, review, frame)
                 model_used = review_model

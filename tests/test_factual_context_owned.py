@@ -130,7 +130,11 @@ class FactualContextOwnedTests(unittest.TestCase):
         self.assertEqual(contract['semantic_verifier']['answer'],
                          self.m._assistant_core_redact_internal_text(f.first_candidate))
         self.assertEqual((completion.budget.deadline_monotonic,completion.budget.max_estimated_cost_usd),limits)
-        self.assertTrue(all(row['payload']['max_output_tokens'] <= 3200 for row in f.post_calls))
+        ceiling = min(4000,max(3200,self.m.V13_FAST_MAX_OUTPUT_TOKENS))
+        self.assertEqual([call['kwargs']['max_output_tokens'] for call in f.calls], [ceiling,ceiling])
+        self.assertTrue(all(row['payload']['max_output_tokens'] <= ceiling for row in f.post_calls))
+        self.assertGreater(f.calls[1]['kwargs']['timeout'],25)
+        self.assertGreater(f.post_calls[1]['timeout'],25)
         self.assertTrue(any(row['review_reserve_seconds']==25 for row in completion.provider_schedules))
         self.assertEqual(completion.provider_schedules[-1]['review_reserve_seconds'],0)
 

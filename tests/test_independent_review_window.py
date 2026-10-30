@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from machinemind.ask import request_completion as completion
+from machinemind.ask import execution, request_completion as completion
 from machinemind.infrastructure import openai_transport, request_budget
 
 PURPOSE = 'assistant_core_answer_contract_verifier'
@@ -181,6 +181,57 @@ class IndependentReviewWindowTests(unittest.TestCase):
         self.assertFalse(owner.budget.call_log[0]['dispatched'])
         self.assertEqual(completion.provider_timeout(PURPOSE, 100), 32)
         self.assertEqual(owner.budget.deadline_monotonic, 1100)
+
+    def test_recorded_second_review_bound_uses_remaining_window_and_existing_cost_ceiling(self):
+        owner = self.owner(); budget = owner.budget
+        limits = (budget.deadline_monotonic,budget.max_estimated_cost_usd,budget.max_llm_calls)
+        self.assertEqual(limits,(1100,.25,4))
+        # T41's settled router + producer + two embeddings, before the second
+        # review. This is an accounting-state replay, not the unretained prompt.
+        budget.llm_calls = 2
+        budget.estimated_cost_usd = .094844275
+        self.now[0] += 52.417
+        runtime = SimpleNamespace(V13_FAST_TIMEOUT_SECONDS=20,review_uses_remaining_window=True)
+        requested_timeout = execution._review_timeout(runtime,budget,protected=True,compact=False)
+        self.assertEqual(requested_timeout,47)
+        messages = [{'role':'user','content':''}]
+        schema = {'name':'recorded_bound_fixture','strict':True,
+                  'schema':{'type':'object','properties':{},'additionalProperties':False}}
+        payload = {'model':'gpt-5.6-terra','input':messages,'store':False,
+            'reasoning':{'effort':'low','context':'current_turn'},
+            'text':{'format':{'type':'json_schema',**schema}},
+            'safety_identifier':openai_transport.safety_identifier('offline-company')}
+        base = request_budget._text_input_bound(messages,payload)[0]
+        messages[0]['content'] = 'x' * (36055-base)
+        self.assertEqual(request_budget._text_input_bound(messages,payload)[0],36055)
+        seen = []
+        def post(url, **kwargs):
+            seen.append({'timeout':kwargs['timeout'], 'cap':kwargs['json']['max_output_tokens'],
+                         'committed':budget.committed_cost_usd,'row':dict(budget.call_log[-1])})
+            return self.response(completed=True)
+        result = openai_transport.responses_json(messages,model='gpt-5.6-terra',json_schema=schema,
+            effort='low',reasoning_mode='',timeout=requested_timeout,max_output_tokens=3200,
+            company_id='offline-company',purpose=PURPOSE,api_key='offline-unused',
+            url='https://offline.invalid/responses',post_fn=post,current_budget_fn=lambda:budget,
+            response_text_fn=openai_transport.response_text,
+            safety_identifier_fn=openai_transport.safety_identifier)
+        self.assertEqual(result,{})
+        self.assertEqual(len(seen),1)
+        self.assertEqual((seen[0]['timeout'],seen[0]['cap'],seen[0]['row']['reserved_input_tokens']),
+                         (44,2832,36055))
+        self.assertAlmostEqual(seen[0]['committed'],.24999615,places=12)
+        self.assertLessEqual(seen[0]['committed'],.25)
+        self.assertEqual(budget.llm_calls,3)
+        self.assertEqual((budget.deadline_monotonic,budget.max_estimated_cost_usd,budget.max_llm_calls),limits)
+        self.assertTrue(all(s['review_reserve_seconds']==0 for s in owner.provider_schedules))
+        self.assertTrue(all(s['publication_reserve_seconds']==3 for s in owner.provider_schedules))
+        # The larger output request cannot borrow from publication or reopen an
+        # expired review window, even after the previous call settled cheaply.
+        self.now[0] = 1091.01
+        with self.assertRaises(request_budget._V13BudgetExceeded):
+            self.dispatch(owner,deny,models=('gpt-5.6-terra',))
+        self.assertEqual(budget.llm_calls,3)
+        self.assertEqual(budget.deadline_monotonic,1100)
 
 
 if __name__ == '__main__':

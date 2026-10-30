@@ -80,7 +80,8 @@ class FactualTableInventoryTests(unittest.TestCase):
         self.assertEqual(len(seen),expected_calls)
         if expected_calls == 2:
             self.assertEqual(seen[1][1]['json_schema']['name'],'factual_context_review')
-            self.assertEqual(seen[1][1]['max_output_tokens'],1200)
+            self.assertEqual(seen[1][1]['max_output_tokens'],
+                             min(4000,max(3200,m.V13_FAST_MAX_OUTPUT_TOKENS)))
             first=seen[0][0][1]['content'].split('SOURCES:\n',1)[1].split('\n\nCURRENT_ANSWER:',1)[0]
             second=seen[1][0][1]['content'].split('SOURCES:\n',1)[1].split('\n\nCOMPLETE_CANDIDATE:',1)[0]
             self.assertEqual(first,second)
