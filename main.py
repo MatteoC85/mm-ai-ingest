@@ -1734,7 +1734,7 @@ def _finalize_ask_response_for_ui(resp: dict, *, language: str = "it", citation_
     preserve_family = preserve_complete and any(isinstance(c, dict) and _v12_evidence_role(c) in {"procedure", "step"} for c in out.get("citations") or [])
     if str(out.get("status") or "").lower() == "answered":
         safe_answer_text = _sanitize_secret_like_answer_for_display(str(out.get("answer") or ""))
-        out["answer"] = safe_answer_text if preserve_family else _compact_answer_for_ui(safe_answer_text, language=language)
+        out["answer"] = safe_answer_text if preserve_complete else _compact_answer_for_ui(safe_answer_text, language=language)
         out["answer"] = _sanitize_media_no_vision_answer(
             str(out.get("answer") or ""),
             out.get("citations") if isinstance(out.get("citations"), list) else [],

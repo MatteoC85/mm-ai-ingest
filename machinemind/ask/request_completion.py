@@ -137,6 +137,7 @@ def record_contract_observation(stage: str, contract: dict, *, diagnostics: dict
         "source_step_structure_unverifiable", "procedure_family_semantic_review_incomplete",
         "supported_list_inventory_missing",
         "factual_inventory_template_invalid", "source_table_inventory_incomplete",
+        "source_table_reference_invalid",
     }
     outcome = contract.get("outcome")
     if type(outcome) is not str or outcome not in {"pass", "rewrite", "partial", "no_sources", "unavailable"}:

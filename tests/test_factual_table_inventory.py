@@ -37,7 +37,7 @@ class FactualTableInventoryTests(unittest.TestCase):
         shared.FactualListReviewTests.tearDownClass()
 
     def case(self, *, items=ITEMS, answer=None, coverage=None, outcome='pass', mode='ask',
-             kind='factual', protected=True, source=SOURCES, draft=None):
+             kind='factual', protected=True, source=SOURCES, draft=None, complete_catalog=False):
         m=self.m
         request=m.AssistantCoreRequest(query='Which lubrication points and maintenance intervals are documented?',
             requested_mode=mode, response_language='en',company_id='offline-company',
@@ -47,6 +47,12 @@ class FactualTableInventoryTests(unittest.TestCase):
             information_task='document_explanation',required_facets=('documented obligations',),
             required_answer_types=('checklist',))
         answer='; '.join(items)+'.' if answer is None else answer
+        if not complete_catalog:
+            # Exercise the pre-existing inventory/marker/index contract through
+            # the real optional-codec fallback: these two valid records remain
+            # unchanged, but unassigned geometry prevents a complete quotation
+            # catalog. No source decoder, matcher or admission guard is mocked.
+            source += '\n- [PDF_TABLE_UNASSIGNED] Boundary words cannot be assigned to one cell.'
         rows=[{'citation_id':'manual:inspection','source_type':'document','chunk_full':source}]
         original=deepcopy(rows);seen=[]
         def provider(messages,**kwargs):
@@ -69,6 +75,8 @@ class FactualTableInventoryTests(unittest.TestCase):
                 answer=answer if draft is None else draft,candidates=rows,runtime=runtime)
         self.assertEqual(len(seen),1)
         self.assertEqual(rows,original)
+        if not complete_catalog:
+            self.assertNotIn('SOURCE_TABLE_PREVIEWS',seen[0][0][1]['content'])
         final=final_contract.final_contract(deterministic={'passed':True}, semantic=result,
             reviewed_answer=result['answer'],answer=result['answer'],semantic_complete=True,semantic_partial=False)
         return result,final,seen[0]
@@ -76,6 +84,24 @@ class FactualTableInventoryTests(unittest.TestCase):
     @staticmethod
     def complete_coverage():
         return ['T1=0,1','T2=2']
+
+    def test_complete_catalog_requires_literal_quotation_in_the_same_real_adapter(self):
+        result,final,_=self.case(coverage=self.complete_coverage(),complete_catalog=True)
+        self.assertEqual(result['outcome'],'no_sources')
+        self.assertEqual(result['reason'],'source_table_reference_invalid')
+        self.assertFalse(final['passed'])
+        result,final,(messages,_)=self.case(items=['[[SOURCE_TABLE:G1]]'],
+            coverage=['T1=0','T2=0'],outcome='rewrite',answer='[[FACTUAL_INVENTORY]]',
+            draft='',complete_catalog=True)
+        self.assertIn('SOURCE_TABLE_PREVIEWS',messages[1]['content'])
+        self.assertEqual(result['outcome'],'rewrite')
+        self.assertTrue(final['passed'])
+        self.assertTrue(final['semantic_answer_bound'])
+        self.assertIn('Inspect wear every 360 hours and grease if necessary.',result['answer'])
+        self.assertIn('Visually check cleanliness and contamination.',result['answer'])
+        self.assertIn('Inspect wiring integrity',result['answer'])
+        self.assertIn('Qualified personnel only.',result['answer'])
+        self.assertNotIn('[[SOURCE_TABLE:',result['answer'])
 
     def test_old_self_reported_inventory_cannot_skip_continuation_record_accounting(self):
         result,final,_=self.case(items=['Grease the slide daily'])
