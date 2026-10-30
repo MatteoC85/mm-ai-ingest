@@ -110,11 +110,14 @@ class FinalReviewWindowTests(unittest.TestCase):
         self.assertIsNotNone(error);self.assertIsNone(result)
         self.assertEqual(calls,[]);self.assertEqual(attempted,[12])
 
-    def test_legacy_and_noncompact_consumers_keep_previous_timeout(self):
-        for kwargs in ({'protected':False},{'compact':False}):
-            with self.subTest(kwargs=kwargs):
-                _,calls,_,error=self.case(**kwargs)
-                self.assertIsNone(error);self.assertEqual(calls[0]['requested'],20)
+    def test_legacy_consumers_keep_previous_timeout(self):
+        _,calls,_,error=self.case(protected=False)
+        self.assertIsNone(error);self.assertEqual(calls[0]['requested'],20)
+
+    def test_protected_noncompact_review_uses_the_same_owned_window(self):
+        _,calls,_,error=self.case(compact=False)
+        self.assertIsNone(error)
+        self.assertEqual(calls,[{'requested':33,'scheduled':29,'cap':3200}])
 
     def test_factory_distinguishes_default_from_explicit_environment_limit(self):
         with patch.dict(os.environ,{}):

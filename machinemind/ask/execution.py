@@ -98,7 +98,7 @@ def _review_timeout(runtime: AskExecutionRuntime, budget: Any, *, protected: boo
     caps; the historical twenty-second cap remains for nonprotected consumers.
     """
     configured = max(12, int(runtime.V13_FAST_TIMEOUT_SECONDS))
-    if not (protected and compact):
+    if not protected:
         return min(20, configured)
     if runtime.review_uses_remaining_window:
         return max(1, int(budget.remaining()))
