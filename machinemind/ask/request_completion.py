@@ -136,6 +136,7 @@ def record_contract_observation(stage: str, contract: dict, *, diagnostics: dict
         "deterministic_response_accepted_with_unresolved_facets",
         "source_step_structure_unverifiable", "procedure_family_semantic_review_incomplete",
         "supported_list_inventory_missing",
+        "factual_inventory_template_invalid", "source_table_inventory_incomplete",
     }
     outcome = contract.get("outcome")
     if type(outcome) is not str or outcome not in {"pass", "rewrite", "partial", "no_sources", "unavailable"}:
@@ -160,6 +161,19 @@ def record_contract_observation(stage: str, contract: dict, *, diagnostics: dict
     # Hashes are debug-only and computed/validated here. Never copy arbitrary
     # provider fields, response/source prose, identifiers or exception messages.
     if getattr(owner.payload, "debug", False) is True:
+        if stage == "semantic_review" and type(diagnostics) is dict:
+            for key, values in {
+                'inventory_model_outcome': {'pass', 'rewrite', 'partial', 'no_sources', 'unavailable'},
+                'inventory_answer_form': {'empty', 'template', 'full', 'invalid'},
+                'inventory_template_gate': {'rejected', 'accepted_or_unused'},
+                'table_coverage_gate': {'rejected', 'accepted_or_unused'},
+            }.items():
+                value = diagnostics.get(key)
+                row[key] = value if type(value) is str and value in values else 'other'
+            for key in ('inventory_wire_count', 'inventory_canonical_count', 'table_expected_count', 'table_wire_count'):
+                value = diagnostics.get(key)
+                if type(value) is int and value >= 0:
+                    row[key] = min(value, 100)
         if stage == "final_contract" and type(diagnostics) is dict:
             # Only digests survive a later terminal response, which may skip
             # a fresh authority fence. Never retain raw claims or source text.

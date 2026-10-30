@@ -126,14 +126,29 @@ def source_first_schema(schema: dict, *, record_ids: tuple[str, ...] = ()) -> di
     return out
 
 
-def validate_table_coverage(result: dict, record_ids: tuple[str, ...], *, wire_inventory=None) -> dict:
+def inventory_positions_match(wire, canonical, *, normalize_item=None) -> bool:
+    """Prove the existing normalization preserves every wire index exactly.
+
+    The visible wire strings are not rewritten. Collisions, dropped items and
+    reordered positions cannot be justified by a matching set of strings.
+    """
+    if (type(wire) is not list or type(canonical) is not list
+            or not 0 < len(wire) == len(canonical) <= 40
+            or any(type(item) is not str or not item.strip() for item in wire + canonical)
+            or len({item.lower() for item in canonical}) != len(canonical)):
+        return False
+    return all((normalize_item(item) if normalize_item is not None else [item]) == [canonical[index]]
+               for index, item in enumerate(wire))
+
+
+def validate_table_coverage(result: dict, record_ids: tuple[str, ...], *, wire_inventory=None, normalize_item=None) -> dict:
     """Require complete bounded bookkeeping, not semantic entailment by ID."""
     if not record_ids or str(result.get('outcome') or '').lower() not in {'pass', 'rewrite'}:
         return result
     expected = result.get('expected_list_items')
     rows = result.get('table_record_coverage')
-    valid = (type(expected) is list and type(wire_inventory) is list
-        and expected == wire_inventory and type(rows) is list and len(rows) == len(record_ids))
+    valid = (inventory_positions_match(wire_inventory, expected, normalize_item=normalize_item)
+        and type(rows) is list and len(rows) == len(record_ids))
     seen = set()
     decoded = []
     if valid:
@@ -162,7 +177,7 @@ def validate_table_coverage(result: dict, record_ids: tuple[str, ...], *, wire_i
     return {**result, 'table_record_coverage':decoded}
 
 
-def resolve_inventory_answer(result: dict, *, canonical_inventory: list[str], allowed: bool) -> dict:
+def resolve_inventory_answer(result: dict, *, canonical_inventory: list[str], allowed: bool, normalize_item=None) -> dict:
     """Expand an explicit rewrite template before any binding/grounding checks.
 
     Only model-returned inventory strings supply content. The original request,
@@ -177,7 +192,7 @@ def resolve_inventory_answer(result: dict, *, canonical_inventory: list[str], al
     marker_lines = [i for i,line in enumerate(lines) if line.rstrip('\r\n') == INVENTORY_MARKER]
     valid = (allowed and result.get('outcome') == 'rewrite' and body.count(INVENTORY_PREFIX) == 1
         and len(marker_lines) == 1 and type(items) is list and bool(items)
-        and items == canonical_inventory and len(items) <= 40
+        and inventory_positions_match(items, canonical_inventory, normalize_item=normalize_item)
         and all(type(item) is str and item.strip() and INVENTORY_PREFIX not in item for item in items))
     if not valid:
         return {**result, 'outcome':'no_sources','answer':'',

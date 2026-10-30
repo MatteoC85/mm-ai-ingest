@@ -691,6 +691,14 @@ def verify_or_repair_answer(
             "boundary evidence stay literal. All semantic, source and operation proof gates apply.")
     if factual_list_review:
         system_msg += _enumeration_review.INSTRUCTIONS
+        if not str(answer or '').strip():
+            system_msg += (
+                " SOURCE_FIRST_SYNTHESIS: CURRENT_ANSWER is intentionally empty. Derive the complete "
+                "supported inventory from QUESTION and SOURCES, then produce and verify a complete "
+                "replacement answer with outcome=rewrite. An absent draft is not missing evidence. "
+                "Assess covered/missing items against your final replacement, not the empty input. "
+                "Use no_sources only when the sources cannot support mandatory requested information; "
+                "all evidence, safety, applicability and coverage rules still apply.")
         if inventory_template_allowed:
             system_msg += _enumeration_review.ANSWER_INSTRUCTIONS
         if table_record_ids:
@@ -807,10 +815,23 @@ def verify_or_repair_answer(
         return {"outcome": "unavailable", "answer": answer, "reason": str(exc)[:300]}
 
     out = dict(parsed or {})
+    inventory_diagnostics = {}
     if factual_list_review:
+        inventory_diagnostics = {
+            'inventory_model_outcome': out.get('outcome'),
+            'inventory_answer_form': ('invalid' if type(out.get('answer')) is not str else
+                'empty' if not out['answer'].strip() else
+                'template' if _enumeration_review.INVENTORY_PREFIX in out['answer'] else 'full'),
+            'inventory_wire_count': len(out['expected_list_items']) if type(out.get('expected_list_items')) is list else 0,
+            'table_expected_count': len(table_record_ids),
+            'table_wire_count': len(out['table_record_coverage']) if type(out.get('table_record_coverage')) is list else 0,
+        }
         out = _enumeration_review.resolve_inventory_answer(out,
             canonical_inventory=_dedup_text_values(out.get("expected_list_items") or [], limit=40),
-            allowed=inventory_template_allowed)
+            allowed=inventory_template_allowed,
+            normalize_item=lambda item: _dedup_text_values([item], limit=1))
+        inventory_diagnostics['inventory_template_gate'] = (
+            'rejected' if out.get('reason') == 'factual_inventory_template_invalid' else 'accepted_or_unused')
     try:
         if wire_aliases is not None:
             out = _procedure_review.decode_review_wire_aliases(out, wire_aliases, layout=layout)
@@ -897,9 +918,13 @@ def verify_or_repair_answer(
         out["covered_list_items"] = _dedup_text_values(out.get("covered_list_items") or [], limit=40)
         out["missing_list_items"] = model_missing_items
     if factual_list_review:
-        out = _enumeration_review.validate_table_coverage(out, table_record_ids, wire_inventory=wire_inventory)
+        out = _enumeration_review.validate_table_coverage(out, table_record_ids, wire_inventory=wire_inventory,
+            normalize_item=lambda item: _dedup_text_values([item], limit=1))
+        inventory_diagnostics['inventory_canonical_count'] = len(expected_items)
+        inventory_diagnostics['table_coverage_gate'] = (
+            'rejected' if out.get('reason') == 'source_table_inventory_incomplete' else 'accepted_or_unused')
         out = _enumeration_review.reject_empty_inventory(out)
-    _record_contract_observation("semantic_review", out)
+    _record_contract_observation("semantic_review", out, diagnostics=inventory_diagnostics or None)
     return out
 
 
