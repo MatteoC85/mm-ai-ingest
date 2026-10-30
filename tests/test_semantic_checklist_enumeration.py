@@ -47,7 +47,7 @@ class SemanticChecklistEnumerationTests(unittest.TestCase):
                 self.assertEqual(request.query, query)
 
     def test_only_supported_factual_information_tasks_opt_in(self):
-        for task in ('document_explanation', 'comparison', 'numeric_specification'):
+        for task in ('document_explanation', 'comparison', 'numeric_specification', 'other'):
             for state in ('supported', 'partial'):
                 with self.subTest(task=task, state=state):
                     self.assertTrue(self.check(decision=replace(
@@ -71,7 +71,7 @@ class SemanticChecklistEnumerationTests(unittest.TestCase):
                 self.assertFalse(self.check(decision=replace(self.decision, request_kind=kind)))
         for task in ('procedure_full', 'procedure_segment', 'fault_diagnostic',
                      'sequence_or_synchronization', 'interface_navigation',
-                     'source_retrieval', 'general_technical', 'out_of_scope', 'other'):
+                     'source_retrieval', 'general_technical', 'out_of_scope'):
             with self.subTest(task=task):
                 self.assertFalse(self.check(decision=replace(self.decision, information_task=task)))
         self.assertFalse(self.check(decision=replace(self.decision,

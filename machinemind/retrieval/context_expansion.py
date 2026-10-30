@@ -123,7 +123,7 @@ def assistant_core_enumeration_requested(
             and getattr(decision, "request_kind", None) == "factual"
             and getattr(decision, "evidence_state", None) in {"supported", "partial"}
             and getattr(decision, "information_task", None) in {
-                "document_explanation", "comparison", "numeric_specification"}
+                "document_explanation", "comparison", "numeric_specification", "other"}
             and "checklist" in (getattr(decision, "required_answer_types", ()) or ())):
         return True
     _normalize_unicode_advanced = runtime._normalize_unicode_advanced

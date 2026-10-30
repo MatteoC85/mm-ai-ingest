@@ -12,8 +12,10 @@ def applies(request, decision, *, protected: bool, enumeration: bool) -> bool:
         and getattr(decision, "effective_mode", "") == "ask"
         and getattr(decision, "request_kind", "") == "factual"
         and getattr(decision, "evidence_state", "") in {"supported", "partial"}
-        and getattr(decision, "information_task", "") in {
-            "document_explanation", "comparison", "numeric_specification"})
+        and (getattr(decision, "information_task", "") in {
+            "document_explanation", "comparison", "numeric_specification"}
+            or (getattr(decision, "information_task", "") == "other"
+                and "checklist" in (getattr(decision, "required_answer_types", ()) or ()))))
 
 
 INSTRUCTIONS = (

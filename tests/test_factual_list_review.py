@@ -29,15 +29,16 @@ class FactualListReviewTests(unittest.TestCase):
 
     def case(self, *, items=(), answer='Inspect the frame.', protected=True,
              mode='ask', kind='factual', task='document_explanation', state='supported',
-             outcome='pass', budget=None, provider_schedule=None, runtime_overrides=None):
+             outcome='pass', budget=None, provider_schedule=None, runtime_overrides=None,
+             answer_types=('checklist',), source=None):
         m=self.m
         request=m.AssistantCoreRequest(query='Which inspection points and intervals are documented?',
             requested_mode=mode,response_language='en',company_id='offline-company',
             machine_id='offline-machine',ai_scope='machine_all',top_k=6)
         decision=m.AssistantCoreDecision(request_kind=kind,effective_mode=mode,confidence=.9,
             requested_mode_fit=True,evidence_state=state,evidence_policy='evidence_required',
-            information_task=task,required_facets=('inspection',),required_answer_types=('checklist',))
-        source='Inspect the frame daily.\nCheck pressure sensor calibration every 200 hours.'
+            information_task=task,required_facets=('inspection',),required_answer_types=answer_types)
+        source=source or 'Inspect the frame daily.\nCheck pressure sensor calibration every 200 hours.'
         rows=[{'citation_id':'manual:inspection','source_type':'document','chunk_full':source}]
         seen=[]
         def provider(messages,**kwargs):
@@ -208,6 +209,71 @@ class FactualListReviewTests(unittest.TestCase):
                     self.assertEqual(result['reason'], 'semantic_contract_incomplete')
                 elif not expected:
                     self.assertEqual(result['missing_list_items'], [complete_items[1]])
+
+    def test_other_factual_checklist_uses_real_enumeration_and_rejects_empty_inventory(self):
+        for state in ('supported', 'partial'):
+            for outcome in ('pass', 'rewrite'):
+                with self.subTest(state=state, outcome=outcome):
+                    reviewed, (_, kwargs), _ = self.case(task='other', state=state,
+                        outcome=outcome, runtime_overrides={
+                            '_assistant_core_enumeration_requested':
+                                self.m._assistant_core_enumeration_requested})
+                    self.assertTrue(reviewed['enumeration_requested'])
+                    self.assertEqual(reviewed['outcome'], 'no_sources')
+                    self.assertEqual(reviewed['reason'], 'supported_list_inventory_missing')
+                    self.assertEqual(next(iter(kwargs['json_schema']['schema']['properties'])),
+                                     'expected_list_items')
+                    final = final_contract.final_contract(
+                        deterministic={'passed': True}, semantic=reviewed,
+                        reviewed_answer=reviewed['answer'], answer=reviewed['answer'],
+                        semantic_complete=True, semantic_partial=False)
+                    self.assertFalse(final['passed'])
+                    self.assertFalse(final['complete'])
+
+    def test_other_inventory_keeps_inspection_and_conditional_intervention_separate(self):
+        # The model's inventory is an explicit fixture. These assertions prove
+        # gate consumption and omission detection, not semantic model quality.
+        items = ['Inspect the carriage surface for dirt daily',
+                 'Every 200 hours inspect carriage condition and lubricate only if needed']
+        source = '. '.join(items) + '.'
+        for answer, expected in ((items[0] + '.', False), (source, True)):
+            with self.subTest(answer=answer):
+                reviewed, (_, kwargs), _ = self.case(task='other', state='partial',
+                    items=items, answer=answer, source=source, runtime_overrides={
+                        '_assistant_core_enumeration_requested':
+                            self.m._assistant_core_enumeration_requested})
+                self.assertTrue(reviewed['enumeration_requested'])
+                self.assertEqual(reviewed['expected_list_items'], items)
+                self.assertEqual(kwargs['max_output_tokens'], 3200)
+                final = final_contract.final_contract(
+                    deterministic={'passed': True}, semantic=reviewed,
+                    reviewed_answer=reviewed['answer'], answer=reviewed['answer'],
+                    semantic_complete=True, semantic_partial=False)
+                self.assertEqual(final['passed'], expected)
+                self.assertEqual(final['complete'], expected)
+                if not expected:
+                    self.assertEqual(reviewed['missing_list_items'], [items[1]])
+
+    def test_other_profile_does_not_change_nonchecklist_or_excluded_consumers(self):
+        # Force the pre-existing lexical signal on to isolate the review gate.
+        # Merely information_task=other must not broaden non-checklist reviews.
+        for overrides in ({'answer_types': ('explanation',)}, {'protected': False},
+                {'mode': 'root_cause'}, {'mode': 'smart_diagnostic'},
+                {'kind': 'procedure'}, {'kind': 'fault_diagnostic'},
+                {'state': 'unsupported'}, {'state': 'clarify'}, {'state': 'refine'}):
+            with self.subTest(overrides=overrides):
+                reviewed, (_, kwargs), baseline = self.case(task='other', **overrides)
+                self.assertEqual(reviewed['outcome'], 'pass')
+                self.assertEqual(kwargs['json_schema'], baseline)
+                self.assertEqual(reviewed['expected_list_items'], [])
+
+    def test_other_no_sources_is_not_promoted_by_an_inventory(self):
+        reviewed, _, _ = self.case(task='other', outcome='no_sources',
+            items=['Inspect the frame daily'], answer='Inspect the frame daily.',
+            runtime_overrides={'_assistant_core_enumeration_requested':
+                               self.m._assistant_core_enumeration_requested})
+        self.assertTrue(reviewed['enumeration_requested'])
+        self.assertEqual(reviewed['outcome'], 'no_sources')
 
 
 if __name__=='__main__':unittest.main(verbosity=2)
