@@ -14,6 +14,7 @@ from dataclasses import replace
 from typing import Optional
 from ..ingest.text_pdf import normalize_unicode_advanced as _normalize_unicode_advanced
 from .validation import AskValidationRuntime
+from . import table_units
 
 _ASSISTANT_CORE_UNIT_TOKEN = r"(?:mm(?:²|2|³|3)?|cm|kg|bar|k\s*pa|m\s*pa|pa|k\s*hz|hz|k\s*w|k\s*n|n\s*(?:[·*x]\s*)?m|nm|rpm|giri\s*/?\s*min(?:uto)?|min\s*(?:-?1|⁻¹)|1\s*/\s*min|ms|°\s*c|°|cst|db\s*\(?a\)?|cycles?|cicli|pieces?|pezzi|occurrences?|occorrenze|%|v|a|w|m|g|s|h)"
 _ASSISTANT_CORE_TECH_UNIT_AFTER_RE = re.compile(
@@ -154,9 +155,20 @@ def _assistant_core_is_list_marker(value: str, start: int, end: int, raw: str) -
 def _assistant_core_claims(text: str) -> list[dict]:
     value = str(text or "")
     claims: list[dict] = []
+    table_values, table_value_spans, conflicting_table_spans = table_units.numeric_cells(value,
+        unit_token=_ASSISTANT_CORE_UNIT_TOKEN, number_atom=_ASSISTANT_CORE_NUMBER_ATOM,
+        normalize_unit=_assistant_core_normalize_unit)
+    for raw, unit in table_values:
+        claims.append({"kind": "number", "raw": raw,
+            "variants": _assistant_core_numeric_variants(raw),
+            "unit": _assistant_core_normalize_unit(unit)})
+    table_value_spans = table_value_spans + conflicting_table_spans
     labeled_value_spans: list[tuple[int, int]] = []
     technical_unit_spans: list[tuple[int, int]] = []
     for labeled_match in _ASSISTANT_CORE_LABELED_VALUE_UNIT_RE.finditer(value):
+        if any(start <= labeled_match.start() and labeled_match.end() <= end
+               for start, end in table_value_spans):
+            continue
         raw_value = str(labeled_match.group("value") or "").strip()
         raw_unit = str(labeled_match.group("unit") or "").strip()
         if not raw_value or not raw_unit:
@@ -183,6 +195,9 @@ def _assistant_core_claims(text: str) -> list[dict]:
     ]
     for match in _ASSISTANT_CORE_NUMBER_RE.finditer(value):
         raw = match.group(0)
+        if any(start <= match.start() and match.end() <= end
+               for start, end in table_value_spans):
+            continue
         if any(
             span_start <= match.start() and match.end() <= span_end
             for span_start, span_end in labeled_value_spans
@@ -238,6 +253,8 @@ def _assistant_core_claims(text: str) -> list[dict]:
             }
         )
     for match in _ASSISTANT_CORE_CODE_RE.finditer(value):
+        if any(start <= match.start() and match.end() <= end for start, end in table_value_spans):
+            continue
         if any(start <= match.start() and match.end() <= stop
                for start, stop in technical_unit_spans):
             continue
@@ -262,6 +279,16 @@ def _assistant_core_claim_supported(
     source_claims: Optional[list[dict]] = None,
 ) -> bool:
     if str(claim.get("kind") or "") == "code" or str(claim.get("unit") or "") == "code":
+        # A compact numeric unit (65bar) can also match the legacy identifier
+        # grammar. A conflicting PDF cell cannot become support through that
+        # second representation. Mask only those exact internal lookup spans;
+        # the admitted source text and rendered response stay unchanged.
+        if '[PDF_TABLE_' in source_text:
+            _, _, conflicts = table_units.numeric_cells(source_text,
+                unit_token=_ASSISTANT_CORE_UNIT_TOKEN, number_atom=_ASSISTANT_CORE_NUMBER_ATOM,
+                normalize_unit=_assistant_core_normalize_unit)
+            for start, end in sorted(conflicts, reverse=True):
+                source_text = source_text[:start] + (' ' * (end - start)) + source_text[end:]
         source_cf = _normalize_unicode_advanced(str(source_text or "")).casefold()
         source_alnum = re.sub(r"[^0-9a-z]", "", source_cf)
         for raw_variant in (claim.get("variants") or set()):

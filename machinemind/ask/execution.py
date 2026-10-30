@@ -21,6 +21,7 @@ from typing import Any, Callable, Optional, TYPE_CHECKING
 from . import procedure_review as _procedure_review
 from . import final_contract as _final_contract
 from . import enumeration_review as _enumeration_review
+from . import review_source_wire as _review_source_wire
 from . import phase_trace
 from .request_scope import conditions_only_contract, bounded_phase_contract
 from .request_completion import current as _current_completion
@@ -554,6 +555,11 @@ def verify_or_repair_answer(
         )
     if not sources_block:
         return {"outcome": "no_sources", "answer": "", "reason": "empty_evidence"}
+
+    if factual_list_review:
+        # Internal wire representation only. Admission, original candidate text,
+        # citation identities and grounding still use the unchanged records.
+        sources_block = _review_source_wire.compact_sources_block(sources_block)
 
     conditions_only = bool(_guarded(runtime, request, decision) and conditions_only_contract(
         procedure_scope=getattr(decision, "procedure_scope", ""),
