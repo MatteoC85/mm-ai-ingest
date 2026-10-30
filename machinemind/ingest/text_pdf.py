@@ -109,8 +109,12 @@ def normalize_text_keep_lines(
 
 
 def pymupdf_page_to_text_blocks(page: Any) -> str:
-    """Read PyMuPDF blocks in stable top-to-bottom, left-to-right order."""
+    """Keep ruled-table cells together, then preserve the legacy prose ordering."""
+    from .pdf_tables import page_text_with_tables
     blocks = page.get_text("blocks") or []
+    table_text = page_text_with_tables(page, blocks)
+    if table_text is not None:
+        return table_text
     blocks_sorted = sorted(blocks, key=lambda b: (float(b[1]), float(b[0])))
 
     parts: list[str] = []

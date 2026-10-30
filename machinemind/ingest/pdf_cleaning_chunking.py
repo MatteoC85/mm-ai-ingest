@@ -38,6 +38,11 @@ TOC_TITLE_RX = re.compile(r"\b(?:contents|content|indice|index|table of contents
 SENT_SPLIT_RX = re.compile(r"(?<=[\.\!\?])\s+")
 
 
+def _is_pdf_table_record(line: str) -> bool:
+    """Recognize atomic geometry records emitted by the PDF extractor."""
+    return bool(re.match(r"^- \[PDF_TABLE_(?:HEADER|RECORD|UNASSIGNED)\s", (line or "").strip()))
+
+
 def hf_norm_line(value: str, *, normalize_text_keep_lines: TextTransform) -> str:
     """Normalize a candidate header/footer line for repetition matching."""
     value = normalize_text_keep_lines(value)
@@ -54,7 +59,7 @@ def extract_top_bottom_lines(
 ) -> tuple[list[str], list[str]]:
     """Return non-empty top and bottom lines from one physical page."""
     lines = [line.strip() for line in (page_text or "").split("\n")]
-    lines = [line for line in lines if line]
+    lines = [line for line in lines if line and not _is_pdf_table_record(line)]
     top = lines[:top_n] if top_n > 0 else []
     bottom = lines[-bottom_n:] if bottom_n > 0 else []
     return top, bottom
@@ -116,7 +121,7 @@ def strip_page_noise_prefix(
     normalize_unicode_advanced: TextTransform,
 ) -> str:
     """Remove embedded ``Page X of Y``/``Pagina X di Y`` prefixes."""
-    if not line:
+    if not line or _is_pdf_table_record(line):
         return line
 
     line = normalize_unicode_advanced(line)
@@ -152,14 +157,16 @@ def remove_headers_footers_from_page(
 
     for index in range(min(top_n, len(lines))):
         lines[index] = strip_page_noise_prefix_fn(lines[index])
-        if hf_norm_line_fn(lines[index]) in header_norm or is_page_noise_line_fn(lines[index]):
+        if not _is_pdf_table_record(lines[index]) and (
+            hf_norm_line_fn(lines[index]) in header_norm or is_page_noise_line_fn(lines[index])
+        ):
             lines[index] = ""
 
     start = len(lines) - min(bottom_n, len(lines))
     for index in range(start, len(lines)):
         if 0 <= index < len(lines):
             lines[index] = strip_page_noise_prefix_fn(lines[index])
-        if 0 <= index < len(lines) and (
+        if 0 <= index < len(lines) and not _is_pdf_table_record(lines[index]) and (
             hf_norm_line_fn(lines[index]) in footer_norm
             or is_page_noise_line_fn(lines[index])
         ):
@@ -198,6 +205,10 @@ def strip_hf_from_chunk_text(
     cleaned: list[str] = []
     for line in lines:
         if not line:
+            continue
+
+        if _is_pdf_table_record(line):
+            cleaned.append(line)
             continue
 
         key = hf_norm_line_fn(line)
@@ -354,7 +365,7 @@ def reflow_paragraphs_conservative(
 def looks_like_toc_line(line: str) -> bool:
     """Recognize an individual table-of-contents line."""
     value = (line or "").strip()
-    if not value:
+    if not value or _is_pdf_table_record(value):
         return False
 
     if re.search(r"\.{4,}", value):

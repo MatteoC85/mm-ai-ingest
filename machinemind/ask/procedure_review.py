@@ -20,6 +20,41 @@ from .final_contract import source_note_present
 
 VERSION = "ask-procedure-review-v2"
 
+# Only these fixed parser labels may leave the review boundary. Never include
+# provider text, source excerpts, exception arguments, or the rejected draft.
+_PROTOCOL_FAILURE_CODES = frozenset({
+    "procedure_review_wire_alias_unknown",
+    "procedure_review_wire_citations_invalid",
+    "procedure_review_wire_edits_invalid",
+    "procedure_review_micro_edit_invalid",
+    "procedure_review_micro_edit_anchor_ambiguous_or_missing",
+    "procedure_review_wire_boundary_invalid",
+    "procedure_review_wire_edge_invalid",
+    "procedure_review_source_sequence_protocol_required",
+    "procedure_review_input_changed",
+    "procedure_review_protocol_invalid",
+    "procedure_review_outcome_invalid",
+    "procedure_review_source_sequence_answer_not_empty",
+    "procedure_review_success_has_missing_requirements",
+    "procedure_review_coverage_shape_invalid",
+    "procedure_review_coverage_not_complete",
+    "procedure_review_reject_invalid",
+    "procedure_review_retain_invalid",
+    "procedure_review_edit_invalid",
+    "procedure_review_edit_shape_invalid",
+    "procedure_review_edit_identity_invalid",
+    "procedure_review_edit_changes_step_sequence",
+    "procedure_review_edit_changes_layout",
+    "procedure_review_replace_invalid",
+    "procedure_review_empty_success",
+    "procedure_review_pass_changes_answer",
+})
+
+
+def protocol_failure_code(exc: ValueError) -> str:
+    code = str(exc)
+    return code if code in _PROTOCOL_FAILURE_CODES else "procedure_review_protocol_invalid"
+
 
 def manual_note_projection(bindings, *, original_answer: str, reviewed_answer: str,
                            review: dict, admitted_ids: set[str]) -> tuple[list[str], dict]:

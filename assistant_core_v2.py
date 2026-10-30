@@ -23,7 +23,7 @@ from typing import Any, Callable, Mapping, MutableMapping, Optional, Sequence
 from machinemind.evidence.ask_input import (
     AskEvidenceAdmission, apply_ask_evidence_input, ask_request_key,
 )
-from machinemind.ask.request_scope import bind_conditions_requirements_to_question
+from machinemind.ask.request_scope import bind_conditions_requirements_to_question, bounded_phase_contract
 from machinemind.ask import procedure_scope as _procedure_scope
 
 
@@ -677,11 +677,17 @@ def normalize_decision(
         and request_kind not in {KIND_UNSAFE_REQUEST, KIND_OUT_OF_SCOPE}
         and raw.get("procedure_scope") in _procedure_scope.SCOPES else "")
     procedure_phase = ()
-    if procedure_scope == "bounded_phase":
+    if procedure_scope in {"bounded_phase", "execution_steps"}:
         if (request_kind != KIND_AMBIGUOUS and information_task == INFO_PROCEDURE_SEGMENT
                 and evidence_state in {EVIDENCE_SUPPORTED, EVIDENCE_PARTIAL, EVIDENCE_REFINE}):
-            procedure_phase = _procedure_scope.validated_phase(raw.get("procedure_phase"), request.query)
-        if not procedure_phase:
+            phase = _procedure_scope.validated_phase(raw.get("procedure_phase"), request.query)
+            if bounded_phase_contract(procedure_scope="bounded_phase", information_task=information_task,
+                    required_answer_types=required_answer_types, facet_queries=facet_queries,
+                    procedure_phase=phase, question=request.query):
+                # Exact semantic excerpts are independent of the broad enum. A
+                # generic execution label cannot erase the user's phase limits.
+                procedure_scope, procedure_phase = "bounded_phase", phase
+        if procedure_scope == "bounded_phase" and not procedure_phase:
             procedure_scope = ""
 
     return bind_conditions_requirements_to_question(AssistantCoreDecision(

@@ -79,13 +79,56 @@ class PhaseRouterTests(unittest.TestCase):
             self.assertFalse(getattr(decision,'procedure_phase',()))
 
     def test_other_scopes_and_legacy_payloads_drop_phase_quotes(self):
-        for scope in ('conditions_only','execution_steps','other',''):
+        for scope in ('conditions_only','other',''):
             raw=payload();raw['procedure_scope']=scope
             self.assertFalse(getattr(normalize_decision(request(),raw),'procedure_phase',()))
         raw=payload();raw.pop('procedure_scope');raw.pop('procedure_phase')
         decision=normalize_decision(request(),raw)
         self.assertEqual(decision.procedure_scope,'')
         self.assertIn('ordered_actions',decision.required_answer_types)
+
+    def test_generic_execution_label_cannot_erase_valid_independent_phase_excerpts(self):
+        cases=[(QUERY,payload()['procedure_phase']),
+            ('Dopo la calibrazione, cosa devo richiudere prima della prova?',
+             {'completed_context':'Dopo la calibrazione','requested_actions':'cosa devo richiudere','later_context':'prima della prova'}),
+            ('Unrelated context. '*80 + QUERY,payload()['procedure_phase'])]
+        for query,phase in cases:
+            with self.subTest(query_length=len(query)):
+                raw=payload();raw.update(procedure_scope='execution_steps',procedure_phase=phase)
+                before=copy.deepcopy(raw)
+                decision=normalize_decision(request(query),raw)
+                self.assertEqual(decision.procedure_scope,'bounded_phase')
+                self.assertEqual(decision.procedure_phase,tuple(phase.values()))
+                self.assertEqual(decision.required_answer_types,tuple(raw['required_answer_types']))
+                self.assertEqual(decision.required_facets,tuple(raw['required_facets']))
+                self.assertEqual(raw,before)
+
+    def test_execution_without_valid_boundaries_remains_canonical(self):
+        phases=[None,{},dict.fromkeys(procedure_scope.PHASE_FIELDS,''),
+            {'completed_context':'','requested_actions':'what must I restore','later_context':''},
+            {'completed_context':'after a source-only operation','requested_actions':'what must I restore','later_context':''}]
+        for phase in phases:
+            with self.subTest(phase=phase):
+                raw=payload();raw.update(procedure_scope='execution_steps',procedure_phase=phase)
+                decision=normalize_decision(request(),raw)
+                self.assertEqual(decision.procedure_scope,'execution_steps')
+                self.assertEqual(decision.procedure_phase,())
+
+    def test_valid_quotes_do_not_override_incompatible_contracts_or_other_modes(self):
+        variants=[{'information_task':'procedure_full'}, {'request_kind':'ambiguous'},
+            {'required_answer_types':['checklist','safety_conditions']},
+            {'facet_queries':[{'facet':'checks','answer_type':'checklist','must_cover':True}]},
+            {'procedure_scope':'conditions_only'}, {'procedure_scope':'other'}]
+        for change in variants:
+            raw=payload();raw['procedure_scope']='execution_steps';raw.update(change)
+            decision=normalize_decision(request(),raw)
+            self.assertNotEqual(decision.procedure_scope,'bounded_phase')
+            self.assertEqual(decision.procedure_phase,())
+        for mode in ('root_cause','smart_diagnostic'):
+            raw=payload();raw['procedure_scope']='execution_steps'
+            decision=normalize_decision(request(mode=mode),raw)
+            self.assertNotEqual(decision.procedure_scope,'bounded_phase')
+            self.assertEqual(decision.procedure_phase,())
 
     def test_quote_length_is_bounded_without_truncation_and_non_english_text_is_literal(self):
         raw=payload();long_quote='restore '+('the assembly '*24)
@@ -108,6 +151,11 @@ class PhaseRouterTests(unittest.TestCase):
         self.assertEqual(set(phase.get('properties',{})),set(phase.get('required',[])))
         self.assertIs(phase.get('additionalProperties'),False)
         self.assertEqual(schema['required'].count('procedure_phase'),1)
+        self.assertEqual(next(iter(schema['properties'])),'procedure_phase')
+        self.assertEqual(schema['required'][0],'procedure_phase')
+        self.assertIn('independently of the scope label',procedure_scope.INSTRUCTION)
+        self.assertIn('even if your preliminary scope label is execution_steps',procedure_scope.INSTRUCTION)
+        self.assertNotIn('For all scopes other than bounded_phase',procedure_scope.INSTRUCTION)
 
 
 if __name__=='__main__':

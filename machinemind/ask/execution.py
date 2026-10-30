@@ -608,6 +608,9 @@ def verify_or_repair_answer(
         "You are the independent final coverage verifier for MachineMind ASK. "
         "Use only SOURCES. Evaluate every REQUIRED_FACET and REQUIRED_ANSWER_TYPE separately. "
         "Do not accept an answer merely because it is on the same topic. A numeric request needs the requested value and unit/context; interface navigation needs every requested screen/menu/location; synchronization needs all participating functions and their state/time order; a checklist needs practical checks, not generic prose. "
+        "Verify each complete source relationship: component, action, interval/value, unit and applicability condition. Mere presence of the same numbers or words in a cited table is not support. Bind each row interval to that row's action, and keep separately qualified actions/intervals in notes distinct. Correct reassigned or swapped relationships using explicit source cells; if the supplied text is ambiguous, disclose the unavailable association rather than approving a guess. "
+        "PDF_TABLE extraction markers express geometry only; they are not technical labels or values to repeat to the user. Text marked UNASSIGNED has no asserted cell relationship and cannot support assigning a value to a neighboring row. "
+        "For factual/document-explanation answers, remove unrequested physical access/setup instructions that are unnecessary to answer the question. For every physical action retained, verify its directly documented prerequisites, authorized operating mode, precautions and required closure even if the router did not request a separate safety facet. PPE or closing guards afterwards does not replace an access prerequisite. Preserve available conditions in the replacement; never invent missing ones or approve an incomplete operational instruction. "
         "If ENUMERATION_REQUESTED=true, identify the complete set of directly supported labels, types, modes, options, actions or settings that answer the requested category. Populate expected_list_items, covered_list_items and missing_list_items. A category name such as 'control type' or 'stop mode' never counts as listing its concrete options. Do not include options from unrelated source sections. "
         "If SOURCES contain missing information, return outcome=rewrite and produce one concise, operationally complete replacement answer in RESPONSE_LANGUAGE. Preserve all supported values, units, labels, modes, control types and list items. "
         "Verify technical identifiers, product/grade designations and codes against their cited source, including letter order and digits. Never approve or introduce a silently corrected apparent typo or a familiar substitute from prior knowledge. In a replacement, keep the exact documented spelling, quoting and qualifying it if uncertain; an alternative needs explicit source support. Remove an unsupported optional identifier before approving the replacement, without omitting supported mandatory facts or concealing required information that is unavailable. "
@@ -773,7 +776,7 @@ def verify_or_repair_answer(
                 required_facets=review_facets, required_types=requirements,
                 source_ordered=source_ordered_review,
                 source_notes=tuple(repair_context.get("procedure_notes") or ()))
-    except ValueError:
+    except ValueError as exc:
         if not source_ordered_review:
             raise
         # Invalid identities/layout are a terminal wire-protocol failure, never
@@ -782,6 +785,7 @@ def verify_or_repair_answer(
             "covered_facets": [], "missing_facets": review_facets,
             "covered_answer_types": [], "missing_answer_types": requirements,
             "missing_list_items": [], "reason": "procedure_review_protocol_invalid",
+            "protocol_failure_code": _procedure_review.protocol_failure_code(exc),
             "_terminal_review_failure": True, "model": model_used,
             **({"review_evidence": review_evidence_diagnostic} if review_evidence_diagnostic else {})}
     if review_evidence_diagnostic:

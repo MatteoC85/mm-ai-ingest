@@ -50,6 +50,13 @@ class SourceOrderedReviewTests(unittest.TestCase):
         self.assertEqual(generic['properties']['answer'],{'type':'string'})
         self.assertEqual(legacy,original)
 
+    def test_protocol_diagnostic_reveals_only_fixed_labels(self):
+        self.assertEqual(review.protocol_failure_code(ValueError('procedure_review_wire_alias_unknown')),
+                         'procedure_review_wire_alias_unknown')
+        for detail in ('private source body', 'procedure_review_wire_alias_unknown: private source body'):
+            self.assertEqual(review.protocol_failure_code(ValueError(detail)),
+                             'procedure_review_protocol_invalid')
+
     def test_extensive_correction_keeps_every_source_ordinal_and_order(self):
         layout=review.block_layout(self.ANSWER)
         edits=[{'block_id':b['block_id'],'text':b['text'].strip()}
@@ -216,6 +223,8 @@ class WiredSourceOrderedReviewTests(unittest.TestCase):
         self.assertFalse(result['meta']['assistant_core_validation']['answer_contract']['passed'])
         self.assertEqual(result['meta']['assistant_core_validation']['answer_contract']['semantic_verifier']['reason'],
                          'procedure_review_protocol_invalid')
+        self.assertEqual(result['meta']['assistant_core_validation']['answer_contract']['semantic_verifier']['protocol_failure_code'],
+                         'procedure_review_wire_alias_unknown')
 
     def test_malformed_source_ordered_protocol_is_terminal_controlled_failure(self):
         for kind in ('reply_mode','missing_audit','null_audit'):

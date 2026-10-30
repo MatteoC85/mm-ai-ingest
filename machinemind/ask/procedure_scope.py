@@ -7,6 +7,11 @@ SCOPES = ("conditions_only", "bounded_phase", "execution_steps", "other")
 PHASE_FIELDS = ("completed_context", "requested_actions", "later_context")
 INSTRUCTION = (
     "For ASK, set procedure_scope from what USER_REQUEST asks the answer to do, not from operations mentioned in the sources. "
+    "First extract procedure_phase independently of the scope label for every request to execute a procedure segment. "
+    "Identify what the user says is already completed, which actions are requested now, and which later operation is not yet requested. "
+    "Return exact, unmodified USER_REQUEST excerpts in completed_context, requested_actions and later_context, even if your preliminary scope label is execution_steps. "
+    "Do not erase a stated boundary merely because the broad request is procedural or because the sources describe the whole operation. "
+    "Only after this extraction choose the scope. A valid action excerpt and at least one temporal boundary select bounded_phase rather than generic execution_steps. "
     "Use conditions_only when the user asks only which prerequisites, checks or safety conditions must hold before an operation. "
     "For this conditions_only procedural request use procedure_segment with checklist and/or safety_conditions; do not add ordered_actions merely because an operation is named. "
     "Each mandatory facet must describe the requested checks or conditions, not an unrequested execution sequence. "
@@ -15,11 +20,11 @@ INSTRUCTION = (
     "Preserve specifics actually requested by the user; otherwise describe the required dimensions and operation, and use source-specific search terms only when their applicability to that operation and phase is established. "
     "Use bounded_phase with procedure_segment and ordered_actions when the user asks for actions within an explicitly bounded phase: an operation already completed and/or a later operation that must not yet be executed. "
     "Distinguish that completed context, the actions actually requested, and the later context. Do not repeat the completed operation or start the later one. "
-    "For bounded_phase, procedure_phase must contain exact, unmodified excerpts from USER_REQUEST: completed_context, requested_actions, later_context. "
     "Each nonempty excerpt must include the relevant action or state, not only a temporal connective; use at most 240 characters per excerpt. "
     "requested_actions must be nonempty and at least one boundary excerpt must be nonempty; leave absent boundaries empty and never invent them from INDEXED_EVIDENCE. "
     "The excerpts scope the answer; they are not proof that equipment is safe. Preserve all source-backed precautions and closures needed for actions actually proposed. "
-    "For all scopes other than bounded_phase, set all three procedure_phase strings to empty. "
+    "Do not infer that an operation is completed from a requested physical Step range, material path or full procedure: those ask for execution, not for what follows it. "
+    "If no completed or excluded later phase is expressed, leave both boundary strings empty. For conditions_only, full procedures and non-execution requests leave all three strings empty. "
     "Use execution_steps for execution requests without this phase boundary, including a requested Step range, a material path, a complete operation, or a combined request for execution and checks. "
     "Preserve ordered_actions/state_sequence and all operational facets for those requests, even when safety or prerequisite checks are also required. "
     "Use other for non-procedural information or when no such intent is established. "
@@ -30,14 +35,17 @@ INSTRUCTION = (
 def router_schema(schema):
     out = deepcopy(schema)
     obj = out["schema"]
-    obj["properties"]["procedure_scope"] = {"type": "string", "enum": list(SCOPES)}
-    obj["properties"]["procedure_phase"] = {"type": "object", "additionalProperties": False,
+    phase_schema = {"type": "object", "additionalProperties": False,
         "properties": {name: {"type": "string"} for name in PHASE_FIELDS},
         "required": list(PHASE_FIELDS)}
-    if "procedure_scope" not in obj["required"]:
-        obj["required"].append("procedure_scope")
-    if "procedure_phase" not in obj["required"]:
-        obj["required"].append("procedure_phase")
+    # Put the user excerpts before classification in the same structured reply.
+    # Shape/limits are unchanged; no extra router or provider request is added.
+    obj["properties"] = {"procedure_phase": phase_schema,
+        **{key: value for key, value in obj["properties"].items()
+           if key not in {"procedure_phase", "procedure_scope"}},
+        "procedure_scope": {"type": "string", "enum": list(SCOPES)}}
+    obj["required"] = ["procedure_phase", *[key for key in obj["required"]
+        if key not in {"procedure_phase", "procedure_scope"}], "procedure_scope"]
     return out
 
 
