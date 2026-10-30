@@ -51,7 +51,8 @@ class ContextFixture(table_fixture.OwnedTableFixture):
             if is_second:
                 self.first_candidate = messages[1]['content'].split('\n\nCOMPLETE_CANDIDATE:\n',1)[1].split(
                     '\n\nIMMUTABLE_INVENTORY_INDICES:',1)[0]
-                reply = {'outcome':'pass', 'edits':[], 'citation_ids':['inspection:p1','inspection:p2'],
+                reply = {'outcome':'rewrite', 'edits':[], 'citation_ids':['inspection:p1','inspection:p2'],
+                         'table_contexts':table_fixture.table_contexts(),
                          'checks':{name:True for name in factual_context_review.CHECKS}, 'reason':'offline independent fixture'}
                 if second is not None:second(reply)
             else:
@@ -113,7 +114,7 @@ class FactualContextOwnedTests(unittest.TestCase):
         self.assertEqual(f.writer_calls,[])
         return contract
 
-    def test_second_pass_preserves_first_rewrite_same_source_packet_and_bound_answer(self):
+    def test_second_context_rewrite_preserves_source_packet_inventory_and_bound_answer(self):
         completion, f = self.case()
         limits = (completion.budget.deadline_monotonic,completion.budget.max_estimated_cost_usd)
         result = f.run(); contract = self.assert_bound(result,f)
@@ -126,9 +127,11 @@ class FactualContextOwnedTests(unittest.TestCase):
         self.assertNotIn('SOURCE_TABLE_PREVIEWS',f.calls[1]['messages'][1]['content'])
         self.assertNotIn('offline first fixture',f.calls[1]['messages'][1]['content'])
         self.assertEqual(contract['semantic_verifier']['outcome'],'rewrite')
-        self.assertEqual(contract['semantic_verifier']['independent_context_review']['outcome'],'pass')
-        self.assertEqual(contract['semantic_verifier']['answer'],
-                         self.m._assistant_core_redact_internal_text(f.first_candidate))
+        self.assertEqual(contract['semantic_verifier']['independent_context_review']['outcome'],'rewrite')
+        self.assertIn(table_fixture.TABLE_QUALIFIER,contract['semantic_verifier']['answer'])
+        self.assertNotIn(table_fixture.TABLE_QUALIFIER,f.first_candidate)
+        self.assertIn('halve them under heavy loading',result['answer_html'])
+        self.assertIn(self.m._assistant_core_redact_internal_text(FIRST_ITEM),contract['semantic_verifier']['answer'])
         self.assertEqual((completion.budget.deadline_monotonic,completion.budget.max_estimated_cost_usd),limits)
         ceiling = min(4000,max(3200,self.m.V13_FAST_MAX_OUTPUT_TOKENS))
         self.assertEqual([call['kwargs']['max_output_tokens'] for call in f.calls], [ceiling,ceiling])
@@ -142,8 +145,7 @@ class FactualContextOwnedTests(unittest.TestCase):
         completion, f = self.case(second=lambda r:r.update(outcome='rewrite',edits=[{'target':'item:1','text':SAFE_ITEM}]))
         result = f.run(); contract = self.assert_bound(result,f)
         verified = contract['semantic_verifier']
-        self.assertEqual(verified['answer'],self.m._assistant_core_redact_internal_text(
-            f.first_candidate.replace(FIRST_ITEM,SAFE_ITEM)))
+        self.assertIn(table_fixture.TABLE_QUALIFIER,verified['answer'])
         self.assertEqual(verified['independent_context_review']['outcome'],'rewrite')
         self.assertEqual(verified['independent_context_review']['edit_count'],1)
         for sentence in SAFE_ITEM.split('. '):
@@ -160,6 +162,11 @@ class FactualContextOwnedTests(unittest.TestCase):
             lambda r:r.update(citation_ids=['inspection:p2']),
             lambda r:r.update(citation_ids=['foreign-tenant:p1','inspection:p2']),
             lambda r:r.update(outcome='rewrite',edits=[{'target':'item:1','text':'[[SOURCE_TABLE:G1]]'}]),
+            lambda r:r.update(table_contexts=[]),
+            lambda r:r['table_contexts'][0].update(target='item:1'),
+            lambda r:r['table_contexts'][0]['source_quotes'][0].update(quote='Invented condition not in any emitted source.'),
+            lambda r:r['table_contexts'][0]['source_quotes'][0].update(citation_id='inspection:p2'),
+            lambda r:r['table_contexts'][0].update(documentary_limits_checked=False),
         ]
         for index,change in enumerate(changes):
             with self.subTest(case=index):

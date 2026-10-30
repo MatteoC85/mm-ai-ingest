@@ -10,6 +10,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from machinemind.ask import factual_context_review as review
 from machinemind.ask import enumeration_review, source_table_review
 
+CONTEXT = 'Scope: sliding assembly. Under heavy loading, halve the documented intervals.'
+
 
 class FactualContextReviewTests(unittest.TestCase):
     def test_normalization_proof_does_not_change_editable_wire_strings(self):
@@ -22,14 +24,15 @@ class FactualContextReviewTests(unittest.TestCase):
             canonical_inventory=normalize(raw), allowed=True, normalize_item=normalize)
         frame = review.prepare_review(wire, expanded,
             catalog=source_table_review.TableCatalog(), admitted_citation_ids=['manual:p1'])
-        result = review.apply_review(expanded, self.verdict(), frame)
+        result = review.apply_review(expanded, self.verdict(table=False), frame)
         self.assertEqual(result['answer'], '- ' + raw)
         self.assertEqual(result['expected_list_items'], [raw])
         self.assertEqual(frame.items, (raw,))
 
     def candidate(self, *, table=True, template=True):
         literal = 'Original quotation.\n  - Action: «Check cleanliness»; Interval: «Daily»; Note: «Intervene only if needed»'
-        entry = source_table_review.TableEntry('[[SOURCE_TABLE:G1]]', literal, 'manual:p1', ('T1',), '0'*64)
+        source_body=CONTEXT+'\n'+literal
+        entry = source_table_review.TableEntry('[[SOURCE_TABLE:G1]]', literal, 'manual:p1', ('T1',), hashlib.sha256(source_body.encode()).hexdigest())
         catalog = source_table_review.TableCatalog((entry,) if table else (), '')
         items = ['[[SOURCE_TABLE:G1]]', 'Inspect the level and top up if necessary.'] if table else ['Inspect the level and top up if necessary.']
         body = 'Documented facts:\n[[FACTUAL_INVENTORY]]\nKeep the stated scope.' if template else items[0]
@@ -41,21 +44,27 @@ class FactualContextReviewTests(unittest.TestCase):
         expanded = source_table_review.resolve_reply(wire, catalog)
         expanded = enumeration_review.resolve_inventory_answer(expanded,
             canonical_inventory=expanded['expected_list_items'], allowed=True)
+        self.sources='[manual:p1] source_type=document; p=1\n'+source_body+'\n\n[manual:p2] source_type=document; p=2\nUse the documented personal protective equipment.'
         frame = review.prepare_review(wire, expanded, catalog=catalog,
-            admitted_citation_ids=['manual:p1', 'manual:p2'])
+            admitted_citation_ids=['manual:p1', 'manual:p2'],sources_block=self.sources)
         return wire, expanded, frame, catalog
 
-    def verdict(self, *, outcome='pass', edits=(), citations=('manual:p1',), **checks):
-        return dict(outcome=outcome, edits=list(edits), citation_ids=list(citations),
+    def verdict(self, *, outcome=None, edits=(), citations=('manual:p1',), table=True, **checks):
+        return dict(outcome=outcome or ('rewrite' if table else 'pass'), edits=list(edits), citation_ids=list(citations),
+                    table_contexts=[{'target':'item:0','context':'The quoted intervals concern this sliding assembly and are halved under heavy loading.',
+                        'documentary_limits_checked':True,'source_quotes':[{'citation_id':'manual:p1','quote':CONTEXT}]}] if table else [],
                     checks={key: checks.get(key, True) for key in review.CHECKS}, reason='PRIVATE_SECOND_REASON')
 
-    def test_pass_keeps_generated_rewrite_and_exact_table_inventory(self):
+    def test_context_only_rewrite_keeps_exact_table_inventory_and_binds_added_conditions(self):
         _, first, frame, _ = self.candidate()
         out = review.apply_review(first, self.verdict(), frame)
         self.assertEqual(out['outcome'], 'rewrite')
-        for field in ('answer','expected_list_items','table_record_coverage','citation_ids','missing_facets','missing_list_items'):
+        for field in ('expected_list_items','table_record_coverage','citation_ids','missing_facets','missing_list_items'):
             self.assertEqual(out[field], first[field])
-        self.assertEqual(out['independent_context_review'], {'outcome':'pass','edit_count':0,
+        self.assertIn(CONTEXT,out['answer'])
+        self.assertIn(first['expected_list_items'][0],out['answer'])
+        self.assertNotEqual(out['answer'],first['answer'])
+        self.assertEqual(out['independent_context_review'], {'outcome':'rewrite','edit_count':0,
             'answer_sha256':hashlib.sha256(out['answer'].encode()).hexdigest()})
         self.assertNotIn('PRIVATE_SECOND_REASON', str(out))
 
@@ -104,7 +113,7 @@ class FactualContextReviewTests(unittest.TestCase):
             self.verdict(outcome='rewrite',edits=[{'target':'item:1','text':'Changed'}, {'target':'item:1','text':'Changed again'}]),
             self.verdict(outcome='rewrite',edits=[{'target':'item:1','text':'[[SOURCE_TABLE:G1]]'}]),
             self.verdict(outcome='rewrite',edits=[{'target':'item:1','text':'[[FACTUAL_INVENTORY]]'}]),
-            self.verdict(edits=[{'target':'item:1','text':'Changed on pass'}]),
+            self.verdict(outcome='pass',edits=[{'target':'item:1','text':'Changed on pass'}]),
         ]
         for body in ('No inventory','inline [[FACTUAL_INVENTORY]]','[[FACTUAL_INVENTORY]]\n[[FACTUAL_INVENTORY]]'):
             variants.append(self.verdict(outcome='rewrite',edits=[{'target':'template-answer','text':body}]))
@@ -123,7 +132,7 @@ class FactualContextReviewTests(unittest.TestCase):
 
     def test_sources_are_byte_identical_and_prior_judgement_is_not_in_second_prompt(self):
         _,_,frame,_=self.candidate()
-        sources='[manual:p1] source_type=document; p=1\nExact\nsource\n\n[manual:p2] source_type=document; p=2\nPPE.'
+        sources=self.sources
         messages=review.build_messages(frame,question='Which maintenance is documented?',response_language='en',sources_block=sources)
         actual=messages[1]['content'].split('SOURCES:\n',1)[1].split('\n\nCOMPLETE_CANDIDATE:',1)[0]
         self.assertEqual(actual,sources)
@@ -131,21 +140,46 @@ class FactualContextReviewTests(unittest.TestCase):
         self.assertNotIn('PRIVATE_FIRST_VERDICT',str(messages))
         self.assertNotIn('SOURCE_TABLE_PREVIEWS',str(messages))
         self.assertEqual(review.schema(frame)['name'],'factual_context_review')
+        with self.assertRaisesRegex(ValueError,'^factual_context_review_invalid$'):
+            review.build_messages(frame,question='Which maintenance?',response_language='en',sources_block=sources+' Changed')
 
     def test_plain_inventory_is_supported_and_legacy_no_marker_is_read_only(self):
         for template in (True,False):
             _,first,frame,_=self.candidate(table=False,template=template)
             self.assertEqual(frame.immutable_indices,())
-            self.assertEqual(review.apply_review(first,self.verdict(),frame)['answer'],first['answer'])
+            self.assertEqual(review.apply_review(first,self.verdict(table=False),frame)['answer'],first['answer'])
             if template:
-                out=review.apply_review(first,self.verdict(outcome='rewrite',edits=[{'target':'item:0','text':'Use the documented prerequisites before intervention.'}]),frame)
+                out=review.apply_review(first,self.verdict(table=False,outcome='rewrite',edits=[{'target':'item:0','text':'Use the documented prerequisites before intervention.'}]),frame)
                 self.assertEqual(out['outcome'],'rewrite')
             else:
                 self.assertEqual(frame.editable_targets,())
                 s=review.schema(frame)['schema']['properties']['edits']
                 self.assertEqual(s['maxItems'],0)
                 self.assertNotIn('enum',s['items']['properties']['target'])
-                self.assertEqual(review.apply_review(first,self.verdict(outcome='rewrite'),frame)['outcome'],'no_sources')
+                self.assertEqual(review.apply_review(first,self.verdict(table=False,outcome='rewrite'),frame)['outcome'],'no_sources')
+
+    def test_table_context_must_cover_exact_targets_and_quote_emitted_owning_source(self):
+        _,first,frame,_=self.candidate()
+        changes=[lambda v:v.update(table_contexts=[]),
+                 lambda v:v.update(outcome='pass'),
+                 lambda v:v['table_contexts'].append(deepcopy(v['table_contexts'][0])),
+                 lambda v:v['table_contexts'][0].update(target='item:1'),
+                 lambda v:v['table_contexts'][0].update(documentary_limits_checked=False),
+                 lambda v:v['table_contexts'][0]['source_quotes'][0].update(quote='A different unseen qualification.'),
+                 lambda v:v['table_contexts'][0]['source_quotes'][0].update(citation_id='foreign:p1'),
+                 lambda v:v['table_contexts'][0].update(source_quotes=[{'citation_id':'manual:p2','quote':'Use the documented personal protective equipment.'}]),
+                 lambda v:v['table_contexts'][0].update(context='[[FACTUAL_INVENTORY]]')]
+        for change in changes:
+            verdict=self.verdict(citations=['manual:p1','manual:p2']);change(verdict)
+            with self.subTest(change=change):
+                self.assertEqual(review.apply_review(first,verdict,frame)['outcome'],'no_sources')
+
+    def test_source_packet_cannot_substitute_unemitted_or_mutated_context_for_catalog(self):
+        wire,first,_,catalog=self.candidate()
+        for sources in ('',self.sources.replace(CONTEXT,'Different conditions.'),self.sources.replace('manual:p1','foreign:p1')):
+            with self.subTest(sources=sources[:40]):
+                with self.assertRaisesRegex(ValueError,'^factual_context_review_invalid$'):
+                    review.prepare_review(wire,first,catalog=catalog,admitted_citation_ids=['manual:p1','manual:p2'],sources_block=sources)
 
 
 if __name__=='__main__':unittest.main(verbosity=2)

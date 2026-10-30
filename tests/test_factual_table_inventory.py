@@ -58,7 +58,13 @@ class FactualTableInventoryTests(unittest.TestCase):
         def provider(messages,**kwargs):
             seen.append((messages,kwargs))
             if kwargs['json_schema']['name'] == 'factual_context_review':
-                return {'outcome':'pass','edits':[], 'citation_ids':['manual:inspection'],
+                contexts=([{'target':'item:0',
+                    'context':'The slide inspection has separate cleanliness and conditional wear/greasing requirements; the quoted source includes the continuation.',
+                    'documentary_limits_checked':True,
+                    'source_quotes':[{'citation_id':'manual:inspection',
+                        'quote':'Inspect wear every 360 hours and grease if necessary.'}]}] if complete_catalog else [])
+                return {'outcome':'rewrite' if contexts else 'pass','edits':[], 'citation_ids':['manual:inspection'],
+                    'table_contexts':contexts,
                     'checks':{name:True for name in factual_context_review.CHECKS},
                     'reason':'offline independent fixture'}, 'offline-model'
             result={'outcome':outcome,'answer':answer,'citation_ids':['manual:inspection'],

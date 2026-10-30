@@ -91,6 +91,7 @@ class SourceFirstFixture:
                 missing_answer_types=[], expected_list_items=values, covered_list_items=[], missing_list_items=[])
             if kwargs['json_schema']['name'] == 'factual_context_review':
                 reply = dict(outcome='pass', edits=[], citation_ids=['maintenance:p1','maintenance:p2'],
+                    table_contexts=[],
                     checks={name:True for name in factual_context_review.CHECKS}, reason='offline independent fixture')
             class Response:
                 status_code=200

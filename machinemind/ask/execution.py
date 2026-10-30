@@ -887,7 +887,8 @@ def verify_or_repair_answer(
         if out.get("outcome") == "rewrite":
             try:
                 frame = _factual_context_review.prepare_review(wire_reply, out,
-                    catalog=source_table_catalog, admitted_citation_ids=valid_ids)
+                    catalog=source_table_catalog, admitted_citation_ids=valid_ids,
+                    sources_block=sources_block)
                 # Reuse the exact owned packet already emitted above, including
                 # its lossless compression. Do not retrieve or compile it again.
                 messages = _factual_context_review.build_messages(frame,

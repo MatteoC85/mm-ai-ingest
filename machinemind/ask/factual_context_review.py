@@ -10,7 +10,8 @@ import hashlib
 import json
 
 from . import enumeration_review
-from .source_table_review import PREFIX, TableCatalog
+from . import review_source_wire
+from .source_table_review import PREFIX, TableCatalog, _HEADER, _RECORD_ID, _escape
 
 MARKER = enumeration_review.INVENTORY_MARKER
 MAX_TEXT = 30000
@@ -35,6 +36,23 @@ INSTRUCTIONS = (
     'no_sources. Preserve all current citation IDs and cite additional support only '
     'from SOURCES. An empty EDITABLE_BLOCKS list means the candidate is read-only: '
     'return pass or no_sources, never rewrite. Return only the strict JSON object.'
+    ' TABLE_CONTEXTS: audit every TABLE_CONTEXT_TARGET exactly once, identifying '
+    'the assembly/applicability only as far as SOURCES establish it and retaining '
+    'all applicable qualifications outside the cells (including adjacent prose). '
+    'Give one or two short sentences of reading context and one or two exact '
+    'supporting quotations from the emitted SOURCES, including the owning source. '
+    'The server places this context and its quotations immediately before that '
+    'unchanged table group. This adds no requested intervention. Do not copy a '
+    'whole source or unrelated operations. A context label saying documentary '
+    'or not instructions never waives the qualifications. Check any assertion '
+    'that information or a chapter is unavailable against all supplied excerpts: '
+    'an incomplete excerpt does not establish absence from the complete document. '
+    'Correct an overbroad absence claim through the ordinary editable item or '
+    'template. Set documentary_limits_checked true only after this check. '
+    'With table contexts, return rewrite even if edits is empty, because the '
+    'qualified contexts are additions; all six checks concern that final assembled '
+    'answer. Without table targets return table_contexts=[] and preserve the '
+    'ordinary pass/rewrite rules. If any context remains unsupported, no_sources.'
 )
 
 
@@ -71,9 +89,34 @@ class ReviewFrame:
     admitted_citation_ids: tuple[str, ...]
     current_citation_ids: tuple[str, ...]
     editable_targets: tuple[str, ...]
+    table_owners: tuple[tuple[int, str], ...]
+    source_bodies: tuple[tuple[str, str], ...]
+    source_packet_sha256: str
 
 
-def prepare_review(wire_reply, expanded_reply, *, catalog: TableCatalog, admitted_citation_ids) -> ReviewFrame:
+def _emitted_source_bodies(sources_block, allowed):
+    """Decode only the already emitted packet; this acquires no source authority."""
+    if type(sources_block) is not str:
+        raise ValueError('factual_context_review_invalid')
+    restored = review_source_wire.restore_sources_block(sources_block)
+    headers = list(_HEADER.finditer(restored))
+    if (not headers or len(headers) > 64 or len(restored) > MAX_TEXT + 2048
+            or restored[:headers[0].start()].strip()):
+        raise ValueError('factual_context_review_invalid')
+    rows = {}
+    for index, header in enumerate(headers):
+        cid = header[1]
+        if cid not in allowed or cid in rows:
+            raise ValueError('factual_context_review_invalid')
+        end = headers[index + 1].start() if index + 1 < len(headers) else len(restored)
+        body = '\n'.join(line for line in restored[header.end():end].strip().splitlines()
+                         if not _RECORD_ID.fullmatch(line))
+        rows[cid] = body
+    return rows
+
+
+def prepare_review(wire_reply, expanded_reply, *, catalog: TableCatalog,
+                   admitted_citation_ids, sources_block='') -> ReviewFrame:
     """Bind exact first-stage data; never locate editable blocks by fuzzy text."""
     invalid = ValueError('factual_context_review_invalid')
     if type(wire_reply) is not dict or type(expanded_reply) is not dict or type(catalog) is not TableCatalog:
@@ -114,6 +157,14 @@ def prepare_review(wire_reply, expanded_reply, *, catalog: TableCatalog, admitte
     for i in immutable:
         if entries[raw_items[i]].citation_id not in citations:
             raise invalid
+    source_bodies = _emitted_source_bodies(sources_block, allowed) if immutable else {}
+    owners = []
+    for i in immutable:
+        entry = entries[raw_items[i]]
+        if (entry.citation_id not in source_bodies
+                or _digest(source_bodies[entry.citation_id]) != entry.source_sha256):
+            raise invalid
+        owners.append((i, entry.citation_id))
     template_mode = _has_template(template)
     if template_mode:
         if _expand(template, items) != answer:
@@ -127,11 +178,15 @@ def prepare_review(wire_reply, expanded_reply, *, catalog: TableCatalog, admitte
             raise invalid
         targets = ()
     return ReviewFrame(_json(expanded_reply), answer, template, tuple(items), tuple(immutable),
-                       allowed, tuple(dict.fromkeys(citations)), targets)
+                       allowed, tuple(dict.fromkeys(citations)), targets,
+                       tuple(owners), tuple(source_bodies.items()),
+                       _digest(sources_block) if sources_block else '')
 
 
 def build_messages(frame: ReviewFrame, *, question: str, response_language: str, sources_block: str):
     if type(frame) is not ReviewFrame or any(type(x) is not str for x in (question, response_language, sources_block)):
+        raise ValueError('factual_context_review_invalid')
+    if frame.source_packet_sha256 and _digest(sources_block) != frame.source_packet_sha256:
         raise ValueError('factual_context_review_invalid')
     editable = [{'target': target, 'text': frame.template if target == 'template-answer'
                  else frame.items[int(target.split(':')[1])]} for target in frame.editable_targets]
@@ -139,6 +194,9 @@ def build_messages(frame: ReviewFrame, *, question: str, response_language: str,
         + '\n\nSOURCES:\n' + sources_block + '\n\nCOMPLETE_CANDIDATE:\n' + frame.answer
         + '\n\nIMMUTABLE_INVENTORY_INDICES: ' + json.dumps(frame.immutable_indices)
         + '\n\nEDITABLE_BLOCKS:\n' + json.dumps(editable, ensure_ascii=False)
+        + '\n\nTABLE_CONTEXT_TARGETS:\n' + json.dumps([
+            {'target': 'item:' + str(index), 'citation_id': cid}
+            for index, cid in frame.table_owners], ensure_ascii=False)
         + '\n\nCURRENT_CITATION_IDS:\n' + json.dumps(frame.current_citation_ids, ensure_ascii=False))
     return [{'role': 'system', 'content': INSTRUCTIONS}, {'role': 'user', 'content': user}]
 
@@ -147,6 +205,9 @@ def schema(frame: ReviewFrame):
     target = {'type': 'string'}
     if frame.editable_targets:
         target['enum'] = list(frame.editable_targets)
+    context_target = {'type': 'string'}
+    if frame.table_owners:
+        context_target['enum'] = ['item:' + str(index) for index, _ in frame.table_owners]
     return {'name': 'factual_context_review', 'strict': True, 'schema': {
         'type': 'object', 'additionalProperties': False,
         'properties': {
@@ -157,10 +218,54 @@ def schema(frame: ReviewFrame):
                 'required': ['target', 'text']}},
             'citation_ids': {'type': 'array', 'maxItems': len(frame.admitted_citation_ids),
                              'items': {'type': 'string', 'enum': list(frame.admitted_citation_ids)}},
+            'table_contexts': {'type': 'array', 'maxItems': len(frame.table_owners), 'items': {
+                    'type': 'object', 'additionalProperties': False,
+                    'properties': {'target': context_target,
+                        'context': {'type': 'string', 'minLength': 1, 'maxLength': 480},
+                        'documentary_limits_checked': {'type': 'boolean'},
+                        'source_quotes': {'type': 'array', 'minItems': 1, 'maxItems': 2,
+                            'items': {'type': 'object', 'additionalProperties': False,
+                                'properties': {
+                                    'citation_id': {'type': 'string', 'enum': list(frame.admitted_citation_ids)},
+                                    'quote': {'type': 'string', 'minLength': 1, 'maxLength': 480}},
+                                'required': ['citation_id', 'quote']}}},
+                    'required': ['target', 'context', 'documentary_limits_checked', 'source_quotes']}},
             'checks': {'type': 'object', 'additionalProperties': False,
                        'properties': {key: {'type': 'boolean'} for key in CHECKS}, 'required': list(CHECKS)},
             'reason': {'type': 'string', 'maxLength': 500}},
-        'required': ['outcome', 'edits', 'citation_ids', 'checks', 'reason']}}
+        'required': ['outcome', 'edits', 'citation_ids', 'table_contexts', 'checks', 'reason']}}
+
+
+def _checked_table_contexts(value, frame, citations):
+    owners = {'item:' + str(index): cid for index, cid in frame.table_owners}
+    if type(value) is not list or len(value) != len(owners):
+        raise ValueError('factual_context_review_invalid')
+    sources, result = dict(frame.source_bodies), {}
+    for audit in value:
+        if (type(audit) is not dict or set(audit) != {'target', 'context', 'documentary_limits_checked', 'source_quotes'}
+                or type(audit.get('target')) is not str or audit['target'] not in owners
+                or audit['target'] in result or audit.get('documentary_limits_checked') is not True
+                or type(audit.get('context')) is not str or not audit['context'].strip()
+                or len(audit['context']) > 480 or type(audit.get('source_quotes')) is not list
+                or not 1 <= len(audit['source_quotes']) <= 2):
+            raise ValueError('factual_context_review_invalid')
+        context, quoted_ids, literal = audit['context'], set(), []
+        for quote in audit['source_quotes']:
+            if (type(quote) is not dict or set(quote) != {'citation_id', 'quote'}
+                    or type(quote.get('citation_id')) is not str or quote['citation_id'] not in citations
+                    or quote['citation_id'] not in sources or type(quote.get('quote')) is not str
+                    or not quote['quote'].strip() or len(quote['quote']) > 480
+                    or quote['quote'] not in sources[quote['citation_id']]):
+                raise ValueError('factual_context_review_invalid')
+            quoted_ids.add(quote['citation_id'])
+            literal.append('\n'.join('> ' + _escape(line) for line in quote['quote'].splitlines()))
+        if owners[audit['target']] not in quoted_ids:
+            raise ValueError('factual_context_review_invalid')
+        if any(marker in text for marker in (PREFIX, enumeration_review.INVENTORY_PREFIX,
+                '[TABLE_RECORD ', '[PDF_TABLE_') for text in [context] + [q['quote'] for q in audit['source_quotes']]):
+            raise ValueError('factual_context_review_invalid')
+        result[audit['target']] = context + '\n' + '\n'.join(literal) + '\n'
+    return result
 
 
 def apply_review(first_reply, review_reply, frame: ReviewFrame):
@@ -171,7 +276,7 @@ def apply_review(first_reply, review_reply, frame: ReviewFrame):
                 'independent_context_review': {'outcome': outcome, 'edit_count': 0}}
     if type(frame) is not ReviewFrame or type(first_reply) is not dict or _json(first_reply) != frame.first_json:
         return reject()
-    if (type(review_reply) is not dict or set(review_reply) != {'outcome','edits','citation_ids','checks','reason'}
+    if (type(review_reply) is not dict or set(review_reply) != {'outcome','edits','citation_ids','table_contexts','checks','reason'}
             or review_reply.get('outcome') not in {'pass','rewrite','no_sources'}
             or type(review_reply.get('reason')) is not str or len(review_reply['reason']) > 500):
         return reject()
@@ -190,12 +295,16 @@ def apply_review(first_reply, review_reply, frame: ReviewFrame):
         return reject('factual_context_review_incomplete', verdict)
     if not set(frame.current_citation_ids).issubset(citations):
         return reject()
+    try:
+        contexts = _checked_table_contexts(review_reply['table_contexts'], frame, citations)
+    except ValueError:
+        return reject()
     if verdict == 'pass':
-        if edits or set(citations) != set(frame.current_citation_ids):
+        if edits or contexts or set(citations) != set(frame.current_citation_ids):
             return reject()
         result = deepcopy(first_reply)
     else:
-        if not edits or not frame.editable_targets:
+        if (not edits and not contexts) or not frame.editable_targets:
             return reject()
         items, template, seen = list(frame.items), frame.template, set()
         for edit in edits:
@@ -214,7 +323,9 @@ def apply_review(first_reply, review_reply, frame: ReviewFrame):
                 if enumeration_review.INVENTORY_PREFIX in text:
                     return reject()
                 items[int(target.split(':')[1])] = text
-        answer = _expand(template, items)
+        rendered_items = [contexts.get('item:' + str(index), '') + item
+                          for index, item in enumerate(items)]
+        answer = _expand(template, rendered_items)
         if len(answer) > MAX_TEXT or sum(map(len, items)) > MAX_TEXT:
             return reject()
         result = deepcopy(first_reply)

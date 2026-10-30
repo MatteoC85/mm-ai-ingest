@@ -26,7 +26,8 @@ from machinemind.retrieval.production_adapters import ProductionReaderAdapters
 from machinemind.infrastructure import request_budget, openai_transport
 
 
-TABLE_BODY = (
+TABLE_QUALIFIER = 'The sliding-assembly intervals apply without contamination; halve them under heavy loading.'
+TABLE_BODY = (TABLE_QUALIFIER+'\n'+
     '- [PDF_TABLE_HEADER rows=1 columns=4] c1 r1="Assembly/action" | c2 r1="Interval" | c3 r1="Material" | c4 r1="Notes"\n'
     '- [PDF_TABLE_RECORD rows=2-3 columns=4] c1 "Assembly/action" r2="Slide inspection" | '
     'c2 "Interval" r2-3="Daily" | c3 "Material" r2-3="Grease ZTR-4" | '
@@ -35,6 +36,11 @@ TABLE_BODY = (
     'Continuation in the same provided source excerpt.\n'
     '- [PDF_TABLE_RECORD rows=1 columns=2] c1 r1="Inspect wiring integrity." | c2 r1="Monthly"')
 CONDITION = 'Only trained personnel may perform the documented inspections with energy isolated.'
+
+
+def table_contexts():
+    return [{'target':'item:0','context':TABLE_QUALIFIER,'documentary_limits_checked':True,
+             'source_quotes':[{'citation_id':'inspection:p1','quote':TABLE_QUALIFIER}]}]
 
 
 class OwnedTableFixture:
@@ -94,7 +100,8 @@ class OwnedTableFixture:
             budget = request_budget._v13_current_budget()
             self.budget_ids.append(id(budget))
             if kwargs['json_schema']['name'] == 'factual_context_review':
-                reply = dict(outcome='pass', edits=[], citation_ids=['inspection:p1','inspection:p2'],
+                reply = dict(outcome='rewrite', edits=[], citation_ids=['inspection:p1','inspection:p2'],
+                    table_contexts=table_contexts(),
                     checks={name:True for name in factual_context_review.CHECKS}, reason='offline independent fixture')
             else:
                 reply = dict(outcome='rewrite', answer='[[FACTUAL_INVENTORY]]', reason='offline fixture',
