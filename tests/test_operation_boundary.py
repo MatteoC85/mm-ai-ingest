@@ -1,5 +1,7 @@
 """Synthetic regression for an operation that stops before its documented closure."""
 from copy import deepcopy
+import hashlib
+import json
 from pathlib import Path
 import sys
 import unittest
@@ -90,6 +92,62 @@ class OperationBoundaryTests(unittest.TestCase):
         self.assertTrue(self.verify(reply, {"manual:one": instruction})["operation_boundary_validation"]["complete"])
         change["resolution"] = "restored"
         self.assertFalse(self.verify(reply, {"manual:one": instruction})["operation_boundary_validation"]["complete"])
+
+    def test_review_wire_contracts_remain_compatible(self):
+        def without_descriptions(value):
+            if isinstance(value, dict):
+                return {key: without_descriptions(item) for key, item in value.items()
+                        if key != 'description'}
+            if isinstance(value, list):
+                return [without_descriptions(item) for item in value]
+            return value
+
+        # Golden wire contracts from caf4b7a. Generic prose may change; the
+        # source-ordered schema, including its descriptions, must not change.
+        expected = {
+            False: '3918a95c4864ce7cca5741c35493008cc24b7ed019934e4a0f0daa695c4eb001',
+            True: '6d777bb37980b26510b5bcc802daf19f146d74d87e3d248267eb69d49f9d0dea',
+        }
+        for source_ordered, baseline_digest in expected.items():
+            with self.subTest(source_ordered=source_ordered):
+                schema = review.review_schema(
+                    {'name': 'verifier', 'schema': {'properties': {}, 'required': []}},
+                    review.block_layout(self.DRAFT), [], [], operation_boundary=True,
+                    source_ordered=source_ordered, operation_source_ids=['manual:one'])
+                contract = schema if source_ordered else without_descriptions(schema)
+                encoded = json.dumps(contract, sort_keys=True, separators=(',', ':')).encode()
+                self.assertEqual(hashlib.sha256(encoded).hexdigest(), baseline_digest)
+
+    def test_requested_restoration_does_not_need_an_invented_second_cycle(self):
+        original='1. Replace the cover and secure its latch.\n2. Keep the supply isolated until authorized restart.'
+        replacement='After cleaning:\n1. Replace the cover.\n2. Secure its latch.\nKeep the supply isolated until authorized restart.'
+        result=review.verify_operation_boundary({'outcome':'rewrite','answer':replacement,
+            'operation_boundary':{'complete':True,'checked_blocks':['step_1','step_2'],'changes':[]}},
+            layout=review.block_layout(original),source_texts={'manual:one':original})
+        self.assertTrue(result['operation_boundary_validation']['complete'])
+        self.assertEqual(result['answer'],replacement)
+
+    def test_terminal_restoration_exact_support_and_self_restored_negative(self):
+        terminal='Secure the cover in its closed position.'
+        reply=self.reply(resolution='documented_terminal_state')
+        reply['answer']='1. '+terminal
+        change=reply['operation_boundary']['changes'][0]
+        change.update(action_quote=terminal,closing_source_quote=terminal,closing_answer_quote=terminal)
+        result=self.verify(reply,{'manual:one':terminal})
+        self.assertTrue(result['operation_boundary_validation']['complete'])
+        for sources,resolution in (({},'documented_terminal_state'),
+                                   ({'manual:one':'Do not secure the cover.'},'documented_terminal_state'),
+                                   ({'manual:one':terminal},'restored')):
+            candidate=deepcopy(reply);candidate['operation_boundary']['changes'][0]['resolution']=resolution
+            self.assertEqual(self.verify(candidate,sources)['outcome'],'no_sources')
+
+    def test_overlapping_self_closure_is_not_a_later_action(self):
+        phrase='Adjust the guide and verify free movement.'
+        reply=self.reply();reply['answer']='1. '+phrase
+        change=reply['operation_boundary']['changes'][0]
+        change.update(action_quote='Adjust the guide',closing_source_quote=phrase,closing_answer_quote=phrase)
+        self.assertEqual(self.verify(reply,{'manual:one':phrase})['reason'],
+                         'operation_boundary_quote_or_order_invalid')
 
     def test_unknown_closure_missing_audit_or_unchecked_block_cannot_pass(self):
         replies = []

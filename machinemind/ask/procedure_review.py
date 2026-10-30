@@ -371,6 +371,20 @@ def review_schema(legacy: dict, layout: dict, facets: list[str], types: list[str
             "action_quote", "closing_source_citation_id", "closing_source_quote", "closing_answer_quote")}
         fields.update(block_id={"type": "string", "enum": block_ids},
                       resolution={"type": "string", "enum": ["restored", "documented_terminal_state", "unresolved"]})
+        if not source_ordered:
+            fields["action_quote"]["description"] = (
+                "Exact quote of a temporary state change introduced in the final answer. "
+                "A requested restoration of an earlier completed operation is not itself a new "
+                "temporary opening. Do not include the later closure in this action quote.")
+            fields["closing_answer_quote"]["description"] = (
+                "Exact final-answer quote of the documented closure/terminal state. With restored, "
+                "this quote must start strictly after the end of action_quote: identical, "
+                "overlapping or prefix-containing self-closure is invalid.")
+            fields["resolution"]["description"] = (
+                "restored: an introduced temporary state is closed by a distinct later action. "
+                "documented_terminal_state: the source explicitly supports the final safe state; "
+                "the same instruction may state it. unresolved: required closure is unavailable. "
+                "Never relabel an unsupported opening as a terminal state to satisfy the protocol.")
         fields["closing_source_citation_id"]["enum"] = list(dict.fromkeys(operation_source_ids))
         schema["properties"]["operation_boundary"] = {
             "type": "object", "additionalProperties": False,
@@ -454,7 +468,25 @@ OPERATION_BOUNDARY_INSTRUCTIONS = (
     "Standing safety prerequisites such as isolation, keeping STOP pressed and wearing PPE are invariants "
     "to maintain, not temporary operational changes requiring reversal. Do not invent re-energization, "
     "restart or release of a safety prerequisite. Respect explicit before-only boundaries and documented "
-    "safe hold states; do not perform an operation that the user explicitly excluded."
+    "safe hold states; do not perform an operation that the user explicitly excluded. "
+    "Distinguish restoring a state changed in an already completed phase from introducing a NEW "
+    "temporary change now. A requested closure such as replacing a cover after cleaning does not "
+    "require another opening/closure cycle. If no new temporary change is introduced, changes=[] "
+    "is valid only after full source-based review of every requested restoration and its prerequisites. "
+    "Completing an earlier phase does not cancel documented safety invariants. Carry forward the "
+    "applicable prerequisites from the whole operation family into every proposed physical restoration "
+    "without repeating the earlier operation. For example, when the source requires isolation or "
+    "trained personnel, merely saying equipment is not running does not replace those conditions. "
+    "State the required conditions before the affected actions; retain a documented safe hold until "
+    "the separately requested or authorized next phase. Do not infer missing conditions. "
+    "When an entry proves an explicitly documented terminal/restored state in the same instruction, "
+    "use documented_terminal_state with exact source support, never a self-paired restored entry. "
+    "With restored, closing_answer_quote must start after the END of action_quote in the final answer: "
+    "identical, overlapping or prefix-containing quotes cannot prove later restoration. Quote only "
+    "the opening/change as action_quote and the distinct later closure as closing_answer_quote. "
+    "Do not omit an actually introduced temporary change or relabel an unsupported opening merely "
+    "to pass this check. block_id and checked_blocks still refer to the ORIGINAL supplied draft "
+    "blocks, including with replace; final-answer quotes must occur in the replacement actually returned."
 )
 
 

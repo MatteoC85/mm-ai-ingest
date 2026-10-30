@@ -9,6 +9,8 @@ import os
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
+import re
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -30,6 +32,9 @@ from machinemind.retrieval.dense import (
 from machinemind.retrieval.lexical import (
     LexicalRuntime, fts_search_chunks, read_fts_chunk_evidence,
     read_prefix_chunk_evidence, build_prefix_tsquery_from_texts,
+)
+from machinemind.retrieval.context_expansion import (
+    ExpandWithNeighborChunksRuntime, expand_with_neighbor_chunks, read_neighbor_chunk_evidence,
 )
 
 COMPANY_A = "p6-quality-company-a"
@@ -179,8 +184,8 @@ class RetrievalScopeQualityTests(unittest.TestCase):
             self.assertEqual(legacy.record["snippet"], row[6][:SNIPPET_CHARS].strip())
             self.assertEqual(legacy.record["citation_id"], f"{row[2]}:p{row[4]}-{row[5]}:c{row[3]}")
             if read.kind == "dense":
-                self.assertEqual(observation.chunk_projection, row[6][:2000])
-                self.assertEqual(legacy.record["chunk_full"], row[6][:2000].strip())
+                self.assertEqual(observation.chunk_projection, row[6])
+                self.assertEqual(legacy.record["chunk_full"], row[6].strip())
                 self.assertEqual(legacy.record["similarity"], legacy.record["semantic_similarity"])
             else:
                 self.assertIsNone(observation.chunk_projection)
@@ -252,6 +257,58 @@ class RetrievalScopeQualityTests(unittest.TestCase):
             read.as_legacy_inputs(scope=self.scope(), current_allowed_sources=frozenset(), adapter_limits=self.limits.adapter)
         with self.assertRaises(EvidenceContractError):
             read.as_legacy_inputs(scope=self.scope(company=COMPANY_B), current_allowed_sources=read.read_sources, adapter_limits=self.limits.adapter)
+
+    def test_bound_dense_keeps_chunk_continuation_in_all_three_sql_selectors(self):
+        text = 'Opening context. ' * 160 + '\nContinuation: inspect the seal every 720 hours.'
+        rows = tuple((*row[:6], text, row[7]) if row[2] == DOC_A else row for row in ROWS)
+        with patch.dict(globals(), {'ROWS': rows}):
+            for scope in (self.scope(), self.scope(single=DOC_A, kind='document_ids'),
+                          self.scope(documents=[DOC_A], kind='document_ids')):
+                with self.subTest(scope=scope):
+                    read = self.bound_dense(scope)
+                    self.assert_bound_text_and_scope(read)
+                    observed = next(o for o in read.observations if o.storage_document_id == DOC_A)
+                    self.assertEqual(observed.chunk_projection, text)
+            legacy = next(c for c in self.dense() if c['bubble_document_id'] == DOC_A)
+            self.assertEqual(legacy['chunk_full'], text[:2000].strip())
+
+    def test_bound_neighbor_preserves_continuation_and_literal_provenance(self):
+        scope = self.scope(single=DOC_A, kind='document_ids')
+        seed = self.bound_dense(scope)
+        inputs = seed.as_legacy_inputs(scope=scope, current_allowed_sources=seed.read_sources,
+                                      adapter_limits=self.limits.adapter)
+        source = seed.observations[0].source
+        runtime = ExpandWithNeighborChunksRuntime(SNIPPET_CHARS, self.fixture_connection, re)
+        text = 'Reference context. ' * 160 + '\nContinuation: restore the protective cover.'
+        rows = tuple((*row[:6], text, row[7]) if row[2] == DOC_A else row for row in ROWS)
+        with patch.dict(globals(), {'ROWS': rows}):
+            read = read_neighbor_chunk_evidence(scope=scope, document_source=source,
+                seed_inputs=inputs, current_allowed_sources=seed.read_sources,
+                limits=self.limits, runtime=runtime, radius=0)
+            restored = read.as_legacy_inputs(scope=scope, current_allowed_sources=seed.read_sources,
+                                             adapter_limits=self.limits.adapter)
+            self.assertEqual(read.observations[0].chunk_projection, text)
+            self.assertEqual(restored[0].record['chunk_full'], text)
+            self.assertEqual(restored[0].context.source, source)
+            legacy = expand_with_neighbor_chunks(COMPANY_A, DOC_A,
+                [inputs[0].record['citation_id']], radius=0, runtime=runtime)
+            self.assertEqual(legacy[0]['chunk_full'], text[:2000].strip())
+
+    def test_bound_chunk_overflow_rejects_instead_of_publishing_a_prefix(self):
+        scope = self.scope(single=DOC_A, kind='document_ids')
+        seed = self.bound_dense(scope)
+        inputs = seed.as_legacy_inputs(scope=scope, current_allowed_sources=seed.read_sources,
+                                      adapter_limits=self.limits.adapter)
+        text = 'X' * (self.limits.adapter.max_text_chars + 100)
+        rows = tuple((*row[:6], text, row[7]) if row[2] == DOC_A else row for row in ROWS)
+        with patch.dict(globals(), {'ROWS': rows}):
+            with self.assertRaises(EvidenceContractError):
+                self.bound_dense(scope)
+            with self.assertRaises(EvidenceContractError):
+                read_neighbor_chunk_evidence(scope=scope, document_source=seed.observations[0].source,
+                    seed_inputs=inputs, current_allowed_sources=seed.read_sources, limits=self.limits,
+                    runtime=ExpandWithNeighborChunksRuntime(SNIPPET_CHARS, self.fixture_connection, re), radius=0)
+        self.assertTrue(all(c.closed for c in self.connections))
 
     def close_connections(self):
         for connection in self.connections:

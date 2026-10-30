@@ -186,7 +186,9 @@ class _ChunkSelectionCapture:
         validate_read(self.scope,row_limit,self.limits)
         if query_text is not None and (type(query_text) is not str or len(query_text)>self.limits.adapter.max_aux_chars):
             raise SupplementalBindingError("invalid literal query metadata")
-        full_chars=None if self.kind in {"token_chunk","entity_chunk"} else 2400 if self.kind=="structured_dense" else 2000
+        full_chars=(None if self.kind in {"token_chunk","entity_chunk"}
+                    else self.limits.adapter.max_text_chars if self.kind=="neighbor_chunks"
+                    else 2400 if self.kind=="structured_dense" else 2000)
         if full_chars is not None and full_chars>self.limits.adapter.max_text_chars:
             raise SupplementalBindingError("chunk projection exceeds explicit budget")
         self.pending=(row_limit,query_text,full_chars)

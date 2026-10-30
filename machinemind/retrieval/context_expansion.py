@@ -28,6 +28,7 @@ def expand_with_neighbor_chunks(company_id: str, bubble_document_id: str, citati
 def _expand_with_neighbor_chunks_impl(company_id: str, bubble_document_id: str, citation_ids: list[str], *, radius: int=1, runtime: ExpandWithNeighborChunksRuntime, _chunk_capture: _ChunkSelectionCapture | None = None) -> list[dict]:
     binding_columns = CHUNK_BINDING_COLUMNS if _chunk_capture is not None else ""
     limit_clause = " LIMIT %s" if _chunk_capture is not None else ""
+    chunk_chars = _chunk_capture.limits.adapter.max_text_chars + 1 if _chunk_capture is not None else 2000
     ASK_SNIPPET_CHARS = runtime.ASK_SNIPPET_CHARS
     _db_conn = runtime._db_conn
     re = runtime.re
@@ -60,7 +61,7 @@ def _expand_with_neighbor_chunks_impl(company_id: str, bubble_document_id: str, 
                 f"""
                 SELECT bubble_document_id, chunk_index, page_from, page_to,
                        left(chunk_text, %s) AS snippet,
-                       left(chunk_text, 2000) AS chunk_full{binding_columns}
+                       left(chunk_text, {chunk_chars}) AS chunk_full{binding_columns}
                 FROM public.document_chunks
                 WHERE company_id=%s
                   AND bubble_document_id=%s

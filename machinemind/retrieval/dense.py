@@ -1,9 +1,9 @@
 """P4-A extraction of existing retrieval behavior.
 
 No app/DB/provider is imported here. Dependencies are supplied by the composition
-root at call time. SQL, thresholds, ordering, scope precedence and error behavior
-are deliberately preserved, including historical quirks. This is not a semantic
-rewrite or a new query-scope policy.
+root at call time. Thresholds, ordering and scope precedence are preserved.
+Legacy reads keep their historical text prefix; bound reads retain complete
+chunks within their explicit allocation limit and reject oversized chunks.
 """
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
@@ -60,16 +60,18 @@ def read_dense_chunk_evidence(
     query_used: Optional[str] = None,
     debug: bool = False,
 ) -> ChunkEvidenceRead:
-    """Opt-in bound view of the SAME SQL read, not a second metadata query.
+    """Opt-in bound view from one scoped SQL read, not a second metadata query.
 
     Source association comes from the two additional selected DB columns.
     Embedding generation remains the caller's existing responsibility. This
-    function neither embeds nor changes query planning, limits or ranking.
+    function neither embeds nor changes query planning, row limits or ranking.
+    The text projection uses the existing adapter cap instead of a display prefix.
     """
     validate_read(scope, candidate_k, limits)
     count, rows = _read_dense_chunk_rows(
         **scope.sql_selectors(), q_vec_lit=q_vec_lit, candidate_k=candidate_k,
         debug=debug, runtime=runtime, include_binding_columns=True,
+        chunk_chars=limits.adapter.max_text_chars + 1,
     )
     if len(rows) > candidate_k:
         raise ChunkReadBindingError("SQL returned more rows than the requested LIMIT")
@@ -91,10 +93,16 @@ def _read_dense_chunk_rows(
     debug: bool = False,
     runtime: DenseRuntime,
     include_binding_columns: bool,
+    chunk_chars: int = 2000,
 ) -> tuple[Optional[int], list[tuple]]:
     _db_conn = runtime.connect_db
     ASK_SNIPPET_CHARS = runtime.snippet_chars
     binding_columns = ", company_id AS evidence_company_id, machine_id AS evidence_machine_id" if include_binding_columns else ""
+    # Bound readers retain the indexed chunk within the existing allocation cap.
+    # One extra character makes an oversized row fail admission, never silently
+    # present a prefix as the complete evidence. Legacy readers keep their view.
+    if type(chunk_chars) is not int or chunk_chars < 1:
+        raise ChunkReadBindingError("positive chunk projection bound required")
     chunks_matching_filter = None
 
     conn = _db_conn()
@@ -118,7 +126,7 @@ def _read_dense_chunk_rows(
                     f"""
                     SELECT bubble_document_id, chunk_index, page_from, page_to,
                            left(chunk_text, %s) AS snippet,
-                           left(chunk_text, 2000) AS chunk_full,
+                           left(chunk_text, {chunk_chars}) AS chunk_full,
                            1 - (embedding <=> %s::vector) AS similarity,
                            embedding,
                            CASE WHEN machine_id = %s THEN TRUE ELSE FALSE END AS exact_machine_scope{binding_columns}
@@ -153,7 +161,7 @@ def _read_dense_chunk_rows(
                     f"""
                     SELECT bubble_document_id, chunk_index, page_from, page_to,
                            left(chunk_text, %s) AS snippet,
-                           left(chunk_text, 2000) AS chunk_full,
+                           left(chunk_text, {chunk_chars}) AS chunk_full,
                            1 - (embedding <=> %s::vector) AS similarity,
                            embedding,
                            CASE WHEN machine_id = %s THEN TRUE ELSE FALSE END AS exact_machine_scope{binding_columns}
@@ -186,7 +194,7 @@ def _read_dense_chunk_rows(
                     f"""
                     SELECT bubble_document_id, chunk_index, page_from, page_to,
                            left(chunk_text, %s) AS snippet,
-                           left(chunk_text, 2000) AS chunk_full,
+                           left(chunk_text, {chunk_chars}) AS chunk_full,
                            1 - (embedding <=> %s::vector) AS similarity,
                            embedding,
                            CASE WHEN machine_id = %s THEN TRUE ELSE FALSE END AS exact_machine_scope{binding_columns}
