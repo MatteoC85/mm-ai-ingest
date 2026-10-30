@@ -1299,6 +1299,7 @@ class AssistantCorePrepareEvidenceRuntime:
     _v13_evidence_metrics: Callable[..., Any]
     _v13_merge_candidates: Callable[..., Any]
     _v13_rescore_root_candidates: Callable[..., Any]
+    _v13_score_candidates: Callable[..., Any]
     re: Any
     time_module: Any
 
@@ -1360,9 +1361,15 @@ def assistant_core_prepare_evidence(request: AssistantCoreRequest, retrieval: di
     _v13_evidence_metrics = runtime._v13_evidence_metrics
     _v13_merge_candidates = runtime._v13_merge_candidates
     _v13_rescore_root_candidates = runtime._v13_rescore_root_candidates
+    _v13_score_candidates = runtime._v13_score_candidates
     re = runtime.re
     time_module = runtime.time_module
     retrieval_query = _assistant_core_retrieval_query(request)
+    canonical_ask_selection = (
+        lineage is not None
+        and getattr(request, "requested_mode", None) == MODE_ASK
+        and decision.effective_mode == MODE_ASK
+    )
     if decision.effective_mode == MODE_SMART_DIAGNOSTIC:
         from . import smart_sources
         # Smart questions need observation/legend/Step evidence even when it
@@ -1457,6 +1464,12 @@ def assistant_core_prepare_evidence(request: AssistantCoreRequest, retrieval: di
             )
             if enumeration_neighbors:
                 enumeration_neighbor_count = len(enumeration_neighbors)
+                if canonical_ask_selection:
+                    # Page readers expose lexical scores on their own scale.
+                    # Only fresh occurrences need canonical scoring; do not
+                    # re-score existing chunks or lose their facet annotations.
+                    enumeration_neighbors = _v13_score_candidates(
+                        retrieval_query, enumeration_neighbors, preserve_complete=True)
                 candidates = _v13_merge_candidates([candidates, enumeration_neighbors])
             section_pages = _assistant_core_expand_enumeration_sections(
                 request=request,
@@ -1465,6 +1478,9 @@ def assistant_core_prepare_evidence(request: AssistantCoreRequest, retrieval: di
             )
             if section_pages:
                 enumeration_neighbor_count += len(section_pages)
+                if canonical_ask_selection:
+                    section_pages = _v13_score_candidates(
+                        retrieval_query, section_pages, preserve_complete=True)
                 candidates = _v13_merge_candidates([
                     _assistant_core_source_diversity_pool(candidates, per_type=2),
                     candidates,
@@ -1926,11 +1942,6 @@ def assistant_core_prepare_evidence(request: AssistantCoreRequest, retrieval: di
             decision.information_task in {INFO_PROCEDURE_FULL, INFO_PROCEDURE_SEGMENT}
             or decision.request_kind == KIND_PROCEDURE
         )
-        canonical_ask_selection = (
-            lineage is not None
-            and getattr(request, "requested_mode", None) == MODE_ASK
-            and decision.effective_mode == MODE_ASK
-        )
         if needs_ordered_actions and (not canonical_ask_selection or procedure_source_intent):
             priority_pool.extend(
                 c for c in scored
@@ -1940,10 +1951,16 @@ def assistant_core_prepare_evidence(request: AssistantCoreRequest, retrieval: di
             priority_pool.extend(
                 sorted(
                     scored,
-                    key=lambda c: (
+                    # The total already includes the bounded enumeration bonus.
+                    # Ranking by that bonus again can replace specific evidence
+                    # with unrelated pages that happen to contain long lists.
+                    key=(lambda c: (
+                        -float(c.get("v13_score", c.get("retrieval_score", 0.0)) or 0.0),
+                        -float(c.get("assistant_core_enumeration_bonus") or 0.0),
+                    )) if canonical_ask_selection else (lambda c: (
                         -float(c.get("assistant_core_enumeration_bonus") or 0.0),
                         -float(c.get("v13_score", c.get("retrieval_score", 0.0)) or 0.0),
-                    ),
+                    )),
                 )[:10]
             )
         selected_pool = _v13_merge_candidates(

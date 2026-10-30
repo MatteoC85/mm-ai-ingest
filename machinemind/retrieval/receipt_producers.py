@@ -757,6 +757,11 @@ def prepare_records(*, request: Any, session: AskEvidenceSession,
                     lambda *a, **kw: call(runtime._assistant_core_overview_catalog_candidates, *a, **kw),
                     [records], records, identical=True)
 
+            def score(q, records, **kwargs):
+                return journal.run(journal.traced,
+                    lambda *a, **kw: call(runtime._v13_score_candidates, *a, **kw),
+                    [records], q, records, **kwargs)
+
             def selector(fn):
                 def selected(records, *args, **kwargs):
                     return journal.run(journal.selected,
@@ -785,6 +790,7 @@ def prepare_records(*, request: Any, session: AskEvidenceSession,
                 _v13_assurance_fetch_neighbor_pages=lambda *a, **kw: source("neighbors", *a, **kw),
                 _assistant_core_expand_enumeration_sections=lambda *a, **kw: source("sections", *a, **kw),
                 _v13_merge_candidates=merge,
+                _v13_score_candidates=score,
                 _assistant_core_overview_catalog_candidates=overview,
                 _dedup_citations_by_snippet=selector(runtime._dedup_citations_by_snippet),
                 _assistant_core_facet_balanced_pool=selector(runtime._assistant_core_facet_balanced_pool),

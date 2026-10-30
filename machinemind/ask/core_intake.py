@@ -405,6 +405,8 @@ class _CoreIntake:
 
             rt = replace(self.preparation,
                 _v13_merge_candidates=ranking.v13_merge_candidates,
+                _v13_score_candidates=lambda q, rows, **kw:
+                    ranking.v13_score_candidates(q, rows, runtime=self.runtime.score, **kw),
                 _assistant_core_overview_catalog_candidates=lambda rows, **kw:
                     source_management.assistant_core_overview_catalog_candidates(rows,
                         runtime=source_management.AssistantCoreOverviewCatalogCandidatesRuntime(

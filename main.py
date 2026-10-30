@@ -15166,6 +15166,7 @@ def _assistant_core_prepare_evidence_runtime():
         _v13_evidence_metrics=_v13_evidence_metrics,
         _v13_merge_candidates=_v13_merge_candidates,
         _v13_rescore_root_candidates=_v13_rescore_root_candidates,
+        _v13_score_candidates=_v13_score_candidates,
         re=re,
         time_module=time_module,
     )
