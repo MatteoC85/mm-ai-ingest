@@ -556,9 +556,11 @@ def verify_or_repair_answer(
     if not sources_block:
         return {"outcome": "no_sources", "answer": "", "reason": "empty_evidence"}
 
+    table_record_ids = ()
     if factual_list_review:
         # Internal wire representation only. Admission, original candidate text,
         # citation identities and grounding still use the unchanged records.
+        sources_block, table_record_ids = _enumeration_review.annotate_table_records(sources_block)
         sources_block = _review_source_wire.compact_sources_block(sources_block)
 
     conditions_only = bool(_guarded(runtime, request, decision) and conditions_only_contract(
@@ -673,6 +675,8 @@ def verify_or_repair_answer(
             "boundary evidence stay literal. All semantic, source and operation proof gates apply.")
     if factual_list_review:
         system_msg += _enumeration_review.INSTRUCTIONS
+        if table_record_ids:
+            system_msg += _enumeration_review.RECORD_INSTRUCTIONS
     user_msg = (
         f"QUESTION:\n{request.query}\n\n"
         f"RESPONSE_LANGUAGE: {request.response_language}\n"
@@ -716,7 +720,7 @@ def verify_or_repair_answer(
         [str(c.get("citation_id") or "").strip() for c in ordered_candidates]) if source_ordered_review else None)
     verifier_schema = _assistant_core_contract_verifier_schema()
     if factual_list_review:
-        verifier_schema = _enumeration_review.source_first_schema(verifier_schema)
+        verifier_schema = _enumeration_review.source_first_schema(verifier_schema, record_ids=table_record_ids)
     if compact_review:
         verifier_schema = _procedure_review.review_schema(verifier_schema, layout, review_facets, requirements,
             operation_boundary=operation_boundary, source_ordered=source_ordered_review,
@@ -848,6 +852,7 @@ def verify_or_repair_answer(
         # final validator must still bind this output to the grounded answer.
         out["reviewed_draft_binding"]["resolved_answer_sha256"] = _final_contract.answer_digest(out["answer"])
     out["enumeration_requested"] = bool(enumeration_requested)
+    wire_inventory = out.get("expected_list_items")
     expected_items = _dedup_text_values(out.get("expected_list_items") or [], limit=40)
     model_missing_items = _dedup_text_values(out.get("missing_list_items") or [], limit=40)
     if enumeration_requested and expected_items:
@@ -870,6 +875,7 @@ def verify_or_repair_answer(
         out["covered_list_items"] = _dedup_text_values(out.get("covered_list_items") or [], limit=40)
         out["missing_list_items"] = model_missing_items
     if factual_list_review:
+        out = _enumeration_review.validate_table_coverage(out, table_record_ids, wire_inventory=wire_inventory)
         out = _enumeration_review.reject_empty_inventory(out)
     _record_contract_observation("semantic_review", out)
     return out
