@@ -16,7 +16,7 @@ import unittest
 
 sys.path[:0] = [str(Path(__file__).resolve().parents[1]), str(Path(__file__).resolve().parent)]
 import test_ask_source_first_inventory as shared
-from machinemind.ask import execution, validation, request_completion
+from machinemind.ask import execution, validation, request_completion, factual_context_review
 from machinemind.ask.response_evidence import ResponseEvidenceError
 from machinemind.evidence.contracts import EvidenceContractError, SourceIdentity, SourceScope, SourceType, SourceFormat, ScopeLevel
 from machinemind.retrieval.ask_composition import AskEvidenceSession, AskSessionLimits, AskSelection
@@ -93,14 +93,18 @@ class OwnedTableFixture:
             self.reviewer_calls.append((deepcopy(messages), deepcopy(kwargs)))
             budget = request_budget._v13_current_budget()
             self.budget_ids.append(id(budget))
-            reply = dict(outcome='rewrite', answer='[[FACTUAL_INVENTORY]]', reason='offline fixture',
-                citation_ids=['inspection:p1', 'inspection:p2'], covered_facets=['documented obligations'],
-                missing_facets=[], covered_answer_types=['checklist'], missing_answer_types=[],
-                expected_list_items=['[[SOURCE_TABLE:G1]]', CONDITION], covered_list_items=[], missing_list_items=[],
-                table_record_coverage=['T1=0', 'T2=0'])
-            if change is not None:
-                change(reply)
-            self.wire_reply = deepcopy(reply)
+            if kwargs['json_schema']['name'] == 'factual_context_review':
+                reply = dict(outcome='pass', edits=[], citation_ids=['inspection:p1','inspection:p2'],
+                    checks={name:True for name in factual_context_review.CHECKS}, reason='offline independent fixture')
+            else:
+                reply = dict(outcome='rewrite', answer='[[FACTUAL_INVENTORY]]', reason='offline fixture',
+                    citation_ids=['inspection:p1', 'inspection:p2'], covered_facets=['documented obligations'],
+                    missing_facets=[], covered_answer_types=['checklist'], missing_answer_types=[],
+                    expected_list_items=['[[SOURCE_TABLE:G1]]', CONDITION], covered_list_items=[], missing_list_items=[],
+                    table_record_coverage=['T1=0', 'T2=0'])
+                if change is not None:
+                    change(reply)
+                self.wire_reply = deepcopy(reply)
             class Response:
                 status_code = 200
                 def json(self):
@@ -180,8 +184,8 @@ class SourceTableOwnedTests(unittest.TestCase):
                     self.assertNotIn(marker, result['answer'])
                 self.assertEqual({c['citation_id'] for c in result['citations']}, {'inspection:p1','inspection:p2'})
                 self.assertEqual(f.writer_calls, [])
-                self.assertEqual(len(f.posts), 1)
-                self.assertEqual(f.budget_ids, [id(completion.budget)])
+                self.assertEqual(len(f.posts), 2)
+                self.assertEqual(f.budget_ids, [id(completion.budget)] * 2)
                 self.assertIn('[[SOURCE_TABLE:G1]] owner=inspection:p1', f.reviewer_calls[0][0][1]['content'])
                 self.assertTrue(f.owner._response_flow.completed)
                 f.close(); completion.close()
@@ -220,7 +224,16 @@ class SourceTableOwnedTests(unittest.TestCase):
             completion, f = self.case(**options)
             with self.assertRaises(EvidenceContractError):
                 f.run()
-            self.assertEqual(len(f.posts), 1)
+            # The second verifier reuses a separately admitted immutable source
+            # snapshot. A changed prepared mirror is rejected at final handoff;
+            # it cannot enter either provider packet. Revocation stops earlier.
+            self.assertEqual(len(f.posts), 1 if options.get('revoke') else 2)
+            self.assertNotIn('UNTRUSTED CHANGE',json.dumps(f.reviewer_calls))
+            if options.get('mutate'):
+                first=f.reviewer_calls[0][0][1]['content'].split('SOURCES:\n',1)[1].split('\n\nCURRENT_ANSWER:',1)[0]
+                second=f.reviewer_calls[1][0][1]['content'].split('SOURCES:\n',1)[1].split('\n\nCOMPLETE_CANDIDATE:',1)[0]
+                self.assertEqual(first,second)
+            self.assertFalse(f.owner._response_flow.completed)
             f.close(); completion.close()
 
     def test_free_prose_still_requires_real_numeric_grounding(self):
@@ -234,7 +247,7 @@ class SourceTableOwnedTests(unittest.TestCase):
         self.assertFalse(contract['passed'])
         self.assertFalse(contract['semantic_answer_bound'])
         self.assertNotIn('999 hours', f.validated.get('answer') or '')
-        self.assertEqual(len(f.posts), 1)
+        self.assertEqual(len(f.posts), 2)
         self.assertFalse(f.owner._response_flow.completed)
 
 

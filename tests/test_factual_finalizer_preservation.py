@@ -46,7 +46,9 @@ class FactualFinalizerPreservationTests(unittest.TestCase):
         self.assertEqual(result['status'], 'answered')
         self.assertTrue(contract['semantic_answer_bound'])
         self.assertEqual(result['answer'], fixture.final['answer'])
-        self.assertEqual(len(fixture.posts), 1)
+        self.assertEqual(len(fixture.posts), 2)
+        self.assertEqual(fixture.reviewer_calls[1][1]['json_schema']['name'], 'factual_context_review')
+        self.assertEqual(contract['semantic_verifier']['independent_context_review']['outcome'], 'pass')
         self.assertEqual(fixture.writer_calls, [])
         visible = self.m._assistant_ui_visible_text_from_html(result['answer_html'])
         for body in bodies:

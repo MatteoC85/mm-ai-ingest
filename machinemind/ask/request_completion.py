@@ -31,6 +31,7 @@ PHASE6_CANDIDATE_VERSION = "phase6-closure-2026-09-29-v1"
 _ACTIVE = ContextVar("mm_ask_request_completion", default=None)
 _CACHE_WINDOW = ContextVar("mm_ask_optional_cache_window", default=None)
 _REVIEW_RESERVE = ContextVar("mm_ask_synthesis_review_reserve", default=None)
+_INDEPENDENT_REVIEW_RESERVE = ContextVar("mm_ask_independent_review_reserve", default=None)
 _SYNTHESIS_PURPOSES = frozenset({"ask_structured_synthesis", "ask_final_synthesis",
     "assistant_core_machine_overview_inventory"})
 _REVIEW_PURPOSE = "assistant_core_answer_contract_verifier"
@@ -117,6 +118,28 @@ def synthesize_observed(callback, review_required):
         return callback()
     with synthesis_review_reserve(required=bool(review_required())):
         return callback()
+
+
+@contextmanager
+def independent_review_reserve(*, required: bool):
+    """Keep 25 seconds for a later check within the SAME protected deadline.
+
+    The composition root activates this only around the initial source-first
+    factual producer. Every verifier transport attempt, including fallback,
+    leaves this window plus the existing publication allowance. A nested scope
+    cannot disable a reserve already required by the same live owner.
+    """
+    owner = current()
+    if owner is None:
+        yield
+        return
+    previous = _INDEPENDENT_REVIEW_RESERVE.get()
+    inherited = previous is not None and previous[0] is owner and previous[1]
+    token = _INDEPENDENT_REVIEW_RESERVE.set((owner, bool(required) or bool(inherited)))
+    try:
+        yield
+    finally:
+        _INDEPENDENT_REVIEW_RESERVE.reset(token)
 
 
 def record_contract_observation(stage: str, contract: dict, *, diagnostics: dict | None = None) -> None:
@@ -272,6 +295,10 @@ class RequestCompletion:
         if (purpose in _SYNTHESIS_PURPOSES and planned is not None
                 and planned[0] is self and planned[1]):
             review = 9.0 + max(1.5, self.largest_fence_seconds)
+        independent = _INDEPENDENT_REVIEW_RESERVE.get()
+        if (purpose == _REVIEW_PURPOSE and current() is self
+                and independent is not None and independent[0] is self and independent[1]):
+            review = 25.0
         available = self.budget.remaining() - publication - review
         minimum = 9.0 if purpose == _REVIEW_PURPOSE else 1.0
         timeout = min(int(configured), math.floor(available))

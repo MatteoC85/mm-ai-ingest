@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 sys.path[:0] = [str(Path(__file__).resolve().parents[1]), str(Path(__file__).resolve().parent)]
 import test_factual_list_review as shared
-from machinemind.ask import execution, enumeration_review, final_contract, review_source_wire
+from machinemind.ask import execution, enumeration_review, final_contract, review_source_wire, factual_context_review
 
 
 HEADER = '- [PDF_TABLE_HEADER rows=1 columns=4] c1 r1="Assembly/action" | c2 r1="Interval" | c3 r1="Material" | c4 r1="Notes"'
@@ -37,7 +37,7 @@ class FactualTableInventoryTests(unittest.TestCase):
         shared.FactualListReviewTests.tearDownClass()
 
     def case(self, *, items=ITEMS, answer=None, coverage=None, outcome='pass', mode='ask',
-             kind='factual', protected=True, source=SOURCES, draft=None, complete_catalog=False):
+             kind='factual', protected=True, source=SOURCES, draft=None, complete_catalog=False, expected_calls=1):
         m=self.m
         request=m.AssistantCoreRequest(query='Which lubrication points and maintenance intervals are documented?',
             requested_mode=mode, response_language='en',company_id='offline-company',
@@ -57,6 +57,10 @@ class FactualTableInventoryTests(unittest.TestCase):
         original=deepcopy(rows);seen=[]
         def provider(messages,**kwargs):
             seen.append((messages,kwargs))
+            if kwargs['json_schema']['name'] == 'factual_context_review':
+                return {'outcome':'pass','edits':[], 'citation_ids':['manual:inspection'],
+                    'checks':{name:True for name in factual_context_review.CHECKS},
+                    'reason':'offline independent fixture'}, 'offline-model'
             result={'outcome':outcome,'answer':answer,'citation_ids':['manual:inspection'],
                 'covered_facets':['documented obligations'],'missing_facets':[],
                 'covered_answer_types':['checklist'],'missing_answer_types':[],
@@ -73,7 +77,13 @@ class FactualTableInventoryTests(unittest.TestCase):
         with patch.object(execution,'_admit_input',side_effect=lambda req,data,dec,**kw:data):
             result=execution.verify_or_repair_answer(request=request,decision=decision,
                 answer=answer if draft is None else draft,candidates=rows,runtime=runtime)
-        self.assertEqual(len(seen),1)
+        self.assertEqual(len(seen),expected_calls)
+        if expected_calls == 2:
+            self.assertEqual(seen[1][1]['json_schema']['name'],'factual_context_review')
+            self.assertEqual(seen[1][1]['max_output_tokens'],1200)
+            first=seen[0][0][1]['content'].split('SOURCES:\n',1)[1].split('\n\nCURRENT_ANSWER:',1)[0]
+            second=seen[1][0][1]['content'].split('SOURCES:\n',1)[1].split('\n\nCOMPLETE_CANDIDATE:',1)[0]
+            self.assertEqual(first,second)
         self.assertEqual(rows,original)
         if not complete_catalog:
             self.assertNotIn('SOURCE_TABLE_PREVIEWS',seen[0][0][1]['content'])
@@ -92,7 +102,7 @@ class FactualTableInventoryTests(unittest.TestCase):
         self.assertFalse(final['passed'])
         result,final,(messages,_)=self.case(items=['[[SOURCE_TABLE:G1]]'],
             coverage=['T1=0','T2=0'],outcome='rewrite',answer='[[FACTUAL_INVENTORY]]',
-            draft='',complete_catalog=True)
+            draft='',complete_catalog=True,expected_calls=2)
         self.assertIn('SOURCE_TABLE_PREVIEWS',messages[1]['content'])
         self.assertEqual(result['outcome'],'rewrite')
         self.assertTrue(final['passed'])

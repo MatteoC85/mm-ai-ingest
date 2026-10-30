@@ -13,6 +13,7 @@ be wired to the SAME request session before production canonical activation.
 from __future__ import annotations
 
 from contextlib import nullcontext
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from functools import wraps
 from inspect import signature
@@ -22,12 +23,14 @@ from . import procedure_review as _procedure_review
 from . import final_contract as _final_contract
 from . import enumeration_review as _enumeration_review
 from . import source_table_review as _source_table_review
+from . import factual_context_review as _factual_context_review
 from . import review_source_wire as _review_source_wire
 from . import phase_trace
 from .request_scope import conditions_only_contract, bounded_phase_contract
 from .request_completion import current as _current_completion
 from .request_completion import record_contract_observation as _record_contract_observation
 from .request_completion import synthesis_review_reserve as _synthesis_review_reserve
+from .request_completion import independent_review_reserve as _independent_review_reserve
 from ..evidence.ask_input import AskEvidenceAdmission, apply_ask_evidence_input, ask_request_key
 from ..evidence.contracts import EvidenceContractError, SourceIdentity
 from ..retrieval.ask_composition import AskEvidenceSession, AskSelection
@@ -425,9 +428,9 @@ def synthesize_ask(
     if (not overview_catalog_requested and runtime.evidence_observer is not None and _enumeration_review.applies(
             request, decision, protected=_guarded(runtime, request, decision),
             enumeration=runtime._assistant_core_enumeration_requested(request, decision))):
-        # The existing source-first recovery producer already performs the
-        # mandatory review and carries its verdict into final validation. A
-        # preliminary paid draft duplicates this work for factual inventories.
+        # Source-first recovery assembles the inventory and independently checks
+        # its factual context before carrying the result into final validation.
+        # Both steps reuse the same request-owned sources and bounded budget.
         response = _assistant_core_recover_ask_from_evidence(
             request=request, decision=decision, retrieval=retrieval,
             reason="source_first_factual_inventory")
@@ -530,6 +533,7 @@ def verify_or_repair_answer(
     enumeration_requested = _assistant_core_enumeration_requested(request, decision)
     factual_list_review = _enumeration_review.applies(request, decision,
         protected=_guarded(runtime, request, decision), enumeration=enumeration_requested)
+    independent_context_review = bool(factual_list_review and not str(answer or "").strip())
     # The request-owned flow can provide a complete, stable procedure packet.
     # Legacy/OFF/Root Cause and nonprocedural consumers keep the old algorithm.
     context_limit = min(30000 if enumeration_requested else 24000,
@@ -804,23 +808,26 @@ def verify_or_repair_answer(
         required_facets=tuple(review_facets), required_types=tuple(requirements))
         if _guarded(runtime, request, decision) else None)
     try:
-        parsed, model_used = _v13_json_models(
-            [
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_msg},
-            ],
-            models=[V13_FAST_MODEL, V13_PLANNER_MODEL],
-            json_schema=verifier_schema,
-            # The bounded output includes reasoning tokens. Keep room for the
-            # complete review JSON/edits without raising its token/cost/deadline
-            # ceilings. Legacy, Root and Smart have no protected ASK owner here.
-            effort="low" if protected_budget else V13_FAST_EFFORT,
-            reasoning_mode="",
-            timeout=_review_timeout(runtime, budget, protected=protected_budget, compact=compact_review),
-            max_output_tokens=min(4000, max(3200, V13_FAST_MAX_OUTPUT_TOKENS)),
-            company_id=request.company_id,
-            purpose="assistant_core_answer_contract_verifier",
-        )
+        # A source-first producer cannot also be its own final semantic check.
+        # Reserve the follow-up window across every initial provider fallback.
+        with (_independent_review_reserve(required=True) if independent_context_review else nullcontext()):
+            parsed, model_used = _v13_json_models(
+                [
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": user_msg},
+                ],
+                models=[V13_FAST_MODEL, V13_PLANNER_MODEL],
+                json_schema=verifier_schema,
+                # The bounded output includes reasoning tokens. Keep room for the
+                # complete review JSON/edits without raising its token/cost/deadline
+                # ceilings. Legacy, Root and Smart have no protected ASK owner here.
+                effort="low" if protected_budget else V13_FAST_EFFORT,
+                reasoning_mode="",
+                timeout=_review_timeout(runtime, budget, protected=protected_budget, compact=compact_review),
+                max_output_tokens=min(4000, max(3200, V13_FAST_MAX_OUTPUT_TOKENS)),
+                company_id=request.company_id,
+                purpose="assistant_core_answer_contract_verifier",
+            )
     except _V13BudgetExceeded:
         if protected_budget:
             raise
@@ -832,6 +839,12 @@ def verify_or_repair_answer(
         return {"outcome": "unavailable", "answer": answer, "reason": str(exc)[:300]}
 
     out = dict(parsed or {})
+    wire_reply = deepcopy(out) if independent_context_review else None
+    valid_ids = {
+        str(c.get("citation_id") or "").strip()
+        for c in ordered_candidates
+        if str(c.get("citation_id") or "").strip()
+    }
     inventory_diagnostics = {}
     if factual_list_review:
         inventory_diagnostics = {
@@ -853,6 +866,59 @@ def verify_or_repair_answer(
         inventory_diagnostics['inventory_template_gate'] = (
             'rejected' if out.get('reason') in {'factual_inventory_template_invalid',
                 'source_table_reference_invalid'} else 'accepted_or_unused')
+    if independent_context_review and out.get("outcome") == "rewrite":
+        # Validate representation first. Invalid/unfinished generation must not
+        # spend a second call or acquire a semantic approval for a partial list.
+        preflight = _enumeration_review.validate_table_coverage(
+            {**out, "expected_list_items": _dedup_text_values(out.get("expected_list_items") or [], limit=40)},
+            table_record_ids,
+            wire_inventory=out.get("expected_list_items"),
+            normalize_item=lambda item: _dedup_text_values([item], limit=1))
+        preflight = _enumeration_review.reject_empty_inventory(preflight)
+        if preflight.get("outcome") == "rewrite" and any(
+                not _assistant_core_list_item_in_answer(item, out.get("answer") or "")
+                for item in preflight.get("expected_list_items") or []):
+            preflight = {**preflight, "outcome": "no_sources", "reason": "missing_supported_list_items"}
+        if preflight.get("outcome") != "rewrite":
+            out = {**out, "outcome": "no_sources", "answer": "",
+                "reason": preflight.get("reason"), "_terminal_review_failure": True}
+        # A successful preflight is only a check: preserve the wire coverage and
+        # exact item strings for the independent edit frame and final decoder.
+        if out.get("outcome") == "rewrite":
+            try:
+                frame = _factual_context_review.prepare_review(wire_reply, out,
+                    catalog=source_table_catalog, admitted_citation_ids=valid_ids)
+                # Reuse the exact owned packet already emitted above, including
+                # its lossless compression. Do not retrieve or compile it again.
+                messages = _factual_context_review.build_messages(frame,
+                    question=request.query, response_language=request.response_language,
+                    sources_block=sources_block)
+                _admit_input(request,
+                    {"candidates": ordered_candidates if packet is not None else candidates},
+                    decision, runtime=runtime, stage="verifier.provider")
+                budget.ensure_time(9.0)
+                if budget.llm_calls >= budget.max_llm_calls:
+                    raise _V13BudgetExceeded("protected verifier LLM call budget exhausted")
+                review, review_model = _v13_json_models(messages,
+                    models=[V13_FAST_MODEL, V13_PLANNER_MODEL],
+                    json_schema=_factual_context_review.schema(frame), effort="low",
+                    reasoning_mode="", timeout=min(25, _review_timeout(runtime, budget,
+                        protected=protected_budget, compact=False)),
+                    max_output_tokens=1200, company_id=request.company_id,
+                    purpose="assistant_core_answer_contract_verifier")
+                out = _factual_context_review.apply_review(out, review, frame)
+                model_used = review_model
+            except _V13BudgetExceeded:
+                raise
+            except EvidenceContractError:
+                raise
+            except Exception:
+                # Provider/wire failures may not publish the unreviewed first
+                # draft. Do not retain provider text or exception payloads.
+                out = {**out, "outcome": "no_sources", "answer": "",
+                    "reason": "factual_context_review_unavailable",
+                    "_terminal_review_failure": True,
+                    "independent_context_review": {"outcome": "unavailable", "edit_count": 0}}
     try:
         if wire_aliases is not None:
             out = _procedure_review.decode_review_wire_aliases(out, wire_aliases, layout=layout)
@@ -879,11 +945,6 @@ def verify_or_repair_answer(
         out = _final_contract.resolve_unchanged_pass(out, draft=reviewed_draft,
             request_key=ask_request_key(request))
     out["model"] = model_used
-    valid_ids = {
-        str(c.get("citation_id") or "").strip()
-        for c in ordered_candidates
-        if str(c.get("citation_id") or "").strip()
-    }
     out["citation_ids"] = [
         str(cid or "").strip()
         for cid in (out.get("citation_ids") or [])

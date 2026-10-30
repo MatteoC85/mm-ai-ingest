@@ -16,7 +16,7 @@ from unittest.mock import patch
 sys.path[:0] = [str(Path(__file__).resolve().parents[1]), str(Path(__file__).resolve().parent)]
 import test_ask_prepared_scope_admission as shared
 from test_lineage_copy_reuse import fixture as limits_fixture
-from machinemind.ask import execution, validation, response_evidence, review_source_wire
+from machinemind.ask import execution, validation, response_evidence, review_source_wire, factual_context_review
 from machinemind.evidence.contracts import EvidenceContractError, SourceIdentity, SourceScope, SourceType, SourceFormat, ScopeLevel
 from machinemind.retrieval.ask_composition import AskEvidenceSession, AskSessionLimits, AskSelection
 from machinemind.retrieval.chunk_evidence import ChunkReadScope
@@ -89,6 +89,9 @@ class SourceFirstFixture:
                 citation_ids=['maintenance:p17'] if foreign else ['maintenance:p1','maintenance:p2'],
                 covered_facets=['documented obligations'], missing_facets=[], covered_answer_types=['checklist'],
                 missing_answer_types=[], expected_list_items=values, covered_list_items=[], missing_list_items=[])
+            if kwargs['json_schema']['name'] == 'factual_context_review':
+                reply = dict(outcome='pass', edits=[], citation_ids=['maintenance:p1','maintenance:p2'],
+                    checks={name:True for name in factual_context_review.CHECKS}, reason='offline independent fixture')
             class Response:
                 status_code=200
                 def json(self): return {'status':'completed', 'output_text':json.dumps(reply),
@@ -140,16 +143,16 @@ class AskSourceFirstInventoryTests(unittest.TestCase):
         self.addCleanup(owner.close);self.addCleanup(h.close)
         return owner,h
 
-    def test_real_owned_recovery_is_single_provider_then_validation_and_finish(self):
+    def test_real_owned_recovery_has_generation_and_independent_review_then_finish(self):
         owner,h=self.run_case()
         limits=(owner.budget.deadline_monotonic,owner.budget.max_llm_calls,owner.budget.max_estimated_cost_usd)
         result=h.run()
         self.assertEqual(result['status'],'answered')
         self.assertEqual(h.writer_calls,[])
-        self.assertEqual(len(h.reviewer_calls),1)
-        self.assertEqual(len(h.posts),1)
-        self.assertEqual(h.budget_ids,[id(owner.budget)])
-        self.assertEqual(owner.budget.llm_calls,1)
+        self.assertEqual(len(h.reviewer_calls),2)
+        self.assertEqual(len(h.posts),2)
+        self.assertEqual(h.budget_ids,[id(owner.budget)]*2)
+        self.assertEqual(owner.budget.llm_calls,2)
         self.assertEqual((owner.budget.deadline_monotonic,owner.budget.max_llm_calls,owner.budget.max_estimated_cost_usd),limits)
         self.assertEqual(h.generated['meta']['assistant_core_recovered_from'],'source_first_factual_inventory')
         for item in h.items:self.assertIn(item,result['answer'])
@@ -181,7 +184,16 @@ class AskSourceFirstInventoryTests(unittest.TestCase):
                 owner,h=self.run_case(**options)
                 with self.assertRaises(EvidenceContractError):h.run()
                 self.assertEqual(h.writer_calls,[])
-                self.assertEqual(len(h.posts),1)
+                # Prepared-mirror mutation does not alter the already admitted
+                # packet reused by the second verifier; final handoff rejects
+                # that mirror. Revocation instead stops before another call.
+                self.assertEqual(len(h.posts),1 if options.get('revoke') else 2)
+                self.assertNotIn('UNTRUSTED CHANGE',json.dumps(h.reviewer_calls))
+                if options.get('mutate'):
+                    first=h.reviewer_calls[0][0][1]['content'].split('SOURCES:\n',1)[1].split('\n\nCURRENT_ANSWER:',1)[0]
+                    second=h.reviewer_calls[1][0][1]['content'].split('SOURCES:\n',1)[1].split('\n\nCOMPLETE_CANDIDATE:',1)[0]
+                    self.assertEqual(first,second)
+                self.assertFalse(h.owner._response_flow.completed)
                 h.close();owner.close()
 
     def test_source_beyond_recovery_cap_cannot_be_cited(self):

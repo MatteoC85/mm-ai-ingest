@@ -143,6 +143,10 @@ class EnumerationSelectionFixture:
             def reviewer(messages, **kwargs):
                 self.calls.append((deepcopy(messages), deepcopy(kwargs)))
                 first = self.base[0]
+                if kwargs['json_schema']['name'] == 'factual_context_review':
+                    from machinemind.ask.factual_context_review import CHECKS
+                    return {'outcome':'pass','edits':[], 'citation_ids':[first['citation_id']],
+                        'checks':{name:True for name in CHECKS},'reason':'offline independent fixture'}, 'offline-reviewer'
                 return {'outcome':'rewrite','answer':'[[FACTUAL_INVENTORY]]',
                     'expected_list_items':[first['chunk_full']], 'covered_list_items':[], 'missing_list_items':[],
                     'covered_facets':list(self.decision.required_facets), 'missing_facets':[],
@@ -210,10 +214,16 @@ class AskEnumerationSelectionTests(unittest.TestCase):
         try:
             result=f.run(source_first=True)
             self.assertEqual(result['status'],'answered')
-            self.assertEqual(len(f.calls),1)
+            self.assertEqual(len(f.calls),2)
             messages,kwargs=f.calls[0]
             self.assertEqual(kwargs['purpose'],'assistant_core_answer_contract_verifier')
-            block=review_source_wire.restore_sources_block(messages[1]['content'].split('SOURCES:\n',1)[1].split('\n\nCURRENT_ANSWER:',1)[0])
+            first_wire=messages[1]['content'].split('SOURCES:\n',1)[1].split('\n\nCURRENT_ANSWER:',1)[0]
+            second_messages,second_kwargs=f.calls[1]
+            self.assertEqual(second_kwargs['json_schema']['name'],'factual_context_review')
+            self.assertEqual(second_kwargs['purpose'],'assistant_core_answer_contract_verifier')
+            second_wire=second_messages[1]['content'].split('SOURCES:\n',1)[1].split('\n\nCOMPLETE_CANDIDATE:',1)[0]
+            self.assertEqual(first_wire,second_wire)
+            block=review_source_wire.restore_sources_block(first_wire)
             for row in f.base + f.sections:self.assertIn(row['chunk_full'],block)
             self.assertIn('COMPLETE_SECTION_END',block)
             self.assertLessEqual(len(f.prepared['retrieval']['citations']),16)

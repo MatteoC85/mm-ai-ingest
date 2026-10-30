@@ -34,7 +34,7 @@ class InventoryNormalizationTests(unittest.TestCase):
                      'Controllare integrita\u0300 ogni mese', '  Inspect wear every 360 hours  '):
             with self.subTest(item=item):
                 items=[item,*shared.ITEMS[1:]]
-                result,final,_=self.case(items=items,answer='[[FACTUAL_INVENTORY]]')
+                result,final,_=self.case(items=items,answer='[[FACTUAL_INVENTORY]]',expected_calls=2)
                 self.assertTrue(final['passed'])
                 raw_body='\n'.join('- '+s for s in items)
                 expanded=enumeration_review.resolve_inventory_answer(
@@ -52,7 +52,7 @@ class InventoryNormalizationTests(unittest.TestCase):
     def test_full_answer_table_coverage_uses_the_same_index_proof(self):
         items=['Check  slide cleanliness daily',*shared.ITEMS[1:]]
         body='\n'.join('- '+s for s in items)
-        result,final,_=self.case(items=items,answer=body)
+        result,final,_=self.case(items=items,answer=body,expected_calls=2)
         self.assertTrue(final['passed'])
         self.assertEqual(result['answer'],self.m._assistant_core_redact_internal_text(body))
         self.assertEqual(result['table_record_coverage'][1]['inventory_items'],[2])
@@ -86,7 +86,11 @@ class InventoryNormalizationTests(unittest.TestCase):
             self.assertEqual(result['status'],'answered')
             self.assertEqual(h.generated['answer'],self.m._assistant_core_redact_internal_text('\n'.join('- '+s for s in raw)))
             self.assertTrue(h.final['meta']['assistant_core_validation']['answer_contract']['semantic_answer_bound'])
-            self.assertEqual(len(h.posts),1)
+            self.assertEqual(len(h.posts),2)
+            self.assertNotEqual(h.reviewer_calls[0][1]['json_schema']['name'],'factual_context_review')
+            self.assertEqual(h.reviewer_calls[1][1]['json_schema']['name'],'factual_context_review')
+            self.assertEqual(h.final['meta']['assistant_core_validation']['answer_contract']
+                             ['semantic_verifier']['independent_context_review']['outcome'],'pass')
             self.assertEqual(h.writer_calls,[])
         finally:h.close();owner.close()
 
