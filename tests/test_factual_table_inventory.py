@@ -75,8 +75,7 @@ class FactualTableInventoryTests(unittest.TestCase):
 
     @staticmethod
     def complete_coverage():
-        return [{'record_id':'T1','inventory_items':[0,1],'outside_request_reason':''},
-                {'record_id':'T2','inventory_items':[2],'outside_request_reason':''}]
+        return ['T1=0,1','T2=2']
 
     def test_old_self_reported_inventory_cannot_skip_continuation_record_accounting(self):
         result,final,_=self.case(items=['Grease the slide daily'])
@@ -94,7 +93,11 @@ class FactualTableInventoryTests(unittest.TestCase):
         self.assertEqual(result['missing_list_items'],[])
         schema=kwargs['json_schema']['schema']['properties']
         self.assertEqual(schema['covered_list_items'].get('maxItems'),0)
-        self.assertEqual(schema['table_record_coverage']['items']['properties']['record_id']['enum'],['T1','T2'])
+        self.assertEqual(schema['table_record_coverage']['items']['type'],'string')
+        self.assertEqual(schema['table_record_coverage']['minItems'],2)
+        self.assertEqual(result['table_record_coverage'],[
+            {'record_id':'T1','inventory_items':[0,1],'outside_request_reason':''},
+            {'record_id':'T2','inventory_items':[2],'outside_request_reason':''}])
         self.assertEqual(kwargs['max_output_tokens'],3200)
         wire=messages[1]['content'].split('SOURCES:\n',1)[1].split('\n\nCURRENT_ANSWER:',1)[0]
         expanded=review_source_wire.restore_sources_block(wire)
@@ -103,12 +106,10 @@ class FactualTableInventoryTests(unittest.TestCase):
 
     def test_incomplete_duplicate_foreign_or_false_indices_cannot_certify_records(self):
         valid=self.complete_coverage()
-        variants=[valid[:1], [valid[0],valid[0]],
-            [valid[0],{**valid[1],'record_id':'OTHER'}],
-            [valid[0],{**valid[1],'inventory_items':[3]}],
-            [valid[0],{**valid[1],'inventory_items':[True]}],
-            [valid[0],{**valid[1],'inventory_items':[]}],
-            [valid[0],{**valid[1],'outside_request_reason':'contradictory classification'}]]
+        variants=[valid[:1], [valid[0],valid[0]], *[[valid[0],value] for value in
+            ('OTHER=2','T2=3','T2=True','T2=','T2!','T2=2!contradictory classification',
+             'T2=02','T2=-1','T2=2,2','T2=2.0','T2=2\n','T02=2','T2!   ',
+             'T2!reason\nother', 'T2!'+'x'*512)]]
         for coverage in variants:
             with self.subTest(coverage=coverage):
                 result,final,_=self.case(coverage=coverage)
@@ -125,8 +126,7 @@ class FactualTableInventoryTests(unittest.TestCase):
 
     def test_wire_inventory_dedup_cannot_reassign_a_record_index(self):
         duplicate_items=[ITEMS[0],ITEMS[0],ITEMS[2]]
-        coverage=[{'record_id':'T1','inventory_items':[0],'outside_request_reason':''},
-                  {'record_id':'T2','inventory_items':[1],'outside_request_reason':''}]
+        coverage=['T1=0','T2=1']
         result,final,_=self.case(items=duplicate_items,coverage=coverage)
         self.assertEqual(result['expected_list_items'],[ITEMS[0],ITEMS[2]])
         self.assertEqual(result['reason'],'source_table_inventory_incomplete')
@@ -136,13 +136,21 @@ class FactualTableInventoryTests(unittest.TestCase):
 
     def test_explicit_outside_request_record_is_not_automatic_cross_assembly_evidence(self):
         coverage=self.complete_coverage()+[
-            {'record_id':'T3','inventory_items':[],
-             'outside_request_reason':'Separate stored unit; no relationship to requested installed assemblies is documented.'}]
+            'T3!Separate stored unit; no relationship to requested installed assemblies is documented.']
         result,final,_=self.case(coverage=coverage,source=SOURCES+'\nOther source\n'+OTHER)
         self.assertTrue(final['passed'])
         self.assertNotIn('Separate packaged unit',result['answer'])
         # The semantic classification is a fixture and must still be reviewed
         # live. No code infers applicability or equivalence from the ID.
+
+    def test_compact_reason_keeps_literal_separators_unicode_and_escaping(self):
+        reason='Outside request: "A=B!"; path C:\\manuali; unità distinta.'
+        coverage=self.complete_coverage()+['T3!'+reason]
+        wire=json.loads(json.dumps(coverage,ensure_ascii=False))
+        result,final,_=self.case(coverage=wire,source=SOURCES+'\nOther source\n'+OTHER)
+        self.assertTrue(final['passed'])
+        self.assertEqual(result['table_record_coverage'][-1],{
+            'record_id':'T3','inventory_items':[],'outside_request_reason':reason})
 
     def test_record_projection_is_lossless_and_identical_rows_keep_wire_dedup(self):
         source='Source A\n'+SOURCES+'\nSource B\n'+SOURCES+'\n'

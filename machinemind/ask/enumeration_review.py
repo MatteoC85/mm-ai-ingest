@@ -4,6 +4,7 @@ The inventory is still a semantic judgement, not deterministic entailment proof.
 Existing evidence admission, text binding and final list checks remain required.
 """
 from copy import deepcopy
+import re
 from . import table_units as _tables
 
 
@@ -47,9 +48,9 @@ INSTRUCTIONS = (
 RECORD_INSTRUCTIONS = (
     " TABLE_RECORD markers identify unchanged literal PDF record occurrences within "
     "their original source context, not new evidence or assembly equivalence. "
-    "Account for every ID exactly once in table_record_coverage: inventory_items are "
-    "zero-based expected_list_items indices covering all its requested actions, intervals "
-    "and conditions; otherwise state outside_request_reason for the complete QUESTION, "
+    "Account for every ID exactly once in table_record_coverage using compact strings: "
+    "T1=0,2 means zero-based expected_list_items indices covering all its requested "
+    "actions, intervals and conditions; T2!reason excludes it with a brief reason for the complete QUESTION, "
     "not only its first category. IDs and coverage declarations do not prove entailment: "
     "check the full cells, detail rows and notes, including continuation records. "
     "Keep these IDs out of the visible answer."
@@ -107,12 +108,8 @@ def source_first_schema(schema: dict, *, record_ids: tuple[str, ...] = ()) -> di
     if record_ids:
         properties['table_record_coverage'] = {
             'type': 'array', 'minItems': len(record_ids), 'maxItems': len(record_ids),
-            'items': {'type': 'object', 'additionalProperties': False,
-                'properties': {
-                    'record_id': {'type': 'string', 'enum': list(record_ids)},
-                    'inventory_items': {'type': 'array', 'items': {'type': 'integer', 'minimum': 0, 'maximum': 39}, 'maxItems': 40},
-                    'outside_request_reason': {'type': 'string'}},
-                'required': ['record_id', 'inventory_items', 'outside_request_reason']}}
+            'items': {'type': 'string', 'maxLength': 512},
+            'description': 'One string per TABLE_RECORD occurrence: T1=0,2 for inventory indices or T2!brief outside-request reason. No missing or duplicate IDs.'}
         out['schema']['required'] = [*out['schema']['required'], 'table_record_coverage']
     return out
 
@@ -126,11 +123,19 @@ def validate_table_coverage(result: dict, record_ids: tuple[str, ...], *, wire_i
     valid = (type(expected) is list and type(wire_inventory) is list
         and expected == wire_inventory and type(rows) is list and len(rows) == len(record_ids))
     seen = set()
+    decoded = []
     if valid:
         for row in rows:
-            if type(row) is not dict:
+            match = (re.fullmatch(r'(T[1-9][0-9]*)(?:=([0-9]+(?:,[0-9]+)*)|!([^\r\n]+))', row)
+                if type(row) is str and len(row) <= 512 else None)
+            if not match:
                 valid = False; break
-            identity, indices, reason = row.get('record_id'), row.get('inventory_items'), row.get('outside_request_reason')
+            identity = match[1]
+            tokens = match[2].split(',') if match[2] is not None else []
+            # Canonical integers only; no coercion of booleans, signs or aliases.
+            if any(len(token) > 2 or str(int(token)) != token for token in tokens):
+                valid = False; break
+            indices, reason = [int(token) for token in tokens], match[3] or ''
             if (type(identity) is not str or identity not in record_ids or identity in seen
                     or type(indices) is not list or len(indices) > 40
                     or any(type(i) is not int or not 0 <= i < len(expected) for i in indices)
@@ -138,10 +143,11 @@ def validate_table_coverage(result: dict, record_ids: tuple[str, ...], *, wire_i
                     or bool(indices) == bool(reason.strip())):
                 valid = False; break
             seen.add(identity)
+            decoded.append({'record_id':identity,'inventory_items':indices,'outside_request_reason':reason})
     if not valid or seen != set(record_ids):
         return {**result, 'outcome': 'no_sources', 'reason': 'source_table_inventory_incomplete',
             '_terminal_review_failure': True}
-    return result
+    return {**result, 'table_record_coverage':decoded}
 
 
 def reject_empty_inventory(result: dict) -> dict:
