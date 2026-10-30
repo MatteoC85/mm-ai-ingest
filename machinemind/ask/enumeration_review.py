@@ -7,6 +7,18 @@ from copy import deepcopy
 import re
 from . import table_units as _tables
 
+INVENTORY_MARKER = '[[FACTUAL_INVENTORY]]'
+INVENTORY_PREFIX = '[[FACTUAL_INVENTORY'
+ANSWER_INSTRUCTIONS = (
+    " For outcome=rewrite, avoid copying the inventory twice: put [[FACTUAL_INVENTORY]] "
+    "exactly once on its own line in answer. The server replaces that line with one bullet "
+    "per expected_list_items string, verbatim and in order. Put headings, limitations or "
+    "necessary context outside that line. Each inventory string must therefore be a complete "
+    "reader-facing obligation in RESPONSE_LANGUAGE with its supported conditions. Review "
+    "the resulting complete answer and cite all its sources. Never put the marker in an "
+    "inventory item or another field. For pass/no_sources do not use the marker."
+)
+
 
 def applies(request, decision, *, protected: bool, enumeration: bool) -> bool:
     return bool(protected and enumeration
@@ -148,6 +160,32 @@ def validate_table_coverage(result: dict, record_ids: tuple[str, ...], *, wire_i
         return {**result, 'outcome': 'no_sources', 'reason': 'source_table_inventory_incomplete',
             '_terminal_review_failure': True}
     return {**result, 'table_record_coverage':decoded}
+
+
+def resolve_inventory_answer(result: dict, *, canonical_inventory: list[str], allowed: bool) -> dict:
+    """Expand an explicit rewrite template before any binding/grounding checks.
+
+    Only model-returned inventory strings supply content. The original request,
+    sources and draft cannot activate this representation or contribute text.
+    Full-answer legacy replies are unchanged; this is never a semantic PASS.
+    """
+    body = result.get('answer')
+    if type(body) is not str or INVENTORY_PREFIX not in body:
+        return result
+    items = result.get('expected_list_items')
+    lines = body.splitlines(keepends=True)
+    marker_lines = [i for i,line in enumerate(lines) if line.rstrip('\r\n') == INVENTORY_MARKER]
+    valid = (allowed and result.get('outcome') == 'rewrite' and body.count(INVENTORY_PREFIX) == 1
+        and len(marker_lines) == 1 and type(items) is list and bool(items)
+        and items == canonical_inventory and len(items) <= 40
+        and all(type(item) is str and item.strip() and INVENTORY_PREFIX not in item for item in items))
+    if not valid:
+        return {**result, 'outcome':'no_sources','answer':'',
+            'reason':'factual_inventory_template_invalid','_terminal_review_failure':True}
+    index = marker_lines[0]
+    ending = '\r\n' if lines[index].endswith('\r\n') else '\n' if lines[index].endswith('\n') else ''
+    lines[index] = '\n'.join('- '+item for item in items) + ending
+    return {**result, 'answer':''.join(lines)}
 
 
 def reject_empty_inventory(result: dict) -> dict:

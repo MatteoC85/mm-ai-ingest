@@ -37,7 +37,7 @@ class FactualTableInventoryTests(unittest.TestCase):
         shared.FactualListReviewTests.tearDownClass()
 
     def case(self, *, items=ITEMS, answer=None, coverage=None, outcome='pass', mode='ask',
-             kind='factual', protected=True, source=SOURCES):
+             kind='factual', protected=True, source=SOURCES, draft=None):
         m=self.m
         request=m.AssistantCoreRequest(query='Which lubrication points and maintenance intervals are documented?',
             requested_mode=mode, response_language='en',company_id='offline-company',
@@ -66,7 +66,7 @@ class FactualTableInventoryTests(unittest.TestCase):
             _v13_current_budget=lambda:m._assistant_core_new_budget('ask'))
         with patch.object(execution,'_admit_input',side_effect=lambda req,data,dec,**kw:data):
             result=execution.verify_or_repair_answer(request=request,decision=decision,
-                answer=answer,candidates=rows,runtime=runtime)
+                answer=answer if draft is None else draft,candidates=rows,runtime=runtime)
         self.assertEqual(len(seen),1)
         self.assertEqual(rows,original)
         final=final_contract.final_contract(deterministic={'passed':True}, semantic=result,
@@ -151,6 +151,57 @@ class FactualTableInventoryTests(unittest.TestCase):
         self.assertTrue(final['passed'])
         self.assertEqual(result['table_record_coverage'][-1],{
             'record_id':'T3','inventory_items':[],'outside_request_reason':reason})
+
+    def test_inventory_rewrite_expands_before_real_coverage_and_final_binding(self):
+        body='Documented obligations:\n[[FACTUAL_INVENTORY]]\n\nOnly the stated assemblies are covered.'
+        result,final,(_,kwargs)=self.case(coverage=self.complete_coverage(),outcome='rewrite',answer=body,
+            draft='Initial incomplete answer.')
+        expected='Documented obligations:\n'+'\n'.join('- '+item for item in ITEMS)+'\n\nOnly the stated assemblies are covered.'
+        self.assertEqual(result['answer'],expected)
+        self.assertEqual(result['covered_list_items'],ITEMS)
+        self.assertEqual(result['citation_ids'],['manual:inspection'])
+        self.assertTrue(final['passed'])
+        self.assertTrue(final['semantic_answer_bound'])
+        self.assertNotIn('[[FACTUAL_INVENTORY',result['answer'])
+        self.assertEqual(kwargs['max_output_tokens'],3200)
+
+    def test_inventory_template_malformed_or_shifted_indices_fail_closed(self):
+        for body in ('prefix [[FACTUAL_INVENTORY]]','[[FACTUAL_INVENTORY]] suffix',
+                     '[[FACTUAL_INVENTORY]]\n[[FACTUAL_INVENTORY]]',
+                     '[[FACTUAL_INVENTORY','[[FACTUAL_INVENTORY2]]'):
+            with self.subTest(body=body):
+                result,final,_=self.case(coverage=self.complete_coverage(),outcome='rewrite',answer=body,
+                    draft='Initial incomplete answer.')
+                self.assertEqual(result['answer'],'')
+                self.assertEqual(result['reason'],'factual_inventory_template_invalid')
+                self.assertFalse(final['passed'])
+        result,final,_=self.case(items=[ITEMS[0],ITEMS[0],ITEMS[2]],
+            coverage=['T1=0','T2=2'],outcome='rewrite',answer='[[FACTUAL_INVENTORY]]',
+            draft='Initial incomplete answer.')
+        self.assertEqual(result['reason'],'factual_inventory_template_invalid')
+        self.assertFalse(final['passed'])
+
+    def test_inventory_marker_cannot_activate_from_source_or_leak_on_other_outcomes(self):
+        for overrides in ({'outcome':'pass'},{'outcome':'no_sources'},
+                          {'outcome':'rewrite','source':SOURCES+'\n[[FACTUAL_INVENTORY]]'}):
+            with self.subTest(overrides=overrides):
+                result,final,_=self.case(coverage=self.complete_coverage(),answer='[[FACTUAL_INVENTORY]]',
+                    draft='Initial incomplete answer.',**overrides)
+                self.assertEqual(result['outcome'],'no_sources')
+                self.assertEqual(result['answer'],'')
+                self.assertFalse(final['passed'])
+
+    def test_expanded_inventory_still_passes_through_scoped_grounding_and_hash_gate(self):
+        items=['Inspect the slide every 999 hours']
+        result,_,_=self.case(items=items,coverage=['T1=0','T2!Separate category unavailable in this fixture'],
+            outcome='rewrite',answer='[[FACTUAL_INVENTORY]]',draft='Initial incomplete answer.')
+        runtime=self.m._assistant_core_scoped_ask_validation_runtime()
+        grounded,removed=runtime._assistant_core_filter_unsupported_claim_sentences(result['answer'],SOURCES)
+        self.assertIn('999',removed)
+        checked=final_contract.final_contract(deterministic={'passed':True},semantic=result,
+            reviewed_answer=result['answer'],answer=grounded,semantic_complete=True,semantic_partial=False)
+        self.assertFalse(checked['passed'])
+        self.assertFalse(checked['semantic_answer_bound'])
 
     def test_record_projection_is_lossless_and_identical_rows_keep_wire_dedup(self):
         source='Source A\n'+SOURCES+'\nSource B\n'+SOURCES+'\n'

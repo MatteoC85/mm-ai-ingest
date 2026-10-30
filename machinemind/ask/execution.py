@@ -557,11 +557,14 @@ def verify_or_repair_answer(
         return {"outcome": "no_sources", "answer": "", "reason": "empty_evidence"}
 
     table_record_ids = ()
+    inventory_template_allowed = False
     if factual_list_review:
         # Internal wire representation only. Admission, original candidate text,
         # citation identities and grounding still use the unchanged records.
         sources_block, table_record_ids = _enumeration_review.annotate_table_records(sources_block)
         sources_block = _review_source_wire.compact_sources_block(sources_block)
+        inventory_template_allowed = not any(_enumeration_review.INVENTORY_PREFIX in text
+            for text in (request.query, answer, sources_block))
 
     conditions_only = bool(_guarded(runtime, request, decision) and conditions_only_contract(
         procedure_scope=getattr(decision, "procedure_scope", ""),
@@ -675,6 +678,8 @@ def verify_or_repair_answer(
             "boundary evidence stay literal. All semantic, source and operation proof gates apply.")
     if factual_list_review:
         system_msg += _enumeration_review.INSTRUCTIONS
+        if inventory_template_allowed:
+            system_msg += _enumeration_review.ANSWER_INSTRUCTIONS
         if table_record_ids:
             system_msg += _enumeration_review.RECORD_INSTRUCTIONS
     user_msg = (
@@ -789,6 +794,10 @@ def verify_or_repair_answer(
         return {"outcome": "unavailable", "answer": answer, "reason": str(exc)[:300]}
 
     out = dict(parsed or {})
+    if factual_list_review:
+        out = _enumeration_review.resolve_inventory_answer(out,
+            canonical_inventory=_dedup_text_values(out.get("expected_list_items") or [], limit=40),
+            allowed=inventory_template_allowed)
     try:
         if wire_aliases is not None:
             out = _procedure_review.decode_review_wire_aliases(out, wire_aliases, layout=layout)
