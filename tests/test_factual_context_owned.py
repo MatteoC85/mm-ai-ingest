@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 sys.path[:0] = [str(Path(__file__).resolve().parents[1]), str(Path(__file__).resolve().parent)]
 import test_source_table_owned as table_fixture
+from context_review_wire_fixture import encode_context_reply, assembled_context_candidate
 from machinemind.ask import factual_context_review, request_completion
 from machinemind.ask.response_evidence import ResponseEvidenceError
 from machinemind.evidence.contracts import EvidenceContractError
@@ -49,12 +50,12 @@ class ContextFixture(table_fixture.OwnedTableFixture):
                                'budget_id': id(request_budget._v13_current_budget())})
             is_second = stage == 'factual_context_review'
             if is_second:
-                self.first_candidate = messages[1]['content'].split('\n\nCOMPLETE_CANDIDATE:\n',1)[1].split(
-                    '\n\nIMMUTABLE_INVENTORY_INDICES:',1)[0]
+                self.first_candidate = assembled_context_candidate(messages)
                 reply = {'outcome':'rewrite', 'edits':[], 'citation_ids':['inspection:p1','inspection:p2'],
                          'table_contexts':table_fixture.table_contexts(),
                          'checks':{name:True for name in factual_context_review.CHECKS}, 'reason':'offline independent fixture'}
                 if second is not None:second(reply)
+                reply = encode_context_reply(reply, messages)
             else:
                 reply = dict(outcome='rewrite', answer='[[FACTUAL_INVENTORY]]', reason='offline first fixture',
                     citation_ids=['inspection:p1','inspection:p2'], covered_facets=['documented obligations'],
@@ -97,8 +98,9 @@ class FactualContextOwnedTests(unittest.TestCase):
         table_fixture.SourceTableOwnedTests.tearDownClass()
 
     def case(self, **kwargs):
+        debug = kwargs.pop('debug', False)
         completion = request_completion.RequestCompletion(runtime=self.m._assistant_core_request_flow_runtime(),
-            payload=SimpleNamespace(company_id='offline-company'), started=time.monotonic())
+            payload=SimpleNamespace(company_id='offline-company',debug=debug), started=time.monotonic())
         f = ContextFixture(self, **kwargs)
         self.addCleanup(completion.close); self.addCleanup(f.close)
         return completion, f
@@ -170,12 +172,23 @@ class FactualContextOwnedTests(unittest.TestCase):
         ]
         for index,change in enumerate(changes):
             with self.subTest(case=index):
-                completion, f = self.case(second=change)
-                result=f.run()
-                self.assertEqual(result['status'],'no_sources')
-                self.assertEqual(result.get('citations') or [],[])
-                self.assertNotIn(FIRST_ITEM,result.get('answer') or '')
-                self.assertNotIn(FIRST_ITEM,json.dumps(result))
+                completion, f = self.case(second=change,debug=True)
+                if index in (0,1,10):
+                    result=f.run()
+                    self.assertEqual(result['status'],'no_sources')
+                    self.assertEqual(result.get('citations') or [],[])
+                    self.assertNotIn(FIRST_ITEM,json.dumps(result))
+                else:
+                    with self.assertRaisesRegex(ResponseEvidenceError,'canonical verifier unavailable: factual_context_review_invalid'):
+                        f.run()
+                    self.assertFalse(f.owner._response_flow.completed)
+                    terminal=completion.finish({'ok':False,'status':'error','result_code':'TECHNICAL_ERROR','meta':{}})
+                    self.assertNotIn(FIRST_ITEM,json.dumps(terminal))
+                row=completion.contract_checks[-1]
+                self.assertEqual(row['independent_review_gate'],[
+                    'model_rejected','checks_false','edit_target','citation_set','citation_alias',
+                    'edit_target','table_count','table_target','quote_not_literal','quote_not_literal',
+                    'documentary_limits_unchecked'][index])
                 self.assertEqual(len(f.post_calls),2)
                 f.close(); completion.close()
 

@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 sys.path[:0] = [str(Path(__file__).resolve().parents[1]), str(Path(__file__).resolve().parent)]
 import test_ask_prepared_scope_admission as shared
+from context_review_wire_fixture import encode_context_reply
 from test_lineage_copy_reuse import fixture as limits_fixture
 from machinemind.ask import execution, validation, response_evidence, review_source_wire, factual_context_review
 from machinemind.evidence.contracts import EvidenceContractError, SourceIdentity, SourceScope, SourceType, SourceFormat, ScopeLevel
@@ -93,6 +94,7 @@ class SourceFirstFixture:
                 reply = dict(outcome='pass', edits=[], citation_ids=['maintenance:p1','maintenance:p2'],
                     table_contexts=[],
                     checks={name:True for name in factual_context_review.CHECKS}, reason='offline independent fixture')
+                reply = encode_context_reply(reply, messages)
             class Response:
                 status_code=200
                 def json(self): return {'status':'completed', 'output_text':json.dumps(reply),
@@ -199,8 +201,10 @@ class AskSourceFirstInventoryTests(unittest.TestCase):
 
     def test_source_beyond_recovery_cap_cannot_be_cited(self):
         owner,h=self.run_case(count=17,foreign=True)
-        result=h.run()
-        self.assertEqual(result['status'],'no_sources')
+        with self.assertRaisesRegex(response_evidence.ResponseEvidenceError,
+                'canonical verifier unavailable: factual_context_review_unavailable'):
+            h.run()
+        self.assertFalse(h.owner._response_flow.completed)
         block=review_source_wire.restore_sources_block(h.reviewer_calls[0][0][1]['content'].split('SOURCES:\n',1)[1].split('\n\nCURRENT_ANSWER:',1)[0])
         self.assertNotIn('[maintenance:p17]',block)
         self.assertEqual(len(h.posts),1)

@@ -866,6 +866,8 @@ def verify_or_repair_answer(
         inventory_diagnostics['inventory_template_gate'] = (
             'rejected' if out.get('reason') in {'factual_inventory_template_invalid',
                 'source_table_reference_invalid'} else 'accepted_or_unused')
+    independent_result = None
+    independent_failure_reason = None
     if independent_context_review and out.get("outcome") == "rewrite":
         # Validate representation first. Invalid/unfinished generation must not
         # spend a second call or acquire a semantic approval for a partial list.
@@ -875,6 +877,12 @@ def verify_or_repair_answer(
             wire_inventory=out.get("expected_list_items"),
             normalize_item=lambda item: _dedup_text_values([item], limit=1))
         preflight = _enumeration_review.reject_empty_inventory(preflight)
+        if preflight.get("outcome") == "rewrite" and any(out.get(key) for key in (
+                "missing_facets", "missing_answer_types", "missing_list_items")):
+            # Declared semantic insufficiency is not a malformed independent
+            # review frame and must not spend the follow-up provider call.
+            preflight = {**preflight, "outcome": "no_sources",
+                "reason": "factual_context_review_incomplete"}
         if preflight.get("outcome") == "rewrite" and any(
                 not _assistant_core_list_item_in_answer(item, out.get("answer") or "")
                 for item in preflight.get("expected_list_items") or []):
@@ -885,6 +893,7 @@ def verify_or_repair_answer(
         # A successful preflight is only a check: preserve the wire coverage and
         # exact item strings for the independent edit frame and final decoder.
         if out.get("outcome") == "rewrite":
+            independent_stage = "source_frame"
             try:
                 frame = _factual_context_review.prepare_review(wire_reply, out,
                     catalog=source_table_catalog, admitted_citation_ids=valid_ids,
@@ -900,6 +909,7 @@ def verify_or_repair_answer(
                 budget.ensure_time(9.0)
                 if budget.llm_calls >= budget.max_llm_calls:
                     raise _V13BudgetExceeded("protected verifier LLM call budget exhausted")
+                independent_stage = "provider_unavailable"
                 review, review_model = _v13_json_models(messages,
                     models=[V13_FAST_MODEL, V13_PLANNER_MODEL],
                     json_schema=_factual_context_review.schema(frame), effort="low",
@@ -907,7 +917,11 @@ def verify_or_repair_answer(
                         protected=protected_budget, compact=False),
                     max_output_tokens=min(4000, max(3200, V13_FAST_MAX_OUTPUT_TOKENS)), company_id=request.company_id,
                     purpose="assistant_core_answer_contract_verifier")
-                out = _factual_context_review.apply_review(out, review, frame)
+                independent_stage = "reply_shape"
+                out = _factual_context_review.apply_wire_review(out, review, frame)
+                independent_result = out.get("independent_context_review")
+                if out.get("reason") == "factual_context_review_invalid":
+                    independent_failure_reason = "factual_context_review_invalid"
                 model_used = review_model
             except _V13BudgetExceeded:
                 raise
@@ -919,7 +933,10 @@ def verify_or_repair_answer(
                 out = {**out, "outcome": "no_sources", "answer": "",
                     "reason": "factual_context_review_unavailable",
                     "_terminal_review_failure": True,
-                    "independent_context_review": {"outcome": "unavailable", "edit_count": 0}}
+                    "independent_context_review": {"outcome": "unavailable", "edit_count": 0,
+                        "gate": independent_stage}}
+                independent_result = out["independent_context_review"]
+                independent_failure_reason = "factual_context_review_unavailable"
     try:
         if wire_aliases is not None:
             out = _procedure_review.decode_review_wire_aliases(out, wire_aliases, layout=layout)
@@ -1007,6 +1024,14 @@ def verify_or_repair_answer(
         inventory_diagnostics['table_coverage_gate'] = (
             'rejected' if out.get('reason') == 'source_table_inventory_incomplete' else 'accepted_or_unused')
         out = _enumeration_review.reject_empty_inventory(out)
+    if type(independent_result) is dict:
+        inventory_diagnostics['independent_review_outcome'] = independent_result.get('outcome')
+        inventory_diagnostics['independent_review_gate'] = independent_result.get('gate')
+        inventory_diagnostics['independent_review_edit_count'] = independent_result.get('edit_count')
+    if independent_failure_reason is not None:
+        # Reuse the protected consumer's existing unavailable -> technical-error
+        # path. Model rejection/failed semantic checks remain ordinary no_sources.
+        out = {**out, 'outcome': 'unavailable', 'reason': independent_failure_reason}
     _record_contract_observation("semantic_review", out, diagnostics=inventory_diagnostics or None)
     return out
 

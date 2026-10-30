@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 sys.path[:0] = [str(Path(__file__).resolve().parents[1]), str(Path(__file__).resolve().parent)]
 import test_factual_list_review as shared
+from context_review_wire_fixture import encode_context_reply
 from machinemind.ask import execution, enumeration_review, final_contract, review_source_wire, factual_context_review
 
 
@@ -63,10 +64,11 @@ class FactualTableInventoryTests(unittest.TestCase):
                     'documentary_limits_checked':True,
                     'source_quotes':[{'citation_id':'manual:inspection',
                         'quote':'Inspect wear every 360 hours and grease if necessary.'}]}] if complete_catalog else [])
-                return {'outcome':'rewrite' if contexts else 'pass','edits':[], 'citation_ids':['manual:inspection'],
+                reply = {'outcome':'rewrite' if contexts else 'pass','edits':[], 'citation_ids':['manual:inspection'],
                     'table_contexts':contexts,
                     'checks':{name:True for name in factual_context_review.CHECKS},
-                    'reason':'offline independent fixture'}, 'offline-model'
+                    'reason':'offline independent fixture'}
+                return encode_context_reply(reply, messages), 'offline-model'
             result={'outcome':outcome,'answer':answer,'citation_ids':['manual:inspection'],
                 'covered_facets':['documented obligations'],'missing_facets':[],
                 'covered_answer_types':['checklist'],'missing_answer_types':[],

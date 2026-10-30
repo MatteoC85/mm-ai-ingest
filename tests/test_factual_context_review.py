@@ -5,8 +5,9 @@ from pathlib import Path
 import sys
 import unicodedata
 import unittest
+import json
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path[:0] = [str(Path(__file__).resolve().parents[1]), str(Path(__file__).resolve().parent)]
 from machinemind.ask import factual_context_review as review
 from machinemind.ask import enumeration_review, source_table_review
 
@@ -65,6 +66,7 @@ class FactualContextReviewTests(unittest.TestCase):
         self.assertIn(first['expected_list_items'][0],out['answer'])
         self.assertNotEqual(out['answer'],first['answer'])
         self.assertEqual(out['independent_context_review'], {'outcome':'rewrite','edit_count':0,
+            'gate':'accepted',
             'answer_sha256':hashlib.sha256(out['answer'].encode()).hexdigest()})
         self.assertNotIn('PRIVATE_SECOND_REASON', str(out))
 
@@ -136,7 +138,10 @@ class FactualContextReviewTests(unittest.TestCase):
         messages=review.build_messages(frame,question='Which maintenance is documented?',response_language='en',sources_block=sources)
         actual=messages[1]['content'].split('SOURCES:\n',1)[1].split('\n\nCOMPLETE_CANDIDATE:',1)[0]
         self.assertEqual(actual,sources)
-        self.assertIn(frame.answer,messages[1]['content'])
+        view=json.loads(messages[1]['content'].split('\n\nCOMPLETE_CANDIDATE:\n',1)[1].split('\n\nCITATION_ALIASES:',1)[0])
+        self.assertEqual(review._expand(view['template'],[item['text']for item in view['inventory']]),frame.answer)
+        self.assertEqual([item['target']for item in view['inventory']],['item:0','item:1'])
+        self.assertEqual([item['immutable']for item in view['inventory']],[True,False])
         self.assertNotIn('PRIVATE_FIRST_VERDICT',str(messages))
         self.assertNotIn('SOURCE_TABLE_PREVIEWS',str(messages))
         self.assertEqual(review.schema(frame)['name'],'factual_context_review')
@@ -180,6 +185,34 @@ class FactualContextReviewTests(unittest.TestCase):
             with self.subTest(sources=sources[:40]):
                 with self.assertRaisesRegex(ValueError,'^factual_context_review_invalid$'):
                     review.prepare_review(wire,first,catalog=catalog,admitted_citation_ids=['manual:p1','manual:p2'],sources_block=sources)
+
+    def test_wire_alias_roundtrip_and_strict_foreign_alias_rejection(self):
+        from context_review_wire_fixture import encode_context_reply
+        _,first,frame,_=self.candidate()
+        messages=review.build_messages(frame,question='Maintenance?',response_language='en',sources_block=self.sources)
+        canonical=self.verdict(citations=['manual:p1','manual:p2'])
+        wire=encode_context_reply(canonical,messages)
+        self.assertEqual(wire['citation_ids'],['S0','S1'])
+        self.assertEqual(review.apply_wire_review(first,wire,frame),review.apply_review(first,canonical,frame))
+        for foreign in ('S01','S9','manual:p1','S0 extra'):
+            bad=deepcopy(wire);bad['table_contexts'][0]['source_quotes'][0]['citation_id']=foreign
+            result=review.apply_wire_review(first,bad,frame)
+            self.assertEqual(result['outcome'],'no_sources')
+            self.assertEqual(result['independent_context_review']['gate'],'citation_alias')
+        bad=deepcopy(wire);bad['table_contexts'][0]['source_quotes'][0]['citation_id']='S1'
+        self.assertEqual(review.apply_wire_review(first,bad,frame)['independent_context_review']['gate'],'quote_not_literal')
+
+    def test_diagnostic_categories_do_not_change_semantic_or_literal_gates(self):
+        _,first,frame,_=self.candidate()
+        cases=[('model_rejected',self.verdict(outcome='no_sources')),
+               ('checks_false',self.verdict(safety=False)),
+               ('table_count',self.verdict())]
+        cases[-1][1]['table_contexts']=[]
+        for gate, verdict in cases:
+            result=review.apply_review(first,verdict,frame)
+            self.assertEqual(result['outcome'],'no_sources')
+            self.assertEqual(result['independent_context_review']['gate'],gate)
+            self.assertNotIn('PRIVATE_SECOND_REASON',str(result))
 
 
 if __name__=='__main__':unittest.main(verbosity=2)

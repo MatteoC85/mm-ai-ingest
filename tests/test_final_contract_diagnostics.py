@@ -19,6 +19,39 @@ from machinemind.ask import request_completion
 
 
 class FinalContractDiagnosticsTests(unittest.TestCase):
+    def test_independent_gate_is_debug_only_bounded_and_content_free_after_terminal_failure(self):
+        for debug in (True,False,'true'):
+            owner=self.owner(debug)
+            try:
+                request_completion.record_contract_observation('semantic_review',
+                    {'outcome':'unavailable','reason':'factual_context_review_invalid'},diagnostics={
+                        'independent_review_outcome':'invalid','independent_review_gate':'quote_not_literal',
+                        'independent_review_edit_count':1000,'raw_quote':'PRIVATE SOURCE PHRASE',
+                        'answer':'PRIVATE CANDIDATE'})
+                terminal=owner.finish({'ok':False,'status':'error','result_code':'TECHNICAL_ERROR','meta':{}})
+                row=terminal['meta']['request_completion']['contract_checks'][-1]
+                self.assertEqual(row['reason'],'factual_context_review_invalid')
+                self.assertEqual(row['outcome'],'unavailable')
+                if debug is True:
+                    self.assertEqual(row['independent_review_gate'],'quote_not_literal')
+                    self.assertEqual(row['independent_review_edit_count'],100)
+                else:
+                    self.assertNotIn('independent_review_gate',row)
+                    self.assertNotIn('independent_review_outcome',row)
+                self.assertNotIn('PRIVATE',json.dumps(terminal))
+            finally:owner.close()
+        owner=self.owner(True)
+        try:
+            self.assertEqual(owner.contract_checks,[])
+            request_completion.record_contract_observation('semantic_review',{'outcome':'no_sources',
+                'reason':'factual_context_review_rejected'},diagnostics={
+                    'independent_review_outcome':'PRIVATE SOURCE PHRASE',
+                    'independent_review_gate':'PRIVATE MODEL ERROR'})
+            self.assertEqual(owner.contract_checks[-1]['independent_review_gate'],'other')
+            self.assertEqual(owner.contract_checks[-1]['independent_review_outcome'],'other')
+            self.assertNotIn('PRIVATE',json.dumps(owner.contract_checks))
+        finally:owner.close()
+
     @classmethod
     def setUpClass(cls):
         source_fixture.AskSourceIdentifierTests.setUpClass()

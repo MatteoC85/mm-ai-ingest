@@ -145,9 +145,11 @@ class EnumerationSelectionFixture:
                 first = self.base[0]
                 if kwargs['json_schema']['name'] == 'factual_context_review':
                     from machinemind.ask.factual_context_review import CHECKS
-                    return {'outcome':'pass','edits':[], 'citation_ids':[first['citation_id']],
+                    from context_review_wire_fixture import encode_context_reply
+                    reply = {'outcome':'pass','edits':[], 'citation_ids':[first['citation_id']],
                         'table_contexts':[],
-                        'checks':{name:True for name in CHECKS},'reason':'offline independent fixture'}, 'offline-reviewer'
+                        'checks':{name:True for name in CHECKS},'reason':'offline independent fixture'}
+                    return encode_context_reply(reply, messages), 'offline-reviewer'
                 return {'outcome':'rewrite','answer':'[[FACTUAL_INVENTORY]]',
                     'expected_list_items':[first['chunk_full']], 'covered_list_items':[], 'missing_list_items':[],
                     'covered_facets':list(self.decision.required_facets), 'missing_facets':[],

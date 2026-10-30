@@ -16,6 +16,7 @@ import unittest
 
 sys.path[:0] = [str(Path(__file__).resolve().parents[1]), str(Path(__file__).resolve().parent)]
 import test_ask_source_first_inventory as shared
+from context_review_wire_fixture import encode_context_reply
 from machinemind.ask import execution, validation, request_completion, factual_context_review
 from machinemind.ask.response_evidence import ResponseEvidenceError
 from machinemind.evidence.contracts import EvidenceContractError, SourceIdentity, SourceScope, SourceType, SourceFormat, ScopeLevel
@@ -103,6 +104,7 @@ class OwnedTableFixture:
                 reply = dict(outcome='rewrite', edits=[], citation_ids=['inspection:p1','inspection:p2'],
                     table_contexts=table_contexts(),
                     checks={name:True for name in factual_context_review.CHECKS}, reason='offline independent fixture')
+                reply = encode_context_reply(reply, messages)
             else:
                 reply = dict(outcome='rewrite', answer='[[FACTUAL_INVENTORY]]', reason='offline fixture',
                     citation_ids=['inspection:p1', 'inspection:p2'], covered_facets=['documented obligations'],

@@ -161,6 +161,9 @@ def record_contract_observation(stage: str, contract: dict, *, diagnostics: dict
         "supported_list_inventory_missing",
         "factual_inventory_template_invalid", "source_table_inventory_incomplete",
         "source_table_reference_invalid",
+        "factual_context_review_invalid", "factual_context_review_unavailable",
+        "factual_context_review_rejected", "factual_context_review_incomplete",
+        "factual_context_review_completed",
     }
     outcome = contract.get("outcome")
     if type(outcome) is not str or outcome not in {"pass", "rewrite", "partial", "no_sources", "unavailable"}:
@@ -191,10 +194,17 @@ def record_contract_observation(stage: str, contract: dict, *, diagnostics: dict
                 'inventory_answer_form': {'empty', 'template', 'full', 'invalid'},
                 'inventory_template_gate': {'rejected', 'accepted_or_unused'},
                 'table_coverage_gate': {'rejected', 'accepted_or_unused'},
+                'independent_review_outcome': {'pass', 'rewrite', 'no_sources', 'unavailable', 'invalid'},
+                'independent_review_gate': {'accepted', 'frame_mismatch', 'reply_shape',
+                    'source_frame', 'provider_unavailable', 'model_rejected', 'checks_false',
+                    'citation_alias', 'citation_set', 'table_count', 'table_shape', 'table_target',
+                    'documentary_limits_unchecked', 'quote_shape', 'quote_source', 'quote_not_literal',
+                    'table_owner', 'table_marker', 'pass_changed', 'edit_target', 'template', 'assembled_size'},
             }.items():
                 value = diagnostics.get(key)
                 row[key] = value if type(value) is str and value in values else 'other'
-            for key in ('inventory_wire_count', 'inventory_canonical_count', 'table_expected_count', 'table_wire_count'):
+            for key in ('inventory_wire_count', 'inventory_canonical_count', 'table_expected_count', 'table_wire_count',
+                        'independent_review_edit_count'):
                 value = diagnostics.get(key)
                 if type(value) is int and value >= 0:
                     row[key] = min(value, 100)
