@@ -14,6 +14,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass
+import hashlib
 import math
 import os
 from typing import Any
@@ -118,7 +119,7 @@ def synthesize_observed(callback, review_required):
         return callback()
 
 
-def record_contract_observation(stage: str, contract: dict) -> None:
+def record_contract_observation(stage: str, contract: dict, *, diagnostics: dict | None = None) -> None:
     """Bounded enums/counts survive errors; never retain answer or source text."""
     owner = current()
     if owner is None or not isinstance(contract, dict) or len(owner.contract_checks) >= 8:
@@ -129,6 +130,12 @@ def record_contract_observation(stage: str, contract: dict) -> None:
         "semantic_contract_rejected_grounded_answer", "semantic_contract_incomplete_grounded_answer",
         "missing_supported_list_items", "procedure_review_coverage_not_complete",
         "source_step_note_binding_incomplete",
+        "semantic_answer_changed_after_review", "semantic_contract_incomplete",
+        "semantic_contract_complete", "semantic_contract_partial_explicit",
+        "source_owned_content_missing_or_changed", "reviewed_draft_binding_invalid",
+        "deterministic_response_accepted_with_unresolved_facets",
+        "source_step_structure_unverifiable", "procedure_family_semantic_review_incomplete",
+        "supported_list_inventory_missing",
     }
     outcome = contract.get("outcome")
     if type(outcome) is not str or outcome not in {"pass", "rewrite", "partial", "no_sources", "unavailable"}:
@@ -137,6 +144,28 @@ def record_contract_observation(stage: str, contract: dict) -> None:
     row = {"stage": stage if type(stage) is str and stage in {"semantic_review", "final_contract"} else "other",
            "outcome": outcome, "reason": reason if type(reason) is str and reason in reasons else "other",
            "at_seconds": round(owner.budget.elapsed(), 6)}
+    for key in ("semantic_answer_bound", "complete"):
+        if type(contract.get(key)) is bool:
+            row[key] = contract[key]
+    source_preservation = contract.get("source_preservation")
+    if type(source_preservation) is dict and type(source_preservation.get("all_present")) is bool:
+        row["source_notes_all_present"] = source_preservation["all_present"]
+    if type(diagnostics) is dict:
+        for key in ("admitted_source_count", "final_citation_count", "post_review_removed_claims_count"):
+            value = diagnostics.get(key)
+            if type(value) is int and value >= 0:
+                row[key] = min(value, 100)
+        if type(diagnostics.get("post_review_grounding_applied")) is bool:
+            row["post_review_grounding_applied"] = diagnostics["post_review_grounding_applied"]
+    # Hashes are debug-only and computed/validated here. Never copy arbitrary
+    # provider fields, response/source prose, identifiers or exception messages.
+    if getattr(owner.payload, "debug", False) is True:
+        semantic = contract.get("semantic_verifier")
+        if type(semantic) is dict and type(semantic.get("answer")) is str:
+            row["reviewed_answer_sha256"] = hashlib.sha256(semantic["answer"].strip().encode("utf-8")).hexdigest()
+        digest = contract.get("answer_sha256")
+        if type(digest) is str and len(digest) == 64 and all(c in "0123456789abcdef" for c in digest):
+            row["final_answer_sha256"] = digest
     for key in ("covered_facets", "missing_facets", "missing_answer_facets", "missing_evidence_facets",
                 "covered_answer_types", "missing_answer_types", "semantic_missing_answer_types", "missing_list_items"):
         value = contract.get(key)

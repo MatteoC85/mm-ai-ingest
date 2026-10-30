@@ -609,6 +609,8 @@ def validate_response(
         if manual_note_binding_invalid:
             manual_note_bindings = []
         manual_note_binding_proof = {}
+        post_review_grounding_applied = False
+        post_review_removed_claims_count = 0
         if citations and source_text:
             answer, removed_claims = _assistant_core_filter_unsupported_claim_sentences(answer, source_text)
         answer = _assistant_core_media_metadata_only(answer, citations, request.response_language)
@@ -812,6 +814,8 @@ def validate_response(
                 answer, removed_after_repair = _assistant_core_filter_unsupported_claim_sentences(
                     answer, source_text
                 )
+                post_review_grounding_applied = True
+                post_review_removed_claims_count = len(removed_after_repair)
                 removed_claims.extend(removed_after_repair)
                 answer = _assistant_core_media_metadata_only(
                     answer, citations, request.response_language
@@ -1016,7 +1020,12 @@ def validate_response(
                 answer_contract_result.update(passed=False, complete=False,
                     reason="manual_procedure_semantic_review_incomplete",
                     manual_note_binding_invalid=True)
-            _record_contract_observation("final_contract", answer_contract_result)
+            _record_contract_observation("final_contract", answer_contract_result, diagnostics={
+                "admitted_source_count": len(allowed),
+                "final_citation_count": len(citations),
+                "post_review_grounding_applied": post_review_grounding_applied,
+                "post_review_removed_claims_count": post_review_removed_claims_count,
+            })
             if not bool(answer_contract_result.get("passed")):
                 repair_attempted = bool(out.get("_assistant_core_repair_attempted"))
                 missing_evidence_facets = list(
