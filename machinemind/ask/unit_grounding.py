@@ -16,15 +16,15 @@ from ..ingest.text_pdf import normalize_unicode_advanced as _normalize_unicode_a
 from .validation import AskValidationRuntime
 from . import table_units
 
-_ASSISTANT_CORE_UNIT_TOKEN = r"(?:mm(?:²|2|³|3)?|cm|kg|bar|k\s*pa|m\s*pa|pa|k\s*hz|hz|k\s*w|k\s*n|n\s*(?:[·*x]\s*)?m|nm|rpm|giri\s*/?\s*min(?:uto)?|min\s*(?:-?1|⁻¹)|1\s*/\s*min|ms|°\s*c|°|cst|db\s*\(?a\)?|cycles?|cicli|pieces?|pezzi|occurrences?|occorrenze|%|v|a|w|m|g|s|h)"
+_ASSISTANT_CORE_UNIT_TOKEN = r"(?:mm(?:²|2|³|3)?|cm|kg|bar|k\s*pa|m\s*pa|pa|k\s*hz|hz|k\s*w|k\s*n|n\s*(?:[·*x]\s*)?m|nm|rpm|giri\s*/?\s*min(?:uto)?|min\s*(?:-?1|⁻¹)|1\s*/\s*min|ms|°\s*c|°|cst|db\s*\(?a\)?|cycles?|cicli|pieces?|pezzi|occurrences?|occorrenze|ore|ora|hours?|hrs?|%|v|a|w|m|g|s|h)"
 _ASSISTANT_CORE_TECH_UNIT_AFTER_RE = re.compile(
     # A unit immediately after a value may use matched square brackets, as in
     # technical PDF tables. Preserve the same unit vocabulary and comparisons.
-    rf"^\s*(?:(?:circa|about|approx(?:imately)?|ca\.?|~)\s*)?(?P<bracket>\[\s*)?(?P<unit>{_ASSISTANT_CORE_UNIT_TOKEN})(?(bracket)\s*\])(?=$|[\s,.;:/)\]])",
+    rf"""^\s*(?:(?:circa|about|approx(?:imately)?|ca\.?|~)\s*)?(?P<bracket>\[\s*)?(?P<unit>{_ASSISTANT_CORE_UNIT_TOKEN})(?(bracket)\s*\])(?=$|[\s,.;:/)\]"'’”])""",
     re.IGNORECASE,
 )
 _ASSISTANT_CORE_RANGE_WITH_UNIT_RE = re.compile(
-    rf"^\s*(?:-|–|—|÷|to|a)\s*[-+]?\d+(?:[.,]\d+)?\s*(?P<unit>{_ASSISTANT_CORE_UNIT_TOKEN})(?=$|[\s,.;:/)\]])",
+    rf"""^\s*(?:-|–|—|÷|to|a)\s*[-+]?\d+(?:[.,]\d+)?\s*(?P<unit>{_ASSISTANT_CORE_UNIT_TOKEN})(?=$|[\s,.;:/)\]"'’”])""",
     re.IGNORECASE,
 )
 _ASSISTANT_CORE_TECH_UNIT_BEFORE_RE = re.compile(
@@ -45,7 +45,7 @@ _ASSISTANT_CORE_NUMBER_RE = re.compile(
 _ASSISTANT_CORE_LABELED_VALUE_UNIT_RE = re.compile(
     rf"\b(?:valore|value)\s*:\s*(?P<value>{_ASSISTANT_CORE_NUMBER_ATOM})"
     rf"\s*\|\s*(?:unità|unita|unit)\s*:\s*(?P<unit>{_ASSISTANT_CORE_UNIT_TOKEN})"
-    rf"(?=$|[\s|,.;:/)\]])",
+    rf"""(?=$|[\s|,.;:/)\]"'’”])""",
     re.IGNORECASE,
 )
 _ASSISTANT_CORE_DIMENSION_CHAIN_RE = re.compile(
@@ -88,6 +88,12 @@ def _assistant_core_normalize_unit(value: str) -> str:
         "occorrenze": "occurrence",
         "occurrence": "occurrence",
         "occurrences": "occurrence",
+        "ora": "h",
+        "ore": "h",
+        "hour": "h",
+        "hours": "h",
+        "hr": "h",
+        "hrs": "h",
     }
     return aliases.get(unit, unit)
 
