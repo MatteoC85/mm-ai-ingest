@@ -611,6 +611,7 @@ def validate_response(
         manual_note_binding_proof = {}
         post_review_grounding_applied = False
         post_review_removed_claims_count = 0
+        post_review_removed_claims: list[str] = []
         if citations and source_text:
             answer, removed_claims = _assistant_core_filter_unsupported_claim_sentences(answer, source_text)
         answer = _assistant_core_media_metadata_only(answer, citations, request.response_language)
@@ -816,6 +817,7 @@ def validate_response(
                 )
                 post_review_grounding_applied = True
                 post_review_removed_claims_count = len(removed_after_repair)
+                post_review_removed_claims = removed_after_repair
                 removed_claims.extend(removed_after_repair)
                 answer = _assistant_core_media_metadata_only(
                     answer, citations, request.response_language
@@ -1025,6 +1027,8 @@ def validate_response(
                 "final_citation_count": len(citations),
                 "post_review_grounding_applied": post_review_grounding_applied,
                 "post_review_removed_claims_count": post_review_removed_claims_count,
+                "post_review_removed_claims": post_review_removed_claims,
+                "source_text": source_text,
             })
             if not bool(answer_contract_result.get("passed")):
                 repair_attempted = bool(out.get("_assistant_core_repair_attempted"))

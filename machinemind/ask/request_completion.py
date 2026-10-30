@@ -160,6 +160,22 @@ def record_contract_observation(stage: str, contract: dict, *, diagnostics: dict
     # Hashes are debug-only and computed/validated here. Never copy arbitrary
     # provider fields, response/source prose, identifiers or exception messages.
     if getattr(owner.payload, "debug", False) is True:
+        if stage == "final_contract" and type(diagnostics) is dict:
+            # Only digests survive a later terminal response, which may skip
+            # a fresh authority fence. Never retain raw claims or source text.
+            # Bound both hashing work and the request-local telemetry size.
+            source = diagnostics.get("source_text")
+            if type(source) is str and len(source) <= 262144:
+                row["source_packet_sha256"] = hashlib.sha256(source.encode("utf-8")).hexdigest()
+            removed = diagnostics.get("post_review_removed_claims")
+            if type(removed) in (list, tuple):
+                hashes = []
+                for value in removed[:16]:
+                    if type(value) is str and 0 < len(value) <= 512:
+                        digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+                        if digest not in hashes:
+                            hashes.append(digest)
+                row["removed_claim_sha256"] = hashes
         semantic = contract.get("semantic_verifier")
         if type(semantic) is dict and type(semantic.get("answer")) is str:
             row["reviewed_answer_sha256"] = hashlib.sha256(semantic["answer"].strip().encode("utf-8")).hexdigest()
@@ -404,6 +420,7 @@ class RequestCompletion:
                 phase_trace.deactivate(self._trace_token)
             finally:
                 _ACTIVE.reset(self._owner_token)
+                self.contract_checks.clear()
                 self._terminal = self.payload = self.runtime = None
 
 

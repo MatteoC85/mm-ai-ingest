@@ -64,6 +64,10 @@ class FinalContractDiagnosticsTests(unittest.TestCase):
         self.assertNotIn('QRT-7',json.dumps(observations))
         self.assertNotIn('QTR-7',json.dumps(observations))
         self.assertNotIn('Il documento',json.dumps(observations))
+        self.assertEqual(final.get('removed_claim_sha256'), [hashlib.sha256(b'QRT-7').hexdigest()])
+        expected_source = ('Documento del costruttore: grado QTR-7. '
+            'Frequenza documentata: ogni 600 ore. Non sono elencate alternative equivalenti.')
+        self.assertEqual(final.get('source_packet_sha256'), hashlib.sha256(expected_source.encode()).hexdigest())
 
     def test_supported_rewrite_keeps_pass_and_zero_removal(self):
         text="Il documento indica il grado QTR-7.\nLa frequenza documentata e' di 600 ore."
@@ -85,6 +89,8 @@ class FinalContractDiagnosticsTests(unittest.TestCase):
         self.assertEqual(observations[-1]['reason'],'semantic_answer_changed_after_review')
         self.assertNotIn('answer',finished)
         self.assertNotIn('QRT-7',json.dumps(finished))
+        self.assertEqual(observations[-1].get('removed_claim_sha256'), [hashlib.sha256(b'QRT-7').hexdigest()])
+        self.assertRegex(observations[-1]['source_packet_sha256'], r'^[0-9a-f]{64}$')
 
     def test_nondebug_malformed_and_untrusted_fields_remain_bounded(self):
         owner=self.owner(False)
@@ -94,7 +100,8 @@ class FinalContractDiagnosticsTests(unittest.TestCase):
                 'source_preservation':{'all_present':'PRIVATE_BOOL'}}
             diagnostics={'admitted_source_count':True,'final_citation_count':-1,
                 'post_review_removed_claims_count':10000,'post_review_grounding_applied':'PRIVATE_BOOL',
-                'answer':'PRIVATE_ANSWER','source':'PRIVATE_SOURCE'}
+                'answer':'PRIVATE_ANSWER','source':'PRIVATE_SOURCE',
+                'source_text':'PRIVATE_SOURCE', 'post_review_removed_claims':['PRIVATE_CLAIM']}
             before=deepcopy((contract,diagnostics))
             request_completion.record_contract_observation('final_contract',contract,diagnostics=diagnostics)
             for _ in range(20):
@@ -107,12 +114,67 @@ class FinalContractDiagnosticsTests(unittest.TestCase):
             self.assertEqual(row.get('post_review_removed_claims_count'),100)
             for key in ('admitted_source_count','final_citation_count','post_review_grounding_applied',
                     'semantic_answer_bound','complete','source_notes_all_present',
-                    'reviewed_answer_sha256','final_answer_sha256'):
+                    'reviewed_answer_sha256','final_answer_sha256',
+                    'source_packet_sha256','removed_claim_sha256'):
                 self.assertNotIn(key,row)
             self.assertNotIn('PRIVATE_',json.dumps(rows))
             self.assertEqual((contract,diagnostics),before)
         finally:
             owner.close()
+
+    def test_debug_hashes_are_bounded_typed_and_request_local(self):
+        owner=self.owner(True)
+        source='PRIVATE_SOURCE_' + 'é'
+        claims=['PRIVATE_CLAIM_0', 'PRIVATE_CLAIM_0', None, 17, True, {'claim':'PRIVATE'},
+                'X'*513, '', *[f'PRIVATE_CLAIM_{i}' for i in range(1,30)]]
+        before=deepcopy(claims)
+        try:
+            request_completion.record_contract_observation('final_contract',
+                {'passed':False}, diagnostics={'source_text':source,'post_review_removed_claims':claims})
+            row=owner.contract_checks[-1]
+            expected=list(dict.fromkeys(hashlib.sha256(s.encode()).hexdigest()
+                for s in claims[:16] if type(s) is str and 0<len(s)<=512))
+            self.assertEqual(row.get('removed_claim_sha256'),expected)
+            self.assertEqual(row['source_packet_sha256'],hashlib.sha256(source.encode()).hexdigest())
+            self.assertNotIn('PRIVATE',json.dumps(owner.contract_checks))
+            self.assertEqual(claims,before)
+            request_completion.record_contract_observation('final_contract',{'passed':False},
+                diagnostics={'source_text':'S'*262145,'post_review_removed_claims':'PRIVATE_STRING'})
+            self.assertNotIn('source_packet_sha256',owner.contract_checks[-1])
+            self.assertNotIn('removed_claim_sha256',owner.contract_checks[-1])
+            published=owner.finish({'ok':False,'status':'budget_exceeded','meta':{}})
+        finally:
+            owner.close()
+        self.assertEqual(owner.contract_checks,[])
+        self.assertIsNone(request_completion.current())
+        # Clearing owner RAM does not erase the already returned content-free receipt.
+        self.assertEqual(published['meta']['request_completion']['contract_checks'][0],row)
+        next_owner=self.owner(True)
+        try:
+            self.assertEqual(next_owner.contract_checks,[])
+            request_completion.record_contract_observation('final_contract',{'passed':False},
+                diagnostics={'source_text':'NEXT_SOURCE','post_review_removed_claims':['NEXT_CLAIM']})
+            next_row=next_owner.contract_checks[-1]
+            self.assertNotEqual(next_row['source_packet_sha256'],row['source_packet_sha256'])
+            self.assertEqual(next_row['removed_claim_sha256'],[hashlib.sha256(b'NEXT_CLAIM').hexdigest()])
+        finally:
+            next_owner.close()
+
+    def test_debug_requires_literal_true_and_no_active_request_captures_nothing(self):
+        self.assertIsNone(request_completion.current())
+        request_completion.record_contract_observation('final_contract',{'passed':False},
+            diagnostics={'source_text':'PRIVATE_SOURCE','post_review_removed_claims':['PRIVATE_CLAIM']})
+        for value in (False, None, 1, 'true'):
+            owner=self.owner(value)
+            try:
+                request_completion.record_contract_observation('final_contract',{'passed':False},
+                    diagnostics={'source_text':'PRIVATE_SOURCE','post_review_removed_claims':['PRIVATE_CLAIM']})
+                row=owner.contract_checks[-1]
+                self.assertNotIn('source_packet_sha256',row)
+                self.assertNotIn('removed_claim_sha256',row)
+                self.assertNotIn('PRIVATE',json.dumps(row))
+            finally:
+                owner.close()
 
     def test_known_final_reasons_and_only_valid_debug_hashes_are_preserved(self):
         owner=self.owner(True)
