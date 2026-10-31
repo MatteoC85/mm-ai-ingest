@@ -64,6 +64,14 @@ INSTRUCTIONS = (
     'qualified contexts are additions; all six checks concern that final assembled '
     'answer. Without table targets return table_contexts=[] and preserve the '
     'ordinary pass/rewrite rules. If any context remains unsupported, no_sources.'
+    ' Additional context targets bind distinct source prose around exactly matching '
+    'table cells. Audit each separately: matching cells do not establish assembly '
+    'equivalence or make the surrounding qualifications duplicates. State the '
+    'applicable qualification or its source-scoped limitation, without transferring '
+    'conditions to another assembly. The server places these audits before the '
+    'same unchanged inventory item; it does not repeat the table. Additional '
+    'context targets require an owning-source quotation from its non-table prose; '
+    'a table heading or cell alone cannot support that audit.'
 )
 
 _ATOMIC_INSTRUCTIONS = (INSTRUCTIONS
@@ -127,6 +135,7 @@ class ReviewFrame:
     source_packet_sha256: str
     quote_view: str
     quote_units: tuple[tuple[str, str, tuple[str, ...]], ...]
+    context_owners: tuple[tuple[str, int, str, tuple[str, ...]], ...] = ()
 
 
 def _emitted_source_bodies(sources_block, allowed):
@@ -148,6 +157,59 @@ def _emitted_source_bodies(sources_block, allowed):
                          if not _RECORD_ID.fullmatch(line))
         rows[cid] = body
     return rows
+
+
+def _table_context_signature(body):
+    """Exact cell serialization and its separate prose, never assembly identity."""
+    tables, prose = [], []
+    for line in body.splitlines():
+        match = table_units._LINE.fullmatch(line)
+        if match is None:
+            if 'PDF_TABLE_' in line:
+                return None
+            prose.append(line)
+            continue
+        first, last, columns = int(match[2]), int(match[3] or match[2]), int(match[4])
+        if not 1 <= first <= last <= 100000 or not 1 <= columns <= 256:
+            return None
+        try:
+            cells = table_units._cells(match[5], 0, first, last, columns)
+        except (ValueError, TypeError):
+            return None
+        if not cells:
+            return None
+        tables.append(line)
+    return (tuple(tables), '\n'.join(prose)) if tables else None
+
+
+def _context_bindings(owners, catalog, sources):
+    occurrences = []
+    for entry in catalog.entries:
+        body = sources.get(entry.citation_id)
+        if body is None or _digest(body) != entry.source_sha256:
+            raise ValueError('factual_context_review_invalid')
+        signature = _table_context_signature(body)
+        if signature is not None:
+            occurrences.append((entry.citation_id, signature))
+    result = []
+    for index, owner in owners:
+        primary = _table_context_signature(sources[owner])
+        groups = {}
+        if primary is not None:
+            for cid, (cells, prose) in occurrences:
+                if cells == primary[0]:
+                    groups.setdefault((prose, sources[cid]), []).append(cid)
+        same = tuple(dict.fromkeys(groups.pop((primary[1], sources[owner]), [owner]))) if primary is not None else (owner,)
+        result.append(('item:' + str(index), index, owner, same))
+        distinct = [cids for (prose, _), cids in groups.items() if prose.strip()]
+        for ordinal, cids in enumerate(distinct, 1):
+            ids = tuple(dict.fromkeys(cids))
+            result.append(('item:' + str(index) + ':context:' + str(ordinal), index, ids[0], ids))
+    return tuple(result)
+
+
+def _context_targets(frame):
+    return frame.context_owners or tuple(('item:' + str(i), i, cid, (cid,)) for i, cid in frame.table_owners)
 
 
 def _source_quote_view(sources_block, source_bodies):
@@ -300,10 +362,11 @@ def prepare_review(wire_reply, expanded_reply, *, catalog: TableCatalog,
             raise invalid
         targets = ()
     quote_view, quote_units = _source_quote_view(sources_block, source_bodies) if immutable else (sources_block, ())
+    bindings = _context_bindings(owners, catalog, source_bodies) if immutable else ()
     return ReviewFrame(_json(expanded_reply), answer, template, tuple(items), tuple(immutable),
                        allowed, tuple(dict.fromkeys(citations)), targets,
                        tuple(owners), tuple(source_bodies.items()),
-                       _digest(sources_block) if sources_block else '', quote_view, quote_units)
+                       _digest(sources_block) if sources_block else '', quote_view, quote_units, bindings)
 
 
 def build_messages(frame: ReviewFrame, *, question: str, response_language: str, sources_block: str):
@@ -333,8 +396,9 @@ def build_messages(frame: ReviewFrame, *, question: str, response_language: str,
         + '\n\nSOURCES:\n' + source_view + '\n\nCOMPLETE_CANDIDATE:\n' + _json(view)
         + ('\n\nCITATION_ALIASES:\n' + _json(aliases) if atomic is None else '')
         + '\n\nTABLE_CONTEXT_TARGETS:\n' + json.dumps([
-            {'target': 'item:' + str(index), 'citation_id': reverse[cid]}
-            for index, cid in frame.table_owners], ensure_ascii=False, separators=(',', ':'))
+            {'target': target, 'inventory_item': index, 'citation_id': reverse[cid],
+             'same_context_sources': [reverse[source] for source in same]}
+            for target, index, cid, same in _context_targets(frame)], ensure_ascii=False, separators=(',', ':'))
         + '\n\nCURRENT_CITATION_IDS:\n' + _json([reverse[cid] for cid in frame.current_citation_ids]))
     representation = (
         '\nCOMPLETE_CANDIDATE is lossless: replace the template\'s single full-line '
@@ -363,7 +427,7 @@ def _atomic_references(frame):
     selected subset of sources, units, or semantic obligations.
     """
     count = sum(len(owners) for _, _, owners in frame.quote_units)
-    other_enums = 3 + len(frame.editable_targets) + len(frame.table_owners) + len(frame.admitted_citation_ids)
+    other_enums = 3 + len(frame.editable_targets) + len(_context_targets(frame)) + len(frame.admitted_citation_ids)
     if not frame.table_owners or not count or count + other_enums > 1000:
         return None
     reverse = {cid: alias[1:] for alias, cid in _citation_aliases(frame).items()}
@@ -461,7 +525,7 @@ def _wire_schema(frame: ReviewFrame, refs=None):
         target['enum'] = list(frame.editable_targets)
     context_target = {'type': 'string'}
     if frame.table_owners:
-        context_target['enum'] = ['item:' + str(index) for index, _ in frame.table_owners]
+        context_target['enum'] = [target for target, _, _, _ in _context_targets(frame)]
     result = {'name': 'factual_context_review', 'strict': True, 'schema': {
         'type': 'object', 'additionalProperties': False,
         'properties': {
@@ -472,7 +536,7 @@ def _wire_schema(frame: ReviewFrame, refs=None):
                 'required': ['target', 'text']}},
             'citation_ids': {'type': 'array', 'maxItems': len(frame.admitted_citation_ids),
                              'items': {'type': 'string', 'enum': list(_citation_aliases(frame))}},
-            'table_contexts': {'type': 'array', 'maxItems': len(frame.table_owners), 'items': {
+            'table_contexts': {'type': 'array', 'maxItems': len(_context_targets(frame)), 'items': {
                     'type': 'object', 'additionalProperties': False,
                     'properties': {'target': context_target,
                         'context': {'type': 'string', 'minLength': 1, 'maxLength': 480},
@@ -503,7 +567,8 @@ def schema(frame: ReviewFrame):
 
 
 def _checked_table_contexts(value, frame, citations):
-    owners = {'item:' + str(index): cid for index, cid in frame.table_owners}
+    bindings = {target: (index, cid) for target, index, cid, _ in _context_targets(frame)}
+    owners = {target: cid for target, (_, cid) in bindings.items()}
     if type(value) is not list or len(value) != len(owners):
         raise ValueError('table_count')
     sources, result = dict(frame.source_bodies), {}
@@ -518,7 +583,7 @@ def _checked_table_contexts(value, frame, citations):
             raise ValueError('table_target')
         if audit.get('documentary_limits_checked') is not True:
             raise ValueError('documentary_limits_unchecked')
-        context, quoted_ids, literal = audit['context'], set(), []
+        context, quoted_ids, literal, prose_ids = audit['context'], set(), [], set()
         for quote in audit['source_quotes']:
             if (type(quote) is not dict or set(quote) != {'citation_id', 'quote'}
                     or type(quote.get('citation_id')) is not str or type(quote.get('quote')) is not str
@@ -529,14 +594,23 @@ def _checked_table_contexts(value, frame, citations):
             if quote['quote'] not in sources[quote['citation_id']]:
                 raise ValueError('quote_not_literal')
             quoted_ids.add(quote['citation_id'])
+            signature = _table_context_signature(sources[quote['citation_id']])
+            if signature is not None and quote['quote'] in signature[1]:
+                prose_ids.add(quote['citation_id'])
             literal.append('\n'.join('> ' + _escape(line) for line in quote['quote'].splitlines()))
         if owners[audit['target']] not in quoted_ids:
+            raise ValueError('table_owner')
+        if ':context:' in audit['target'] and owners[audit['target']] not in prose_ids:
             raise ValueError('table_owner')
         if any(marker in text for marker in (PREFIX, enumeration_review.INVENTORY_PREFIX,
                 '[TABLE_RECORD ', '[PDF_TABLE_') for text in [context] + [q['quote'] for q in audit['source_quotes']]):
             raise ValueError('table_marker')
         result[audit['target']] = context + '\n' + '\n'.join(literal) + '\n'
-    return result
+    assembled = {}
+    for target, (index, _) in bindings.items():
+        item = 'item:' + str(index)
+        assembled[item] = assembled.get(item, '') + result[target]
+    return assembled
 
 
 def _rejected(first_reply, *, reason='factual_context_review_invalid', outcome='invalid', gate='reply_shape'):
