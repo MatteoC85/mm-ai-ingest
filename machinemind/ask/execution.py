@@ -719,7 +719,7 @@ def verify_or_repair_answer(
         if inventory_template_allowed:
             system_msg += _enumeration_review.ANSWER_INSTRUCTIONS
         if table_record_ids:
-            system_msg += (_source_table_review.RECORD_INSTRUCTIONS if source_table_catalog.entries
+            system_msg += (_source_table_review.record_instructions(derive_duplicate_records=independent_context_review) if source_table_catalog.entries
                            else _enumeration_review.RECORD_INSTRUCTIONS)
         if source_table_catalog.entries:
             system_msg += _source_table_review.INSTRUCTIONS
@@ -769,7 +769,8 @@ def verify_or_repair_answer(
     verifier_schema = _assistant_core_contract_verifier_schema()
     if factual_list_review:
         verifier_schema = _enumeration_review.source_first_schema(verifier_schema, record_ids=table_record_ids)
-        verifier_schema = _source_table_review.reference_schema(verifier_schema, source_table_catalog)
+        verifier_schema = _source_table_review.reference_schema(verifier_schema, source_table_catalog,
+            derive_duplicate_records=independent_context_review)
     if compact_review:
         verifier_schema = _procedure_review.review_schema(verifier_schema, layout, review_facets, requirements,
             operation_boundary=operation_boundary, source_ordered=source_ordered_review,
@@ -862,7 +863,8 @@ def verify_or_repair_answer(
         # expansion, semantic observation and the final answer hash are bound.
         table_diagnostics = {}
         out = _source_table_review.resolve_reply(out, source_table_catalog,
-            admitted_citation_ids=valid_ids, diagnostics=table_diagnostics)
+            admitted_citation_ids=valid_ids, diagnostics=table_diagnostics,
+            derive_duplicate_records=independent_context_review)
         inventory_diagnostics.update(table_diagnostics)
         out = _enumeration_review.resolve_inventory_answer(out,
             canonical_inventory=_dedup_text_values(out.get("expected_list_items") or [], limit=40),

@@ -57,7 +57,19 @@ RECORD_INSTRUCTIONS = (
 )
 
 
-def reference_schema(schema: dict, catalog: 'TableCatalog') -> dict:
+def record_instructions(*, derive_duplicate_records: bool = False) -> str:
+    if derive_duplicate_records is not True:
+        return RECORD_INSTRUCTIONS
+    return RECORD_INSTRUCTIONS.replace(
+        'Only records bound by a selected whole SOURCE_TABLE token may be omitted.',
+        'Records bound by selected whole SOURCE_TABLE tokens, and complete byte-identical '
+        'table occurrences, may be omitted. The server accounts for missing duplicate '
+        'records; every distinct owner context still requires independent review. '
+        'Identical cells never establish assembly equivalence. Explicit classifications '
+        'are never replaced; different or partial tables must still be classified.')
+
+
+def reference_schema(schema: dict, catalog: 'TableCatalog', *, derive_duplicate_records: bool = False) -> dict:
     """Only an emitted catalog permits omission of mechanically bound records."""
     if not catalog.entries:
         return schema
@@ -68,6 +80,11 @@ def reference_schema(schema: dict, catalog: 'TableCatalog') -> dict:
         'Classify every unselected TABLE_RECORD once using T1=0,2 or T2!outside-request reason. '
         'Records in selected whole SOURCE_TABLE tokens may be omitted; their owner and exact '
         'inventory index are server-bound. Explicit conflicting mappings/exclusions are invalid.')
+    if derive_duplicate_records is True:
+        coverage['description'] += (
+            ' Missing records in complete byte-identical occurrences of selected tables '
+            'are also server-accounted as duplicates, with every distinct source context '
+            'independently reviewed. No partial-table or assembly equivalence is inferred.')
     return out
 
 
@@ -78,6 +95,7 @@ class TableEntry:
     citation_id: str
     record_ids: tuple[str, ...]
     source_sha256: str
+    table_lines: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -149,7 +167,7 @@ def compile_catalog(sources_block: str, source_views: dict, response_language: s
         if (len(expected) > MAX_TEXT or PREFIX in expected or '[TABLE_RECORD ' in expected
                 or deannotated != expected):
             return empty
-        records, record_ids, pending = [], [], None
+        records, record_ids, table_lines, pending = [], [], [], None
         for line in lines:
             identity = _RECORD_ID.fullmatch(line)
             if identity:
@@ -172,6 +190,7 @@ def compile_catalog(sources_block: str, source_views: dict, response_language: s
                 return empty
             if not cells or any('\n' in c['value'] or '\r' in c['value'] or '\n' in (c['label'] or '') or '\r' in (c['label'] or '') for c in cells):
                 return empty
+            table_lines.append(line)
             if role == 'HEADER':
                 if pending is not None:
                     return empty
@@ -190,7 +209,7 @@ def compile_catalog(sources_block: str, source_views: dict, response_language: s
         if record_ids:
             token = '[[SOURCE_TABLE:G' + str(len(entries) + 1) + ']]'
             text = _render(records, view.get('page_from'), view.get('page_to'), response_language)
-            entries.append(TableEntry(token, text, cid, tuple(record_ids), hashlib.sha256(expected.encode()).hexdigest()))
+            entries.append(TableEntry(token, text, cid, tuple(record_ids), hashlib.sha256(expected.encode()).hexdigest(), tuple(table_lines)))
     if sum(len(e.text) for e in entries) > MAX_TEXT:
         return empty
     preview = '\n\n'.join(e.token + ' owner=' + e.citation_id + '\n' + e.text for e in entries)
@@ -225,7 +244,7 @@ def _control_strings(result):
 
 
 def resolve_reply(result: dict, catalog: TableCatalog, *, admitted_citation_ids=None,
-                  diagnostics: dict | None = None) -> dict:
+                  diagnostics: dict | None = None, derive_duplicate_records: bool = False) -> dict:
     """Expand a whole inventory item without changing its ordered index.
 
     A reference binds to the owning citation and every record in that occurrence.
@@ -305,6 +324,21 @@ def resolve_reply(result: dict, catalog: TableCatalog, *, admitted_citation_ids=
             bound_citations.append(entry.citation_id)
         selected.add(item)
         expanded.append(entry.text)
+    if derive_duplicate_records is True:
+        # Only the request-owned source-first path enables this, after arranging
+        # mandatory independent review of every exact-table owner context.
+        # No model field can enable it. Explicit classifications stay untouched.
+        if admitted_citation_ids is None:
+            return reject('source_scope_invalid')
+        signatures = {entries[token].table_lines for token in selected if entries[token].table_lines}
+        for entry in catalog.entries:
+            if entry.token in selected or not entry.table_lines or entry.table_lines not in signatures:
+                continue
+            if entry.citation_id not in admitted_citation_ids:
+                return reject('source_scope_invalid')
+            for rid in entry.record_ids:
+                if rid not in parsed_coverage:
+                    bound_coverage.append(rid + '!Duplicate literal table occurrence; its source context requires independent review.')
     if not required.issubset(selected):
         return reject('required_reference_missing')
     if sum(map(len, expanded)) > MAX_TEXT:
