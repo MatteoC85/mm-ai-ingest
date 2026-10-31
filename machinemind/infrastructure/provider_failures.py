@@ -13,17 +13,21 @@ FAILURE_CODES = frozenset({
 
 class ProviderResponseError(RuntimeError):
     """A local classification from an observed provider field, never raw text."""
-    def __init__(self, code: str):
+    def __init__(self, code: str, *, http_status=None):
         self.failure_code = code if type(code) is str and code in FAILURE_CODES else "unclassified"
-        super().__init__("OpenAI provider failure: " + self.failure_code)
+        self.http_status = (http_status if self.failure_code in {"http_4xx", "http_5xx", "http_other"}
+                            and type(http_status) is int and 100 <= http_status <= 599 else None)
+        # Keep the existing safe integer-only diagnostic consumed by Smart.
+        super().__init__("OpenAI provider returned HTTP " + str(self.http_status)
+                         if self.http_status is not None else "OpenAI provider failure: " + self.failure_code)
 
 
 def http_failure(status) -> ProviderResponseError:
     if type(status) is int and 400 <= status < 500:
-        return ProviderResponseError("http_4xx")
+        return ProviderResponseError("http_4xx", http_status=status)
     if type(status) is int and 500 <= status < 600:
-        return ProviderResponseError("http_5xx")
-    return ProviderResponseError("http_other")
+        return ProviderResponseError("http_5xx", http_status=status)
+    return ProviderResponseError("http_other", http_status=status)
 
 
 def response_status_failure(data: dict) -> ProviderResponseError:

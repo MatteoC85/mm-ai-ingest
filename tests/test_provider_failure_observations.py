@@ -180,6 +180,28 @@ class ProviderFailureObservationsTests(unittest.TestCase):
         self.assertEqual(transport._chat_content({"choices": [{"finish_reason": "stop",
                          "message": {"content": "valid"}}]}), "valid")
 
+    def test_existing_smart_http_diagnostic_and_root_error_type_are_preserved(self):
+        from machinemind.retrieval import smart_review
+        error, row = self.assert_failure(Response({"error": "raw-private-provider-text"}, 429),
+                                        "http_4xx", "uncertain")
+        self.assertEqual(row['error'], 'RuntimeError')
+        self.assertEqual(error.http_status, 429)
+        # json_models wraps the safe error message on an exhausted fallback list.
+        wrapped = RuntimeError('All V13 model calls failed: ' + str(error))
+        detail = smart_review.failure_diagnostic(wrapped, call_rows=[{
+            **row, 'purpose': 'smart_diagnostic_independent_review'}], elapsed_seconds=1.25)
+        self.assertEqual(detail, {'category': 'provider_http', 'error_class': 'RuntimeError',
+            'http_status': 429, 'elapsed_seconds': 1.25, 'accounting_state': 'uncertain'})
+        self.assertNotIn('raw-private-provider-text', str(error))
+
+    def test_http_status_diagnostic_rejects_noninteger_or_out_of_range_values(self):
+        for value in (True, '429 raw-private-provider-text', 0, 600, None):
+            with self.subTest(value=value):
+                error = failures.http_failure(value)
+                self.assertIsNone(error.http_status)
+                self.assertEqual(error.failure_code, 'http_other')
+                self.assertNotIn('raw-private-provider-text', str(error))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -18,7 +18,7 @@ from collections.abc import Mapping
 from typing import Any, Optional
 
 from machinemind.config import assistant_runtime as _assistant_defaults
-from .provider_failures import failure_code as _provider_failure_code
+from .provider_failures import ProviderResponseError, failure_code as _provider_failure_code
 
 BUDGET_POLICY_VERSION = _assistant_defaults.V13_BUDGET_POLICY_VERSION
 _RUNTIME_GLOBALS: Mapping[str, Any] = {}
@@ -261,7 +261,10 @@ class _V13RequestBudget:
     def mark_call_failed(self, call_index: int, error: Any, *, embedding: bool = False) -> None:
         with self._lock:
             row = self._row(call_index, embedding=embedding)
-            row.update(failed=True, error=type(error).__name__, completed_at_elapsed_seconds=round(self.elapsed(), 3))
+            # Preserve the established Root/Smart diagnostic class; the bounded
+            # new code carries extra detail without changing those contracts.
+            row.update(failed=True, error="RuntimeError" if isinstance(error, ProviderResponseError) else type(error).__name__,
+                       completed_at_elapsed_seconds=round(self.elapsed(), 3))
             row["provider_failure_code"] = _provider_failure_code(error)
             if row["accounting_state"] == "pending":
                 row["accounting_state"] = "uncertain" if row["dispatched"] else "not_sent"
