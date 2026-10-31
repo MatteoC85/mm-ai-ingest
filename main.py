@@ -21007,7 +21007,11 @@ def _sd_normalize_step(
         "recommended_checks": [],
     }
 
-    if hyps and not valid_hypothesis_ids:
+    excluded_terminal = _smart_review.is_excluded_terminal({
+        "status": "completed" if final_ready and status != "no_sources" else status,
+        "final_ready": final_ready, "hypotheses": hyps,
+    })
+    if hyps and not valid_hypothesis_ids and not excluded_terminal:
         status = "no_sources"
         final_ready = False
 
@@ -22532,6 +22536,28 @@ def _sd_canonicalize_final_result(final_raw: dict, hypotheses: list[dict], langu
         and str(h.get("status") or "").strip().lower() != "excluded"
     ]
     if not grounded:
+        if _smart_review.is_excluded_terminal({
+                "status": "completed", "final_ready": True, "hypotheses": hypotheses}):
+            # Only the reviewed hypotheses supply machine claims/checks. Never
+            # publish the generator's unreviewed final summary or pick an
+            # excluded cause merely to fill the legacy most-likely fields.
+            is_en = str(language or "").lower().startswith("en")
+            heading = (
+                "None of the documented hypotheses evaluated remains supported by the reported observations. "
+                "The diagnosis is inconclusive: the cause has not been identified."
+                if is_en else
+                "Nessuna delle ipotesi documentate valutate resta supportata dai riscontri riportati. "
+                "La diagnosi è inconclusiva: la causa non è stata identificata."
+            )
+            reasons = [str(h.get("why") or h.get("description") or "").strip() for h in hypotheses]
+            return {
+                "summary": "\n\n".join([heading] + [reason for reason in reasons if reason]),
+                "most_likely_hypothesis_id": "",
+                "most_likely_label": "No cause identified" if is_en else "Nessuna causa identificata",
+                "probability_pct": 0.0, "probability_band": "unknown",
+                "recommended_checks": _unique_non_empty_strings(
+                    [str(check).strip() for h in hypotheses for check in h.get("checks") or []], limit=8),
+            }
         return {}
     by_id = {str(h.get("id") or "").strip(): h for h in grounded}
     requested_id = str((final_raw or {}).get("most_likely_hypothesis_id") or "").strip()
@@ -22638,7 +22664,10 @@ def smart_diagnostic_finalize_v1(
     language = _sd_language(payload.language or state.get("language"), symptom_text)
     if not _sd_state_has_admitted_evidence(state):
         return _sd_no_sources_response(language, session_id, symptom_text, debug=bool(payload.debug), gate_result=dict(state.get("evidence_gate") or {}))
-    if not any(h.get("status") != "excluded" for h in state.get("hypotheses") or []):
+    if (not any(h.get("status") != "excluded" for h in state.get("hypotheses") or [])
+            and not _smart_review.is_excluded_terminal({
+                "status": state.get("status"), "final_ready": state.get("status") == "completed",
+                "hypotheses": state.get("hypotheses") or []})):
         return _sd_no_sources_response(language, session_id, symptom_text, debug=bool(payload.debug),
                                        gate_result=dict(state.get("evidence_gate") or {}))
     packet = _smart_evidence.review_packet(_sd_require_grounding_packet(state))

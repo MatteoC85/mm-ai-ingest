@@ -87,6 +87,11 @@ been reported or because its documented mechanism comes from a historical case.
 An Unknown answer neither confirms nor excludes that condition or strengthens
 the hypothesis. Reassess the entire immutable proposal and every check anyway;
 an earlier accepted ID or verdict is never authority to accept the new turn.
+For a proposal explicitly marked excluded, assess the documented mechanism and
+whether the reported observations justify its exclusion, not whether that
+mechanism occurred. Accept the exclusion only when its complete explanation and
+every retained check are supported. Unknown alone never justifies exclusion.
+Accepting an excluded proposal does not restore it as a possible current cause.
 Read the label, description and why together: a short nominal hypothesis label
 does not by itself assert occurrence when its description and explanation are
 explicitly conditional. Reject an explicit claim of current/observed/confirmed
@@ -200,6 +205,16 @@ def validate_raw_step(parsed):
         require(isinstance(checks, list) and len(checks) <= 5, 'invalid_check_count')
         require(all(isinstance(s, str) and s.strip() and len(s) <= MAX_CHECK_CHARS for s in checks),
                 'invalid_check_text')
+
+
+def is_excluded_terminal(step):
+    """Structural shape only; every exclusion still needs current source review."""
+    hypotheses = step.get('hypotheses') or []
+    return (step.get('status') == 'completed' and step.get('final_ready') is True
+            and bool(hypotheses) and all(
+                h.get('status') == 'excluded' and h.get('probability_pct') == 0
+                and isinstance(h.get('id'), str) and bool(h['id'].strip())
+                for h in hypotheses))
 
 
 def observation_text(symptom_text, history):
@@ -556,9 +571,15 @@ def resolve(*, prepared, parsed, probability_band, continuity_policy=None):
                    citations_json=json.dumps(ids, ensure_ascii=False))
         accepted.append(row)
     active = [h for h in accepted if h.get('status') != 'excluded']
-    usable(bool(active), 'no_supported_hypotheses')
+    # A fully reviewed negative conclusion is useful even when no cause remains.
+    # Partial rejection must not become an assertion that all candidates were
+    # excluded: every proposed exclusion must pass this turn's unchanged proofs.
+    excluded_terminal = (continuity_policy == continuity.POLICY_VERSION
+                         and is_excluded_terminal(original)
+                         and len(accepted) == len(original['hypotheses']))
+    usable(bool(active) or excluded_terminal, 'no_supported_hypotheses')
     total = sum(float(h.get('probability_pct') or 0) for h in active)
-    usable(total > 0, 'no_positive_supported_hypothesis')
+    usable(total > 0 or excluded_terminal, 'no_positive_supported_hypothesis')
     accumulated = 0.0
     for index, h in enumerate(active):
         if continuity_policy is None:
