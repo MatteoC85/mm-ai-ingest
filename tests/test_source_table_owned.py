@@ -45,11 +45,12 @@ def table_contexts():
 
 
 class OwnedTableFixture:
-    def __init__(self, test, *, change=None, revoke=False, mutate=False, narrow=False):
+    def __init__(self, test, *, change=None, revoke=False, mutate=False, narrow=False, query=None):
         self.test, self.m = test, test.m
         m = self.m
-        query = ('Which slide inspections are documented?' if narrow else
-                 'Which inspections and maintenance intervals are documented?')
+        if query is None:
+            query = ('Which slide inspections are documented?' if narrow else
+                     'Which inspections and maintenance intervals are documented?')
         self.request = request = m.AssistantCoreRequest(query=query, requested_mode='ask',
             response_language='en', company_id='offline-company', machine_id='offline-machine',
             ai_scope='machine_all', top_k=6, allowed_effective_modes=('ask',))

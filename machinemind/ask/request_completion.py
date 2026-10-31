@@ -15,6 +15,7 @@ from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass
 import hashlib
+import json
 import math
 import os
 from typing import Any
@@ -248,6 +249,22 @@ def record_contract_observation(stage: str, contract: dict, *, diagnostics: dict
         mode = review.get("reply_mode")
         row["review_reply_mode"] = mode if type(mode) is str and mode in {"retain", "edit", "replace", "reject"} else "other"
     owner.contract_checks.append(row)
+    if (getattr(owner.payload, "debug", False) is True and row["stage"] == "semantic_review"
+            and type(diagnostics) is dict and "independent_review_gate" in diagnostics):
+        # Log only the already sanitized, content-free terminal observation.
+        # This remains recoverable if the response transport loses its body.
+        event = {"event": "independent_review", "outcome": row["independent_review_outcome"],
+                 "gate": row["independent_review_gate"], "reason": row["reason"]}
+        request_id = getattr(owner.budget, "request_id", None)
+        if (type(request_id) is str and len(request_id) == 32
+                and all(char in "0123456789abcdef" for char in request_id)):
+            event["request_id"] = request_id
+        if "independent_review_edit_count" in row:
+            event["edit_count"] = row["independent_review_edit_count"]
+        try:
+            print("ASK_INDEPENDENT_REVIEW", json.dumps(event, separators=(",", ":")), flush=True)
+        except Exception:
+            pass  # Observability failure never changes the answer or its gates.
 
 
 def provider_timeout(purpose: str, configured: int) -> int:

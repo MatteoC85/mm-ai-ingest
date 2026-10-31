@@ -32,11 +32,11 @@ def source_packet(message, end):
 
 
 class ContextFixture(table_fixture.OwnedTableFixture):
-    def __init__(self, test, *, second=None, first_change=None, fault=None):
+    def __init__(self, test, *, second=None, first_change=None, fault=None, query=None):
         # The conditions are source evidence before registration, never inserted
         # into a mutable admitted row after its owner/session boundary.
         with patch.object(table_fixture, 'CONDITION', SAFE_ITEM):
-            super().__init__(test)
+            super().__init__(test, query=query)
         self.calls, self.rendered, self.post_calls = [], [], []
         self.initial_reads = self.session.summary()['registered_reads']
         renderer = self.owner._response_flow.execution._v13_sources_block
