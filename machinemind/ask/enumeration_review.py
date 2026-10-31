@@ -58,6 +58,35 @@ INSTRUCTIONS = (
     "from expected_list_items and the final answer; do not repeat the inventory there."
 )
 
+SOURCE_FIRST_INSTRUCTIONS = INSTRUCTIONS.replace(
+    'Inspect every relevant table row and continuation section for each independently requested category.',
+    'Inspect source rows and continuations for every requested category; select sufficient reliable '
+    'detail for a useful answer, not every available manual fact. State material limits; never '
+    'present an incomplete list as exhaustive.') + (
+    ' Explicitly requested exhaustiveness remains a requirement or a clearly stated limitation. '
+    'Every published fact or action must retain all qualifications and prerequisites affecting '
+    'its meaning or safety. A coverage reason may truthfully identify a relevant record not included '
+    'in the explicitly limited answer; do not falsely label it unrelated.')
+
+
+def useful_verifier_instructions(text: str) -> str:
+    """Scope useful, explicitly limited inventories without conflicting completeness rules."""
+    replacements = (
+        ("Verify coverage of every independently requested category and its relevant source rows, including continuation sections and items absent from the facet plan.",
+         "Verify useful coverage of every independently requested category, considering its source rows, continuation sections and items absent from the facet plan."),
+        ("If the answer omits a requested category or supported relevant rows, rewrite it to include them; never approve it solely because every planned facet is covered.",
+         "If the answer omits a requested category or a material qualification of a published fact or action, rewrite it; never approve it solely because every planned facet is covered. A useful inventory may be explicitly limited without repeating every available row."),
+        ("If ENUMERATION_REQUESTED=true, identify the complete set of directly supported labels, types, modes, options, actions or settings that answer the requested category.",
+         "If ENUMERATION_REQUESTED=true, identify sufficient directly supported labels, types, modes, options, actions or settings to answer every requested category usefully. State any material limits; explicitly requested exhaustiveness remains required or must be clearly qualified as unavailable."),
+        ("Preserve all supported values, units, labels, modes, control types and list items.",
+         "Preserve the exact values, units, labels, modes, control types and material qualifications of every retained fact or action."),
+        ("When MACHINE_CATALOG is present, inspect every catalog row before deriving expected_list_items; low ranking or different wording is not permission to omit an explicitly documented machine assembly or auxiliary system.",
+         "When MACHINE_CATALOG is present, inspect it for requested categories and relevant applicability conditions. Low ranking or different wording does not make a source irrelevant; an explicitly limited useful answer need not quote every assembly or auxiliary system."),
+    )
+    for before, after in replacements:
+        text = text.replace(before, after)
+    return text
+
 
 RECORD_INSTRUCTIONS = (
     " TABLE_RECORD markers identify unchanged literal PDF record occurrences within "
@@ -102,7 +131,7 @@ def annotate_table_records(sources: str) -> tuple[str, tuple[str, ...]]:
     return ''.join(rows), tuple(identities)
 
 
-def source_first_schema(schema: dict, *, record_ids: tuple[str, ...] = ()) -> dict:
+def source_first_schema(schema: dict, *, record_ids: tuple[str, ...] = (), useful_response: bool = False) -> dict:
     out = deepcopy(schema)
     properties = out["schema"]["properties"]
     inventory = properties["expected_list_items"]
@@ -111,6 +140,12 @@ def source_first_schema(schema: dict, *, record_ids: tuple[str, ...] = ()) -> di
         "CURRENT_ANSWER, in RESPONSE_LANGUAGE. Each item preserves the requested relationship "
         "between component, action, interval/value and condition. Include all relevant rows "
         "and continuation sections; do not use broad category names as concrete items.")
+    if useful_response is True:
+        inventory['description'] = (
+            'Useful supported inventory addressing every requested category in RESPONSE_LANGUAGE, '
+            'with truthful limits and no unsupported claim of exhaustiveness. Preserve every '
+            'published component/action/value relationship and its applicable qualifications and '
+            'prerequisites; broad category names alone are not concrete facts.')
     out["schema"]["properties"] = {
         "expected_list_items": inventory,
         **{key: value for key, value in properties.items() if key != "expected_list_items"},

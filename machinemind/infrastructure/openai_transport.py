@@ -63,6 +63,30 @@ def response_text(data: dict) -> str:
     raise RuntimeError("OpenAI Responses API returned no output_text")
 
 
+def parse_model_json(text: str, json_schema: Optional[dict]) -> Any:
+    """Coalesce exact redundancy; reject conflicts only on the owned keyed wire."""
+    if not json_schema or json_schema.get("reject_duplicate_keys") is not True:
+        return json.loads(text)
+    def identical(left, right):
+        if type(left) is not type(right):
+            return False
+        if type(left) is dict:
+            return left.keys() == right.keys() and all(identical(left[key], right[key]) for key in left)
+        if type(left) is list:
+            return len(left) == len(right) and all(identical(a, b) for a, b in zip(left, right))
+        return left == right
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                if not identical(result[key], value):
+                    raise ValueError("structured_output_duplicate_key")
+                continue
+            result[key] = value
+        return result
+    return json.loads(text, object_pairs_hook=unique_object)
+
+
 def _send_json(*, url: str, headers: dict, payload: dict, timeout: int,
                post_fn: PostFn, budget=None, call_index: Optional[int] = None,
                embedding: bool = False, cache_hits: int = 0, purpose: str = "") -> dict:
@@ -183,7 +207,9 @@ def _chat_response(messages: list[dict], *, model: str, json_schema: Optional[di
     budget = current_budget_fn() if callable(current_budget_fn) else None
     payload = {"model": model, "messages": messages, "temperature": temperature}
     if json_schema:
-        payload["response_format"] = {"type": "json_schema", "json_schema": json_schema}
+        wire_schema = ({key: value for key, value in json_schema.items() if key != "reject_duplicate_keys"}
+                       if "reject_duplicate_keys" in json_schema else json_schema)
+        payload["response_format"] = {"type": "json_schema", "json_schema": wire_schema}
     call_index = None
     if budget is not None:
         timeout = _provider_timeout(purpose, timeout)
@@ -245,7 +271,7 @@ def chat_json(messages: list[dict], *, model: Optional[str] = None, json_schema:
         text = _chat_content(data)
         if not text:
             raise RuntimeError("OpenAI chat JSON empty response")
-        parsed = json.loads(text)
+        parsed = parse_model_json(text, json_schema)
         if not isinstance(parsed, dict):
             raise RuntimeError("OpenAI chat structured output is not an object")
         return parsed
@@ -302,7 +328,7 @@ def responses_json(messages: list[dict], *, model: str, json_schema: dict, effor
         status = str(data.get("status") or "completed").lower()
         if status != "completed":
             raise RuntimeError(f"OpenAI Responses status={status}")
-        parsed = json.loads(response_text_fn(data))
+        parsed = parse_model_json(response_text_fn(data), json_schema)
         if not isinstance(parsed, dict):
             raise RuntimeError("OpenAI Responses structured output is not an object")
         return parsed

@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 sys.path[:0] = [str(Path(__file__).resolve().parents[1]), str(Path(__file__).resolve().parent)]
 import test_factual_list_review as shared
-from context_review_wire_fixture import encode_context_reply, original_context_sources
+from context_review_wire_fixture import encode_context_reply, original_context_sources, encode_table_coverage_reply
 from machinemind.ask import execution, enumeration_review, final_contract, review_source_wire, factual_context_review
 
 
@@ -79,7 +79,7 @@ class FactualTableInventoryTests(unittest.TestCase):
                 'missing_list_items':[],'reason':'offline fixture'}
             if coverage is not None:
                 result['table_record_coverage']=deepcopy(coverage)
-            return result,'offline-model'
+            return encode_table_coverage_reply(result,kwargs['json_schema']),'offline-model'
         runtime=replace(m._assistant_core_ask_execution_runtime(),
             evidence_admission=(lambda *a,**kw:None) if protected else None,
             _assistant_core_enumeration_requested=lambda *a:True,

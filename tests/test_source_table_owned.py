@@ -16,7 +16,7 @@ import unittest
 
 sys.path[:0] = [str(Path(__file__).resolve().parents[1]), str(Path(__file__).resolve().parent)]
 import test_ask_source_first_inventory as shared
-from context_review_wire_fixture import encode_context_reply, original_context_sources
+from context_review_wire_fixture import encode_context_reply, original_context_sources, encode_table_coverage_reply
 from machinemind.ask import execution, validation, request_completion, factual_context_review
 from machinemind.ask.response_evidence import ResponseEvidenceError
 from machinemind.evidence.contracts import EvidenceContractError, SourceIdentity, SourceScope, SourceType, SourceFormat, ScopeLevel
@@ -115,7 +115,11 @@ class OwnedTableFixture:
                     table_record_coverage=['T1=0', 'T2=0'])
                 if change is not None:
                     change(reply)
+                # Keep the canonical fixture input separately from the exact
+                # schema-guided object returned through the real transport.
                 self.wire_reply = deepcopy(reply)
+                reply = encode_table_coverage_reply(reply, kwargs['json_schema'])
+                self.provider_wire_reply = deepcopy(reply)
             class Response:
                 status_code = 200
                 def json(self):

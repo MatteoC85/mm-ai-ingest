@@ -47,7 +47,12 @@ class SourceTableBindingTests(unittest.TestCase):
                     self.assertIn(literal,result['answer'])
                     self.assertIn(literal,self.m._assistant_ui_visible_text_from_html(result['answer_html']))
                 schema=f.reviewer_calls[0][1]['json_schema']['schema']['properties']['table_record_coverage']
-                self.assertEqual((schema['minItems'],schema['maxItems']),(0,2))
+                self.assertEqual(schema['type'],'object')
+                self.assertFalse(schema['additionalProperties'])
+                self.assertEqual(set(schema['properties']),{'T1','T2'})
+                self.assertEqual(set(schema['required']),{'T1','T2'})
+                self.assertEqual(f.provider_wire_reply['table_record_coverage'],
+                    {'T1':None,'T2':None} if 'table_record_coverage'in changes else {'T1':'=0','T2':'=0'})
                 observation=next(r for r in owner.contract_checks if r['stage']=='semantic_review')
                 self.assertEqual(observation['source_table_gate'],'accepted')
                 self.assertEqual(observation['source_table_bound_record_count'],2 if 'table_record_coverage'in changes else 0)
@@ -64,7 +69,6 @@ class SourceTableBindingTests(unittest.TestCase):
             ({'expected_list_items':['[[SOURCE_TABLE:G999]]',owned.CONDITION]},'reference_unknown'),
             ({'table_record_coverage':['T1=0','T2!outside request']},'selected_record_conflict'),
             ({'table_record_coverage':['T1=0','T2=1']},'selected_record_conflict'),
-            ({'table_record_coverage':['T1=0','T1=0']},'coverage_duplicate'),
             ({'expected_list_items':['[[SOURCE_TABLE:G1]]']*2},'reference_duplicate'),
             ({'expected_list_items':['Grease every day.',owned.CONDITION]},'required_reference_missing'),
         ]
@@ -81,6 +85,16 @@ class SourceTableBindingTests(unittest.TestCase):
                 self.assertNotIn('source_table_bound_record_count',observation)
                 self.assertNotIn('foreign:p1',logs.getvalue())
                 f.close();owner.close()
+        # A duplicate object key must be tested as raw JSON before parsing
+        # (the scoped transport suite does so). The unchanged canonical decoder
+        # still rejects duplicate rows rather than silently coalescing them.
+        helper=pure.SourceTableReviewTests();catalog=helper.catalog();reply=helper.result(catalog)
+        reply['table_record_coverage']=['T1=0','T1=0']
+        diagnostic={}
+        result=st.resolve_reply(reply,catalog,admitted_citation_ids={pure.CID},diagnostics=diagnostic)
+        self.assertEqual(result['outcome'],'no_sources')
+        self.assertEqual(diagnostic['source_table_gate'],'coverage_duplicate')
+        self.assertNotIn('source_table_bound_record_count',diagnostic)
 
     def test_unselected_occurrences_still_require_complete_canonical_classification(self):
         helper=pure.SourceTableReviewTests()

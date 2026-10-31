@@ -666,6 +666,8 @@ def verify_or_repair_answer(
         "When repair fields are non-empty, this is the one bounded repair attempt: return a complete replacement, not an addendum, preserving all correct supported content. "
         "When MACHINE_CATALOG is present, inspect every catalog row before deriving expected_list_items; low ranking or different wording is not permission to omit an explicitly documented machine assembly or auxiliary system."
     )
+    if independent_context_review:
+        system_msg = _enumeration_review.useful_verifier_instructions(system_msg)
     if conditions_only:
         system_msg += (
             " PROCEDURE_SCOPE=conditions_only: verify a complete checklist of directly applicable "
@@ -707,11 +709,14 @@ def verify_or_repair_answer(
             "the final answer in RESPONSE_LANGUAGE for covered list labels. Source quotes and "
             "boundary evidence stay literal. All semantic, source and operation proof gates apply.")
     if factual_list_review:
-        system_msg += _enumeration_review.INSTRUCTIONS
+        system_msg += (_enumeration_review.SOURCE_FIRST_INSTRUCTIONS if independent_context_review
+                       else _enumeration_review.INSTRUCTIONS)
         if not str(answer or '').strip():
             system_msg += (
-                " SOURCE_FIRST_SYNTHESIS: CURRENT_ANSWER is intentionally empty. Derive the complete "
-                "supported inventory from QUESTION and SOURCES, then produce and verify a complete "
+                " SOURCE_FIRST_SYNTHESIS: CURRENT_ANSWER is intentionally empty. "
+                + ("Derive a useful supported inventory covering every requested category with truthful limits "
+                   if independent_context_review else "Derive the complete supported inventory ")
+                + "from QUESTION and SOURCES, then produce and verify a complete "
                 "replacement answer with outcome=rewrite. An absent draft is not missing evidence. "
                 "Assess covered/missing items against your final replacement, not the empty input. "
                 "Use no_sources only when the sources cannot support mandatory requested information; "
@@ -719,10 +724,11 @@ def verify_or_repair_answer(
         if inventory_template_allowed:
             system_msg += _enumeration_review.ANSWER_INSTRUCTIONS
         if table_record_ids:
-            system_msg += (_source_table_review.record_instructions(derive_duplicate_records=independent_context_review) if source_table_catalog.entries
+            system_msg += (_source_table_review.record_instructions(derive_duplicate_records=independent_context_review,
+                keyed_coverage=independent_context_review) if source_table_catalog.entries
                            else _enumeration_review.RECORD_INSTRUCTIONS)
         if source_table_catalog.entries:
-            system_msg += _source_table_review.INSTRUCTIONS
+            system_msg += _source_table_review.quotation_instructions(keyed_coverage=independent_context_review)
     user_msg = (
         f"QUESTION:\n{request.query}\n\n"
         f"RESPONSE_LANGUAGE: {request.response_language}\n"
@@ -768,9 +774,10 @@ def verify_or_repair_answer(
         [str(c.get("citation_id") or "").strip() for c in ordered_candidates]) if source_ordered_review else None)
     verifier_schema = _assistant_core_contract_verifier_schema()
     if factual_list_review:
-        verifier_schema = _enumeration_review.source_first_schema(verifier_schema, record_ids=table_record_ids)
+        verifier_schema = _enumeration_review.source_first_schema(verifier_schema, record_ids=table_record_ids,
+            useful_response=independent_context_review)
         verifier_schema = _source_table_review.reference_schema(verifier_schema, source_table_catalog,
-            derive_duplicate_records=independent_context_review)
+            derive_duplicate_records=independent_context_review, keyed_coverage=independent_context_review)
     if compact_review:
         verifier_schema = _procedure_review.review_schema(verifier_schema, layout, review_facets, requirements,
             operation_boundary=operation_boundary, source_ordered=source_ordered_review,
@@ -857,14 +864,16 @@ def verify_or_repair_answer(
                 'template' if _enumeration_review.INVENTORY_PREFIX in out['answer'] else 'full'),
             'inventory_wire_count': len(out['expected_list_items']) if type(out.get('expected_list_items')) is list else 0,
             'table_expected_count': len(table_record_ids),
-            'table_wire_count': len(out['table_record_coverage']) if type(out.get('table_record_coverage')) is list else 0,
+            'table_wire_count': (len(out['table_record_coverage']) if type(out.get('table_record_coverage')) is list else
+                sum(value is not None for value in out['table_record_coverage'].values())
+                if type(out.get('table_record_coverage')) is dict else 0),
         }
         # Decode source-owned quotations before inventory normalization, answer
         # expansion, semantic observation and the final answer hash are bound.
         table_diagnostics = {}
         out = _source_table_review.resolve_reply(out, source_table_catalog,
             admitted_citation_ids=valid_ids, diagnostics=table_diagnostics,
-            derive_duplicate_records=independent_context_review)
+            derive_duplicate_records=independent_context_review, keyed_coverage=independent_context_review)
         inventory_diagnostics.update(table_diagnostics)
         out = _enumeration_review.resolve_inventory_answer(out,
             canonical_inventory=_dedup_text_values(out.get("expected_list_items") or [], limit=40),

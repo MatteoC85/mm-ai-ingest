@@ -57,19 +57,36 @@ RECORD_INSTRUCTIONS = (
 )
 
 
-def record_instructions(*, derive_duplicate_records: bool = False) -> str:
-    if derive_duplicate_records is not True:
-        return RECORD_INSTRUCTIONS
-    return RECORD_INSTRUCTIONS.replace(
+def quotation_instructions(*, keyed_coverage: bool = False) -> str:
+    if keyed_coverage is not True:
+        return INSTRUCTIONS
+    return INSTRUCTIONS.replace(
+        'You may omit these selected records from table_record_coverage:',
+        'Set these selected record values to null in table_record_coverage:')
+
+
+def record_instructions(*, derive_duplicate_records: bool = False, keyed_coverage: bool = False) -> str:
+    text = RECORD_INSTRUCTIONS
+    if derive_duplicate_records is True:
+        text = text.replace(
         'Only records bound by a selected whole SOURCE_TABLE token may be omitted.',
         'Records bound by selected whole SOURCE_TABLE tokens, and complete byte-identical '
         'table occurrences, may be omitted. The server accounts for missing duplicate '
         'records; every distinct owner context still requires independent review. '
         'Identical cells never establish assembly equivalence. Explicit classifications '
         'are never replaced; different or partial tables must still be classified.')
+    if keyed_coverage is True:
+        text = text.replace(
+            'Account for every unselected ID exactly once in table_record_coverage using compact strings.',
+            'table_record_coverage is an object with every emitted Tn key exactly once. '
+            'Use null only for an omission already derivable from selected tables; otherwise supply a suffix string.')
+        text = text.replace('may be omitted.', 'may have null values.')
+        text = text.replace('T1=0,2 means', 'T1:"=0,2" means').replace('T2!reason excludes', 'T2:"!reason" excludes')
+    return text
 
 
-def reference_schema(schema: dict, catalog: 'TableCatalog', *, derive_duplicate_records: bool = False) -> dict:
+def reference_schema(schema: dict, catalog: 'TableCatalog', *, derive_duplicate_records: bool = False,
+                     keyed_coverage: bool = False) -> dict:
     """Only an emitted catalog permits omission of mechanically bound records."""
     if not catalog.entries:
         return schema
@@ -85,6 +102,17 @@ def reference_schema(schema: dict, catalog: 'TableCatalog', *, derive_duplicate_
             ' Missing records in complete byte-identical occurrences of selected tables '
             'are also server-accounted as duplicates, with every distinct source context '
             'independently reviewed. No partial-table or assembly equivalence is inferred.')
+    if keyed_coverage is True:
+        identities = tuple(rid for entry in catalog.entries for rid in entry.record_ids)
+        out['schema']['properties']['table_record_coverage'] = {
+            'type': 'object', 'additionalProperties': False,
+            'properties': {rid: {'type': ['string', 'null'], 'maxLength': 512 - len(rid)} for rid in identities},
+            'required': list(identities),
+            'description': 'Every emitted record ID is a required key. Use "=0,2" for zero-based inventory indices, '
+                '"!reason" for explicit exclusion, or null only when selected whole tables or their exact duplicates '
+                'already determine the record. Different/partial tables still require explicit classification. '
+                'Explicit conflicts remain invalid; all distinct owner contexts require independent review.'}
+        out['reject_duplicate_keys'] = True
     return out
 
 
@@ -244,7 +272,8 @@ def _control_strings(result):
 
 
 def resolve_reply(result: dict, catalog: TableCatalog, *, admitted_citation_ids=None,
-                  diagnostics: dict | None = None, derive_duplicate_records: bool = False) -> dict:
+                  diagnostics: dict | None = None, derive_duplicate_records: bool = False,
+                  keyed_coverage: bool = False) -> dict:
     """Expand a whole inventory item without changing its ordered index.
 
     A reference binds to the owning citation and every record in that occurrence.
@@ -258,6 +287,21 @@ def resolve_reply(result: dict, catalog: TableCatalog, *, admitted_citation_ids=
             diagnostics['source_table_gate'] = gate
         return {**result, 'outcome': 'no_sources', 'answer': '',
                 'reason': 'source_table_reference_invalid', '_terminal_review_failure': True}
+    if keyed_coverage is True and catalog.entries and result.get('outcome') in {'pass', 'rewrite'}:
+        keyed = result.get('table_record_coverage')
+        identities = tuple(rid for entry in catalog.entries for rid in entry.record_ids)
+        if type(keyed) is not dict or set(keyed) != set(identities):
+            return reject('coverage_shape')
+        rows = []
+        for rid in identities:
+            suffix = keyed[rid]
+            if suffix is None:
+                continue
+            if (type(suffix) is not str or len(rid + suffix) > 512
+                    or re.fullmatch(r'(?:=[0-9]+(?:,[0-9]+)*|![^\r\n]+)', suffix) is None):
+                return reject('coverage_shape')
+            rows.append(rid + suffix)
+        result = {**result, 'table_record_coverage': rows}
     has_reference = any(PREFIX in value for value in _control_strings(result))
     coverage = result.get('table_record_coverage')
     covered_records = {

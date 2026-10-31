@@ -3,6 +3,7 @@
 Model responses and SQL rows are fixtures; no claim of model semantic quality.
 """
 from copy import deepcopy
+from contextlib import ExitStack
 from dataclasses import replace
 import hashlib
 import json
@@ -18,7 +19,7 @@ from machinemind.ask import factual_context_review as review, source_table_revie
 from machinemind.ask import request_completion
 from machinemind.ask.response_evidence import ResponseEvidenceError
 from machinemind.infrastructure import request_budget, openai_transport
-from context_review_wire_fixture import encode_context_reply, original_context_sources
+from context_review_wire_fixture import encode_context_reply, original_context_sources, encode_table_coverage_reply
 import test_source_table_owned as owned
 
 CELLS = ('- [PDF_TABLE_HEADER rows=1 columns=2] c1 r1="Oil temperature" | c2 r1="Interval"\n'
@@ -145,13 +146,13 @@ class DuplicateContextOwnedTests(unittest.TestCase):
 
     def test_real_source_first_admission_binding_and_public_html_preserve_alternate_context(self):
         for omit in (False, True):
-            with self.subTest(missing_context=omit):
+            with self.subTest(missing_context=omit), ExitStack() as cleanup:
                 completion = request_completion.RequestCompletion(runtime=self.m._assistant_core_request_flow_runtime(),
                     payload=SimpleNamespace(company_id='offline-company', debug=True), started=time.monotonic())
-                self.addCleanup(completion.close)
+                cleanup.callback(completion.close)
                 with patch.object(owned, 'TABLE_BODY', SCOPE + '\n' + CELLS), patch.object(owned, 'CONDITION', SCOPE + '\n' + QUALIFIER + '\n' + CELLS):
                     f = owned.OwnedTableFixture(self)
-                self.addCleanup(f.close)
+                cleanup.callback(f.close)
                 calls = []
                 def provider(messages, **kw):
                     calls.append(deepcopy(messages))
@@ -172,6 +173,7 @@ class DuplicateContextOwnedTests(unittest.TestCase):
                             citation_ids=['inspection:p1'], covered_facets=['documented obligations'], missing_facets=[],
                             covered_answer_types=['checklist'], missing_answer_types=[], expected_list_items=['[[SOURCE_TABLE:G1]]'],
                             covered_list_items=[], missing_list_items=[], table_record_coverage=['T1=0','T2!same cells'])
+                        reply = encode_table_coverage_reply(reply, kw['json_schema'])
                     class Response:
                         status_code = 200
                         def json(self): return dict(status='completed', output_text=json.dumps(reply), usage=dict(input_tokens=100,output_tokens=100))
@@ -197,7 +199,6 @@ class DuplicateContextOwnedTests(unittest.TestCase):
                     self.assertEqual([r['inventory_items'] for r in contract['semantic_verifier']['table_record_coverage']], [[0], []])
                 self.assertEqual(len(calls), 2)
                 self.assertEqual(f.writer_calls, [])
-                f.close(); completion.close()
 
 
 if __name__ == '__main__': unittest.main(verbosity=2)

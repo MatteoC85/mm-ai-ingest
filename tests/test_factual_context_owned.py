@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 sys.path[:0] = [str(Path(__file__).resolve().parents[1]), str(Path(__file__).resolve().parent)]
 import test_source_table_owned as table_fixture
-from context_review_wire_fixture import encode_context_reply, assembled_context_candidate, original_context_sources
+from context_review_wire_fixture import encode_context_reply, assembled_context_candidate, original_context_sources, encode_table_coverage_reply
 from machinemind.ask import factual_context_review, request_completion
 from machinemind.ask.response_evidence import ResponseEvidenceError
 from machinemind.evidence.contracts import EvidenceContractError
@@ -64,6 +64,8 @@ class ContextFixture(table_fixture.OwnedTableFixture):
                     expected_list_items=['[[SOURCE_TABLE:G1]]',FIRST_ITEM], covered_list_items=[],
                     missing_list_items=[], table_record_coverage=['T1=0','T2=0'])
                 if first_change is not None:first_change(reply)
+                reply = encode_table_coverage_reply(reply, kwargs['json_schema'])
+                self.first_provider_wire_reply = deepcopy(reply)
             class Response:
                 status_code = 200
                 def json(self):

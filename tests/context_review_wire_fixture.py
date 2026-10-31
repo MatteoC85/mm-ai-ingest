@@ -4,6 +4,30 @@ import json
 import re
 
 
+def encode_table_coverage_reply(reply, json_schema):
+    """Encode legacy fixture classifications for the actual keyed wire schema.
+
+    Duplicate rows are deliberately not coalesced: raw duplicate-key tests must
+    supply response text to the real transport, preserving that failure mode.
+    """
+    field = json_schema.get('schema', {}).get('properties', {}).get('table_record_coverage', {})
+    rows = reply.get('table_record_coverage')
+    if field.get('type') != 'object' or type(rows) is not list:
+        return reply
+    keyed = {rid: None for rid in field['required']}
+    seen = set()
+    for row in rows:
+        match = re.fullmatch(r'(T[1-9][0-9]*)(.*)', row) if type(row) is str else None
+        if match is None:
+            raise AssertionError('Malformed fixture needs an explicit keyed response')
+        rid, suffix = match.groups()
+        if rid in seen:
+            raise AssertionError('Duplicate fixture needs raw JSON transport coverage')
+        seen.add(rid)
+        keyed[rid] = suffix
+    return {**deepcopy(reply), 'table_record_coverage': keyed}
+
+
 def original_context_sources(view, original_sources=None):
     """Undo only the reference markers; the original source wire stays exact."""
     from machinemind.ask import review_source_wire
