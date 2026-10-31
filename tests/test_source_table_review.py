@@ -97,7 +97,7 @@ class SourceTableReviewTests(unittest.TestCase):
             {'table_record_coverage':['T1=0','T2=1']},
             {'table_record_coverage':['T1=0,1','T2=0']},
             {'table_record_coverage':['T1=0','T1=0','T2=0']},
-            {'reason':catalog.entries[0].token}]
+            {'covered_facets':[catalog.entries[0].token]}]
         for mutation in mutations:
             with self.subTest(mutation=mutation):
                 out=st.resolve_reply({**valid,**mutation},catalog)

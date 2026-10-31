@@ -36,8 +36,9 @@ INSTRUCTIONS = (
     'RESPONSE_LANGUAGE. Preserve necessary safety prerequisites from non-tabular sources. '
     'Source quotations retain their original language and do not constitute a translation; '
     'provide the needed explanation in RESPONSE_LANGUAGE. Use references only for rewrite '
-    'with the existing FACTUAL_INVENTORY answer template. No reference may occur in other '
-    'fields. All existing semantic, safety, source and completeness checks still apply.'
+    'with the existing FACTUAL_INVENTORY answer template. Only expected_list_items selects '
+    'references; mentions in reason or record-exclusion explanations are inert metadata. '
+    'No reference may occur in other fields. All existing semantic, safety, source and completeness checks still apply.'
     ' Avoid repeated quotations from overlapping occurrences: when literal equivalence '
     'is established, select one complete occurrence, cite its owner and mark the other '
     'occurrence records as duplicates. Never merge different assemblies or source identities.'
@@ -207,6 +208,22 @@ def _strings(value):
             yield from _strings(item)
 
 
+def _control_strings(result):
+    """Explanations neither select quotations nor supply visible answer text."""
+    for key, value in result.items():
+        if key == 'reason' and type(value) is str:
+            continue
+        if key == 'table_record_coverage' and type(value) is list:
+            for row in value:
+                match = (re.fullmatch(r'T[1-9][0-9]*!([^\r\n]+)', row)
+                         if type(row) is str and len(row) <= 512 else None)
+                if match and match[1].strip():
+                    continue
+                yield from _strings(row)
+        else:
+            yield from _strings(value)
+
+
 def resolve_reply(result: dict, catalog: TableCatalog, *, admitted_citation_ids=None,
                   diagnostics: dict | None = None) -> dict:
     """Expand a whole inventory item without changing its ordered index.
@@ -222,7 +239,7 @@ def resolve_reply(result: dict, catalog: TableCatalog, *, admitted_citation_ids=
             diagnostics['source_table_gate'] = gate
         return {**result, 'outcome': 'no_sources', 'answer': '',
                 'reason': 'source_table_reference_invalid', '_terminal_review_failure': True}
-    has_reference = any(PREFIX in value for value in _strings(result))
+    has_reference = any(PREFIX in value for value in _control_strings(result))
     coverage = result.get('table_record_coverage')
     covered_records = {
         match[1] for row in (coverage if type(coverage) is list else ())
@@ -239,7 +256,8 @@ def resolve_reply(result: dict, catalog: TableCatalog, *, admitted_citation_ids=
     if (type(body) is not str or body.splitlines().count(_INVENTORY) != 1
             or body.count('[[FACTUAL_INVENTORY') != 1):
         return reject('template_invalid')
-    if any(PREFIX in value for key, value in result.items() if key != 'expected_list_items' for value in _strings(value)):
+    if any(PREFIX in value for value in _control_strings(
+            {key: value for key, value in result.items() if key != 'expected_list_items'})):
         return reject('marker_outside_inventory')
     entries = {e.token: e for e in catalog.entries}
     citations = result.get('citation_ids')
