@@ -77,7 +77,8 @@ class SourceQuoteReferencesTests(unittest.TestCase):
         self.assertEqual(set(shared),{'manual:p1','other:p1'})
         messages=review.build_messages(frame,question='Which component?',response_language='en',sources_block=sources)
         verdict=fixture.FactualContextReviewTests().verdict(citations=['manual:p1','other:p1'])
-        verdict['table_contexts'][0]['source_quotes']=[{'citation_id':'manual:p1','quote':value}]
+        verdict['table_contexts'][0]['source_quotes']=[{'citation_id':'manual:p1','quote':value},
+            {'citation_id':'manual:p1','quote':qualifier}]
         out=review.apply_wire_review(first,encode_context_reply(verdict,messages,source_ids=frame.admitted_citation_ids),frame)
         self.assertEqual(out['outcome'],'rewrite')
         self.assertIn('> '+value,out['answer'])

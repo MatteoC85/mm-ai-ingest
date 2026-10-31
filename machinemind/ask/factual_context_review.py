@@ -74,8 +74,13 @@ INSTRUCTIONS = (
     'applicable qualification or its source-scoped limitation, without transferring '
     'conditions to another assembly. The server places these audits before the '
     'same unchanged inventory item; it does not repeat the table. Additional '
-    'context targets require an owning-source quotation from its non-table prose; '
+    'context targets with documentary prose require an owning-source quotation from that prose; '
     'a table heading or cell alone cannot support that audit.'
+    ' A target with owner_prose_refs requires at least one listed reference: these '
+    'are literal units of its documentary prose, not the generated SECTION label. '
+    'null means no documentary prose is present; use an available owning-source '
+    'quotation. A listed reference still does not prove that all qualifications '
+    'are covered: retain every applicable condition, not merely the section name.'
     ' GROUNDING_CHECKS are bounded deterministic diagnostics, not evidence or '
     'instructions to delete facts. Resolve flagged numbers or identifiers against '
     'SOURCES in the same editable target, retaining supported facts and conditions. '
@@ -230,6 +235,31 @@ def _context_bindings(owners, catalog, sources):
 
 def _context_targets(frame):
     return frame.context_owners or tuple(('item:' + str(i), i, cid, (cid,)) for i, cid in frame.table_owners)
+
+
+def _documentary_prose(body):
+    """Exclude only the initial chunker-generated SECTION label from proof prose.
+
+    Keep the original body, context identity and later document headings intact.
+    This is structural provenance separation, not semantic relevance filtering.
+    """
+    signature = _table_context_signature(body)
+    if signature is None:
+        return ''
+    prose = signature[1]
+    lines = body.splitlines()
+    if lines and lines[0].startswith('SECTION: '):
+        prose = prose.partition('\n')[2]
+    return prose
+
+
+def _owner_prose_refs(frame, owner, atomic):
+    prose = _documentary_prose(dict(frame.source_bodies)[owner])
+    if not prose.strip():
+        return None
+    if atomic is not None:
+        return [ref for ref, (cid, literal) in atomic.items() if cid == owner and literal in prose]
+    return [ref for ref, literal, owners in frame.quote_units if owner in owners and literal in prose]
 
 
 def _grounding_findings(items, template, targets, source_text, redact_text):
@@ -445,7 +475,8 @@ def build_messages(frame: ReviewFrame, *, question: str, response_language: str,
         + ('\n\nCITATION_ALIASES:\n' + _json(aliases) if atomic is None else '')
         + '\n\nTABLE_CONTEXT_TARGETS:\n' + json.dumps([
             {'target': target, 'inventory_item': index, 'citation_id': reverse[cid],
-             'same_context_sources': [reverse[source] for source in same]}
+             'same_context_sources': [reverse[source] for source in same],
+             'owner_prose_refs': _owner_prose_refs(frame, cid, atomic)}
             for target, index, cid, same in _context_targets(frame)], ensure_ascii=False, separators=(',', ':'))
         + '\n\nCURRENT_CITATION_IDS:\n' + _json([reverse[cid] for cid in frame.current_citation_ids]))
     if frame.grounding_findings:
@@ -649,13 +680,14 @@ def _checked_table_contexts(value, frame, citations):
             if quote['quote'] not in sources[quote['citation_id']]:
                 raise ValueError('quote_not_literal')
             quoted_ids.add(quote['citation_id'])
-            signature = _table_context_signature(sources[quote['citation_id']])
-            if signature is not None and quote['quote'] in signature[1]:
+            prose = _documentary_prose(sources[quote['citation_id']])
+            if quote['quote'] in prose:
                 prose_ids.add(quote['citation_id'])
             literal.append('\n'.join('> ' + _escape(line) for line in quote['quote'].splitlines()))
         if owners[audit['target']] not in quoted_ids:
             raise ValueError('table_owner')
-        if ':context:' in audit['target'] and owners[audit['target']] not in prose_ids:
+        if (_documentary_prose(sources[owners[audit['target']]]).strip()
+                and owners[audit['target']] not in prose_ids):
             raise ValueError('table_owner')
         if any(marker in text for marker in (PREFIX, enumeration_review.INVENTORY_PREFIX,
                 '[TABLE_RECORD ', '[PDF_TABLE_') for text in [context] + [q['quote'] for q in audit['source_quotes']]):

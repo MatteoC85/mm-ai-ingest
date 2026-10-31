@@ -22,7 +22,8 @@ HEADER = '- [PDF_TABLE_HEADER rows=1 columns=4] c1 r1="Assembly/action" | c2 r1=
 ROW = '- [PDF_TABLE_RECORD rows=2-3 columns=4] c1 "Assembly/action" r2="Slide maintenance" | c2 "Interval" r2-3="Daily" | c3 "Material" r2-3="Grease ZTR-4" | c4 "Notes" r2-3="Inspect wear every 360 hours and grease if necessary." | c1 "Assembly/action" r3="Visually check cleanliness and contamination."'
 CONTINUATION = '- [PDF_TABLE_RECORD rows=1 columns=4] c1 r1="Inspect wiring integrity" | c2 r1="Monthly" | c3 r1="" | c4 r1="Qualified personnel only."'
 OTHER = '- [PDF_TABLE_RECORD rows=1 columns=2] c1 r1="Separate packaged unit" | c2 r1="Storage only, no installed machine relationship stated."'
-SOURCES = HEADER+'\n'+ROW+'\nPage break / continuation\n'+CONTINUATION
+CONTEXT = 'The table continues with wiring maintenance subject to the stated personnel requirements.'
+SOURCES = HEADER+'\n'+ROW+'\n'+CONTEXT+'\n'+CONTINUATION
 ITEMS = ['Check slide cleanliness daily', 'Inspect slide wear every 360 hours and grease only if necessary',
          'Qualified personnel inspect wiring integrity monthly']
 
@@ -63,7 +64,8 @@ class FactualTableInventoryTests(unittest.TestCase):
                     'context':'The slide inspection has separate cleanliness and conditional wear/greasing requirements; the quoted source includes the continuation.',
                     'documentary_limits_checked':True,
                     'source_quotes':[{'citation_id':'manual:inspection',
-                        'quote':'Inspect wear every 360 hours and grease if necessary.'}]}] if complete_catalog else [])
+                        'quote':'Inspect wear every 360 hours and grease if necessary.'},
+                        {'citation_id':'manual:inspection','quote':CONTEXT}]}] if complete_catalog else [])
                 reply = {'outcome':'rewrite' if contexts else 'pass','edits':[], 'citation_ids':['manual:inspection'],
                     'table_contexts':contexts,
                     'checks':{name:True for name in factual_context_review.CHECKS},
