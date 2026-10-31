@@ -42,13 +42,13 @@ class SourceOwnedContextWireTests(unittest.TestCase):
         wire['additional_citation_ids']=['S1']
         self.assertEqual(review.apply_wire_review(first,wire,frame)['citation_ids'],['manual:p1','manual:p2'])
 
-    def test_immutable_table_occurrence_is_reconstructed_exactly_from_emitted_source(self):
+    def test_immutable_table_occurrence_is_shown_exactly_in_complete_candidate(self):
         helper=quote_fixture.SourceQuoteReferencesTests()
         _,_,sources,_,first,frame=helper.table_frame()
         messages=review.build_messages(frame,question='Which component?',response_language='en',sources_block=sources)
         view=candidate_view(messages)
-        self.assertIn('source_table',view['inventory'][0])
-        self.assertNotIn('text',view['inventory'][0])
+        self.assertNotIn('source_table',view['inventory'][0])
+        self.assertEqual(view['inventory'][0]['text'],first['expected_list_items'][0])
         self.assertEqual(assembled_context_candidate(messages),first['answer'])
         displayed=messages[1]['content'].split('\n\nSOURCES:\n',1)[1].split('\n\nCOMPLETE_CANDIDATE:',1)[0]
         self.assertEqual(original_context_sources(displayed,sources),sources)
@@ -64,7 +64,7 @@ class SourceOwnedContextWireTests(unittest.TestCase):
             self.assertEqual(assembled_context_candidate(fallback),extra.answer)
         # Equal text from another source does not merge the owning occurrence.
         self.assertEqual(dict(frame.source_bodies)['manual:p1'],dict(frame.source_bodies)['other:p1'])
-        self.assertEqual(view['inventory'][0]['source_table'],'S0')
+        self.assertEqual(dict(frame.table_owners)[0],'manual:p1')
 
     def test_unstructured_immutable_item_and_non_table_items_stay_full_text(self):
         helper=context_fixture.FactualContextReviewTests()

@@ -39,7 +39,17 @@ INSTRUCTIONS = (
     'adjacent conditions; retain documented personal protection, isolation, permitted '
     'mode, access and restoration prerequisites in the same item. Attribution such '
     'as "the manual says/recommends" does not waive those conditions. Review the fully assembled result after any edits, not '
-    'only the changed sentences. Immutable source quotations cannot be edited or '
+    'only the changed sentences. Compare every editable item and template claim '
+    'with all supplied sources and the complete selected factual inventory, especially '
+    'claims that a value, frequency or detail is absent, unspecified or only available '
+    'in a vague form. Less-specific wording in one excerpt does not establish absence '
+    'when another applicable passage or table gives the detail. A specific categorical '
+    'value or interval is not missing merely because it has no numeral. Reconcile '
+    'different precision in the same editable item and every repeated template claim, '
+    'attributing each statement to its actual source and scope. Do not transfer values '
+    'between distinct assemblies or silently resolve conflicting applicability. '
+    'An incomplete excerpt does not establish absence from the complete document. '
+    'Retain truthful source-scoped limits and useful supported facts. Immutable source quotations cannot be edited or '
     'paraphrased; they are documentary context, not additional requested operations. '
     'Correct only a non-immutable inventory target or template-answer: complete supported conditions in the '
     'same item or remove an unnecessary physical intervention. For informational requests, '
@@ -67,11 +77,8 @@ INSTRUCTIONS = (
     'The server places this context and its quotations immediately before that '
     'unchanged table group. This adds no requested intervention. Do not copy a '
     'whole source or unrelated operations. A context label saying documentary '
-    'or not instructions never waives the qualifications. Check any assertion '
-    'that information or a chapter is unavailable against all supplied excerpts: '
-    'an incomplete excerpt does not establish absence from the complete document. '
-    'Correct an overbroad absence claim through the ordinary editable item or '
-    'template. Set documentary_limits_checked true only after this check. '
+    'or not instructions never waives the qualifications. Set documentary_limits_checked '
+    'true only after checking applicability, qualifications and source-scoped documentary limits. '
     'With table contexts, return rewrite even if edits is empty, because the '
     'qualified contexts are additions; all six checks concern that final assembled '
     'answer. Without table targets return table_contexts=[] and preserve the '
@@ -116,11 +123,9 @@ _ATOMIC_INSTRUCTIONS = (INSTRUCTIONS
              'Without table targets return table_contexts=[].'))
 _ATOMIC_REPRESENTATION = (
     '\nCOMPLETE_CANDIDATE is lossless: expand its template inventory marker into the ordered items, each prefixed "- ". '
-    'A text item is verbatim. An immutable source_table item is its exact caption followed by ALL HEADER/RECORD rows '
-    'from that source occurrence, in source order (including notes and row restarts). Each row is "  - " plus every '
-    'nonempty cell as [explicit label+": "]+"«"+literal value+"»", joined by "; ", with Markdown escaping. '
-    'Remove only [Qn] and [/Q] markers before literal table expansion. '
-    'No other candidate prose is hidden; adjacent source qualifications still apply. '
+    'Every inventory text is the verbatim assembled candidate, including immutable source quotations. '
+    'Compare editable claims directly with these visible facts and the original source geometry; '
+    'all adjacent source qualifications and explicit row spans still apply. '
     'Source header Sx denotes its unchanged admitted source. additional_citation_ids contains only extra Sx support. '
     'Select source_quotes only from the enum: token "a:b" explicitly cites source Sa and literal unit Qb '
     'marked [Qb]...[/Q] in SOURCES. Do not copy quotation text or invent pairs. Existing @n references expand normally. '
@@ -480,8 +485,6 @@ def build_messages(frame: ReviewFrame, *, question: str, response_language: str,
             for i, text in enumerate(frame.items)]}
         if _expand(view['template'], [item['text'] for item in view['inventory']]) != frame.answer:
             raise ValueError('factual_context_review_invalid')
-        if atomic is not None:
-            view = _compact_candidate_tables(view, frame, response_language)
     else:
         # No-marker prose stays a complete, read-only candidate.
         view = {'read_only_answer': frame.answer}
