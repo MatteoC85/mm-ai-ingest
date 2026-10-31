@@ -49,6 +49,27 @@ def _cells(payload, base, first, last, columns):
     return cells
 
 
+def decoded_value_cells(text):
+    """Return literal value/span pairs only from valid serialized table rows.
+
+    Each value is an independent parser view. It never joins adjacent cells,
+    inherits a heading, or changes the admitted source serialization.
+    """
+    result, offset = [], 0
+    for raw_line in str(text or '').splitlines(keepends=True):
+        match = _LINE.fullmatch(raw_line.rstrip('\r\n'))
+        if match:
+            first, last, columns = int(match[2]), int(match[3] or match[2]), int(match[4])
+            if 1 <= first <= last <= 100000 and 1 <= columns <= 256:
+                try:
+                    cells = _cells(match[5], offset + match.start(5), first, last, columns)
+                except (ValueError, TypeError):
+                    cells = None
+                result.extend((cell['value'], cell['span']) for cell in (cells or ()))
+        offset += len(raw_line)
+    return result
+
+
 def numeric_cells(text, *, unit_token, number_atom, normalize_unit):
     """Return typed pairs, owned numeric spans and conflicting-cell spans.
 

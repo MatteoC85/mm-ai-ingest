@@ -72,6 +72,13 @@ INSTRUCTIONS = (
     'same unchanged inventory item; it does not repeat the table. Additional '
     'context targets require an owning-source quotation from its non-table prose; '
     'a table heading or cell alone cannot support that audit.'
+    ' GROUNDING_CHECKS are bounded deterministic diagnostics, not evidence or '
+    'instructions to delete facts. Resolve flagged numbers or identifiers against '
+    'SOURCES in the same editable target, retaining supported facts and conditions. '
+    'Preserve source-exact technical identifiers, including unusual spelling; never '
+    'correct them from convention or memory, even when no diagnostic is listed. '
+    'Omitted diagnostic details do not waive any check; the unchanged final grounding '
+    'and answer binding still apply after your edits.'
 )
 
 _ATOMIC_INSTRUCTIONS = (INSTRUCTIONS
@@ -136,6 +143,7 @@ class ReviewFrame:
     quote_view: str
     quote_units: tuple[tuple[str, str, tuple[str, ...]], ...]
     context_owners: tuple[tuple[str, int, str, tuple[str, ...]], ...] = ()
+    grounding_findings: tuple[tuple[str, int, tuple[tuple[str, str, str], ...]], ...] = ()
 
 
 def _emitted_source_bodies(sources_block, allowed):
@@ -210,6 +218,33 @@ def _context_bindings(owners, catalog, sources):
 
 def _context_targets(frame):
     return frame.context_owners or tuple(('item:' + str(i), i, cid, (cid,)) for i, cid in frame.table_owners)
+
+
+def _grounding_findings(items, template, targets, source_text, redact_text):
+    if not source_text:
+        return ()
+    if type(source_text) is not str or len(source_text) > 262144 or not callable(redact_text):
+        raise ValueError('factual_context_review_invalid')
+    # Use the same scoped ASK matcher as final validation, not a second parser.
+    from .unit_grounding import _assistant_core_claims, _assistant_core_claim_supported
+    source_claims = _assistant_core_claims(source_text)
+    result, remaining_details = [], 12
+    for target in targets:
+        text = template if target == 'template-answer' else items[int(target.split(':')[1])]
+        claims = _assistant_core_claims(redact_text(text))
+        unsupported = [claim for claim in claims
+                       if not _assistant_core_claim_supported(claim, source_text, source_claims)]
+        if not unsupported:
+            continue
+        details = []
+        for claim in unsupported:
+            raw = claim.get('raw')
+            if (len(details) < 3 and remaining_details and type(raw) is str
+                    and 0 < len(raw) <= 96 and claim.get('kind') in {'number', 'code'}):
+                details.append((claim['kind'], raw, str(claim.get('unit') or '')))
+                remaining_details -= 1
+        result.append((target, len(unsupported), tuple(details)))
+    return tuple(result)
 
 
 def _source_quote_view(sources_block, source_bodies):
@@ -298,7 +333,7 @@ def _source_quote_view(sources_block, source_bodies):
 
 
 def prepare_review(wire_reply, expanded_reply, *, catalog: TableCatalog,
-                   admitted_citation_ids, sources_block='') -> ReviewFrame:
+                    admitted_citation_ids, sources_block='', grounding_source_text='', redact_text=None) -> ReviewFrame:
     """Bind exact first-stage data; never locate editable blocks by fuzzy text."""
     invalid = ValueError('factual_context_review_invalid')
     if type(wire_reply) is not dict or type(expanded_reply) is not dict or type(catalog) is not TableCatalog:
@@ -363,10 +398,11 @@ def prepare_review(wire_reply, expanded_reply, *, catalog: TableCatalog,
         targets = ()
     quote_view, quote_units = _source_quote_view(sources_block, source_bodies) if immutable else (sources_block, ())
     bindings = _context_bindings(owners, catalog, source_bodies) if immutable else ()
+    findings = _grounding_findings(items, template, targets, grounding_source_text, redact_text)
     return ReviewFrame(_json(expanded_reply), answer, template, tuple(items), tuple(immutable),
                        allowed, tuple(dict.fromkeys(citations)), targets,
                        tuple(owners), tuple(source_bodies.items()),
-                       _digest(sources_block) if sources_block else '', quote_view, quote_units, bindings)
+                       _digest(sources_block) if sources_block else '', quote_view, quote_units, bindings, findings)
 
 
 def build_messages(frame: ReviewFrame, *, question: str, response_language: str, sources_block: str):
@@ -400,6 +436,12 @@ def build_messages(frame: ReviewFrame, *, question: str, response_language: str,
              'same_context_sources': [reverse[source] for source in same]}
             for target, index, cid, same in _context_targets(frame)], ensure_ascii=False, separators=(',', ':'))
         + '\n\nCURRENT_CITATION_IDS:\n' + _json([reverse[cid] for cid in frame.current_citation_ids]))
+    if frame.grounding_findings:
+        user += '\n\nGROUNDING_CHECKS:\n' + _json([
+            {'target': target, 'unsupported_count': count,
+             'claims': [{'kind': kind, 'raw': raw, 'unit': unit} for kind, raw, unit in details],
+             'omitted_details': count - len(details)}
+            for target, count, details in frame.grounding_findings])
     representation = (
         '\nCOMPLETE_CANDIDATE is lossless: replace the template\'s single full-line '
         '[[FACTUAL_INVENTORY]] by the ordered inventory texts, each prefixed by "- ". '

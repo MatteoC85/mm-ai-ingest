@@ -897,7 +897,9 @@ def verify_or_repair_answer(
             try:
                 frame = _factual_context_review.prepare_review(wire_reply, out,
                     catalog=source_table_catalog, admitted_citation_ids=valid_ids,
-                    sources_block=sources_block)
+                    sources_block=sources_block,
+                    grounding_source_text="\n".join(_assistant_core_candidate_evidence_text(c)
+                        for c in ordered_candidates), redact_text=_assistant_core_redact_internal_text)
                 # Reuse the exact owned packet already emitted above, including
                 # its lossless compression. Do not retrieve or compile it again.
                 messages = _factual_context_review.build_messages(frame,

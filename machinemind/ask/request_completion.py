@@ -216,6 +216,15 @@ def record_contract_observation(stage: str, contract: dict, *, diagnostics: dict
             source = diagnostics.get("source_text")
             if type(source) is str and len(source) <= 262144:
                 row["source_packet_sha256"] = hashlib.sha256(source.encode("utf-8")).hexdigest()
+            initial = diagnostics.get("initial_grounding")
+            if type(initial) is dict:
+                for key in ("input", "redacted", "grounded", "media"):
+                    value = initial.get(key)
+                    if type(value) is str and len(value) <= 262144:
+                        row["initial_" + key + "_sha256"] = hashlib.sha256(value.encode("utf-8")).hexdigest()
+                count = initial.get("removed_claims_count")
+                if type(count) is int and count >= 0:
+                    row["initial_removed_claims_count"] = min(count, 100)
             removed = diagnostics.get("post_review_removed_claims")
             if type(removed) in (list, tuple):
                 hashes = []
@@ -265,6 +274,21 @@ def record_contract_observation(stage: str, contract: dict, *, diagnostics: dict
             print("ASK_INDEPENDENT_REVIEW", json.dumps(event, separators=(",", ":")), flush=True)
         except Exception:
             pass  # Observability failure never changes the answer or its gates.
+    if (getattr(owner.payload, "debug", False) is True and row["stage"] == "final_contract"
+            and "initial_removed_claims_count" in row):
+        event = {"event": "initial_grounding", "outcome": row["outcome"], "reason": row["reason"]}
+        for key in ("initial_removed_claims_count", "initial_input_sha256", "initial_redacted_sha256",
+                    "initial_grounded_sha256", "initial_media_sha256", "source_packet_sha256"):
+            if key in row:
+                event[key] = row[key]
+        request_id = getattr(owner.budget, "request_id", None)
+        if (type(request_id) is str and len(request_id) == 32
+                and all(char in "0123456789abcdef" for char in request_id)):
+            event["request_id"] = request_id
+        try:
+            print("ASK_INITIAL_GROUNDING", json.dumps(event, separators=(",", ":")), flush=True)
+        except Exception:
+            pass
 
 
 def provider_timeout(purpose: str, configured: int) -> int:

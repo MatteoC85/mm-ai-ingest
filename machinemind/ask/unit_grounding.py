@@ -158,17 +158,25 @@ def _assistant_core_is_list_marker(value: str, start: int, end: int, raw: str) -
     )
 
 
-def _assistant_core_claims(text: str) -> list[dict]:
+def _assistant_core_claims(text: str, *, _parse_serialized_cells: bool = True) -> list[dict]:
     value = str(text or "")
     claims: list[dict] = []
-    table_values, table_value_spans, conflicting_table_spans = table_units.numeric_cells(value,
+    table_values, table_value_spans, conflicting_table_spans = (table_units.numeric_cells(value,
         unit_token=_ASSISTANT_CORE_UNIT_TOKEN, number_atom=_ASSISTANT_CORE_NUMBER_ATOM,
-        normalize_unit=_assistant_core_normalize_unit)
+        normalize_unit=_assistant_core_normalize_unit) if _parse_serialized_cells else ([], [], []))
     for raw, unit in table_values:
         claims.append({"kind": "number", "raw": raw,
             "variants": _assistant_core_numeric_variants(raw),
             "unit": _assistant_core_normalize_unit(unit)})
     table_value_spans = table_value_spans + conflicting_table_spans
+    if _parse_serialized_cells:
+        for literal, span in table_units.decoded_value_cells(value):
+            if span not in table_value_spans:
+                # JSON escapes are representation, not source text. Parse each
+                # decoded cell separately; keep typed/conflicting cells under
+                # the existing same-column rules and never parse nested markers.
+                claims.extend(_assistant_core_claims(literal, _parse_serialized_cells=False))
+                table_value_spans.append(span)
     labeled_value_spans: list[tuple[int, int]] = []
     technical_unit_spans: list[tuple[int, int]] = []
     for labeled_match in _ASSISTANT_CORE_LABELED_VALUE_UNIT_RE.finditer(value):

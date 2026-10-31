@@ -601,7 +601,9 @@ def validate_response(
                 }
             )
     else:
-        answer = _assistant_core_redact_internal_text(out.get("answer") or "")
+        initial_answer = out.get("answer") or ""
+        answer = _assistant_core_redact_internal_text(initial_answer)
+        initial_redacted_answer = answer
         manual_note_bindings = ((manual_note_carrier if manual_note_carrier is not None else
             (out.get("_assistant_ui_model") or {}).get("manual_note_sources")) or []) if protected_procedure else []
         manual_note_original = answer
@@ -614,7 +616,10 @@ def validate_response(
         post_review_removed_claims: list[str] = []
         if citations and source_text:
             answer, removed_claims = _assistant_core_filter_unsupported_claim_sentences(answer, source_text)
+        initial_grounded_answer = answer
+        initial_removed_claims_count = len(removed_claims)
         answer = _assistant_core_media_metadata_only(answer, citations, request.response_language)
+        initial_media_answer = answer
         out["answer"] = answer
 
         semantic_value = out.pop("_assistant_core_semantic_verified", {})
@@ -1029,6 +1034,11 @@ def validate_response(
                 "post_review_removed_claims_count": post_review_removed_claims_count,
                 "post_review_removed_claims": post_review_removed_claims,
                 "source_text": source_text,
+                "initial_grounding": {
+                    "input": initial_answer, "redacted": initial_redacted_answer,
+                    "grounded": initial_grounded_answer, "media": initial_media_answer,
+                    "removed_claims_count": initial_removed_claims_count,
+                },
             })
             if not bool(answer_contract_result.get("passed")):
                 repair_attempted = bool(out.get("_assistant_core_repair_attempted"))
