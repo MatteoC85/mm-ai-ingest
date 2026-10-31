@@ -920,6 +920,9 @@ def verify_or_repair_answer(
                     max_output_tokens=min(4000, max(3200, V13_FAST_MAX_OUTPUT_TOKENS)), company_id=request.company_id,
                     purpose="assistant_core_answer_contract_verifier")
                 independent_stage = "reply_shape"
+                # Request-local debug observation only; never enter the semantic
+                # carrier or use a decision summary as acceptance authority.
+                inventory_diagnostics['independent_review_decision'] = review
                 out = _factual_context_review.apply_wire_review(out, review, frame)
                 independent_result = out.get("independent_context_review")
                 if out.get("reason") == "factual_context_review_invalid":

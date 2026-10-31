@@ -143,6 +143,25 @@ def independent_review_reserve(*, required: bool):
         _INDEPENDENT_REVIEW_RESERVE.reset(token)
 
 
+def _decision_observation(diagnostics: dict) -> dict:
+    """Only fixed diagnostics may survive a terminal without a fresh fence."""
+    decision = diagnostics.get('independent_review_decision')
+    if type(decision) is not dict:
+        return {}
+    checks = decision.get('checks')
+    result = {'independent_review_checks': {
+        key: checks[key] for key in ('source_fidelity', 'scope_applicability', 'completeness',
+                                    'safety', 'language', 'provenance')
+        if type(checks) is dict and type(checks.get(key)) is bool}}
+    reason = decision.get('reason')
+    allowed = {'accepted', 'unsupported_fact', 'missing_available_information',
+        'unavailable_requested_details', 'missing_prerequisite', 'incorrect_scope',
+        'incorrect_language', 'citation_problem', 'inconsistent_sources',
+        'uneditable_candidate', 'other'}
+    result['independent_review_reason_code'] = reason if type(reason) is str and reason in allowed else 'other'
+    return result
+
+
 def record_contract_observation(stage: str, contract: dict, *, diagnostics: dict | None = None) -> None:
     """Bounded enums/counts survive errors; never retain answer or source text."""
     owner = current()
@@ -190,6 +209,7 @@ def record_contract_observation(stage: str, contract: dict, *, diagnostics: dict
     # provider fields, response/source prose, identifiers or exception messages.
     if getattr(owner.payload, "debug", False) is True:
         if stage == "semantic_review" and type(diagnostics) is dict:
+            row.update(_decision_observation(diagnostics))
             for key, values in {
                 'inventory_model_outcome': {'pass', 'rewrite', 'partial', 'no_sources', 'unavailable'},
                 'inventory_answer_form': {'empty', 'template', 'full', 'invalid'},
@@ -270,6 +290,10 @@ def record_contract_observation(stage: str, contract: dict, *, diagnostics: dict
             event["request_id"] = request_id
         if "independent_review_edit_count" in row:
             event["edit_count"] = row["independent_review_edit_count"]
+        if 'independent_review_checks' in row:
+            event['failed_checks'] = [key for key, passed in row['independent_review_checks'].items() if not passed]
+        if 'independent_review_reason_code' in row:
+            event['independent_review_reason_code'] = row['independent_review_reason_code']
         try:
             print("ASK_INDEPENDENT_REVIEW", json.dumps(event, separators=(",", ":")), flush=True)
         except Exception:

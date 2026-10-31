@@ -24,6 +24,10 @@ _SOURCE_MARKER = re.compile(
     r'\[\[SOURCE_TABLE:[^\]\r\n]*\]\]|\[\[FACTUAL_INVENTORY\]\])')
 CHECKS = ('source_fidelity', 'scope_applicability', 'completeness',
           'safety', 'language', 'provenance')
+DECISION_REASONS = ('accepted', 'unsupported_fact', 'missing_available_information',
+    'unavailable_requested_details', 'missing_prerequisite', 'incorrect_scope',
+    'incorrect_language', 'citation_problem', 'inconsistent_sources',
+    'uneditable_candidate', 'other')
 INSTRUCTIONS = (
     'Independently review the complete candidate against QUESTION and SOURCES. '
     'No prior model verdict is supplied. Check source fidelity, requested scope '
@@ -79,6 +83,14 @@ INSTRUCTIONS = (
     'correct them from convention or memory, even when no diagnostic is listed. '
     'Omitted diagnostic details do not waive any check; the unchanged final grounding '
     'and answer binding still apply after your edits.'
+    ' Judge completeness relative to QUESTION and the supplied evidence. When the '
+    'request permits missing data, supported facts with explicit source-scoped '
+    'limitations can satisfy the six checks; missing unsupplied details alone do '
+    'not invalidate those facts. Do not demand unseen chapters or infer their '
+    'contents. This never permits omitting available requested facts, qualifications '
+    'or prerequisites of a retained intervention. Select reason only from its '
+    'diagnostic enum, never quote source text or explain reasoning in that field. '
+    'The reason code does not replace any of the six checks.'
 )
 
 _ATOMIC_INSTRUCTIONS = (INSTRUCTIONS
@@ -469,7 +481,8 @@ def _atomic_references(frame):
     selected subset of sources, units, or semantic obligations.
     """
     count = sum(len(owners) for _, _, owners in frame.quote_units)
-    other_enums = 3 + len(frame.editable_targets) + len(_context_targets(frame)) + len(frame.admitted_citation_ids)
+    other_enums = (3 + len(frame.editable_targets) + len(_context_targets(frame))
+                   + len(frame.admitted_citation_ids) + len(DECISION_REASONS))
     if not frame.table_owners or not count or count + other_enums > 1000:
         return None
     reverse = {cid: alias[1:] for alias, cid in _citation_aliases(frame).items()}
@@ -592,7 +605,7 @@ def _wire_schema(frame: ReviewFrame, refs=None):
                     'required': ['target', 'context', 'documentary_limits_checked', 'source_quotes']}},
             'checks': {'type': 'object', 'additionalProperties': False,
                        'properties': {key: {'type': 'boolean'} for key in CHECKS}, 'required': list(CHECKS)},
-            'reason': {'type': 'string', 'maxLength': 500}},
+            'reason': {'type': 'string', 'maxLength': 500, 'enum': list(DECISION_REASONS)}},
         'required': ['outcome', 'edits', 'citation_ids', 'table_contexts', 'checks', 'reason']}}
     if refs is not None:
         properties = result['schema']['properties']
