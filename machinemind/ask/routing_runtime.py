@@ -12,6 +12,7 @@ from copy import deepcopy
 import math
 import re
 import time
+from machinemind.infrastructure.provider_failures import FAILURE_CODES
 
 VERSION = "ask-router-low-accounting-v1"
 _ACTIVE = ContextVar("mm_protected_ask_routing_runtime", default=None)
@@ -34,6 +35,9 @@ def _provider_attempts(ledger):
                     "accounting_state": _safe_name(row.get("accounting_state")),
                     "failed": row.get("failed") is True,
                     "dispatched": row.get("dispatched") is True}
+            code = row.get("provider_failure_code")
+            if item["failed"] and type(code) is str and code in FAILURE_CODES:
+                item["provider_failure_code"] = code
             for key in ("started_at_elapsed_seconds", "completed_at_elapsed_seconds",
                         "timeout_seconds", "max_output_tokens", "reserved_input_tokens",
                         "input_tokens", "output_tokens", "reasoning_tokens",

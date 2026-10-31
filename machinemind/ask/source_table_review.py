@@ -57,7 +57,24 @@ RECORD_INSTRUCTIONS = (
 )
 
 
-def quotation_instructions(*, keyed_coverage: bool = False) -> str:
+def quotation_instructions(*, keyed_coverage: bool = False, selected_records_only: bool = False) -> str:
+    if selected_records_only is True:
+        return (
+            ' SOURCE_TABLE_QUOTATIONS: select each supporting [[SOURCE_TABLE:Gn]] only as a whole '
+            'expected_list_items string. The server expands every cell and note unchanged and binds '
+            'the exact owning source and selected record identities. Do not paraphrase table cells '
+            'into other items. Select enough supported facts for every requested category; also '
+            'include necessary non-table facts and material qualifications. Unselected tables are '
+            'unselected/unassessed, never automatically irrelevant, covered or semantically verified. '
+            'Do not classify unselected records or reproduce bookkeeping. Return table_record_coverage=[]. '
+            'Avoid redundant identical tables, but retain every distinct applicable owner context '
+            'and qualification; identical cells do not establish assembly equivalence. Use the '
+            'FACTUAL_INVENTORY template, with each source-table reference only in expected_list_items. '
+            'selection_scope_note must be a short reader-facing statement in RESPONSE_LANGUAGE '
+            'that this is a supported selection rather than an exhaustive inventory. It must not '
+            'claim unselected records irrelevant or verified. The server inserts this note before '
+            'the template and the independent reviewer judges that complete answer. All source, '
+            'safety, factual meaning and requested-category checks remain mandatory.')
     if keyed_coverage is not True:
         return INSTRUCTIONS
     return INSTRUCTIONS.replace(
@@ -66,7 +83,13 @@ def quotation_instructions(*, keyed_coverage: bool = False) -> str:
         'do not omit it or use null. The server verifies these exact bindings.')
 
 
-def record_instructions(*, derive_duplicate_records: bool = False, keyed_coverage: bool = False) -> str:
+def record_instructions(*, derive_duplicate_records: bool = False, keyed_coverage: bool = False,
+                        selected_records_only: bool = False) -> str:
+    if selected_records_only is True:
+        return (' TABLE_RECORD IDs identify unchanged source occurrences, not semantic coverage. '
+                'Return table_record_coverage=[]; selected whole-table mappings are server-computed. '
+                'No unselected record is classified. Inspect the complete supplied evidence for '
+                'requested categories and applicable qualifications; do not infer relevance from IDs.')
     text = RECORD_INSTRUCTIONS
     if derive_duplicate_records is True:
         text = text.replace(
@@ -94,11 +117,21 @@ def record_instructions(*, derive_duplicate_records: bool = False, keyed_coverag
 
 
 def reference_schema(schema: dict, catalog: 'TableCatalog', *, derive_duplicate_records: bool = False,
-                     keyed_coverage: bool = False) -> dict:
+                     keyed_coverage: bool = False, selected_records_only: bool = False) -> dict:
     """Only an emitted catalog permits omission of mechanically bound records."""
     if not catalog.entries:
         return schema
     out = deepcopy(schema)
+    if selected_records_only is True:
+        out['schema']['properties']['table_record_coverage'] = {
+            'type': 'array', 'maxItems': 0, 'items': {'type': 'string'},
+            'description': 'Return []; exact selected-table bindings are server-computed. Unselected records remain unassessed.'}
+        out['schema']['properties']['selection_scope_note'] = {
+            'type': 'string', 'minLength': 1, 'maxLength': 400,
+            'description': 'Reader-facing RESPONSE_LANGUAGE statement that the answer is a supported selection, not an exhaustive inventory; no claim that unselected facts are irrelevant or verified.'}
+        out['schema']['required'] = [*out['schema']['required'], 'selection_scope_note']
+        out['reject_duplicate_keys'] = True
+        return out
     coverage = out['schema']['properties']['table_record_coverage']
     coverage['minItems'] = 0
     coverage['description'] = (
@@ -281,9 +314,40 @@ def _control_strings(result):
             yield from _strings(value)
 
 
+def selected_record_bindings(wire_reply: dict, catalog: TableCatalog) -> tuple[tuple[str, int], ...]:
+    """Exact selected ownership only; no relevance or exclusion is inferred."""
+    if type(wire_reply) is not dict or type(catalog) is not TableCatalog:
+        raise ValueError('selected_record_binding_invalid')
+    items = wire_reply.get('expected_list_items')
+    if type(items) is not list or not 0 < len(items) <= 40 or any(type(x) is not str for x in items):
+        raise ValueError('selected_record_binding_invalid')
+    entries = {entry.token: entry for entry in catalog.entries}
+    bindings, seen = [], set()
+    for index, item in enumerate(items):
+        if PREFIX not in item:
+            continue
+        entry = entries.get(item)
+        if entry is None or item in seen:
+            raise ValueError('selected_record_binding_invalid')
+        seen.add(item)
+        bindings.extend((record, index) for record in entry.record_ids)
+    if len({record for record, _ in bindings}) != len(bindings):
+        raise ValueError('selected_record_binding_invalid')
+    return tuple(bindings)
+
+
+def selection_template(wire_reply: dict) -> str:
+    """Assemble a model-written scope note before any semantic review."""
+    note, template = wire_reply.get('selection_scope_note'), wire_reply.get('answer')
+    if (type(note) is not str or not note.strip() or len(note) > 400
+            or type(template) is not str or PREFIX in note or '[[FACTUAL_INVENTORY' in note):
+        raise ValueError('selection_scope_invalid')
+    return note + '\n\n' + template
+
+
 def resolve_reply(result: dict, catalog: TableCatalog, *, admitted_citation_ids=None,
                   diagnostics: dict | None = None, derive_duplicate_records: bool = False,
-                  keyed_coverage: bool = False) -> dict:
+                  keyed_coverage: bool = False, selected_records_only: bool = False) -> dict:
     """Expand a whole inventory item without changing its ordered index.
 
     A reference binds to the owning citation and every record in that occurrence.
@@ -297,7 +361,15 @@ def resolve_reply(result: dict, catalog: TableCatalog, *, admitted_citation_ids=
             diagnostics['source_table_gate'] = gate
         return {**result, 'outcome': 'no_sources', 'answer': '',
                 'reason': 'source_table_reference_invalid', '_terminal_review_failure': True}
-    if keyed_coverage is True and catalog.entries and result.get('outcome') in {'pass', 'rewrite'}:
+    if selected_records_only is True and result.get('outcome') in {'pass', 'rewrite'}:
+        if not catalog.entries or type(result.get('table_record_coverage')) is not list or result['table_record_coverage']:
+            return reject('coverage_shape')
+        try:
+            selected_record_bindings(result, catalog)
+            result = {**result, 'answer': selection_template(result)}
+        except ValueError:
+            return reject('selection_scope_invalid')
+    elif keyed_coverage is True and catalog.entries and result.get('outcome') in {'pass', 'rewrite'}:
         keyed = result.get('table_record_coverage')
         identities = tuple(rid for entry in catalog.entries for rid in entry.record_ids)
         if type(keyed) is not dict or set(keyed) != set(identities):
@@ -316,7 +388,8 @@ def resolve_reply(result: dict, catalog: TableCatalog, *, admitted_citation_ids=
         match[1] for row in (coverage if type(coverage) is list else ())
         if type(row) is str and (match := _COVERAGE.fullmatch(row)) is not None}
     required = {e.token for e in catalog.entries if covered_records.intersection(e.record_ids)}
-    if not has_reference and (not required or result.get('outcome') not in {'pass', 'rewrite'}):
+    if (not selected_records_only and not has_reference
+            and (not required or result.get('outcome') not in {'pass', 'rewrite'})):
         return result
     items = result.get('expected_list_items')
     body = result.get('answer')
@@ -376,7 +449,7 @@ def resolve_reply(result: dict, catalog: TableCatalog, *, admitted_citation_ids=
             bound_citations.append(entry.citation_id)
         selected.add(item)
         expanded.append(entry.text)
-    if derive_duplicate_records is True:
+    if derive_duplicate_records is True and selected_records_only is not True:
         # Only the request-owned source-first path enables this, after arranging
         # mandatory independent review of every exact-table owner context.
         # No model field can enable it. Explicit classifications stay untouched.

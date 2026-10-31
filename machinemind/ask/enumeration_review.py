@@ -9,12 +9,23 @@ from . import table_units as _tables
 
 INVENTORY_MARKER = '[[FACTUAL_INVENTORY]]'
 INVENTORY_PREFIX = '[[FACTUAL_INVENTORY'
+INFORMATIONAL_SCOPE_INSTRUCTIONS = (
+    ' Judge informational descriptions and execution guidance by their function in the '
+    'complete question and answer, not a keyword. A documented maintenance frequency '
+    'does not require a complete operating procedure or PPE checklist. Preserve every '
+    'qualification changing the stated fact, value, interval or applicability. If the '
+    'question asks how to act, or the answer directs physical execution, retain the '
+    'applicable sourced PPE, isolation, access, machine-state and restoration conditions. '
+    'Attribution such as "the manual says" never excuses unsafe execution guidance. '
+    'Remove unnecessary execution commands, not useful requested frequency facts; '
+    'never propose bypassing safeguards or invent an operating condition.'
+)
 ANSWER_INSTRUCTIONS = (
     " For outcome=rewrite, avoid copying the inventory twice: put [[FACTUAL_INVENTORY]] "
     "exactly once on its own line in answer. The server replaces that line with one bullet "
     "per expected_list_items string, verbatim and in order. Put headings, limitations or "
     "necessary context outside that line. Each inventory string must therefore be a complete "
-    "reader-facing obligation in RESPONSE_LANGUAGE with its supported conditions. Review "
+    "reader-facing supported statement in RESPONSE_LANGUAGE with its applicable conditions. Review "
     "the resulting complete answer and cite all its sources. Never put the marker in an "
     "inventory item or another field. For pass/no_sources do not use the marker."
 )
@@ -56,7 +67,7 @@ INSTRUCTIONS = (
     "Do not turn a scheduled inspection into scheduled intervention by combining its interval "
     "with a material column. covered_list_items must be []: the server computes coverage "
     "from expected_list_items and the final answer; do not repeat the inventory there."
-)
+) + INFORMATIONAL_SCOPE_INSTRUCTIONS
 
 SOURCE_FIRST_INSTRUCTIONS = INSTRUCTIONS.replace(
     'Inspect every relevant table row and continuation section for each independently requested category.',
@@ -64,9 +75,9 @@ SOURCE_FIRST_INSTRUCTIONS = INSTRUCTIONS.replace(
     'detail for a useful answer, not every available manual fact. State material limits; never '
     'present an incomplete list as exhaustive.') + (
     ' Explicitly requested exhaustiveness remains a requirement or a clearly stated limitation. '
-    'Every published fact or action must retain all qualifications and prerequisites affecting '
-    'its meaning or safety. A coverage reason may truthfully identify a relevant record not included '
-    'in the explicitly limited answer; do not falsely label it unrelated.')
+    'Every published fact must retain qualifications affecting its meaning; actual execution '
+    'guidance must retain its applicable operating prerequisites. A useful selection does not '
+    'establish that other source records are unrelated, covered or semantically verified.')
 
 
 def useful_verifier_instructions(text: str) -> str:
@@ -144,8 +155,8 @@ def source_first_schema(schema: dict, *, record_ids: tuple[str, ...] = (), usefu
         inventory['description'] = (
             'Useful supported inventory addressing every requested category in RESPONSE_LANGUAGE, '
             'with truthful limits and no unsupported claim of exhaustiveness. Preserve every '
-            'published component/action/value relationship and its applicable qualifications and '
-            'prerequisites; broad category names alone are not concrete facts.')
+            'published component/action/value relationship and material qualifications, plus '
+            'prerequisites for actual execution guidance; broad category names alone are not concrete facts.')
     out["schema"]["properties"] = {
         "expected_list_items": inventory,
         **{key: value for key, value in properties.items() if key != "expected_list_items"},
@@ -178,10 +189,25 @@ def inventory_positions_match(wire, canonical, *, normalize_item=None) -> bool:
                for index, item in enumerate(wire))
 
 
-def validate_table_coverage(result: dict, record_ids: tuple[str, ...], *, wire_inventory=None, normalize_item=None) -> dict:
+def validate_table_coverage(result: dict, record_ids: tuple[str, ...], *, wire_inventory=None, normalize_item=None,
+                            selected_bindings: tuple[tuple[str, int], ...] | None = None) -> dict:
     """Require complete bounded bookkeeping, not semantic entailment by ID."""
-    if not record_ids or str(result.get('outcome') or '').lower() not in {'pass', 'rewrite'}:
+    if ((not record_ids and selected_bindings is None)
+            or str(result.get('outcome') or '').lower() not in {'pass', 'rewrite'}):
         return result
+    selected = None
+    if selected_bindings is not None:
+        # This tuple is held by the caller from the original owned catalog and
+        # wire selection. No model response field can enable partial coverage.
+        if (type(selected_bindings) is not tuple
+                or any(type(pair) is not tuple or len(pair) != 2
+                       or type(pair[0]) is not str or pair[0] not in record_ids
+                       or type(pair[1]) is not int or not 0 <= pair[1] < 40 for pair in selected_bindings)
+                or len({pair[0] for pair in selected_bindings}) != len(selected_bindings)):
+            return {**result, 'outcome': 'no_sources', 'reason': 'source_table_inventory_incomplete',
+                    '_terminal_review_failure': True}
+        selected = dict(selected_bindings)
+        record_ids = tuple(selected)
     expected = result.get('expected_list_items')
     rows = result.get('table_record_coverage')
     valid = (inventory_positions_match(wire_inventory, expected, normalize_item=normalize_item)
@@ -200,6 +226,8 @@ def validate_table_coverage(result: dict, record_ids: tuple[str, ...], *, wire_i
             if any(len(token) > 2 or str(int(token)) != token for token in tokens):
                 valid = False; break
             indices, reason = [int(token) for token in tokens], match[3] or ''
+            if selected is not None and (indices != [selected.get(identity)] or reason):
+                valid = False; break
             if (type(identity) is not str or identity not in record_ids or identity in seen
                     or type(indices) is not list or len(indices) > 40
                     or any(type(i) is not int or not 0 <= i < len(expected) for i in indices)

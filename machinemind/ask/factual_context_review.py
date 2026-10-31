@@ -13,7 +13,7 @@ import re
 from . import enumeration_review
 from . import review_source_wire
 from . import table_units
-from .source_table_review import PREFIX, TableCatalog, _HEADER, _RECORD_ID, _escape, _render as _render_table_rows
+from .source_table_review import PREFIX, TableCatalog, _HEADER, _RECORD_ID, _escape, selection_template, _render as _render_table_rows
 
 MARKER = enumeration_review.INVENTORY_MARKER
 MAX_TEXT = 30000
@@ -32,10 +32,10 @@ INSTRUCTIONS = (
     'Independently review the complete candidate against QUESTION and SOURCES. '
     'No prior model verdict is supplied. Check source fidelity, requested scope '
     'and applicability, completeness across every requested category, safety '
-    'prerequisites for each physical intervention retained, response language and '
+    'prerequisites for actual execution guidance, response language and '
     'citation provenance. FIRST inspect every editable inventory item and template '
-    'sentence, including unchanged prose, for physical actions before auditing table '
-    'contexts. For every retained action, check its source paragraph and applicable '
+    'sentence, including unchanged prose, for factual meaning and actual execution '
+    'guidance before auditing table contexts. For each instructed intervention, check its source paragraph and applicable '
     'adjacent conditions; retain documented personal protection, isolation, permitted '
     'mode, access and restoration prerequisites in the same item. Attribution such '
     'as "the manual says/recommends" does not waive those conditions. Review the fully assembled result after any edits, not '
@@ -46,8 +46,8 @@ INSTRUCTIONS = (
     'remove unrequested access, setup, state-change and restart instructions from editable '
     'prose while preserving requested facts, maintenance frequencies, applicability and '
     'qualifications. Remove only unrequested execution commands, not a requested fact '
-    'merely to avoid qualifying it. Every physical action that remains, whether or not '
-    'explicitly requested, must retain its source-supported prerequisites and operating '
+    'merely to avoid qualifying it. Every instruction to perform an intervention that remains, '
+    'whether or not explicitly requested, must retain its source-supported prerequisites and operating '
     'conditions; generic safety advice cannot replace a specific condition. Do not introduce '
     'an unrequested operation, source, value or assembly equivalence. Do not add, '
     'delete or reorder inventory slots. A template-answer edit must retain '
@@ -100,11 +100,11 @@ INSTRUCTIONS = (
     'source-scoped limits can satisfy the six checks without repeating every available manual fact. '
     'Never present an incomplete list as exhaustive; explicitly requested exhaustiveness remains '
     'a requirement or a clearly stated limitation. Do not demand unseen chapters or infer their '
-    'contents. Retain every qualification or prerequisite affecting the meaning or safety of '
-    'each published fact or action. Select reason only from its '
+    'contents. Retain every qualification affecting a published fact or value, and the '
+    'applicable operating prerequisites for actual execution guidance. Select reason only from its '
     'diagnostic enum, never quote source text or explain reasoning in that field. '
     'The reason code does not replace any of the six checks.'
-)
+) + enumeration_review.INFORMATIONAL_SCOPE_INSTRUCTIONS
 
 _ATOMIC_INSTRUCTIONS = (INSTRUCTIONS
     .replace('Preserve all current citation IDs and cite additional support only from SOURCES.',
@@ -169,6 +169,7 @@ class ReviewFrame:
     quote_units: tuple[tuple[str, str, tuple[str, ...]], ...]
     context_owners: tuple[tuple[str, int, str, tuple[str, ...]], ...] = ()
     grounding_findings: tuple[tuple[str, int, tuple[tuple[str, str, str], ...]], ...] = ()
+    selection_scope_note: str = ''
 
 
 def _emitted_source_bodies(sources_block, allowed):
@@ -383,7 +384,8 @@ def _source_quote_view(sources_block, source_bodies):
 
 
 def prepare_review(wire_reply, expanded_reply, *, catalog: TableCatalog,
-                    admitted_citation_ids, sources_block='', grounding_source_text='', redact_text=None) -> ReviewFrame:
+                    admitted_citation_ids, sources_block='', grounding_source_text='', redact_text=None,
+                    selected_records_only: bool = False) -> ReviewFrame:
     """Bind exact first-stage data; never locate editable blocks by fuzzy text."""
     invalid = ValueError('factual_context_review_invalid')
     if type(wire_reply) is not dict or type(expanded_reply) is not dict or type(catalog) is not TableCatalog:
@@ -395,6 +397,12 @@ def prepare_review(wire_reply, expanded_reply, *, catalog: TableCatalog,
         raise invalid
     raw_items, items = wire_reply.get('expected_list_items'), expanded_reply.get('expected_list_items')
     answer, template = expanded_reply.get('answer'), wire_reply.get('answer')
+    scope_note = ''
+    if selected_records_only is True:
+        template = selection_template(wire_reply)
+        scope_note = wire_reply['selection_scope_note']
+        if expanded_reply.get('selection_scope_note') != scope_note:
+            raise invalid
     if (type(raw_items) is not list or type(items) is not list
             or not 0 < len(items) == len(raw_items) <= 40
             or any(type(x) is not str or not x.strip() for x in raw_items + items)
@@ -452,7 +460,7 @@ def prepare_review(wire_reply, expanded_reply, *, catalog: TableCatalog,
     return ReviewFrame(_json(expanded_reply), answer, template, tuple(items), tuple(immutable),
                        allowed, tuple(dict.fromkeys(citations)), targets,
                        tuple(owners), tuple(source_bodies.items()),
-                       _digest(sources_block) if sources_block else '', quote_view, quote_units, bindings, findings)
+                       _digest(sources_block) if sources_block else '', quote_view, quote_units, bindings, findings, scope_note)
 
 
 def build_messages(frame: ReviewFrame, *, question: str, response_language: str, sources_block: str):
@@ -506,6 +514,17 @@ def build_messages(frame: ReviewFrame, *, question: str, response_language: str,
         'quote text. The server inserts the literal slice; unmarked text remains source context. '
         'Use Q references only in quote_ref, never as markers in context or edits.')
     system = _ATOMIC_INSTRUCTIONS + _ATOMIC_REPRESENTATION if atomic is not None else INSTRUCTIONS + representation
+    if frame.selection_scope_note:
+        system += (
+            ' USEFUL_SELECTION: the server computed only exact selected-table mappings. '
+            'Unselected records remain unassessed; no exclusion or semantic coverage is inferred. '
+            'Check every requested category against the complete supplied sources, all selected '
+            'facts and every material qualification. The candidate begins with its immutable '
+            'selection_scope_note. Check that it is in RESPONSE_LANGUAGE and truthfully describes '
+            'a supported non-exhaustive selection, without calling unselected information '
+            'irrelevant or verified. Reject any claim of exhaustiveness or an omitted requested '
+            'category; a scope note does not waive useful category coverage. Template edits must '
+            'preserve that exact opening note. If the note itself is misleading, reject the candidate.')
     return [{'role': 'system', 'content': system}, {'role': 'user', 'content': user}]
 
 
@@ -829,6 +848,8 @@ def apply_review(first_reply, review_reply, frame: ReviewFrame):
             seen.add(target)
             if target == 'template-answer':
                 if not _has_template(text):
+                    return reject(gate='template')
+                if frame.selection_scope_note and not text.startswith(frame.selection_scope_note + '\n\n'):
                     return reject(gate='template')
                 template = text
             else:

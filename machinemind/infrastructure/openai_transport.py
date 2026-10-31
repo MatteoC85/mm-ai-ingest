@@ -14,6 +14,7 @@ from collections.abc import Callable
 from typing import Any, Optional, Type
 from machinemind.ask.phase_trace import span as _phase_span
 from machinemind.ask.request_completion import provider_timeout as _provider_timeout
+from .provider_failures import ProviderResponseError, http_failure, response_status_failure
 
 PostFn = Callable[..., Any]
 BudgetResolver = Callable[[], Any]
@@ -59,8 +60,8 @@ def response_text(data: dict) -> str:
     if parts:
         return "\n".join(parts).strip()
     if refusals:
-        raise RuntimeError("OpenAI refusal: " + " | ".join(refusals)[:500])
-    raise RuntimeError("OpenAI Responses API returned no output_text")
+        raise ProviderResponseError("refusal")
+    raise ProviderResponseError("empty_output")
 
 
 def parse_model_json(text: str, json_schema: Optional[dict]) -> Any:
@@ -111,7 +112,12 @@ def _send_json_attempt(*, url, headers, payload, timeout, post_fn, budget,
         if budget is not None:
             budget.mark_dispatched(call_index, embedding=embedding)
         response = post_fn(url, headers=headers, json=payload, timeout=timeout, allow_redirects=False)
-        data = response.json()
+        try:
+            data = response.json()
+        except ValueError:
+            if response.status_code != 200:
+                raise http_failure(response.status_code) from None
+            raise
         if budget is not None:
             usage = data.get("usage") if isinstance(data, dict) else None
             if embedding:
@@ -119,9 +125,9 @@ def _send_json_attempt(*, url, headers, payload, timeout, post_fn, budget,
             else:
                 budget.record_usage(call_index, str(payload["model"]), usage)
         if response.status_code != 200:
-            raise RuntimeError(f"OpenAI provider returned HTTP {response.status_code}")
+            raise http_failure(response.status_code)
         if not isinstance(data, dict):
-            raise RuntimeError("OpenAI provider returned non-object JSON")
+            raise ProviderResponseError("invalid_shape")
         if budget is not None:
             budget.ensure_time(0.0)  # account late result, but do not use it after cancellation
         return data
@@ -230,13 +236,13 @@ def _chat_response(messages: list[dict], *, model: str, json_schema: Optional[di
 def _chat_content(data: dict) -> str:
     choices = data.get("choices") or []
     if not choices or not isinstance(choices[0], dict):
-        raise RuntimeError("OpenAI chat returned no choices")
+        raise ProviderResponseError("empty_output")
     choice = choices[0]
     if choice.get("finish_reason") in {"length", "content_filter"}:
-        raise RuntimeError("OpenAI chat output incomplete or filtered")
+        raise ProviderResponseError("output_limit" if choice["finish_reason"] == "length" else "content_filter")
     msg = choice.get("message") or {}
     if msg.get("refusal"):
-        raise RuntimeError("OpenAI chat refusal")
+        raise ProviderResponseError("refusal")
     content = msg.get("content", "")
     if isinstance(content, list):
         return "".join(str(part.get("text", "")) for part in content if isinstance(part, dict) and part.get("type") == "text").strip()
@@ -270,10 +276,10 @@ def chat_json(messages: list[dict], *, model: Optional[str] = None, json_schema:
     try:
         text = _chat_content(data)
         if not text:
-            raise RuntimeError("OpenAI chat JSON empty response")
+            raise ProviderResponseError("empty_output")
         parsed = parse_model_json(text, json_schema)
         if not isinstance(parsed, dict):
-            raise RuntimeError("OpenAI chat structured output is not an object")
+            raise ProviderResponseError("invalid_shape")
         return parsed
     except BaseException as exc:
         if budget is not None:
@@ -327,10 +333,10 @@ def responses_json(messages: list[dict], *, model: str, json_schema: dict, effor
                           purpose=purpose)
         status = str(data.get("status") or "completed").lower()
         if status != "completed":
-            raise RuntimeError(f"OpenAI Responses status={status}")
+            raise response_status_failure(data)
         parsed = parse_model_json(response_text_fn(data), json_schema)
         if not isinstance(parsed, dict):
-            raise RuntimeError("OpenAI Responses structured output is not an object")
+            raise ProviderResponseError("invalid_shape")
         return parsed
     except BaseException as exc:
         budget.mark_call_failed(index, exc)

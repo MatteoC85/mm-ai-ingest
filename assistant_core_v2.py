@@ -25,6 +25,7 @@ from machinemind.evidence.ask_input import (
 )
 from machinemind.ask.request_scope import bind_conditions_requirements_to_question, bounded_phase_contract
 from machinemind.ask import procedure_scope as _procedure_scope
+from machinemind.ask import factual_coverage as _factual_coverage
 
 
 MODE_ASK = "ask"
@@ -241,6 +242,7 @@ class AssistantCoreDecision:
     degraded_reason: str = ""
     procedure_scope: str = ""
     procedure_phase: tuple[str, str, str] = ()
+    factual_coverage: str = "unspecified"
 
     @property
     def routed(self) -> bool:
@@ -720,6 +722,8 @@ def normalize_decision(
         router_model=_clean_text(raw.get("router_model"), 100),
         procedure_scope=procedure_scope,
         procedure_phase=procedure_phase,
+        factual_coverage=_factual_coverage.normalize(raw.get("factual_coverage"),
+            requested_mode=request.requested_mode, effective_mode=effective, request_kind=request_kind),
     ))
 
 

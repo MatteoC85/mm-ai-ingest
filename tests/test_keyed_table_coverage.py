@@ -3,6 +3,7 @@
 Source observations/model replies are fixtures, not semantic model quality.
 """
 from copy import deepcopy
+from dataclasses import replace
 import hashlib
 from pathlib import Path
 import sys
@@ -139,9 +140,10 @@ class KeyedTableCoverageTests(unittest.TestCase):
         limitation='The supplied excerpts support the following information; this is not an exhaustive list of the entire manual.'
         for missing in (False,True):
             def change(reply):
-                reply.update(answer=limitation+'\n[[FACTUAL_INVENTORY]]',table_record_coverage={'T1':'=0','T2':'=0'})
+                reply.update(answer='[[FACTUAL_INVENTORY]]',selection_scope_note=limitation,table_record_coverage=[])
                 if missing:reply['missing_facets']=['documented obligations']
             owner,f=self.case(change=change)
+            f.decision=replace(f.decision,factual_coverage='useful')
             try:
                 result=f.run()
                 if missing:

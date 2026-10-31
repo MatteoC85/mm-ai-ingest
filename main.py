@@ -38,6 +38,7 @@ from urllib.parse import urlparse, unquote
 from machinemind.ask import routing_runtime as _ask_routing_runtime
 from machinemind.ask import request_readiness as _ask_request_readiness
 from machinemind.ask import procedure_scope as _ask_procedure_scope
+from machinemind.ask import factual_coverage as _ask_factual_coverage
 from machinemind.ask import request_scope as _ask_request_scope
 
 from assistant_core_v2 import (
@@ -13908,6 +13909,7 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
         system_msg += _retrieval_precision_facts.SCALAR_TARGET_INSTRUCTION
         system_msg += _ask_request_readiness.INSTRUCTION
         system_msg += _ask_procedure_scope.INSTRUCTION
+        system_msg += _ask_factual_coverage.INSTRUCTION
     # USER_REQUEST is supplied once, unmodified. There is no precomputed
     # "observed" block that could incorrectly override a negated clause.
     epistemic_block = ""
@@ -13951,9 +13953,11 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
                 _retrieval_diagnostic_query.router_schema_with_diagnostic_basis(
                     build_router_schema(allowed_modes)
                 ) if is_root_cause else (
-                    _ask_procedure_scope.router_schema(
-                        _ask_request_readiness.router_schema(
-                            _retrieval_precision_facts.router_schema_with_scalar_target(build_router_schema(allowed_modes))
+                    _ask_factual_coverage.router_schema(
+                        _ask_procedure_scope.router_schema(
+                            _ask_request_readiness.router_schema(
+                                _retrieval_precision_facts.router_schema_with_scalar_target(build_router_schema(allowed_modes))
+                            )
                         )
                     )
                     if request.requested_mode == MODE_ASK else build_router_schema(allowed_modes)

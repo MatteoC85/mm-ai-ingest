@@ -18,6 +18,7 @@ import test_ask_conditions_family_admission as fixtures
 from assistant_core_v2 import _finish_ask_validation, _choose_monotonic_response, decorate_response
 from machinemind.ask import execution, validation, request_completion
 from machinemind.infrastructure import request_budget, openai_transport
+from machinemind.infrastructure.provider_failures import ProviderResponseError
 
 
 class AskRepairCapacityTests(unittest.TestCase):
@@ -53,7 +54,8 @@ class AskRepairCapacityTests(unittest.TestCase):
             response_text_fn=openai_transport.response_text,
             safety_identifier_fn=openai_transport.safety_identifier)
         if failed:
-            with self.assertRaisesRegex(RuntimeError, 'status=incomplete'):call()
+            with self.assertRaises(ProviderResponseError) as caught:call()
+            self.assertEqual(caught.exception.failure_code, 'response_incomplete')
         else:self.assertEqual(call(), {})
 
     def scenario(self, *, failed=False, remaining=24.48, missing_budget=False):

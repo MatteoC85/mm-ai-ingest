@@ -45,14 +45,15 @@ def table_contexts():
 
 
 class OwnedTableFixture:
-    def __init__(self, test, *, change=None, revoke=False, mutate=False, narrow=False, query=None):
+    def __init__(self, test, *, change=None, revoke=False, mutate=False, narrow=False, query=None,
+                 company_id='offline-company', machine_id='offline-machine', document_id='inspection', second_change=None):
         self.test, self.m = test, test.m
         m = self.m
         if query is None:
             query = ('Which slide inspections are documented?' if narrow else
                      'Which inspections and maintenance intervals are documented?')
         self.request = request = m.AssistantCoreRequest(query=query, requested_mode='ask',
-            response_language='en', company_id='offline-company', machine_id='offline-machine',
+            response_language='en', company_id=company_id, machine_id=machine_id,
             ai_scope='machine_all', top_k=6, allowed_effective_modes=('ask',))
         self.decision = m.AssistantCoreDecision(request_kind='factual', effective_mode='ask', confidence=.9,
             requested_mode_fit=True, evidence_state='supported', evidence_policy='evidence_required',
@@ -60,7 +61,7 @@ class OwnedTableFixture:
             required_answer_types=('checklist',), facet_queries=(m.AssistantCoreFacetQuery(
                 facet='documented obligations', answer_type='checklist', must_cover=True),))
         identity = SourceIdentity(SourceScope(request.company_id, ScopeLevel.MACHINE, request.machine_id),
-            SourceType.DOCUMENT, 'inspection', SourceFormat.UNKNOWN)
+            SourceType.DOCUMENT, document_id, SourceFormat.UNKNOWN)
         self.allowance = frozenset({identity})
         self.authorize = lambda req:self.allowance
         def invoke(callback, req, *args, **kwargs):
@@ -73,10 +74,10 @@ class OwnedTableFixture:
         bodies = [TABLE_BODY, CONDITION]
         capture = _PageReadCapture(scope, limits, 'ask_pages', snippet_chars=2000)
         capture.expect(2, 3000)
-        capture.capture([('inspection', request.machine_id, i+1, body, request.company_id, request.machine_id)
+        capture.capture([(document_id, request.machine_id, i+1, body, request.company_id, request.machine_id)
                          for i, body in enumerate(bodies)])
-        rows = [dict(bubble_document_id='inspection', page_from=i+1, page_to=i+1,
-                     citation_id='inspection:p'+str(i+1), source_type='document',
+        rows = [dict(bubble_document_id=document_id, page_from=i+1, page_to=i+1,
+                     citation_id=document_id+':p'+str(i+1), source_type='document',
                      chunk_full=body, snippet=body, similarity=.8) for i,body in enumerate(bodies)]
         reg = self.session.register(request=request, receipt=capture.finish(rows), current_allowed_sources=self.allowance)
         rows = [dict(x.record) for x in self.session.records(request=request, handles=reg.records,
@@ -102,14 +103,19 @@ class OwnedTableFixture:
             budget = request_budget._v13_current_budget()
             self.budget_ids.append(id(budget))
             if kwargs['json_schema']['name'] == 'factual_context_review':
-                reply = dict(outcome='rewrite', edits=[], citation_ids=['inspection:p1','inspection:p2'],
-                    table_contexts=table_contexts(),
+                contexts = table_contexts()
+                for context in contexts:
+                    for quote in context['source_quotes']:
+                        quote['citation_id'] = quote['citation_id'].replace('inspection:', document_id+':', 1)
+                reply = dict(outcome='rewrite', edits=[], citation_ids=[document_id+':p1',document_id+':p2'],
+                    table_contexts=contexts,
                     checks={name:True for name in factual_context_review.CHECKS}, reason='offline independent fixture')
+                if second_change is not None:second_change(reply)
                 first_sources = self.reviewer_calls[0][0][1]['content'].split('SOURCES:\n',1)[1].split('\n\nCURRENT_ANSWER:',1)[0]
                 reply = encode_context_reply(reply, messages, original_sources=first_sources)
             else:
                 reply = dict(outcome='rewrite', answer='[[FACTUAL_INVENTORY]]', reason='offline fixture',
-                    citation_ids=['inspection:p1', 'inspection:p2'], covered_facets=['documented obligations'],
+                    citation_ids=[document_id+':p1', document_id+':p2'], covered_facets=['documented obligations'],
                     missing_facets=[], covered_answer_types=['checklist'], missing_answer_types=[],
                     expected_list_items=['[[SOURCE_TABLE:G1]]', CONDITION], covered_list_items=[], missing_list_items=[],
                     table_record_coverage=['T1=0', 'T2=0'])
