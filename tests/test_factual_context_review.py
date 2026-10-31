@@ -10,6 +10,7 @@ import json
 sys.path[:0] = [str(Path(__file__).resolve().parents[1]), str(Path(__file__).resolve().parent)]
 from machinemind.ask import factual_context_review as review
 from machinemind.ask import enumeration_review, source_table_review
+from context_review_wire_fixture import original_context_sources
 
 CONTEXT = 'Scope: sliding assembly. Under heavy loading, halve the documented intervals.'
 
@@ -137,7 +138,7 @@ class FactualContextReviewTests(unittest.TestCase):
         sources=self.sources
         messages=review.build_messages(frame,question='Which maintenance is documented?',response_language='en',sources_block=sources)
         actual=messages[1]['content'].split('SOURCES:\n',1)[1].split('\n\nCOMPLETE_CANDIDATE:',1)[0]
-        self.assertEqual(actual,sources)
+        self.assertEqual(original_context_sources(actual),sources)
         view=json.loads(messages[1]['content'].split('\n\nCOMPLETE_CANDIDATE:\n',1)[1].split('\n\nCITATION_ALIASES:',1)[0])
         self.assertEqual(review._expand(view['template'],[item['text']for item in view['inventory']]),frame.answer)
         self.assertEqual([item['target']for item in view['inventory']],['item:0','item:1'])
@@ -200,7 +201,7 @@ class FactualContextReviewTests(unittest.TestCase):
             self.assertEqual(result['outcome'],'no_sources')
             self.assertEqual(result['independent_context_review']['gate'],'citation_alias')
         bad=deepcopy(wire);bad['table_contexts'][0]['source_quotes'][0]['citation_id']='S1'
-        self.assertEqual(review.apply_wire_review(first,bad,frame)['independent_context_review']['gate'],'quote_not_literal')
+        self.assertEqual(review.apply_wire_review(first,bad,frame)['independent_context_review']['gate'],'quote_source')
 
     def test_diagnostic_categories_do_not_change_semantic_or_literal_gates(self):
         _,first,frame,_=self.candidate()

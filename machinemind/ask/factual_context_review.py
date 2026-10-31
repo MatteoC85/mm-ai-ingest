@@ -8,13 +8,20 @@ from copy import deepcopy
 from dataclasses import dataclass
 import hashlib
 import json
+import re
 
 from . import enumeration_review
 from . import review_source_wire
+from . import table_units
 from .source_table_review import PREFIX, TableCatalog, _HEADER, _RECORD_ID, _escape
 
 MARKER = enumeration_review.INVENTORY_MARKER
 MAX_TEXT = 30000
+_QUOTE_MARKER = re.compile(r'\[\s*/?\s*Q\s*[0-9]*\s*\]', re.IGNORECASE)
+_QUOTE_REF = re.compile(r'Q[1-9][0-9]{0,4}')
+_SOURCE_MARKER = re.compile(
+    r'(\[PDF_TABLE_[^\]\r\n]*\]|\[TABLE_RECORD T[1-9][0-9]*\]|'
+    r'\[\[SOURCE_TABLE:[^\]\r\n]*\]\]|\[\[FACTUAL_INVENTORY\]\])')
 CHECKS = ('source_fidelity', 'scope_applicability', 'completeness',
           'safety', 'language', 'provenance')
 INSTRUCTIONS = (
@@ -39,8 +46,8 @@ INSTRUCTIONS = (
     ' TABLE_CONTEXTS: audit every TABLE_CONTEXT_TARGET exactly once, identifying '
     'the assembly/applicability only as far as SOURCES establish it and retaining '
     'all applicable qualifications outside the cells (including adjacent prose). '
-    'Give one or two short sentences of reading context and one or two exact '
-    'supporting quotations from the emitted SOURCES, including the owning source. '
+    'Give one or two short sentences of reading context and select one or two '
+    'supporting quote_ref units from SOURCES, including the owning source. '
     'The server places this context and its quotations immediately before that '
     'unchanged table group. This adds no requested intervention. Do not copy a '
     'whole source or unrelated operations. A context label saying documentary '
@@ -92,6 +99,8 @@ class ReviewFrame:
     table_owners: tuple[tuple[int, str], ...]
     source_bodies: tuple[tuple[str, str], ...]
     source_packet_sha256: str
+    quote_view: str
+    quote_units: tuple[tuple[str, str, tuple[str, ...]], ...]
 
 
 def _emitted_source_bodies(sources_block, allowed):
@@ -113,6 +122,91 @@ def _emitted_source_bodies(sources_block, allowed):
                          if not _RECORD_ID.fullmatch(line))
         rows[cid] = body
     return rows
+
+
+def _source_quote_view(sources_block, source_bodies):
+    """Annotate the existing wire without changing its dictionary or source text.
+
+    References name contiguous literal slices, not claims or semantic support.
+    Equal text may share a reference; source membership remains separate.
+    """
+    if _QUOTE_MARKER.search(sources_block):
+        raise ValueError('factual_context_review_invalid')
+    units, owners, out = {}, {}, []
+
+    def mark(part):
+        if any(prefix in part for prefix in (PREFIX, enumeration_review.INVENTORY_PREFIX,
+                                             '[TABLE_RECORD ', '[PDF_TABLE_')):
+            return part
+        result = []
+        while part:
+            boundary = min(480, len(part))
+            if boundary < len(part):
+                space = max(part.rfind(' ', 0, boundary + 1), part.rfind('\t', 0, boundary + 1))
+                if space > 0:
+                    boundary = space
+            piece, part = part[:boundary], part[boundary:]
+            literal = piece.strip()
+            membership = tuple(cid for cid, body in source_bodies.items() if literal and literal in body)
+            if not membership:
+                result.append(piece)
+                continue
+            ref = units.setdefault(literal, 'Q' + str(len(units) + 1))
+            owners[ref] = membership
+            left = len(piece) - len(piece.lstrip())
+            result.append(piece[:left] + '[' + ref + ']' + literal + '[/Q]' + piece[left + len(literal):])
+        return ''.join(result)
+
+    compressed = sources_block.startswith(review_source_wire._START)
+    records = not compressed
+    for line in review_source_wire._lines(sources_block):
+        text = line.rstrip('\r\n')
+        ending = line[len(text):]
+        if compressed and text == review_source_wire._RECORDS.rstrip('\n'):
+            records = True
+            out.append(line)
+            continue
+        dictionary = re.fullmatch(r'(@[1-9][0-9]*=)(.*)', text) if compressed and not records else None
+        prefix = ''
+        if dictionary:
+            prefix, text = dictionary.groups()
+        elif (not records or _HEADER.fullmatch(text) or _RECORD_ID.fullmatch(text)
+                or (compressed and re.fullmatch(r'@[1-9][0-9]*', text))):
+            out.append(line)
+            continue
+        out.append(prefix)
+        if '[PDF_TABLE_' in text:
+            # Keep all geometry visible but quote only the existing literal
+            # JSON value spans. No decoding, header inheritance or row joining.
+            match = table_units._LINE.fullmatch(text)
+            cells = None
+            if match:
+                first, last, columns = int(match[2]), int(match[3] or match[2]), int(match[4])
+                if 1 <= first <= last <= 100000 and 1 <= columns <= 256:
+                    try:
+                        cells = table_units._cells(match[5], match.start(5), first, last, columns)
+                    except (ValueError, TypeError):
+                        pass
+            pos = 0
+            for cell in cells or ():
+                start, end = cell['span']
+                out.append(text[pos:start + 1])
+                out.append(mark(text[start + 1:end - 1]))
+                pos = end - 1
+            out.append(text[pos:] + ending)
+            continue
+        for part in _SOURCE_MARKER.split(text):
+            if not part:
+                continue
+            if _SOURCE_MARKER.fullmatch(part):
+                out.append(part)
+                continue
+            out.append(mark(part))
+        out.append(ending)
+    view = ''.join(out)
+    if _QUOTE_MARKER.sub('', view) != sources_block:
+        raise ValueError('factual_context_review_invalid')
+    return view, tuple((ref, literal, owners[ref]) for literal, ref in units.items())
 
 
 def prepare_review(wire_reply, expanded_reply, *, catalog: TableCatalog,
@@ -145,6 +239,8 @@ def prepare_review(wire_reply, expanded_reply, *, catalog: TableCatalog,
             immutable.append(i)
         elif raw != item:
             raise invalid
+    if immutable and any(_QUOTE_MARKER.search(value) for value in (answer, template, *items)):
+        raise invalid
     if type(admitted_citation_ids) not in (tuple, list, set, frozenset):
         raise invalid
     if any(type(cid) is not str or not cid for cid in admitted_citation_ids):
@@ -177,16 +273,20 @@ def prepare_review(wire_reply, expanded_reply, *, catalog: TableCatalog,
                 or template != answer):
             raise invalid
         targets = ()
+    quote_view, quote_units = _source_quote_view(sources_block, source_bodies) if immutable else (sources_block, ())
     return ReviewFrame(_json(expanded_reply), answer, template, tuple(items), tuple(immutable),
                        allowed, tuple(dict.fromkeys(citations)), targets,
                        tuple(owners), tuple(source_bodies.items()),
-                       _digest(sources_block) if sources_block else '')
+                       _digest(sources_block) if sources_block else '', quote_view, quote_units)
 
 
 def build_messages(frame: ReviewFrame, *, question: str, response_language: str, sources_block: str):
     if type(frame) is not ReviewFrame or any(type(x) is not str for x in (question, response_language, sources_block)):
         raise ValueError('factual_context_review_invalid')
     if frame.source_packet_sha256 and _digest(sources_block) != frame.source_packet_sha256:
+        raise ValueError('factual_context_review_invalid')
+    if (frame.table_owners and _QUOTE_MARKER.sub('', frame.quote_view) != sources_block
+            or not frame.table_owners and frame.quote_view != sources_block):
         raise ValueError('factual_context_review_invalid')
     aliases = _citation_aliases(frame)
     reverse = {cid: alias for alias, cid in aliases.items()}
@@ -200,7 +300,7 @@ def build_messages(frame: ReviewFrame, *, question: str, response_language: str,
         # No-marker prose stays a complete, read-only candidate.
         view = {'read_only_answer': frame.answer}
     user = ('QUESTION:\n' + question + '\n\nRESPONSE_LANGUAGE: ' + response_language
-        + '\n\nSOURCES:\n' + sources_block + '\n\nCOMPLETE_CANDIDATE:\n' + _json(view)
+        + '\n\nSOURCES:\n' + frame.quote_view + '\n\nCOMPLETE_CANDIDATE:\n' + _json(view)
         + '\n\nCITATION_ALIASES:\n' + _json(aliases)
         + '\n\nTABLE_CONTEXT_TARGETS:\n' + json.dumps([
             {'target': 'item:' + str(index), 'citation_id': reverse[cid]}
@@ -213,7 +313,11 @@ def build_messages(frame: ReviewFrame, *, question: str, response_language: str,
         'or template-answer, retaining its inventory marker. read_only_answer is immutable prose. '
         'For citation_ids and source_quotes.citation_id use only CITATION_ALIASES keys; '
         'they denote unchanged original source IDs. All quotation, applicability, limitation '
-        'and safety obligations remain unchanged.')
+        'and safety obligations remain unchanged. '
+        'SOURCES [Qn]...[/Q] marks an exact quote_ref unit; existing @n dictionary references '
+        'expand with these markers intact. Select Qn present in the cited source, never copy '
+        'quote text. The server inserts the literal slice; unmarked text remains source context. '
+        'Use Q references only in quote_ref, never as markers in context or edits.')
     return [{'role': 'system', 'content': INSTRUCTIONS + representation}, {'role': 'user', 'content': user}]
 
 
@@ -247,8 +351,8 @@ def schema(frame: ReviewFrame):
                             'items': {'type': 'object', 'additionalProperties': False,
                                 'properties': {
                                     'citation_id': {'type': 'string', 'enum': list(_citation_aliases(frame))},
-                                    'quote': {'type': 'string', 'minLength': 1, 'maxLength': 480}},
-                                'required': ['citation_id', 'quote']}}},
+                                    'quote_ref': {'type': 'string', 'pattern': '^Q[1-9][0-9]{0,4}$'}},
+                                'required': ['citation_id', 'quote_ref']}}},
                     'required': ['target', 'context', 'documentary_limits_checked', 'source_quotes']}},
             'checks': {'type': 'object', 'additionalProperties': False,
                        'properties': {key: {'type': 'boolean'} for key in CHECKS}, 'required': list(CHECKS)},
@@ -300,7 +404,7 @@ def _rejected(first_reply, *, reason='factual_context_review_invalid', outcome='
 
 
 def apply_wire_review(first_reply, review_reply, frame: ReviewFrame):
-    """Decode only frame-owned aliases, then apply the unchanged canonical gates."""
+    """Decode frame-owned aliases/slices, then apply unchanged canonical gates."""
     if type(frame) is not ReviewFrame or type(review_reply) is not dict:
         return _rejected(first_reply)
     citations, contexts = review_reply.get('citation_ids'), review_reply.get('table_contexts')
@@ -311,16 +415,30 @@ def apply_wire_review(first_reply, review_reply, frame: ReviewFrame):
         return _rejected(first_reply, gate='citation_alias')
     decoded = deepcopy(review_reply)
     decoded['citation_ids'] = [aliases[cid] for cid in citations]
+    quote_units = {ref: (literal, owners) for ref, literal, owners in frame.quote_units}
+    if frame.table_owners and decoded.get('outcome') in {'pass', 'rewrite'}:
+        for edit in decoded.get('edits', []) if type(decoded.get('edits')) is list else ():
+            if type(edit) is dict and type(edit.get('text')) is str and _QUOTE_MARKER.search(edit['text']):
+                return _rejected(first_reply, gate='edit_target')
     for audit in decoded['table_contexts']:
         if type(audit) is not dict or type(audit.get('source_quotes')) is not list:
             return _rejected(first_reply, gate='table_shape')
+        if (frame.table_owners and decoded.get('outcome') in {'pass', 'rewrite'}
+                and type(audit.get('context')) is str and _QUOTE_MARKER.search(audit['context'])):
+            return _rejected(first_reply, gate='table_marker')
         for quote in audit['source_quotes']:
-            if type(quote) is not dict:
+            if (type(quote) is not dict or set(quote) != {'citation_id', 'quote_ref'}
+                    or type(quote.get('quote_ref')) is not str or not _QUOTE_REF.fullmatch(quote['quote_ref'])):
                 return _rejected(first_reply, gate='quote_shape')
             alias = quote.get('citation_id')
             if type(alias) is not str or alias not in aliases:
                 return _rejected(first_reply, gate='citation_alias')
-            quote['citation_id'] = aliases[alias]
+            cid = aliases[alias]
+            unit = quote_units.get(quote['quote_ref'])
+            if unit is None or cid not in unit[1]:
+                return _rejected(first_reply, gate='quote_source')
+            quote.clear()
+            quote.update(citation_id=cid, quote=unit[0])
     return apply_review(first_reply, decoded, frame)
 
 

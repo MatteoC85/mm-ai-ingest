@@ -15,7 +15,7 @@ from unittest.mock import patch
 
 sys.path[:0] = [str(Path(__file__).resolve().parents[1]), str(Path(__file__).resolve().parent)]
 import test_ask_prepared_scope_admission as shared
-from context_review_wire_fixture import encode_context_reply
+from context_review_wire_fixture import encode_context_reply, original_context_sources
 from test_lineage_copy_reuse import fixture as limits_fixture
 from machinemind.ask import execution, validation, response_evidence, review_source_wire, factual_context_review
 from machinemind.evidence.contracts import EvidenceContractError, SourceIdentity, SourceScope, SourceType, SourceFormat, ScopeLevel
@@ -195,7 +195,7 @@ class AskSourceFirstInventoryTests(unittest.TestCase):
                 if options.get('mutate'):
                     first=h.reviewer_calls[0][0][1]['content'].split('SOURCES:\n',1)[1].split('\n\nCURRENT_ANSWER:',1)[0]
                     second=h.reviewer_calls[1][0][1]['content'].split('SOURCES:\n',1)[1].split('\n\nCOMPLETE_CANDIDATE:',1)[0]
-                    self.assertEqual(first,second)
+                    self.assertEqual(first,original_context_sources(second))
                 self.assertFalse(h.owner._response_flow.completed)
                 h.close();owner.close()
 

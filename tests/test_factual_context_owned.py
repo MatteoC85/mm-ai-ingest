@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 sys.path[:0] = [str(Path(__file__).resolve().parents[1]), str(Path(__file__).resolve().parent)]
 import test_source_table_owned as table_fixture
-from context_review_wire_fixture import encode_context_reply, assembled_context_candidate
+from context_review_wire_fixture import encode_context_reply, assembled_context_candidate, original_context_sources
 from machinemind.ask import factual_context_review, request_completion
 from machinemind.ask.response_evidence import ResponseEvidenceError
 from machinemind.evidence.contracts import EvidenceContractError
@@ -125,7 +125,7 @@ class FactualContextOwnedTests(unittest.TestCase):
         self.assertEqual({c['budget_id'] for c in f.calls},{id(completion.budget)})
         first_sources = source_packet(f.calls[0]['messages'][1]['content'],'\n\nCURRENT_ANSWER:')
         second_sources = source_packet(f.calls[1]['messages'][1]['content'],'\n\nCOMPLETE_CANDIDATE:')
-        self.assertEqual(first_sources,second_sources)
+        self.assertEqual(first_sources,original_context_sources(second_sources))
         self.assertNotIn('SOURCE_TABLE_PREVIEWS',f.calls[1]['messages'][1]['content'])
         self.assertNotIn('offline first fixture',f.calls[1]['messages'][1]['content'])
         self.assertEqual(contract['semantic_verifier']['outcome'],'rewrite')
@@ -187,7 +187,7 @@ class FactualContextOwnedTests(unittest.TestCase):
                 row=completion.contract_checks[-1]
                 self.assertEqual(row['independent_review_gate'],[
                     'model_rejected','checks_false','edit_target','citation_set','citation_alias',
-                    'edit_target','table_count','table_target','quote_not_literal','quote_not_literal',
+                    'edit_target','table_count','table_target','quote_source','quote_source',
                     'documentary_limits_unchecked'][index])
                 self.assertEqual(len(f.post_calls),2)
                 f.close(); completion.close()

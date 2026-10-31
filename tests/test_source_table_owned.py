@@ -16,7 +16,7 @@ import unittest
 
 sys.path[:0] = [str(Path(__file__).resolve().parents[1]), str(Path(__file__).resolve().parent)]
 import test_ask_source_first_inventory as shared
-from context_review_wire_fixture import encode_context_reply
+from context_review_wire_fixture import encode_context_reply, original_context_sources
 from machinemind.ask import execution, validation, request_completion, factual_context_review
 from machinemind.ask.response_evidence import ResponseEvidenceError
 from machinemind.evidence.contracts import EvidenceContractError, SourceIdentity, SourceScope, SourceType, SourceFormat, ScopeLevel
@@ -241,7 +241,7 @@ class SourceTableOwnedTests(unittest.TestCase):
             if options.get('mutate'):
                 first=f.reviewer_calls[0][0][1]['content'].split('SOURCES:\n',1)[1].split('\n\nCURRENT_ANSWER:',1)[0]
                 second=f.reviewer_calls[1][0][1]['content'].split('SOURCES:\n',1)[1].split('\n\nCOMPLETE_CANDIDATE:',1)[0]
-                self.assertEqual(first,second)
+                self.assertEqual(first,original_context_sources(second))
             self.assertFalse(f.owner._response_flow.completed)
             f.close(); completion.close()
 

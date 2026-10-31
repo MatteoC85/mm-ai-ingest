@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 sys.path[:0] = [str(Path(__file__).resolve().parents[1]), str(Path(__file__).resolve().parent)]
 import test_factual_list_review as shared
-from context_review_wire_fixture import encode_context_reply
+from context_review_wire_fixture import encode_context_reply, original_context_sources
 from machinemind.ask import execution, enumeration_review, final_contract, review_source_wire, factual_context_review
 
 
@@ -92,7 +92,7 @@ class FactualTableInventoryTests(unittest.TestCase):
                              min(4000,max(3200,m.V13_FAST_MAX_OUTPUT_TOKENS)))
             first=seen[0][0][1]['content'].split('SOURCES:\n',1)[1].split('\n\nCURRENT_ANSWER:',1)[0]
             second=seen[1][0][1]['content'].split('SOURCES:\n',1)[1].split('\n\nCOMPLETE_CANDIDATE:',1)[0]
-            self.assertEqual(first,second)
+            self.assertEqual(first,original_context_sources(second))
         self.assertEqual(rows,original)
         if not complete_catalog:
             self.assertNotIn('SOURCE_TABLE_PREVIEWS',seen[0][0][1]['content'])
