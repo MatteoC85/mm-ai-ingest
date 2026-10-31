@@ -28,6 +28,28 @@ class LexicalMultiQueryRuntime:
     dedup_citations: Callable[..., list[dict]]
 
 
+def _legacy_source_binding(row: tuple, document_id: str, *, company_id: str,
+                           machine_id: str, doc_ids, bubble_document_id) -> dict:
+    """Keep the actual scoped SQL association; never infer it from selection."""
+    stored_company, stored_machine = row[-2:]
+    if (type(stored_company) is not str or not stored_company.strip()
+            or (stored_machine is not None and type(stored_machine) is not str)
+            or (stored_machine not in (None, "") and not stored_machine.strip())):
+        raise ChunkReadBindingError("invalid stored lexical source binding")
+    # Mirror the SQL selector precedence: a document list wins; a falsy
+    # single-document value supplies no selector at all.
+    single_document = bubble_document_id if not doc_ids and bubble_document_id else None
+    explicit = bool(doc_ids or single_document)
+    selector = None if machine_id in (None, "") else machine_id
+    scope = ChunkReadScope(company_id, selector,
+        "document_ids" if explicit else "machine_all" if selector else "company_general",
+        tuple(doc_ids or ()), single_document)
+    if not scope.permits(stored_company, stored_machine, document_id):
+        raise ChunkReadBindingError("lexical source outside resolved SQL scope")
+    return {"company_id": stored_company, "machine_id": stored_machine,
+            "exact_machine_scope": bool(stored_machine) and stored_machine == machine_id}
+
+
 def build_prefix_tsquery_from_texts(texts: list[str], limit: int = 10, *, normalize_unicode: Callable[[str], str]) -> Optional[str]:
     _normalize_unicode_advanced = normalize_unicode
     stopwords = {
@@ -73,7 +95,7 @@ def fts_search_chunks_prefix(
     runtime: LexicalRuntime,
     build_prefix_query: Callable[..., Optional[str]],
 ) -> list[dict]:
-    """Unchanged legacy view; no canonical conversion is activated here."""
+    """Legacy text view with DB-owned scope metadata; no canonical conversion."""
     return _read_fts_search_chunks_prefix(
         company_id, machine_id, texts, top_k, doc_ids, bubble_document_id,
         runtime=runtime, build_prefix_query=build_prefix_query,
@@ -113,7 +135,7 @@ def _read_fts_search_chunks_prefix(
     _build_prefix_tsquery_from_texts = build_prefix_query
     _db_conn = runtime.connect_db
     ASK_SNIPPET_CHARS = runtime.snippet_chars
-    binding_columns = ", company_id AS evidence_company_id, machine_id AS evidence_machine_id" if include_binding_columns else ""
+    binding_columns = ", company_id AS evidence_company_id, machine_id AS evidence_machine_id"
     ts_query = _build_prefix_tsquery_from_texts(texts, limit=10)
     if not ts_query:
         return [], []
@@ -155,12 +177,12 @@ def _read_fts_search_chunks_prefix(
                 [ASK_SNIPPET_CHARS, ts_query, *params, ts_query, top_k],
             )
             rows = cur.fetchall()
+            source_rows = rows
             bound_rows = rows if include_binding_columns else []
-            if include_binding_columns:
-                rows = strip_binding_columns(rows, width=6)
+            rows = strip_binding_columns(rows, width=6)
 
         out: list[dict] = []
-        for (bdid, chunk_index, page_from, page_to, snippet, _rank) in rows:
+        for index, (bdid, chunk_index, page_from, page_to, snippet, _rank) in enumerate(rows):
             citation_id = f"{bdid}:p{int(page_from)}-{int(page_to)}:c{int(chunk_index)}"
             out.append(
                 {
@@ -173,6 +195,10 @@ def _read_fts_search_chunks_prefix(
                     "similarity": 0.0,
                 }
             )
+            if not include_binding_columns:
+                out[-1].update(_legacy_source_binding(source_rows[index], str(bdid),
+                    company_id=company_id, machine_id=machine_id,
+                    doc_ids=doc_ids, bubble_document_id=bubble_document_id))
         return out, bound_rows
     finally:
         conn.close()
@@ -225,7 +251,7 @@ def _read_fts_search_chunks(
 ) -> tuple[list[dict], list[tuple]]:
     _db_conn = runtime.connect_db
     ASK_SNIPPET_CHARS = runtime.snippet_chars
-    binding_columns = ", company_id AS evidence_company_id, machine_id AS evidence_machine_id" if include_binding_columns else ""
+    binding_columns = ", company_id AS evidence_company_id, machine_id AS evidence_machine_id"
     q = (q or "").strip()
     if not q:
         return [], []
@@ -267,12 +293,12 @@ def _read_fts_search_chunks(
                 [ASK_SNIPPET_CHARS, q, *params, q, top_k],
             )
             rows = cur.fetchall()
+            source_rows = rows
             bound_rows = rows if include_binding_columns else []
-            if include_binding_columns:
-                rows = strip_binding_columns(rows, width=6)
+            rows = strip_binding_columns(rows, width=6)
 
             out: list[dict] = []
-            for (bdid, chunk_index, page_from, page_to, snippet, _rank) in rows:
+            for index, (bdid, chunk_index, page_from, page_to, snippet, _rank) in enumerate(rows):
                 citation_id = f"{bdid}:p{int(page_from)}-{int(page_to)}:c{int(chunk_index)}"
                 out.append(
                     {
@@ -285,6 +311,10 @@ def _read_fts_search_chunks(
                         "similarity": 0.0,
                     }
                 )
+                if not include_binding_columns:
+                    out[-1].update(_legacy_source_binding(source_rows[index], str(bdid),
+                        company_id=company_id, machine_id=machine_id,
+                        doc_ids=doc_ids, bubble_document_id=bubble_document_id))
             return out, bound_rows
     finally:
         conn.close()

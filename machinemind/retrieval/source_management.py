@@ -505,7 +505,9 @@ def candidate_source_bias(item: dict, query_terms: set[str], *, query_style: str
         "source_type": source_type,
         "overlap_score": overlap,
         "content_term_count": len(text_terms),
-        "exact_machine_scope": exact_machine_scope,
+        # Scope is producer provenance, not a ranking result. The caller keeps
+        # its original true/false/absent field; missing must not become false
+        # and erase a verified binding in a later cross-query merge.
         "scope_bonus": float(SEMANTIC_EXACT_MACHINE_BONUS or 0.0) if exact_machine_scope else 0.0,
     }
 
