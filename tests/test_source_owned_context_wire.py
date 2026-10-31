@@ -74,14 +74,14 @@ class SourceOwnedContextWireTests(unittest.TestCase):
         self.assertEqual([item['text'] for item in view['inventory']],list(frame.items))
         self.assertEqual(assembled_context_candidate(messages),first['answer'])
 
-    def test_enum_capacity_fallback_preserves_all_units_sources_and_previous_protocol(self):
+    def test_enum_capacity_fallback_preserves_all_units_sources_and_uniform_citations(self):
         helper=quote_fixture.SourceQuoteReferencesTests()
         _,value,sources,_,first,frame=helper.table_frame('\n'.join('Distinct literal item '+str(i) for i in range(600)))
         self.assertGreater(sum(len(owners) for _,_,owners in frame.quote_units),1000)
         self.assertIsNone(review._atomic_references(frame))
         schema=review.schema(frame)['schema']['properties']
-        self.assertIn('citation_ids',schema)
-        self.assertNotIn('additional_citation_ids',schema)
+        self.assertIn('additional_citation_ids',schema)
+        self.assertNotIn('citation_ids',schema)
         self.assertIn('quote_ref',schema['table_contexts']['items']['properties']['source_quotes']['items']['properties'])
         messages=review.build_messages(frame,question='q',response_language='en',sources_block=sources)
         self.assertIn('CITATION_ALIASES',messages[1]['content'])

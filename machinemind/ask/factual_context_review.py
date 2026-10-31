@@ -55,8 +55,9 @@ INSTRUCTIONS = (
     'inventory entries, changing only accepted non-table item edits. Return pass '
     'only for the unchanged complete safe candidate, with no edits. Return rewrite '
     'only if the assembled revised candidate meets all six checks. Otherwise return '
-    'no_sources. Preserve all current citation IDs and cite additional support only '
-    'from SOURCES. A read_only_answer candidate permits no edits: '
+    'no_sources. Current citations remain preserved by the server. Cite only extra '
+    'support through additional_citation_ids from SOURCES. Sources explicitly selected '
+    'by valid quotation references are also added by the server. A read_only_answer candidate permits no edits: '
     'return pass or no_sources, never rewrite. Return only the strict JSON object.'
     ' TABLE_CONTEXTS: audit every TABLE_CONTEXT_TARGET exactly once, identifying '
     'the assembly/applicability only as far as SOURCES establish it and retaining '
@@ -107,8 +108,6 @@ INSTRUCTIONS = (
 ) + enumeration_review.INFORMATIONAL_SCOPE_INSTRUCTIONS
 
 _ATOMIC_INSTRUCTIONS = (INSTRUCTIONS
-    .replace('Preserve all current citation IDs and cite additional support only from SOURCES.',
-             'Current citations remain preserved. Cite support for edits through additional_citation_ids only from SOURCES.')
     .replace('supporting quote_ref units from SOURCES', 'supporting source_quotes references from the schema')
     .replace('This adds no requested intervention. ', '')
     .replace('because the qualified contexts are additions; all six checks concern that final assembled answer.',
@@ -508,7 +507,7 @@ def build_messages(frame: ReviewFrame, *, question: str, response_language: str,
         '[[FACTUAL_INVENTORY]] by the ordered inventory texts, each prefixed by "- ". '
         'Judge that entire assembled answer against QUESTION. Edit only non-immutable item targets '
         'or template-answer, retaining its inventory marker. read_only_answer is immutable prose. '
-        'For citation_ids and source_quotes.citation_id use only CITATION_ALIASES keys; '
+        'For additional_citation_ids and source_quotes.citation_id use only CITATION_ALIASES keys; '
         'they denote unchanged original source IDs. All quotation, applicability, limitation '
         'and safety obligations remain unchanged. '
         'SOURCES [Qn]...[/Q] marks an exact quote_ref unit; existing @n dictionary references '
@@ -659,7 +658,7 @@ def _wire_schema(frame: ReviewFrame, refs=None, bound=None):
                 'type': 'object', 'additionalProperties': False,
                 'properties': {'target': target, 'text': {'type': 'string', 'minLength': 1, 'maxLength': 4000}},
                 'required': ['target', 'text']}},
-            'citation_ids': {'type': 'array', 'maxItems': len(frame.admitted_citation_ids),
+            'additional_citation_ids': {'type': 'array', 'maxItems': len(frame.admitted_citation_ids),
                              'items': {'type': 'string', 'enum': list(_citation_aliases(frame))}},
             'table_contexts': {'type': 'array', 'maxItems': len(_context_targets(frame)), 'items': {
                     'type': 'object', 'additionalProperties': False,
@@ -676,12 +675,9 @@ def _wire_schema(frame: ReviewFrame, refs=None, bound=None):
             'checks': {'type': 'object', 'additionalProperties': False,
                        'properties': {key: {'type': 'boolean'} for key in CHECKS}, 'required': list(CHECKS)},
             'reason': {'type': 'string', 'maxLength': 500, 'enum': list(DECISION_REASONS)}},
-        'required': ['outcome', 'edits', 'citation_ids', 'table_contexts', 'checks', 'reason']}}
+        'required': ['outcome', 'edits', 'additional_citation_ids', 'table_contexts', 'checks', 'reason']}}
     if refs is not None:
         properties = result['schema']['properties']
-        properties['additional_citation_ids'] = properties.pop('citation_ids')
-        result['schema']['required'] = ['additional_citation_ids' if key == 'citation_ids' else key
-                                        for key in result['schema']['required']]
         properties['table_contexts']['items']['properties']['source_quotes']['items'] = {
             'type': 'string', 'enum': list(refs)}
         if bound is not None:
@@ -810,10 +806,9 @@ def apply_wire_review(first_reply, review_reply, frame: ReviewFrame):
         return _rejected(first_reply)
     atomic = _atomic_references(frame)
     bound = _bound_context_references(frame, atomic)
-    citation_key = 'additional_citation_ids' if atomic is not None else 'citation_ids'
-    if atomic is not None and 'citation_ids' in review_reply:
+    if 'citation_ids' in review_reply:
         return _rejected(first_reply)
-    citations, contexts = review_reply.get(citation_key), review_reply.get('table_contexts')
+    citations, contexts = review_reply.get('additional_citation_ids'), review_reply.get('table_contexts')
     if type(citations) is not list:
         return _rejected(first_reply)
     if bound is not None:
@@ -850,8 +845,7 @@ def apply_wire_review(first_reply, review_reply, frame: ReviewFrame):
     decoded = deepcopy(review_reply)
     decoded['table_contexts'] = deepcopy(contexts)
     explicit_citations = [aliases[cid] for cid in citations]
-    if atomic is not None:
-        del decoded['additional_citation_ids']
+    del decoded['additional_citation_ids']
     decoded['citation_ids'] = explicit_citations
     quoted_sources = []
     quote_units = {ref: (literal, owners) for ref, literal, owners in frame.quote_units}
@@ -889,13 +883,14 @@ def apply_wire_review(first_reply, review_reply, frame: ReviewFrame):
                 return _rejected(first_reply, gate='quote_source')
             quote.clear()
             quote.update(citation_id=cid, quote=unit[0])
+            quoted_sources.append(cid)
             canonical_quotes.append(quote)
         audit['source_quotes'] = canonical_quotes
-    if atomic is not None:
-        # Every addition is explicitly selected in a bound reference or the
-        # extra-support field. No unseen source or inferred citation is added.
-        decoded['citation_ids'] = list(dict.fromkeys(
-            (*frame.current_citation_ids, *quoted_sources, *explicit_citations)))
+    # Citation bookkeeping is identical in every wire representation. Every
+    # addition was explicitly selected in a validated quotation or extra-support
+    # field; preserving the existing frame adds no source authority or approval.
+    decoded['citation_ids'] = list(dict.fromkeys(
+        (*frame.current_citation_ids, *quoted_sources, *explicit_citations)))
     return apply_review(first_reply, decoded, frame)
 
 

@@ -65,9 +65,7 @@ def encode_context_reply(reply, messages, *, source_ids=None, original_sources=N
         assert ref not in refs or refs[ref] == literal
         refs[ref] = literal
     by_literal = {literal: ref for ref, literal in refs.items()}
-    out['citation_ids'] = [reverse.get(cid, cid) for cid in out['citation_ids']]
-    if atomic:
-        out['additional_citation_ids'] = out.pop('citation_ids')
+    out['additional_citation_ids'] = [reverse.get(cid, cid) for cid in out.pop('citation_ids')]
     for context in out.get('table_contexts', []):
         pairs = []
         for quote in context['source_quotes']:
