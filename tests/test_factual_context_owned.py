@@ -55,7 +55,8 @@ class ContextFixture(table_fixture.OwnedTableFixture):
                          'table_contexts':table_fixture.table_contexts(),
                          'checks':{name:True for name in factual_context_review.CHECKS}, 'reason':'offline independent fixture'}
                 if second is not None:second(reply)
-                reply = encode_context_reply(reply, messages)
+                first_sources = source_packet(self.calls[0]['messages'][1]['content'],'\n\nCURRENT_ANSWER:')
+                reply = encode_context_reply(reply, messages, original_sources=first_sources)
             else:
                 reply = dict(outcome='rewrite', answer='[[FACTUAL_INVENTORY]]', reason='offline first fixture',
                     citation_ids=['inspection:p1','inspection:p2'], covered_facets=['documented obligations'],
@@ -125,7 +126,7 @@ class FactualContextOwnedTests(unittest.TestCase):
         self.assertEqual({c['budget_id'] for c in f.calls},{id(completion.budget)})
         first_sources = source_packet(f.calls[0]['messages'][1]['content'],'\n\nCURRENT_ANSWER:')
         second_sources = source_packet(f.calls[1]['messages'][1]['content'],'\n\nCOMPLETE_CANDIDATE:')
-        self.assertEqual(first_sources,original_context_sources(second_sources))
+        self.assertEqual(first_sources,original_context_sources(second_sources,first_sources))
         self.assertNotIn('SOURCE_TABLE_PREVIEWS',f.calls[1]['messages'][1]['content'])
         self.assertNotIn('offline first fixture',f.calls[1]['messages'][1]['content'])
         self.assertEqual(contract['semantic_verifier']['outcome'],'rewrite')
@@ -161,7 +162,6 @@ class FactualContextOwnedTests(unittest.TestCase):
             lambda r:r.update(outcome='no_sources'),
             lambda r:r['checks'].update(safety=False),
             lambda r:r.update(outcome='rewrite',edits=[{'target':'item:0','text':'Grease the slide every day.'}]),
-            lambda r:r.update(citation_ids=['inspection:p2']),
             lambda r:r.update(citation_ids=['foreign-tenant:p1','inspection:p2']),
             lambda r:r.update(outcome='rewrite',edits=[{'target':'item:1','text':'[[SOURCE_TABLE:G1]]'}]),
             lambda r:r.update(table_contexts=[]),
@@ -173,7 +173,7 @@ class FactualContextOwnedTests(unittest.TestCase):
         for index,change in enumerate(changes):
             with self.subTest(case=index):
                 completion, f = self.case(second=change,debug=True)
-                if index in (0,1,10):
+                if index in (0,1,9):
                     result=f.run()
                     self.assertEqual(result['status'],'no_sources')
                     self.assertEqual(result.get('citations') or [],[])
@@ -186,11 +186,20 @@ class FactualContextOwnedTests(unittest.TestCase):
                     self.assertNotIn(FIRST_ITEM,json.dumps(terminal))
                 row=completion.contract_checks[-1]
                 self.assertEqual(row['independent_review_gate'],[
-                    'model_rejected','checks_false','edit_target','citation_set','citation_alias',
+                    'model_rejected','checks_false','edit_target','citation_alias',
                     'edit_target','table_count','table_target','quote_source','quote_source',
                     'documentary_limits_unchecked'][index])
                 self.assertEqual(len(f.post_calls),2)
                 f.close(); completion.close()
+
+    def test_atomic_quote_and_current_citations_need_not_be_repeated_as_additional_ids(self):
+        completion, f = self.case(second=lambda r:r.update(citation_ids=[]))
+        result=f.run()
+        self.assert_bound(result,f)
+        self.assertEqual(len(f.post_calls),2)
+        self.assertIn('additional_citation_ids',f.calls[1]['kwargs']['json_schema']['schema']['required'])
+        self.assertIn(table_fixture.TABLE_QUALIFIER,result['answer'])
+        self.assertEqual({c['citation_id']for c in result['citations']},{'inspection:p1','inspection:p2'})
 
     def test_rejected_or_malformed_first_reply_does_not_trigger_second_review(self):
         changes=[lambda r:r.update(outcome='no_sources'),

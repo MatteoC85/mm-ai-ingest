@@ -138,8 +138,8 @@ class FactualContextReviewTests(unittest.TestCase):
         sources=self.sources
         messages=review.build_messages(frame,question='Which maintenance is documented?',response_language='en',sources_block=sources)
         actual=messages[1]['content'].split('SOURCES:\n',1)[1].split('\n\nCOMPLETE_CANDIDATE:',1)[0]
-        self.assertEqual(original_context_sources(actual),sources)
-        view=json.loads(messages[1]['content'].split('\n\nCOMPLETE_CANDIDATE:\n',1)[1].split('\n\nCITATION_ALIASES:',1)[0])
+        self.assertEqual(original_context_sources(actual,sources),sources)
+        view=json.loads(messages[1]['content'].split('\n\nCOMPLETE_CANDIDATE:\n',1)[1].split('\n\n',1)[0])
         self.assertEqual(review._expand(view['template'],[item['text']for item in view['inventory']]),frame.answer)
         self.assertEqual([item['target']for item in view['inventory']],['item:0','item:1'])
         self.assertEqual([item['immutable']for item in view['inventory']],[True,False])
@@ -192,15 +192,15 @@ class FactualContextReviewTests(unittest.TestCase):
         _,first,frame,_=self.candidate()
         messages=review.build_messages(frame,question='Maintenance?',response_language='en',sources_block=self.sources)
         canonical=self.verdict(citations=['manual:p1','manual:p2'])
-        wire=encode_context_reply(canonical,messages)
-        self.assertEqual(wire['citation_ids'],['S0','S1'])
+        wire=encode_context_reply(canonical,messages,source_ids=frame.admitted_citation_ids)
+        self.assertEqual(wire['additional_citation_ids'],['S0','S1'])
         self.assertEqual(review.apply_wire_review(first,wire,frame),review.apply_review(first,canonical,frame))
         for foreign in ('S01','S9','manual:p1','S0 extra'):
-            bad=deepcopy(wire);bad['table_contexts'][0]['source_quotes'][0]['citation_id']=foreign
+            bad=deepcopy(wire);bad['additional_citation_ids'][0]=foreign
             result=review.apply_wire_review(first,bad,frame)
             self.assertEqual(result['outcome'],'no_sources')
             self.assertEqual(result['independent_context_review']['gate'],'citation_alias')
-        bad=deepcopy(wire);bad['table_contexts'][0]['source_quotes'][0]['citation_id']='S1'
+        bad=deepcopy(wire);ref=bad['table_contexts'][0]['source_quotes'][0];bad['table_contexts'][0]['source_quotes'][0]='1:'+ref.split(':')[1]
         self.assertEqual(review.apply_wire_review(first,bad,frame)['independent_context_review']['gate'],'quote_source')
 
     def test_diagnostic_categories_do_not_change_semantic_or_literal_gates(self):

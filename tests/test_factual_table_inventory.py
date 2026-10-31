@@ -68,7 +68,8 @@ class FactualTableInventoryTests(unittest.TestCase):
                     'table_contexts':contexts,
                     'checks':{name:True for name in factual_context_review.CHECKS},
                     'reason':'offline independent fixture'}
-                return encode_context_reply(reply, messages), 'offline-model'
+                first_sources = seen[0][0][1]['content'].split('SOURCES:\n',1)[1].split('\n\nCURRENT_ANSWER:',1)[0]
+                return encode_context_reply(reply, messages, original_sources=first_sources), 'offline-model'
             result={'outcome':outcome,'answer':answer,'citation_ids':['manual:inspection'],
                 'covered_facets':['documented obligations'],'missing_facets':[],
                 'covered_answer_types':['checklist'],'missing_answer_types':[],
@@ -92,7 +93,7 @@ class FactualTableInventoryTests(unittest.TestCase):
                              min(4000,max(3200,m.V13_FAST_MAX_OUTPUT_TOKENS)))
             first=seen[0][0][1]['content'].split('SOURCES:\n',1)[1].split('\n\nCURRENT_ANSWER:',1)[0]
             second=seen[1][0][1]['content'].split('SOURCES:\n',1)[1].split('\n\nCOMPLETE_CANDIDATE:',1)[0]
-            self.assertEqual(first,original_context_sources(second))
+            self.assertEqual(first,original_context_sources(second,first))
         self.assertEqual(rows,original)
         if not complete_catalog:
             self.assertNotIn('SOURCE_TABLE_PREVIEWS',seen[0][0][1]['content'])

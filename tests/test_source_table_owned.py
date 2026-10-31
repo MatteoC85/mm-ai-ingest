@@ -104,7 +104,8 @@ class OwnedTableFixture:
                 reply = dict(outcome='rewrite', edits=[], citation_ids=['inspection:p1','inspection:p2'],
                     table_contexts=table_contexts(),
                     checks={name:True for name in factual_context_review.CHECKS}, reason='offline independent fixture')
-                reply = encode_context_reply(reply, messages)
+                first_sources = self.reviewer_calls[0][0][1]['content'].split('SOURCES:\n',1)[1].split('\n\nCURRENT_ANSWER:',1)[0]
+                reply = encode_context_reply(reply, messages, original_sources=first_sources)
             else:
                 reply = dict(outcome='rewrite', answer='[[FACTUAL_INVENTORY]]', reason='offline fixture',
                     citation_ids=['inspection:p1', 'inspection:p2'], covered_facets=['documented obligations'],
@@ -241,7 +242,7 @@ class SourceTableOwnedTests(unittest.TestCase):
             if options.get('mutate'):
                 first=f.reviewer_calls[0][0][1]['content'].split('SOURCES:\n',1)[1].split('\n\nCURRENT_ANSWER:',1)[0]
                 second=f.reviewer_calls[1][0][1]['content'].split('SOURCES:\n',1)[1].split('\n\nCOMPLETE_CANDIDATE:',1)[0]
-                self.assertEqual(first,original_context_sources(second))
+                self.assertEqual(first,original_context_sources(second,first))
             self.assertFalse(f.owner._response_flow.completed)
             f.close(); completion.close()
 

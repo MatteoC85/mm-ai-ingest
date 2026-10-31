@@ -94,7 +94,8 @@ class SourceFirstFixture:
                 reply = dict(outcome='pass', edits=[], citation_ids=['maintenance:p1','maintenance:p2'],
                     table_contexts=[],
                     checks={name:True for name in factual_context_review.CHECKS}, reason='offline independent fixture')
-                reply = encode_context_reply(reply, messages)
+                first_sources = self.reviewer_calls[0][0][1]['content'].split('SOURCES:\n',1)[1].split('\n\nCURRENT_ANSWER:',1)[0]
+                reply = encode_context_reply(reply, messages, original_sources=first_sources)
             class Response:
                 status_code=200
                 def json(self): return {'status':'completed', 'output_text':json.dumps(reply),
@@ -195,7 +196,7 @@ class AskSourceFirstInventoryTests(unittest.TestCase):
                 if options.get('mutate'):
                     first=h.reviewer_calls[0][0][1]['content'].split('SOURCES:\n',1)[1].split('\n\nCURRENT_ANSWER:',1)[0]
                     second=h.reviewer_calls[1][0][1]['content'].split('SOURCES:\n',1)[1].split('\n\nCOMPLETE_CANDIDATE:',1)[0]
-                    self.assertEqual(first,original_context_sources(second))
+                    self.assertEqual(first,original_context_sources(second,first))
                 self.assertFalse(h.owner._response_flow.completed)
                 h.close();owner.close()
 

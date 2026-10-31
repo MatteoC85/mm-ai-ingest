@@ -13,7 +13,7 @@ import re
 from . import enumeration_review
 from . import review_source_wire
 from . import table_units
-from .source_table_review import PREFIX, TableCatalog, _HEADER, _RECORD_ID, _escape
+from .source_table_review import PREFIX, TableCatalog, _HEADER, _RECORD_ID, _escape, _render as _render_table_rows
 
 MARKER = enumeration_review.INVENTORY_MARKER
 MAX_TEXT = 30000
@@ -61,6 +61,28 @@ INSTRUCTIONS = (
     'answer. Without table targets return table_contexts=[] and preserve the '
     'ordinary pass/rewrite rules. If any context remains unsupported, no_sources.'
 )
+
+_ATOMIC_INSTRUCTIONS = (INSTRUCTIONS
+    .replace('Preserve all current citation IDs and cite additional support only from SOURCES.',
+             'Current citations remain preserved. Cite support for edits through additional_citation_ids only from SOURCES.')
+    .replace('supporting quote_ref units from SOURCES', 'supporting source_quotes references from the schema')
+    .replace('This adds no requested intervention. ', '')
+    .replace('because the qualified contexts are additions; all six checks concern that final assembled answer.',
+             'because the qualified contexts are additions.')
+    .replace('Without table targets return table_contexts=[] and preserve the ordinary pass/rewrite rules.',
+             'Without table targets return table_contexts=[].'))
+_ATOMIC_REPRESENTATION = (
+    '\nCOMPLETE_CANDIDATE is lossless: expand its template inventory marker into the ordered items, each prefixed "- ". '
+    'A text item is verbatim. An immutable source_table item is its exact caption followed by ALL HEADER/RECORD rows '
+    'from that source occurrence, in source order (including notes and row restarts). Each row is "  - " plus every '
+    'nonempty cell as [explicit label+": "]+"«"+literal value+"»", joined by "; ", with Markdown escaping. '
+    'Remove only [Qn] and [/Q] markers before literal table expansion. '
+    'No other candidate prose is hidden; adjacent source qualifications still apply. '
+    'Source header Sx denotes its unchanged admitted source. additional_citation_ids contains only extra Sx support. '
+    'Select source_quotes only from the enum: token "a:b" explicitly cites source Sa and literal unit Qb '
+    'marked [Qb]...[/Q] in SOURCES. Do not copy quotation text or invent pairs. Existing @n references expand normally. '
+    'The server preserves current citations and adds the sources explicitly selected by these references and additional IDs. '
+    'References belong only in source_quotes, never as markers in public context or edits.')
 
 
 def _json(value):
@@ -290,18 +312,22 @@ def build_messages(frame: ReviewFrame, *, question: str, response_language: str,
         raise ValueError('factual_context_review_invalid')
     aliases = _citation_aliases(frame)
     reverse = {cid: alias for alias, cid in aliases.items()}
+    atomic = _atomic_references(frame)
     if _has_template(frame.template):
         view = {'template': frame.template, 'inventory': [
             {'target': 'item:' + str(i), 'immutable': i in frame.immutable_indices, 'text': text}
             for i, text in enumerate(frame.items)]}
         if _expand(view['template'], [item['text'] for item in view['inventory']]) != frame.answer:
             raise ValueError('factual_context_review_invalid')
+        if atomic is not None:
+            view = _compact_candidate_tables(view, frame, response_language)
     else:
         # No-marker prose stays a complete, read-only candidate.
         view = {'read_only_answer': frame.answer}
+    source_view = _aliased_source_headers(frame.quote_view, aliases) if atomic is not None else frame.quote_view
     user = ('QUESTION:\n' + question + '\n\nRESPONSE_LANGUAGE: ' + response_language
-        + '\n\nSOURCES:\n' + frame.quote_view + '\n\nCOMPLETE_CANDIDATE:\n' + _json(view)
-        + '\n\nCITATION_ALIASES:\n' + _json(aliases)
+        + '\n\nSOURCES:\n' + source_view + '\n\nCOMPLETE_CANDIDATE:\n' + _json(view)
+        + ('\n\nCITATION_ALIASES:\n' + _json(aliases) if atomic is None else '')
         + '\n\nTABLE_CONTEXT_TARGETS:\n' + json.dumps([
             {'target': 'item:' + str(index), 'citation_id': reverse[cid]}
             for index, cid in frame.table_owners], ensure_ascii=False, separators=(',', ':'))
@@ -318,21 +344,121 @@ def build_messages(frame: ReviewFrame, *, question: str, response_language: str,
         'expand with these markers intact. Select Qn present in the cited source, never copy '
         'quote text. The server inserts the literal slice; unmarked text remains source context. '
         'Use Q references only in quote_ref, never as markers in context or edits.')
-    return [{'role': 'system', 'content': INSTRUCTIONS + representation}, {'role': 'user', 'content': user}]
+    system = _ATOMIC_INSTRUCTIONS + _ATOMIC_REPRESENTATION if atomic is not None else INSTRUCTIONS + representation
+    return [{'role': 'system', 'content': system}, {'role': 'user', 'content': user}]
 
 
 def _citation_aliases(frame):
     return {'S' + str(index): cid for index, cid in enumerate(frame.admitted_citation_ids)}
 
 
-def schema(frame: ReviewFrame):
+def _atomic_references(frame):
+    """Enumerate complete source/unit pairs only within structured-output limits.
+
+    Oversized or absent catalogs use the complete preceding wire, never a
+    selected subset of sources, units, or semantic obligations.
+    """
+    count = sum(len(owners) for _, _, owners in frame.quote_units)
+    other_enums = 3 + len(frame.editable_targets) + len(frame.table_owners) + len(frame.admitted_citation_ids)
+    if not frame.table_owners or not count or count + other_enums > 1000:
+        return None
+    reverse = {cid: alias[1:] for alias, cid in _citation_aliases(frame).items()}
+    refs = {}
+    for ref, literal, owners in frame.quote_units:
+        for cid in owners:
+            if cid not in reverse or not _QUOTE_REF.fullmatch(ref):
+                return None
+            refs[reverse[cid] + ':' + ref[1:]] = (cid, literal)
+    if len(refs) != count or (count > 250 and sum(map(len, refs)) > 15000):
+        return None
+    enum_count, string_chars, valid = 0, 0, True
+    def inspect(value):
+        nonlocal enum_count, string_chars, valid
+        if type(value) is str:
+            string_chars += len(value)
+        elif type(value) is dict:
+            choices = value.get('enum')
+            if type(choices) is list:
+                enum_count += len(choices)
+                if len(choices) > 250 and sum(len(x) for x in choices if type(x) is str) > 15000:
+                    valid = False
+            for key, item in value.items():
+                string_chars += len(key)
+                inspect(item)
+        elif type(value) is list:
+            for item in value:
+                inspect(item)
+    inspect(_wire_schema(frame, refs))
+    if not valid or enum_count > 1000 or string_chars > 120000:
+        return None
+    return refs
+
+
+def _aliased_source_headers(view, aliases):
+    reverse = {cid: alias for alias, cid in aliases.items()}
+    def rename(match, mapping):
+        if match[1] not in mapping:
+            raise ValueError('factual_context_review_invalid')
+        return '[' + mapping[match[1]] + ']' + match[0][len(match[1]) + 2:]
+    result = _HEADER.sub(lambda match: rename(match, reverse), view)
+    if _HEADER.sub(lambda match: rename(match, aliases), result) != view:
+        raise ValueError('factual_context_review_invalid')
+    return result
+
+
+def _candidate_table_text(body, caption, language):
+    records = []
+    for line in body.splitlines():
+        match = table_units._LINE.fullmatch(line)
+        if not match:
+            if '[PDF_TABLE_' in line:
+                raise ValueError('factual_context_review_invalid')
+            continue
+        first, last, columns = int(match[2]), int(match[3] or match[2]), int(match[4])
+        if not 1 <= first <= last <= 100000 or not 1 <= columns <= 256:
+            raise ValueError('factual_context_review_invalid')
+        cells = table_units._cells(match[5], 0, first, last, columns)
+        if not cells:
+            raise ValueError('factual_context_review_invalid')
+        records.append(cells)
+    if not records:
+        raise ValueError('factual_context_review_invalid')
+    rendered = _render_table_rows(records, None, None, language)
+    return caption + '\n' + rendered.split('\n', 1)[1]
+
+
+def _compact_candidate_tables(view, frame, language):
+    result = deepcopy(view)
+    aliases = {cid: alias for alias, cid in _citation_aliases(frame).items()}
+    bodies, owners = dict(frame.source_bodies), dict(frame.table_owners)
+    rebuilt = []
+    for index, item in enumerate(result['inventory']):
+        text = item['text']
+        if index in owners:
+            cid = owners[index]
+            caption = text.split('\n', 1)[0]
+            try:
+                restored = _candidate_table_text(bodies[cid], caption, language)
+            except (ValueError, TypeError, KeyError):
+                restored = None
+            if restored == text:
+                item.update(source_table=aliases[cid], caption=caption)
+                del item['text']
+        # Keep full text on any mismatch, including candidate-only prose.
+        rebuilt.append(restored if 'source_table' in item else text)
+    if tuple(rebuilt) != frame.items or _expand(result['template'], rebuilt) != frame.answer:
+        raise ValueError('factual_context_review_invalid')
+    return result
+
+
+def _wire_schema(frame: ReviewFrame, refs=None):
     target = {'type': 'string'}
     if frame.editable_targets:
         target['enum'] = list(frame.editable_targets)
     context_target = {'type': 'string'}
     if frame.table_owners:
         context_target['enum'] = ['item:' + str(index) for index, _ in frame.table_owners]
-    return {'name': 'factual_context_review', 'strict': True, 'schema': {
+    result = {'name': 'factual_context_review', 'strict': True, 'schema': {
         'type': 'object', 'additionalProperties': False,
         'properties': {
             'outcome': {'type': 'string', 'enum': ['pass', 'rewrite', 'no_sources']},
@@ -358,6 +484,18 @@ def schema(frame: ReviewFrame):
                        'properties': {key: {'type': 'boolean'} for key in CHECKS}, 'required': list(CHECKS)},
             'reason': {'type': 'string', 'maxLength': 500}},
         'required': ['outcome', 'edits', 'citation_ids', 'table_contexts', 'checks', 'reason']}}
+    if refs is not None:
+        properties = result['schema']['properties']
+        properties['additional_citation_ids'] = properties.pop('citation_ids')
+        result['schema']['required'] = ['additional_citation_ids' if key == 'citation_ids' else key
+                                        for key in result['schema']['required']]
+        properties['table_contexts']['items']['properties']['source_quotes']['items'] = {
+            'type': 'string', 'enum': list(refs)}
+    return result
+
+
+def schema(frame: ReviewFrame):
+    return _wire_schema(frame, _atomic_references(frame))
 
 
 def _checked_table_contexts(value, frame, citations):
@@ -407,14 +545,22 @@ def apply_wire_review(first_reply, review_reply, frame: ReviewFrame):
     """Decode frame-owned aliases/slices, then apply unchanged canonical gates."""
     if type(frame) is not ReviewFrame or type(review_reply) is not dict:
         return _rejected(first_reply)
-    citations, contexts = review_reply.get('citation_ids'), review_reply.get('table_contexts')
+    atomic = _atomic_references(frame)
+    citation_key = 'additional_citation_ids' if atomic is not None else 'citation_ids'
+    if atomic is not None and 'citation_ids' in review_reply:
+        return _rejected(first_reply)
+    citations, contexts = review_reply.get(citation_key), review_reply.get('table_contexts')
     if type(citations) is not list or type(contexts) is not list:
         return _rejected(first_reply)
     aliases = _citation_aliases(frame)
     if any(type(cid) is not str or cid not in aliases for cid in citations):
         return _rejected(first_reply, gate='citation_alias')
     decoded = deepcopy(review_reply)
-    decoded['citation_ids'] = [aliases[cid] for cid in citations]
+    explicit_citations = [aliases[cid] for cid in citations]
+    if atomic is not None:
+        del decoded['additional_citation_ids']
+    decoded['citation_ids'] = explicit_citations
+    quoted_sources = []
     quote_units = {ref: (literal, owners) for ref, literal, owners in frame.quote_units}
     if frame.table_owners and decoded.get('outcome') in {'pass', 'rewrite'}:
         for edit in decoded.get('edits', []) if type(decoded.get('edits')) is list else ():
@@ -426,7 +572,18 @@ def apply_wire_review(first_reply, review_reply, frame: ReviewFrame):
         if (frame.table_owners and decoded.get('outcome') in {'pass', 'rewrite'}
                 and type(audit.get('context')) is str and _QUOTE_MARKER.search(audit['context'])):
             return _rejected(first_reply, gate='table_marker')
+        canonical_quotes = []
         for quote in audit['source_quotes']:
+            if atomic is not None:
+                if type(quote) is not str:
+                    return _rejected(first_reply, gate='quote_shape')
+                unit = atomic.get(quote)
+                if unit is None:
+                    return _rejected(first_reply, gate='quote_source')
+                cid, literal = unit
+                quoted_sources.append(cid)
+                canonical_quotes.append({'citation_id': cid, 'quote': literal})
+                continue
             if (type(quote) is not dict or set(quote) != {'citation_id', 'quote_ref'}
                     or type(quote.get('quote_ref')) is not str or not _QUOTE_REF.fullmatch(quote['quote_ref'])):
                 return _rejected(first_reply, gate='quote_shape')
@@ -439,6 +596,13 @@ def apply_wire_review(first_reply, review_reply, frame: ReviewFrame):
                 return _rejected(first_reply, gate='quote_source')
             quote.clear()
             quote.update(citation_id=cid, quote=unit[0])
+            canonical_quotes.append(quote)
+        audit['source_quotes'] = canonical_quotes
+    if atomic is not None:
+        # Every addition is explicitly selected in a bound reference or the
+        # extra-support field. No unseen source or inferred citation is added.
+        decoded['citation_ids'] = list(dict.fromkeys(
+            (*frame.current_citation_ids, *quoted_sources, *explicit_citations)))
     return apply_review(first_reply, decoded, frame)
 
 
