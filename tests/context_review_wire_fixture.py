@@ -43,7 +43,7 @@ def original_context_sources(view, original_sources=None):
     return result
 
 
-def encode_context_reply(reply, messages, *, source_ids=None, original_sources=None):
+def encode_context_reply(reply, messages, *, json_schema, source_ids=None, original_sources=None):
     from machinemind.ask import review_source_wire
     from machinemind.ask.source_table_review import _HEADER
     user = messages[1]['content']
@@ -78,9 +78,12 @@ def encode_context_reply(reply, messages, *, source_ids=None, original_sources=N
                 pairs.append(alias[1:]+':'+ref[1:] if re.fullmatch(r'S[0-9]+',alias) else '99999:'+ref[1:])
         if atomic:
             context['source_quotes'] = pairs
-    targets = json.loads(user.split('\n\nTABLE_CONTEXT_TARGETS:\n', 1)[1].split('\n\n', 1)[0])
-    if atomic and targets and all('owning_source_refs' in target for target in targets):
-        owners = {target['target']: target['owning_source_refs'] for target in targets}
+    context_schema = json_schema['schema']['properties']['table_contexts']
+    if atomic and context_schema.get('type') == 'object':
+        # The provider receives these exact enums. Do not depend on duplicate
+        # user-message hints, invent an owner, or repair an unsupported quote.
+        owners = {target: slot['anyOf'][0]['properties']['owning_source_quote']['enum']
+                  for target, slot in context_schema['properties'].items()}
         slots = {}
         for context in out.get('table_contexts', []):
             target = context['target']

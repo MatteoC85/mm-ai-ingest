@@ -26,7 +26,7 @@ class SourceOwnedContextWireTests(unittest.TestCase):
         verdict=helper.verdict()
         verdict['table_contexts'][0]['source_quotes'].append({
             'citation_id':'manual:p2','quote':'Use the documented personal protective equipment.'})
-        wire=encode_context_reply(verdict,messages,source_ids=frame.admitted_citation_ids)
+        wire=encode_context_reply(verdict,messages,source_ids=frame.admitted_citation_ids, json_schema=review.schema(frame))
         wire['additional_citation_ids']=[]
         self.assertNotIn('citation_ids',wire)
         self.assertIsInstance(wire['table_contexts']['item:0']['owning_source_quote'],str)
@@ -90,7 +90,7 @@ class SourceOwnedContextWireTests(unittest.TestCase):
         self.assertEqual(original_context_sources(displayed),sources)
         verdict=context_fixture.FactualContextReviewTests().verdict(citations=['manual:p1','other:p1'])
         verdict['table_contexts'][0]['source_quotes']=[{'citation_id':'manual:p1','quote':value}]
-        out=review.apply_wire_review(first,encode_context_reply(verdict,messages),frame)
+        out=review.apply_wire_review(first,encode_context_reply(verdict,messages, json_schema=review.schema(frame)),frame)
         self.assertEqual(out,review.apply_review(first,verdict,frame))
 
     def test_atomic_schema_total_limits_and_foreign_pair_do_not_change_canonical_gates(self):
@@ -109,7 +109,7 @@ class SourceOwnedContextWireTests(unittest.TestCase):
         visit(schema)
         self.assertLessEqual(sum(counts),1000)
         messages=review.build_messages(frame,question='q',response_language='en',sources_block=helper.sources)
-        good=encode_context_reply(helper.verdict(),messages,source_ids=frame.admitted_citation_ids)
+        good=encode_context_reply(helper.verdict(),messages,source_ids=frame.admitted_citation_ids, json_schema=review.schema(frame))
         for ref in ('999:1','0:0','0:01',True,{'source':'S0','quote':'literal'}):
             bad=deepcopy(good);bad['table_contexts']['item:0']['owning_source_quote']=ref
             result=review.apply_wire_review(first,bad,frame)

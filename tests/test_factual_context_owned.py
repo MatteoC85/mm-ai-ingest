@@ -56,7 +56,7 @@ class ContextFixture(table_fixture.OwnedTableFixture):
                          'checks':{name:True for name in factual_context_review.CHECKS}, 'reason':'offline independent fixture'}
                 if second is not None:second(reply)
                 first_sources = source_packet(self.calls[0]['messages'][1]['content'],'\n\nCURRENT_ANSWER:')
-                reply = encode_context_reply(reply, messages, original_sources=first_sources)
+                reply = encode_context_reply(reply, messages, original_sources=first_sources, json_schema=kwargs['json_schema'])
             else:
                 reply = dict(outcome='rewrite', answer='[[FACTUAL_INVENTORY]]', reason='offline first fixture',
                     citation_ids=['inspection:p1','inspection:p2'], covered_facets=['documented obligations'],

@@ -112,7 +112,7 @@ class OwnedTableFixture:
                     checks={name:True for name in factual_context_review.CHECKS}, reason='offline independent fixture')
                 if second_change is not None:second_change(reply)
                 first_sources = self.reviewer_calls[0][0][1]['content'].split('SOURCES:\n',1)[1].split('\n\nCURRENT_ANSWER:',1)[0]
-                reply = encode_context_reply(reply, messages, original_sources=first_sources)
+                reply = encode_context_reply(reply, messages, original_sources=first_sources, json_schema=kwargs['json_schema'])
             else:
                 reply = dict(outcome='rewrite', answer='[[FACTUAL_INVENTORY]]', reason='offline fixture',
                     citation_ids=[document_id+':p1', document_id+':p2'], covered_facets=['documented obligations'],

@@ -25,7 +25,7 @@ class CitationRoundtripTests(unittest.TestCase):
             response_language='en', sources_block=helper.sources)
         canonical = helper.verdict(table=False)
         canonical['reason'] = 'accepted'
-        wire = encode_context_reply(canonical, messages)
+        wire = encode_context_reply(canonical, messages, json_schema=review.schema(frame))
         wire['additional_citation_ids'] = []
         return first, frame, helper.sources, messages, canonical, wire
 
@@ -50,7 +50,7 @@ class CitationRoundtripTests(unittest.TestCase):
         canonical['reason'] = 'accepted'
         canonical['citation_ids'] = list(dict.fromkeys([*first['citation_ids'],
             *(quote['citation_id'] for context in canonical['table_contexts'] for quote in context['source_quotes'])]))
-        wire = encode_context_reply(canonical, messages, original_sources=sources)
+        wire = encode_context_reply(canonical, messages, original_sources=sources, json_schema=review.schema(frame))
         wire['additional_citation_ids'] = []
         return first, frame, sources, messages, canonical, wire
 

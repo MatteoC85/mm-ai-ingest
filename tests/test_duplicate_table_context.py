@@ -72,7 +72,7 @@ class DuplicateTableContextTests(unittest.TestCase):
         self.assertEqual(len(review._context_targets(frame)), 2)
         good = verdict(frame)
         messages = review.build_messages(frame, question='Which intervals are documented?', response_language='en', sources_block=sources)
-        wire = encode_context_reply(good, messages, original_sources=sources)
+        wire = encode_context_reply(good, messages, original_sources=sources, json_schema=review.schema(frame))
         result = review.apply_wire_review(first, wire, frame)
         self.assertEqual(result['outcome'], 'rewrite')
         self.assertEqual(result['expected_list_items'], first['expected_list_items'])
@@ -167,7 +167,7 @@ class DuplicateContextOwnedTests(unittest.TestCase):
                         reply = dict(outcome='rewrite', edits=[], citation_ids=['inspection:p1','inspection:p2'],
                             table_contexts=audits, checks={key:True for key in review.CHECKS}, reason='fixture')
                         sources = calls[0][1]['content'].split('SOURCES:\n',1)[1].split('\n\nCURRENT_ANSWER:',1)[0]
-                        reply = encode_context_reply(reply, messages, original_sources=sources)
+                        reply = encode_context_reply(reply, messages, original_sources=sources, json_schema=kw['json_schema'])
                     else:
                         reply = dict(outcome='rewrite', answer='[[FACTUAL_INVENTORY]]', reason='fixture',
                             citation_ids=['inspection:p1'], covered_facets=['documented obligations'], missing_facets=[],

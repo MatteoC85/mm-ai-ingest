@@ -19,7 +19,7 @@ class ContextOwnerBoundWireTests(unittest.TestCase):
         messages = review.build_messages(frame, question='Which intervals?', response_language='en', sources_block=sources)
         canonical = fx.verdict(frame)
         canonical['reason'] = 'accepted'
-        wire = encode_context_reply(canonical, messages, original_sources=sources)
+        wire = encode_context_reply(canonical, messages, original_sources=sources, json_schema=review.schema(frame))
         return first, frame, sources, messages, canonical, wire
 
     def test_emitted_schema_requires_every_owner_and_excludes_cell_only_or_other_owner(self):
@@ -69,6 +69,33 @@ class ContextOwnerBoundWireTests(unittest.TestCase):
             self.assertEqual(result['independent_context_review']['gate'], 'table_owner')
             self.assertEqual(result['answer'], '')
 
+    def test_bound_user_dedup_preserves_schema_source_candidate_and_exact_owner_choices(self):
+        for label, qualifier in [('lathe-v', 'Only for the documented auxiliary spindle.'),
+                                 ('pompe-z', 'Applicable uniquement au groupe auxiliaire documenté.')]:
+            bodies={label+':p1':fx.SCOPE+'\n'+fx.CELLS,
+                    label+':p2':qualifier+'\n'+fx.CELLS}
+            first,frame,sources,_=fx.candidate(bodies)
+            before=deepcopy(review.schema(frame))
+            messages=review.build_messages(frame,question='Which interval?',response_language='en',sources_block=sources)
+            self.assertEqual(review.schema(frame),before)
+            user=messages[1]['content']
+            targets=json.loads(user.split('TABLE_CONTEXT_TARGETS:\n',1)[1].split('\n\n',1)[0])
+            candidate=json.loads(user.split('COMPLETE_CANDIDATE:\n',1)[1].split('\n\n',1)[0])
+            self.assertEqual([x['text']for x in candidate['inventory']],list(frame.items))
+            emitted=user.split('SOURCES:\n',1)[1].split('\n\nCOMPLETE_CANDIDATE:',1)[0]
+            self.assertEqual(original_context_sources(emitted,sources),sources)
+            refs=review._atomic_references(frame)
+            slots=before['schema']['properties']['table_contexts']['properties']
+            self.assertEqual({x['target']for x in targets},set(slots))
+            for target in targets:
+                self.assertNotIn('owner_prose_refs',target)
+                self.assertNotIn('owning_source_refs',target)
+                owner=review._context_targets(frame)[[x[0]for x in review._context_targets(frame)].index(target['target'])][2]
+                choices=slots[target['target']]['anyOf'][0]['properties']['owning_source_quote']['enum']
+                expected=review._owner_prose_refs(frame,owner,refs)
+                self.assertEqual(choices,expected)
+                self.assertTrue(all(refs[ref][0]==owner for ref in choices))
+
     def test_missing_extra_null_and_legacy_slots_cannot_approve_and_no_sources_needs_no_invention(self):
         first, frame, _, _, _, good = self.fixture()
         first_target = next(iter(good['table_contexts']))
@@ -103,7 +130,7 @@ class ContextOwnerBoundWireTests(unittest.TestCase):
             first, frame, sources, messages, canonical, _ = self.fixture(bodies)
             canonical['table_contexts'][1]['context'] = sentence
             canonical['table_contexts'][1]['source_quotes'] = [{'citation_id': prefix + ':p12', 'quote': sentence}]
-            wire = encode_context_reply(canonical, messages, original_sources=sources)
+            wire = encode_context_reply(canonical, messages, original_sources=sources, json_schema=review.schema(frame))
             out = review.apply_wire_review(first, wire, frame)
             self.assertEqual(out['outcome'], 'rewrite')
             self.assertIn(sentence, out['answer'])
@@ -129,9 +156,14 @@ class ContextOwnerBoundWireTests(unittest.TestCase):
         self.assertIsNone(review._bound_context_references(oversized, refs))
         self.assertEqual(review.schema(oversized)['schema']['properties']['table_contexts']['type'], 'array')
         messages = review.build_messages(oversized, question='q', response_language='en', sources_block=sources)
+        targets=json.loads(messages[1]['content'].split('TABLE_CONTEXT_TARGETS:\n',1)[1].split('\n\n',1)[0])
+        self.assertEqual(len(targets),80)
+        for target in targets:
+            self.assertTrue(target['owner_prose_refs'])
+            self.assertNotIn('owning_source_refs',target)
         emitted = messages[1]['content'].split('SOURCES:\n', 1)[1].split('\n\nCOMPLETE_CANDIDATE:', 1)[0]
         self.assertEqual(original_context_sources(emitted, sources), sources)
-        short = encode_context_reply(canonical, messages, original_sources=sources)
+        short = encode_context_reply(canonical, messages, original_sources=sources, json_schema=review.schema(oversized))
         self.assertEqual(review.apply_wire_review(first, short, oversized)['independent_context_review']['gate'], 'table_count')
 
     def test_472_real_literal_pairs_and_three_contexts_use_one_complete_supplementary_enum(self):
@@ -165,7 +197,7 @@ class ContextOwnerBoundWireTests(unittest.TestCase):
         self.assertLessEqual(sum(map(len, enums)), 1000)
         messages = review.build_messages(frame, question='Which intervals?', response_language='en', sources_block=sources)
         canonical = fx.verdict(frame); canonical['reason'] = 'accepted'
-        wire = encode_context_reply(canonical, messages, original_sources=sources)
+        wire = encode_context_reply(canonical, messages, original_sources=sources, json_schema=review.schema(frame))
         self.assertIsInstance(wire['table_contexts'], dict)
         self.assertEqual(review.apply_wire_review(first, wire, frame), review.apply_review(first, canonical, frame))
         emitted = messages[1]['content'].split('SOURCES:\n', 1)[1].split('\n\nCOMPLETE_CANDIDATE:', 1)[0]

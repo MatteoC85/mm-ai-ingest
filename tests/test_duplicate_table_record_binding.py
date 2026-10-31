@@ -115,7 +115,7 @@ class DuplicateTableRecordBindingTests(unittest.TestCase):
                         reply=dict(outcome='rewrite',edits=[],citation_ids=['inspection:p1','inspection:p2'],table_contexts=audits,
                             checks={k:True for k in review.CHECKS},reason='accepted')
                         first_sources=f.reviewer_calls[0][0][1]['content'].split('SOURCES:\n',1)[1].split('\n\nCURRENT_ANSWER:',1)[0]
-                        out=encode_context_reply(reply,messages,original_sources=first_sources)
+                        out=encode_context_reply(reply,messages,original_sources=first_sources, json_schema=kw['json_schema'])
                     return out,model
                 f.owner._response_flow.execution=replace(f.owner._response_flow.execution,_v13_json_models=provider)
                 if omit_context:

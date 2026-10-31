@@ -38,11 +38,14 @@ class ContextProseReferencesTests(unittest.TestCase):
         messages=review.build_messages(frame,question='Which intervals?',response_language='en',sources_block=sources)
         targets=json.loads(messages[1]['content'].split('TABLE_CONTEXT_TARGETS:\n',1)[1].split('\n\n',1)[0])
         refs=review._atomic_references(frame)
+        slots=review.schema(frame)['schema']['properties']['table_contexts']['properties']
         for target in targets:
-            self.assertTrue(target['owner_prose_refs'])
-            self.assertFalse(any(refs[r][1]==LABEL for r in target['owner_prose_refs']))
-        self.assertTrue(any(refs[r][1]==fx.QUALIFIER for r in targets[1]['owner_prose_refs']))
-        result=review.apply_wire_review(first,encode_context_reply(good,messages,original_sources=sources),frame)
+            eligible=slots[target['target']]['anyOf'][0]['properties']['owning_source_quote']['enum']
+            self.assertTrue(eligible)
+            self.assertFalse(any(refs[r][1]==LABEL for r in eligible))
+        eligible=slots[targets[1]['target']]['anyOf'][0]['properties']['owning_source_quote']['enum']
+        self.assertTrue(any(refs[r][1]==fx.QUALIFIER for r in eligible))
+        result=review.apply_wire_review(first,encode_context_reply(good,messages,original_sources=sources, json_schema=review.schema(frame)),frame)
         self.assertEqual(result['outcome'],'rewrite');self.assertIn(fx.QUALIFIER,result['answer'])
         self.assertEqual(result['expected_list_items'],first['expected_list_items'])
         self.assertEqual(result['table_record_coverage'],first['table_record_coverage'])
@@ -94,12 +97,13 @@ class ContextProseOwnedTests(unittest.TestCase):
                     result,model=original(messages,**kw)
                     if kw['json_schema']['name']=='factual_context_review':
                         targets=json.loads(messages[1]['content'].split('TABLE_CONTEXT_TARGETS:\n',1)[1].split('\n\n',1)[0])
-                        self.assertTrue(targets[0]['owner_prose_refs'])
+                        slot=kw['json_schema']['schema']['properties']['table_contexts']['properties'][targets[0]['target']]
+                        self.assertTrue(slot['anyOf'][0]['properties']['owning_source_quote']['enum'])
                         canonical=dict(outcome='rewrite',edits=[],citation_ids=['inspection:p1','inspection:p2'],
                             checks={k:True for k in review.CHECKS},reason='accepted',table_contexts=owned.table_contexts())
                         if metadata_only:canonical['table_contexts'][0]['source_quotes'][0]['quote']=LABEL
                         first_sources=f.reviewer_calls[0][0][1]['content'].split('SOURCES:\n',1)[1].split('\n\nCURRENT_ANSWER:',1)[0]
-                        result=encode_context_reply(canonical,messages,original_sources=first_sources)
+                        result=encode_context_reply(canonical,messages,original_sources=first_sources, json_schema=kw['json_schema'])
                         self.assertEqual(original_context_sources(messages[1]['content'].split('SOURCES:\n',1)[1].split('\n\nCOMPLETE_CANDIDATE:',1)[0],first_sources),first_sources)
                     return result,model
                 f.owner._response_flow.execution=replace(f.owner._response_flow.execution,_v13_json_models=provider)

@@ -133,7 +133,7 @@ class UsefulTableSelectionTests(unittest.TestCase):
         good=duplicates.verdict(frame)
         messages=context.build_messages(frame,question='Which intervals are documented?',
             response_language='en',sources_block=sources)
-        wire_review=encode_context_reply(good,messages,original_sources=sources)
+        wire_review=encode_context_reply(good,messages,original_sources=sources, json_schema=context.schema(frame))
         result=context.apply_wire_review(first,wire_review,frame)
         self.assertEqual(result['outcome'],'rewrite')
         self.assertIn(duplicates.QUALIFIER,result['answer'])

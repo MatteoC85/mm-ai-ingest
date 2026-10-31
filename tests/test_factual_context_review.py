@@ -192,7 +192,7 @@ class FactualContextReviewTests(unittest.TestCase):
         _,first,frame,_=self.candidate()
         messages=review.build_messages(frame,question='Maintenance?',response_language='en',sources_block=self.sources)
         canonical=self.verdict(citations=['manual:p1','manual:p2'])
-        wire=encode_context_reply(canonical,messages,source_ids=frame.admitted_citation_ids)
+        wire=encode_context_reply(canonical,messages,source_ids=frame.admitted_citation_ids, json_schema=review.schema(frame))
         self.assertEqual(wire['additional_citation_ids'],['S0','S1'])
         self.assertEqual(review.apply_wire_review(first,wire,frame),review.apply_review(first,canonical,frame))
         for foreign in ('S01','S9','manual:p1','S0 extra'):

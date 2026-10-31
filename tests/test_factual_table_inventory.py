@@ -71,7 +71,7 @@ class FactualTableInventoryTests(unittest.TestCase):
                     'checks':{name:True for name in factual_context_review.CHECKS},
                     'reason':'offline independent fixture'}
                 first_sources = seen[0][0][1]['content'].split('SOURCES:\n',1)[1].split('\n\nCURRENT_ANSWER:',1)[0]
-                return encode_context_reply(reply, messages, original_sources=first_sources), 'offline-model'
+                return encode_context_reply(reply, messages, original_sources=first_sources, json_schema=kwargs['json_schema']), 'offline-model'
             result={'outcome':outcome,'answer':answer,'citation_ids':['manual:inspection'],
                 'covered_facets':['documented obligations'],'missing_facets':[],
                 'covered_answer_types':['checklist'],'missing_answer_types':[],

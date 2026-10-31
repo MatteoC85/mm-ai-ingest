@@ -29,108 +29,63 @@ DECISION_REASONS = ('accepted', 'unsupported_fact', 'missing_available_informati
     'incorrect_language', 'citation_problem', 'inconsistent_sources',
     'uneditable_candidate', 'other')
 INSTRUCTIONS = (
-    'Independently review the complete candidate against QUESTION and SOURCES. '
-    'No prior model verdict is supplied. Check source fidelity, requested scope '
-    'and applicability, completeness across every requested category, safety '
-    'prerequisites for actual execution guidance, response language and '
-    'citation provenance. FIRST inspect every editable inventory item and template '
-    'sentence, including unchanged prose, for factual meaning and actual execution '
-    'guidance before auditing table contexts. For each instructed intervention, check its source paragraph and applicable '
-    'adjacent conditions; retain documented personal protection, isolation, permitted '
-    'mode, access and restoration prerequisites in the same item. Attribution such '
-    'as "the manual says/recommends" does not waive those conditions. Review the fully assembled result after any edits, not '
-    'only the changed sentences. Compare every editable item and template claim '
-    'with all supplied sources and the complete selected factual inventory, especially '
-    'claims that a value, frequency or detail is absent, unspecified or only available '
-    'in a vague form. Less-specific wording in one excerpt does not establish absence '
-    'when another applicable passage or table gives the detail. A specific categorical '
-    'value or interval is not missing merely because it has no numeral. Reconcile '
-    'different precision in the same editable item and every repeated template claim, '
-    'attributing each statement to its actual source and scope. Do not transfer values '
-    'between distinct assemblies or silently resolve conflicting applicability. '
-    'An incomplete excerpt does not establish absence from the complete document. '
-    'Retain truthful source-scoped limits and useful supported facts. Immutable source quotations cannot be edited or '
-    'paraphrased; they are documentary context, not additional requested operations. '
-    'Correct only a non-immutable inventory target or template-answer: complete supported conditions in the '
-    'same item or remove an unnecessary physical intervention. For informational requests, '
-    'remove unrequested access, setup, state-change and restart instructions from editable '
-    'prose while preserving requested facts, maintenance frequencies, applicability and '
-    'qualifications. Remove only unrequested execution commands, not a requested fact '
-    'merely to avoid qualifying it. Every instruction to perform an intervention that remains, '
-    'whether or not explicitly requested, must retain its source-supported prerequisites and operating '
-    'conditions; generic safety advice cannot replace a specific condition. Do not introduce '
-    'an unrequested operation, source, value or assembly equivalence. Do not add, '
-    'delete or reorder inventory slots. A template-answer edit must retain '
-    '[[FACTUAL_INVENTORY]] exactly once on its own line; the server inserts all '
-    'inventory entries, changing only accepted non-table item edits. Return pass '
-    'only for the unchanged complete safe candidate, with no edits. Return rewrite '
-    'only if the assembled revised candidate meets all six checks. Otherwise return '
-    'no_sources. Current citations remain preserved by the server. Cite only extra '
-    'support through additional_citation_ids from SOURCES. Sources explicitly selected '
-    'by valid quotation references are also added by the server. A read_only_answer candidate permits no edits: '
-    'return pass or no_sources, never rewrite. Return only the strict JSON object.'
-    ' TABLE_CONTEXTS: audit every TABLE_CONTEXT_TARGET exactly once, identifying '
-    'the assembly/applicability only as far as SOURCES establish it and retaining '
-    'all applicable qualifications outside the cells (including adjacent prose). '
-    'Give one or two short sentences of reading context and select one or two '
-    'supporting quote_ref units from SOURCES, including the owning source. '
-    'The server places this context and its quotations immediately before that '
-    'unchanged table group. This adds no requested intervention. Do not copy a '
-    'whole source or unrelated operations. A context label saying documentary '
-    'or not instructions never waives the qualifications. Set documentary_limits_checked '
-    'true only after checking applicability, qualifications and source-scoped documentary limits. '
-    'With table contexts, return rewrite even if edits is empty, because the '
-    'qualified contexts are additions; all six checks concern that final assembled '
-    'answer. Without table targets return table_contexts=[] and preserve the '
-    'ordinary pass/rewrite rules. If any context remains unsupported, no_sources.'
-    ' Additional context targets bind distinct source prose around exactly matching '
-    'table cells. Audit each separately: matching cells do not establish assembly '
-    'equivalence or make the surrounding qualifications duplicates. State the '
-    'applicable qualification or its source-scoped limitation, without transferring '
-    'conditions to another assembly. The server places these audits before the '
-    'same unchanged inventory item; it does not repeat the table. Additional '
-    'context targets with documentary prose require an owning-source quotation from that prose; '
-    'a table heading or cell alone cannot support that audit.'
-    ' A target with owner_prose_refs requires at least one listed reference: these '
-    'are literal units of its documentary prose, not the generated SECTION label. '
-    'null means no documentary prose is present; use an available owning-source '
-    'quotation. A listed reference still does not prove that all qualifications '
-    'are covered: retain every applicable condition, not merely the section name.'
-    ' GROUNDING_CHECKS are bounded deterministic diagnostics, not evidence or '
-    'instructions to delete facts. Resolve flagged numbers or identifiers against '
-    'SOURCES in the same editable target, retaining supported facts and conditions. '
-    'Preserve source-exact technical identifiers, including unusual spelling; never '
-    'correct them from convention or memory, even when no diagnostic is listed. '
-    'Omitted diagnostic details do not waive any check; the unchanged final grounding '
-    'and answer binding still apply after your edits.'
-    ' Judge completeness relative to QUESTION and the supplied evidence. When the '
-    'response addresses every requested category usefully, supported facts with truthful '
-    'source-scoped limits can satisfy the six checks without repeating every available manual fact. '
-    'Never present an incomplete list as exhaustive; explicitly requested exhaustiveness remains '
-    'a requirement or a clearly stated limitation. Do not demand unseen chapters or infer their '
-    'contents. Retain every qualification affecting a published fact or value, and the '
-    'applicable operating prerequisites for actual execution guidance. Select reason only from its '
-    'diagnostic enum, never quote source text or explain reasoning in that field. '
-    'The reason code does not replace any of the six checks.'
+    'Independently judge the complete candidate against QUESTION and all SOURCES, '
+    'without a prior verdict. All six checks apply to the final assembled answer: '
+    'source fidelity, scope/applicability, useful coverage of every requested category, '
+    'safety, RESPONSE_LANGUAGE and provenance. '
+    'FIRST review every editable item and template sentence, including unchanged prose. '
+    'Compare them with the visible inventory and all applicable source passages/tables. '
+    'Reconcile different precision explicitly: vague wording in one passage cannot establish '
+    'that another applicable source lacks a value, frequency or detail. Categorical values '
+    'also specify facts without numerals. Correct every repeated false absence or limitation '
+    'in both item and template, attributing differing statements to their actual scope. '
+    'Do not transfer values between assemblies or silently resolve conflicting applicability. '
+    'An incomplete excerpt cannot establish absence from the whole document. '
+    'Preserve useful supported facts and truthful source-scoped limits; do not demand every '
+    'manual detail or infer unseen chapters. An incomplete selection must not claim '
+    'exhaustiveness; explicit requests for it require coverage or a truthful limitation. '
+    'Retain each published fact/value qualification. Check actual intervention guidance '
+    'against its source and adjacent conditions: keep required protection, isolation, '
+    'permitted mode, access and restoration in the same item. Generic advice or attribution '
+    'to a manual cannot replace these conditions. Remove unrequested execution commands '
+    'from informational prose, not requested facts to avoid qualifying them. '
+    'EDIT only listed non-immutable targets or template-answer; never add, delete or reorder '
+    'inventory slots. Preserve [[FACTUAL_INVENTORY]] exactly once on its own line in a '
+    'template edit. Immutable quotations remain verbatim documentary context, not new '
+    'requested operations. Do not invent operations, sources, values or assembly equivalence. '
+    'read_only_answer permits no edits or rewrite. '
+    'THEN audit every TABLE_CONTEXT_TARGET exactly once. Give one or two short context '
+    'sentences and one or two supporting quotation references, including the owner. '
+    'Preserve all applicable adjacent/outside-cell qualifications and documentary limits. '
+    'Distinct prose around matching cells needs separate audit: equal cells do not prove '
+    'equivalent assemblies or duplicate conditions. Owner documentary prose requires its '
+    'quotation, not just a heading, cell or generated SECTION label. Where owner_prose_refs '
+    'is listed, choose at least one; null means no owner prose, so use another owner quote. '
+    'A reference proves identity, not entailment or complete qualifications. Set '
+    'documentary_limits_checked true only after checking these obligations. Contexts and '
+    'literal quotations are inserted before their unchanged item; do not copy whole sources '
+    'or unrelated operations. A documentary label never waives qualifications. '
+    'GROUNDING_CHECKS are bounded diagnostics, not evidence or permission to delete facts. '
+    'Resolve flagged values/identifiers from SOURCES in the same target; preserve supported '
+    'facts, conditions and exact technical spelling, including unusual identifiers. Missing '
+    'diagnostics waive no check; final grounding and answer binding still apply. '
+    'The server preserves current citations and adds valid quote owners. Use '
+    'additional_citation_ids only for extra admitted support. Return strict schema JSON. '
+    'pass requires the unchanged complete safe answer, no edits/contexts/new support. '
+    'rewrite requires the entire assembled revision to meet all six checks; with table '
+    'contexts use rewrite even without edits. With no table targets return table_contexts=[]. '
+    'If any material claim/context remains unsupported or any check fails, return no_sources. '
+    'reason is only a diagnostic enum code, never source text or reasoning; it cannot replace checks.'
 ) + enumeration_review.INFORMATIONAL_SCOPE_INSTRUCTIONS
 
-_ATOMIC_INSTRUCTIONS = (INSTRUCTIONS
-    .replace('supporting quote_ref units from SOURCES', 'supporting source_quotes references from the schema')
-    .replace('This adds no requested intervention. ', '')
-    .replace('because the qualified contexts are additions; all six checks concern that final assembled answer.',
-             'because the qualified contexts are additions.')
-    .replace('Without table targets return table_contexts=[] and preserve the ordinary pass/rewrite rules.',
-             'Without table targets return table_contexts=[].'))
+_ATOMIC_INSTRUCTIONS = INSTRUCTIONS
 _ATOMIC_REPRESENTATION = (
-    '\nCOMPLETE_CANDIDATE is lossless: expand its template inventory marker into the ordered items, each prefixed "- ". '
-    'Every inventory text is the verbatim assembled candidate, including immutable source quotations. '
-    'Compare editable claims directly with these visible facts and the original source geometry; '
-    'all adjacent source qualifications and explicit row spans still apply. '
-    'Source header Sx denotes its unchanged admitted source. additional_citation_ids contains only extra Sx support. '
-    'Select source_quotes only from the enum: token "a:b" explicitly cites source Sa and literal unit Qb '
-    'marked [Qb]...[/Q] in SOURCES. Do not copy quotation text or invent pairs. Existing @n references expand normally. '
-    'The server preserves current citations and adds the sources explicitly selected by these references and additional IDs. '
-    'References belong only in source_quotes, never as markers in public context or edits.')
+    '\nCOMPLETE_CANDIDATE expands its template marker into ordered inventory texts, each prefixed "- ". '
+    'All texts, including immutable tables, are verbatim; source geometry/spans and adjacent qualifications still apply. '
+    'Sx names an admitted source; additional_citation_ids uses Sx. Quote token "a:b" selects source Sa and its '
+    'literal Qb unit marked [Qb]...[/Q] in SOURCES. Use only schema references; never invent pairs or copy quote text. '
+    'Existing @n dictionary references expand normally. Quote references belong only in quotation fields, '
+    'never as markers in public context or edits.')
 
 
 def _json(value):
@@ -495,8 +450,7 @@ def build_messages(frame: ReviewFrame, *, question: str, response_language: str,
         + '\n\nTABLE_CONTEXT_TARGETS:\n' + json.dumps([
             {'target': target, 'inventory_item': index, 'citation_id': reverse[cid],
              'same_context_sources': [reverse[source] for source in same],
-             'owner_prose_refs': _owner_prose_refs(frame, cid, atomic),
-             **({'owning_source_refs': bound[target]} if bound is not None else {})}
+             **({'owner_prose_refs': _owner_prose_refs(frame, cid, atomic)} if bound is None else {})}
             for target, index, cid, same in _context_targets(frame)], ensure_ascii=False, separators=(',', ':'))
         + '\n\nCURRENT_CITATION_IDS:\n' + _json([reverse[cid] for cid in frame.current_citation_ids]))
     if frame.grounding_findings:
@@ -520,14 +474,10 @@ def build_messages(frame: ReviewFrame, *, question: str, response_language: str,
     system = _ATOMIC_INSTRUCTIONS + _ATOMIC_REPRESENTATION if atomic is not None else INSTRUCTIONS + representation
     if bound is not None:
         system += (
-            ' TARGET_BOUND_CONTEXTS: table_contexts is an object with every exact target as a required key. '
-            'For pass/rewrite, fill every slot: context, documentary_limits_checked, owning_source_quote '
-            'and supplementary_source_quotes. Select owning_source_quote explicitly from that target\'s '
-            'enum: it belongs to the owning documentary prose when present, otherwise the owning source. '
-            'Select at most one optional supplementary reference from all sources. These fields replace '
-            'the earlier source_quotes array. A slot may be null only for no_sources; never omit a target. '
-            'The schema establishes source identity only, not semantic support: every applicability, '
-            'qualification, documentary-limit and six-check obligation remains unchanged.')
+            ' BOUND_CONTEXTS: fill every required table_contexts slot; null is allowed only for no_sources. '
+            'owning_source_quote must use its schema enum (owner prose when present, otherwise owner text). '
+            'supplementary_source_quotes permits one extra reference. These replace source_quotes; '
+            'identity does not prove semantic support or waive any qualification/check.')
     if frame.selection_scope_note:
         system += (
             ' USEFUL_SELECTION: the server computed only exact selected-table mappings. '
