@@ -200,7 +200,7 @@ class FactualContextReviewTests(unittest.TestCase):
             result=review.apply_wire_review(first,bad,frame)
             self.assertEqual(result['outcome'],'no_sources')
             self.assertEqual(result['independent_context_review']['gate'],'citation_alias')
-        bad=deepcopy(wire);ref=bad['table_contexts'][0]['source_quotes'][0];bad['table_contexts'][0]['source_quotes'][0]='1:'+ref.split(':')[1]
+        bad=deepcopy(wire);ref=bad['table_contexts']['item:0']['owning_source_quote'];bad['table_contexts']['item:0']['owning_source_quote']='1:'+ref.split(':')[1]
         self.assertEqual(review.apply_wire_review(first,bad,frame)['independent_context_review']['gate'],'quote_source')
 
     def test_diagnostic_categories_do_not_change_semantic_or_literal_gates(self):

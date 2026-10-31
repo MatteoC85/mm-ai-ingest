@@ -3488,6 +3488,7 @@ def _openai_chat_json(
     timeout: int = 60,
     max_output_tokens: Optional[int] = None,
     purpose: str = "legacy_chat_json",
+    require_full_output: bool = False,
 ) -> dict:
     from machinemind.authority.request_admission import before_egress
     before_egress(purpose)
@@ -3503,6 +3504,7 @@ def _openai_chat_json(
         current_budget_fn=_v13_current_budget,
         max_output_tokens=max_output_tokens,
         purpose=purpose,
+        **({"require_full_output": True} if require_full_output else {}),
     )
 
 
@@ -10970,6 +10972,7 @@ def _v13_responses_json(
     max_output_tokens: int,
     company_id: str,
     purpose: str,
+    require_full_output: bool = False,
 ) -> dict:
     from machinemind.authority.request_admission import before_egress
     before_egress(purpose)
@@ -10995,6 +10998,7 @@ def _v13_responses_json(
         current_budget_fn=_v13_current_budget,
         response_text_fn=_v13_response_text,
         safety_identifier_fn=_v13_safety_identifier,
+        **({"require_full_output": True} if require_full_output else {}),
     )
 
 
@@ -11009,6 +11013,7 @@ def _v13_json_models(
     max_output_tokens: int,
     company_id: str,
     purpose: str,
+    require_full_output: bool = False,
 ) -> tuple[dict, str]:
     return _openai_transport.json_models(
         messages,
@@ -11026,6 +11031,7 @@ def _v13_json_models(
         responses_json_fn=_v13_responses_json,
         chat_json_fn=_openai_chat_json,
         budget_exceeded_type=_V13BudgetExceeded,
+        **({"require_full_output": True} if require_full_output else {}),
     )
 
 

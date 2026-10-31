@@ -80,6 +80,23 @@ def encode_context_reply(reply, messages, *, source_ids=None, original_sources=N
                 pairs.append(alias[1:]+':'+ref[1:] if re.fullmatch(r'S[0-9]+',alias) else '99999:'+ref[1:])
         if atomic:
             context['source_quotes'] = pairs
+    targets = json.loads(user.split('\n\nTABLE_CONTEXT_TARGETS:\n', 1)[1].split('\n\n', 1)[0])
+    if atomic and targets and all('owning_source_refs' in target for target in targets):
+        owners = {target['target']: target['owning_source_refs'] for target in targets}
+        slots = {}
+        for context in out.get('table_contexts', []):
+            target = context['target']
+            if target in slots:
+                # A duplicate cannot be represented by an object. Keep the
+                # malformed legacy shape so a negative fixture still fails.
+                return out
+            pairs = list(context['source_quotes'])
+            selected = next((i for i, ref in enumerate(pairs) if ref in owners.get(target, [])), 0)
+            owner = pairs.pop(selected) if pairs else ''
+            slots[target] = {'context': context['context'],
+                'documentary_limits_checked': context['documentary_limits_checked'],
+                'owning_source_quote': owner, 'supplementary_source_quotes': pairs}
+        out['table_contexts'] = slots
     return out
 
 

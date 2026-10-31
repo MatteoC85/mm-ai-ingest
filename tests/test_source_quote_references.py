@@ -46,12 +46,15 @@ class SourceQuoteReferencesTests(unittest.TestCase):
 
     def test_reference_decodes_before_unchanged_literal_and_final_answer_binding(self):
         helper,_,first,frame,_,messages = self.fixture()
-        properties = review.schema(frame)['schema']['properties']['table_contexts']['items']['properties']['source_quotes']['items']
+        schema = review.schema(frame)['schema']
+        reference = schema['properties']['table_contexts']['properties']['item:0']['anyOf'][0]['properties']['supplementary_source_quotes']['items']
+        self.assertEqual(reference, {'$ref': '#/$defs/source_quote_reference'})
+        properties = schema['$defs']['source_quote_reference']
         self.assertEqual(properties['type'],'string')
         self.assertEqual(set(properties['enum']),set(review._atomic_references(frame)))
         canonical = helper.verdict()
         wire = encode_context_reply(canonical,messages,source_ids=frame.admitted_citation_ids)
-        self.assertNotIn('quote',wire['table_contexts'][0]['source_quotes'][0])
+        self.assertNotIn('quote',wire['table_contexts']['item:0']['owning_source_quote'])
         out = review.apply_wire_review(first,wire,frame)
         self.assertEqual(out,review.apply_review(first,canonical,frame))
         self.assertEqual(out['independent_context_review']['answer_sha256'],hashlib.sha256(out['answer'].encode()).hexdigest())
@@ -87,13 +90,13 @@ class SourceQuoteReferencesTests(unittest.TestCase):
     def test_unknown_noncanonical_cross_source_and_free_text_references_fail_closed(self):
         helper,_,first,frame,_,messages=self.fixture()
         good=encode_context_reply(helper.verdict(citations=['manual:p1','manual:p2']),messages,source_ids=frame.admitted_citation_ids)
-        ref=good['table_contexts'][0]['source_quotes'][0]
+        ref=good['table_contexts']['item:0']['owning_source_quote']
         cases=[('0:99999','quote_source'),('00:'+ref.split(':')[1],'quote_source'),
                (ref+' 0:2','quote_source'),(ref+'\n','quote_source'),
                ({'quote':'Invented free text'},'quote_shape'),('1:'+ref.split(':')[1],'quote_source'),
                (True,'quote_shape')]
         for change,gate in cases:
-            bad=deepcopy(good);bad['table_contexts'][0]['source_quotes'][0]=change
+            bad=deepcopy(good);bad['table_contexts']['item:0']['owning_source_quote']=change
             with self.subTest(change=change):
                 result=review.apply_wire_review(first,bad,frame)
                 self.assertEqual(result['outcome'],'no_sources');self.assertEqual(result['answer'],'')
@@ -110,7 +113,7 @@ class SourceQuoteReferencesTests(unittest.TestCase):
         self.assertEqual(review.apply_wire_review(first,encode_context_reply(verdict,messages,source_ids=frame.admitted_citation_ids),frame)['independent_context_review']['gate'],'table_owner')
         helper,_,first,frame,_,messages=self.fixture()
         wire=encode_context_reply(helper.verdict(),messages,source_ids=frame.admitted_citation_ids)
-        ref='Q'+wire['table_contexts'][0]['source_quotes'][0].split(':')[1]
+        ref='Q'+wire['table_contexts']['item:0']['owning_source_quote'].split(':')[1]
         damaged=replace(frame,quote_units=tuple((q,'Invented text' if q==ref else text,owners)for q,text,owners in frame.quote_units))
         self.assertEqual(review.apply_wire_review(first,wire,damaged)['independent_context_review']['gate'],'quote_not_literal')
         changed=deepcopy(first);changed['answer']='Changed first response'
@@ -130,11 +133,11 @@ class SourceQuoteReferencesTests(unittest.TestCase):
         helper,raw,first,frame,catalog,messages=self.fixture()
         good=encode_context_reply(helper.verdict(),messages,source_ids=frame.admitted_citation_ids)
         for marker in ('[Q1]','[/Q]','[ Q 01 ]'):
-            bad=deepcopy(good);bad['table_contexts'][0]['context']+=' '+marker
+            bad=deepcopy(good);bad['table_contexts']['item:0']['context']+=' '+marker
             self.assertEqual(review.apply_wire_review(first,bad,frame)['independent_context_review']['gate'],'table_marker')
             bad=deepcopy(good);bad['edits']=[{'target':'item:1','text':'Keep '+marker}]
             self.assertEqual(review.apply_wire_review(first,bad,frame)['independent_context_review']['gate'],'edit_target')
-            bad=deepcopy(good);bad['outcome']='no_sources';bad['table_contexts'][0]['context']+=marker
+            bad=deepcopy(good);bad['outcome']='no_sources';bad['table_contexts']['item:0']['context']+=marker
             result=review.apply_wire_review(first,bad,frame)
             self.assertEqual(result['independent_context_review']['gate'],'model_rejected')
             self.assertEqual(result['answer'],'')
@@ -143,7 +146,7 @@ class SourceQuoteReferencesTests(unittest.TestCase):
             expanded['answer']=review._expand(wire['answer'],expanded['expected_list_items'])
             with self.assertRaisesRegex(ValueError,'^factual_context_review_invalid$'):
                 review.prepare_review(wire,expanded,catalog=catalog,admitted_citation_ids=['manual:p1','manual:p2'],sources_block=helper.sources)
-        ordinary=deepcopy(good);ordinary['table_contexts'][0]['context']+=' Identifier Q1 stays a normal identifier.'
+        ordinary=deepcopy(good);ordinary['table_contexts']['item:0']['context']+=' Identifier Q1 stays a normal identifier.'
         self.assertEqual(review.apply_wire_review(first,ordinary,frame)['outcome'],'rewrite')
 
     def test_malformed_technical_markers_stay_context_and_plain_no_table_path_stays_unchanged(self):

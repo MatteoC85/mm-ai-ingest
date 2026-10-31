@@ -44,6 +44,11 @@ class _V13BudgetExceeded(RuntimeError):
     pass
 
 
+class _V13OutputCapacityInsufficient(_V13BudgetExceeded):
+    """This model cannot reserve the requested output; no call was admitted."""
+    pass
+
+
 class _RequestControl:
     """Cooperative cancellation shared with copied worker contexts; no thread kill."""
     def __init__(self, seconds: float, *, allow_llm: bool = True, parent=None):
@@ -208,7 +213,8 @@ class _V13RequestBudget:
         return timeout
 
     def reserve_call(self, *, model: str, purpose: str, requested_timeout: int,
-                     max_output_tokens: int, messages: list[dict], request_payload: Optional[dict] = None) -> tuple[int, int, int]:
+                     max_output_tokens: int, messages: list[dict], request_payload: Optional[dict] = None,
+                     require_full_output: bool = False) -> tuple[int, int, int]:
         with self._lock:
             self._admission()
             for control in (self._control, _REQUEST_CONTROL_CTX.get()):
@@ -226,6 +232,15 @@ class _V13RequestBudget:
                 raise _V13BudgetExceeded("Invalid output token ceiling")
             available = self.remaining_cost_usd - input_cost
             cap = min(requested, max(0, math.floor(available * 1_000_000.0 / output_rate))) if output_rate else (requested if available >= 0 else 0)
+            if type(require_full_output) is not bool:
+                raise _V13BudgetExceeded("Invalid full-output reservation requirement")
+            if require_full_output:
+                full_amount = input_cost + requested * output_rate / 1_000_000.0
+                if self.committed_cost_usd + full_amount > float(self.max_estimated_cost_usd):
+                    raise _V13OutputCapacityInsufficient("Insufficient reserved cost for requested structured output")
+                # Compare the complete amount directly: subtract/divide/floor can
+                # lose one token at an otherwise exactly affordable boundary.
+                cap = requested
             if cap < min(800, requested):
                 raise _V13BudgetExceeded(f"V13 {self.mode} insufficient reserved cost for useful output")
             timeout = self._timeout(requested_timeout)

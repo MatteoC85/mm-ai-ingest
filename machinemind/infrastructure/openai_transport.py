@@ -15,6 +15,7 @@ from typing import Any, Optional, Type
 from machinemind.ask.phase_trace import span as _phase_span
 from machinemind.ask.request_completion import provider_timeout as _provider_timeout
 from .provider_failures import ProviderResponseError, http_failure, response_status_failure
+from .request_budget import _V13OutputCapacityInsufficient
 
 PostFn = Callable[..., Any]
 BudgetResolver = Callable[[], Any]
@@ -207,7 +208,8 @@ def embed_texts(texts: list[str], *, timeout: int = 60, api_key: str, model: str
 def _chat_response(messages: list[dict], *, model: str, json_schema: Optional[dict],
                    timeout: int, temperature: float, max_output_tokens: Optional[int],
                    purpose: str, api_key: str, url: str, post_fn: PostFn,
-                   current_budget_fn: Optional[BudgetResolver]) -> tuple[dict, Any, Optional[int]]:
+                   current_budget_fn: Optional[BudgetResolver],
+                   require_full_output: bool = False) -> tuple[dict, Any, Optional[int]]:
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY missing")
     budget = current_budget_fn() if callable(current_budget_fn) else None
@@ -221,7 +223,8 @@ def _chat_response(messages: list[dict], *, model: str, json_schema: Optional[di
         timeout = _provider_timeout(purpose, timeout)
         timeout, cap, call_index = budget.reserve_call(model=model, purpose=purpose, requested_timeout=timeout,
                                                       max_output_tokens=2000 if max_output_tokens is None else max_output_tokens, messages=messages,
-                                                      request_payload=payload)
+                                                      request_payload=payload,
+                                                      **({"require_full_output": True} if require_full_output else {}))
         payload["max_completion_tokens"] = cap
     elif max_output_tokens is not None:
         if int(max_output_tokens) <= 0:
@@ -268,11 +271,13 @@ def chat_text(messages: list[dict], *, model: Optional[str] = None, temperature:
 def chat_json(messages: list[dict], *, model: Optional[str] = None, json_schema: Optional[dict] = None,
               timeout: int = 60, api_key: str, default_model: str, url: str, post_fn: PostFn,
               current_budget_fn: Optional[BudgetResolver] = None,
-              max_output_tokens: Optional[int] = None, purpose: str = "legacy_chat_json") -> dict:
+              max_output_tokens: Optional[int] = None, purpose: str = "legacy_chat_json",
+              require_full_output: bool = False) -> dict:
     data, budget, call_index = _chat_response(messages, model=model or default_model, json_schema=json_schema,
                                              timeout=timeout, temperature=0, max_output_tokens=max_output_tokens,
                                              purpose=purpose, api_key=api_key, url=url,
-                                             post_fn=post_fn, current_budget_fn=current_budget_fn)
+                                             post_fn=post_fn, current_budget_fn=current_budget_fn,
+                                             **({"require_full_output": True} if require_full_output else {}))
     try:
         text = _chat_content(data)
         if not text:
@@ -309,7 +314,7 @@ def responses_json(messages: list[dict], *, model: str, json_schema: dict, effor
                    reasoning_mode: str = "", timeout: int, max_output_tokens: int,
                    company_id: str, purpose: str, api_key: str, url: str, post_fn: PostFn,
                    current_budget_fn: BudgetResolver, response_text_fn: Callable[[dict], str],
-                   safety_identifier_fn: Callable[[str], str]) -> dict:
+                   safety_identifier_fn: Callable[[str], str], require_full_output: bool = False) -> dict:
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY missing")
     budget = current_budget_fn()
@@ -325,7 +330,8 @@ def responses_json(messages: list[dict], *, model: str, json_schema: dict, effor
     timeout = _provider_timeout(purpose, timeout)
     timeout, cap, index = budget.reserve_call(model=model, purpose=purpose, requested_timeout=timeout,
                                               max_output_tokens=max_output_tokens, messages=messages,
-                                              request_payload=payload)
+                                              request_payload=payload,
+                                              **({"require_full_output": True} if require_full_output else {}))
     payload["max_output_tokens"] = cap
     try:
         data = _send_json(url=url, headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
@@ -348,9 +354,11 @@ def json_models(messages: list[dict], *, models: list[str], json_schema: dict, e
                 purpose: str, default_model: str,
                 normalize_models_fn: Callable[[Optional[list[str]]], list[str]],
                 current_budget_fn: BudgetResolver, responses_json_fn: Callable[..., dict],
-                chat_json_fn: Callable[..., dict], budget_exceeded_type: Type[BaseException]) -> tuple[dict, str]:
+                chat_json_fn: Callable[..., dict], budget_exceeded_type: Type[BaseException],
+                require_full_output: bool = False) -> tuple[dict, str]:
     candidates = normalize_models_fn(models) or [default_model]
     errors, failed_attempts = [], 0
+    last_capacity_error = None
     for model in candidates:
         budget = current_budget_fn()
         if budget is None:
@@ -360,19 +368,30 @@ def json_models(messages: list[dict], *, models: list[str], json_schema: dict, e
             if str(model).startswith("gpt-5.6"):
                 parsed = responses_json_fn(messages, model=model, json_schema=json_schema, effort=effort,
                                            reasoning_mode=reasoning_mode, timeout=timeout, max_output_tokens=max_output_tokens,
-                                           company_id=company_id, purpose=purpose)
+                                           company_id=company_id, purpose=purpose,
+                                           **({"require_full_output": True} if require_full_output else {}))
             else:
                 # This delegate now reserves, caps and settles its own receipt, exactly
                 # like Responses. Never fake an empty usage receipt after success.
                 parsed = chat_json_fn(messages, model=model, json_schema=json_schema, timeout=timeout,
-                                      max_output_tokens=max_output_tokens, purpose=purpose)
+                                      max_output_tokens=max_output_tokens, purpose=purpose,
+                                      **({"require_full_output": True} if require_full_output else {}))
             if failed_attempts:
                 budget.grant_retry_allowance(failed_attempts=failed_attempts, reason=f"{purpose}:model_fallback_succeeded")
             return parsed, model
+        except _V13OutputCapacityInsufficient as exc:
+            if not require_full_output or int(budget.llm_calls) != calls_before:
+                raise
+            # No reservation, provider dispatch or retry credit: try the next
+            # existing model under the same cost/deadline/call budget.
+            last_capacity_error = exc
         except budget_exceeded_type:
             raise  # do not disguise a budget/deadline guard as a provider failure
         except Exception as exc:
+            last_capacity_error = None
             if int(budget.llm_calls) > calls_before:
                 failed_attempts += 1
             errors.append(f"{model}: {type(exc).__name__}: {str(exc)[:300]}")
+    if last_capacity_error is not None:
+        raise last_capacity_error
     raise RuntimeError("All V13 model calls failed: " + " | ".join(errors)[:1800])

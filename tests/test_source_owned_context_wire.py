@@ -29,7 +29,7 @@ class SourceOwnedContextWireTests(unittest.TestCase):
         wire=encode_context_reply(verdict,messages,source_ids=frame.admitted_citation_ids)
         wire['additional_citation_ids']=[]
         self.assertNotIn('citation_ids',wire)
-        self.assertIsInstance(wire['table_contexts'][0]['source_quotes'][0],str)
+        self.assertIsInstance(wire['table_contexts']['item:0']['owning_source_quote'],str)
         out=review.apply_wire_review(first,wire,frame)
         canonical=deepcopy(verdict);canonical['citation_ids']=['manual:p1','manual:p2']
         self.assertEqual(out,review.apply_review(first,canonical,frame))
@@ -37,7 +37,7 @@ class SourceOwnedContextWireTests(unittest.TestCase):
         self.assertEqual(out['independent_context_review']['answer_sha256'],hashlib.sha256(out['answer'].encode()).hexdigest())
         # The direct canonical gate still refuses an uncited quoted source.
         self.assertEqual(review.apply_review(first,verdict,frame)['independent_context_review']['gate'],'quote_source')
-        wire['table_contexts'][0]['source_quotes'].pop()
+        wire['table_contexts']['item:0']['supplementary_source_quotes'].pop()
         self.assertEqual(review.apply_wire_review(first,wire,frame)['citation_ids'],['manual:p1'])
         wire['additional_citation_ids']=['S1']
         self.assertEqual(review.apply_wire_review(first,wire,frame)['citation_ids'],['manual:p1','manual:p2'])
@@ -111,7 +111,7 @@ class SourceOwnedContextWireTests(unittest.TestCase):
         messages=review.build_messages(frame,question='q',response_language='en',sources_block=helper.sources)
         good=encode_context_reply(helper.verdict(),messages,source_ids=frame.admitted_citation_ids)
         for ref in ('999:1','0:0','0:01',True,{'source':'S0','quote':'literal'}):
-            bad=deepcopy(good);bad['table_contexts'][0]['source_quotes']=[ref]
+            bad=deepcopy(good);bad['table_contexts']['item:0']['owning_source_quote']=ref
             result=review.apply_wire_review(first,bad,frame)
             self.assertEqual(result['outcome'],'no_sources')
             self.assertEqual(result['answer'],'')

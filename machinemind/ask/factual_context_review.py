@@ -474,6 +474,7 @@ def build_messages(frame: ReviewFrame, *, question: str, response_language: str,
     aliases = _citation_aliases(frame)
     reverse = {cid: alias for alias, cid in aliases.items()}
     atomic = _atomic_references(frame)
+    bound = _bound_context_references(frame, atomic)
     if _has_template(frame.template):
         view = {'template': frame.template, 'inventory': [
             {'target': 'item:' + str(i), 'immutable': i in frame.immutable_indices, 'text': text}
@@ -492,7 +493,8 @@ def build_messages(frame: ReviewFrame, *, question: str, response_language: str,
         + '\n\nTABLE_CONTEXT_TARGETS:\n' + json.dumps([
             {'target': target, 'inventory_item': index, 'citation_id': reverse[cid],
              'same_context_sources': [reverse[source] for source in same],
-             'owner_prose_refs': _owner_prose_refs(frame, cid, atomic)}
+             'owner_prose_refs': _owner_prose_refs(frame, cid, atomic),
+             **({'owning_source_refs': bound[target]} if bound is not None else {})}
             for target, index, cid, same in _context_targets(frame)], ensure_ascii=False, separators=(',', ':'))
         + '\n\nCURRENT_CITATION_IDS:\n' + _json([reverse[cid] for cid in frame.current_citation_ids]))
     if frame.grounding_findings:
@@ -514,6 +516,16 @@ def build_messages(frame: ReviewFrame, *, question: str, response_language: str,
         'quote text. The server inserts the literal slice; unmarked text remains source context. '
         'Use Q references only in quote_ref, never as markers in context or edits.')
     system = _ATOMIC_INSTRUCTIONS + _ATOMIC_REPRESENTATION if atomic is not None else INSTRUCTIONS + representation
+    if bound is not None:
+        system += (
+            ' TARGET_BOUND_CONTEXTS: table_contexts is an object with every exact target as a required key. '
+            'For pass/rewrite, fill every slot: context, documentary_limits_checked, owning_source_quote '
+            'and supplementary_source_quotes. Select owning_source_quote explicitly from that target\'s '
+            'enum: it belongs to the owning documentary prose when present, otherwise the owning source. '
+            'Select at most one optional supplementary reference from all sources. These fields replace '
+            'the earlier source_quotes array. A slot may be null only for no_sources; never omit a target. '
+            'The schema establishes source identity only, not semantic support: every applicability, '
+            'qualification, documentary-limit and six-check obligation remains unchanged.')
     if frame.selection_scope_note:
         system += (
             ' USEFUL_SELECTION: the server computed only exact selected-table mappings. '
@@ -632,7 +644,7 @@ def _compact_candidate_tables(view, frame, language):
     return result
 
 
-def _wire_schema(frame: ReviewFrame, refs=None):
+def _wire_schema(frame: ReviewFrame, refs=None, bound=None):
     target = {'type': 'string'}
     if frame.editable_targets:
         target['enum'] = list(frame.editable_targets)
@@ -672,11 +684,70 @@ def _wire_schema(frame: ReviewFrame, refs=None):
                                         for key in result['schema']['required']]
         properties['table_contexts']['items']['properties']['source_quotes']['items'] = {
             'type': 'string', 'enum': list(refs)}
+        if bound is not None:
+            # Reuse the complete supplementary universe once. Repeating this
+            # enum per target can exceed the provider limit on ordinary packets.
+            result['schema']['$defs'] = {'source_quote_reference': {'type': 'string', 'enum': list(refs)}}
+            slots = {}
+            for target, choices in bound.items():
+                slots[target] = {'anyOf': [{'type': 'object', 'additionalProperties': False,
+                    'properties': {
+                        'context': {'type': 'string', 'minLength': 1, 'maxLength': 480},
+                        'documentary_limits_checked': {'type': 'boolean'},
+                        'owning_source_quote': {'type': 'string', 'enum': choices},
+                        'supplementary_source_quotes': {'type': 'array', 'maxItems': 1,
+                            'items': {'$ref': '#/$defs/source_quote_reference'}}},
+                    'required': ['context', 'documentary_limits_checked',
+                                 'owning_source_quote', 'supplementary_source_quotes']}, {'type': 'null'}]}
+            properties['table_contexts'] = {'type': 'object', 'additionalProperties': False,
+                'properties': slots, 'required': list(slots)}
     return result
 
 
+def _bound_context_references(frame, refs):
+    """Bind every context to its owner without selecting or approving a quote.
+
+    Fall back to the complete prior wire if any required owner has no available
+    literal unit or the new schema exceeds conservative structured-output limits.
+    """
+    if refs is None:
+        return None
+    bound = {}
+    for target, _, owner, _ in _context_targets(frame):
+        choices = _owner_prose_refs(frame, owner, refs)
+        if choices is None:
+            choices = [ref for ref, (cid, _) in refs.items() if cid == owner]
+        if not choices or target in bound:
+            return None
+        bound[target] = choices
+    enum_count, string_chars, properties, valid = 0, 0, 0, True
+    def inspect(value, depth=0):
+        nonlocal enum_count, string_chars, properties, valid
+        if type(value) is str:
+            string_chars += len(value)
+        elif type(value) is dict:
+            choices = value.get('enum')
+            if type(choices) is list:
+                enum_count += len(choices)
+                if len(choices) > 250 and sum(map(len, choices)) > 15000:
+                    valid = False
+            if value.get('type') == 'object':
+                properties += len(value.get('properties', {}))
+                if depth > 8:
+                    valid = False
+            for key, item in value.items():
+                string_chars += len(key)
+                inspect(item, depth + (key in {'properties', 'items'}))
+        elif type(value) is list:
+            for item in value:
+                inspect(item, depth)
+    inspect(_wire_schema(frame, refs, bound))
+    return bound if valid and enum_count <= 1000 and string_chars <= 120000 and properties <= 100 else None
+
+
 def schema(frame: ReviewFrame):
-    return _wire_schema(frame, _atomic_references(frame))
+    refs = _atomic_references(frame)
+    return _wire_schema(frame, refs, _bound_context_references(frame, refs))
 
 
 def _checked_table_contexts(value, frame, citations):
@@ -738,16 +809,46 @@ def apply_wire_review(first_reply, review_reply, frame: ReviewFrame):
     if type(frame) is not ReviewFrame or type(review_reply) is not dict:
         return _rejected(first_reply)
     atomic = _atomic_references(frame)
+    bound = _bound_context_references(frame, atomic)
     citation_key = 'additional_citation_ids' if atomic is not None else 'citation_ids'
     if atomic is not None and 'citation_ids' in review_reply:
         return _rejected(first_reply)
     citations, contexts = review_reply.get(citation_key), review_reply.get('table_contexts')
-    if type(citations) is not list or type(contexts) is not list:
+    if type(citations) is not list:
+        return _rejected(first_reply)
+    if bound is not None:
+        if type(contexts) is not dict or len(contexts) != len(bound):
+            return _rejected(first_reply, gate='table_count')
+        if set(contexts) != set(bound):
+            return _rejected(first_reply, gate='table_target')
+        canonical_contexts = []
+        for target, choices in bound.items():
+            audit = contexts[target]
+            if audit is None and review_reply.get('outcome') == 'no_sources':
+                continue
+            if (type(audit) is not dict or set(audit) != {'context', 'documentary_limits_checked',
+                    'owning_source_quote', 'supplementary_source_quotes'}
+                    or type(audit.get('supplementary_source_quotes')) is not list
+                    or len(audit['supplementary_source_quotes']) > 1):
+                return _rejected(first_reply, gate='table_shape')
+            selected = audit['owning_source_quote']
+            if type(selected) is not str:
+                return _rejected(first_reply, gate='quote_shape')
+            if selected not in atomic:
+                return _rejected(first_reply, gate='quote_source')
+            if selected not in choices:
+                return _rejected(first_reply, gate='table_owner')
+            canonical_contexts.append({'target': target, 'context': audit['context'],
+                'documentary_limits_checked': audit['documentary_limits_checked'],
+                'source_quotes': [audit['owning_source_quote'], *audit['supplementary_source_quotes']]})
+        contexts = canonical_contexts
+    elif type(contexts) is not list:
         return _rejected(first_reply)
     aliases = _citation_aliases(frame)
     if any(type(cid) is not str or cid not in aliases for cid in citations):
         return _rejected(first_reply, gate='citation_alias')
     decoded = deepcopy(review_reply)
+    decoded['table_contexts'] = deepcopy(contexts)
     explicit_citations = [aliases[cid] for cid in citations]
     if atomic is not None:
         del decoded['additional_citation_ids']
