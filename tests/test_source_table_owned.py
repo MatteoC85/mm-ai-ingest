@@ -201,10 +201,9 @@ class SourceTableOwnedTests(unittest.TestCase):
                 self.assertTrue(f.owner._response_flow.completed)
                 f.close(); completion.close()
 
-    def test_foreign_missing_owner_and_contradictory_coverage_fail_before_publication(self):
+    def test_foreign_owner_and_contradictory_coverage_fail_before_publication(self):
         changes = [
             lambda r:r.update(expected_list_items=['[[SOURCE_TABLE:G999]]', CONDITION]),
-            lambda r:r.update(citation_ids=['inspection:p2']),
             lambda r:r.update(citation_ids=['foreign-tenant:p1', 'inspection:p2']),
             lambda r:r.update(table_record_coverage=['T1=0','T2!outside request']),
             lambda r:r.update(table_record_coverage=['T1=0','T2=1']),

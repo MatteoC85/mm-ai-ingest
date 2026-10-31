@@ -89,7 +89,7 @@ class SourceTableReviewTests(unittest.TestCase):
 
     def test_contradictory_coverage_partial_duplicate_or_foreign_references_fail(self):
         catalog=self.catalog();valid=self.result(catalog)
-        mutations=[{'citation_ids':[]}, {'outcome':'pass'}, {'answer':'full answer'},
+        mutations=[{'outcome':'pass'}, {'answer':'full answer'},
             {'expected_list_items':['prefix '+catalog.entries[0].token]},
             {'expected_list_items':['[[SOURCE_TABLE:G99]]']},
             {'expected_list_items':[catalog.entries[0].token]*2},

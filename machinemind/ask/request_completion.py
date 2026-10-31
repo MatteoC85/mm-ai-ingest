@@ -215,6 +215,11 @@ def record_contract_observation(stage: str, contract: dict, *, diagnostics: dict
                 'inventory_answer_form': {'empty', 'template', 'full', 'invalid'},
                 'inventory_template_gate': {'rejected', 'accepted_or_unused'},
                 'table_coverage_gate': {'rejected', 'accepted_or_unused'},
+                'source_table_gate': {'unused', 'accepted', 'rewrite_required', 'inventory_shape',
+                    'template_invalid', 'marker_outside_inventory', 'citation_shape',
+                    'citation_not_admitted', 'source_scope_invalid', 'coverage_shape',
+                    'coverage_duplicate', 'item_shape', 'reference_unknown', 'reference_duplicate',
+                    'selected_record_conflict', 'required_reference_missing', 'expanded_size'},
                 'independent_review_outcome': {'pass', 'rewrite', 'no_sources', 'unavailable', 'invalid'},
                 'independent_review_gate': {'accepted', 'frame_mismatch', 'reply_shape',
                     'source_frame', 'provider_unavailable', 'model_rejected', 'checks_false',
@@ -225,6 +230,7 @@ def record_contract_observation(stage: str, contract: dict, *, diagnostics: dict
                 value = diagnostics.get(key)
                 row[key] = value if type(value) is str and value in values else 'other'
             for key in ('inventory_wire_count', 'inventory_canonical_count', 'table_expected_count', 'table_wire_count',
+                        'source_table_selected_count', 'source_table_bound_record_count', 'source_table_bound_citation_count',
                         'independent_review_edit_count'):
                 value = diagnostics.get(key)
                 if type(value) is int and value >= 0:
@@ -278,6 +284,21 @@ def record_contract_observation(stage: str, contract: dict, *, diagnostics: dict
         mode = review.get("reply_mode")
         row["review_reply_mode"] = mode if type(mode) is str and mode in {"retain", "edit", "replace", "reject"} else "other"
     owner.contract_checks.append(row)
+    if (getattr(owner.payload, 'debug', False) is True and row['stage'] == 'semantic_review'
+            and type(diagnostics) is dict and 'source_table_gate' in diagnostics):
+        event = {'event': 'source_table_binding', 'outcome': row['outcome'],
+                 'gate': row['source_table_gate'], 'reason': row['reason']}
+        for key in ('source_table_selected_count', 'source_table_bound_record_count', 'source_table_bound_citation_count'):
+            if key in row:
+                event[key] = row[key]
+        request_id = getattr(owner.budget, 'request_id', None)
+        if (type(request_id) is str and len(request_id) == 32
+                and all(char in '0123456789abcdef' for char in request_id)):
+            event['request_id'] = request_id
+        try:
+            print('ASK_SOURCE_TABLE_BINDING', json.dumps(event, separators=(',', ':')), flush=True)
+        except Exception:
+            pass  # Diagnostics never change the binding or its rejection.
     if (getattr(owner.payload, "debug", False) is True and row["stage"] == "semantic_review"
             and type(diagnostics) is dict and "independent_review_gate" in diagnostics):
         # Log only the already sanitized, content-free terminal observation.

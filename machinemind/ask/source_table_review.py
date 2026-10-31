@@ -27,9 +27,11 @@ INSTRUCTIONS = (
     'table cells into other inventory items or prose: a material column does not create '
     'an action. Select an occurrence when it supports the complete QUESTION, considering '
     'the union of requested categories. In a narrow question, the remaining quoted rows '
-    'are source context, not additional requested instructions. Cite the owning citation '
-    'ID. Every TABLE_RECORD in a selected group MUST map to exactly that one inventory '
-    'index in table_record_coverage; it cannot be excluded or mapped to a paraphrase. Normal inventory items '
+    'are source context, not additional requested instructions. Selecting the token explicitly '
+    'cites its owner and binds every record in that occurrence to this inventory index. '
+    'You may omit these selected records from table_record_coverage: the server supplies '
+    'their exact bindings. Any supplied mapping must agree; exclusions or other indices '
+    'are contradictions. Normal inventory items '
     'remain necessary for supported non-tabular facts and applicable conditions, in '
     'RESPONSE_LANGUAGE. Preserve necessary safety prerequisites from non-tabular sources. '
     'Source quotations retain their original language and do not constitute a translation; '
@@ -40,6 +42,32 @@ INSTRUCTIONS = (
     'is established, select one complete occurrence, cite its owner and mark the other '
     'occurrence records as duplicates. Never merge different assemblies or source identities.'
 )
+
+RECORD_INSTRUCTIONS = (
+    ' TABLE_RECORD markers identify unchanged literal PDF record occurrences within '
+    'their original source context, not new evidence or assembly equivalence. '
+    'Account for every unselected ID exactly once in table_record_coverage using compact strings. '
+    'Only records bound by a selected whole SOURCE_TABLE token may be omitted. '
+    'T1=0,2 means zero-based expected_list_items indices covering all its requested '
+    'actions, intervals and conditions; T2!reason excludes it with a brief reason for the complete QUESTION, '
+    'not only its first category. IDs and coverage declarations do not prove entailment: '
+    'check the full cells, detail rows and notes, including continuation records. '
+    'Keep these IDs out of the visible answer.'
+)
+
+
+def reference_schema(schema: dict, catalog: 'TableCatalog') -> dict:
+    """Only an emitted catalog permits omission of mechanically bound records."""
+    if not catalog.entries:
+        return schema
+    out = deepcopy(schema)
+    coverage = out['schema']['properties']['table_record_coverage']
+    coverage['minItems'] = 0
+    coverage['description'] = (
+        'Classify every unselected TABLE_RECORD once using T1=0,2 or T2!outside-request reason. '
+        'Records in selected whole SOURCE_TABLE tokens may be omitted; their owner and exact '
+        'inventory index are server-bound. Explicit conflicting mappings/exclusions are invalid.')
+    return out
 
 
 @dataclass(frozen=True)
@@ -179,13 +207,19 @@ def _strings(value):
             yield from _strings(item)
 
 
-def resolve_reply(result: dict, catalog: TableCatalog) -> dict:
+def resolve_reply(result: dict, catalog: TableCatalog, *, admitted_citation_ids=None,
+                  diagnostics: dict | None = None) -> dict:
     """Expand a whole inventory item without changing its ordered index.
 
     A reference binds to the owning citation and every record in that occurrence.
     Existing table bookkeeping and semantic validation run after this decoder.
     """
-    def reject():
+    if diagnostics is not None:
+        diagnostics.clear()
+        diagnostics['source_table_gate'] = 'unused'
+    def reject(gate):
+        if diagnostics is not None:
+            diagnostics['source_table_gate'] = gate
         return {**result, 'outcome': 'no_sources', 'answer': '',
                 'reason': 'source_table_reference_invalid', '_terminal_review_failure': True}
     has_reference = any(PREFIX in value for value in _strings(result))
@@ -198,40 +232,71 @@ def resolve_reply(result: dict, catalog: TableCatalog) -> dict:
         return result
     items = result.get('expected_list_items')
     body = result.get('answer')
-    if (result.get('outcome') != 'rewrite' or type(items) is not list or not 0 < len(items) <= 40
-            or type(body) is not str or body.splitlines().count(_INVENTORY) != 1
-            or body.count('[[FACTUAL_INVENTORY') != 1
-            or any(PREFIX in value for key, value in result.items() if key != 'expected_list_items' for value in _strings(value))):
-        return reject()
+    if result.get('outcome') != 'rewrite':
+        return reject('rewrite_required')
+    if type(items) is not list or not 0 < len(items) <= 40:
+        return reject('inventory_shape')
+    if (type(body) is not str or body.splitlines().count(_INVENTORY) != 1
+            or body.count('[[FACTUAL_INVENTORY') != 1):
+        return reject('template_invalid')
+    if any(PREFIX in value for key, value in result.items() if key != 'expected_list_items' for value in _strings(value)):
+        return reject('marker_outside_inventory')
     entries = {e.token: e for e in catalog.entries}
     citations = result.get('citation_ids')
-    if type(citations) is not list or type(coverage) is not list:
-        return reject()
+    if type(citations) is not list or any(type(cid) is not str or not cid for cid in citations):
+        return reject('citation_shape')
+    if admitted_citation_ids is not None:
+        if (type(admitted_citation_ids) not in (set, frozenset, tuple, list)
+                or any(type(cid) is not str or not cid for cid in admitted_citation_ids)):
+            return reject('source_scope_invalid')
+        if any(cid not in admitted_citation_ids for cid in citations):
+            return reject('citation_not_admitted')
+    if type(coverage) is not list:
+        return reject('coverage_shape')
+    bound_citations, bound_coverage = list(citations), list(coverage)
     parsed_coverage = {}
     for row in coverage:
         if type(row) is not str:
-            return reject()
+            return reject('coverage_shape')
         match = _COVERAGE.fullmatch(row)
         rid = row.split('=', 1)[0].split('!', 1)[0]
         if rid in parsed_coverage:
-            return reject()
+            return reject('coverage_duplicate')
         parsed_coverage[rid] = tuple(int(n) for n in match[2].split(',')) if match else None
     expanded, selected = [], set()
     for index, item in enumerate(items):
         if type(item) is not str:
-            return reject()
+            return reject('item_shape')
         if PREFIX not in item:
             expanded.append(item)
             continue
         entry = entries.get(item)
-        if (not _TOKEN.fullmatch(item) or entry is None or item in selected
-                or entry.citation_id not in citations
-                or any(parsed_coverage.get(rid) != (index,) for rid in entry.record_ids)):
-            return reject()
+        if not _TOKEN.fullmatch(item) or entry is None:
+            return reject('reference_unknown')
+        if item in selected:
+            return reject('reference_duplicate')
+        if admitted_citation_ids is not None and entry.citation_id not in admitted_citation_ids:
+            return reject('source_scope_invalid')
+        for rid in entry.record_ids:
+            if rid in parsed_coverage:
+                if parsed_coverage[rid] != (index,):
+                    return reject('selected_record_conflict')
+            else:
+                bound_coverage.append(rid + '=' + str(index))
+        if entry.citation_id not in bound_citations:
+            bound_citations.append(entry.citation_id)
         selected.add(item)
         expanded.append(entry.text)
-    if not required.issubset(selected) or sum(map(len, expanded)) > MAX_TEXT:
-        return reject()
+    if not required.issubset(selected):
+        return reject('required_reference_missing')
+    if sum(map(len, expanded)) > MAX_TEXT:
+        return reject('expanded_size')
     out = deepcopy(result)
     out['expected_list_items'] = expanded
+    out['citation_ids'] = bound_citations
+    out['table_record_coverage'] = bound_coverage
+    if diagnostics is not None:
+        diagnostics.update(source_table_gate='accepted', source_table_selected_count=len(selected),
+            source_table_bound_record_count=len(bound_coverage)-len(coverage),
+            source_table_bound_citation_count=len(bound_citations)-len(citations))
     return out
