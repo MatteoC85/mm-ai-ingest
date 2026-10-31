@@ -30,8 +30,8 @@ class SourceTableBindingTests(unittest.TestCase):
     case = owned.SourceTableOwnedTests.case
 
     def test_selected_token_binds_only_its_owner_and_records_through_publication(self):
-        for changes in ({'citation_ids':['inspection:p2']}, {'table_record_coverage':[]},
-                        {'citation_ids':['inspection:p2'],'table_record_coverage':[]}):
+        for changes in ({'citation_ids':['inspection:p2']},
+                        {'citation_ids':['inspection:p2'],'table_record_coverage':['T1=0','T2=0']}):
             with self.subTest(changes=changes):
                 owner, f = self.case(change=lambda r:r.update(deepcopy(changes)))
                 owner.payload.debug = True
@@ -52,10 +52,10 @@ class SourceTableBindingTests(unittest.TestCase):
                 self.assertEqual(set(schema['properties']),{'T1','T2'})
                 self.assertEqual(set(schema['required']),{'T1','T2'})
                 self.assertEqual(f.provider_wire_reply['table_record_coverage'],
-                    {'T1':None,'T2':None} if 'table_record_coverage'in changes else {'T1':'=0','T2':'=0'})
+                    {'T1':'=0','T2':'=0'})
                 observation=next(r for r in owner.contract_checks if r['stage']=='semantic_review')
                 self.assertEqual(observation['source_table_gate'],'accepted')
-                self.assertEqual(observation['source_table_bound_record_count'],2 if 'table_record_coverage'in changes else 0)
+                self.assertEqual(observation['source_table_bound_record_count'],0)
                 self.assertEqual(observation['source_table_bound_citation_count'],int('citation_ids'in changes))
                 self.assertEqual(len(f.posts),2);self.assertEqual(f.writer_calls,[])
                 self.assertEqual(f.budget_ids,[id(owner.budget)]*2)
@@ -65,6 +65,8 @@ class SourceTableBindingTests(unittest.TestCase):
 
     def test_explicit_rejections_and_forged_diagnostic_never_turn_into_bindings(self):
         cases=[
+            ({'table_record_coverage':[]},'coverage_shape'),
+            ({'citation_ids':['inspection:p2'],'table_record_coverage':[]},'coverage_shape'),
             ({'citation_ids':['foreign:p1']},'citation_not_admitted'),
             ({'expected_list_items':['[[SOURCE_TABLE:G999]]',owned.CONDITION]},'reference_unknown'),
             ({'table_record_coverage':['T1=0','T2!outside request']},'selected_record_conflict'),

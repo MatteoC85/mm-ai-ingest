@@ -97,12 +97,12 @@ class DuplicateTableRecordBindingTests(unittest.TestCase):
         self.assertIs(observed.call_args.kwargs['derive_duplicate_records'],False)
         self.assertNotIn('byte-identical occurrences',spec['json_schema']['schema']['properties']['table_record_coverage']['description'])
 
-    def test_owned_missing_duplicates_require_all_contexts_before_html_and_final_hash(self):
+    def test_owned_explicit_duplicates_require_all_contexts_before_html_and_final_hash(self):
         for omit_context in (False,True):
             with self.subTest(omit_context=omit_context):
                 with patch.object(owned,'TABLE_BODY',contexts.SCOPE+'\n'+contexts.CELLS),patch.object(owned,'CONDITION',contexts.QUALIFIER+'\n'+contexts.CELLS):
                     owner,f=self.case(change=lambda r:r.update(expected_list_items=['[[SOURCE_TABLE:G1]]'],
-                        citation_ids=['inspection:p1'],table_record_coverage=[]))
+                        citation_ids=['inspection:p1'],table_record_coverage=['T1=0','T2!Exact duplicate table; distinct context reviewed']))
                 original=f.owner._response_flow.execution._v13_json_models
                 def provider(messages,**kw):
                     out,model=original(messages,**kw)
@@ -122,7 +122,7 @@ class DuplicateTableRecordBindingTests(unittest.TestCase):
                     with self.assertRaises(ResponseEvidenceError):f.run()
                 else:
                     result=f.run();self.assertEqual(result['status'],'answered')
-                    self.assertEqual(f.wire_reply['table_record_coverage'],[])
+                    self.assertEqual(f.wire_reply['table_record_coverage'],['T1=0','T2!Exact duplicate table; distinct context reviewed'])
                     self.assertEqual(f.wire_reply['citation_ids'],['inspection:p1'])
                     for text in (contexts.SCOPE.rstrip('.'),contexts.QUALIFIER.rstrip('.')):
                         self.assertIn(text,result['answer']);self.assertIn(text,result['answer_html'])

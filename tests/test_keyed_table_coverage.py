@@ -39,33 +39,36 @@ class KeyedTableCoverageTests(unittest.TestCase):
         checked=er.validate_table_coverage(out,('T1','T2'),wire_inventory=out['expected_list_items'])
         return out,checked,diagnostic
 
-    def test_key_order_is_irrelevant_and_null_only_uses_existing_derivation(self):
-        first,checked,_=self.decode({'T1':None,'T2':None})
-        second,other,_=self.decode({'T2':None,'T1':None})
+    def test_key_order_is_irrelevant_and_every_occurrence_is_explicit(self):
+        first,checked,_=self.decode({'T1':'=0','T2':'!Exact duplicate table; distinct context reviewed'})
+        second,other,_=self.decode({'T2':'!Exact duplicate table; distinct context reviewed','T1':'=0'})
         self.assertEqual(first,second);self.assertEqual(checked,other);self.assertEqual(checked['outcome'],'rewrite')
         self.assertEqual(first['citation_ids'],['doc:p1'])
         self.assertEqual([row['inventory_items']for row in checked['table_record_coverage']],[[0],[]])
+        self.assertEqual(self.decode({'T1':None,'T2':None})[1]['outcome'],'no_sources')
         self.assertEqual(self.decode({'T1':None,'T2':None},different=True)[1]['outcome'],'no_sources')
-        self.assertEqual(self.decode({'T1':None,'T2':'!Different documented table'},different=True)[1]['outcome'],'rewrite')
+        self.assertEqual(self.decode({'T1':'=0','T2':'!Different documented table'},different=True)[1]['outcome'],'rewrite')
         limit='!'+'x'*(512-len('T2')-1)
-        self.assertEqual(self.decode({'T1':None,'T2':limit},different=True)[1]['outcome'],'rewrite')
-        self.assertEqual(self.decode({'T1':None,'T2':limit+'x'},different=True)[1]['outcome'],'no_sources')
+        self.assertEqual(self.decode({'T1':'=0','T2':limit},different=True)[1]['outcome'],'rewrite')
+        self.assertEqual(self.decode({'T1':'=0','T2':limit+'x'},different=True)[1]['outcome'],'no_sources')
 
     def test_shape_and_explicit_contradictions_are_never_treated_as_omissions(self):
         cases=[{}, {'T1':None}, {'T1':None,'T2':None,'T99':None},
             {'T1':False,'T2':None}, {'T1':[0],'T2':None}, ['T1=0','T2!outside'],
-            {'T1':'=00','T2':None}, {'T1':'=0,0','T2':None}, {'T1':'=1','T2':None},
-            {'T1':'!Excluded selected table','T2':None}, {'T1':None,'T2':'=0'},
-            {'T1':None,'T2':'!   '}, {'T1':None,'T2':'!reason\nextra'}]
+            {'T1':'=0','T2':None}, {'T1':None,'T2':'!other'},
+            {'T1':'=00','T2':'!other'}, {'T1':'=0,0','T2':'!other'}, {'T1':'=1','T2':'!other'},
+            {'T1':'!Excluded selected table','T2':'!other'}, {'T1':'=0','T2':'=0'},
+            {'T1':'=0','T2':'!   '}, {'T1':'=0','T2':'!reason\nextra'},
+            {'T1':'=0','T2':''}, {'T1':'=0','T2':'!'}, {'T1':'=0','T2':'='}]
         for value in cases:
             with self.subTest(value=value):self.assertEqual(self.decode(value)[1]['outcome'],'no_sources')
 
     def test_inert_reason_markers_do_not_select_but_operational_markers_still_fail(self):
         mention='Other occurrence [[SOURCE_TABLE:G2]] has its own context'
-        out,checked,_=self.decode({'T1':None,'T2':'!'+mention},reason=mention)
+        out,checked,_=self.decode({'T1':'=0','T2':'!'+mention},reason=mention)
         self.assertEqual(checked['outcome'],'rewrite');self.assertNotIn(mention,out['expected_list_items'][0])
         self.assertEqual(out['citation_ids'],['doc:p1'])
-        self.assertEqual(self.decode({'T1':None,'T2':None},answer='[[FACTUAL_INVENTORY]]\n[[SOURCE_TABLE:G2]]')[2]['source_table_gate'],'marker_outside_inventory')
+        self.assertEqual(self.decode({'T1':'=0','T2':'!Other occurrence'},answer='[[FACTUAL_INVENTORY]]\n[[SOURCE_TABLE:G2]]')[2]['source_table_gate'],'marker_outside_inventory')
 
     def test_schema_is_scoped_and_all_keys_required_without_new_limits(self):
         base=er.source_first_schema(self.m._assistant_core_contract_verifier_schema(),record_ids=('T1','T2'))
@@ -74,7 +77,8 @@ class KeyedTableCoverageTests(unittest.TestCase):
         field=new['schema']['properties']['table_record_coverage']
         self.assertEqual(field['required'],['T1','T2']);self.assertFalse(field['additionalProperties'])
         self.assertEqual(set(field['properties']),{'T1','T2'});self.assertIs(new['reject_duplicate_keys'],True)
-        for rid,value in field['properties'].items():self.assertEqual(value['maxLength'],512-len(rid))
+        for rid,value in field['properties'].items():
+            self.assertEqual(value['maxLength'],512-len(rid));self.assertEqual(value['type'],'string')
         self.assertEqual(old['schema']['properties']['table_record_coverage']['type'],'array')
         self.assertNotIn('reject_duplicate_keys',old)
         restored=deepcopy(new);restored.pop('reject_duplicate_keys')
@@ -83,7 +87,7 @@ class KeyedTableCoverageTests(unittest.TestCase):
         self.assertEqual(st.reference_schema(base,st.TableCatalog(),keyed_coverage=True),base)
 
     def test_owned_keyed_wire_reaches_two_reviews_real_hash_and_html(self):
-        owner,f=self.case(change=lambda reply:reply.update(table_record_coverage={'T1':None,'T2':None}))
+        owner,f=self.case(change=lambda reply:reply.update(table_record_coverage={'T1':'=0','T2':'=0'}))
         try:
             result=f.run();self.assertEqual(result['status'],'answered')
             contract=f.validated['meta']['assistant_core_validation']['answer_contract']
@@ -92,13 +96,32 @@ class KeyedTableCoverageTests(unittest.TestCase):
             self.assertIn(owned.TABLE_QUALIFIER.rstrip('.'),result['answer_html'])
             self.assertEqual(len(f.posts),2);self.assertEqual(f.writer_calls,[])
             self.assertEqual(f.budget_ids,[id(owner.budget)]*2)
-            self.assertEqual(f.wire_reply['table_record_coverage'],{'T1':None,'T2':None})
+            self.assertEqual(f.wire_reply['table_record_coverage'],{'T1':'=0','T2':'=0'})
             self.assertNotIn('reject_duplicate_keys',str(f.posts))
+            emitted=f.posts[0]['text']['format']
+            self.assertIs(emitted['strict'],True)
+            coverage=emitted['schema']['properties']['table_record_coverage']
+            self.assertEqual(coverage['type'],'object');self.assertFalse(coverage['additionalProperties'])
+            self.assertEqual(set(coverage['required']),{'T1','T2'})
+            # Assert the schema actually sent to the provider forbids null;
+            # server-side rejection alone would not prevent the R55 failure.
+            self.assertEqual({rid:field['type']for rid,field in coverage['properties'].items()},
+                             {'T1':'string','T2':'string'})
+            for rid,field in coverage['properties'].items():
+                self.assertEqual(field['minLength'],2)
+                self.assertEqual(field['maxLength'],512-len(rid))
+                self.assertEqual(field['pattern'],r'^(?:=[0-9]+(?:,[0-9]+)*|![^\r\n]+)$')
+            self.assertIn('Explicitly map every selected record',f.posts[0]['input'][0]['content'])
+            self.assertIn('non-null suffix string for each key',f.posts[0]['input'][0]['content'])
+            self.assertNotIn('Set these selected record values to null',f.posts[0]['input'][0]['content'])
+            self.assertEqual(f.posts[0]['input'],f.reviewer_calls[0][0])
         finally:f.close();owner.close()
 
     def test_owned_rejection_and_source_revocation_cannot_skip_final_authority(self):
         for change in (
             lambda reply:reply.update(table_record_coverage={'T1':None}),
+            lambda reply:reply.update(table_record_coverage={'T1':None,'T2':None}),
+            lambda reply:reply.update(table_record_coverage={'T1':'=0','T2':None}),
             lambda reply:reply.update(citation_ids=['foreign:p1']),
             lambda reply:reply.update(outcome='no_sources',answer='',table_record_coverage={'T1':None,'T2':None})):
             owner,f=self.case(change=change)
@@ -106,7 +129,7 @@ class KeyedTableCoverageTests(unittest.TestCase):
                 result=f.run();self.assertEqual(result['status'],'no_sources');self.assertEqual(result.get('citations')or[],[])
                 self.assertEqual(len(f.posts),1)
             finally:f.close();owner.close()
-        owner,f=self.case(revoke=True,change=lambda reply:reply.update(table_record_coverage={'T1':None,'T2':None}))
+        owner,f=self.case(revoke=True,change=lambda reply:reply.update(table_record_coverage={'T1':'=0','T2':'=0'}))
         try:
             with self.assertRaises(EvidenceContractError):f.run()
             self.assertEqual(len(f.posts),1)
@@ -116,7 +139,7 @@ class KeyedTableCoverageTests(unittest.TestCase):
         limitation='The supplied excerpts support the following information; this is not an exhaustive list of the entire manual.'
         for missing in (False,True):
             def change(reply):
-                reply.update(answer=limitation+'\n[[FACTUAL_INVENTORY]]',table_record_coverage={'T1':None,'T2':None})
+                reply.update(answer=limitation+'\n[[FACTUAL_INVENTORY]]',table_record_coverage={'T1':'=0','T2':'=0'})
                 if missing:reply['missing_facets']=['documented obligations']
             owner,f=self.case(change=change)
             try:

@@ -61,8 +61,9 @@ def quotation_instructions(*, keyed_coverage: bool = False) -> str:
     if keyed_coverage is not True:
         return INSTRUCTIONS
     return INSTRUCTIONS.replace(
-        'You may omit these selected records from table_record_coverage:',
-        'Set these selected record values to null in table_record_coverage:')
+        'You may omit these selected records from table_record_coverage: the server supplies their exact bindings.',
+        'Explicitly map every selected record in table_record_coverage to its inventory index using "=i"; '
+        'do not omit it or use null. The server verifies these exact bindings.')
 
 
 def record_instructions(*, derive_duplicate_records: bool = False, keyed_coverage: bool = False) -> str:
@@ -76,12 +77,19 @@ def record_instructions(*, derive_duplicate_records: bool = False, keyed_coverag
         'Identical cells never establish assembly equivalence. Explicit classifications '
         'are never replaced; different or partial tables must still be classified.')
     if keyed_coverage is True:
-        text = text.replace(
-            'Account for every unselected ID exactly once in table_record_coverage using compact strings.',
-            'table_record_coverage is an object with every emitted Tn key exactly once. '
-            'Use null only for an omission already derivable from selected tables; otherwise supply a suffix string.')
-        text = text.replace('may be omitted.', 'may have null values.')
-        text = text.replace('T1=0,2 means', 'T1:"=0,2" means').replace('T2!reason excludes', 'T2:"!reason" excludes')
+        return (
+            ' TABLE_RECORD markers identify unchanged literal PDF record occurrences within '
+            'their original source context, not new evidence or assembly equivalence. '
+            'table_record_coverage is an object with every emitted Tn key exactly once and a '
+            'non-null suffix string for each key. Map every record in each selected whole '
+            'SOURCE_TABLE to that token\'s zero-based expected_list_items index, e.g. T1:"=0". '
+            'For every unselected record use T2:"!brief truthful reason", including exact duplicate '
+            'occurrences or facts not included in an explicitly limited useful answer. Do not '
+            'falsely call relevant facts unrelated. Null, missing keys and conflicting classifications '
+            'are invalid. Never map another occurrence to a selected token from a different source. '
+            'All distinct owner contexts still require independent review; identical cells do not '
+            'establish assembly equivalence. IDs and declarations do not prove entailment: check '
+            'full cells, detail rows, notes and continuation records. Keep IDs out of the visible answer.')
     return text
 
 
@@ -106,11 +114,13 @@ def reference_schema(schema: dict, catalog: 'TableCatalog', *, derive_duplicate_
         identities = tuple(rid for entry in catalog.entries for rid in entry.record_ids)
         out['schema']['properties']['table_record_coverage'] = {
             'type': 'object', 'additionalProperties': False,
-            'properties': {rid: {'type': ['string', 'null'], 'maxLength': 512 - len(rid)} for rid in identities},
+            'properties': {rid: {'type': 'string', 'minLength': 2, 'maxLength': 512 - len(rid),
+                'pattern': r'^(?:=[0-9]+(?:,[0-9]+)*|![^\r\n]+)$'} for rid in identities},
             'required': list(identities),
             'description': 'Every emitted record ID is a required key. Use "=0,2" for zero-based inventory indices, '
-                '"!reason" for explicit exclusion, or null only when selected whole tables or their exact duplicates '
-                'already determine the record. Different/partial tables still require explicit classification. '
+                '"!reason" for an explicit truthful exclusion. Every selected record must map to its token index; '
+                'every unselected record needs a reason, including duplicates and explicitly limited coverage. '
+                'Null and omissions are invalid. Different/partial tables require their own classification. '
                 'Explicit conflicts remain invalid; all distinct owner contexts require independent review.'}
         out['reject_duplicate_keys'] = True
     return out
@@ -295,8 +305,6 @@ def resolve_reply(result: dict, catalog: TableCatalog, *, admitted_citation_ids=
         rows = []
         for rid in identities:
             suffix = keyed[rid]
-            if suffix is None:
-                continue
             if (type(suffix) is not str or len(rid + suffix) > 512
                     or re.fullmatch(r'(?:=[0-9]+(?:,[0-9]+)*|![^\r\n]+)', suffix) is None):
                 return reject('coverage_shape')
