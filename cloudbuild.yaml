@@ -8,12 +8,14 @@ timeout: 1200s
 substitutions:
   # Keep production on its prior revision until the live checks have passed.
   _P6_OPERATION: stage
-  _P6_EXPECTED_CURRENT_SHA: f989f245b46fc21c03d07bdaeb4bba0770e793ae
-  _P6_EXPECTED_CURRENT_REVISION: mm-ai-ingest-prod-bda3ae803c9224cf69bf61c0c9b1a667f
-  _P6_EXPECTED_CURRENT_DIGEST: sha256:bd528dc07dcce6a148735c5527b85a4d3962f82cd16ada6e18cac28185d0f159
+  _P6_EXPECTED_CURRENT_SHA: bd4cce7ed527eea1669621fa04895eb2d7cff63a
+  _P6_EXPECTED_CURRENT_REVISION: mm-ai-ingest-prod-b073da9dc6128467187f3483e4f940b76
+  _P6_EXPECTED_CURRENT_DIGEST: sha256:16d21a6405c365ddc75e7c5cda609fe8b4752d3e785b58f01de7a276817e3acc
 
 steps:
-  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+  # Reuse the exact SDK image that passed build 073da9dc on 2026-10-31.
+  # Floating latest removed python3 from PATH and broke the release entrypoint.
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:aa2b2728a6f3eaf1d6d37409133fde8220b28460282f6983e3055b1b2c792228
     id: phase6-readonly-preflight
     entrypoint: python3
     args: [tools/phase6_release.py]
@@ -31,7 +33,7 @@ steps:
   - name: gcr.io/cloud-builders/docker
     id: push-candidate
     args: [push, 'europe-west1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/mm-ai-ingest/mm-ai-ingest-prod:$COMMIT_SHA']
-  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk@sha256:aa2b2728a6f3eaf1d6d37409133fde8220b28460282f6983e3055b1b2c792228
     id: phase6-required-release-guard
     entrypoint: python3
     args: [tools/phase6_release.py]
