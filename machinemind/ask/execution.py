@@ -29,6 +29,7 @@ from . import phase_trace
 from .request_scope import conditions_only_contract, bounded_phase_contract
 from .request_completion import current as _current_completion
 from .request_completion import record_contract_observation as _record_contract_observation
+from .request_completion import record_private_factual_review as _record_private_factual_review
 from .request_completion import synthesis_review_reserve as _synthesis_review_reserve
 from .request_completion import independent_review_reserve as _independent_review_reserve
 from ..evidence.ask_input import AskEvidenceAdmission, apply_ask_evidence_input, ask_request_key
@@ -955,6 +956,10 @@ def verify_or_repair_answer(
                 # Request-local debug observation only; never enter the semantic
                 # carrier or use a decision summary as acceptance authority.
                 inventory_diagnostics['independent_review_decision'] = review
+                _record_private_factual_review(request=request, first_wire_reply=wire_reply,
+                    expanded_candidate=out, review_frame=frame, table_catalog=source_table_catalog,
+                    actual_review_reply=review, sources_block=sources_block,
+                    response_language=request.response_language, selected_records_only=selected_records_only)
                 out = _factual_context_review.apply_wire_review(out, review, frame)
                 independent_result = out.get("independent_context_review")
                 if out.get("reason") == "factual_context_review_invalid":

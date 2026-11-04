@@ -60,6 +60,34 @@ def current():
     return owner if type(owner) is RequestCompletion and owner.active else None
 
 
+def record_private_factual_review(*, request, **body) -> None:
+    """Observe only this protected debug request; never change a verdict."""
+    owner = current()
+    if owner is None or getattr(owner.payload, 'debug', False) is not True:
+        return
+    if owner._private_review_attempted:
+        owner._private_review_invalidated = True
+        owner._private_review_envelope = None
+        return
+    owner._private_review_attempted = True
+    try:
+        if owner.budget.remaining() <= 0:
+            return
+        if (getattr(request, 'requested_mode', None) != 'ask'
+                or str(getattr(request, 'company_id', '') or '') != str(owner.payload.company_id or '')
+                or str(getattr(request, 'machine_id', '') or '') != str(getattr(owner.payload, 'machine_id', '') or '')
+                or str(getattr(request, 'query', '') or '').strip() != str(getattr(owner.payload, 'query', '') or '').strip()):
+            return
+        from .private_review_diagnostics import seal
+        body['question'] = str(request.query)
+        envelope = seal(body=body, binding=owner._private_review_binding(),
+            secret=owner.runtime.AI_INTERNAL_SECRET, environment=os.environ)
+        if current() is owner and owner.active and not owner._private_review_invalidated:
+            owner._private_review_envelope = envelope
+    except Exception:
+        owner._private_review_envelope = None  # No plaintext/error fallback.
+
+
 def check_io_time() -> None:
     owner = current()
     if owner is None:
@@ -374,6 +402,16 @@ class RequestCompletion:
         self.cache_committed = False
         self.provider_schedules = []
         self.contract_checks = []
+        self._private_review_envelope = None
+        self._private_review_attempted = False
+        self._private_review_invalidated = False
+
+    def _private_review_binding(self):
+        return {'commit_sha': os.environ.get('COMMIT_SHA', '').lower(),
+            'company_id': str(self.payload.company_id or ''),
+            'machine_id': str(getattr(self.payload, 'machine_id', '') or ''),
+            'request_id': self.budget.request_id,
+            'query_sha256': hashlib.sha256(str(getattr(self.payload, 'query', '') or '').encode('utf-8')).hexdigest()}
 
     def measure(self, name, callback, /, *args, **kwargs):
         if not self.active or current() is not self:
@@ -508,6 +546,11 @@ class RequestCompletion:
     def finish(self, response):
         if type(response) is not dict:
             raise TypeError("response mapping required")
+        # Never carry a cached/foreign envelope into this request, including
+        # no-debug, terminal and unauthorized exits. Only the owned one below
+        # can be attached after this request's successful publication.
+        response = {**response, 'meta': dict(response.get('meta') or {})}
+        response['meta'].pop('private_factual_review_diagnostics', None)
         if str(response.get("status") or "").lower() == "answered":
             self.budget.ensure_time(0.0)
         result = self.runtime._assistant_core_attach_runtime_meta(
@@ -532,6 +575,7 @@ class RequestCompletion:
             "reserve_basis": "observed_fence_wall_plus_local_allowance_not_SLA",
         }, "ask_phase_trace": self.trace.summary(), "runtime_commit_sha": commit,
             "phase6_candidate_version": PHASE6_CANDIDATE_VERSION}
+        result['meta'].pop('private_factual_review_diagnostics', None)
         # Read-only diagnostics must survive timeout/revocation. Never trigger
         # fresh authority I/O here or turn a fault snapshot into scope approval.
         from ..authority.request_admission import current_summary
@@ -540,6 +584,18 @@ class RequestCompletion:
             existing = result["meta"].get("request_authority")
             result["meta"]["request_authority"] = {
                 **authority, **(existing if type(existing) is dict else {})}
+        if (current() is self and getattr(self.payload, 'debug', False) is True
+                and self._terminal is None and self.publication_finished is not None
+                and not self._private_review_invalidated
+                and result.get('ok') is True and result.get('status') in {'answered', 'no_sources'}
+                and (result['meta'].get('request_authority') or {}).get('scope_authorized') is True
+                and type(self._private_review_envelope) is dict):
+            try:
+                if all(self._private_review_envelope['aad'].get(k) == v
+                       for k, v in self._private_review_binding().items()):
+                    result['meta']['private_factual_review_diagnostics'] = deepcopy(self._private_review_envelope)
+            except Exception:
+                pass  # Diagnostic failure never changes publication/accounting.
         if str(result.get("status") or "").lower() == "answered":
             # Metadata/trace serialization belongs to this request too. A
             # callback or scheduler pause after the entry check cannot release
@@ -559,6 +615,8 @@ class RequestCompletion:
             finally:
                 _ACTIVE.reset(self._owner_token)
                 self.contract_checks.clear()
+                self._private_review_invalidated = True
+                self._private_review_envelope = None
                 self._terminal = self.payload = self.runtime = None
 
 

@@ -20,6 +20,34 @@ from .request_budget import _V13OutputCapacityInsufficient
 PostFn = Callable[..., Any]
 BudgetResolver = Callable[[], Any]
 IngestMeterResolver = Callable[[], Any]
+_OFFICIAL_MODEL_ENDPOINTS = frozenset({"https://api.openai.com/v1/responses",
+                                      "https://api.openai.com/v1/chat/completions"})
+_SERVICE_TIERS = frozenset({"auto", "default", "flex", "scale", "priority", "fast", "ultrafast"})
+
+
+def _standard_service_tier(payload: dict, url: str) -> None:
+    # An omitted tier inherits the project's settings. Pin standard pricing per
+    # request on the official model endpoints; preserve custom provider payloads.
+    if url in _OFFICIAL_MODEL_ENDPOINTS:
+        payload["service_tier"] = "default"
+
+
+def _record_service_tier(budget, call_index, payload: dict, data=None) -> None:
+    """Bounded diagnostics only; never change rates, counters or liabilities."""
+    rows, lock = getattr(budget, "call_log", None), getattr(budget, "_lock", None)
+    if not isinstance(rows, list) or lock is None:
+        return
+    with lock:
+        row = next((r for r in rows if isinstance(r, dict) and r.get("call") == call_index), None)
+        if row is None:
+            return
+        requested = payload.get("service_tier")
+        if isinstance(requested, str) and requested in _SERVICE_TIERS:
+            row["requested_service_tier"] = requested
+        if isinstance(data, dict):
+            actual = data.get("service_tier")
+            row["provider_service_tier"] = (actual if isinstance(actual, str) and actual in _SERVICE_TIERS
+                                             else "not_reported" if actual is None else "unknown")
 
 
 def normalize_model_candidates(models: Optional[list[str]]) -> list[str]:
@@ -111,6 +139,8 @@ def _send_json_attempt(*, url, headers, payload, timeout, post_fn, budget,
         # remains, the existing not_sent receipt releases only unsent liability.
         timeout = _provider_timeout("embedding" if embedding else purpose, timeout)
         if budget is not None:
+            if not embedding:
+                _record_service_tier(budget, call_index, payload)
             budget.mark_dispatched(call_index, embedding=embedding)
         response = post_fn(url, headers=headers, json=payload, timeout=timeout, allow_redirects=False)
         try:
@@ -124,6 +154,7 @@ def _send_json_attempt(*, url, headers, payload, timeout, post_fn, budget,
             if embedding:
                 budget.record_embedding_usage(call_index, usage, cache_hits=cache_hits)
             else:
+                _record_service_tier(budget, call_index, payload, data)
                 budget.record_usage(call_index, str(payload["model"]), usage)
         if response.status_code != 200:
             raise http_failure(response.status_code)
@@ -214,6 +245,7 @@ def _chat_response(messages: list[dict], *, model: str, json_schema: Optional[di
         raise RuntimeError("OPENAI_API_KEY missing")
     budget = current_budget_fn() if callable(current_budget_fn) else None
     payload = {"model": model, "messages": messages, "temperature": temperature}
+    _standard_service_tier(payload, url)
     if json_schema:
         wire_schema = ({key: value for key, value in json_schema.items() if key != "reject_duplicate_keys"}
                        if "reject_duplicate_keys" in json_schema else json_schema)
@@ -325,6 +357,7 @@ def responses_json(messages: list[dict], *, model: str, json_schema: dict, effor
                "text": {"format": {"type": "json_schema", "name": str(json_schema.get("name") or "machinemind_v13_output"),
                                      "strict": bool(json_schema.get("strict", True)), "schema": json_schema.get("schema") or {}}},
                "safety_identifier": safety_identifier_fn(company_id)}
+    _standard_service_tier(payload, url)
     if reasoning_mode:
         payload["reasoning"]["mode"] = reasoning_mode
     timeout = _provider_timeout(purpose, timeout)
