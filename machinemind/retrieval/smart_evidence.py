@@ -120,7 +120,34 @@ def select_complete_sources(raw_rows: list[dict], *, scope: dict, max_items: int
     of one ID or a foreign row cannot hide after an alias or the selected cap.
     The existing serialized/expanded 22k limit remains enforced by build().
     """
+    selected, _ = _select_complete_sources(raw_rows, scope=scope, max_items=max_items,
+        allow_raw_snippet=allow_raw_snippet, relevant_ids=relevant_ids)
+    return selected
+
+
+def select_start_sources(raw_rows: list[dict], *, scope: dict, max_items: int,
+                         max_chars: int = MAX_CHARS, allow_raw_snippet: bool = False,
+                         relevant_ids=()) -> tuple[list[dict], dict]:
+    """Pack complete START records before any planner references/state exist.
+
+    Capacity may omit a whole record, never shorten it. This is deliberately
+    separate from default count selection and atomic signed-state enrichment.
+    Both serialized state and expanded review must fit the existing hard cap.
+    Omission is not proof that the remaining records cover the whole symptom.
+    """
+    _limit(max_chars)
+    selected, omitted = _select_complete_sources(raw_rows, scope=scope, max_items=max_items,
+        allow_raw_snippet=allow_raw_snippet, relevant_ids=relevant_ids, max_chars=max_chars)
+    return selected, {"policy": "smart-start-capacity-v1", "max_chars": max_chars,
+        "selected_ids": [row["citation_id"] for row in selected], "capacity_omitted": omitted,
+        "complete_selected_records": True, "semantic_coverage_proven": False}
+
+
+def _select_complete_sources(raw_rows: list[dict], *, scope: dict, max_items: int,
+                             allow_raw_snippet: bool, relevant_ids, max_chars=None) -> tuple[list[dict], list[dict]]:
     bound = _scope(scope)
+    if max_chars is not None:
+        _limit(max_chars)
     _require(type(max_items) is int and 0 <= max_items <= MAX_SELECTED_SOURCES,
              "evidence_selection_limit_invalid")
     _require(type(allow_raw_snippet) is bool, "evidence_raw_mode_invalid")
@@ -142,13 +169,23 @@ def select_complete_sources(raw_rows: list[dict], *, scope: dict, max_items: int
     validated.sort(key=lambda item: item[1] not in priority)
     seen_complete: set[tuple[str, str]] = set()
     selected: list[dict] = []
+    omitted: list[dict] = []
     for row, cid, complete in validated:
         if complete in seen_complete:
             continue
         seen_complete.add(complete)
         if len(selected) < max_items:
+            if max_chars is not None:
+                try:
+                    build(selected + [row], scope=bound, max_chars=max_chars,
+                          allow_raw_snippet=allow_raw_snippet)
+                except SmartEvidenceError as exc:
+                    if str(exc) not in {"evidence_packet_capacity_exceeded", "evidence_review_capacity_exceeded"}:
+                        raise
+                    omitted.append({"citation_id": cid, "reason": str(exc)})
+                    continue
             selected.append(deepcopy(row))
-    return selected
+    return selected, omitted
 
 
 def _text(packet: dict, source: dict) -> str:

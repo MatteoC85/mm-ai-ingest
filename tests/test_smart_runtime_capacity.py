@@ -82,6 +82,9 @@ class RuntimeCapacityTests(unittest.TestCase):
 
         env = {
             '_sd_select_complete_citations': select, '_sd_build_grounding_packet': build,
+            '_sanitize_citations_for_response': lambda rows, **kwargs: deepcopy(rows),
+            '_sd_prepare_citations_for_response': lambda rows, **kwargs: deepcopy(rows),
+            'SMART_DIAGNOSTIC_MAX_CONTEXT_CHARS': smart_evidence.MAX_CHARS,
             '_v13_current_budget': lambda: Budget(),
             '_smart_review': types.SimpleNamespace(RESERVED_REVIEW_SECONDS=30, MAX_REVIEW_SECONDS=45,
                                                   FINALIZATION_RESERVE_SECONDS=2),

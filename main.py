@@ -19892,13 +19892,26 @@ def _sd_select_complete_citations(raw_citations: list[dict], *, company_id: str,
 def _sd_prepare_start_grounding(raw_citations: list[dict], *, company_id: str, machine_id: str,
                                 max_items: int, relevant_ids=()) -> tuple[list[dict], dict, dict]:
     """Select before display, then optionally add exact bounded procedure context."""
-    citations = _sd_select_complete_citations(raw_citations, company_id=company_id,
-        machine_id=machine_id, max_items=max_items, relevant_ids=relevant_ids)
+    try:
+        selected, capacity_meta = _smart_evidence.select_start_sources(raw_citations,
+            scope=_sd_grounding_scope(company_id, machine_id), max_items=max_items,
+            max_chars=SMART_DIAGNOSTIC_MAX_CONTEXT_CHARS, allow_raw_snippet=True, relevant_ids=relevant_ids)
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail={"code": "SMART_DIAGNOSTIC_EVIDENCE_PACKET_INVALID",
+                                                    "reason": str(exc)}) from None
+    if not selected:
+        # Evidence exists but cannot be admitted whole. Do not call it absent,
+        # create a fake session, or generate from clipped display projections.
+        raise HTTPException(status_code=502, detail={"code": "SMART_DIAGNOSTIC_EVIDENCE_PACKET_INVALID",
+                                                    "reason": "evidence_start_capacity_unavailable"})
+    citations = _sd_prepare_citations_for_response(
+        _sanitize_citations_for_response(selected, company_id=company_id),
+        max_items=max_items, preserve_evidence_ids=True)
     packet = _sd_build_grounding_packet(raw_citations, citations,
         company_id=company_id, machine_id=machine_id)
     meta = {'policy': 'smart-canonical-context-v1', 'read_calls': 0, 'added_ids': [],
             'omitted_ids': [], 'reason': 'context_time_unavailable',
-            'base_ids': [c['citation_id'] for c in citations]}
+            'base_ids': [c['citation_id'] for c in citations], 'capacity_selection': capacity_meta}
     budget = _v13_current_budget()
     reserve = max(_smart_review.RESERVED_REVIEW_SECONDS + _smart_review.FINALIZATION_RESERVE_SECONDS,
                   V13_RETRIEVAL_ASSURANCE_RESERVE_FINAL_SECONDS_ROOT_CAUSE)
@@ -20104,6 +20117,28 @@ def _sd_error_response(exc: HTTPException, language: str, *, budget, phase: str)
     """Keep generation failures on the same request ledger through publication."""
     detail = exc.detail if isinstance(exc.detail, dict) else {}
     code = detail.get("code")
+    if exc.status_code == 502 and code == "SMART_DIAGNOSTIC_EVIDENCE_PACKET_INVALID":
+        reason = detail.get("reason")
+        if reason not in {"evidence_packet_capacity_exceeded", "evidence_review_capacity_exceeded",
+                          "evidence_start_capacity_unavailable"}:
+            reason = "evidence_packet_invalid"
+        capacity_failed = reason != "evidence_packet_invalid"
+        message = (("The retrieved sources exceed the diagnostic analysis limit. Describe a more specific symptom or consult the machine document; no unverified diagnosis is returned."
+                    if language == "en" else "Le fonti recuperate superano il limite di analisi diagnostica. Specifica meglio il sintomo o consulta il documento della macchina; nessuna diagnosi non verificata viene restituita.")
+                   if capacity_failed else
+                   ("The diagnostic sources could not be prepared safely; no unverified diagnosis is returned."
+                    if language == "en" else "Non è stato possibile preparare in sicurezza le fonti diagnostiche; nessuna diagnosi non verificata viene restituita."))
+        response = {"ok": False, "status": "error", "result_code": RESULT_TECHNICAL_ERROR,
+            "error_code": code, "error_message": message, "message": message, "operator_summary": message,
+            "final_ready": False, "language": language, "question": _sd_empty_question(0),
+            "hypotheses": [], "citations": [], "rg_links": [], "session_state_json": "",
+            "detail": {"code": code, "reason": reason},
+            "meta": {"cacheable": False, "semantic_cacheable": False,
+                     "smart_evidence": {"outcome": "error", "reason": reason}}}
+        _sd_flatten_question(response, response["question"])
+        _sd_flatten_hypotheses(response, [])
+        _sd_flatten_citations(response, [], [])
+        return response
     if code not in ("SMART_DIAGNOSTIC_GENERATION_FAILED", "SMART_DIAGNOSTIC_FINALIZE_FAILED", _smart_routing.FAILURE_CODE):
         return _sd_review_error_response(exc, language)
     router_failed = code == _smart_routing.FAILURE_CODE
@@ -20128,7 +20163,8 @@ def _sd_error_response(exc: HTTPException, language: str, *, budget, phase: str)
 
 def _sd_error_stage(response: dict) -> str:
     code = response.get("error_code")
-    return ("router" if code == _smart_routing.FAILURE_CODE else "generation" if code in
+    return ("evidence" if code == "SMART_DIAGNOSTIC_EVIDENCE_PACKET_INVALID" else
+            "router" if code == _smart_routing.FAILURE_CODE else "generation" if code in
             ("SMART_DIAGNOSTIC_GENERATION_FAILED", "SMART_DIAGNOSTIC_FINALIZE_FAILED") else "review")
 
 
