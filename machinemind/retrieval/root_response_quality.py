@@ -10,7 +10,7 @@ from typing import Any
 
 from . import review_references
 
-POLICY_VERSION = "root-response-quality-v3"
+POLICY_VERSION = "root-response-quality-v4"
 
 SYNTHESIS_INSTRUCTION = """
 A root-cause answer is a diagnostic decision aid, not a repair procedure.
@@ -40,6 +40,15 @@ the check limit is a ceiling, not a quota. Each check must discriminate this
 hypothesis using an observable state or relationship actually documented in its
 cited source. State what result would support or weaken the hypothesis when that
 relationship is documented. Do not append a generic corrective-action checklist.
+For support/weakening statements, prefer naming the affected cause, especially
+when comparing alternatives. A pronoun is acceptable when its reference remains
+unambiguous and refers to the same cause. Do not silently switch the referent of
+"it", "this hypothesis" or a similar pronoun between clauses; name the cause when
+needed to keep the comparison clear. The direction of
+each inference must follow the documented relationship: the same observation
+must not both support and weaken the same cause under unchanged conditions.
+A concise clear comparison is sufficient; do not add unsupported alternatives
+or recite all manual details to satisfy this requirement.
 
 Start by asking for relevant observations, recorded states or readings ALREADY
 available. When the user expressly says a discriminating condition has not been
@@ -146,6 +155,22 @@ Do not accept a powered observation merely because it is in manual mode or at lo
 speed: any applicable personnel, protection and operating prerequisites must be
 explicit and supported. Otherwise omit that action and retain a supported causal
 hypothesis without checks when justified; never invent missing prerequisites.
+
+Review the causal meaning of EACH retained check, not just whether a similar
+test appears in a source. Prefer explicit cause names in support/weakening
+statements, especially when alternatives are compared, but accept clear pronouns
+that consistently refer to the same cause. Do not reject a check merely because
+it uses a pronoun or omits a repeated label. Reject only a genuinely ambiguous
+causal referent or a claimed inference that is contradictory or unsupported by
+its cited condition/consequence. A pronoun must not silently change referent.
+Do not guess the intended cause, rewrite the check, or invent the missing inference.
+If that defect is confined to a check and the cause/explanation remain supported,
+put only that check in blocking_checks and retain the other independently safe,
+supported checks through the existing subset contract. It is valid to retain
+no checks. Do not reject an otherwise supported useful cause merely to demand
+every manual detail or a longer list of alternatives. Complete clear comparisons
+between supported alternatives are allowed; do not require every check to discuss
+only its parent cause. All existing proof and safety-prerequisite rules still apply.
 """.strip()
 
 

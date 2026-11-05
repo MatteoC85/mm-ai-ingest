@@ -6,12 +6,15 @@ degraded-decision path stops before refinement, evidence preparation or synthesi
 The Smart adapter must project that path as a technical failure, not no sources.
 """
 from __future__ import annotations
+import math
 
 
 POLICY_VERSION = "smart-router-single-attempt-v1"
 EFFORT_ENV = "MM_ASSISTANT_CORE_SMART_ROUTER_EFFORT"
 FAILURE_REASON = "smart_semantic_router_unavailable"
 FAILURE_CODE = "SMART_DIAGNOSTIC_ROUTER_FAILED"
+MAX_ROUTER_WAIT_SECONDS = 30
+MIN_ROUTER_WAIT_SECONDS = 8
 
 
 class SmartRouterUnavailable(RuntimeError):
@@ -38,3 +41,16 @@ def attempt_plan(primary_model: str, *, effort_override: str | None = None) -> d
         "effort": (effort_override or "").strip() or "low",
         "attempt_limit": 1,
     }
+
+
+def allocated_timeout(remaining_seconds: float, *, downstream_reserve_seconds: float) -> int:
+    """One router wait within the existing request deadline, reserving later work.
+
+    A zero result means no useful dispatch is admitted. Monetary, output and
+    call limits remain with the native budget; this function only allocates time.
+    """
+    if any(type(value) not in (int, float) or not math.isfinite(value) or value < 0
+           for value in (remaining_seconds, downstream_reserve_seconds)):
+        raise ValueError("Smart router time allocation must be finite and nonnegative")
+    available = math.floor(remaining_seconds - downstream_reserve_seconds)
+    return min(MAX_ROUTER_WAIT_SECONDS, available) if available >= MIN_ROUTER_WAIT_SECONDS else 0

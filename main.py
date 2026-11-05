@@ -13953,6 +13953,18 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
             request.metadata[_retrieval_diagnostic_query.ROUTER_EXECUTION_KEY] = router_execution
     router_started = time_module.monotonic()
     try:
+        if request.requested_mode == MODE_SMART_DIAGNOSTIC:
+            budget = _v13_current_budget()
+            if budget is None:
+                raise RuntimeError("Smart routing requires its request budget")
+            # Keep one primary attempt, but reserve the existing minimum
+            # generation slot plus mandatory review/finalization time. The
+            # transport still enforces the original cost and request deadline.
+            router_timeout = _smart_routing.allocated_timeout(budget.remaining(),
+                downstream_reserve_seconds=7 + _smart_review.RESERVED_REVIEW_SECONDS
+                    + _smart_review.FINALIZATION_RESERVE_SECONDS)
+            if router_timeout < 1:
+                raise _V13BudgetExceeded("smart_router_deadline_reserve")
         parsed, model_used = _v13_json_models(
             [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
             models=router_models,

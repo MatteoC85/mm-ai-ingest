@@ -79,9 +79,19 @@ class ActualRouterCoverageSchemaTests(unittest.TestCase):
                 def provider(messages,**kwargs):
                     captured.append(deepcopy(kwargs))
                     return payload(mode=mode),'offline-router'
-                with patch.object(self.m,'_v13_json_models',provider), patch.object(
-                        self.m,'_v13_gate_candidate_block',return_value=('No evidence.',[])):
-                    self.m._assistant_core_router_call(request(mode),{})
+                token = None
+                if mode == 'smart_diagnostic':
+                    # Smart START installs this native budget before the real
+                    # router; exercise that production precondition in the fixture.
+                    budget = self.m._assistant_core_new_budget(mode, company_id=request(mode).company_id)
+                    token = self.m._V13_BUDGET_CTX.set(budget)
+                try:
+                    with patch.object(self.m,'_v13_json_models',provider), patch.object(
+                            self.m,'_v13_gate_candidate_block',return_value=('No evidence.',[])):
+                        self.m._assistant_core_router_call(request(mode),{})
+                finally:
+                    if token is not None:
+                        self.m._V13_BUDGET_CTX.reset(token)
                 self.assertEqual(len(captured),1)
                 schema=captured[0]['json_schema']['schema']
                 self.assertEqual('factual_coverage' in schema['properties'],mode=='ask')
