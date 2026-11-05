@@ -13,6 +13,33 @@ from typing import Any
 from fastapi import HTTPException
 
 
+def _root_window_cursor_factory(base_factory, window, statement_limit):
+    """Keep native cursors; tighten each Root optional reader's next statement.
+
+    The connection and its transaction/context-manager behavior remain native.
+    A separate native control cursor avoids disturbing the data cursor's result.
+    Existing Root readers use execute(), not copy/executemany/server-side fetches.
+    Transport and server cancellation overhead still prevent a hard wall-clock
+    guarantee; the request's outer deadline remains authoritative.
+    """
+    class RootWindowCursor(base_factory):
+        def execute(self, query, vars=None):
+            timeout_ms = window.timeout_ms(statement_limit)
+            control = self.connection.cursor(cursor_factory=base_factory)
+            try:
+                # Session SET also works for an autocommit connection. No commit,
+                # rollback or transaction context is added by this wrapper.
+                control.execute("SET statement_timeout = %s", (timeout_ms,))
+            finally:
+                control.close()
+            # If the control round trip consumed the reserved slot, do not send
+            # a data statement whose already-installed timeout no longer fits.
+            window.check(minimum_seconds=timeout_ms / 1000.0)
+            return super().execute(query, vars)
+
+    return RootWindowCursor
+
+
 def connect_database(
     *,
     db_host: str,
@@ -43,6 +70,7 @@ def connect_database(
         budget = None
 
     assurance_remaining = None
+    assurance_deadline = 0.0
     try:
         assurance_ctx = runtime_globals.get("_V13_ASSURANCE_DEADLINE_CTX")
         assurance_deadline = (
@@ -91,7 +119,38 @@ def connect_database(
             f"{max(500, min(statement_limit, int(max(0.5, remaining - 0.2) * 1000)))}"
         )
 
-    return connect_fn(**kwargs)
+    from machinemind.retrieval import root_time_budget
+    root_window = root_time_budget.current_window()
+    if root_window is None or not root_window.optional:
+        return connect_fn(**kwargs)
+    if assurance_deadline > 0.0:
+        from dataclasses import replace
+        root_window = replace(root_window, deadline=min(root_window.deadline, assurance_deadline))
+
+    # Bind this exact synchronous child deadline, rather than renewing it for
+    # each connection/statement or consulting a later unrelated request context.
+    # libpq connection timeout granularity is whole seconds (minimum two).
+    root_window.check(minimum_seconds=2.05)
+    connect_limit = int(kwargs.get("connect_timeout") or runtime_globals.get(
+        "V13_DB_CONNECT_TIMEOUT_SECONDS", 5) or 5)
+    kwargs["connect_timeout"] = max(1, min(connect_limit, int(root_window.remaining() - 0.05)))
+    statement_limit = int(runtime_globals.get("V13_DB_STATEMENT_TIMEOUT_MS", 9000) or 9000)
+    if "options" in kwargs:
+        # These options were constructed above; retain a tighter native or
+        # assurance timeout instead of widening it for the optional Root slot.
+        statement_limit = min(statement_limit, int(kwargs["options"].split("=", 1)[1]))
+    kwargs["options"] = "-c statement_timeout=" + str(root_window.timeout_ms(statement_limit))
+    connection = connect_fn(**kwargs)
+    try:
+        root_window.check()
+        from psycopg2.extensions import cursor as native_cursor
+        base_factory = connection.cursor_factory or native_cursor
+        connection.cursor_factory = _root_window_cursor_factory(
+            base_factory, root_window, statement_limit)
+    except BaseException:
+        connection.close()
+        raise
+    return connection
 
 
 def vector_literal(vec: list[float]) -> str:

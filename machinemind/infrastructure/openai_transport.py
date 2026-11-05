@@ -138,6 +138,10 @@ def _send_json_attempt(*, url, headers, payload, timeout, post_fn, budget,
         # Recheck after payload/reservation work, before dispatch. If no time
         # remains, the existing not_sent receipt releases only unsent liability.
         timeout = _provider_timeout("embedding" if embedding else purpose, timeout)
+        # Root optional retrieval alone has a child slot for both connect/read.
+        # Keep the same reservation and dispatch; no retry or extra provider.
+        from machinemind.retrieval import root_time_budget
+        timeout = root_time_budget.optional_transport_timeout(timeout)
         if budget is not None:
             if not embedding:
                 _record_service_tier(budget, call_index, payload)

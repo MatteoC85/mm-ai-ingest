@@ -14205,11 +14205,13 @@ def _assistant_core_refine_retrieval(
     retrieval: dict,
     decision: AssistantCoreDecision,
 ) -> dict:
-    return _retrieval_evidence_orchestration.assistant_core_refine_retrieval(
-        request,
-        retrieval,
-        decision,
-        runtime=_assistant_core_refine_retrieval_runtime(),
+    from machinemind.retrieval import root_time_budget
+    return root_time_budget.optional_retrieval(
+        request=request, decision=decision, retrieval=retrieval, budget=_v13_current_budget(),
+        producer_timeout=V13_FAST_TIMEOUT_SECONDS, review_timeout=min(20, V13_FAST_TIMEOUT_SECONDS),
+        stage="facet_refinement",
+        run=lambda candidate: _retrieval_evidence_orchestration.assistant_core_refine_retrieval(
+            request, candidate, decision, runtime=_assistant_core_refine_retrieval_runtime()),
     )
 
 def _assistant_core_required_facet_metrics(text: str, facets: list[str] | tuple[str, ...]) -> dict:
@@ -15079,11 +15081,8 @@ def _assistant_core_root_diagnostic_evidence_assurance(
     retrieval: dict,
     decision: AssistantCoreDecision,
 ) -> dict:
-    return _retrieval_evidence_orchestration.assistant_core_root_diagnostic_evidence_assurance(
-        request,
-        retrieval,
-        decision,
-        runtime=_retrieval_evidence_orchestration.AssistantCoreRootDiagnosticEvidenceAssuranceRuntime(
+    from machinemind.retrieval import root_time_budget
+    runtime = _retrieval_evidence_orchestration.AssistantCoreRootDiagnosticEvidenceAssuranceRuntime(
             ASSISTANT_CORE_MAX_FACETS=ASSISTANT_CORE_MAX_FACETS,
             MODE_ROOT_CAUSE=MODE_ROOT_CAUSE,
             V13_DENSE_QUERY_LIMIT=V13_DENSE_QUERY_LIMIT,
@@ -15101,7 +15100,13 @@ def _assistant_core_root_diagnostic_evidence_assurance(
             _v13_fetch_structured_title_candidates=_v13_fetch_structured_title_candidates,
             _v13_initial_retrieval=_v13_initial_retrieval,
             _v13_score_candidates=_v13_score_candidates,
-        ),
+        )
+    return root_time_budget.optional_retrieval(
+        request=request, decision=decision, retrieval=retrieval, budget=_v13_current_budget(),
+        producer_timeout=V13_FAST_TIMEOUT_SECONDS, review_timeout=min(20, V13_FAST_TIMEOUT_SECONDS),
+        stage="diagnostic_assurance",
+        run=lambda candidate: _retrieval_evidence_orchestration.assistant_core_root_diagnostic_evidence_assurance(
+            request, candidate, decision, runtime=runtime),
     )
 
 def _assistant_core_root_source_selection(
@@ -15771,6 +15776,7 @@ def _assistant_core_synthesize_root_cause(
     retrieval: dict,
     decision: AssistantCoreDecision,
 ) -> dict:
+    from machinemind.retrieval import root_time_budget
     retrieval_query = _assistant_core_retrieval_query(request)
     rescored = _v13_rescore_root_candidates(
         retrieval_query, retrieval.get("citations") or retrieval.get("candidates") or []
@@ -15802,15 +15808,19 @@ def _assistant_core_synthesize_root_cause(
             )} if request.requested_mode == MODE_ROOT_CAUSE else {}),
         },
     }
-    response = _v13_generate_root_cause_response(
-        q=retrieval_query,
-        company_id=request.company_id,
-        response_language=request.response_language,
-        top_k=request.top_k,
-        max_causes=request.max_causes,
-        retrieval=root_retrieval,
-        debug=request.debug,
-    )
+    with root_time_budget.producer_window(
+        request=request, decision=decision, budget=_v13_current_budget(),
+        review_timeout=min(20, V13_FAST_TIMEOUT_SECONDS),
+    ):
+        response = _v13_generate_root_cause_response(
+            q=retrieval_query,
+            company_id=request.company_id,
+            response_language=request.response_language,
+            top_k=request.top_k,
+            max_causes=request.max_causes,
+            retrieval=root_retrieval,
+            debug=request.debug,
+        )
     return _assistant_core_adjudicate_root_cause(
         request=request,
         decision=decision,
