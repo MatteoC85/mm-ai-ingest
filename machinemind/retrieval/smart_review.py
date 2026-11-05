@@ -14,7 +14,7 @@ POLICY_VERSION = 'smart-reviewed-proposals-v5'
 MAX_CHECK_CHARS = 2000
 MAX_SOURCE_SAFETY_NOTE_CHARS = 900
 WIRE_VERSION = 'smart-review-wire-v2'
-INPUT_VERSION = 'smart-review-table-input-v1'
+INPUT_VERSION = 'smart-review-table-input-v2'
 RESERVED_REVIEW_SECONDS = 30
 MAX_REVIEW_SECONDS = 45
 FINALIZATION_RESERVE_SECONDS = 2
@@ -113,6 +113,17 @@ any proposed causal link lacks support; never silently narrow its wording.
 Scope: selected-machine context resolves unqualified 'the machine', not component
 identity, document correctness or dependency. Reject wrong/unidentified targets.
 Use only admitted sources, including any valid rebind of unvalidated generator IDs.
+PROPOSAL_SOURCE_HINTS maps the draft's exact admitted citation IDs to existing
+source indices. These are unvalidated search hints, NOT evidence, proof,
+acceptance, or an exclusive source list. Begin with those sources, then check
+other relevant admitted sources before rejecting a claim as absent. An empty
+hint list is not grounds for rejection. Inspect each relevant passage and its
+governing heading/row: a broad summary may omit a distinction that a detailed
+source documents. Different documented alternatives may require separate proofs
+from different sources. Do not transfer one row's condition to another, invent a
+relation, or accept a hinted source without validating its complete applicability.
+Question hints come from its declared target hypotheses, not accepted targets;
+the question still needs an independently accepted target and all check proofs.
 The SOURCE_TABLE columns/rows reconstruct each original source with ALL metadata
 and text; no source is merged. Each [unit_id,text] is a literal contiguous passage,
 not proof of relevance/truth. Inspect its wording, scope and governing conditions.
@@ -411,6 +422,29 @@ def question_option_roles(options):
             'abstention_controls': [deepcopy(option) for option in options if option in canonical_controls]}
 
 
+def proposal_source_hints(prepared):
+    """Advisory indices only; never extend the sealed source/proof registry."""
+    frozen = prepared['references']['frozen']
+    source_indices = {source['citation_id']: index
+                      for index, source in enumerate(frozen['source_manifest'])}
+    hypotheses = {hypothesis['id']: hypothesis for hypothesis in prepared['step']['hypotheses']}
+    by_hypothesis = {}
+    rows = []
+    for proposal in frozen['proposals']:
+        if proposal['kind'] == 'cause':
+            hypothesis = hypotheses.get(proposal['hypothesis_id'], {})
+            proposed = hypothesis.get('evidence_ids')
+            ids = proposed if isinstance(proposed, list) else []
+            indices = sorted({source_indices[cid] for cid in ids
+                              if isinstance(cid, str) and cid in source_indices})
+            by_hypothesis[proposal['hypothesis_id']] = indices
+        else:
+            indices = sorted({index for target in proposal.get('target_hypotheses', [])
+                              for index in by_hypothesis.get(target, [])})
+        rows.append({'proposal_index': proposal['proposal_index'], 'source_indices': indices})
+    return rows
+
+
 def messages(prepared, *, language, symptom_text, history):
     references = prepared['references']
     frozen = references['frozen']
@@ -425,6 +459,7 @@ def messages(prepared, *, language, symptom_text, history):
         f'RESPONSE_LANGUAGE: {language}\nDECLARED_CONTEXT: {refs.canonical(symptom_text)}\n'
         f'ANSWER_HISTORY: {refs.canonical(continuity.generation_history(history))}\n'
         f'PROPOSALS: {refs.canonical(frozen["proposals"])}\n'
+        f'PROPOSAL_SOURCE_HINTS: {refs.canonical(proposal_source_hints(prepared))}\n'
         f'OBSERVED_UNITS: {refs.canonical(references["observed_units"])}\n'
         f'AUTHORIZATION: {refs.canonical(compact_authorized)}\n'
         f'REVIEW_PACKET: {refs.canonical(compact_source_table(references["model_packet"]))}\nReturn decisions only.'}]
