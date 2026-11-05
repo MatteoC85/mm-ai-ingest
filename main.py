@@ -22636,6 +22636,24 @@ def _sd_canonicalize_final_result(final_raw: dict, hypotheses: list[dict], langu
                     [str(check).strip() for h in hypotheses for check in h.get("checks") or []], limit=8),
             }
         return {}
+    if _smart_review.is_unweighted_open(grounded):
+        # Approved possibilities can justify a clarification without supplying
+        # any relative likelihood. A forced finalization must not rank them.
+        is_en = str(language or "").lower().startswith("en")
+        heading = (
+            "The diagnosis is inconclusive: the available observations do not identify a cause."
+            if is_en else
+            "La diagnosi è inconclusiva: i riscontri disponibili non identificano una causa."
+        )
+        reasons = [str(h.get("why") or h.get("description") or "").strip() for h in grounded]
+        return {
+            "summary": "\n\n".join([heading] + [reason for reason in reasons if reason]),
+            "most_likely_hypothesis_id": "",
+            "most_likely_label": "No cause identified" if is_en else "Nessuna causa identificata",
+            "probability_pct": 0.0, "probability_band": "unknown",
+            "recommended_checks": _unique_non_empty_strings(
+                [str(check).strip() for h in grounded for check in h.get("checks") or []], limit=8),
+        }
     by_id = {str(h.get("id") or "").strip(): h for h in grounded}
     requested_id = str((final_raw or {}).get("most_likely_hypothesis_id") or "").strip()
     selected = by_id.get(requested_id)

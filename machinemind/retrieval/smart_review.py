@@ -217,6 +217,14 @@ def is_excluded_terminal(step):
                 for h in hypotheses))
 
 
+def is_unweighted_open(hypotheses):
+    """Structural uncertainty only; this never supplies evidence or acceptance."""
+    return bool(hypotheses) and all(
+        h.get('status') == 'open' and h.get('probability_band') == 'unknown'
+        and type(h.get('probability_pct')) in (int, float)
+        and h['probability_pct'] == 0 for h in hypotheses)
+
+
 def observation_text(symptom_text, history):
     # Labels are supplied with their question so a bare yes/no is not ambiguous.
     # The independent reviewer still distinguishes reported, simulated and actual
@@ -579,7 +587,19 @@ def resolve(*, prepared, parsed, probability_band, continuity_policy=None):
                          and len(accepted) == len(original['hypotheses']))
     usable(bool(active) or excluded_terminal, 'no_supported_hypotheses')
     total = sum(float(h.get('probability_pct') or 0) for h in active)
-    usable(total > 0 or excluded_terminal, 'no_positive_supported_hypothesis')
+    targets = (original.get('question') or {}).get('target_hypotheses') or []
+    # Source support for a hypothesis/question is different from evidence that a
+    # physical cause is probable. A reviewed clarification may ask for missing
+    # observations while preserving every unknown weight at zero. It cannot
+    # rescue a rejected question, invent a target, or certify a conclusion.
+    unweighted_clarification = (
+        continuity_policy == continuity.POLICY_VERSION
+        and original.get('status') == 'in_progress' and original.get('final_ready') is False
+        and is_unweighted_open(active) and question_index is not None
+        and question_index in by_index and bool(targets)
+        and set(targets).issubset({h['id'] for h in active}))
+    usable(total > 0 or excluded_terminal or unweighted_clarification,
+           'no_positive_supported_hypothesis')
     accumulated = 0.0
     for index, h in enumerate(active):
         if continuity_policy is None:

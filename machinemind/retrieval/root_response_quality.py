@@ -10,7 +10,7 @@ from typing import Any
 
 from . import review_references
 
-POLICY_VERSION = "root-response-quality-v2"
+POLICY_VERSION = "root-response-quality-v3"
 
 SYNTHESIS_INSTRUCTION = """
 A root-cause answer is a diagnostic decision aid, not a repair procedure.
@@ -90,6 +90,32 @@ check or to remove a prerequisite needed by a retained action.
 """.strip()
 
 
+CONDITIONAL_APPLICABILITY_INSTRUCTION = """
+For Root hypotheses, distinguish the documented target/mechanism from whether its
+enabling condition or optional configuration was actually present. Do not reject
+solely as unknown_target because that condition remains unverified, but ONLY when
+the original proposal itself explicitly preserves that uncertainty, the source
+and reported observation establish the same relevant target and symptom, and the
+documented mechanism explains that observation conditionally. A name/code match
+alone cannot override a conflicting model or establish a causal dependency.
+If the user explicitly asks about a documentary or hypothetical case, assess the
+hypothesis within that stated case; do not turn it into a confirmed diagnosis or
+assert that the described configuration is installed on the user's machine.
+
+With unverified configuration, retained checks may ask only for already available
+observations or records of the specific source-documented condition, or be empty.
+They must not invent a sensor, interface, reading or dependency, require a new
+operation, or prescribe an intervention whose applicability/prerequisites remain
+unknown. The proposed cause and explanation must themselves respect these limits.
+The reviewer must still independently establish applicable target evidence and
+causal support with the existing authorized proofs; uncertainty is not a proof.
+Selected-machine routing alone remains insufficient. Reject wrong-model claims,
+unsupported dependencies/actions and wording that presents an unknown condition
+as established. Never repair a proposal or convert a rejection into acceptance
+merely because it uses conditional words.
+""".strip()
+
+
 CHECK_SELECTION_INSTRUCTION = """
 Review the COMPLETE original draft before selecting any check. Each decision also
 includes selected_check_indices and safe_check_subset. For an accepted cause,
@@ -142,7 +168,8 @@ def review_instruction() -> str:
         if instruction.count(old) != 1:
             raise review_references.ReferenceError("review_instruction_contract_changed")
         instruction = instruction.replace(old, new)
-    return instruction + "\n\n" + CHECK_SELECTION_INSTRUCTION + "\n\n" + RANKING_INSTRUCTION
+    return (instruction + "\n\n" + CONDITIONAL_APPLICABILITY_INSTRUCTION
+            + "\n\n" + CHECK_SELECTION_INSTRUCTION + "\n\n" + RANKING_INSTRUCTION)
 
 
 def review_schema(frozen: dict[str, Any]) -> dict[str, Any]:
