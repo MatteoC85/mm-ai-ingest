@@ -840,10 +840,14 @@ def verify_or_repair_answer(
                 ],
                 models=[V13_FAST_MODEL, V13_PLANNER_MODEL],
                 json_schema=verifier_schema,
-                # The bounded output includes reasoning tokens. Keep room for the
-                # complete review JSON/edits without raising its token/cost/deadline
-                # ceilings. Legacy, Root and Smart have no protected ASK owner here.
-                effort="low" if protected_budget else V13_FAST_EFFORT,
+                # This source-first draft still requires the independent semantic
+                # review below. Keep its bounded output for the wire inventory;
+                # the independent reviewer retains low effort and every check.
+                # Unverified model overrides keep their existing effort behavior.
+                effort=("none" if protected_budget and independent_context_review
+                        and {V13_FAST_MODEL, V13_PLANNER_MODEL}.issubset(
+                            {"gpt-5.6-terra", "gpt-5.6-luna"})
+                        else "low" if protected_budget else V13_FAST_EFFORT),
                 reasoning_mode="",
                 timeout=_review_timeout(runtime, budget, protected=protected_budget, compact=compact_review),
                 max_output_tokens=min(4000, max(3200, V13_FAST_MAX_OUTPUT_TOKENS)),
