@@ -223,22 +223,19 @@ def ingest_document(
         if len(data) > runtime.max_pdf_bytes:
             raise runtime.http_exception_cls(status_code=413, detail="PDF too large")
 
+        pdf_stage = "extract_pages"
+        pdf_page = None
         try:
             raw_pages = runtime.extract_pdf_pages(data)
             pages_total = len(raw_pages)
 
+            pdf_stage = "detect_headers_footers"
             header_norm, footer_norm = runtime.detect_repeated_headers_footers(
                 raw_pages
             )
 
-            try:
-                runtime.upsert_cleaning_meta(
-                    company_id, bubble_document_id, header_norm, footer_norm
-                )
-            except Exception as exc:
-                runtime.log_fn("CLEANING_META_UPSERT_FAIL", str(exc))
-
-            for text in raw_pages:
+            pdf_stage = "clean_page"
+            for pdf_page, text in enumerate(raw_pages, 1):
                 cleaned = runtime.remove_headers_footers_from_page(
                     text, header_norm, footer_norm
                 )
@@ -248,7 +245,22 @@ def ingest_document(
                 text_chars += len(cleaned)
                 if len(cleaned) >= runtime.min_page_chars:
                     pages_with_text += 1
-        except Exception:
+        except Exception as exc:
+            from .text_pdf import PdfPageExtractionError
+
+            if isinstance(exc, PdfPageExtractionError):
+                pdf_stage = exc.stage
+                pdf_page = exc.page_number
+            # No exception message/traceback, URL, credentials or document text.
+            # Logging must not replace the stable public error or start indexing.
+            try:
+                runtime.log_fn("PDF_PARSE_FAILED", {
+                    "stage": pdf_stage,
+                    "page_number": pdf_page,
+                    "pages_detected": pages_total,
+                })
+            except Exception:
+                pass
             raise runtime.http_exception_cls(status_code=422, detail="PDF parse failed")
 
     else:
@@ -432,6 +444,19 @@ def ingest_document(
             "doc_prev_storage_bytes": prev_doc_storage,
             "new_total_storage_bytes": new_total_storage,
         }
+
+    # Rejected documents must not replace cleaning metadata for an existing
+    # index. Persist it only after every indexability and plan admission check.
+    if source_file_type == "pdf":
+        try:
+            runtime.upsert_cleaning_meta(
+                company_id, bubble_document_id, header_norm, footer_norm
+            )
+        except Exception:
+            try:
+                runtime.log_fn("CLEANING_META_UPSERT_FAIL", "metadata_write_failed")
+            except Exception:
+                pass
 
     runtime.replace_document_pages(
         company_id=company_id,

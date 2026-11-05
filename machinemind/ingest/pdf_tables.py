@@ -29,6 +29,39 @@ def _overlap(a, b):
     return min(a[2], b[2]) - max(a[0], b[0]) > .5 and min(a[3], b[3]) - max(a[1], b[1]) > .5
 
 
+def _contains(outer, inner):
+    return (outer[0] <= inner[0] + .5 and outer[1] <= inner[1] + .5
+            and outer[2] >= inner[2] - .5 and outer[3] >= inner[3] - .5)
+
+
+# These failures describe uncertain relationships in a detector candidate, not
+# unreadable PDF text. Quarantine their text instead of fabricating a table or
+# making an unrelated page fail. Invalid rectangles and detector/runtime errors
+# remain fatal: there is no reliable region to quarantine in those cases.
+_QUARANTINABLE_LAYOUT_ERRORS = frozenset({
+    "table_boundary_ambiguous", "table_grid_dimensions_ambiguous",
+    "table_grid_extent_ambiguous", "table_cells_overlap",
+    "table_grid_has_unresolved_cells", "table_word_cell_ambiguous",
+})
+
+
+def _unassigned_region(bbox, words):
+    members = [(i, w) for i, w in enumerate(words) if _overlap(bbox, w[:4])]
+    lines = defaultdict(list)
+    for _, word in members:
+        lines[word[5], word[6]].append(word)
+    # Repeat the warning for each physical line so it survives page cleaning and
+    # chunk boundaries. No inferred rows, columns, units or diagram connections.
+    parts = [
+        '- [PDF_TABLE_UNASSIGNED relationship=ambiguous] '
+        'Text in an unresolved PDF layout; no row/column relationship or diagram '
+        'connection is asserted: '
+        + json.dumps(" ".join(_word_text(line).split()), ensure_ascii=False)
+        for line in sorted(lines.values(), key=lambda line: (min(w[1] for w in line), min(w[0] for w in line)))
+    ]
+    return bbox, "\n\n".join(parts), {i for i, _ in members}
+
+
 def _bounds(values):
     groups = []
     for value in sorted(values):
@@ -207,14 +240,24 @@ def page_text_with_tables(page, blocks):
 
     PyMuPDF 1.24.9 is pinned by the application. Older injected page doubles with
     no table API retain their historical behavior. A failed real table detector
-    or ambiguous text-bearing geometry is explicit and must not publish a fake
-    table: the existing ingest boundary converts this error to PDF parse failed.
+    remains fatal. Ambiguous candidate geometry is preserved as explicitly
+    unassigned text, never projected into invented row/column relationships.
     """
     detector = getattr(page,"find_tables",None)
     if not callable(detector):
         return None
+    rotation = getattr(page, "rotation", 0)
     try:
-        tables = detector(strategy="lines_strict").tables
+        # get_text uses unrotated PDF coordinates. The pinned detector can use
+        # the displayed rotation instead; align both coordinate spaces before
+        # assigning words to cells, then restore the in-memory page metadata.
+        try:
+            if rotation:
+                page.set_rotation(0)
+            tables = detector(strategy="lines_strict").tables
+        finally:
+            if rotation:
+                page.set_rotation(rotation)
     except Exception as exc:
         raise PdfTableLayoutError("table_detection_failed") from exc
     candidates = [table for table in tables if table.row_count >= 2 and table.col_count >= 2]
@@ -225,16 +268,57 @@ def page_text_with_tables(page, blocks):
     spans = [span for block in rich_blocks if block.get("type") == 0
              for line in block.get("lines", []) for span in line.get("spans", [])]
     images = [block["bbox"] for block in rich_blocks if block.get("type") == 1]
-    accepted = []
+    accepted, ambiguous = [], []
     for table in candidates:
-        result = _table(table,words,spans,images)
+        try:
+            result = _table(table,words,spans,images)
+        except PdfTableLayoutError as exc:
+            if str(exc) not in _QUARANTINABLE_LAYOUT_ERRORS:
+                raise
+            ambiguous.append(_rect(table.bbox))
+            continue
         if result is None:
             continue
-        if any(result[0] == old[0] and result[2] == old[2] for old in accepted):
+        if any(result == old for old, _ in accepted):
             continue
-        if any(_overlap(result[0],old[0]) for old in accepted):
+        if any(_overlap(result[0],old[0]) for old, _ in accepted):
             raise PdfTableLayoutError("table_regions_overlap")
-        accepted.append(result)
+        accepted.append((result, table))
+    unresolved = []
+    for bbox in ambiguous:
+        # Underlines and boxed text can create a spurious subgrid inside a real
+        # cell. The validated parent already owns its words and establishes only
+        # that cell relationship; do not invent the contradictory child grid.
+        region_words = _unassigned_region(bbox, words)[2]
+        if any(region_words <= result[2] and any(
+                cell is not None and _contains(_rect(cell), bbox)
+                for cell in table.cells) for result, table in accepted):
+            continue
+        unresolved.append(bbox)
+    # An uncertain region crossing a verified table cannot leave half of that
+    # table's claims published. Quarantine the union, including all its words.
+    # Merge overlapping uncertain regions to preserve each word exactly once.
+    regions = [(result, False) for result, _ in accepted]
+    regions += [(_unassigned_region(bbox, words), True) for bbox in unresolved]
+    changed = True
+    while changed:
+        changed = False
+        for i, (left, left_uncertain) in enumerate(regions):
+            for j in range(i + 1, len(regions)):
+                right, right_uncertain = regions[j]
+                if not (left_uncertain or right_uncertain) or not (
+                        _overlap(left[0], right[0]) or left[2] & right[2]):
+                    continue
+                a, b = left[0], right[0]
+                union = (min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3]))
+                regions[i] = (_unassigned_region(union, words), True)
+                regions.pop(j)
+                changed = True
+                break
+            if changed:
+                break
+    accepted = [_unassigned_region(result[0], words) if uncertain else result
+                for result, uncertain in regions]
     if not accepted:
         return None
     owned = set().union(*(item[2] for item in accepted))

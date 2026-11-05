@@ -18,6 +18,15 @@ NormalizeText = Callable[[str], str]
 PageToTextBlocks = Callable[[Any], str]
 
 
+class PdfPageExtractionError(ValueError):
+    """Content-free page/stage context for the ingest boundary's safe log."""
+
+    def __init__(self, page_number: int, stage: str):
+        self.page_number = page_number
+        self.stage = stage
+        super().__init__("pdf_page_extraction_failed")
+
+
 def normalize_unicode_advanced(s: str) -> str:
     """Apply the production Unicode/ligature/dash normalization exactly."""
     if not s:
@@ -144,9 +153,15 @@ def extract_pages_with_layout_blocks(
     try:
         out: list[str] = []
         for index in range(doc.page_count):
-            page = doc.load_page(index)
-            text = page_to_text_blocks_fn(page)
-            text = normalize_text_keep_lines_fn(text)
+            stage = "load_page"
+            try:
+                page = doc.load_page(index)
+                stage = "extract_layout"
+                text = page_to_text_blocks_fn(page)
+                stage = "normalize_text"
+                text = normalize_text_keep_lines_fn(text)
+            except Exception as exc:
+                raise PdfPageExtractionError(index + 1, stage) from exc
             out.append(text)
         return out
     finally:
