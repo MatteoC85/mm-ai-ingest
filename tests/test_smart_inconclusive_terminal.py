@@ -121,7 +121,7 @@ class SmartInconclusiveTerminalTests(unittest.TestCase):
                 self.assertEqual(final.json()['meta']['smart_review']['finalization_provider_calls'], 0)
                 result = final.json()
 
-    def test_rejected_exclusion_is_not_relabelled_as_successful_inconclusive_result(self):
+    def test_rejected_exclusion_closes_neutrally_without_certifying_an_exclusion(self):
         start = self.start()
         def reject(*args, **kwargs):
             parsed = parsed_review(self.prepared[-1], rejected=(0,))
@@ -132,9 +132,16 @@ class SmartInconclusiveTerminalTests(unittest.TestCase):
             response = self.post('answer', start['session_state_json'], question_id='Q1',
                 answer=dict(value='unknown', api_value='unknown', label='Unknown', free_text='Not verified'))
         self.assertEqual(response.status_code, 200, response.text)
-        self.assertFalse(response.json()['ok'])
-        self.assertFalse(response.json()['final_ready'])
-        self.assertEqual(response.json()['error_code'], 'SMART_DIAGNOSTIC_REVIEW_REJECTED')
+        result = response.json()
+        self.assertTrue(result['ok'])
+        self.assertTrue(result['final_ready'])
+        self.assertEqual(result['hypotheses'], [])
+        self.assertEqual(result['final_result']['most_likely_hypothesis_id'], '')
+        self.assertEqual(result['final_probability_pct'], 0)
+        self.assertEqual(result['meta']['smart_review']['outcome'], 'rejected')
+        self.assertFalse(result['meta']['protocol_terminal']['current_proposal_accepted'])
+        self.assertFalse(result['meta']['protocol_terminal']['exclusions_certified'])
+        self.assertIn('does not confirm or exclude', result['final_summary_text'])
         state = json.loads(response.json()['session_state_json'])
         self.assertEqual(len(state['history']), 1)
         self.assertNotIn('grounding_review', state)

@@ -195,6 +195,7 @@ from machinemind.retrieval import review_packet as _retrieval_review_packet
 from machinemind.retrieval import review_decisions as _retrieval_review_decisions
 from machinemind.retrieval import review_references as _retrieval_review_references
 from machinemind.retrieval import smart_review as _smart_review
+from machinemind.retrieval import smart_protocol as _smart_protocol
 from machinemind.retrieval import smart_evidence as _smart_evidence
 from machinemind.retrieval import smart_context as _smart_context
 from machinemind.retrieval import smart_routing as _smart_routing
@@ -19984,7 +19985,7 @@ def _sd_require_grounding_packet(state: dict) -> dict:
 
 
 def _sd_review_step(*, step: dict, state: dict, language: str, debug: bool = False,
-                    raw_draft: Optional[dict] = None) -> tuple[dict, dict]:
+                    raw_draft: Optional[dict] = None, protocol_context: Optional[dict] = None) -> tuple[dict, dict]:
     packet = _smart_evidence.review_packet(_sd_require_grounding_packet(state))
     budget = _v13_current_budget()
     if budget is None or budget.remaining() < 8.0 or budget.llm_calls >= budget.max_llm_calls:
@@ -20040,6 +20041,15 @@ def _sd_review_step(*, step: dict, state: dict, language: str, debug: bool = Fal
                 **_smart_review.rejection_diagnostic(exc, prepared=prepared),
                 "model": model, "elapsed_seconds": round(time_module.monotonic() - started, 3),
                 "timeout_seconds": review_timeout, "input_version": _smart_review.INPUT_VERSION}
+            if str(exc) == "no_supported_hypotheses" and protocol_context is not None:
+                try:
+                    terminal, checkpoint = _smart_protocol.conclude(context=protocol_context,
+                        state=rejected_state, packet=packet, probability_band=_sd_probability_band)
+                except ValueError:
+                    pass  # A missing/changed prior proof never grants a neutral terminal.
+                else:
+                    terminal["question"] = _sd_empty_question(len(state.get("history") or []))
+                    return terminal, checkpoint
             if debug:
                 rejected_state["grounding_review_debug"] = _smart_review.debug_capture(stage="review_rejected",
                     grounding_packet=state["grounding_packet"], raw_draft=raw_draft or step, normalized_draft=step,
@@ -21457,7 +21467,23 @@ def _sd_response_from_step(
         ),
     }
     if final_ready and status != "no_sources":
-        if state.get("grounding_review"):
+        if state.get("protocol_inconclusive"):
+            try:
+                terminal, wanted = _smart_protocol.replay(state=state,
+                    packet=_smart_evidence.review_packet(_sd_require_grounding_packet(state)),
+                    probability_band=_sd_probability_band)
+                _smart_protocol.validate_projection(step, terminal)
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail={"code": "SMART_DIAGNOSTIC_SESSION_RESTART_REQUIRED",
+                    "reason": str(exc)}) from None
+            by_id = {str(c.get("citation_id") or ""): c for c in citations}
+            if any(cid not in by_id for cid in wanted):
+                raise HTTPException(status_code=502, detail={"code": "SMART_DIAGNOSTIC_REVIEW_CITATION_MISSING"})
+            citations = [by_id[cid] for cid in wanted]
+            source_manifest_meta = {"version": SMART_DIAGNOSTIC_SOURCE_MANIFEST_VERSION,
+                "hypothesis_scoped": False, "protocol_context_only": True,
+                "reviewer_proof_bound": False, "question_proof_bound": True, "citation_count": len(citations)}
+        elif state.get("grounding_review"):
             # A proof-selected citation cannot be substituted by a nearby page
             # or silently evicted by the presentation's six-slot preference.
             by_id = {str(c.get("citation_id") or ""): c for c in citations}
@@ -21550,6 +21576,13 @@ def _sd_response_from_step(
         },
     }
     _sd_flatten_question(resp, question)
+    if current_state.get("protocol_inconclusive"):
+        resp["meta"].update(cacheable=False, semantic_cacheable=False,
+                            session_history_preserved=True, session_continuable=False)
+        resp["meta"]["protocol_terminal"] = {"policy_version": _smart_protocol.POLICY_VERSION,
+            "outcome": "inconclusive", "current_proposal_accepted": False,
+            "exclusions_certified": False, "prior_question_review_replayed": True,
+            "finalization_provider_calls": 0}
     _sd_flatten_hypotheses(resp, hypotheses)
     _sd_flatten_citations(resp, citations, rg_links)
     if debug:
@@ -22493,6 +22526,13 @@ def smart_diagnostic_answer_v1(
             symptom_text=symptom_text, language=language, state=state, step=step,
             citations=list(state.get("citations") or []), rg_links=list(state.get("rg_links") or []),
             debug=bool(payload.debug))
+    protocol_context = None
+    try:
+        protocol_context = _smart_protocol.prepare(state=state,
+            packet=_smart_evidence.review_packet(_sd_require_grounding_packet(state)),
+            answer=answer, language=language, probability_band=_sd_probability_band)
+    except ValueError:
+        pass  # Existing rejection behavior remains when this prior proof cannot replay.
     history = list(state.get("history") or [])
     history.append({"question": current_question, "answer": answer})
     state["history"] = history
@@ -22530,7 +22570,8 @@ def smart_diagnostic_answer_v1(
                 status_code=502,
                 detail={"code": "SMART_DIAGNOSTIC_REPEATED_QUESTION", "message": "Smart Diagnostic did not produce a new discriminating question. Retry this answer."},
             )
-    step, state = _sd_review_step(step=step, state=state, language=language, debug=bool(payload.debug), raw_draft=parsed)
+    step, state = _sd_review_step(step=step, state=state, language=language, debug=bool(payload.debug),
+                                 raw_draft=parsed, protocol_context=protocol_context)
     if step.get("status") == "no_sources":
         return _sd_review_rejected_response(state=state, language=language,
             session_id=session_id, symptom_text=symptom_text)
@@ -22700,6 +22741,21 @@ def smart_diagnostic_finalize_v1(
     language = _sd_language(payload.language or state.get("language"), symptom_text)
     if not _sd_state_has_admitted_evidence(state):
         return _sd_no_sources_response(language, session_id, symptom_text, debug=bool(payload.debug), gate_result=dict(state.get("evidence_gate") or {}))
+    if state.get("protocol_inconclusive"):
+        # Replay this signed record in its frozen language; do not change the
+        # language binding while returning the same immutable terminal text.
+        language = str(state.get("language") or language)
+        try:
+            step, _ = _smart_protocol.replay(state=state,
+                packet=_smart_evidence.review_packet(_sd_require_grounding_packet(state)),
+                probability_band=_sd_probability_band)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail={"code": "SMART_DIAGNOSTIC_SESSION_RESTART_REQUIRED",
+                "reason": str(exc)}) from None
+        return _sd_response_from_step(session_id=session_id, company_id=company_id, machine_id=machine_id,
+            symptom_text=symptom_text, language=language, state=state, step=step,
+            citations=list(state.get("citations") or []), rg_links=list(state.get("rg_links") or []),
+            debug=bool(payload.debug))
     if (not any(h.get("status") != "excluded" for h in state.get("hypotheses") or [])
             and not _smart_review.is_excluded_terminal({
                 "status": state.get("status"), "final_ready": state.get("status") == "completed",

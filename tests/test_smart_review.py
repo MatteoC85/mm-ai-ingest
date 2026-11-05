@@ -1369,15 +1369,24 @@ class SmartReviewEndpointTests(unittest.TestCase):
             with patch.object(self.m, '_sd_llm_step_answer', return_value=answer_step):
                 responses.append(self.post('answer', start['session_state_json'], question_id='Q1',
                     answer={'value': 'unknown', 'api_value': 'unknown', 'label': 'Unknown'}))
-        for response in responses:
+        for index, response in enumerate(responses):
             self.assertEqual(response.status_code, 200, response.text)
             body = response.json()
-            self.assertFalse(body['ok'])
-            self.assertEqual(body['status'], 'no_sources')
-            self.assertEqual(body['error_code'], 'SMART_DIAGNOSTIC_REVIEW_REJECTED')
-            self.assertEqual(body['error_message'], body['operator_summary'])
+            if index == 2:
+                self.assertTrue(body['ok'])
+                self.assertEqual(body['status'], 'completed')
+                self.assertTrue(body['final_ready'])
+                self.assertEqual(body['meta']['smart_review']['outcome'], 'rejected')
+                self.assertFalse(body['meta']['protocol_terminal']['current_proposal_accepted'])
+                self.assertFalse(body['meta']['protocol_terminal']['exclusions_certified'])
+                self.assertEqual(body['final_result']['most_likely_hypothesis_id'], '')
+            else:
+                self.assertFalse(body['ok'])
+                self.assertEqual(body['status'], 'no_sources')
+                self.assertEqual(body['error_code'], 'SMART_DIAGNOSTIC_REVIEW_REJECTED')
+                self.assertEqual(body['error_message'], body['operator_summary'])
+                self.assertEqual(body['meta']['reason'], 'smart_review_rejected')
             self.assertEqual(body['hypotheses'], [])
-            self.assertEqual(body['meta']['reason'], 'smart_review_rejected')
             self.assertTrue(body['meta']['evidence_gate']['accepted'])
             self.assertEqual(body['meta']['smart_review']['failure_reason'], 'no_supported_hypotheses')
             self.assertEqual(len(body['meta']['smart_review']['verdicts']), 5)
