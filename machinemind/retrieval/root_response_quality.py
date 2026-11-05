@@ -10,7 +10,7 @@ from typing import Any
 
 from . import review_references
 
-POLICY_VERSION = "root-response-quality-v4"
+POLICY_VERSION = "root-response-quality-v5"
 
 SYNTHESIS_INSTRUCTION = """
 A root-cause answer is a diagnostic decision aid, not a repair procedure.
@@ -49,6 +49,14 @@ each inference must follow the documented relationship: the same observation
 must not both support and weaken the same cause under unchanged conditions.
 A concise clear comparison is sufficient; do not add unsupported alternatives
 or recite all manual details to satisfy this requirement.
+Keep the condition at the time of the failure distinct from its state after a
+correction or other change. An alarm disappearing after a suspected condition
+was corrected does not by itself weaken that condition as the initiating cause;
+it may be compatible with that cause. A later normal state does not establish
+that the earlier state was normal. Name the relevant time/conditions whenever
+the distinction affects the inference. Do not invent a causal prediction merely
+to complete a check: asking for the documented observation already available is
+sufficient when its diagnostic direction is not established.
 
 Start by asking for relevant observations, recorded states or readings ALREADY
 available. When the user expressly says a discriminating condition has not been
@@ -171,6 +179,17 @@ no checks. Do not reject an otherwise supported useful cause merely to demand
 every manual detail or a longer list of alternatives. Complete clear comparisons
 between supported alternatives are allowed; do not require every check to discuss
 only its parent cause. All existing proof and safety-prerequisite rules still apply.
+
+Check the timing and conditions of every causal inference. Distinguish a state
+observed during the failure from a later state after correction or another
+change. Disappearance after correction cannot by itself refute that condition
+as the initiating cause, and a later normal observation cannot be projected
+backward as proof of an earlier normal state. If a check makes that unsupported
+inference, omit that check through the existing explicit subset decision; do not
+discard a separately supported cause or independent useful check. No inferred
+outcome is required: a supported question about an existing observation may be
+retained without claiming what it proves. Do not repair the original wording,
+infer an intervention occurred, or add a new test to resolve missing history.
 """.strip()
 
 

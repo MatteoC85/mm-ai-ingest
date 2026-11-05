@@ -90,6 +90,31 @@ class CausalCheckSelectionTests(unittest.TestCase):
         self.assertEqual(result['causes'][0]['checks'], [SAFE])
         self.assertNotIn(contradictory, str(result['causes']))
 
+    def test_success_after_correction_does_not_launder_a_false_historical_exclusion(self):
+        temporal_error = ('If an existing record shows pressure was restored and the feed then ran '
+                          'without slip, this weakens loss of clamping pressure as the original cause.')
+        frozen, records, observed, parsed, proposal = fixture(temporal_error)
+        parsed['decisions'][0]['note'] = ('A result after pressure restoration cannot exclude pressure '
+                                         'loss during the earlier failure; independent first check retained.')
+        result = quality.validate_review(parsed=parsed, frozen=frozen, records=records, observed_query=observed)
+        self.assertEqual(result['causes'][0]['cause'], proposal['cause'])
+        self.assertEqual(result['causes'][0]['why'], proposal['why'])
+        self.assertEqual(result['causes'][0]['checks'], [SAFE])
+        self.assertEqual(result['summary']['check_selection'][0]['blocking_checks'], [1])
+        self.assertNotIn(temporal_error, str(result['causes']))
+        self.assertEqual(frozen['proposals'][0]['checks'][1]['text'], temporal_error)
+
+    def test_existing_time_specific_observation_can_survive_without_causal_prediction(self):
+        observation_only = ('Is a clamping-pressure reading already recorded for the time of the slip, '
+                            'rather than only after a later change? If not, the earlier pressure remains '
+                            'unknown; do not run a new cycle to obtain it.')
+        frozen, records, observed, parsed, proposal = fixture(observation_only, (0, 1))
+        result = quality.validate_review(parsed=parsed, frozen=frozen, records=records, observed_query=observed)
+        self.assertEqual(result['causes'][0]['checks'], proposal['checks'])
+        self.assertEqual(result['causes'][0]['checks'][1], observation_only)
+        self.assertEqual(result['summary']['check_selection'][0]['blocking_checks'], [])
+        self.assertEqual(result['summary']['support_proofs'][0]['decision']['check_indices'], [0, 1])
+
     def test_missing_decision_or_proof_for_discarded_check_fails_closed(self):
         frozen, records, observed, parsed, _ = fixture()
         bad = deepcopy(parsed)
