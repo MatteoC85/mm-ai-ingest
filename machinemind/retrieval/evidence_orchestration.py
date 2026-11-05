@@ -1810,6 +1810,7 @@ def assistant_core_prepare_evidence(request: AssistantCoreRequest, retrieval: di
         # plausible causal or discriminating-check signal.
         supported = supported and bool(root_viable)
 
+    hard_supported = bool(supported)
     precision_requirements = required_answer_types & {
         REQ_NUMERIC_VALUE,
         REQ_INTERFACE_LOCATIONS,
@@ -1967,6 +1968,36 @@ def assistant_core_prepare_evidence(request: AssistantCoreRequest, retrieval: di
             [priority_pool, scored]
         ) if priority_pool else scored
 
+    root_partial_evidence_admission: dict = {}
+    if (
+        request.requested_mode == MODE_ROOT_CAUSE
+        and decision.effective_mode == MODE_ROOT_CAUSE
+        and not supported
+        and hard_supported
+        and not decision.degraded
+        and decision.evidence_state in {EVIDENCE_SUPPORTED, EVIDENCE_PARTIAL, EVIDENCE_REFINE}
+        and not facet_threshold_pass
+        and not (decision.request_kind == KIND_GENERAL_TECHNICAL
+                 and decision.evidence_policy == POLICY_GENERAL_ALLOWED)
+        and precision_type_annotations_pass
+        and selected_pool
+        and (decision.source_type_policy != "require" or not preferred or preferred_viable)
+    ):
+        # Facet tags/lexical coverage are retrieval hints, not a semantic verdict.
+        # Admit independently viable, selected Root sources to the existing
+        # producer and mandatory reviewer. Never mark missing facets covered or
+        # rescue a failed hard contract; review still rejects unsupported claims.
+        supported = True
+        root_partial_evidence_admission = {
+            "policy_version": "root-partial-evidence-admission-v1",
+            "status": "admitted_for_review",
+            "reason": "strict_facet_gate_rejected_independently_viable_root_evidence",
+            "requires_semantic_review": True,
+            "coverage_complete": False,
+            "missing_facets": [facet for facet in must_cover_facets
+                               if str(facet).strip().casefold() not in covered_facets],
+        }
+
     if supported and must_cover_facets:
         selected = _assistant_core_facet_balanced_pool(
             selected_pool, must_cover_facets, limit=limit
@@ -1990,6 +2021,8 @@ def assistant_core_prepare_evidence(request: AssistantCoreRequest, retrieval: di
         "citations": selected,
         "metrics": _v13_evidence_metrics(selected),
         "assistant_core_contract": {
+            **({"root_partial_evidence_admission": root_partial_evidence_admission}
+               if root_partial_evidence_admission else {}),
             "information_task": decision.information_task,
             "required_answer_types": list(decision.required_answer_types),
             "required_facets": list(decision.required_facets),
@@ -2019,6 +2052,8 @@ def assistant_core_prepare_evidence(request: AssistantCoreRequest, retrieval: di
             ],
         },
         "assistant_core_decision": {
+            **({"root_partial_evidence_admission": root_partial_evidence_admission}
+               if root_partial_evidence_admission else {}),
             "request_kind": decision.request_kind,
             "information_task": decision.information_task,
             "required_answer_types": list(decision.required_answer_types),
