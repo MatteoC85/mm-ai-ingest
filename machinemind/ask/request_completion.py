@@ -239,6 +239,7 @@ def record_contract_observation(stage: str, contract: dict, *, diagnostics: dict
         if stage == "semantic_review" and type(diagnostics) is dict:
             row.update(_decision_observation(diagnostics))
             for key, values in {
+                'factual_coverage_intent': {'useful', 'exhaustive', 'unspecified'},
                 'inventory_model_outcome': {'pass', 'rewrite', 'partial', 'no_sources', 'unavailable'},
                 'inventory_answer_form': {'empty', 'template', 'full', 'invalid'},
                 'inventory_template_gate': {'rejected', 'accepted_or_unused'},
@@ -257,6 +258,11 @@ def record_contract_observation(stage: str, contract: dict, *, diagnostics: dict
             }.items():
                 value = diagnostics.get(key)
                 row[key] = value if type(value) is str and value in values else 'other'
+            for key in ('source_first_factual_review', 'useful_factual_selection',
+                        'inventory_template_allowed', 'source_table_catalog_nonempty',
+                        'source_table_catalog_complete', 'selected_records_only'):
+                if type(diagnostics.get(key)) is bool:
+                    row[key] = diagnostics[key]
             for key in ('inventory_wire_count', 'inventory_canonical_count', 'table_expected_count', 'table_wire_count',
                         'source_table_selected_count', 'source_table_bound_record_count', 'source_table_bound_citation_count',
                         'independent_review_edit_count'):

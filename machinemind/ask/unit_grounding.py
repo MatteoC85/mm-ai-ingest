@@ -16,15 +16,20 @@ from ..ingest.text_pdf import normalize_unicode_advanced as _normalize_unicode_a
 from .validation import AskValidationRuntime
 from . import table_units
 
-_ASSISTANT_CORE_UNIT_TOKEN = r"(?:mm(?:²|2|³|3)?|cm|kg|bar|k\s*pa|m\s*pa|pa|k\s*hz|hz|k\s*w|k\s*n|n\s*(?:[·*x]\s*)?m|nm|rpm|giri\s*/?\s*min(?:uto)?|min\s*(?:-?1|⁻¹)|1\s*/\s*min|ms|°\s*c|°|cst|db\s*\(?a\)?|cycles?|cicli|pieces?|pezzi|occurrences?|occorrenze|ore|ora|hours?|hrs?|%|v|a|w|m|g|s|h)"
+_ASSISTANT_CORE_UNIT_TOKEN = r"(?:mm(?:²|2|³|3)?|cm|kg|bar|psi|cfm|l\s*/\s*min|m(?:³|3)\s*/\s*min|k\s*pa|m\s*pa|pa|k\s*hz|hz|k\s*w|k\s*n|n\s*(?:[·*x]\s*)?m|nm|rpm|giri\s*/?\s*min(?:uto)?|min\s*(?:-?1|⁻¹)|1\s*/\s*min|ms|°\s*c|°|cst|db\s*\(?a\)?|cycles?|cicli|pieces?|pezzi|occurrences?|occorrenze|ore|ora|hours?|hrs?|%|v|a|w|m|g|s|h)"
+_ASSISTANT_CORE_NUMBER_ATOM = r"[-+]?(?:(?:\d{1,3}(?:[ .]\d{3})+|\d+)(?:[.,]\d+)?|[.,]\d+)(?!\d)"
+# A slash suffix is a different dimension even when spaces surround it; a dot
+# followed by a word continues a designation. Stars are accepted only as a
+# complete Markdown closing delimiter, never multiplication/exponent prefixes.
+_ASSISTANT_CORE_UNIT_END = r"""(?!\s*/\s*\w)(?!\.\w)(?=$|[\s,.;:/)\]"'’”]|\*{1,2}(?=$|[\s,.;:/)\]"'’”]))"""
 _ASSISTANT_CORE_TECH_UNIT_AFTER_RE = re.compile(
     # A unit immediately after a value may use matched square brackets, as in
-    # technical PDF tables. Preserve the same unit vocabulary and comparisons.
-    rf"""^\s*(?:(?:circa|about|approx(?:imately)?|ca\.?|~)\s*)?(?P<bracket>\[\s*)?(?P<unit>{_ASSISTANT_CORE_UNIT_TOKEN})(?(bracket)\s*\])(?=$|[\s,.;:/)\]"'’”])""",
+    # technical PDF tables. Require a complete supported unit and delimiter.
+    rf"^\s*(?:(?:circa|about|approx(?:imately)?|ca\.?|~)\s*)?(?P<bracket>\[\s*)?(?P<unit>{_ASSISTANT_CORE_UNIT_TOKEN})(?(bracket)\s*\]){_ASSISTANT_CORE_UNIT_END}",
     re.IGNORECASE,
 )
 _ASSISTANT_CORE_RANGE_WITH_UNIT_RE = re.compile(
-    rf"""^\s*(?:-|–|—|÷|to|a)\s*[-+]?\d+(?:[.,]\d+)?\s*(?P<unit>{_ASSISTANT_CORE_UNIT_TOKEN})(?=$|[\s,.;:/)\]"'’”])""",
+    rf"^\s*(?:-|–|—|÷|to|a)\s*{_ASSISTANT_CORE_NUMBER_ATOM}\s*(?P<unit>{_ASSISTANT_CORE_UNIT_TOKEN}){_ASSISTANT_CORE_UNIT_END}",
     re.IGNORECASE,
 )
 _ASSISTANT_CORE_TECH_UNIT_BEFORE_RE = re.compile(
@@ -35,7 +40,6 @@ _ASSISTANT_CORE_TECH_UNIT_BEFORE_RE = re.compile(
     rf"\[\s*(?P<unit>{_ASSISTANT_CORE_UNIT_TOKEN})\s*\]\s*$",
     re.IGNORECASE,
 )
-_ASSISTANT_CORE_NUMBER_ATOM = r"[-+]?(?:\d{1,3}(?:[ .]\d{3})+|\d+)(?:[.,]\d+)?(?!\d)"
 _ASSISTANT_CORE_NUMBER_RE = re.compile(
     rf"(?<![\w]){_ASSISTANT_CORE_NUMBER_ATOM}"
 )
@@ -113,7 +117,7 @@ def _assistant_core_numeric_variants(value: str) -> set[str]:
     # Deleting all punctuation would incorrectly make 50.00 equal to 5000.
     # Work on decimal strings, never binary floats or machine-specific values.
     def exact_decimal(token: str) -> str | None:
-        if not re.fullmatch(r"[-+]?\d+(?:\.\d+)?", token):
+        if not re.fullmatch(r"[-+]?(?:\d+(?:\.\d+)?|\.\d+)", token):
             return None
         negative = token.startswith("-")
         whole, _, fraction = token.lstrip("+-").partition(".")
@@ -222,14 +226,17 @@ def _assistant_core_claims(text: str, *, _parse_serialized_cells: bool = True) -
         # A number embedded in an alphanumeric designation (for example the
         # 1000 in AME-1000SN) is validated by the complete code claim, not as an
         # independent process value.
-        if (
-            re.match(r"[A-Za-z_]", value[match.end():match.end() + 1])
-            or re.search(r"[A-Za-z_][./_-]$", value[max(0, match.start() - 3):match.start()])
-        ):
+        if re.search(r"[A-Za-z_][./_-]$", value[max(0, match.start() - 3):match.start()]):
             continue
         after = value[match.end():match.end() + 48]
         before = value[max(0, match.start() - 48):match.start()]
         unit_match = _ASSISTANT_CORE_TECH_UNIT_AFTER_RE.match(after)
+        # Compact source quantities (1kW, .75l/min, 100psi) are quantities when
+        # the complete suffix is a recognized unit. Keep composite model/code
+        # identifiers in the exact-code path; never take a unit prefix from
+        # an unknown suffix such as 1kWh or 100psi_model.
+        if re.match(r"[A-Za-z_]", after[:1]) and unit_match is None:
+            continue
         # In Italian ranges, the connector ``a`` ("da 0 a 50") is not the
         # electrical unit ampere. Do not classify it as ``A``; the complete
         # range parser below will attach the unit that follows the second value.
@@ -248,6 +255,10 @@ def _assistant_core_claims(text: str, *, _parse_serialized_cells: bool = True) -
                       else match.end())
             technical_unit_spans.append((offset + matched_unit.start("unit"),
                                          offset + matched_unit.end("unit")))
+            if unit_match:
+                # The numeric+unit token is already checked dimensionally.
+                # Do not also reinterpret .75l/min as the identifier 75l/min.
+                technical_unit_spans.append((match.start(), match.end() + unit_match.end("unit")))
         if not unit:
             for span_start, span_end, span_unit in dimension_spans:
                 if span_start <= match.start() and match.end() <= span_end:

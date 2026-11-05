@@ -535,8 +535,9 @@ def verify_or_repair_answer(
     factual_list_review = _enumeration_review.applies(request, decision,
         protected=_guarded(runtime, request, decision), enumeration=enumeration_requested)
     independent_context_review = bool(factual_list_review and not str(answer or "").strip())
+    factual_coverage_intent = getattr(decision, 'factual_coverage', 'unspecified')
     useful_factual_selection = bool(independent_context_review
-        and getattr(decision, 'factual_coverage', 'unspecified') == 'useful')
+        and factual_coverage_intent == 'useful')
     # The request-owned flow can provide a complete, stable procedure packet.
     # Legacy/OFF/Root Cause and nonprocedural consumers keep the old algorithm.
     context_limit = min(30000 if enumeration_requested else 24000,
@@ -601,9 +602,10 @@ def verify_or_repair_answer(
     # Only a complete request-owned catalog may mechanically bind selections.
     # Missing/invalid router intent and incomplete catalogs keep strict coverage.
     catalog_records = tuple(rid for entry in source_table_catalog.entries for rid in entry.record_ids)
+    source_table_catalog_complete = bool(source_table_catalog.entries
+        and len(catalog_records) == len(table_record_ids) and set(catalog_records) == set(table_record_ids))
     selected_records_only = bool(useful_factual_selection and inventory_template_allowed
-        and source_table_catalog.entries and len(catalog_records) == len(table_record_ids)
-        and set(catalog_records) == set(table_record_ids))
+        and source_table_catalog_complete)
     selected_bindings = None
 
     conditions_only = bool(_guarded(runtime, request, decision) and conditions_only_contract(
@@ -874,6 +876,15 @@ def verify_or_repair_answer(
     inventory_diagnostics = {}
     if factual_list_review:
         inventory_diagnostics = {
+            # Request-owned mode observations only. Provider fields cannot grant
+            # selection scope or explain away a failed table-binding gate.
+            'factual_coverage_intent': factual_coverage_intent,
+            'source_first_factual_review': independent_context_review,
+            'useful_factual_selection': useful_factual_selection,
+            'inventory_template_allowed': inventory_template_allowed,
+            'source_table_catalog_nonempty': bool(source_table_catalog.entries),
+            'source_table_catalog_complete': source_table_catalog_complete,
+            'selected_records_only': selected_records_only,
             'inventory_model_outcome': out.get('outcome'),
             'inventory_answer_form': ('invalid' if type(out.get('answer')) is not str else
                 'empty' if not out['answer'].strip() else
