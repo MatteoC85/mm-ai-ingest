@@ -35,6 +35,8 @@ def fixture():
         selected = [0, 1] if i == 0 else [0]
         parsed['decisions'].append({'proposal_index': i, 'verdict': 'accept', 'reason': 'supported',
             'selected_check_indices': selected, 'safe_check_subset': True,
+            'selected_why_indices': [u['why_index'] for u in quality.why_units(draft[i]['why'])],
+            'omitted_why_indices': [], 'safe_why_subset': True,
             'blocking_checks': [2] if i == 0 else [],
             'note': 'Unsafe operation omitted; retained checks require no removed prerequisite.' if i == 0 else '',
             'proofs': [{'source_index': i, 'supports_cause': True,
@@ -146,7 +148,9 @@ class RootResponseQualityTests(unittest.TestCase):
     def test_rejected_cause_never_returns_even_if_in_rank_list(self):
         decision = self.parsed['decisions'][0]
         decision.update(verdict='reject', reason='unsupported', selected_check_indices=[],
-            safe_check_subset=False, proofs=[], note='No applicable mechanism.')
+            safe_check_subset=False, proofs=[], note='No applicable mechanism.',
+            selected_why_indices=[], safe_why_subset=False,
+            omitted_why_indices=[u['why_index'] for u in quality.why_units(self.frozen['proposals'][0]['why'])])
         with self.assertRaisesRegex(refs.ReferenceError, 'accepted_ranking_mismatch'):
             self.validate()
         self.parsed['ranked_proposal_indices'] = [1]
@@ -169,6 +173,9 @@ class RootResponseQualityTests(unittest.TestCase):
         branch = after['schema']['properties']['decisions']['items']['anyOf'][0]
         self.assertEqual(branch['properties']['selected_check_indices']['items']['enum'], [0, 1, 2])
         self.assertIn('safe_check_subset', branch['required'])
+        self.assertIn('selected_why_indices', branch['required'])
+        self.assertIn('omitted_why_indices', branch['required'])
+        self.assertIn('safe_why_subset', branch['required'])
         self.assertEqual(after['schema']['properties']['ranked_proposal_indices']['items']['enum'], [0, 1])
 
     def test_instructions_do_not_contradict_subset_safety_contract(self):
@@ -264,6 +271,7 @@ class RootReviewMainIntegrationTests(unittest.TestCase):
         messages, arguments = self.calls[0]
         self.assertIn('Adjust the clamp under load with guards open.', messages[1]['content'])
         self.assertIn('safe_check_subset', arguments['json_schema']['schema']['properties']['decisions']['items']['anyOf'][0]['properties'])
+        self.assertIn('safe_why_subset', arguments['json_schema']['schema']['properties']['decisions']['items']['anyOf'][0]['required'])
         self.assertEqual(arguments['purpose'], 'assistant_core_root_cause_adjudicator')
         self.assertNotIn('guards open', str(out['possible_causes']))
         self.assertNotIn('guards open', str(out['recommended_next_checks']))
@@ -273,7 +281,10 @@ class RootReviewMainIntegrationTests(unittest.TestCase):
     def test_rejected_draft_is_not_reported_as_missing_sources(self):
         for d in self.parsed['decisions']:
             d.update(verdict='reject', reason='unsupported', selected_check_indices=[],
-                safe_check_subset=False, proofs=[], note='Unsupported explanation.')
+                safe_check_subset=False, proofs=[], note='Unsupported explanation.',
+                selected_why_indices=[], safe_why_subset=False,
+                omitted_why_indices=[u['why_index'] for u in quality.why_units(
+                    self.frozen['proposals'][d['proposal_index']]['why'])])
         self.parsed['ranked_proposal_indices'] = []
         out = self.run_response()
         self.assertFalse(out['ok'])

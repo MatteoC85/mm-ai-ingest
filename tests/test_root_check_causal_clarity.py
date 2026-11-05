@@ -40,6 +40,8 @@ def fixture(check=AMBIGUOUS, selected=(0,)):
     blocked = [index for index in range(2) if index not in selected]
     parsed = {'decisions': [{'proposal_index': 0, 'verdict': 'accept', 'reason': 'supported',
         'selected_check_indices': selected, 'blocking_checks': blocked, 'safe_check_subset': True,
+        'selected_why_indices': [u['why_index'] for u in quality.why_units(proposal['why'])],
+        'omitted_why_indices': [], 'safe_why_subset': True,
         'note': 'Causal referent in the omitted check is ambiguous.' if blocked else '',
         'proofs': [{'source_index': 0, 'supports_cause': True, 'observation_units': frozen['observed_ids'],
             'source_units': frozen['source_sets'][0], 'target_units': frozen['target_sets'][0],

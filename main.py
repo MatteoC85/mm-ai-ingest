@@ -15441,6 +15441,7 @@ def _assistant_core_adjudicate_root_cause_grounded(
         f"REQUEST_OBSERVATIONS:\n{json.dumps(_retrieval_diagnostic_query.reasoning_packet(_assistant_core_diagnostic_query_profile(request)), ensure_ascii=False)}\n\n"
         f"MISSING_INFORMATION: {json.dumps(list(decision.missing_information), ensure_ascii=False)}\n\n"
         f"PROPOSALS (unvalidated, immutable):\n{json.dumps(frozen['proposals'], ensure_ascii=False, separators=(',', ':'))}\n\n"
+        f"WHY_SELECTION (original proposal sentence spans, not evidence):\n{json.dumps(_root_quality.why_selection_packet(frozen), ensure_ascii=False, separators=(',', ':'))}\n\n"
         f"SOURCE_INDEX:\n{json.dumps(proposal_manifest['sources'], ensure_ascii=False, separators=(',', ':'))}\n"
         f"\nOBSERVED_UNITS:\n{_retrieval_review_references.canonical(references['observed_units'])}"
         f"\nAUTHORIZED_REFERENCES:\n{_retrieval_review_references.canonical(_retrieval_review_references.authorized_references(frozen))}"
@@ -15500,9 +15501,10 @@ def _assistant_core_adjudicate_root_cause_grounded(
             review_execution["invalid_reference"] = exc.reference_failure
         return unavailable("review_decision_" + str(exc))
     review_execution["decision_validated"] = True
+    review_summary = _root_quality.response_review_summary(result["summary"], debug=bool(request.debug))
     meta = {**dict(response.get("meta") or {}),
-            "root_review_decisions": result["summary"],
-            "root_causal_applicability": {**result["summary"], "policy_version": _retrieval_diagnostic_sources.CAUSAL_GROUNDING_POLICY},
+            "root_review_decisions": review_summary,
+            "root_causal_applicability": {**review_summary, "policy_version": _retrieval_diagnostic_sources.CAUSAL_GROUNDING_POLICY},
             "root_review_packet": dict(review_meta), "root_review_execution": dict(review_execution),
             "assistant_core_root_adjudication": {
                 "model": model_used, "outcome": "answered" if result["causes"] else "no_sources",

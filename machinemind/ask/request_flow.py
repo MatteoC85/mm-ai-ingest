@@ -330,9 +330,11 @@ def run_sync(payload: Any, x_ai_internal_secret: Optional[str], *,
         narrow_scope = bool(doc_ids or bubble_document_id or ai_scope == "document_ids")
         cache_scope = {**scope, "_v13_top_k": top_k, "_v13_max_causes": max_causes}
         if requested_mode == MODE_ROOT_CAUSE:
+            from ..retrieval import root_response_quality as _root_quality
             cache_scope["_root_observation_policy"] = _retrieval_diagnostic_query.DIAGNOSTIC_BASIS_POLICY
             cache_scope["_root_review_packet_policy"] = _retrieval_review_packet.POLICY_VERSION
             cache_scope["_root_review_decision_policy"] = _retrieval_review_references.POLICY_VERSION
+            cache_scope["_root_response_quality_policy"] = _root_quality.POLICY_VERSION
 
         # B4o: guard arguments are absent (not just None) on the legacy path.
         # Provider/lifetime faults remain terminal despite cache's broad catch.
@@ -367,6 +369,9 @@ def run_sync(payload: Any, x_ai_internal_secret: Optional[str], *,
                 or (requested_mode == MODE_ROOT_CAUSE and cached.get("possible_causes") and
                     ((cached.get("meta") or {}).get("root_review_decisions") or {}).get("policy_version")
                     != _retrieval_review_references.POLICY_VERSION)
+                or (cached.get("possible_causes") and
+                    ((cached.get("meta") or {}).get("root_review_decisions") or {}).get("quality_policy_version")
+                    != _root_quality.POLICY_VERSION)
             ):
                 cached = None
                 budget.semantic_cache = "bypass_unvalidated_observation_basis"

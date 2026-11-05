@@ -38,6 +38,8 @@ def conditional_fixture():
                           original_query=query, observed_query=observed)['frozen']
     parsed = {'decisions': [{'proposal_index': 0, 'verdict': 'accept', 'reason': 'supported',
         'selected_check_indices': [0], 'safe_check_subset': True, 'blocking_checks': [], 'note': '',
+        'selected_why_indices': [u['why_index'] for u in quality.why_units(proposal['why'])],
+        'omitted_why_indices': [], 'safe_why_subset': True,
         'proofs': [{'source_index': 0, 'supports_cause': True,
             'observation_units': frozen['observed_ids'], 'source_units': frozen['source_sets'][0],
             'target_units': frozen['target_sets'][0], 'applicability': 'same_target',
@@ -71,6 +73,8 @@ class ConditionalRootProofTests(unittest.TestCase):
             with self.subTest(reason=reason):
                 self.parsed['decisions'][0].update(verdict='reject', reason=reason,
                     selected_check_indices=[], safe_check_subset=False, proofs=[],
+                    selected_why_indices=[], safe_why_subset=False,
+                    omitted_why_indices=[u['why_index'] for u in quality.why_units(self.proposal['why'])],
                     blocking_checks=[0], note='Reviewer found applicability or support insufficient.')
                 self.parsed['ranked_proposal_indices'] = []
                 result = self.validate()
@@ -119,7 +123,10 @@ class RootOnlyInstructionIntegrationTests(unittest.TestCase):
         helper.setUp()
         for decision in helper.parsed['decisions']:
             decision.update(verdict='reject', reason='unknown_target', selected_check_indices=[],
-                safe_check_subset=False, proofs=[], note='Target genuinely not established.')
+                safe_check_subset=False, proofs=[], note='Target genuinely not established.',
+                selected_why_indices=[], safe_why_subset=False,
+                omitted_why_indices=[u['why_index'] for u in quality.why_units(
+                    helper.frozen['proposals'][decision['proposal_index']]['why'])])
         helper.parsed['ranked_proposal_indices'] = []
         out = helper.run_response()
         self.assertFalse(out['ok'])

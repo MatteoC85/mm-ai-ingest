@@ -6,11 +6,87 @@ This module adds no evidence, repairs, provider calls or semantic code inference
 from __future__ import annotations
 
 from copy import deepcopy
+from hashlib import sha256
+import re
 from typing import Any
 
 from . import review_references
 
-POLICY_VERSION = "root-response-quality-v5"
+POLICY_VERSION = "root-response-quality-v6"
+
+MAX_WHY_UNITS = 8
+# These are punctuation ambiguities, not evidence or diagnostic classifications.
+_ABBREVIATIONS = frozenset({"approx", "prof", "dott", "sign", "resp", "incl", "dept", "assn", "misc"})
+
+
+def why_units(why: str) -> list[dict[str, Any]]:
+    """Lossless complete-sentence spans, or one atomic original on ambiguity.
+
+    This mechanical partition grants no support to any sentence. In particular,
+    it cannot decide that an omitted qualifier is dispensable: the independent
+    reviewer must judge the complete retained explanation in its original context.
+    """
+    if not isinstance(why, str) or not why.strip():
+        raise review_references.ReferenceError("invalid_why_text")
+
+    def atomic():
+        return [{"why_index": 0, "start": 0, "end": len(why), "text": why}]
+
+    if not why.rstrip().endswith((".", "?", "!")):
+        return atomic()
+    stack = []
+    closing = {"(": ")", "[": "]", "{": "}", "«": "»", "“": "”", "‘": "’"}
+    boundaries = []
+    for pos, char in enumerate(why):
+        # Apostrophes within words are not quotation marks. An unmatched quote
+        # (including a possessive apostrophe) conservatively keeps WHY atomic.
+        word_apostrophe = (char in "'’" and 0 < pos < len(why) - 1
+                           and why[pos - 1].isalnum() and why[pos + 1].isalnum())
+        if word_apostrophe:
+            continue
+        if char in "\"'":
+            if pos and why[pos - 1] == "\\":
+                return atomic()
+            if stack and stack[-1] == char:
+                stack.pop()
+            else:
+                stack.append(char)
+        elif char in closing:
+            stack.append(closing[char])
+        elif char in closing.values():
+            if not stack or stack.pop() != char:
+                return atomic()
+        if char not in ".?!" or stack:
+            continue
+        # Only punctuation followed by whitespace and a new capitalized sentence
+        # is separable. Internal decimals/codes are never split.
+        end = pos + 1
+        if end >= len(why) or not why[end].isspace():
+            continue
+        while end < len(why) and why[end].isspace():
+            end += 1
+        if end == len(why):
+            continue
+        if not why[end].isupper() or (pos and why[pos - 1] in ".?!"):
+            return atomic()
+        if char == ".":
+            word = re.search(r"([^\W\d_]+)$", why[:pos])
+            if (not word or len(word[1]) < 4 or word[1].isupper()
+                    or word[1].lower() in _ABBREVIATIONS):
+                return atomic()
+        boundaries.append(end)
+    if stack or len(boundaries) >= MAX_WHY_UNITS:
+        return atomic()
+    offsets = [0, *boundaries, len(why)]
+    return [{"why_index": index, "start": start, "end": end, "text": why[start:end]}
+            for index, (start, end) in enumerate(zip(offsets, offsets[1:]))]
+
+
+def why_selection_packet(frozen: dict[str, Any]) -> list[dict[str, Any]]:
+    """Root-only proposal spans; these indices are never source-evidence IDs."""
+    review_references.authorized_references(frozen)
+    return [{"proposal_index": proposal["proposal_index"],
+             "why_units": why_units(proposal["why"])} for proposal in frozen["proposals"]]
 
 SYNTHESIS_INSTRUCTION = """
 A root-cause answer is a diagnostic decision aid, not a repair procedure.
@@ -100,7 +176,7 @@ conditional consequence matching the abnormal combination of observations over a
 general normal-operation sequence, unless the condition is contradicted. An
 unverified condition remains unknown and may support a qualified hypothesis; it
 must not be treated as an observed fact or as automatically excluded. Preserve
-uncertainty and the original immutable wording. If a proposal's explanation asserts a comparative priority incompatible
+uncertainty and the original immutable wording. If the retained explanation asserts a comparative priority incompatible
 with the resulting order, reject that inconsistent proposal rather than silently
 rewriting its explanation. Ranking never grants permission to accept an unsafe
 check or to remove a prerequisite needed by a retained action.
@@ -139,10 +215,10 @@ includes selected_check_indices and safe_check_subset. For an accepted cause,
 selected_check_indices contains the exact original indices of the safe checks to
 retain, in their original order. blocking_checks contains every omitted index;
 the two lists must be disjoint and cover ALL original checks. Use a short factual
-note explaining omissions; use an empty note when nothing is omitted. An omitted
+note explaining check or WHY omissions; use an empty note when neither is omitted. An omitted
 unsafe/unsupported action must never appear in retained checks, cause or why.
 
-Set safe_check_subset=true ONLY when the cause and explanation are supported and
+Set safe_check_subset=true ONLY when the cause and selected explanation are supported and
 every retained check is independently safe and fully supported with its necessary
 conditions. Explicitly consider all omitted checks: none may be a prerequisite
 for a retained action. A safety/isolation condition in an omitted check cannot
@@ -150,7 +226,7 @@ justify a retained intervention. Retain such prerequisites together, or omit the
 dependent action too; if the remaining wording is unsafe, reject the proposal.
 No rewriting, merging, paraphrasing or invented safety conditions is permitted.
 A supported cause may have selected_check_indices=[] when no check qualifies;
-its mechanism and explanation still require causal proofs. For a rejected cause,
+its mechanism and selected explanation still require causal proofs. For a rejected cause,
 selected_check_indices=[], safe_check_subset=false and proofs=[]; normal rejection
 rules apply. For acceptance, provide proofs for EVERY retained check, using its
 ORIGINAL check index. No proof may cover a discarded check. A cause without
@@ -172,7 +248,7 @@ it uses a pronoun or omits a repeated label. Reject only a genuinely ambiguous
 causal referent or a claimed inference that is contradictory or unsupported by
 its cited condition/consequence. A pronoun must not silently change referent.
 Do not guess the intended cause, rewrite the check, or invent the missing inference.
-If that defect is confined to a check and the cause/explanation remain supported,
+If that defect is confined to a check and the cause/selected explanation remain supported,
 put only that check in blocking_checks and retain the other independently safe,
 supported checks through the existing subset contract. It is valid to retain
 no checks. Do not reject an otherwise supported useful cause merely to demand
@@ -193,12 +269,45 @@ infer an intervention occurred, or add a new test to resolve missing history.
 """.strip()
 
 
+WHY_SELECTION_INSTRUCTION = """
+Review the COMPLETE original cause, WHY and checks before choosing any WHY unit.
+WHY_SELECTION contains server-defined complete original sentence spans, not source
+evidence. For EVERY decision include selected_why_indices, omitted_why_indices and
+safe_why_subset. The selected and omitted indices must be disjoint and together
+cover every original WHY unit. Keep selected indices in their original order.
+An accepted cause must retain at least one unit, set safe_why_subset=true and have
+the existing authorized causal proofs for its cause and COMPLETE retained WHY.
+Read the retained units as one explanation, with the original omitted context in
+view: each remaining claim and the combined meaning must be supported and safe.
+Do not project a document's consequence into an observed fact that the user did
+not report. A false observational sentence may be omitted only when the remaining
+original explanation independently supports the hypothesis without that claim.
+
+Preserve every qualification, negation, uncertainty, optional-model limitation,
+safety prerequisite and dependency necessary to the retained cause, explanation
+or checks. Never make a hypothesis more certain or broadly applicable by dropping
+such wording. If a removed sentence is needed to interpret a retained reference,
+condition, contrast or action safely and truthfully, retain the dependency too
+only if supported; otherwise reject the proposal or omit the dependent material.
+Do not select a fragment, rewrite, paraphrase, merge claims or invent replacement
+text. Atomic units cannot be split further. An unsafe clause inside a retained
+unit still disqualifies that unit. Selection does not turn an existing rejection
+into acceptance: independently assess the entire selected result and its proofs.
+For a rejected cause select no WHY units, omit all of them, set safe_why_subset=false
+and provide no proofs. Explain omissions in note when accepting with any WHY unit
+or check omitted; note is empty only when both original lists are fully retained.
+safe_check_subset=true must assess checks together with the selected explanation,
+including the prerequisites and limitations that remain. No extra facts or checks
+are authorized by this selection contract.
+""".strip()
+
+
 def review_instruction() -> str:
     # Preserve the shared evidence semantics while replacing only the original
     # whole-proposal selection contract with an explicitly reviewed subset.
     replacements = {
         "Accept only when its cause, explanation and EVERY check are supported and safe.":
-            "Accept only when its cause, explanation and EVERY retained check are supported and safe.",
+            "Accept only when its cause, selected explanation and EVERY retained check are supported and safe.",
         "Each check must have supporting evidence with applicable target context.":
             "Each retained check must have supporting evidence with applicable target context.",
         "Retain a whole supported\nproposal or reject it; NEVER drop a safety prerequisite and keep its dependent\noperation.":
@@ -213,13 +322,14 @@ def review_instruction() -> str:
             raise review_references.ReferenceError("review_instruction_contract_changed")
         instruction = instruction.replace(old, new)
     return (instruction + "\n\n" + CONDITIONAL_APPLICABILITY_INSTRUCTION
-            + "\n\n" + CHECK_SELECTION_INSTRUCTION + "\n\n" + RANKING_INSTRUCTION)
+            + "\n\n" + CHECK_SELECTION_INSTRUCTION + "\n\n" + WHY_SELECTION_INSTRUCTION
+            + "\n\n" + RANKING_INSTRUCTION)
 
 
 def review_schema(frozen: dict[str, Any]) -> dict[str, Any]:
     """Extend the exact source-bound schema; never widen evidence authorization."""
     result = deepcopy(review_references.schema(frozen))
-    result["name"] = "machinemind_root_quality_review_v2"
+    result["name"] = "machinemind_root_quality_review_v3"
     authorized = review_references.authorized_references(frozen)
     ids = [item["proposal_index"] for item in authorized["proposals"]]
     for branch, proposal in zip(result["schema"]["properties"]["decisions"]["items"]["anyOf"],
@@ -230,6 +340,13 @@ def review_schema(frozen: dict[str, Any]) -> dict[str, Any]:
         branch["properties"].update(selected_check_indices=selected,
                                      safe_check_subset={"type": "boolean"})
         branch["required"].extend(["selected_check_indices", "safe_check_subset"])
+        why_indices = [unit["why_index"] for unit in why_units(
+            frozen["proposals"][proposal["proposal_index"]]["why"])]
+        why_array = {"type": "array", "maxItems": len(why_indices),
+                     "items": {"type": "integer", "enum": why_indices}}
+        branch["properties"].update(selected_why_indices=deepcopy(why_array),
+            omitted_why_indices=deepcopy(why_array), safe_why_subset={"type": "boolean"})
+        branch["required"].extend(["selected_why_indices", "omitted_why_indices", "safe_why_subset"])
     result["schema"]["properties"]["ranked_proposal_indices"] = {
         "type": "array", "maxItems": len(ids),
         "items": {"type": "integer", "enum": ids},
@@ -238,10 +355,11 @@ def review_schema(frozen: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _indices(value: Any, allowed: set[int], *, ordered: bool = False) -> list[int]:
+def _indices(value: Any, allowed: set[int], *, ordered: bool = False,
+             error: str = "invalid_check_selection_indices") -> list[int]:
     if (not isinstance(value, list) or any(type(i) is not int or i not in allowed for i in value)
             or len(value) != len(set(value)) or (ordered and value != sorted(value))):
-        raise review_references.ReferenceError("invalid_check_selection_indices")
+        raise review_references.ReferenceError(error)
     return value
 
 
@@ -250,7 +368,7 @@ def validate_review(*, parsed: dict[str, Any], frozen: dict[str, Any],
     """Validate selected immutable text with the unchanged shared proof validator.
 
 The provider sees the original frozen manifest in full. Code only selects exact
-check strings expressly approved by that reviewer; it cannot repair an action,
+check strings and complete WHY spans expressly approved by that reviewer; it cannot repair an action,
 forge a proof or approve a mechanism. Original indices remain in the audit.
 """
     if not isinstance(parsed, dict) or set(parsed) != {"decisions", "ranked_proposal_indices"}:
@@ -263,6 +381,7 @@ forge a proof or approve a mechanism. Original indices remain in the audit.
     derived = deepcopy(frozen)
     selected_decisions = []
     selection_audit = []
+    why_audit = []
     maps = {}
     seen = set()
     for decision in decisions:
@@ -277,17 +396,38 @@ forge a proof or approve a mechanism. Original indices remain in the audit.
         allowed = set(range(len(original[pi]["checks"])))
         selected = _indices(decision["selected_check_indices"], allowed, ordered=True)
         blocked = _indices(decision.get("blocking_checks"), allowed)
+        units = why_units(original[pi]["why"])
+        why_allowed = set(range(len(units)))
+        if ("selected_why_indices" not in decision or "omitted_why_indices" not in decision
+                or type(decision.get("safe_why_subset")) is not bool):
+            raise review_references.ReferenceError("missing_why_selection")
+        why_selected = _indices(decision["selected_why_indices"], why_allowed, ordered=True,
+                                error="invalid_why_selection_indices")
+        why_omitted = _indices(decision["omitted_why_indices"], why_allowed, ordered=True,
+                               error="invalid_why_selection_indices")
+        if (set(why_selected) & set(why_omitted)
+                or set(why_selected) | set(why_omitted) != why_allowed):
+            raise review_references.ReferenceError("incomplete_why_partition")
         normalized = deepcopy(decision)
         normalized.pop("selected_check_indices")
         normalized.pop("safe_check_subset")
+        normalized.pop("selected_why_indices")
+        normalized.pop("omitted_why_indices")
+        normalized.pop("safe_why_subset")
         if decision.get("verdict") == "accept":
+            if not why_selected:
+                raise review_references.ReferenceError("empty_selected_why")
+            if decision["safe_why_subset"] is not True:
+                raise review_references.ReferenceError("why_subset_not_safe")
             if set(selected) & set(blocked) or set(selected) | set(blocked) != allowed:
                 raise review_references.ReferenceError("incomplete_check_partition")
             if decision["safe_check_subset"] is not True:
                 raise review_references.ReferenceError("check_subset_not_safe")
             note = decision.get("note")
-            if not isinstance(note, str) or len(note) > 220 or (bool(blocked) != bool(note.strip())):
+            if (not isinstance(note, str) or len(note) > 220
+                    or (bool(blocked or why_omitted) != bool(note.strip()))):
                 raise review_references.ReferenceError("invalid_selection_note")
+            derived["proposals"][pi]["why"] = "".join(units[index]["text"] for index in why_selected)
             mapping = {index: position for position, index in enumerate(selected)}
             maps[pi] = {position: index for index, position in mapping.items()}
             derived["proposals"][pi]["checks"] = [
@@ -304,11 +444,20 @@ forge a proof or approve a mechanism. Original indices remain in the audit.
             normalized.update(blocking_checks=[], note="")
         elif selected or decision["safe_check_subset"] is not False:
             raise review_references.ReferenceError("rejected_proposal_keeps_checks")
+        elif why_selected or decision["safe_why_subset"] is not False:
+            raise review_references.ReferenceError("rejected_proposal_keeps_why")
         selected_decisions.append(normalized)
         selection_audit.append({"proposal_index": pi, "accepted": decision.get("verdict") == "accept",
             "selected_check_indices": list(selected), "blocking_checks": list(blocked),
             "safe_check_subset": decision["safe_check_subset"], "note": decision.get("note"),
             "input_check_count": len(allowed)})
+        why_audit.append({"proposal_index": pi, "accepted": decision.get("verdict") == "accept",
+            "selected_why_indices": list(why_selected), "omitted_why_indices": list(why_omitted),
+            "safe_why_subset": decision["safe_why_subset"], "note": decision.get("note"),
+            "input_why_unit_count": len(units), "units": [
+                {key: unit[key] for key in ("why_index", "start", "end")}
+                | {"text_sha256": sha256(unit["text"].encode("utf-8")).hexdigest()}
+                for unit in units]})
     derived["fingerprint"] = review_references.digest(
         {key: value for key, value in derived.items() if key != "fingerprint"})
     result = review_references.validate(parsed={"decisions": selected_decisions},
@@ -329,14 +478,34 @@ forge a proof or approve a mechanism. Original indices remain in the audit.
         mapping = maps[proof["proposal_index"]]
         proof["decision"]["check_indices"] = [mapping[i] for i in proof["decision"]["check_indices"]]
     subset_used = any(row["accepted"] and row["blocking_checks"] for row in selection_audit)
+    why_subset_used = any(row["accepted"] and row["omitted_why_indices"] for row in why_audit)
     result["summary"].update(quality_policy_version=POLICY_VERSION,
         ranking_validated=True, ranked_input_indices=list(order),
-        immutable_proposals=not subset_used, immutable_proposal_text=True,
+        immutable_proposals=not (subset_used or why_subset_used),
+        immutable_proposal_text=not why_subset_used, immutable_retained_why_units=True,
+        all_input_why_units_decided=True, why_selection=sorted(why_audit, key=lambda row: row["proposal_index"]),
         immutable_retained_checks=True, all_input_checks_decided=True,
         all_retained_checks_covered=True, proof_check_index_namespace="original_proposal",
         check_selection=sorted(selection_audit, key=lambda row: row["proposal_index"]),
         original_registry_fingerprint=frozen["fingerprint"],
         selected_registry_fingerprint=derived["fingerprint"])
+    return result
+
+
+def response_review_summary(summary: dict[str, Any], *, debug: bool) -> dict[str, Any]:
+    """Keep unreviewed free-form omission notes in the private/debug audit only.
+
+    A reviewer can quote rejected WHY or checks when explaining an omission.
+    Publishing that note would put unapproved claims back into normal metadata.
+    Hashes retain audit correlation without interpreting or rewriting the note.
+    """
+    result = deepcopy(summary)
+    if not debug:
+        for section in ("verdicts", "check_selection", "why_selection"):
+            for row in result.get(section, []):
+                if "note" in row:
+                    note = row.pop("note")
+                    row["note_sha256"] = sha256(note.encode("utf-8")).hexdigest()
     return result
 
 
