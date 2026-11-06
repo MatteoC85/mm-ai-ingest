@@ -1512,6 +1512,34 @@ def assistant_core_prepare_evidence(request: AssistantCoreRequest, retrieval: di
     )
     query_terms = _content_term_set(retrieval_query, limit=80)
 
+    # Router-provided query variants may be in the source language. Preserve
+    # their literal support through Root's final ranking instead of reverting
+    # to the user's language after acquisition. This is only a ranking signal:
+    # it never grants viability, facet coverage, authority or review acceptance.
+    root_variant_terms: list[set[str]] = []
+    if decision.effective_mode == MODE_ROOT_CAUSE:
+        common_source_terms = set.intersection(*(
+            _content_term_set(_v13_candidate_text(candidate), limit=260)
+            for candidate in candidates
+        )) if candidates else set()
+        identifier_terms: set[str] = set()
+        for facet in decision.facet_queries:
+            for term in facet.exact_terms:
+                if any(character.isdigit() for character in str(term)):
+                    identifier_terms.update(_content_term_set(str(term), limit=30))
+        # A numeric token may instead identify the fault or a critical setpoint.
+        # Exclude it only if every source already contains it, making it unable
+        # to distinguish these candidates. Never infer "model" from its shape.
+        identifier_terms.intersection_update(common_source_terms)
+        variants = _dedup_text_values([
+            query for facet in decision.facet_queries
+            for query in (*facet.dense_queries, *facet.lexical_queries)
+        ], limit=24)
+        for variant in variants:
+            terms = _content_term_set(variant, limit=80) - identifier_terms
+            if len(terms) >= 2 and terms not in root_variant_terms:
+                root_variant_terms.append(terms)
+
     scored: list[dict] = []
     preferred_viable = False
     for c in candidates:
@@ -1521,6 +1549,15 @@ def assistant_core_prepare_evidence(request: AssistantCoreRequest, retrieval: di
         cc["source_type"] = source_type
         text = _v13_candidate_text(cc)
         overlap = _term_overlap_score(query_terms, _content_term_set(text, limit=140)) if query_terms else 0.0
+        if decision.effective_mode == MODE_ROOT_CAUSE:
+            source_terms = _content_term_set(text, limit=260)
+            # Only source text is eligible here. Facet tags contain the query,
+            # not corroborating source content; a common model code is scope,
+            # not evidence of the requested symptom.
+            cc["assistant_core_root_query_support"] = max(
+                (len(terms & source_terms) / len(terms) for terms in root_variant_terms),
+                default=0.0,
+            )
         semantic = float(
             cc.get("semantic_similarity", cc.get("gate_similarity", cc.get("similarity", 0.0)))
             or 0.0
@@ -1674,6 +1711,8 @@ def assistant_core_prepare_evidence(request: AssistantCoreRequest, retrieval: di
             key=lambda c: (
                 0 if bool(c.get("assistant_core_root_viable")) else 1,
                 -float((c.get("assistant_core_diagnostic_priority") or {}).get("score") or 0.0),
+                -float(c.get("assistant_core_root_query_support") or 0.0)
+                if decision.effective_mode == MODE_ROOT_CAUSE else 0.0,
                 -float(c.get("v13_score", c.get("retrieval_score", c.get("similarity", 0.0))) or 0.0),
                 str(c.get("citation_id") or ""),
             )
