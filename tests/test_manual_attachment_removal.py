@@ -36,7 +36,7 @@ class ManualAttachmentRemovalTests(unittest.TestCase):
                          'source_citation_id': 'steps', 'source_quote': 'Insert cartridge. Secure housing.'}]}}
         resolved = review.resolve_reply(value, answer=original, layout=layout,
             required_facets=['sequence'], required_types=['ordered_actions'], source_ordered=True,
-            source_notes=())
+            source_notes=({'source_number': 1, 'texts': ['Keep the guard closed.']},))
         return review.verify_operation_boundary(resolved, layout=layout,
             source_texts={'steps': 'Insert cartridge. Secure housing.'}, source_ordered=True)
 

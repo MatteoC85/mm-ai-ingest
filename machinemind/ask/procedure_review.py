@@ -92,18 +92,41 @@ def protocol_failure_diagnostic(exc: ValueError) -> dict:
                for key in ("unit_count", "first", "last")}}
 
 
-def _manual_attachment_removed(bindings, original_answer: str, reviewed_answer: str) -> bool:
-    """Recognize only the complete appendix emitted by procedure_ui_model_to_text.
+def _manual_attachment_removed(bindings, original_answer: str, reviewed_answer: str,
+                               edits: list[dict]) -> bool:
+    """Recognize exact appendix deletion inside its original owning block.
 
-    Whitespace can change in the existing grounding/redaction projection. Words,
-    case, punctuation, bullets, note order and the entire remaining answer cannot.
-    This is a deletion-shape check, not a decision that a note is unnecessary.
+    Its operational prefix cannot change except whitespace. Other blocks may
+    contain explicit edits from the same already-verified review; never infer,
+    normalize or approve their meaning here. All global review guards still run.
     """
-    original, reviewed = " ".join(original_answer.split()), " ".join(reviewed_answer.split())
+    original_blocks = block_layout(original_answer)["blocks"]
+    final_blocks = block_layout(reviewed_answer)["blocks"]
+    if ([b["block_id"] for b in original_blocks] != [b["block_id"] for b in final_blocks]
+            or type(edits) is not list):
+        return False
+    originals = {b["block_id"]: b["text"] for b in original_blocks}
+    replacements = {}
+    for edit in edits:
+        if (type(edit) is not dict or set(edit) != {"block_id", "text"}
+                or type(edit.get("block_id")) is not str or edit["block_id"] not in originals
+                or edit["block_id"] in replacements or type(edit.get("text")) is not str):
+            return False
+        try:
+            replacements[edit["block_id"]] = _edited_block(originals[edit["block_id"]], edit["text"])
+        except ValueError:
+            return False
+    for before, after in zip(original_blocks, final_blocks):
+        expected = replacements.get(before["block_id"], before["text"])
+        if " ".join(expected.split()) != " ".join(after["text"].split()):
+            return False
+    original = " ".join(original_blocks[-1]["text"].split())
+    reviewed = " ".join(final_blocks[-1]["text"].split())
     notes = " ".join("- " + " ".join(binding["text"].split()) for binding in bindings)
     for heading in ("Manual support", "Supporto dal manuale"):
         suffix = " " + heading + " " + notes
-        if original.endswith(suffix) and original.count(suffix) == 1:
+        if (original.endswith(suffix)
+                and " ".join(original_answer.split()).count(suffix) == 1):
             return bool(reviewed) and original[:-len(suffix)] == reviewed
     return False
 
@@ -117,7 +140,8 @@ def manual_note_projection(bindings, *, original_answer: str, reviewed_answer: s
     reference omitted by the reviewer. An edited/translated note needs the
     independently verified block edit and its original references. Only a pure,
     independently reviewed removal of the complete server-bound appendix can
-    omit its references. Original admission is distinct from final display: this
+    omit its references, independently of explicit reviewed edits to other blocks.
+    Original admission is distinct from final display: this
     function never attributes new prose to a source or grants a semantic PASS.
     """
     if not bindings:
@@ -162,7 +186,8 @@ def manual_note_projection(bindings, *, original_answer: str, reviewed_answer: s
     if (review.get("outcome") == "rewrite"
             and audit.get("source_note_bindings_complete") is True
             and original_blocks[-1]["block_id"] in changed_blocks
-            and _manual_attachment_removed(bindings, original_answer, reviewed_answer)):
+            and _manual_attachment_removed(bindings, original_answer, reviewed_answer,
+                                           review.get("edits"))):
         return [], {"version": "ask-manual-note-binding-v1", "complete": True,
                     "basis": "reviewed_exact_manual_attachment_removal", "notes": len(bindings),
                     "removed_notes": len(bindings), "citation_ids": []}
