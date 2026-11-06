@@ -12,7 +12,9 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from machinemind.ask import procedure_review as r
 
 def interval(first=0,last=None):return {'first':first,'last':first if last is None else last}
-def endpoint(first=0,last=None,kind='original'):return {'kind':kind,**interval(first,last)}
+def endpoint(first=0,last=None,kind='original',block='b1'):
+    return {'block_id':block,'kind':kind,'range':interval(first,last)}
+def proof(first=0,last=None,source='s1'):return {'source':source,'range':interval(first,last)}
 
 class ReferenceTests(unittest.TestCase):
     ANSWER='1. Release the guide. Keep the supply isolated.\n2. Feed the strip.\n3. Secure the guide before movement.'
@@ -30,8 +32,7 @@ class ReferenceTests(unittest.TestCase):
             'citation_ids':['s1'],'covered_facets':['feed'],'missing_facets':[],
             'covered_answer_types':['ordered_actions'],'missing_answer_types':[],'missing_list_items':[],
             'operation_boundary':{'complete':True,'checked_blocks':['b1','b2','b3'],
-                'precedence':[{'from':'b1','action':endpoint(),'to':'b3','next':endpoint(),
-                               'source':'s1','proof':interval(2)}],
+                'precedence':[{'action':endpoint(),'next':endpoint(block='b3'),'proof':proof(2)}],
                 'change_edges':[{'edge_index':0,'resolution':'restored'}]}}
 
     def execute(self,value,prepared=None,mutate=None):
@@ -74,8 +75,8 @@ class ReferenceTests(unittest.TestCase):
         value.update(outcome='rewrite',reply_mode='edit',edits=[{'block_id':'b1','original':interval(),
             'replacement_parts':['Release the guide ', 'then secure the guide before movement']}])
         value['operation_boundary']['checked_blocks']=['b1']
-        value['operation_boundary']['precedence']=[{'from':'b1','action':endpoint(kind='replacement'),
-            'to':'b1','next':endpoint(1,kind='replacement'),'source':'s1','proof':interval()}]
+        value['operation_boundary']['precedence']=[{'action':endpoint(kind='replacement'),
+            'next':endpoint(1,kind='replacement'),'proof':proof()}]
         result=self.execute(value,prepared)
         self.assertEqual(result['answer'],answer)
         self.assertTrue(result['operation_boundary_validation']['complete'])
@@ -84,8 +85,7 @@ class ReferenceTests(unittest.TestCase):
         answer='1. Release the guide. Secure the guide.';prepared=self.prepare(answer,answer[3:])
         for before,after in ((endpoint(1),endpoint(0)),(endpoint(0,1),endpoint(1)),(endpoint(),endpoint())):
             value=self.reply();value['operation_boundary']['checked_blocks']=['b1']
-            value['operation_boundary']['precedence']=[{'from':'b1','action':before,'to':'b1',
-                'next':after,'source':'s1','proof':interval(0,1)}]
+            value['operation_boundary']['precedence']=[{'action':before,'next':after,'proof':proof(0,1)}]
             out=self.execute(value,prepared)
             self.assertEqual(out['outcome'],'no_sources')
             self.assertEqual(out['reason'],'operation_reference_closure_order_invalid')
@@ -93,8 +93,7 @@ class ReferenceTests(unittest.TestCase):
     def test_documented_terminal_hold_requires_that_exact_edge_resolution(self):
         answer='1. Keep the supply isolated.';prepared=self.prepare(answer,answer[3:])
         value=self.reply();value['operation_boundary']['checked_blocks']=['b1']
-        value['operation_boundary']['precedence']=[{'from':'b1','action':endpoint(),'to':'b1',
-            'next':endpoint(),'source':'s1','proof':interval()}]
+        value['operation_boundary']['precedence']=[{'action':endpoint(),'next':endpoint(),'proof':proof()}]
         value['operation_boundary']['change_edges'][0]['resolution']='documented_terminal_state'
         self.assertEqual(self.execute(value,prepared)['outcome'],'pass')
         # An identically worded OTHER edge cannot lend its terminal exemption.
@@ -110,13 +109,13 @@ class ReferenceTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'procedure_reference_deleted_unit'):self.execute(value)
 
     def test_invalid_ranges_boolean_unknown_kind_or_cross_block_replacement_fail(self):
-        for ref in ({'kind':'original','first':True,'last':0},endpoint(-1),endpoint(0,50),
+        for ref in ({'block_id':'b1','kind':'original','range':{'first':True,'last':0}},endpoint(-1),endpoint(0,50),
                     endpoint(kind='guessed'),endpoint(kind='replacement')):
             value=self.reply();value['operation_boundary']['precedence'][0]['action']=ref
             with self.assertRaises(ValueError):self.execute(value)
 
     def test_wrong_source_alias_and_changed_source_binding_fail(self):
-        value=self.reply();value['operation_boundary']['precedence'][0]['source']='other-tenant'
+        value=self.reply();value['operation_boundary']['precedence'][0]['proof']['source']='other-tenant'
         with self.assertRaisesRegex(ValueError,'procedure_review_wire_alias_unknown'):self.execute(value)
         out=self.execute(self.reply(),mutate=lambda out,sources:sources.update({'manual:one':'Changed source.'}))
         self.assertEqual(out['reason'],'operation_reference_source_binding_changed')
@@ -176,7 +175,7 @@ class ReferenceTests(unittest.TestCase):
 
     def test_references_allow_complete_source_span_beyond_old_wire_quote_limit(self):
         source=self.SOURCE+' Context remains literal.'*30;prepared=self.prepare(source=source)
-        value=self.reply();value['operation_boundary']['precedence'][0]['proof']=interval(0,len(prepared[3]['sources']['s1']['units'])-1)
+        value=self.reply();value['operation_boundary']['precedence'][0]['proof']=proof(0,len(prepared[3]['sources']['s1']['units'])-1)
         result=self.execute(value,prepared)
         self.assertTrue(result['operation_boundary_validation']['complete'])
         self.assertGreater(len(result['operation_boundary']['precedence'][0]['source_quote']),400)
@@ -186,11 +185,14 @@ class ReferenceTests(unittest.TestCase):
         legacy={'name':'fixture','schema':{'properties':{'citation_ids':{'type':'array','items':{'type':'string'}}},'required':['citation_ids']}}
         schema=r.review_schema(legacy,layout,[],[],operation_boundary=True,source_ordered=True,
             operation_source_ids=['manual:one'],wire_aliases=aliases,reference_catalogue=catalog)['schema']
-        edit=schema['properties']['edits']['items']['properties']
-        self.assertEqual(set(edit),{'block_id','original','replacement_parts'})
+        edits=schema['properties']['edits']['items']['anyOf']
+        for edit in edits:self.assertEqual(set(edit['properties']),{'block_id','original','replacement_parts'})
         edge=schema['properties']['operation_boundary']['properties']['precedence']['items']['properties']
-        self.assertEqual(edge['proof']['type'],'object');self.assertEqual(edge['action']['type'],'object')
-        self.assertEqual(edge['action']['properties']['kind']['enum'],['original','replacement'])
+        self.assertEqual(set(edge),{'action','next','proof'})
+        endpoints=schema['$defs'][edge['action']['$ref'].split('/')[-1]]['anyOf']
+        self.assertEqual({kind for item in endpoints for kind in item['properties']['kind']['enum']},
+                         {'original','replacement'})
+        for item in endpoints:self.assertEqual(set(item['properties']),{'block_id','kind','range'})
 
     def test_prompt_views_reconstruct_bodies_and_keep_one_source_identity(self):
         answer,_,_,catalog,_=self.prepare()

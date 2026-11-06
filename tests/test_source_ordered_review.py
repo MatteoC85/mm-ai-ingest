@@ -142,7 +142,7 @@ class WiredSourceOrderedReviewTests(unittest.TestCase):
                     'change_edges':[],'precedence':[]}}
             props=kwargs['json_schema']['schema']['properties']
             source_aliases=props['citation_ids']['items']['enum']
-            block_aliases=props['edits']['items']['properties']['block_id']['enum']
+            block_aliases=props['operation_boundary']['properties']['checked_blocks']['items']['enum']
             result['citation_ids']=source_aliases
             result['operation_boundary']['checked_blocks']=block_aliases
             prompt='\n'.join(message['content'] for message in messages)
@@ -161,10 +161,9 @@ class WiredSourceOrderedReviewTests(unittest.TestCase):
                             replacement_parts=[replacement])
             if whitespace or proof_tamper=='closure':
                 result['edits'][0]['replacement_parts']=['Isolate  and\t','verify  zero energy.','\n'+notes[0]]
-                result['operation_boundary']['precedence']=[{'from':block_aliases[0],
-                    'action':{'kind':'replacement','first':0,'last':0},'to':block_aliases[0],
-                    'next':{'kind':'replacement','first':1,'last':1},'source':source_aliases[0],
-                    'proof':{'first':0,'last':0}}]
+                result['operation_boundary']['precedence']=[{'action':{'block_id':block_aliases[0],'kind':'replacement','range':{'first':0,'last':0}},
+                    'next':{'block_id':block_aliases[0],'kind':'replacement','range':{'first':1,'last':1}},
+                    'proof':{'source':source_aliases[0],'range':{'first':0,'last':0}}}]
             if proof_tamper=='redacted_content':
                 result['edits'][0]['replacement_parts'][0]='Isolate step:offline_internal_123  and\t'
             if proof_tamper=='closure':
@@ -264,7 +263,7 @@ class WiredSourceOrderedReviewTests(unittest.TestCase):
                 self.assertTrue(contract['semantic_answer_bound'])
                 self.assertTrue(boundary['complete']);self.assertTrue(boundary['precedence_checked'])
                 self.assertEqual(boundary['version'],'ask-operation-boundary-v1')
-                self.assertEqual(boundary['reference_protocol'],'ask-procedure-references-v1')
+                self.assertEqual(boundary['reference_protocol'],'ask-procedure-references-v2')
                 self.assertEqual(boundary['answer_sha256'],review.digest(semantic['answer'].strip()))
                 self.assertEqual(audit['output_answer_sha256'],review.digest(semantic['answer']))
                 self.assertEqual(audit['reply_mode'],mode)

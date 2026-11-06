@@ -65,7 +65,7 @@ class FinalReviewWindowTests(unittest.TestCase):
             if 'edits' in props:
                 result['citation_ids']=props['citation_ids']['items'].get('enum',['step:one'])
                 result.update(reply_mode='retain',edits=[],operation_boundary={
-                    'complete':True,'checked_blocks':props['edits']['items']['properties']['block_id']['enum'],
+                    'complete':True,'checked_blocks':props['operation_boundary']['properties']['checked_blocks']['items']['enum'],
                     'change_edges':[],'precedence':[]})
             else:result['answer']=answer
             return result,'offline-model'

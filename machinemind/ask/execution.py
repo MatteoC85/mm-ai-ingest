@@ -768,6 +768,7 @@ def verify_or_repair_answer(
             return {"outcome":"no_sources", "answer":"", "citation_ids":[],
                     "reason":"procedure_review_protocol_invalid",
                     "protocol_failure_code":_procedure_review.protocol_failure_code(exc),
+                    "protocol_failure_diagnostic":_procedure_review.protocol_failure_diagnostic(exc),
                     "_terminal_review_failure":True}
     user_msg = (
         f"QUESTION:\n{request.query}\n\n"
@@ -1028,6 +1029,7 @@ def verify_or_repair_answer(
             "covered_answer_types": [], "missing_answer_types": requirements,
             "missing_list_items": [], "reason": "procedure_review_protocol_invalid",
             "protocol_failure_code": _procedure_review.protocol_failure_code(exc),
+            "protocol_failure_diagnostic": _procedure_review.protocol_failure_diagnostic(exc),
             "_terminal_review_failure": True, "model": model_used,
             **({"review_evidence": review_evidence_diagnostic} if review_evidence_diagnostic else {})}
     if review_evidence_diagnostic:

@@ -65,6 +65,33 @@ def protocol_failure_code(exc: ValueError) -> str:
     return code if code in _PROTOCOL_FAILURE_CODES else "procedure_review_protocol_invalid"
 
 
+class _ReferenceFailure(ValueError):
+    """Fixed parser category and bounded numbers, never wire text or identities."""
+    def __init__(self, code: str, *, stage: str, reason: str, value=None, count=0):
+        super().__init__(code)
+        value = value if type(value) is dict else {}
+        def number(raw):
+            return max(-1000000, min(1000000, raw)) if type(raw) is int else None
+        self.diagnostic = {"version": "ask-procedure-reference-diagnostic-v1",
+            "stage": stage, "reason": reason, "unit_count": number(count),
+            "first": number(value.get("first")), "last": number(value.get("last"))}
+
+
+def protocol_failure_diagnostic(exc: ValueError) -> dict:
+    """Do not project arbitrary exception attributes or provider-controlled text."""
+    if type(exc) is not _ReferenceFailure:
+        return {}
+    value = exc.diagnostic
+    if (value.get("stage") not in {"edit_original", "action", "next", "proof"}
+            or value.get("reason") not in {"shape", "reversed", "out_of_bounds", "empty_span",
+                                           "replacement_missing", "kind_invalid"}):
+        return {}
+    return {"version": "ask-procedure-reference-diagnostic-v1",
+            "stage": value["stage"], "reason": value["reason"],
+            **{key: max(-1000000, min(1000000, value[key])) if type(value.get(key)) is int else None
+               for key in ("unit_count", "first", "last")}}
+
+
 def manual_note_projection(bindings, *, original_answer: str, reviewed_answer: str,
                            review: dict, admitted_ids: set[str]) -> tuple[list[str], dict]:
     """Keep references for unchanged server-bound manual excerpts, not authority.
@@ -318,9 +345,13 @@ def reference_catalog(layout: dict, aliases: dict, sources_block: str,
     original_blocks = {block["block_id"]: block["text"] for block in layout["blocks"]}
     for alias, bid in aliases["blocks"].items():
         prefix, body, suffix = _block_parts(original_blocks[bid])
+        if not body.strip():
+            # This is inside the caller's catalog preflight catch, before the
+            # provider/schema boundary. Empty owners cannot define a valid span.
+            raise ValueError("procedure_reference_catalog_invalid")
         blocks[alias] = {"block_id": bid, "prefix": prefix, "text": body, "suffix": suffix,
                          "units": reference_units(body)}
-    return {"version": "ask-procedure-references-v1", "answer_sha256": layout["answer_sha256"],
+    return {"version": "ask-procedure-references-v2", "answer_sha256": layout["answer_sha256"],
             "sources": sources, "blocks": blocks}
 
 
@@ -336,17 +367,23 @@ def reference_views(catalog: dict) -> tuple[str, list[dict]]:
     return "\n\n".join(sources), blocks
 
 
-def _reference_range(value: Any, units: tuple) -> tuple[int, int, str]:
+def _reference_range(value: Any, units: tuple, *, stage: str) -> tuple[int, int, str]:
     if (type(value) is not dict or set(value) != {"first", "last"}
             or type(value.get("first")) is not int or type(value.get("last")) is not int):
-        raise ValueError("procedure_reference_shape_invalid")
+        raise _ReferenceFailure("procedure_reference_shape_invalid", stage=stage,
+                                reason="shape", value=value, count=len(units))
     first, last = value["first"], value["last"]
+    if first > last:
+        raise _ReferenceFailure("procedure_reference_range_invalid", stage=stage,
+                                reason="reversed", value=value, count=len(units))
     if not 0 <= first <= last < len(units):
-        raise ValueError("procedure_reference_range_invalid")
+        raise _ReferenceFailure("procedure_reference_range_invalid", stage=stage,
+                                reason="out_of_bounds", value=value, count=len(units))
     selected = units[first:last + 1]
     text = "".join(unit[2] for unit in selected)
     if not text.strip():
-        raise ValueError("procedure_reference_range_invalid")
+        raise _ReferenceFailure("procedure_reference_range_invalid", stage=stage,
+                                reason="empty_span", value=value, count=len(units))
     return selected[0][0], selected[-1][1], text
 
 
@@ -394,7 +431,7 @@ def decode_reference_reply(parsed: dict, aliases: dict, *, layout: dict,
         if type(edit) is not dict or set(edit) != {"block_id", "original", "replacement_parts"}:
             raise ValueError("procedure_reference_edit_invalid")
         alias = edit["block_id"]; block = owner(alias, "blocks")
-        start, end, _ = _reference_range(edit["original"], block["units"])
+        start, end, _ = _reference_range(edit["original"], block["units"], stage="edit_original")
         parts = edit["replacement_parts"]
         if (alias in changes or type(parts) is not list or not 0 <= len(parts) <= 16
                 or any(type(part) is not str or not part.strip() for part in parts)):
@@ -415,13 +452,13 @@ def decode_reference_reply(parsed: dict, aliases: dict, *, layout: dict,
         positions[alias] = cursor + len(block["prefix"]) - leading
         final.append(text); cursor += len(text)
     answer = "".join(final)
-    def answer_span(alias, ref):
-        block = owner(alias, "blocks")
-        if type(ref) is not dict or set(ref) != {"kind", "first", "last"}:
-            raise ValueError("procedure_reference_shape_invalid")
-        interval = {key:ref[key] for key in ("first", "last")}
+    def answer_span(ref, stage):
+        if type(ref) is not dict or set(ref) != {"block_id", "kind", "range"}:
+            raise _ReferenceFailure("procedure_reference_shape_invalid", stage=stage, reason="shape")
+        alias = ref["block_id"]; block = owner(alias, "blocks")
+        interval = ref["range"]
         if ref["kind"] == "original":
-            start, end, text = _reference_range(interval, block["units"])
+            start, end, text = _reference_range(interval, block["units"], stage=stage)
             if alias in changes:
                 old_start, old_end, parts, _ = changes[alias]
                 if start < old_end and end > old_start:
@@ -434,9 +471,11 @@ def decode_reference_reply(parsed: dict, aliases: dict, *, layout: dict,
             units, at = [], old_start
             for part in parts:
                 units.append((at, at + len(part), part)); at += len(part)
-            start, end, text = _reference_range(interval, tuple(units))
+            start, end, text = _reference_range(interval, tuple(units), stage=stage)
         else:
-            raise ValueError("procedure_reference_range_invalid")
+            raise _ReferenceFailure("procedure_reference_range_invalid", stage=stage,
+                reason="replacement_missing" if ref["kind"] == "replacement" else "kind_invalid",
+                value=interval)
         # Whitespace is retained in the answer, but not part of action boundaries.
         leading = len(text) - len(text.lstrip()); trailing = len(text) - len(text.rstrip())
         start += leading; end -= trailing; text = text.strip()
@@ -452,12 +491,15 @@ def decode_reference_reply(parsed: dict, aliases: dict, *, layout: dict,
     audit["checked_blocks"] = [owner(alias,"blocks")["block_id"] for alias in audit["checked_blocks"]]
     edges, proof_edges = [], []
     for edge in audit["precedence"]:
-        if type(edge) is not dict or set(edge) != set(_WIRE_EDGE_FIELDS):
+        if type(edge) is not dict or set(edge) != {"action", "next", "proof"}:
             raise ValueError("procedure_review_wire_edge_invalid")
-        before = answer_span(edge["from"], edge["action"])
-        after = answer_span(edge["to"], edge["next"])
-        source = owner(edge["source"], "sources")
-        _, _, quote = _reference_range(edge["proof"], source["units"])
+        before = answer_span(edge["action"], "action")
+        after = answer_span(edge["next"], "next")
+        proof = edge["proof"]
+        if type(proof) is not dict or set(proof) != {"source", "range"}:
+            raise _ReferenceFailure("procedure_reference_shape_invalid", stage="proof", reason="shape")
+        source = owner(proof["source"], "sources")
+        _, _, quote = _reference_range(proof["range"], source["units"], stage="proof")
         edges.append({"before_block_id":before[0], "before_answer_quote":before[3],
                       "after_block_id":after[0], "after_answer_quote":after[3],
                       "source_citation_id":source["citation_id"], "source_quote":quote})
@@ -657,26 +699,48 @@ def review_schema(legacy: dict, layout: dict, facets: list[str], types: list[str
     if reference_catalogue is not None:
         if wire_aliases is None or reference_catalogue["answer_sha256"] != layout["answer_sha256"]:
             raise ValueError("procedure_reference_catalog_invalid")
-        def interval(maximum, *, answer=False):
-            fields = {key:{"type":"integer", "minimum":0, "maximum":maximum}
-                      for key in ("first","last")}
-            if answer:
-                fields = {"kind":{"type":"string","enum":["original","replacement"]}, **fields}
-            return {"type":"object","additionalProperties":False,
-                    "properties":fields,"required":list(fields)}
-        block_max = max(len(block["units"]) for block in reference_catalogue["blocks"].values()) - 1
-        source_max = max(len(source["units"]) for source in reference_catalogue["sources"].values()) - 1
-        schema["properties"]["edits"]["items"] = {
-            "type":"object", "additionalProperties":False,
-            "properties":{"block_id":{"type":"string","enum":list(wire_aliases["blocks"])},
-                "original":interval(max(0,block_max)),
-                "replacement_parts":{"type":"array","minItems":0,"maxItems":16,
-                                     "items":{"type":"string","minLength":1}}},
-            "required":["block_id","original","replacement_parts"]}
-        fields = schema["properties"]["operation_boundary"]["properties"]["precedence"]["items"]["properties"]
-        fields["action"] = interval(max(15,block_max),answer=True)
-        fields["next"] = interval(max(15,block_max),answer=True)
-        fields["proof"] = interval(max(0,source_max))
+        # Bind an owner and its bounds in the SAME alternative. Group owners
+        # with equal unit counts and share definitions: no owner cross-product,
+        # raw source strings, or quadratic enumeration of every possible span.
+        definitions = {}
+        def obj(fields):
+            return {"type":"object", "additionalProperties":False,
+                    "properties":fields, "required":list(fields)}
+        def interval(count):
+            if count < 1:
+                raise ValueError("procedure_reference_catalog_invalid")
+            name = "procedure_range_" + str(count)
+            definitions.setdefault(name, obj({key:{"type":"integer", "minimum":0, "maximum":count-1}
+                                               for key in ("first", "last")}))
+            return {"$ref":"#/$defs/" + name}
+        def groups(kind):
+            grouped = {}
+            for alias, item in reference_catalogue[kind].items():
+                grouped.setdefault(len(item["units"]), []).append(alias)
+            return grouped.items()
+        endpoints, edits, proofs = [], [], []
+        for count, owners in groups("blocks"):
+            owned = {"type":"string", "enum":owners}
+            endpoints.append(obj({"block_id":owned, "kind":{"type":"string", "enum":["original"]},
+                                  "range":interval(count)}))
+            edits.append(obj({"block_id":owned, "original":interval(count),
+                "replacement_parts":{"type":"array", "minItems":0, "maxItems":16,
+                                     "items":{"type":"string", "minLength":1}}}))
+        endpoints.append(obj({"block_id":{"type":"string", "enum":list(wire_aliases["blocks"])},
+                              "kind":{"type":"string", "enum":["replacement"]}, "range":interval(16)}))
+        for count, owners in groups("sources"):
+            proofs.append(obj({"source":{"type":"string", "enum":owners}, "range":interval(count)}))
+        definitions["procedure_answer_reference"] = {"anyOf":endpoints}
+        definitions["procedure_source_reference"] = {"anyOf":proofs}
+        if set(definitions).intersection(schema.get("$defs", {})):
+            raise ValueError("procedure_reference_catalog_invalid")
+        schema.setdefault("$defs", {}).update(definitions)
+        schema["properties"]["edits"]["items"] = {"anyOf":edits}
+        edge = schema["properties"]["operation_boundary"]["properties"]["precedence"]["items"]
+        edge["properties"] = {"action":{"$ref":"#/$defs/procedure_answer_reference"},
+                              "next":{"$ref":"#/$defs/procedure_answer_reference"},
+                              "proof":{"$ref":"#/$defs/procedure_source_reference"}}
+        edge["required"] = list(edge["properties"])
     return result
 
 
@@ -774,12 +838,15 @@ REFERENCE_BOUNDARY_INSTRUCTIONS = (
     + SOURCE_ORDERED_BOUNDARY_INSTRUCTIONS.split("For each introduced/changed operation,")[1].split("WIRE PROOF SCOPE:")[0]
     + "REFERENTIAL DELTA PROOF: precedence/change_edges cover material edits and all dependencies "
     "they affect, including prerequisites/closures in unchanged blocks. Still semantically review "
-    "every unchanged block. Every materially edited block participates in an edge. from/to select "
-    "block aliases. action/next are {kind,first,last}: kind=original selects displayed units that "
-    "remain unedited; kind=replacement selects whole replacement_parts in that same block. Never "
-    "reference deleted original units. source selects one admitted source alias and proof:{first,last} "
-    "selects its displayed literal source units supporting the precise relationship, not merely "
-    "similar words. Original and replacement indices are separate namespaces. References select "
+    "every unchanged block. Every materially edited block participates in an edge. Each precedence "
+    "entry has only action, next and proof. action/next are {block_id,kind,range:{first,last}}: "
+    "block_id owns that local range; kind=original selects displayed units that remain unedited; "
+    "kind=replacement selects whole replacement_parts from an edit in that SAME block. Never "
+    "reference a replacement without an edit or deleted original units. proof is "
+    "{source,range:{first,last}}: source owns the displayed literal units supporting the precise "
+    "relationship, not merely similar words. Every range is inclusive, zero-based and must satisfy "
+    "0 <= first <= last < that owner's unit count (or that edit's replacement_parts count). "
+    "Original and replacement indices are separate namespaces. References select "
     "positions, not semantic approval. The server verifies actual resolved offsets. With restored, "
     "the opening ends before the closure starts. Identical/overlapping parts cannot prove restoration. "
     "If a single original unit contains both actions, use a segmentation-only edit rather than "
@@ -1050,7 +1117,7 @@ def _verify_reference_boundary(parsed: dict, *, layout: dict, source_texts: dict
     out["operation_boundary_validation"] = {
         # Reference units change the private wire, not the canonical safety
         # proof consumed by the final procedure-family contract.
-        "version":"ask-operation-boundary-v1", "reference_protocol":"ask-procedure-references-v1",
+        "version":"ask-operation-boundary-v1", "reference_protocol":"ask-procedure-references-v2",
         "complete":bool(valid),
         "answer_sha256":digest(answer.strip()), "reason":"complete" if valid else reason,
         "checked_blocks":len(expected), "temporary_changes":len(audit["changes"]) if valid else None,
