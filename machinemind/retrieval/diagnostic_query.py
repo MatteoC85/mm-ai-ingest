@@ -17,11 +17,14 @@ from typing import Any, Mapping, Sequence
 import copy
 import hashlib
 import re
+from collections import Counter
 
-POLICY_VERSION = "root-request-preservation-v4"
+POLICY_VERSION = "root-request-preservation-v5"
 DIAGNOSTIC_BASIS_POLICY = "root-observation-admission-v5"
 BASIS_METADATA_KEY = "root_diagnostic_basis"
 MAX_PARTS = 32
+MAX_RETRIEVAL_ALIASES = 2
+MAX_RETRIEVAL_ALIAS_CHARS = 240
 BASIS_USES = ("context", "support", "identity_gap")
 ROUTER_EXECUTION_KEY = "root_observation_router_execution"
 ROUTER_CALL_POLICY = "root-router-single-attempt-v1"
@@ -51,6 +54,41 @@ def query_fingerprint(query: str) -> str:
     return hashlib.sha256(_space(str(query or "")).encode("utf-8")).hexdigest()
 
 
+def protected_literals(value: str) -> tuple[str, ...]:
+    """Conservative code/value-unit spans, kept exact across retrieval hints.
+
+    This is not a translator or a semantic negation validator. If a span cannot
+    be preserved exactly, the optional alias is discarded, never the original.
+    """
+    return tuple(m.group(0).rstrip(".,;:!?") for m in re.finditer(
+        r"(?<![\w+\-−﹣－＋])(?:[A-Za-z]+[A-Za-z0-9_.:/-]*\d[A-Za-z0-9_.:/-]*|(?:[+\-−﹣－＋]\s*)?\d+(?:[.,]\d+)?(?:\s*[A-Za-z%°µΩ]{1,8}[⁰¹²³⁴⁵⁶⁷⁸⁹]*(?:/[A-Za-z]{1,8}[⁰¹²³⁴⁵⁶⁷⁸⁹]*)?)?)(?!\w)", value))
+
+
+def protected_literals_present(clue: str, source: str) -> bool:
+    # Compare complete extracted literals, not substring boundaries: otherwise
+    # 6 could match -6/6.5/6,5 and E101 could match E101.2. Only internal
+    # number-unit whitespace is harmless; sign, decimal notation and unit stay.
+    expected = Counter(re.sub(r"\s+", "", x) for x in protected_literals(clue))
+    observed = Counter(re.sub(r"\s+", "", x) for x in protected_literals(source))
+    return all(observed[key] > 0 for key in expected)
+
+
+def _retrieval_aliases(value: Any, quote: str, role: str) -> tuple[str, ...]:
+    if role not in FACT_ROLES or not isinstance(value, (list, tuple)) or len(value) > MAX_RETRIEVAL_ALIASES:
+        return ()
+    expected = Counter(re.sub(r"\s+", "", x) for x in protected_literals(quote))
+    result = []
+    for item in value:
+        if not isinstance(item, str) or not 0 < len(item) <= MAX_RETRIEVAL_ALIAS_CHARS:
+            continue
+        item = _space(item)
+        actual = Counter(re.sub(r"\s+", "", x) for x in protected_literals(item))
+        if not item or item == quote or actual != expected or item in result:
+            continue
+        result.append(item)
+    return tuple(result)
+
+
 def _source_units(query: str) -> tuple[tuple[int, int, str], ...]:
     """Lossless reference encoding, with no sentence or epistemic classification.
 
@@ -78,10 +116,12 @@ class RequestPart:
     start: int
     end: int
     basis_use: str = "context"
+    retrieval_aliases: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {"role": self.role, "quote": self.quote, "start": self.start,
-                "end": self.end, "basis_use": self.basis_use}
+                "end": self.end, "basis_use": self.basis_use,
+                **({"retrieval_aliases": list(self.retrieval_aliases)} if self.retrieval_aliases else {})}
 
 
 @dataclass(frozen=True)
@@ -233,7 +273,7 @@ def _partition(value: Any, original: str) -> tuple[tuple[RequestPart, ...], str]
     cursor = 0
     parts: list[RequestPart] = []
     for item in value:
-        if not isinstance(item, Mapping) or set(item) - {"role", "quote", "start", "end", "basis_use"}:
+        if not isinstance(item, Mapping) or set(item) - {"role", "quote", "start", "end", "basis_use", "retrieval_aliases"}:
             return (), "invalid_request_part_shape"
         role, quote = item.get("role"), item.get("quote")
         if not isinstance(role, str) or role not in ROLES or not isinstance(quote, str):
@@ -252,7 +292,8 @@ def _partition(value: Any, original: str) -> tuple[tuple[RequestPart, ...], str]
         # Do not infer word/clause boundaries from spaces or character classes:
         # many writing systems do not separate semantic units with whitespace.
         # Whether the role covers a complete meaningful clause is a model judgement.
-        parts.append(RequestPart(role, source[cursor:end], cursor, end, basis_use))
+        parts.append(RequestPart(role, source[cursor:end], cursor, end, basis_use,
+                                 _retrieval_aliases(item.get("retrieval_aliases"), quote, role)))
         cursor = end
     if source[cursor:].strip():
         return (), "request_partition_coverage_incomplete"
@@ -279,7 +320,7 @@ def _partition_references(basis: Mapping[str, Any], original: str) -> tuple[tupl
     source, units = _space(original), _source_units(original)
     cursor, parts = 0, []
     for item in value:
-        if not isinstance(item, Mapping) or set(item) != {"role", "first_unit", "last_unit", "basis_use"}:
+        if not isinstance(item, Mapping) or (set(item) - {"retrieval_aliases"}) != {"role", "first_unit", "last_unit", "basis_use"}:
             return (), "invalid_request_part_shape"
         role, basis_use = item["role"], item["basis_use"]
         if not isinstance(role, str) or role not in ROLES:
@@ -295,7 +336,8 @@ def _partition_references(basis: Mapping[str, Any], original: str) -> tuple[tupl
         # Trailing inter-unit whitespace is excluded just as in the private
         # quote round-trip validator. Every non-space character is retained.
         quote = source[start:end].rstrip()
-        parts.append(RequestPart(role, quote, start, start + len(quote), basis_use))
+        parts.append(RequestPart(role, quote, start, start + len(quote), basis_use,
+                                 _retrieval_aliases(item.get("retrieval_aliases"), quote, role)))
         cursor = last + 1
     if cursor != len(units):
         return (), "request_partition_coverage_incomplete"
@@ -451,7 +493,15 @@ DIAGNOSTIC_BASIS_INSTRUCTION = (
     "are valid observations but their sufficiency still needs evidence. sufficient needs "
     "at least one support part and no required identity_gap part. The server derives the "
     "four factual diagnostic arrays from the partition; do not generate them again. "
-    "Keep remaining query variants concise and do not repeat the entire request in every field. "
+    "Each part also has retrieval_aliases: normally [] when translation is unnecessary. "
+    "For a factual part, optionally supply at most two concise faithful translations in the "
+    "language of relevant indexed sources (each <=240 characters). They are retrieval hints "
+    "only, never new facts, role changes or support proofs. Preserve every negation, condition, "
+    "comparison, technical code, number and unit exactly; never replace an unknown with a "
+    "result. Unknown, hypothesis, request, identity and other nonfactual parts must use []. "
+    "Do not summarize away qualifications to fit; leave [] instead. The original units and "
+    "basis_use remain authoritative. Use concise query variants to stay within the unchanged "
+    "router output budget; do not repeat the full request in every field. "
     "For genuinely nondiagnostic requests routed "
     "to ASK choose not_diagnostic; identity-dependent diagnostic prescriptions are not exempt. "
     "Unsafe or out-of-scope requests retain priority. Missing or unknown variables may be "
@@ -466,7 +516,7 @@ DIAGNOSTIC_BASIS_INSTRUCTION = (
 
 def router_schema_with_diagnostic_basis(schema: Mapping[str, Any], *, original_query: str = "") -> dict[str, Any]:
     out = copy.deepcopy(dict(schema))
-    out["name"] = "machinemind_root_observation_router_v4"
+    out["name"] = "machinemind_root_observation_router_v5"
     body = out["schema"]
     last_unit = max(0, len(_source_units(original_query)) - 1)
     for field in DERIVED_DIAGNOSTIC_FIELDS:
@@ -483,8 +533,10 @@ def router_schema_with_diagnostic_basis(schema: Mapping[str, Any], *, original_q
                     "first_unit": {"type": "integer", "minimum": 0, "maximum": last_unit},
                     "last_unit": {"type": "integer", "minimum": 0, "maximum": last_unit},
                     "basis_use": {"type": "string", "enum": list(BASIS_USES)},
+                    "retrieval_aliases": {"type": "array", "maxItems": MAX_RETRIEVAL_ALIASES,
+                        "items": {"type": "string", "maxLength": MAX_RETRIEVAL_ALIAS_CHARS}},
                 },
-                "required": ["role", "first_unit", "last_unit", "basis_use"],
+                "required": ["role", "first_unit", "last_unit", "basis_use", "retrieval_aliases"],
             }},
             "state": {"type": "string", "enum": [
                 "sufficient", "needs_observations", "needs_target_identity", "not_diagnostic"

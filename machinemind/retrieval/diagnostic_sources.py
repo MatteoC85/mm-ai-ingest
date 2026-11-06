@@ -22,13 +22,14 @@ and source spans. It does not replace semantic judgement with lexical ranking.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections import deque
 from typing import Any, Callable, Iterable, Mapping, Sequence
 import math
 import re
 import unicodedata
 
 
-_POLICY_VERSION = "root-diagnostic-source-selection-v1"
+_POLICY_VERSION = "root-diagnostic-source-selection-v2"
 _GROUP_THRESHOLD = 0.20
 
 
@@ -39,6 +40,7 @@ class DiagnosticSourceRuntime:
     source_type: Callable[[dict], str]
     stable_key: Callable[[dict], str]
     family_key: Callable[[dict], str]
+    support_match: Callable[[dict], Mapping[str, Any]] | None = None
 
 
 @dataclass(frozen=True)
@@ -78,6 +80,10 @@ class DiagnosticCandidateAssessment:
     generic_downranked: bool
     role_group: str
     evidence_tokens: frozenset[str]
+    matched_support_part_ids: tuple[str, ...]
+    support_query_sha256: str
+    support_source_text_sha256: str
+    support_policy_version: str
 
 
 @dataclass(frozen=True)
@@ -306,6 +312,26 @@ def assess_root_cause_candidate(
         quality -= 0.07
     quality = _bounded(quality)
 
+    # Only the composition-root callback can bind current factual request parts
+    # to actual source text. Candidate-supplied scores/flags are not this proof.
+    support = runtime.support_match(dict(item)) if runtime.support_match is not None else {}
+    if not isinstance(support, Mapping):
+        support = {}
+    part_ids = support.get("matched_support_part_ids")
+    query_sha = support.get("query_sha256")
+    source_sha = support.get("source_text_sha256")
+    support_policy = support.get("policy_version")
+    valid_support = bool(
+        isinstance(part_ids, (list, tuple))
+        and len(part_ids) <= 32
+        and all(isinstance(value, str) and len(value) <= 128 and re.fullmatch(
+            r"[0-9]+:[0-9]+:(?:observation|observed_negative|action_performed|action_not_performed)", value,
+        ) for value in part_ids)
+        and isinstance(query_sha, str) and re.fullmatch(r"[0-9a-f]{64}", query_sha)
+        and isinstance(source_sha, str) and re.fullmatch(r"[0-9a-f]{64}", source_sha)
+        and isinstance(support_policy, str) and 0 < len(support_policy) <= 128
+    )
+
     return DiagnosticCandidateAssessment(
         candidate=item,
         input_rank=int(input_rank),
@@ -328,6 +354,25 @@ def assess_root_cause_candidate(
         generic_downranked=generic,
         role_group=role_group,
         evidence_tokens=_evidence_tokens(item, groups=groups),
+        matched_support_part_ids=tuple(dict.fromkeys(part_ids)) if valid_support else (),
+        support_query_sha256=query_sha if valid_support else "",
+        support_source_text_sha256=source_sha if valid_support else "",
+        support_policy_version=support_policy if valid_support else "",
+    )
+
+
+def _supported_core_context(
+    assessment: DiagnosticCandidateAssessment, policy: DiagnosticSelectionPolicy,
+) -> bool:
+    """Source-local eligibility, independent of another source's quality."""
+    return bool(
+        assessment.role_group == "core"
+        and assessment.quality >= policy.absolute_quality_floor
+        and assessment.causal_support >= 0.08
+        and assessment.subsystem_support > 0.0
+        and assessment.matched_support_part_ids
+        and not assessment.candidate.get("hard_excluded")
+        and assessment.candidate.get("assistant_core_root_viable") is True
     )
 
 
@@ -392,9 +437,13 @@ def select_root_cause_candidates(
     seen_excerpts: set[tuple[str, int, int, str]] = set()
     duplicate_count = 0
     hard_excluded_count = 0
+    not_viable_count = 0
     for rank, raw in enumerate(raw_items):
         if bool(raw.get("hard_excluded")):
             hard_excluded_count += 1
+            continue
+        if raw.get("assistant_core_root_viable") is False:
+            not_viable_count += 1
             continue
         assessed = assess_root_cause_candidate(raw, input_rank=rank, runtime=runtime)
         if not assessed.stable_key:
@@ -428,6 +477,7 @@ def select_root_cause_candidates(
                 "rejection_counts": {
                     "duplicate_or_missing_identity": duplicate_count,
                     "hard_excluded": hard_excluded_count,
+                    "not_root_viable": not_viable_count,
                 },
             },
         )
@@ -449,12 +499,14 @@ def select_root_cause_candidates(
     covered_tokens: set[str] = set()
     rejection_reasons: dict[str, str] = {}
 
-    def capacity_reason(assessed: DiagnosticCandidateAssessment) -> str:
+    def capacity_reason(
+        assessed: DiagnosticCandidateAssessment, *, source_overflow: bool = False,
+    ) -> str:
         if len(selected) >= limit:
             return "limit"
         if assessed.stable_key in selected_ids:
             return "duplicate"
-        if source_counts.get(assessed.source_key, 0) >= max(
+        if not source_overflow and source_counts.get(assessed.source_key, 0) >= max(
             1, policy.per_source_cap
         ):
             return "source_cap"
@@ -462,7 +514,9 @@ def select_root_cause_candidates(
             return "family_cap"
         return ""
 
-    def add(assessed: DiagnosticCandidateAssessment, reason: str) -> bool:
+    def add(
+        assessed: DiagnosticCandidateAssessment, reason: str, *, source_overflow: bool = False,
+    ) -> bool:
         # Relative/fallback evidence may enrich a valid pack, but it must never
         # manufacture the first cause.  This allows an intentionally empty pack
         # when every retrieved candidate is too weak or ambiguous.
@@ -470,13 +524,14 @@ def select_root_cause_candidates(
             "corroborated_documented_case",
             "new_supported_signal",
             "core_mechanism",
+            "core_context_overflow",
         }
         if not selected and reason not in strong_seed_reasons:
             rejection_reasons.setdefault(assessed.stable_key, "insufficient_absolute_evidence")
             return False
-        blocked = capacity_reason(assessed)
+        blocked = capacity_reason(assessed, source_overflow=source_overflow)
         if blocked:
-            rejection_reasons.setdefault(assessed.stable_key, blocked)
+            rejection_reasons[assessed.stable_key] = blocked
             return False
         if not selected and assessed is assessments[0]:
             reason = "anchor"
@@ -539,16 +594,23 @@ def select_root_cause_candidates(
                 )
             )
         )
-        core_mechanism = bool(
-            assessed.role_group == "core"
-            and assessed.quality >= novel_floor
-            and assessed.independent_axis_count >= policy.minimum_novel_axes
-            and (assessed.causal_support >= 0.08 or assessed.subsystem_support > 0.0)
-        )
+        if runtime.support_match is None:
+            # Opt-in migration: an unconfigured caller keeps the exact previous
+            # core contract. A configured callback with no match never falls back.
+            core_mechanism = bool(
+                assessed.role_group == "core"
+                and assessed.quality >= novel_floor
+                and assessed.independent_axis_count >= policy.minimum_novel_axes
+                and (assessed.causal_support >= 0.08 or assessed.subsystem_support > 0.0)
+            )
+        else:
+            core_mechanism = _supported_core_context(assessed, policy)
         return documented_case, novel_supported, core_mechanism, close_peer
 
-    # Coverage pass: every candidate, including rank 1, must pass an absolute
-    # diagnostic admission contract.  The first admitted rank-1 candidate keeps
+    # Coverage pass: every candidate, including rank 1, must pass its evidence
+    # contract. Core context has an absolute, source-local contract; historical
+    # documented-case/novel-signal branches retain their relative floors.
+    # The first admitted rank-1 candidate keeps
     # the public ``anchor`` label, but ranking alone never grants admission.
     # This also permits a zero-evidence result for underspecified symptoms.
     for assessed in assessments:
@@ -566,6 +628,26 @@ def select_root_cause_candidates(
             add(assessed, "new_supported_signal")
         elif core_mechanism:
             add(assessed, "core_mechanism")
+
+    # Spend only still-unused global slots on independently source-bound core
+    # context before weak peer fill. Round-robin source queues preserve input
+    # order and bypass only the source quota, never family/global/dedup limits.
+    queues: dict[str, deque[DiagnosticCandidateAssessment]] = {}
+    for assessed in assessments:
+        if assessed.stable_key not in selected_ids and _supported_core_context(assessed, policy):
+            queues.setdefault(assessed.source_key, deque()).append(assessed)
+    queues = dict(sorted(queues.items(), key=lambda item: (item[1][0].input_rank, item[0])))
+    while queues and len(selected) < limit:
+        for source_key in tuple(queues):
+            queue = queues[source_key]
+            while queue and len(selected) < limit:
+                assessed = queue.popleft()
+                if add(assessed, "core_context_overflow", source_overflow=True):
+                    break
+            if not queue:
+                del queues[source_key]
+            if len(selected) >= limit:
+                break
 
     # Relevance-fill pass: add only close-quality peers.  Different source identity
     # is intentionally absent from this admission decision.
@@ -600,6 +682,10 @@ def select_root_cause_candidates(
     # full during the coverage pass.
     for assessed in assessments:
         if assessed.stable_key not in selected_ids:
+            if _supported_core_context(assessed, policy):
+                final_capacity = capacity_reason(assessed, source_overflow=True)
+                if final_capacity:
+                    rejection_reasons[assessed.stable_key] = final_capacity
             rejection_reasons.setdefault(
                 assessed.stable_key,
                 "limit" if len(selected) >= limit else "below_relevance_floor",
@@ -622,6 +708,7 @@ def select_root_cause_candidates(
         "rejection_counts": {
             **({"duplicate_or_missing_identity": duplicate_count} if duplicate_count else {}),
             **({"hard_excluded": hard_excluded_count} if hard_excluded_count else {}),
+            **({"not_root_viable": not_viable_count} if not_viable_count else {}),
             **dict(sorted(rejection_counts.items())),
         },
         "selected": [
@@ -630,6 +717,19 @@ def select_root_cause_candidates(
                 **dict(item.get("assistant_core_diagnostic_source_selection") or {}),
             }
             for item in selected
+        ],
+        "core_context_assessments": [
+            {
+                "citation_id": str(item.candidate.get("citation_id") or ""),
+                "eligible": _supported_core_context(item, policy),
+                "selected": item.stable_key in selected_ids,
+                "not_selected_reason": rejection_reasons.get(item.stable_key, ""),
+                "matched_support_part_ids": list(item.matched_support_part_ids),
+                "query_sha256": item.support_query_sha256,
+                "source_text_sha256": item.support_source_text_sha256,
+                "support_policy_version": item.support_policy_version,
+            }
+            for item in assessments
         ],
     }
     return DiagnosticSelectionResult(candidates=tuple(selected), summary=summary)

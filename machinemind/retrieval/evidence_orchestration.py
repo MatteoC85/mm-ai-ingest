@@ -1464,9 +1464,10 @@ def assistant_core_prepare_evidence(request: AssistantCoreRequest, retrieval: di
             )
             if enumeration_neighbors:
                 enumeration_neighbor_count = len(enumeration_neighbors)
-                if canonical_ask_selection:
+                if canonical_ask_selection or decision.effective_mode == MODE_ROOT_CAUSE:
                     # Page readers expose lexical scores on their own scale.
-                    # Only fresh occurrences need canonical scoring; do not
+                    # Root and owned ASK must compare fresh pages on the same
+                    # canonical scale. Only fresh occurrences need scoring; do not
                     # re-score existing chunks or lose their facet annotations.
                     enumeration_neighbors = _v13_score_candidates(
                         retrieval_query, enumeration_neighbors, preserve_complete=True)
@@ -1478,7 +1479,7 @@ def assistant_core_prepare_evidence(request: AssistantCoreRequest, retrieval: di
             )
             if section_pages:
                 enumeration_neighbor_count += len(section_pages)
-                if canonical_ask_selection:
+                if canonical_ask_selection or decision.effective_mode == MODE_ROOT_CAUSE:
                     section_pages = _v13_score_candidates(
                         retrieval_query, section_pages, preserve_complete=True)
                 candidates = _v13_merge_candidates([
@@ -1956,7 +1957,7 @@ def assistant_core_prepare_evidence(request: AssistantCoreRequest, retrieval: di
         if decision.effective_mode == MODE_ROOT_CAUSE:
             root_source_selection = _assistant_core_root_source_selection(
                 root_viable,
-                limit=limit,
+                limit=limit, decision=decision,
             )
             selected_pool = list(root_source_selection.candidates)
             root_source_selection_summary = dict(root_source_selection.summary)

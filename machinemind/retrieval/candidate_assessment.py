@@ -757,6 +757,13 @@ def assistant_core_diagnostic_priority_metrics(
     _dedup_text_values = runtime._dedup_text_values
     _v13_candidate_text = runtime._v13_candidate_text
     text = _v13_candidate_text(candidate)
+    if decision.effective_mode == "root_cause":
+        from . import root_clue_support
+        return root_clue_support.priority_metrics(
+            decision, text, source_type=_assistant_core_candidate_source_type(candidate),
+            substantive_ps=_assistant_core_ps_is_substantive(candidate),
+            metrics=_assistant_core_required_facet_metrics,
+        )
     tag_text = " ".join(
         str(x or "").strip()
         for x in (candidate.get("assistant_core_facet_hits") or [])

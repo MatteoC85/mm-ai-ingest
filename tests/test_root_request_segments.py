@@ -221,7 +221,7 @@ class RequestSegmentContractTests(unittest.TestCase):
         part = basis["properties"]["request_parts"]["items"]
         self.assertNotIn("quote", part["properties"])
         self.assertEqual(part["properties"]["last_unit"]["maximum"], len(dq.router_request_units(QUERY)["units"]) - 1)
-        self.assertEqual(set(part["required"]), {"role", "first_unit", "last_unit", "basis_use"})
+        self.assertEqual(set(part["required"]), {"role", "first_unit", "last_unit", "basis_use", "retrieval_aliases"})
         self.assertFalse(part["additionalProperties"])
         self.assertEqual(base, before)
 

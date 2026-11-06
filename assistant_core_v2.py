@@ -26,6 +26,7 @@ from machinemind.evidence.ask_input import (
 from machinemind.ask.request_scope import bind_conditions_requirements_to_question, bounded_phase_contract
 from machinemind.ask import procedure_scope as _procedure_scope
 from machinemind.ask import factual_coverage as _factual_coverage
+from machinemind.retrieval import root_clue_support as _root_clue_support
 
 
 MODE_ASK = "ask"
@@ -243,6 +244,7 @@ class AssistantCoreDecision:
     procedure_scope: str = ""
     procedure_phase: tuple[str, str, str] = ()
     factual_coverage: str = "unspecified"
+    root_clue_support: Any = field(default=None, repr=False, compare=False)
 
     @property
     def routed(self) -> bool:
@@ -714,6 +716,9 @@ def normalize_decision(
         diagnostic_operating_conditions=_unique_strings(raw.get("diagnostic_operating_conditions"), 8),
         diagnostic_discriminants=_unique_strings(raw.get("diagnostic_discriminants"), 8),
         diagnostic_exclusions=_unique_strings(raw.get("diagnostic_exclusions"), 8),
+        root_clue_support=(_root_clue_support.for_request(raw.get(_root_clue_support.WIRE_KEY),
+            query=request.query, company_id=request.company_id, machine_id=request.machine_id)
+            if request.requested_mode == MODE_ROOT_CAUSE and effective == MODE_ROOT_CAUSE else None),
         missing_information=_unique_strings(raw.get("missing_information"), 8),
         clarification_question=clarification,
         safety_reason=_clean_text(raw.get("safety_reason"), 500),

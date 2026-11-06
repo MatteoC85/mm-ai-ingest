@@ -189,6 +189,7 @@ from machinemind.retrieval import evidence_orchestration as _retrieval_evidence_
 from machinemind.retrieval import candidate_ranking as _retrieval_candidate_ranking
 from machinemind.retrieval import lexical as _retrieval_lexical
 from machinemind.retrieval import diagnostic_query as _retrieval_diagnostic_query
+from machinemind.retrieval import root_clue_support as _root_clue_support
 from machinemind.retrieval import diagnostic_sources as _retrieval_diagnostic_sources
 from machinemind.retrieval import precision_facts as _retrieval_precision_facts
 from machinemind.retrieval import review_packet as _retrieval_review_packet
@@ -14086,6 +14087,13 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
             )
         if isinstance(request.metadata, dict):
             request.metadata[_retrieval_diagnostic_query.BASIS_METADATA_KEY] = basis_result.summary
+        # This object is created only after the original partition and admission
+        # have passed. Provider JSON/candidate tags cannot instantiate the carrier.
+        out.pop(_root_clue_support.WIRE_KEY, None)
+        if basis_result.summary.get("admitted"):
+            out[_root_clue_support.WIRE_KEY] = _root_clue_support.from_profile(
+                profile, company_id=request.company_id, machine_id=request.machine_id,
+            )
     if request.requested_mode == MODE_ASK and isinstance(request.metadata, dict):
         target = _retrieval_precision_facts.scalar_target_from_router(request.query, out)
         if target:
@@ -15122,12 +15130,19 @@ def _assistant_core_root_source_selection(
     candidates: list[dict],
     *,
     limit: int,
+    decision: Optional[AssistantCoreDecision] = None,
 ) -> _retrieval_diagnostic_sources.DiagnosticSelectionResult:
     """Build the final Root Cause pack through the modular relevance gate."""
     return _retrieval_diagnostic_sources.select_root_cause_candidates(
         candidates,
         limit=limit,
-        runtime=_DIAGNOSTIC_SOURCE_RUNTIME(),
+        runtime=(_retrieval_diagnostic_sources.DiagnosticSourceRuntime(
+            source_type=_DIAGNOSTIC_SOURCE_RUNTIME().source_type,
+            stable_key=_DIAGNOSTIC_SOURCE_RUNTIME().stable_key,
+            family_key=_DIAGNOSTIC_SOURCE_RUNTIME().family_key,
+            support_match=lambda candidate: _root_clue_support.support_match(
+                decision, _v13_candidate_text(candidate)),
+        ) if decision is not None else _DIAGNOSTIC_SOURCE_RUNTIME()),
     )
 
 
