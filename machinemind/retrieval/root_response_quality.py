@@ -12,7 +12,7 @@ from typing import Any
 
 from . import review_references
 
-POLICY_VERSION = "root-response-quality-v6"
+POLICY_VERSION = "root-response-quality-v7"
 
 MAX_WHY_UNITS = 8
 # These are punctuation ambiguities, not evidence or diagnostic classifications.
@@ -191,9 +191,30 @@ the original proposal itself explicitly preserves that uncertainty, the source
 and reported observation establish the same relevant target and symptom, and the
 documented mechanism explains that observation conditionally. A name/code match
 alone cannot override a conflicting model or establish a causal dependency.
-If the user explicitly asks about a documentary or hypothetical case, assess the
-hypothesis within that stated case; do not turn it into a confirmed diagnosis or
-assert that the described configuration is installed on the user's machine.
+Distinguish an UNKNOWN installed model from a KNOWN incompatible model. An empty
+machine-model field is not itself evidence of incompatibility. Judge the type of
+claim, not whether the request uses a documentary or hypothetical label. A real
+machine question may also receive an explicitly source-scoped conditional
+explanation while applicability remains unverified; that explanation does not
+assert the documented configuration is installed. The source's actual content
+and governing context must independently connect the relevant target, reported
+observations and causal mechanism; a matching message, document title or
+selected-machine routing alone does not establish that connection. Use authorized
+target units to substantiate this bounded relationship, not to assert installed
+equipment identity. For an explicitly documentary case, assess the observations
+within that stated case without turning them into a real incident.
+
+This permits only the original wording that explicitly limits the mechanism to
+the documented configuration and leaves its applicability unverified. Do not
+require an extra model label when the retained wording already preserves that
+material limitation. A useful conditional hypothesis is not a confirmed fault,
+installed-model identification or authorization to apply the manual's procedures.
+If the proposal asserts installation/applicability without support, contradicts a
+known model, or fails to preserve a necessary limitation, reject it; do not add a
+qualification or assume compatibility. A merely hypothetical phrasing never
+licenses transferring a mechanism between unrelated targets. A claim that the
+mechanism actually applies to installed equipment requires applicable
+identity/dependency evidence as usual, even in a purported documentary case.
 
 With unverified configuration, retained checks may ask only for already available
 observations or records of the specific source-documented condition, or be empty.
