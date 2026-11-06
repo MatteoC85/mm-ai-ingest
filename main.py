@@ -21454,6 +21454,45 @@ def _sd_validate_state_binding(
         )
 
 
+def _sd_final_result_for_display(final_result: dict, hypotheses: list[dict], language: str) -> dict:
+    """Clarify unconfirmed conclusions without changing signed diagnostic state.
+
+    Replace only the server's canonical lead; reviewed explanations, pending
+    questions and safety text remain literal. IDs, weights and checks are copied.
+    """
+    displayed = dict(final_result)
+    active = [h for h in hypotheses if isinstance(h, dict) and h.get("status") != "excluded"]
+    selected_id = str(final_result.get("most_likely_hypothesis_id") or "")
+    if (not selected_id or not any(h.get("id") == selected_id for h in active)
+            or any(h.get("status") == "confirmed" for h in active)):
+        return displayed
+    is_en = str(language or "").lower().startswith("en")
+    label = str(final_result.get("most_likely_label") or "")
+    prefix = (f"Most supported hypothesis: {label}." if is_en else f"Ipotesi più supportata: {label}.")
+    summary = str(final_result.get("summary") or "")
+    if not label or not summary.startswith(prefix):
+        return displayed
+    weights = [round(float(h.get("probability_pct") or 0.0), 1) for h in active]
+    tied = weights.count(max(weights)) > 1
+    pct = round(float(final_result.get("probability_pct") or 0.0), 1)
+    if is_en:
+        lead = "The diagnosis is inconclusive: no cause has been confirmed."
+        if tied:
+            lead += " The highest relative weights are equal; they do not identify a leading cause."
+        if pct == 100.0:
+            lead += " A relative weight of 100% does not confirm a fault."
+        lead += f"\n\nDocumented hypothesis still to verify: {label}."
+    else:
+        lead = "La diagnosi è inconclusiva: nessuna causa è confermata."
+        if tied:
+            lead += " I pesi relativi maggiori sono alla pari: non indicano una causa prevalente."
+        if pct == 100.0:
+            lead += " Un peso relativo del 100% non conferma un guasto."
+        lead += f"\n\nIpotesi documentata ancora da verificare: {label}."
+    displayed["summary"] = lead + summary[len(prefix):]
+    return displayed
+
+
 def _sd_response_from_step(
     *,
     session_id: str,
@@ -21571,6 +21610,20 @@ def _sd_response_from_step(
 
     current_state = _sd_sign_state(current_state)
 
+    # Presentation happens after signing. Older completed sessions can still
+    # replay their exact canonical conclusion; the public summary is clearer.
+    operator_summary = str(step.get("operator_summary") or "")
+    if final_ready:
+        displayed_final = _sd_final_result_for_display(final_result, hypotheses, language)
+        if displayed_final.get("summary") != final_result.get("summary"):
+            if operator_summary and operator_summary != str(final_result.get("summary") or ""):
+                # A noncanonical caller may supply additional operator context.
+                # Do not erase it or merge potentially distinct reviewed claims.
+                displayed_final = final_result
+            else:
+                operator_summary = str(displayed_final.get("summary") or "")
+        final_result = displayed_final
+
     resp = {
         "ok": True,
         "status": status,
@@ -21582,7 +21635,7 @@ def _sd_response_from_step(
         "final_result": final_result if final_ready else {},
         "citations": citations,
         "rg_links": rg_links,
-        "operator_summary": str(step.get("operator_summary") or ""),
+        "operator_summary": operator_summary,
         "final_result_json": _sd_json_dumps(final_result if final_ready else {}),
         "final_summary_text": str(final_result.get("summary") or "") if final_ready else "",
         "final_most_likely_label": str(final_result.get("most_likely_label") or "") if final_ready else "",
