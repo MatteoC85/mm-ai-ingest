@@ -13917,9 +13917,15 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
         system_msg += _ask_request_readiness.INSTRUCTION
         system_msg += _ask_procedure_scope.INSTRUCTION
         system_msg += _ask_factual_coverage.INSTRUCTION
-    # USER_REQUEST is supplied once, unmodified. There is no precomputed
-    # "observed" block that could incorrectly override a negated clause.
-    epistemic_block = ""
+    # USER_REQUEST remains unmodified. Root receives only a lossless reference
+    # index alongside it, with no preclassified observations or unknowns.
+    epistemic_block = (
+        "USER_REQUEST_UNITS:\n" + json.dumps(
+            _retrieval_diagnostic_query.router_request_units(request.query),
+            ensure_ascii=False, separators=(",", ":"),
+        ) + "\n\n"
+        if is_root_cause else ""
+    )
     user_msg = (
         f"REQUESTED_MODE: {request.requested_mode}\n"
         f"ALLOWED_EFFECTIVE_MODES: {json.dumps(allowed_modes)}\n"
@@ -13970,7 +13976,7 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
             models=router_models,
             json_schema=(
                 _retrieval_diagnostic_query.router_schema_with_diagnostic_basis(
-                    build_router_schema(allowed_modes)
+                    build_router_schema(allowed_modes), original_query=request.query
                 ) if is_root_cause else (
                     _ask_factual_coverage.router_schema(
                         _ask_procedure_scope.router_schema(

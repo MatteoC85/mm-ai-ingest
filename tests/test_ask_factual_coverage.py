@@ -100,7 +100,8 @@ class ActualRouterCoverageSchemaTests(unittest.TestCase):
                     self.assertEqual(schema,build_router_schema(list(request(mode).allowed_effective_modes))['schema'])
                 if mode=='root_cause':
                     expected=self.m._retrieval_diagnostic_query.router_schema_with_diagnostic_basis(
-                        build_router_schema(list(request(mode).allowed_effective_modes)))
+                        build_router_schema(list(request(mode).allowed_effective_modes)),
+                        original_query=request(mode).query)
                     self.assertEqual(schema,expected['schema'])
 
 

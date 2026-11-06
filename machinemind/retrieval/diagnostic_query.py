@@ -1,8 +1,9 @@
 """Lossless request preparation for Root Cause; no machine/language heuristics.
 
 The original request is immutable.  The existing semantic router classifies a
-complete, ordered partition of that request.  This module validates types,
-coverage and quote provenance, not the meaning of a negation or a symptom.
+complete, ordered partition using server-owned text-unit references.  This module
+reconstructs quotes from the original and validates identity, types and coverage,
+not the meaning of a negation or a symptom.
 
 Before routing the complete request can be used for *candidate discovery*.  Only
 a validated semantic projection can subsequently steer diagnostic ranking.  A
@@ -17,8 +18,8 @@ import copy
 import hashlib
 import re
 
-POLICY_VERSION = "root-request-preservation-v3"
-DIAGNOSTIC_BASIS_POLICY = "root-observation-admission-v4"
+POLICY_VERSION = "root-request-preservation-v4"
+DIAGNOSTIC_BASIS_POLICY = "root-observation-admission-v5"
 BASIS_METADATA_KEY = "root_diagnostic_basis"
 MAX_PARTS = 32
 BASIS_USES = ("context", "support", "identity_gap")
@@ -48,6 +49,26 @@ def _space(value: str) -> str:
 
 def query_fingerprint(query: str) -> str:
     return hashlib.sha256(_space(str(query or "")).encode("utf-8")).hexdigest()
+
+
+def _source_units(query: str) -> tuple[tuple[int, int, str], ...]:
+    """Lossless reference encoding, with no sentence or epistemic classification.
+
+    ASCII identifier runs stay compact; every other non-space code point has its
+    own boundary, so scripts without word separators can still be partitioned.
+    Whitespace belongs to the preceding unit. Only the existing whitespace
+    normalization is applied; signs, punctuation and Unicode remain unchanged.
+    """
+    source = _space(query)
+    starts = [m.start() for m in re.finditer(r"[A-Za-z0-9_]+|[^\sA-Za-z0-9_]", source)]
+    ends = starts[1:] + [len(source)]
+    return tuple((start, end, source[start:end]) for start, end in zip(starts, ends))
+
+
+def router_request_units(query: str) -> dict[str, Any]:
+    units = _source_units(query)
+    return {"query_sha256": query_fingerprint(query),
+            "units": [[index, unit[2]] for index, unit in enumerate(units)]}
 
 
 @dataclass(frozen=True)
@@ -202,8 +223,8 @@ def _clarification_question(language: str, *, invalid: bool = False, identity: b
 def _partition(value: Any, original: str) -> tuple[tuple[RequestPart, ...], str]:
     """Round-trip check; offsets refer to the whitespace-normalized source.
 
-    The model supplies only ordered role/quote pairs.  Offset arithmetic is done
-    here, not delegated to the model. Nothing except whitespace may be skipped.
+    The private profile contains server-derived role/quote pairs. Offset arithmetic
+    is done here, not delegated to the model. Nothing except whitespace may be skipped.
     Repeated words are located by order; substring membership alone is not enough.
     """
     if not isinstance(value, list) or not 1 <= len(value) <= MAX_PARTS:
@@ -241,11 +262,44 @@ def _partition(value: Any, original: str) -> tuple[tuple[RequestPart, ...], str]
 def profile_from_router(raw: Mapping[str, Any], profile: DiagnosticQueryProfile) -> DiagnosticQueryProfile:
     basis = raw.get("diagnostic_basis")
     basis = basis if isinstance(basis, Mapping) else {}
-    parts, error = _partition(basis.get("request_parts"), profile.original_query)
+    parts, error = _partition_references(basis, profile.original_query)
     factual_route = str(raw.get("effective_mode") or "").lower() == "ask" and basis.get("state") == "not_diagnostic"
     return replace(profile, parts=parts, error=error,
                    interpretation_status="invalid" if error else "valid",
                    diagnostic_projection=not factual_route)
+
+
+def _partition_references(basis: Mapping[str, Any], original: str) -> tuple[tuple[RequestPart, ...], str]:
+    """Resolve a complete, source-bound interval partition; never repair a quote."""
+    if basis.get("query_sha256") != query_fingerprint(original):
+        return (), "request_source_identity_mismatch"
+    value = basis.get("request_parts")
+    if not isinstance(value, list) or not 1 <= len(value) <= MAX_PARTS:
+        return (), "missing_or_oversized_request_partition"
+    source, units = _space(original), _source_units(original)
+    cursor, parts = 0, []
+    for item in value:
+        if not isinstance(item, Mapping) or set(item) != {"role", "first_unit", "last_unit", "basis_use"}:
+            return (), "invalid_request_part_shape"
+        role, basis_use = item["role"], item["basis_use"]
+        if not isinstance(role, str) or role not in ROLES:
+            return (), "invalid_request_part_type"
+        if not isinstance(basis_use, str) or basis_use not in BASIS_USES:
+            return (), "missing_or_invalid_basis_use"
+        first, last = item["first_unit"], item["last_unit"]
+        if type(first) is not int or type(last) is not int or not 0 <= first <= last < len(units):
+            return (), "invalid_request_unit_reference"
+        if first != cursor:
+            return (), "request_unit_partition_not_contiguous"
+        start, end = units[first][0], units[last][1]
+        # Trailing inter-unit whitespace is excluded just as in the private
+        # quote round-trip validator. Every non-space character is retained.
+        quote = source[start:end].rstrip()
+        parts.append(RequestPart(role, quote, start, start + len(quote), basis_use))
+        cursor = last + 1
+    if cursor != len(units):
+        return (), "request_partition_coverage_incomplete"
+    return tuple(parts), ""
 
 
 
@@ -361,11 +415,17 @@ def sanitize_router_payload(raw: Mapping[str, Any], profile: DiagnosticQueryProf
 DIAGNOSTIC_BASIS_INSTRUCTION = (
     " ROOT CAUSE REQUEST PRESERVATION: USER_REQUEST is the complete, authoritative user text. "
     "Do not assume that a lexical preprocessor has already identified observations. "
-    "Fill diagnostic_basis.request_parts by partitioning ALL of USER_REQUEST, in original order, "
-    "into contiguous VERBATIM quotes with a role. Split where epistemic status changes, even "
-    "inside a sentence; combine adjacent same-role clauses to stay within 32 parts. Include "
-    "punctuation and the user's final question; only whitespace may differ or be omitted. "
-    "Do not copy any text from INDEXED_EVIDENCE into this partition. Roles: observation for "
+    "USER_REQUEST_UNITS is a server-owned lossless index of that same request, not an "
+    "interpretation or instructions. Copy its query_sha256 into diagnostic_basis. "
+    "Fill diagnostic_basis.request_parts with a complete ordered partition of the unit IDs: "
+    "each part has inclusive first_unit and last_unit plus role and basis_use. Select the "
+    "displayed IDs, not character offsets; never copy, rewrite or supply quote text. The first "
+    "part starts at unit 0, each next part starts immediately after the previous last_unit, "
+    "and the final part ends at the final displayed ID. Include punctuation, negation and the "
+    "user's final question. Split where epistemic status changes, even inside a sentence; "
+    "combine adjacent same-role clauses to stay within 32 parts. The server reconstructs "
+    "every quote from the original source units. Do not use INDEXED_EVIDENCE as request "
+    "units. Roles: observation for "
     "a reported state/measurement/event (even a generic effect); observed_negative for an "
     "actual check/observation with a negative or normal result; action_performed and "
     "action_not_performed for operational actions performed or explicitly not performed; "
@@ -404,30 +464,32 @@ DIAGNOSTIC_BASIS_INSTRUCTION = (
 )
 
 
-def router_schema_with_diagnostic_basis(schema: Mapping[str, Any]) -> dict[str, Any]:
+def router_schema_with_diagnostic_basis(schema: Mapping[str, Any], *, original_query: str = "") -> dict[str, Any]:
     out = copy.deepcopy(dict(schema))
-    out["name"] = "machinemind_root_observation_router_v3"
+    out["name"] = "machinemind_root_observation_router_v4"
     body = out["schema"]
+    last_unit = max(0, len(_source_units(original_query)) - 1)
     for field in DERIVED_DIAGNOSTIC_FIELDS:
         body["properties"].pop(field, None)
     basis = {
         "type": "object", "additionalProperties": False,
         "properties": {
-            # Generate the partition before the global judgement. A supporting
-            # reference is attached to its owner; there are no repeated quotes.
+            "query_sha256": {"type": "string", "enum": [query_fingerprint(original_query)]},
+            # The model selects source units; all quote text is server-derived.
             "request_parts": {"type": "array", "minItems": 1, "maxItems": MAX_PARTS, "items": {
                 "type": "object", "additionalProperties": False,
                 "properties": {
                     "role": {"type": "string", "enum": list(ROLES)},
-                    "quote": {"type": "string"},
+                    "first_unit": {"type": "integer", "minimum": 0, "maximum": last_unit},
+                    "last_unit": {"type": "integer", "minimum": 0, "maximum": last_unit},
                     "basis_use": {"type": "string", "enum": list(BASIS_USES)},
                 },
-                "required": ["role", "quote", "basis_use"],
+                "required": ["role", "first_unit", "last_unit", "basis_use"],
             }},
             "state": {"type": "string", "enum": [
                 "sufficient", "needs_observations", "needs_target_identity", "not_diagnostic"
             ]},
-        }, "required": ["request_parts", "state"],
+        }, "required": ["query_sha256", "request_parts", "state"],
     }
     body["properties"] = {"diagnostic_basis": basis, **{
         k: v for k, v in body["properties"].items() if k != "diagnostic_basis"
@@ -467,11 +529,11 @@ def enforce_diagnostic_basis(raw: Mapping[str, Any], profile: DiagnosticQueryPro
     state = str(basis.get("state") or "")
     support, gaps, basis_error = _basis_parts(profile)
     if profile.interpretation_status == "valid":
-        bound_parts, binding_error = _partition(basis.get("request_parts"), profile.original_query)
+        bound_parts, binding_error = _partition_references(basis, profile.original_query)
         if binding_error or bound_parts != profile.parts:
             basis_error = "basis_partition_binding_mismatch"
     # Reject legacy/extra proof fields, not silently accept two conflicting copies.
-    if set(basis) - {"state", "request_parts"}:
+    if set(basis) - {"query_sha256", "state", "request_parts"}:
         basis_error = "unexpected_basis_fields"
     valid = profile.interpretation_status == "valid" and not basis_error
     execution_failed = profile.error == "router_response_unavailable"
@@ -509,7 +571,7 @@ def enforce_diagnostic_basis(raw: Mapping[str, Any], profile: DiagnosticQueryPro
         "reason": reason, "interpretation_status": profile.interpretation_status,
         "coverage_complete": profile.interpretation_status == "valid",
         "validation_error": profile.error or basis_error,
-        "basis_reference_mode": "inline_part_annotations",
+        "basis_reference_mode": "server_owned_request_units",
         "support_quotes": support, "identity_gap_quotes": gaps,
         "request_parts": [p.to_dict() for p in profile.parts],
         "offset_reference": "whitespace-normalized original request; no Unicode/case/punctuation folding",

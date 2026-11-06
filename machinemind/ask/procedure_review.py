@@ -538,6 +538,25 @@ def _quote_text(value: str) -> str:
         "\u201c": '"', "\u201d": '"'})).split())
 
 
+def _source_quote_present(quote: str, source: str) -> bool:
+    """Match a literal source span, tolerating one enclosing quotation pair.
+
+    A reviewer can delimit a verbatim citation with double quotes that are not
+    printed in the source. Only that balanced outer pair is presentation; the
+    entire interior must still match this same admitted source. Inner quotes,
+    negations, case, numbers and units are never removed or rewritten.
+    """
+    quoted, original = _quote_text(quote), _quote_text(source)
+    if not quoted:
+        return False
+    if quoted in original:
+        return True
+    if len(quoted) > 2 and quoted[0] == quoted[-1] == '"':
+        interior = quoted[1:-1].strip()
+        return bool(interior) and interior in original
+    return False
+
+
 def _canonical_boundary(audit: Any) -> dict | None:
     """Expand source-ordered wire references; indices add no source authority."""
     if type(audit) is not dict:
@@ -601,7 +620,7 @@ def verify_operation_boundary(parsed: dict, *, layout: dict, source_texts: dict[
             closure_start = (action_at if change["resolution"] == "documented_terminal_state"
                              else action_at + len(action))
             closure_at = body.find(closure, closure_start) if action_at >= 0 else -1
-            if (source is None or _quote_text(change["closing_source_quote"]) not in _quote_text(source)
+            if (source is None or not _source_quote_present(change["closing_source_quote"], source)
                     or action_at < 0 or closure_at < 0):
                 valid = False
                 reason = "operation_boundary_quote_or_order_invalid"
@@ -641,7 +660,7 @@ def verify_operation_boundary(parsed: dict, *, layout: dict, source_texts: dict[
                         and change["block_id"] == edge["before_block_id"]
                         and _quote_text(change["action_quote"]) == before
                         and _quote_text(change["closing_answer_quote"]) == after for change in audit["changes"]))
-                if (source is None or _quote_text(edge["source_quote"]) not in _quote_text(source)
+                if (source is None or not _source_quote_present(edge["source_quote"], source)
                         or before_body.count(before) != 1 or after_body.count(after) != 1
                         or (not same_terminal_hold and before_base + before_body.find(before) + len(before)
                             > after_base + after_body.find(after))):
