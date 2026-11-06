@@ -109,6 +109,26 @@ A broad sequence/configuration hypothesis must not crowd out an explicit failure
 mechanism with a closer documented consequence. Return only supported causes,
 within the existing cause limit; do not fill slots with weaker unrelated cases.
 
+SOURCES metadata such as exact_machine_scope, document IDs and citation IDs
+describes retrieval provenance only. A source attached or routed to the selected
+machine does not by itself establish its installed model, configuration, physical
+applicability, or the manual's correctness/currentness. Prefer exact-machine
+evidence only when literal source content and explicit user facts establish the
+relevant relationship; never infer that relationship from routing metadata or a
+name/code match alone.
+
+When a documented mechanism explains the reported observation but its installed
+configuration or applicability remains unverified, scope the original hypothesis
+and explanation explicitly to the configuration documented in that source and
+state that applicability is unverified. Keep this distinct from whether the
+mechanism's enabling condition was observed. Do not describe the source as the
+exact/current manual for the installed equipment without supporting evidence.
+Preserve known incompatibilities; conditional wording cannot transfer a mechanism
+between unrelated targets. With unverified applicability, ask only for relevant
+observations or records already available, or return no checks; do not prescribe
+a new operation or intervention. Omit a hypothesis if the source does not support
+the mechanism-to-symptom relationship, or if a known target incompatibility applies.
+
 For each hypothesis, explain the documented mechanism, the reported observation
 it could explain, and what remains unverified. Prefer one or two high-information,
 independently understandable checks;

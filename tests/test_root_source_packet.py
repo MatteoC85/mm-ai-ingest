@@ -5,9 +5,11 @@ import json
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from machinemind.retrieval import root_source_packet, source_management
+from machinemind.retrieval import root_response_quality
 
 
 RUNTIME = source_management.V13SourcesBlockRuntime(
@@ -26,7 +28,90 @@ def pack(rows, limit=18000):
     return source_management.v13_root_sources_packet(rows, max_context_chars=limit, runtime=RUNTIME)
 
 
+def synthesis_call(rows, *, query="The actuator moves but the carriage remains still.",
+                   returned_why="The documented coupling mechanism could explain the observation."):
+    """Observe the actual producer call; the stub is never a semantic verdict."""
+    path = Path(__file__).resolve().parents[1] / "main.py"
+    fn = next(node for node in ast.parse(path.read_text(encoding="utf-8")).body
+              if isinstance(node, ast.FunctionDef) and node.name == "_v13_generate_root_cause_response")
+    calls = []
+    def model(messages, **kwargs):
+        calls.append(deepcopy((messages, kwargs)))
+        return {"problem_summary": "Unvalidated draft", "possible_causes": [{
+            "cause": "Documented coupling condition", "why": returned_why,
+            "checks": [], "citations": [rows[0]["citation_id"]]}]}, "fixture-model"
+    namespace = {"_retrieval_source_management": source_management,
+        "_source_type_from_document_id": RUNTIME._source_type_from_document_id,
+        "_v13_candidate_text": RUNTIME._v13_candidate_text,
+        "_dedup_text_values": lambda values, **kwargs: values,
+        "_v13_root_cause_model": lambda q, retrieval: ("fixture-model", "low", ""),
+        "_v13_json_models": model, "_root_cause_response_schema": lambda **kwargs: {"name": "unchanged-fixture-schema"},
+        "_v13_assurance_prompt_block": lambda retrieval: "",
+        "_ground_root_cause_result": lambda **kwargs: (kwargs["result"], kwargs["citations"]),
+        "_compact_root_cause_result_citations_by_family": lambda **kwargs: (kwargs["result"], kwargs["citations"]),
+        "_lock_root_cause_result": lambda result, citations, **kwargs: (result, citations),
+        "_sanitize_citations_for_response": lambda citations, **kwargs: citations,
+        "_build_rg_links": lambda company, citations: [],
+        "V13_FAST_MODEL": "fixture-model", "V13_HEAVY_MODEL": "fixture-heavy",
+        "V13_FAST_CONTEXT_CHARS": 18000, "V13_HEAVY_CONTEXT_CHARS": 38000,
+        "V13_FAST_TIMEOUT_SECONDS": 26, "V13_HEAVY_TIMEOUT_SECONDS": 30,
+        "V13_FAST_MAX_OUTPUT_TOKENS": 3000, "V13_HEAVY_MAX_OUTPUT_TOKENS": 4000,
+        "V13_MAX_EVIDENCE_ITEMS_ROOT_CAUSE": 14, "json": json}
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), str(path), "exec"), namespace)
+    response = namespace[fn.name](q=query, company_id="company", response_language="en",
+        top_k=8, max_causes=3, retrieval={"citations": rows}, debug=False)
+    return calls, response
+
+
 class RootSourcePacketTests(unittest.TestCase):
+    def test_actual_producer_receives_provenance_rule_without_changing_source_claims(self):
+        for scope in (True, False, None):
+            with self.subTest(exact_machine_scope=scope):
+                text = "For Model Y, an open coupling allows actuator movement without carriage travel."
+                rows = [candidate(1, text, exact_machine_scope=scope)]
+                original = deepcopy(rows)
+                calls, response = synthesis_call(rows, query="On Model X, the actuator moves but the carriage stays still.")
+                self.assertEqual(len(calls), 1)
+                system, user = calls[0][0]
+                self.assertIn(root_response_quality.SYNTHESIS_INSTRUCTION, system["content"])
+                self.assertIn("describes retrieval provenance only", system["content"])
+                self.assertIn("state that applicability is unverified", system["content"])
+                self.assertIn("known target incompatibility applies", system["content"])
+                self.assertIn("mechanism-to-symptom relationship", system["content"])
+                packet = json.loads(user["content"].split("SOURCES:\n", 1)[1].split("\n\nReturn JSON", 1)[0])
+                self.assertEqual(packet["sources"][0]["text"], text)
+                self.assertIs(packet["sources"][0]["exact_machine_scope"], scope)
+                self.assertEqual(packet["sources"][0]["citation_id"], rows[0]["citation_id"])
+                self.assertEqual(rows, original)
+                self.assertEqual(response["meta"]["root_synthesis_packet"], pack(rows)["summary"])
+
+    def test_instruction_change_affects_only_system_text_not_calls_sources_or_limits(self):
+        rows = [candidate(1, "A documented bypass disengages the coupling.")]
+        reviewer_before = root_response_quality.review_instruction()
+        with patch.object(root_response_quality, "SYNTHESIS_INSTRUCTION", "Offline control instruction."):
+            control_calls, control_response = synthesis_call(rows)
+        current_calls, current_response = synthesis_call(rows)
+        self.assertEqual(len(control_calls), 1)
+        self.assertEqual(len(current_calls), 1)
+        self.assertEqual(control_calls[0][1], current_calls[0][1])
+        self.assertEqual(control_calls[0][0][1:], current_calls[0][0][1:])
+        self.assertEqual(control_calls[0][0][0]["content"].replace("Offline control instruction.", root_response_quality.SYNTHESIS_INSTRUCTION),
+                         current_calls[0][0][0]["content"])
+        self.assertEqual(control_response, current_response)
+        self.assertEqual(root_response_quality.review_instruction(), reviewer_before)
+        self.assertEqual(current_calls[0][1]["timeout"], 26)
+        self.assertEqual(current_calls[0][1]["max_output_tokens"], 3000)
+
+    def test_producer_does_not_postprocess_an_unsupported_identity_assertion(self):
+        rows = [candidate(1, "A documented coupling may be disengaged.")]
+        unvalidated = "The exact-machine manual proves that this configuration is installed."
+        calls, response = synthesis_call(rows, returned_why=unvalidated)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(response["possible_causes"][0]["why"], unvalidated)
+        self.assertEqual(response["possible_causes"][0]["citations"], [rows[0]["citation_id"]])
+        # This is the unreviewed producer boundary, not an accepted final answer.
+        self.assertNotIn("root_review_decisions", response["meta"])
+
     def test_long_early_sources_no_longer_hide_later_documented_mechanism(self):
         rows = [candidate(i, ("Existing record provides detailed machine context and conditional checks. " * 60)) for i in range(6)]
         last = candidate(6, "During setup the isolation latch can hold the drive coupling open. "
