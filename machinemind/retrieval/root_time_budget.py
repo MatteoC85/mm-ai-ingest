@@ -95,6 +95,21 @@ def review_timeout_seconds(configured: int) -> int:
     return min(35, configured)
 
 
+def review_dispatch_timeout_seconds(configured: int, *, use_remaining_window: bool = False) -> int:
+    """Spend available final-review slack within the existing 35-second ceiling.
+
+    Upstream retrieval/producer reservations still use review_timeout_seconds:
+    this does not take additional time away from evidence acquisition. Only an
+    unconfigured final Root reviewer may use the existing ceiling. An explicit
+    operator FAST timeout remains authoritative. reviewer_window and the native
+    ledger shorten this requested cap at dispatch and retain finalization time.
+    """
+    reserved = review_timeout_seconds(configured)
+    if type(use_remaining_window) is not bool:
+        raise ValueError("Root review window policy must be boolean")
+    return 35 if use_remaining_window else reserved
+
+
 @contextmanager
 def _window(budget, seconds, *, optional):
     # Never modify the native request deadline, call allowance or cost ledger.

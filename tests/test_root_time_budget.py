@@ -406,5 +406,116 @@ class RootTimeBudgetTests(unittest.TestCase):
                 policy.review_timeout_seconds(value)
 
 
+    def cap(self, explicit=False, configured=26):
+        return policy.review_dispatch_timeout_seconds(configured, use_remaining_window=not explicit)
+
+    def test_default_uses_only_existing_ceiling_explicit_fast_remains_cap(self):
+        self.assertEqual(self.cap(), 35)
+        for configured, expected in ((12, 12), (20, 20), (26, 26), (100, 35)):
+            self.assertEqual(self.cap(explicit=True, configured=configured), expected)
+        self.assertEqual(policy.review_dispatch_timeout_seconds(26), 26)
+        for invalid in (None, 1, "true"):
+            with self.assertRaises(ValueError): policy.review_dispatch_timeout_seconds(26, use_remaining_window=invalid)
+
+    def test_native_remaining_floor_bounds_late_review(self):
+        for elapsed, expected in ((38.828, 35), (60.0, 27), (80.0, 7), (80.3, 6)):
+            self.now = elapsed
+            with self.subTest(elapsed=elapsed), policy.reviewer_window(budget=self.budget):
+                self.assertEqual(self.budget._timeout(self.cap()), expected)
+            self.assertEqual(self.budget.deadline_monotonic, 92)
+
+    def test_outer_child_deadline_is_not_bypassed(self):
+        self.now = 40
+        _, token = native._v13_push_operation_limits(seconds=20)
+        try:
+            with policy.reviewer_window(budget=self.budget):
+                self.assertEqual(self.budget._timeout(self.cap()), 15)
+        finally: native._v13_pop_operation_limits(token)
+        self.assertEqual(self.budget.remaining(), 52)
+
+    def test_shortage_fails_before_any_call_or_liability(self):
+        for elapsed in (87.5, 88, 91.9):
+            self.now = elapsed; calls = []
+            with self.subTest(elapsed=elapsed), self.assertRaises(native._V13BudgetExceeded):
+                with policy.reviewer_window(budget=self.budget):
+                    self.budget.reserve_call(model="gpt-5.6-terra", purpose="assistant_core_root_cause_adjudicator",
+                        requested_timeout=self.cap(), max_output_tokens=1000, messages=[{"role": "user", "content": "fixture"}])
+                    calls.append(True)
+            self.assertEqual(calls, []); self.assertEqual(self.budget.llm_calls, 0)
+            self.assertEqual(self.budget.committed_cost_usd, 0)
+            self.assertIsNone(policy.current_window())
+
+    def test_upstream_reservations_and_planner_allowance_unchanged(self):
+        self.assertEqual(policy.review_timeout_seconds(26), 26)
+        self.assertEqual(policy.reserved_final_seconds(producer_timeout=26, review_timeout=26), 56)
+        self.now = 18; seen = []
+        def run(retrieval):
+            seen.append(policy.current_window().deadline)
+            return retrieval
+        result = policy.optional_retrieval(request=self.request, decision=self.decision, retrieval={"citations": []},
+            budget=self.budget, producer_timeout=26, review_timeout=26, stage="facet_refinement", run=run)
+        self.assertEqual(seen, [36.0])
+        self.assertEqual(result["assistant_core_root_time_budget"]["stages"][0]["reserved_final_seconds"], 56)
+        self.assertEqual(self.budget.llm_calls, 0)
+
+    def test_simulated_28s_review_can_use_idle_time_without_deadline_extension(self):
+        from requests.exceptions import ReadTimeout
+        for explicit, succeeds in ((True, False), (False, True)):
+            self.now = 38.828
+            original = (self.budget.deadline_monotonic, self.budget.max_llm_calls, self.budget.max_estimated_cost_usd)
+            def simulate():
+                with policy.reviewer_window(budget=self.budget):
+                    timeout = self.budget._timeout(self.cap(explicit=explicit))
+                    self.now += min(28, timeout)
+                    if timeout < 28: raise ReadTimeout("fake clock only")
+            if succeeds: simulate()
+            else:
+                with self.assertRaises(ReadTimeout): simulate()
+            self.assertEqual(original, (self.budget.deadline_monotonic, self.budget.max_llm_calls, self.budget.max_estimated_cost_usd))
+            self.assertGreater(self.budget.remaining(), 4)
+
+    def test_single_fake_timeout_retains_uncertain_liability_no_retry(self):
+        from requests.exceptions import ReadTimeout
+        self.now = 38.828; calls = []
+        def post(*args, **kwargs):
+            calls.append(kwargs["timeout"]); self.now += kwargs["timeout"]
+            raise ReadTimeout("one fake provider attempt")
+        with policy.reviewer_window(budget=self.budget):
+            timeout, tokens, index = self.budget.reserve_call(model="gpt-5.6-terra", purpose="assistant_core_root_cause_adjudicator",
+                requested_timeout=self.cap(), max_output_tokens=1000, messages=[{"role": "user", "content": "fixture"}])
+            with self.assertRaises(ReadTimeout):
+                openai_transport._send_json_attempt(url="https://fixture.invalid", headers={}, payload={"model": "gpt-5.6-terra"},
+                    timeout=timeout, post_fn=post, budget=self.budget, call_index=index, embedding=False,
+                    cache_hits=0, purpose="assistant_core_root_cause_adjudicator")
+        self.assertEqual(calls, [35]); self.assertEqual(self.budget.llm_calls, 1)
+        self.assertEqual(self.budget.call_log[0]["accounting_state"], "uncertain")
+        self.assertGreater(self.budget.committed_cost_usd, 0)
+        self.assertEqual(self.budget.deadline_monotonic, 92)
+
+    def test_time_choice_does_not_change_model_token_or_cost_reservation(self):
+        outcomes = []
+        for configured, explicit in ((26, True), (26, False)):
+            self.now = 0
+            budget = native._V13RequestBudget("root_cause"); budget.deadline_monotonic = 92
+            self.now = 38.828
+            with policy.reviewer_window(budget=budget):
+                timeout, tokens, index = budget.reserve_call(model="gpt-5.6-terra", purpose="assistant_core_root_cause_adjudicator",
+                    requested_timeout=self.cap(explicit=explicit), max_output_tokens=1000,
+                    messages=[{"role": "user", "content": "same source protocol"}])
+            row = budget.call_log[0]
+            outcomes.append((timeout, tokens, row["reserved_cost_usd"], row["model"], budget.max_llm_calls, budget.max_estimated_cost_usd))
+        self.assertEqual(outcomes[0][0], 26); self.assertEqual(outcomes[1][0], 35)
+        self.assertEqual(outcomes[0][1:], outcomes[1][1:])
+
+    def test_actual_proposed_main_uses_environment_presence_not_value(self):
+        tree = ast.parse((Path(__file__).resolve().parents[1] / "main.py").read_text(encoding="utf-8"))
+        function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_assistant_core_adjudicate_root_cause_grounded")
+        assignment = next(n for n in function.body if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "review_dispatch_timeout" for t in n.targets))
+        for environ, configured, expected in (({}, 26, 35), ({"MM_V13_FAST_TIMEOUT_SECONDS": "26"}, 26, 26), ({"MM_V13_FAST_TIMEOUT_SECONDS": "12"}, 12, 12)):
+            namespace = {"root_time_budget": policy, "V13_FAST_TIMEOUT_SECONDS": configured, "os": SimpleNamespace(environ=environ)}
+            exec(compile(ast.Module(body=[assignment], type_ignores=[]), "proposed-root-allocation", "exec"), namespace)
+            self.assertEqual(namespace["review_dispatch_timeout"], expected)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

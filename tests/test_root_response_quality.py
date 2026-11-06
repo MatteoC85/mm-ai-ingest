@@ -2,11 +2,13 @@
 import ast
 from copy import deepcopy
 import json
+import os
 import time
 from types import SimpleNamespace
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from machinemind.retrieval import review_decisions, review_references as refs
@@ -205,6 +207,7 @@ class RootResponseQualityTests(unittest.TestCase):
 
 class RootReviewMainIntegrationTests(unittest.TestCase):
     def setUp(self):
+        self.fast_timeout_override = '20'
         self.frozen, self.records, self.observed, self.parsed = fixture()
         self.calls = []
         self.no_evidence_calls = []
@@ -255,14 +258,20 @@ class RootReviewMainIntegrationTests(unittest.TestCase):
             'COMPANY_GENERAL_MACHINE_SENTINEL': 'GENERAL', 'V13_FAST_TIMEOUT_SECONDS': 20,
             'V13_FAST_MODEL': 'fixture-model', 'V13_FAST_EFFORT': 'low',
             'V13_FAST_MAX_OUTPUT_TOKENS': 3400, 'RESULT_TIMEOUT': 'TIMEOUT',
-            'RESULT_TECHNICAL_ERROR': 'TECHNICAL_ERROR', 'json': json, 'time_module': time,
+            'RESULT_TECHNICAL_ERROR': 'TECHNICAL_ERROR', 'json': json, 'time_module': time, 'os': os,
         }
         exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), 'exec'), namespace)
         self.run_review = namespace[function.name]
 
     def run_response(self):
-        return self.run_review(request=self.request, decision=self.decision,
-            retrieval=self.retrieval, response=self.draft)
+        # The production dispatch distinguishes an absent setting from an explicit cap.
+        with patch.dict(os.environ):
+            if self.fast_timeout_override is None:
+                os.environ.pop('MM_V13_FAST_TIMEOUT_SECONDS', None)
+            else:
+                os.environ['MM_V13_FAST_TIMEOUT_SECONDS'] = self.fast_timeout_override
+            return self.run_review(request=self.request, decision=self.decision,
+                retrieval=self.retrieval, response=self.draft)
 
     def test_real_root_stage_uses_one_call_and_keeps_full_original_draft_in_review(self):
         out = self.run_response()
@@ -278,8 +287,9 @@ class RootReviewMainIntegrationTests(unittest.TestCase):
         self.assertEqual(out['meta']['accounting_marker'], 'preserved')
         self.assertEqual(self.no_evidence_calls, [])
 
-    def test_real_reviewer_uses_existing_fast_timeout_without_extra_call_or_tokens(self):
+    def test_real_reviewer_respects_explicit_fast_timeout_without_extra_call_or_tokens(self):
         self.run_review.__globals__['V13_FAST_TIMEOUT_SECONDS'] = 26
+        self.fast_timeout_override = '26'
         out = self.run_response()
         self.assertEqual(out['status'], 'answered')
         self.assertEqual(len(self.calls), 1)
@@ -288,6 +298,19 @@ class RootReviewMainIntegrationTests(unittest.TestCase):
         self.assertEqual(arguments['max_output_tokens'], 3400)
         self.assertEqual(arguments['effort'], 'low')
         self.assertEqual(out['meta']['root_review_execution']['timeout_seconds'], 26)
+        self.assertEqual(out['meta']['accounting_marker'], 'preserved')
+
+    def test_real_reviewer_default_uses_existing_ceiling_without_extra_call_or_tokens(self):
+        self.run_review.__globals__['V13_FAST_TIMEOUT_SECONDS'] = 26
+        self.fast_timeout_override = None
+        out = self.run_response()
+        self.assertEqual(out['status'], 'answered')
+        self.assertEqual(len(self.calls), 1)
+        arguments = self.calls[0][1]
+        self.assertEqual(arguments['timeout'], 35)
+        self.assertEqual(arguments['max_output_tokens'], 3400)
+        self.assertEqual(arguments['effort'], 'low')
+        self.assertEqual(out['meta']['root_review_execution']['timeout_seconds'], 35)
         self.assertEqual(out['meta']['accounting_marker'], 'preserved')
 
     def test_rejected_draft_is_not_reported_as_missing_sources(self):

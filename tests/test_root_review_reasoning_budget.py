@@ -27,9 +27,10 @@ def deny(*args, **kwargs):
 
 
 class RootReviewReasoningBudgetTests(unittest.TestCase):
-    def dispatch(self, *, timeout=26, output_cap=3000, failure=None, exhausted=False):
+    def dispatch(self, *, timeout=26, output_cap=3000, failure=None, exhausted=False, explicit_timeout=True):
         harness = existing.RootReviewMainIntegrationTests('runTest')
         harness.setUp()
+        harness.fast_timeout_override = str(timeout) if explicit_timeout else None
         now = [1000.0]
         posts, calls = [], []
         with ExitStack() as stack:
@@ -114,6 +115,16 @@ class RootReviewReasoningBudgetTests(unittest.TestCase):
         self.assertEqual(posts[0]['timeout'], 12)
         self.assertEqual(posts[0]['json']['max_output_tokens'], 3400)
         self.assertEqual(budget.call_log[0]['timeout_seconds'], 12)
+
+    def test_absent_fast_override_uses_existing_review_ceiling_in_actual_transport(self):
+        _, out, posts, calls, budget = self.dispatch(explicit_timeout=False)
+        self.assertEqual(out['status'], 'answered')
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(posts[0]['timeout'], 35)
+        self.assertEqual(posts[0]['json']['max_output_tokens'], 3000)
+        self.assertEqual(budget.call_log[0]['timeout_seconds'], 35)
+        self.assertEqual(budget.llm_calls, 1)
 
     def test_read_timeout_keeps_uncertain_liability_and_drops_unreviewed_draft_without_retry(self):
         _, out, posts, calls, budget = self.dispatch(failure='timeout')

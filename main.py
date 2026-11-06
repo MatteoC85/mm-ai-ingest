@@ -15408,9 +15408,13 @@ def _assistant_core_adjudicate_root_cause_grounded(
     capture_token = None
     budget = _v13_current_budget()
     review_meta: dict = {"policy_version": _retrieval_review_packet.POLICY_VERSION}
+    review_dispatch_timeout = root_time_budget.review_dispatch_timeout_seconds(
+        V13_FAST_TIMEOUT_SECONDS,
+        use_remaining_window="MM_V13_FAST_TIMEOUT_SECONDS" not in os.environ,
+    )
     review_execution: dict = {"stage": "root_adjudicator", "outcome": "not_started",
                              "attempt_limit": 1,
-                             "timeout_seconds": root_time_budget.review_timeout_seconds(V13_FAST_TIMEOUT_SECONDS),
+                             "timeout_seconds": review_dispatch_timeout,
                              "provider_response_received": False,
                              "decision_policy": _root_quality.POLICY_VERSION}
 
@@ -15514,7 +15518,7 @@ def _assistant_core_adjudicate_root_cause_grounded(
                 models=[V13_FAST_MODEL],
                 json_schema=_root_quality.review_schema(frozen),
                 effort="low", reasoning_mode="",
-                timeout=root_time_budget.review_timeout_seconds(V13_FAST_TIMEOUT_SECONDS),
+                timeout=review_dispatch_timeout,
                 max_output_tokens=min(3400, V13_FAST_MAX_OUTPUT_TOKENS),
                 company_id=request.company_id, purpose="assistant_core_root_cause_adjudicator",
             )
