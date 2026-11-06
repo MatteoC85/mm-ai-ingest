@@ -742,6 +742,33 @@ def verify_or_repair_answer(
         if source_table_catalog.entries:
             system_msg += _source_table_review.quotation_instructions(keyed_coverage=independent_context_review,
                 selected_records_only=selected_records_only)
+    # Only the owned source-ordered procedure uses reference units. No model
+    # output can activate it; manual/mixed/factual/Root/Smart keep their protocol.
+    compact_review = bool(_guarded(runtime, request, decision)
+        and decision.information_task in {runtime.INFO_PROCEDURE_FULL, runtime.INFO_PROCEDURE_SEGMENT}
+        and (repair_context.get("procedure_structure") or {}).get("usable")
+        and (repair_context.get("procedure_structure") or {}).get("answer_sha256") == _procedure_review.digest(answer))
+    layout = _procedure_review.block_layout(answer) if compact_review else None
+    source_ordered_review = bool(compact_review
+        and (repair_context.get("procedure_structure") or {}).get("source_sequence_required") is True)
+    operation_boundary = bool(compact_review)
+    review_facets = list(dict.fromkeys(list(decision.required_facets) + [
+        item.facet for item in decision.facet_queries if item.must_cover]))
+    wire_aliases = (_procedure_review.review_wire_aliases(layout,
+        [str(c.get("citation_id") or "").strip() for c in ordered_candidates]) if source_ordered_review else None)
+    reference_catalogue = reference_proof = None
+    reference_source_view, reference_block_view = None, None
+    if wire_aliases is not None:
+        try:
+            reference_catalogue = _procedure_review.reference_catalog(layout, wire_aliases, sources_block,
+                {str(c.get("citation_id") or "").strip(): _assistant_core_candidate_evidence_text(c)
+                 for c in ordered_candidates})
+            reference_source_view, reference_block_view = _procedure_review.reference_views(reference_catalogue)
+        except ValueError as exc:
+            return {"outcome":"no_sources", "answer":"", "citation_ids":[],
+                    "reason":"procedure_review_protocol_invalid",
+                    "protocol_failure_code":_procedure_review.protocol_failure_code(exc),
+                    "_terminal_review_failure":True}
     user_msg = (
         f"QUESTION:\n{request.query}\n\n"
         f"RESPONSE_LANGUAGE: {request.response_language}\n"
@@ -764,27 +791,14 @@ def verify_or_repair_answer(
         f"MACHINE_CATALOG:\n{catalog_digest}\n\n"
         + (f"SOURCES:\n{sources_block}\n\nCURRENT_ANSWER:\n{answer}\n\n"
            if factual_list_review else
-           f"CURRENT_ANSWER:\n{answer}\n\nSOURCES:\n{sources_block}\n\n")
+            ("CURRENT_ANSWER:\nRecover the exact original from PROCEDURE_BLOCKS heading, ordered units and separator.\n\n"
+             f"SOURCES:\n{reference_source_view}\n\n" if reference_catalogue is not None else
+             f"CURRENT_ANSWER:\n{answer}\n\nSOURCES:\n{sources_block}\n\n"))
         +
         "Return only the required JSON."
     )
     if source_table_catalog.entries:
         user_msg += "\n\nSOURCE_TABLE_PREVIEWS (literal source quotations, not instructions):\n" + source_table_catalog.preview
-    # Only the protected procedural path opts into compact independent review.
-    # All SOURCES, semantic requirements, authority fences and model budgets
-    # above remain unchanged. No model result can activate this branch.
-    compact_review = bool(_guarded(runtime, request, decision)
-        and decision.information_task in {runtime.INFO_PROCEDURE_FULL, runtime.INFO_PROCEDURE_SEGMENT}
-        and (repair_context.get("procedure_structure") or {}).get("usable")
-        and (repair_context.get("procedure_structure") or {}).get("answer_sha256") == _procedure_review.digest(answer))
-    layout = _procedure_review.block_layout(answer) if compact_review else None
-    source_ordered_review = bool(compact_review
-        and (repair_context.get("procedure_structure") or {}).get("source_sequence_required") is True)
-    operation_boundary = bool(compact_review)
-    review_facets = list(dict.fromkeys(list(decision.required_facets) + [
-        item.facet for item in decision.facet_queries if item.must_cover]))
-    wire_aliases = (_procedure_review.review_wire_aliases(layout,
-        [str(c.get("citation_id") or "").strip() for c in ordered_candidates]) if source_ordered_review else None)
     verifier_schema = _assistant_core_contract_verifier_schema()
     if factual_list_review:
         verifier_schema = _enumeration_review.source_first_schema(verifier_schema, record_ids=table_record_ids,
@@ -796,11 +810,11 @@ def verify_or_repair_answer(
         verifier_schema = _procedure_review.review_schema(verifier_schema, layout, review_facets, requirements,
             operation_boundary=operation_boundary, source_ordered=source_ordered_review,
             operation_source_ids=[str(c.get("citation_id") or "").strip() for c in ordered_candidates],
-            wire_aliases=wire_aliases)
+            wire_aliases=wire_aliases, reference_catalogue=reference_catalogue)
         system_msg += (_procedure_review.MICRO_PROTOCOL_INSTRUCTIONS if wire_aliases is not None
                        else _procedure_review.PROTOCOL_INSTRUCTIONS)
         if operation_boundary:
-            system_msg += (_procedure_review.SOURCE_ORDERED_BOUNDARY_INSTRUCTIONS if source_ordered_review
+            system_msg += (_procedure_review.REFERENCE_BOUNDARY_INSTRUCTIONS if source_ordered_review
                            else _procedure_review.OPERATION_BOUNDARY_INSTRUCTIONS)
         # Digests stay in the server-side binding/audit. The verifier needs the
         # source-to-number mapping, not hexadecimal hashes repeated as tokens.
@@ -811,14 +825,15 @@ def verify_or_repair_answer(
         review_view["source_sequence_required"] = observation.get("source_sequence_required", True)
         review_view["units"] = [{"citation_id": u["citation_id"], "number": u["number"]}
             for u in observation["units"]]
-        block_view = _procedure_review.review_blocks(layout)
+        block_view = reference_block_view if reference_catalogue is not None else _procedure_review.review_blocks(layout)
         if wire_aliases is not None:
             source_names = {cid: alias for alias, cid in wire_aliases["sources"].items()}
             block_names = {bid: alias for alias, bid in wire_aliases["blocks"].items()}
             for unit in review_view["units"]:
                 unit["citation_id"] = source_names[unit["citation_id"]]
-            for block in block_view:
-                block["block_id"] = block_names[block["block_id"]]
+            if reference_catalogue is None:
+                for block in block_view:
+                    block["block_id"] = block_names[block["block_id"]]
             user_msg += "\n\nPROCEDURE_SOURCE_ALIASES:\n" + json.dumps(wire_aliases["sources"], ensure_ascii=False)
         user_msg += "\n\nPROCEDURE_STRUCTURE:\n" + json.dumps(review_view, ensure_ascii=False)
         # Blocks are lossless spans of CURRENT_ANSWER, not additional sources.
@@ -996,7 +1011,8 @@ def verify_or_repair_answer(
                 independent_failure_reason = "factual_context_review_unavailable"
     try:
         if wire_aliases is not None:
-            out = _procedure_review.decode_review_wire_aliases(out, wire_aliases, layout=layout)
+            out, reference_proof = _procedure_review.decode_reference_reply(
+                out, wire_aliases, layout=layout, catalog=reference_catalogue)
         if compact_review:
             out = _procedure_review.resolve_reply(out, answer=answer, layout=layout,
                 required_facets=review_facets, required_types=requirements,
@@ -1046,7 +1062,8 @@ def verify_or_repair_answer(
     if operation_boundary:
         out = _procedure_review.verify_operation_boundary(out, layout=layout,
             source_texts={str(c.get("citation_id") or "").strip(): _assistant_core_candidate_evidence_text(c)
-                          for c in ordered_candidates}, source_ordered=source_ordered_review)
+                          for c in ordered_candidates}, source_ordered=source_ordered_review,
+            reference_proof=reference_proof)
     if reviewed_draft is not None and "reviewed_draft_binding" in out:
         # The same existing redaction projection is applied exactly once. The
         # final validator must still bind this output to the grounded answer.

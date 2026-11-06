@@ -72,8 +72,7 @@ class FinalReviewWindowTests(unittest.TestCase):
         runtime=replace(m._assistant_core_ask_execution_runtime(),evidence_admission=denied if protected else None,
             review_uses_remaining_window=explicit_timeout is None,
             V13_FAST_TIMEOUT_SECONDS=26 if explicit_timeout is None else explicit_timeout,
-            _v13_current_budget=lambda:budget,_v13_json_models=provider,
-            _v13_sources_block=lambda *a,**kw:answer)
+            _v13_current_budget=lambda:budget,_v13_json_models=provider)
         structure={'usable':True,'answer_sha256':review.digest(answer),'basis':'offline-source-structure',
             'expected_numbers':[1,2],'visible_numbers':[1,2],'sequence_complete':True,
             'source_notes':0,'source_notes_present':True,'semantic_coverage_proven':False,

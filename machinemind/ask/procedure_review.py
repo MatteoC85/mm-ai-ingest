@@ -12,7 +12,9 @@ full-answer replies remain readable, without acquiring a structural proof.
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import dataclass
 import hashlib
+import json
 import re
 from typing import Any, Callable
 
@@ -23,6 +25,13 @@ VERSION = "ask-procedure-review-v2"
 # Only these fixed parser labels may leave the review boundary. Never include
 # provider text, source excerpts, exception arguments, or the rejected draft.
 _PROTOCOL_FAILURE_CODES = frozenset({
+    "procedure_reference_catalog_invalid",
+    "procedure_reference_source_missing",
+    "procedure_reference_shape_invalid",
+    "procedure_reference_range_invalid",
+    "procedure_reference_deleted_unit",
+    "procedure_reference_edit_invalid",
+    "procedure_reference_answer_changed",
     "procedure_review_wire_alias_unknown",
     "procedure_review_wire_citations_invalid",
     "procedure_review_wire_edits_invalid",
@@ -268,6 +277,198 @@ def review_wire_aliases(layout: dict, source_ids: list[str]) -> dict:
             "blocks": {f"b{i+1}": bid for i, bid in enumerate(blocks)}}
 
 
+def reference_units(text: str) -> tuple[tuple[int, int, str], ...]:
+    """Lossless punctuation/line units, bounded without semantic classification."""
+    cuts = [m.end() for m in re.finditer(r"(?:[.!?;:,](?=\s)|[。！？；：]|\n)[ \t\r\n]*", text)]
+    cuts.append(len(text))
+    units, start = [], 0
+    for end in cuts:
+        while end - start > 160:
+            at = text.rfind(" ", start + 1, start + 160)
+            stop = at + 1 if at > start else start + 160
+            units.append((start, stop, text[start:stop])); start = stop
+        if end > start:
+            units.append((start, end, text[start:end])); start = end
+    assert "".join(unit[2] for unit in units) == text
+    return tuple(units)
+
+
+def reference_catalog(layout: dict, aliases: dict, sources_block: str,
+                      source_texts: dict[str, str]) -> dict:
+    """Bind only complete emitted sources and the immutable original block bodies."""
+    sources, blocks = {}, {}
+    ids = list(aliases["sources"].values())
+    headers = ["[" + cid + "] " for cid in ids]
+    positions = []
+    for header in headers:
+        matches = list(re.finditer(r"(?m)^" + re.escape(header), sources_block))
+        if len(matches) != 1:
+            raise ValueError("procedure_reference_catalog_invalid")
+        positions.append(matches[0].start())
+    if positions != sorted(positions) or not positions or sources_block[:positions[0]].strip():
+        raise ValueError("procedure_reference_catalog_invalid")
+    for index, (alias, cid) in enumerate(aliases["sources"].items()):
+        segment = sources_block[positions[index]:positions[index + 1] if index + 1 < len(ids) else len(sources_block)]
+        header, separator, body = segment.partition("\n")
+        body = body.strip()
+        if not separator or not body or cid not in source_texts or body not in source_texts[cid]:
+            raise ValueError("procedure_reference_source_missing")
+        sources[alias] = {"citation_id": cid, "header": header, "text": body,
+                          "units": reference_units(body), "grounding_sha256": digest(source_texts[cid])}
+    original_blocks = {block["block_id"]: block["text"] for block in layout["blocks"]}
+    for alias, bid in aliases["blocks"].items():
+        prefix, body, suffix = _block_parts(original_blocks[bid])
+        blocks[alias] = {"block_id": bid, "prefix": prefix, "text": body, "suffix": suffix,
+                         "units": reference_units(body)}
+    return {"version": "ask-procedure-references-v1", "answer_sha256": layout["answer_sha256"],
+            "sources": sources, "blocks": blocks}
+
+
+def reference_views(catalog: dict) -> tuple[str, list[dict]]:
+    """An alternative lossless presentation, never an additional source selection."""
+    sources = []
+    for alias, source in catalog["sources"].items():
+        sources.append(source["header"] + "\nSOURCE_UNITS " + alias + ":" + json.dumps(
+            [[i, unit[2]] for i, unit in enumerate(source["units"])], ensure_ascii=False, separators=(",", ":")))
+    blocks = [{"block_id": alias, "heading": block["prefix"], "separator": block["suffix"],
+               "units": [[i, unit[2]] for i, unit in enumerate(block["units"])]}
+              for alias, block in catalog["blocks"].items()]
+    return "\n\n".join(sources), blocks
+
+
+def _reference_range(value: Any, units: tuple) -> tuple[int, int, str]:
+    if (type(value) is not dict or set(value) != {"first", "last"}
+            or type(value.get("first")) is not int or type(value.get("last")) is not int):
+        raise ValueError("procedure_reference_shape_invalid")
+    first, last = value["first"], value["last"]
+    if not 0 <= first <= last < len(units):
+        raise ValueError("procedure_reference_range_invalid")
+    selected = units[first:last + 1]
+    text = "".join(unit[2] for unit in selected)
+    if not text.strip():
+        raise ValueError("procedure_reference_range_invalid")
+    return selected[0][0], selected[-1][1], text
+
+
+def _answer_projection(text: str) -> str:
+    # Match only the existing final redactor's innocuous whitespace projection.
+    # Citation/identifier removal or content masking is deliberately NOT copied.
+    return re.sub(r"[ \t]+", " ", text).strip()
+
+
+def _project_offset(text: str, offset: int) -> int:
+    collapsed = re.sub(r"[ \t]+", " ", text)
+    leading = len(collapsed) - len(collapsed.lstrip())
+    return len(re.sub(r"[ \t]+", " ", text[:offset])) - leading
+
+
+@dataclass(frozen=True)
+class ReferenceProof:
+    original_sha256: str
+    answer_sha256: str
+    source_hashes: tuple[tuple[str, str], ...]
+    # block IDs, final absolute start/end offsets, source ID and literal span.
+    edges: tuple[tuple, ...]
+
+
+def decode_reference_reply(parsed: dict, aliases: dict, *, layout: dict,
+                           catalog: dict) -> tuple[dict, ReferenceProof]:
+    """Resolve this single review's explicit spans; never infer action semantics."""
+    if catalog["answer_sha256"] != layout["answer_sha256"]:
+        raise ValueError("procedure_review_input_changed")
+    out = deepcopy(parsed)
+    def owner(alias, kind):
+        if type(alias) is not str or alias not in catalog[kind]:
+            raise ValueError("procedure_review_wire_alias_unknown")
+        return catalog[kind][alias]
+    citations = out.get("citation_ids")
+    if type(citations) is not list:
+        raise ValueError("procedure_review_wire_citations_invalid")
+    out["citation_ids"] = [owner(alias, "sources")["citation_id"] for alias in citations]
+    edits = out.get("edits")
+    if type(edits) is not list:
+        raise ValueError("procedure_reference_edit_invalid")
+    changes, canonical_edits = {}, []
+    for edit in edits:
+        if type(edit) is not dict or set(edit) != {"block_id", "original", "replacement_parts"}:
+            raise ValueError("procedure_reference_edit_invalid")
+        alias = edit["block_id"]; block = owner(alias, "blocks")
+        start, end, _ = _reference_range(edit["original"], block["units"])
+        parts = edit["replacement_parts"]
+        if (alias in changes or type(parts) is not list or not 0 <= len(parts) <= 16
+                or any(type(part) is not str or not part.strip() for part in parts)):
+            raise ValueError("procedure_reference_edit_invalid")
+        replacement = "".join(parts)
+        body = block["text"][:start] + replacement + block["text"][end:]
+        original = block["prefix"] + block["text"] + block["suffix"]
+        if _edited_block(original, body) != block["prefix"] + body.strip() + block["suffix"]:
+            raise ValueError("procedure_reference_edit_invalid")
+        changes[alias] = (start, end, tuple(parts), body)
+        canonical_edits.append({"block_id": block["block_id"], "text": body})
+    final, positions, cursor = [], {}, 0
+    for alias, block in catalog["blocks"].items():
+        raw_body = changes[alias][3] if alias in changes else block["text"]
+        body = raw_body.strip() if alias in changes else raw_body
+        text = block["prefix"] + body + block["suffix"]
+        leading = len(raw_body) - len(raw_body.lstrip()) if alias in changes else 0
+        positions[alias] = cursor + len(block["prefix"]) - leading
+        final.append(text); cursor += len(text)
+    answer = "".join(final)
+    def answer_span(alias, ref):
+        block = owner(alias, "blocks")
+        if type(ref) is not dict or set(ref) != {"kind", "first", "last"}:
+            raise ValueError("procedure_reference_shape_invalid")
+        interval = {key:ref[key] for key in ("first", "last")}
+        if ref["kind"] == "original":
+            start, end, text = _reference_range(interval, block["units"])
+            if alias in changes:
+                old_start, old_end, parts, _ = changes[alias]
+                if start < old_end and end > old_start:
+                    raise ValueError("procedure_reference_deleted_unit")
+                if start >= old_end:
+                    shift = len("".join(parts)) - (old_end - old_start)
+                    start += shift; end += shift
+        elif ref["kind"] == "replacement" and alias in changes:
+            old_start, _, parts, _ = changes[alias]
+            units, at = [], old_start
+            for part in parts:
+                units.append((at, at + len(part), part)); at += len(part)
+            start, end, text = _reference_range(interval, tuple(units))
+        else:
+            raise ValueError("procedure_reference_range_invalid")
+        # Whitespace is retained in the answer, but not part of action boundaries.
+        leading = len(text) - len(text.lstrip()); trailing = len(text) - len(text.rstrip())
+        start += leading; end -= trailing; text = text.strip()
+        start += positions[alias]; end += positions[alias]
+        if answer[start:end] != text:
+            raise ValueError("procedure_reference_answer_changed")
+        return block["block_id"], start, end, text
+    audit = out.get("operation_boundary")
+    if (type(audit) is not dict or set(audit) != {"complete", "checked_blocks", "precedence", "change_edges"}
+            or type(audit.get("checked_blocks")) is not list or type(audit.get("precedence")) is not list
+            or len(audit["precedence"]) > 16):
+        raise ValueError("procedure_review_wire_boundary_invalid")
+    audit["checked_blocks"] = [owner(alias,"blocks")["block_id"] for alias in audit["checked_blocks"]]
+    edges, proof_edges = [], []
+    for edge in audit["precedence"]:
+        if type(edge) is not dict or set(edge) != set(_WIRE_EDGE_FIELDS):
+            raise ValueError("procedure_review_wire_edge_invalid")
+        before = answer_span(edge["from"], edge["action"])
+        after = answer_span(edge["to"], edge["next"])
+        source = owner(edge["source"], "sources")
+        _, _, quote = _reference_range(edge["proof"], source["units"])
+        edges.append({"before_block_id":before[0], "before_answer_quote":before[3],
+                      "after_block_id":after[0], "after_answer_quote":after[3],
+                      "source_citation_id":source["citation_id"], "source_quote":quote})
+        proof_edges.append((before[0], _project_offset(answer,before[1]), _project_offset(answer,before[2]),
+                            after[0], _project_offset(answer,after[1]), _project_offset(answer,after[2]),
+                            source["citation_id"], quote))
+    out["edits"] = canonical_edits; audit["precedence"] = edges
+    return out, ReferenceProof(layout["answer_sha256"], digest(_answer_projection(answer)),
+        tuple((source["citation_id"], source["grounding_sha256"]) for source in catalog["sources"].values()),
+        tuple(proof_edges))
+
+
 _WIRE_EDGE_FIELDS = {"from": "before_block_id", "action": "before_answer_quote",
     "to": "after_block_id", "next": "after_answer_quote", "source": "source_citation_id",
     "proof": "source_quote"}
@@ -335,7 +536,8 @@ def decode_review_wire_aliases(parsed: dict, aliases: dict, *, layout: dict | No
 
 def review_schema(legacy: dict, layout: dict, facets: list[str], types: list[str], *,
                   operation_boundary: bool = False, source_ordered: bool = False,
-                  operation_source_ids: list[str] | None = None, wire_aliases: dict | None = None) -> dict:
+                  operation_source_ids: list[str] | None = None, wire_aliases: dict | None = None,
+                  reference_catalogue: dict | None = None) -> dict:
     result = deepcopy(legacy)
     result["name"] = legacy["name"]  # backwards-readable verifier envelope
     schema = result["schema"]
@@ -451,6 +653,29 @@ def review_schema(legacy: dict, layout: dict, facets: list[str], types: list[str
         fields["source_citation_id"]["enum"] = source_names
         edge["properties"] = {wire: fields[canonical] for wire, canonical in _WIRE_EDGE_FIELDS.items()}
         edge["required"] = list(_WIRE_EDGE_FIELDS)
+    if reference_catalogue is not None:
+        if wire_aliases is None or reference_catalogue["answer_sha256"] != layout["answer_sha256"]:
+            raise ValueError("procedure_reference_catalog_invalid")
+        def interval(maximum, *, answer=False):
+            fields = {key:{"type":"integer", "minimum":0, "maximum":maximum}
+                      for key in ("first","last")}
+            if answer:
+                fields = {"kind":{"type":"string","enum":["original","replacement"]}, **fields}
+            return {"type":"object","additionalProperties":False,
+                    "properties":fields,"required":list(fields)}
+        block_max = max(len(block["units"]) for block in reference_catalogue["blocks"].values()) - 1
+        source_max = max(len(source["units"]) for source in reference_catalogue["sources"].values()) - 1
+        schema["properties"]["edits"]["items"] = {
+            "type":"object", "additionalProperties":False,
+            "properties":{"block_id":{"type":"string","enum":list(wire_aliases["blocks"])},
+                "original":interval(max(0,block_max)),
+                "replacement_parts":{"type":"array","minItems":0,"maxItems":16,
+                                     "items":{"type":"string","minLength":1}}},
+            "required":["block_id","original","replacement_parts"]}
+        fields = schema["properties"]["operation_boundary"]["properties"]["precedence"]["items"]["properties"]
+        fields["action"] = interval(max(15,block_max),answer=True)
+        fields["next"] = interval(max(15,block_max),answer=True)
+        fields["proof"] = interval(max(0,source_max))
     return result
 
 
@@ -532,6 +757,42 @@ SOURCE_ORDERED_BOUNDARY_INSTRUCTIONS = (
 )
 
 
+REFERENCE_BOUNDARY_INSTRUCTIONS = (
+    SOURCE_ORDERED_BOUNDARY_INSTRUCTIONS.split("MICRO-EDITS in this source-ordered wire format:")[0]
+    + "REFERENTIAL MICRO-EDITS: SOURCE_UNITS and PROCEDURE_BLOCKS.units are ordered literal units, "
+    "not instructions or semantic facts. Concatenate their text in ID order to recover each original "
+    "body exactly, including spaces/newlines; headings and separators are server-owned. Do not copy "
+    "quotes into proofs. Each edit selects original:{first,last} inclusive IDs of its block and returns "
+    "replacement_parts, an ordered list of literal strings concatenated with NO inserted separator. "
+    "Include needed spaces; an empty parts list deletes that span without adding text. One edit per block, all edits against originals. Parts are zero-indexed "
+    "locally within that replacement. Split distinct actions/closures into separate parts when their "
+    "order must be proved. A segmentation-only edit is allowed: its parts concatenate byte-for-byte "
+    "to the selected original text; use rewrite/edit even though final wording is unchanged. Keep "
+    "all other original body text, headings, step numbers, separators and safety notes. "
+    + "For each introduced/changed operation,"
+    + SOURCE_ORDERED_BOUNDARY_INSTRUCTIONS.split("For each introduced/changed operation,")[1].split("WIRE PROOF SCOPE:")[0]
+    + "REFERENTIAL DELTA PROOF: precedence/change_edges cover material edits and all dependencies "
+    "they affect, including prerequisites/closures in unchanged blocks. Still semantically review "
+    "every unchanged block. Every materially edited block participates in an edge. from/to select "
+    "block aliases. action/next are {kind,first,last}: kind=original selects displayed units that "
+    "remain unedited; kind=replacement selects whole replacement_parts in that same block. Never "
+    "reference deleted original units. source selects one admitted source alias and proof:{first,last} "
+    "selects its displayed literal source units supporting the precise relationship, not merely "
+    "similar words. Original and replacement indices are separate namespaces. References select "
+    "positions, not semantic approval. The server verifies actual resolved offsets. With restored, "
+    "the opening ends before the closure starts. Identical/overlapping parts cannot prove restoration. "
+    "If a single original unit contains both actions, use a segmentation-only edit rather than "
+    "claiming an overlapping edge. A source-documented terminal hold may reference the same part. "
+    "change_edges references the zero-based precedence edge_index and its resolution. No separate "
+    "quote copy there. At most16 edges. Unknown closure, unsafe order or unsupported relationship: "
+    "complete=false/outcome=no_sources. Never use a reference merely to make validation pass. "
+    "Complete=true still asserts whole-procedure semantic review and complete delta proof. Empty "
+    "proof only when no material edits or impacted dependencies. Isolation/STOP/PPE invariants do "
+    "not require reversal. Never invent restart/re-energization; preserve before-only boundaries "
+    "and safe hold states."
+)
+
+
 def _quote_text(value: str) -> str:
     # Typography/line wrapping only; keep case, negations, numbers and units.
     return " ".join(value.translate(str.maketrans({"\u2018": "'", "\u2019": "'",
@@ -589,8 +850,12 @@ def _canonical_boundary(audit: Any) -> dict | None:
 
 
 def verify_operation_boundary(parsed: dict, *, layout: dict, source_texts: dict[str, str],
-                              source_ordered: bool = False) -> dict:
+                              source_ordered: bool = False,
+                              reference_proof: ReferenceProof | None = None) -> dict:
     """Validate a same-call semantic closure audit, never infer physical safety."""
+    if reference_proof is not None:
+        return _verify_reference_boundary(parsed, layout=layout, source_texts=source_texts,
+                                          proof=reference_proof, source_ordered=source_ordered)
     out = deepcopy(parsed)
     audit = _canonical_boundary(out.get("operation_boundary")) if source_ordered else out.get("operation_boundary")
     if source_ordered and audit is not None:
@@ -691,6 +956,7 @@ def verify_operation_boundary(parsed: dict, *, layout: dict, source_texts: dict[
             edge_count = len(edges)
     out["operation_boundary_validation"] = {"version": "ask-operation-boundary-v1",
         "complete": bool(valid), "answer_sha256": digest(answer.strip()),
+        "reason": "complete" if valid else reason,
         "checked_blocks": len(expected), "temporary_changes": len(audit["changes"]) if valid else None,
         **({"precedence_checked": bool(valid), "precedence_edges": edge_count}
            if source_ordered else {})}
@@ -703,6 +969,88 @@ def verify_operation_boundary(parsed: dict, *, layout: dict, source_texts: dict[
     if not valid and out.get("outcome") in {"pass", "rewrite"}:
         out["outcome"] = "no_sources"
         out["reason"] = reason
+    return out
+
+
+def _verify_reference_boundary(parsed: dict, *, layout: dict, source_texts: dict[str, str],
+                               proof: ReferenceProof, source_ordered: bool) -> dict:
+    """Exact same-call identity/order proof over server-resolved positions."""
+    out = deepcopy(parsed)
+    answer = str(out.get("answer") or "")
+    projected_answer = _answer_projection(answer)
+    raw_audit = out.get("operation_boundary")
+    audit = _canonical_boundary(out.get("operation_boundary"))
+    if audit is not None:
+        out["operation_boundary"] = audit
+    expected = [block["block_id"] for block in layout["blocks"]]
+    reason = "operation_reference_boundary_incomplete"
+    valid = (source_ordered and type(proof) is ReferenceProof
+        and type(audit) is dict and audit.get("complete") is True
+        and type(audit.get("checked_blocks")) is list
+        and all(type(bid) is str for bid in audit["checked_blocks"])
+        and len(audit["checked_blocks"]) == len(expected)
+        and set(audit["checked_blocks"]) == set(expected)
+        and type(audit.get("changes")) is list and len(audit["changes"]) <= 16
+        and type(audit.get("precedence")) is list and len(audit["precedence"]) == len(proof.edges))
+    if valid and (proof.original_sha256 != layout["answer_sha256"]
+                  or proof.answer_sha256 != digest(projected_answer)):
+        valid = False; reason = "operation_reference_answer_binding_changed"
+    if valid and (set(cid for cid,_ in proof.source_hashes) != set(source_texts)
+                  or any(digest(source_texts[cid]) != expected_hash for cid,expected_hash in proof.source_hashes)):
+        valid = False; reason = "operation_reference_source_binding_changed"
+    final_layout = block_layout(projected_answer)
+    if valid and [block["block_id"] for block in final_layout["blocks"]] != expected:
+        valid = False; reason = "operation_reference_block_layout_changed"
+    block_spans, at = {}, 0
+    for block in final_layout["blocks"]:
+        block_spans[block["block_id"]] = (at, at + len(block["text"]))
+        at += len(block["text"])
+    touched, edge_sources = set(), []
+    if valid:
+        terminal_edges = {item["edge_index"] for item in raw_audit.get("change_edges", [])
+                          if item["resolution"] == "documented_terminal_state"}
+        for edge_index, (edge, bound) in enumerate(zip(audit["precedence"], proof.edges)):
+            before_bid, start, end, after_bid, close_start, close_end, cid, quote = bound
+            before_span, after_span = block_spans.get(before_bid), block_spans.get(after_bid)
+            if (not before_span or not before_span[0] <= start < end <= before_span[1]
+                    or projected_answer[start:end] != _answer_projection(str(edge.get("before_answer_quote") or ""))
+                    or edge.get("before_block_id") != before_bid):
+                valid = False; reason = "operation_reference_action_absent"; break
+            if (not after_span or not after_span[0] <= close_start < close_end <= after_span[1]
+                    or projected_answer[close_start:close_end] != _answer_projection(str(edge.get("after_answer_quote") or ""))
+                    or edge.get("after_block_id") != after_bid):
+                valid = False; reason = "operation_reference_closure_absent"; break
+            if cid not in source_texts or edge.get("source_citation_id") != cid or edge.get("source_quote") != quote or quote not in source_texts[cid]:
+                valid = False; reason = "operation_reference_source_absent"; break
+            same_hold = (before_bid == after_bid and start == close_start and end == close_end
+                         and edge_index in terminal_edges)
+            if not same_hold and end > close_start:
+                valid = False; reason = "operation_reference_closure_order_invalid"; break
+            touched.update((before_bid,after_bid)); edge_sources.append(cid)
+    if valid:
+        for change in audit["changes"]:
+            if (type(change) is not dict or change.get("resolution") not in {"restored","documented_terminal_state"}
+                    or not any(edge.get("before_block_id") == change.get("block_id")
+                        and edge.get("before_answer_quote") == change.get("action_quote")
+                        and edge.get("after_answer_quote") == change.get("closing_answer_quote")
+                        and edge.get("source_citation_id") == change.get("closing_source_citation_id")
+                        and edge.get("source_quote") == change.get("closing_source_quote") for edge in audit["precedence"])):
+                valid = False; reason = "operation_reference_unresolved_change"; break
+    if valid:
+        originals = {block["block_id"]:_quote_text(block["text"]) for block in layout["blocks"]}
+        changed = {block["block_id"] for block in final_layout["blocks"]
+                   if _quote_text(block["text"]) != originals[block["block_id"]]}
+        if not changed.issubset(touched):
+            valid = False; reason = "operation_reference_edited_dependency_missing"
+    out["operation_boundary_validation"] = {
+        "version":"ask-operation-references-v1", "complete":bool(valid),
+        "answer_sha256":digest(answer.strip()), "reason":"complete" if valid else reason,
+        "checked_blocks":len(expected), "temporary_changes":len(audit["changes"]) if valid else None,
+        "precedence_checked":bool(valid), "precedence_edges":len(proof.edges) if valid else None}
+    if valid:
+        out["citation_ids"] = list(dict.fromkeys(list(out.get("citation_ids") or []) + edge_sources))
+    elif out.get("outcome") in {"pass","rewrite"}:
+        out.update(outcome="no_sources",reason=reason)
     return out
 
 

@@ -7,6 +7,7 @@ from contextlib import ExitStack
 from copy import deepcopy
 from dataclasses import replace
 import importlib
+import json
 import os
 from pathlib import Path
 import sys
@@ -109,7 +110,7 @@ class WiredSourceOrderedReviewTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.guards.close()
 
-    def run_review(self, reject=False, note_mutation=None, unknown_alias=False, malformed=None):
+    def run_review(self, reject=False, note_mutation=None, unknown_alias=False, malformed=None, whitespace=False):
         m=self.m
         numbers=[2,7,11]
         actions=['Isolate and verify zero energy.','Feed material through the guide.','Close the guide and secure the lever.']
@@ -141,6 +142,9 @@ class WiredSourceOrderedReviewTests(unittest.TestCase):
             block_aliases=props['edits']['items']['properties']['block_id']['enum']
             result['citation_ids']=source_aliases
             result['operation_boundary']['checked_blocks']=block_aliases
+            prompt='\n'.join(message['content'] for message in messages)
+            block_view=json.JSONDecoder().raw_decode(prompt.split('PROCEDURE_BLOCKS:\n',1)[1])[0]
+            original_units={block['block_id']:block['units'] for block in block_view}
             for edit in result['edits']:
                 edit['block_id']=block_aliases[int(edit['block_id'].split('_')[1])-1]
             if note_mutation == 'delete':
@@ -150,21 +154,27 @@ class WiredSourceOrderedReviewTests(unittest.TestCase):
                 result['edits'][1]['text']=actions[1]+'\n'+notes[0]
             for i,edit in enumerate(result['edits']):
                 replacement=edit.pop('text')
-                edit.update(old_text=actions[i]+'\n'+notes[i],new_text=replacement)
+                edit.update(original={'first':0,'last':len(original_units[edit['block_id']])-1},
+                            replacement_parts=[replacement])
+            if whitespace:
+                result['edits'][0]['replacement_parts']=['Isolate  and\t','verify  zero energy.','\n'+notes[0]]
+                result['operation_boundary']['precedence']=[{'from':block_aliases[0],
+                    'action':{'kind':'replacement','first':0,'last':0},'to':block_aliases[0],
+                    'next':{'kind':'replacement','first':1,'last':1},'source':source_aliases[0],
+                    'proof':{'first':0,'last':0}}]
             if unknown_alias:result['citation_ids']=['foreign-source']
             if malformed=='reply_mode':result['reply_mode']='unknown-mode'
             if malformed=='missing_audit':result.pop('operation_boundary')
             if malformed=='null_audit':result['operation_boundary']=None
             return result,'offline-model'
         eruntime=replace(m._assistant_core_ask_execution_runtime(),evidence_admission=denied,
-            _v13_current_budget=lambda:m._assistant_core_new_budget('ask'),_v13_json_models=provider,
-            _v13_sources_block=lambda *a,**kw:'\n'.join(r['chunk_full'] for r in rows))
+            _v13_current_budget=lambda:m._assistant_core_new_budget('ask'),_v13_json_models=provider)
         runtime=replace(m._assistant_core_ask_validation_runtime(),execution_runtime=eruntime,
             final_contract_enabled=True,source_fields=lambda c:c.get('fields',{}),source_sections=lambda text:{},
             _assistant_core_candidate_source_type=lambda c:c['source_type'],
             _assistant_core_candidate_evidence_text=lambda c:c['chunk_full'],
             _assistant_core_recover_citations=lambda *a,**kw:(rows,[]),
-            _assistant_core_redact_internal_text=lambda text:text,
+            _assistant_core_redact_internal_text=m._assistant_core_redact_internal_text,
             _assistant_core_media_metadata_only=lambda text,*a:text,
             _assistant_core_should_semantic_verify_answer=lambda d:True,
             _assistant_core_verify_or_repair_answer=lambda **kw:execution.verify_or_repair_answer(**kw,runtime=eruntime),
@@ -199,6 +209,16 @@ class WiredSourceOrderedReviewTests(unittest.TestCase):
         self.assertEqual(contract['procedure_structure']['visible_numbers'],[2,7,11])
         self.assertEqual(result['answer'].splitlines(),[x for x in answer.splitlines() if x])
         self.assertNotIn('_assistant_core_needs_repair',result)
+
+    def test_real_redactor_preserves_referenced_order_through_spaces_and_tabs(self):
+        result,calls,answer=self.run_review(whitespace=True)
+        self.assertEqual(len(calls),1)
+        contract=result['meta']['assistant_core_validation']['answer_contract']
+        self.assertTrue(contract['passed'])
+        proof=contract['semantic_verifier']['operation_boundary_validation']
+        self.assertTrue(proof['complete'])
+        self.assertEqual(proof['precedence_edges'],1)
+        self.assertEqual(result['answer'].splitlines(),[x for x in answer.splitlines() if x])
 
     def test_complete_coverage_cannot_delete_or_swap_source_safety_notes(self):
         for mutation in ('delete','swap'):
