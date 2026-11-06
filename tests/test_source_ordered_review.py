@@ -110,7 +110,8 @@ class WiredSourceOrderedReviewTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.guards.close()
 
-    def run_review(self, reject=False, note_mutation=None, unknown_alias=False, malformed=None, whitespace=False):
+    def run_review(self, reject=False, note_mutation=None, unknown_alias=False, malformed=None,
+                   whitespace=False, family_required=False, reply_mode='edit', proof_tamper=None):
         m=self.m
         numbers=[2,7,11]
         actions=['Isolate and verify zero energy.','Feed material through the guide.','Close the guide and secure the lever.']
@@ -126,7 +127,9 @@ class WiredSourceOrderedReviewTests(unittest.TestCase):
             information_task=m.INFO_PROCEDURE_SEGMENT,required_facets=('sequence','safety'),
             required_answer_types=(m.REQ_ORDERED_ACTIONS,m.REQ_SAFETY_CONDITIONS))
         calls=[]
+        provider_finished=False
         def provider(messages,**kwargs):
+            nonlocal provider_finished
             calls.append((messages,kwargs))
             result={'outcome':'no_sources' if reject else 'rewrite','reply_mode':'reject' if reject else 'edit',
                 'answer':'','edits':[] if reject else [
@@ -156,19 +159,47 @@ class WiredSourceOrderedReviewTests(unittest.TestCase):
                 replacement=edit.pop('text')
                 edit.update(original={'first':0,'last':len(original_units[edit['block_id']])-1},
                             replacement_parts=[replacement])
-            if whitespace:
+            if whitespace or proof_tamper=='closure':
                 result['edits'][0]['replacement_parts']=['Isolate  and\t','verify  zero energy.','\n'+notes[0]]
                 result['operation_boundary']['precedence']=[{'from':block_aliases[0],
                     'action':{'kind':'replacement','first':0,'last':0},'to':block_aliases[0],
                     'next':{'kind':'replacement','first':1,'last':1},'source':source_aliases[0],
                     'proof':{'first':0,'last':0}}]
+            if proof_tamper=='redacted_content':
+                result['edits'][0]['replacement_parts'][0]='Isolate step:offline_internal_123  and\t'
+            if proof_tamper=='closure':
+                edge=result['operation_boundary']['precedence'][0]
+                edge['action'],edge['next']=edge['next'],edge['action']
+            if not reject and reply_mode=='retain':
+                result.update(outcome='pass',reply_mode='retain',edits=[])
             if unknown_alias:result['citation_ids']=['foreign-source']
             if malformed=='reply_mode':result['reply_mode']='unknown-mode'
             if malformed=='missing_audit':result.pop('operation_boundary')
             if malformed=='null_audit':result['operation_boundary']=None
+            provider_finished=True
             return result,'offline-model'
+        def evidence_text(row):
+            text=m._assistant_core_candidate_evidence_text(row)
+            return text+' Changed after review.' if proof_tamper=='source' and provider_finished else text
         eruntime=replace(m._assistant_core_ask_execution_runtime(),evidence_admission=denied,
-            _v13_current_budget=lambda:m._assistant_core_new_budget('ask'),_v13_json_models=provider)
+            _v13_current_budget=lambda:m._assistant_core_new_budget('ask'),_v13_json_models=provider,
+            _assistant_core_candidate_evidence_text=evidence_text)
+        def verify_review(**kwargs):
+            resolve=review.resolve_reply
+            def resolve_with_stale_audit(*args,**kw):
+                resolved=resolve(*args,**kw)
+                resolved['procedure_review']['output_answer_sha256']='0'*64
+                return resolved
+            with ExitStack() as guards:
+                if proof_tamper=='raw_audit_digest':
+                    guards.enter_context(patch.object(review,'resolve_reply',side_effect=resolve_with_stale_audit))
+                result=execution.verify_or_repair_answer(**kwargs,runtime=eruntime)
+            if proof_tamper=='missing_boundary':result.pop('operation_boundary_validation',None)
+            elif proof_tamper=='boundary_version':result['operation_boundary_validation']['version']='unknown-proof'
+            elif proof_tamper=='boundary_digest':result['operation_boundary_validation']['answer_sha256']='0'*64
+            elif proof_tamper=='missing_audit':result.pop('procedure_review',None)
+            elif proof_tamper=='audit_digest':result['procedure_review']['output_answer_sha256']='0'*64
+            return result
         runtime=replace(m._assistant_core_ask_validation_runtime(),execution_runtime=eruntime,
             final_contract_enabled=True,source_fields=lambda c:c.get('fields',{}),source_sections=lambda text:{},
             _assistant_core_candidate_source_type=lambda c:c['source_type'],
@@ -177,12 +208,13 @@ class WiredSourceOrderedReviewTests(unittest.TestCase):
             _assistant_core_redact_internal_text=m._assistant_core_redact_internal_text,
             _assistant_core_media_metadata_only=lambda text,*a:text,
             _assistant_core_should_semantic_verify_answer=lambda d:True,
-            _assistant_core_verify_or_repair_answer=lambda **kw:execution.verify_or_repair_answer(**kw,runtime=eruntime),
+            _assistant_core_verify_or_repair_answer=verify_review,
             _assistant_core_answer_contract_check=lambda **kw:{'passed':True,'reason':'offline_deterministic'},
             _sanitize_citations_for_response=lambda items,**kw:list(items),_build_rg_links=lambda *a,**kw:[],
             _v13_current_budget=lambda:None)
         response={'ok':True,'status':'answered','answer':answer,'citations':rows,'meta':{},
                   '_assistant_core_source_ordered_procedure':True}
+        if family_required:response['_assistant_core_procedure_family_review_required']=True
         with patch.object(validation,'_inputs',side_effect=lambda r,q,t,d,**kw:(r,t)), \
              patch.object(validation,'_collection',side_effect=lambda q,items,d,**kw:items), \
              patch.object(validation,'_output',side_effect=lambda r,*a,**kw:r), \
@@ -219,6 +251,66 @@ class WiredSourceOrderedReviewTests(unittest.TestCase):
         self.assertTrue(proof['complete'])
         self.assertEqual(proof['precedence_edges'],1)
         self.assertEqual(result['answer'].splitlines(),[x for x in answer.splitlines() if x])
+
+    def test_required_family_accepts_canonical_proof_for_retain_and_edit(self):
+        for mode in ('retain','edit'):
+            with self.subTest(mode=mode):
+                result,calls,answer=self.run_review(family_required=True,reply_mode=mode)
+                self.assertEqual(len(calls),1)
+                contract=result['meta']['assistant_core_validation']['answer_contract']
+                semantic=contract['semantic_verifier'];boundary=semantic['operation_boundary_validation']
+                audit=semantic['procedure_review']
+                self.assertTrue(contract['passed']);self.assertTrue(contract['complete'])
+                self.assertTrue(contract['semantic_answer_bound'])
+                self.assertTrue(boundary['complete']);self.assertTrue(boundary['precedence_checked'])
+                self.assertEqual(boundary['version'],'ask-operation-boundary-v1')
+                self.assertEqual(boundary['reference_protocol'],'ask-procedure-references-v1')
+                self.assertEqual(boundary['answer_sha256'],review.digest(semantic['answer'].strip()))
+                self.assertEqual(audit['output_answer_sha256'],review.digest(semantic['answer']))
+                self.assertEqual(audit['reply_mode'],mode)
+                self.assertTrue(audit['independent_semantic_review'])
+                self.assertTrue(audit['source_sequence_immutable'])
+                self.assertTrue(audit['source_note_bindings_complete'])
+                self.assertEqual(contract['procedure_structure']['visible_numbers'],[2,7,11])
+                self.assertEqual(result['answer'].splitlines(),[x for x in answer.splitlines() if x])
+
+    def test_required_family_rejects_missing_stale_or_foreign_proofs(self):
+        for tamper in ('missing_boundary','boundary_version','boundary_digest','missing_audit','audit_digest','source','closure'):
+            with self.subTest(tamper=tamper):
+                result,calls,_=self.run_review(family_required=True,proof_tamper=tamper)
+                self.assertEqual(len(calls),1)
+                self.assertFalse(result['meta']['assistant_core_validation']['answer_contract']['passed'])
+
+    def test_required_family_binds_real_redactor_whitespace_projection(self):
+        result,calls,answer=self.run_review(family_required=True,whitespace=True)
+        self.assertEqual(len(calls),1)
+        contract=result['meta']['assistant_core_validation']['answer_contract']
+        semantic=contract['semantic_verifier']
+        self.assertTrue(contract['passed']);self.assertTrue(contract['complete'])
+        self.assertTrue(contract['semantic_answer_bound'])
+        self.assertTrue(semantic['operation_boundary_validation']['complete'])
+        self.assertEqual(semantic['procedure_review']['output_answer_sha256'],review.digest(semantic['answer']))
+        self.assertNotIn('\t',semantic['answer']);self.assertNotIn('  ',semantic['answer'])
+        self.assertEqual(result['answer'].splitlines(),[line for line in answer.splitlines() if line])
+
+    def test_required_family_projection_rejects_removed_content_and_stale_raw_audit(self):
+        for tamper,reason in (('redacted_content','operation_reference_answer_binding_changed'),
+                              ('raw_audit_digest','operation_reference_review_binding_changed')):
+            with self.subTest(tamper=tamper):
+                result,calls,_=self.run_review(family_required=True,whitespace=True,proof_tamper=tamper)
+                self.assertEqual(len(calls),1)
+                contract=result['meta']['assistant_core_validation']['answer_contract']
+                self.assertFalse(contract['passed'])
+                semantic=contract['semantic_verifier']
+                self.assertEqual(semantic['reason'],reason)
+                self.assertFalse(semantic['operation_boundary_validation']['complete'])
+
+    def test_required_family_does_not_promote_semantic_reject_or_deleted_notes(self):
+        for changes in ({'reject':True},{'note_mutation':'delete'},{'note_mutation':'swap'},{'unknown_alias':True}):
+            with self.subTest(changes=changes):
+                result,calls,_=self.run_review(family_required=True,**changes)
+                self.assertEqual(len(calls),1)
+                self.assertFalse(result['meta']['assistant_core_validation']['answer_contract']['passed'])
 
     def test_complete_coverage_cannot_delete_or_swap_source_safety_notes(self):
         for mutation in ('delete','swap'):

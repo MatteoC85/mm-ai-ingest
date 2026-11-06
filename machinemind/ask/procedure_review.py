@@ -365,6 +365,7 @@ def _project_offset(text: str, offset: int) -> int:
 @dataclass(frozen=True)
 class ReferenceProof:
     original_sha256: str
+    raw_answer_sha256: str
     answer_sha256: str
     source_hashes: tuple[tuple[str, str], ...]
     # block IDs, final absolute start/end offsets, source ID and literal span.
@@ -464,7 +465,7 @@ def decode_reference_reply(parsed: dict, aliases: dict, *, layout: dict,
                             after[0], _project_offset(answer,after[1]), _project_offset(answer,after[2]),
                             source["citation_id"], quote))
     out["edits"] = canonical_edits; audit["precedence"] = edges
-    return out, ReferenceProof(layout["answer_sha256"], digest(_answer_projection(answer)),
+    return out, ReferenceProof(layout["answer_sha256"], digest(answer), digest(_answer_projection(answer)),
         tuple((source["citation_id"], source["grounding_sha256"]) for source in catalog["sources"].values()),
         tuple(proof_edges))
 
@@ -995,6 +996,10 @@ def _verify_reference_boundary(parsed: dict, *, layout: dict, source_texts: dict
     if valid and (proof.original_sha256 != layout["answer_sha256"]
                   or proof.answer_sha256 != digest(projected_answer)):
         valid = False; reason = "operation_reference_answer_binding_changed"
+    review_audit = out.get("procedure_review")
+    if valid and (type(review_audit) is not dict
+                  or review_audit.get("output_answer_sha256") != proof.raw_answer_sha256):
+        valid = False; reason = "operation_reference_review_binding_changed"
     if valid and (set(cid for cid,_ in proof.source_hashes) != set(source_texts)
                   or any(digest(source_texts[cid]) != expected_hash for cid,expected_hash in proof.source_hashes)):
         valid = False; reason = "operation_reference_source_binding_changed"
@@ -1043,11 +1048,17 @@ def _verify_reference_boundary(parsed: dict, *, layout: dict, source_texts: dict
         if not changed.issubset(touched):
             valid = False; reason = "operation_reference_edited_dependency_missing"
     out["operation_boundary_validation"] = {
-        "version":"ask-operation-references-v1", "complete":bool(valid),
+        # Reference units change the private wire, not the canonical safety
+        # proof consumed by the final procedure-family contract.
+        "version":"ask-operation-boundary-v1", "reference_protocol":"ask-procedure-references-v1",
+        "complete":bool(valid),
         "answer_sha256":digest(answer.strip()), "reason":"complete" if valid else reason,
         "checked_blocks":len(expected), "temporary_changes":len(audit["changes"]) if valid else None,
         "precedence_checked":bool(valid), "precedence_edges":len(proof.edges) if valid else None}
     if valid:
+        # Only the verified, same-call whitespace projection may rebind the
+        # canonical review audit. Content removal/masking already failed above.
+        review_audit["output_answer_sha256"] = digest(answer)
         out["citation_ids"] = list(dict.fromkeys(list(out.get("citation_ids") or []) + edge_sources))
     elif out.get("outcome") in {"pass","rewrite"}:
         out.update(outcome="no_sources",reason=reason)
