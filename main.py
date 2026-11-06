@@ -13215,6 +13215,7 @@ def _v13_root_fallback_from_evidence(
     citations: list[dict],
     max_causes: int,
     response_language: str,
+    root_literal_fallback_fields: bool = False,
 ) -> tuple[dict, list[dict]]:
     selected: list[dict] = []
     causes: list[dict] = []
@@ -13230,13 +13231,24 @@ def _v13_root_fallback_from_evidence(
             continue
         if not _assistant_core_ps_is_substantive(citation):
             continue
-        fields = _parse_structured_source_fields(_v13_candidate_text(citation))
+        if root_literal_fallback_fields:
+            from machinemind.retrieval.root_fallback import ps_fields
+            fields = ps_fields(_v13_candidate_text(citation))
+        else:
+            fields = _parse_structured_source_fields(_v13_candidate_text(citation))
         title = _clean_display_text(
             fields.get("title") or fields.get("category") or "Problema/Soluzione",
             max_len=100,
         )
         problem = _clean_display_text(fields.get("description") or fields.get("notes") or "", max_len=320)
-        solution = _clean_display_text(fields.get("solution") or "", max_len=320)
+        if root_literal_fallback_fields:
+            # Never turn a clipped repair instruction into a proposed check.
+            # The complete source remains available to the mandatory reviewer.
+            solution = _clean_display_text(fields.get("solution") or "", max_len=0)
+            if len(solution) > 320:
+                solution = ""
+        else:
+            solution = _clean_display_text(fields.get("solution") or "", max_len=320)
         if not (problem or solution):
             continue
 
@@ -13284,6 +13296,7 @@ def _v13_generate_root_cause_response(
     max_causes: int,
     retrieval: dict,
     debug: bool,
+    root_literal_fallback_fields: bool = False,
 ) -> dict:
     citations = list(retrieval.get("citations") or retrieval.get("candidates") or [])
     citations = citations[:V13_MAX_EVIDENCE_ITEMS_ROOT_CAUSE]
@@ -13409,6 +13422,7 @@ def _v13_generate_root_cause_response(
             citations=citations,
             max_causes=max_causes,
             response_language=response_language,
+            root_literal_fallback_fields=root_literal_fallback_fields,
         )
 
     if not grounded_result.get("possible_causes"):
@@ -15847,6 +15861,10 @@ def _assistant_core_synthesize_root_cause(
             max_causes=request.max_causes,
             retrieval=root_retrieval,
             debug=request.debug,
+            root_literal_fallback_fields=(
+                request.requested_mode == MODE_ROOT_CAUSE
+                and decision.effective_mode == MODE_ROOT_CAUSE
+            ),
         )
     return _assistant_core_adjudicate_root_cause(
         request=request,

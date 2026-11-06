@@ -1688,7 +1688,26 @@ def assistant_core_prepare_evidence(request: AssistantCoreRequest, retrieval: di
             int(c.get("page_from") or 0),
         )
     )
-    scored = _dedup_citations_by_snippet(scored, max_items=24)
+    bound_root_support = False
+    if (getattr(request, "requested_mode", None) == MODE_ROOT_CAUSE
+            and decision.effective_mode == MODE_ROOT_CAUSE):
+        from . import root_clue_support
+        bound_root_support = root_clue_support.for_request(
+            getattr(decision, "root_clue_support", None), query=request.query,
+            company_id=request.company_id, machine_id=request.machine_id,
+        ) is not None
+    if bound_root_support:
+        # The canonical deduplicator sorts again before truncating. Preserve its
+        # representatives and order, then apply source-backed factual coverage
+        # before the same cap; query tags and cached candidate flags cannot help.
+        unique = _dedup_citations_by_snippet(scored, max_items=len(scored))
+        supported, remaining = [], []
+        for candidate in unique:
+            match = root_clue_support.support_match(decision, _v13_candidate_text(candidate))
+            (supported if match.get("matched_support_part_ids") else remaining).append(candidate)
+        scored = (supported + remaining)[:24]
+    else:
+        scored = _dedup_citations_by_snippet(scored, max_items=24)
 
     diagnostic_mode = decision.effective_mode in {MODE_ROOT_CAUSE, MODE_SMART_DIAGNOSTIC}
     if diagnostic_mode:
