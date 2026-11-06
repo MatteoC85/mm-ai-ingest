@@ -1018,7 +1018,8 @@ def validate_response(
                     _, manual_note_binding_proof = _procedure_review.manual_note_projection(
                         manual_note_bindings, original_answer=manual_note_original,
                         reviewed_answer=str(semantic_contract.get("answer") or ""),
-                        review=semantic_contract, admitted_ids=final_ids)
+                        review=semantic_contract, admitted_ids=set(allowed),
+                        final_citation_ids=final_ids)
                 except ValueError:
                     manual_note_binding_invalid = True
                 answer_contract_result["manual_note_bindings"] = manual_note_binding_proof

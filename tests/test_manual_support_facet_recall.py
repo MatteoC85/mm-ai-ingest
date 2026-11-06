@@ -9,6 +9,7 @@ import importlib
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import unittest
 from unittest.mock import patch
@@ -155,21 +156,35 @@ class ManualSupportFacetRecallTests(unittest.TestCase):
                     return list(packet.rows),packet.sources,packet.diagnostic(reused=False)
             def provider(messages,**kwargs):
                 msg=messages[-1]['content']; calls.append(msg)
-                self.assertIn(detail,msg); self.assertIn(main_note,msg)
+                # The current packet sends lossless source units, not a second
+                # unsegmented copy. Reconstruct precisely what the reviewer sees.
+                source_units={match.group(1):json.loads(match.group(2)) for match in
+                    re.finditer(r'(?m)^SOURCE_UNITS (s\d+):(\[.*\])$',msg)}
+                source_text='\n'.join(''.join(unit[1] for unit in units) for units in source_units.values())
+                self.assertIn(detail,source_text); self.assertIn(main_note,source_text)
                 aliases=json.JSONDecoder().raw_decode(msg.split('PROCEDURE_SOURCE_ALIASES:\n',1)[1])[0]
                 blocks=json.loads(msg.split('PROCEDURE_BLOCKS:\n',1)[1])
-                target=next(b['block_id'] for b in blocks if b['step_number']==7)
+                target_block=next(b for b in blocks if b['heading'].strip()=='7.')
+                target=target_block['block_id']
                 route=next(a for a,cid in aliases.items() if cid=='complement-manual')
+                old='Feed material through the guide'
+                unit_index,unit_text=next((i,text) for i,text in target_block['units'] if old in text)
+                self.assertEqual(unit_text.count(old),1)
+                replacement=unit_text.replace(old,detail.rstrip('.'))
+                cut=replacement.index('pivot arm R')
+                parts=[replacement[:cut],replacement[cut:]]
                 return {'outcome':'rewrite','reply_mode':'edit','answer':'',
-                    'edits':[{'block_id':target,'old_text':'Feed material through the guide',
-                              'new_text':detail.rstrip('.')}],
+                    'edits':[{'block_id':target,'original':{'first':unit_index,'last':unit_index},
+                              'replacement_parts':parts}],
                     'citation_ids':list(aliases),'covered_facets':list(decision.required_facets),
                     'missing_facets':[],'covered_answer_types':list(decision.required_answer_types),
                     'missing_answer_types':[],'expected_list_items':[],'covered_list_items':[],
                     'missing_list_items':[],'reason':'offline grounded edit fixture',
                     'operation_boundary':{'complete':True,'checked_blocks':[b['block_id'] for b in blocks],
-                        'change_edges':[],'precedence':[{'from':target,'action':'fixed guides P and Q',
-                            'to':target,'next':'pivot arm R','source':route,'proof':detail}]}},'offline-model'
+                        'change_edges':[],'precedence':[{
+                            'action':{'block_id':target,'kind':'replacement','range':{'first':0,'last':0}},
+                            'next':{'block_id':target,'kind':'replacement','range':{'first':1,'last':1}},
+                            'proof':{'source':route,'range':{'first':0,'last':len(source_units[route])-1}}}]}},'offline-model'
             eruntime=replace(runtime.execution_runtime,evidence_observer=Observer(),
                 _v13_json_models=provider,_v13_sources_block=m._v13_sources_block)
             runtime=replace(runtime,execution_runtime=eruntime,
