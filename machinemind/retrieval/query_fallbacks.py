@@ -367,13 +367,24 @@ def v13_fallback_plan(q: str, *, runtime: V13FallbackPlanRuntime) -> dict:
 class V13BuildProfileFromPlanRuntime:
     _ask_evidence_fallback_profile: Callable[..., Any]
     _dedup_text_values: Callable[..., Any]
+    _ask_evidence_tokenize: Optional[Callable[..., Any]] = None
 
 
 def v13_build_profile_from_plan(q: str, language: str, plan: Optional[dict], *, runtime: V13BuildProfileFromPlanRuntime) -> dict:
     _ask_evidence_fallback_profile = runtime._ask_evidence_fallback_profile
     _dedup_text_values = runtime._dedup_text_values
-    profile = _ask_evidence_fallback_profile(q, language)
+    profile = dict(_ask_evidence_fallback_profile(q, language))
     plan = dict(plan or {})
+    planned_queries = _dedup_text_values(
+        list(plan.get("dense_queries") or []) + list(plan.get("lexical_queries") or []), limit=24)
+    # Router rewrites already carry the vocabulary of the indexed sources.
+    # Preserve their individual words for lexical scoring as well as complete
+    # phrases: a translated query seldom occurs verbatim on a manual page.
+    # No synonym expansion, new query, source or permission is introduced.
+    tokenizer = getattr(runtime, "_ask_evidence_tokenize", None)
+    planned_terms = (_dedup_text_values(
+        [term for query in planned_queries for term in tokenizer(query)], limit=32)
+        if callable(tokenizer) else [])
     profile["search_phrases"] = _dedup_text_values(
         list(profile.get("search_phrases") or [])
         + list(plan.get("dense_queries") or [])
@@ -381,11 +392,11 @@ def v13_build_profile_from_plan(q: str, language: str, plan: Optional[dict], *, 
         limit=24,
     )
     profile["search_terms_it"] = _dedup_text_values(
-        list(profile.get("search_terms_it") or []) + list(plan.get("exact_terms") or []) + list(plan.get("required_facets") or []),
+        list(profile.get("search_terms_it") or []) + list(plan.get("exact_terms") or []) + list(plan.get("required_facets") or []) + planned_terms,
         limit=32,
     )
     profile["search_terms_en"] = _dedup_text_values(
-        list(profile.get("search_terms_en") or []) + list(plan.get("exact_terms") or []) + list(plan.get("required_facets") or []),
+        list(profile.get("search_terms_en") or []) + list(plan.get("exact_terms") or []) + list(plan.get("required_facets") or []) + planned_terms,
         limit=32,
     )
     profile["required_information"] = _dedup_text_values(

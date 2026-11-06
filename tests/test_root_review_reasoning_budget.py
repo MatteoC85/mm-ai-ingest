@@ -93,7 +93,7 @@ class RootReviewReasoningBudgetTests(unittest.TestCase):
         self.assertEqual(payload['reasoning'], {'effort': 'low', 'context': 'current_turn'})
         self.assertEqual(payload['model'], 'gpt-5.6-terra')
         self.assertEqual(payload['max_output_tokens'], 3000)
-        self.assertEqual(posts[0]['timeout'], 20)
+        self.assertEqual(posts[0]['timeout'], 26)
         self.assertFalse(posts[0]['allow_redirects'])
         self.assertFalse(payload['store'])
         schema = root_response_quality.review_schema(h.frozen)
@@ -125,7 +125,7 @@ class RootReviewReasoningBudgetTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         review = out['meta']['root_review_execution']
         self.assertEqual(review['provider_error'], 'ReadTimeout')
-        self.assertEqual(review['elapsed_seconds'], 20.025)
+        self.assertEqual(review['elapsed_seconds'], 26.025)
         self.assertFalse(review['provider_response_received'])
         self.assertEqual(review['provider_attempts'], 1)
         row = budget.call_log[0]

@@ -278,6 +278,18 @@ class RootReviewMainIntegrationTests(unittest.TestCase):
         self.assertEqual(out['meta']['accounting_marker'], 'preserved')
         self.assertEqual(self.no_evidence_calls, [])
 
+    def test_real_reviewer_uses_existing_fast_timeout_without_extra_call_or_tokens(self):
+        self.run_review.__globals__['V13_FAST_TIMEOUT_SECONDS'] = 26
+        out = self.run_response()
+        self.assertEqual(out['status'], 'answered')
+        self.assertEqual(len(self.calls), 1)
+        arguments = self.calls[0][1]
+        self.assertEqual(arguments['timeout'], 26)
+        self.assertEqual(arguments['max_output_tokens'], 3400)
+        self.assertEqual(arguments['effort'], 'low')
+        self.assertEqual(out['meta']['root_review_execution']['timeout_seconds'], 26)
+        self.assertEqual(out['meta']['accounting_marker'], 'preserved')
+
     def test_rejected_draft_is_not_reported_as_missing_sources(self):
         for d in self.parsed['decisions']:
             d.update(verdict='reject', reason='unsupported', selected_check_indices=[],

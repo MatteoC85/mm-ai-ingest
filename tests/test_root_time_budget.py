@@ -348,12 +348,14 @@ class RootTimeBudgetTests(unittest.TestCase):
                     namespace.setdefault(field, object())
                 exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), namespace)
                 run = namespace[hook_name]
-                self.now = 20
+                self.now = 18
                 self.request.requested_mode = self.decision.effective_mode = "root_cause"
                 result = run(self.request, self.baseline, self.decision)
                 self.assertTrue(seen[-1][3].optional)
                 self.assertIsNot(seen[-1][1], self.baseline)
-                self.assertEqual(seen[-1][3].deadline, 42)
+                # The real caller reserves the configured 26-second reviewer,
+                # not the former artificial 20-second sublimit.
+                self.assertEqual(seen[-1][3].deadline, 36)
                 self.assertEqual(result["candidates"], self.baseline["candidates"])
                 self.assertIsNone(policy.current_window())
                 for requested, effective in (("ask", "ask"), ("smart_diagnostic", "smart_diagnostic"),
@@ -362,6 +364,46 @@ class RootTimeBudgetTests(unittest.TestCase):
                     result = run(self.request, self.baseline, self.decision)
                     self.assertIs(result, self.baseline)
                     self.assertIsNone(seen[-1][3])
+
+    def test_review_has_configured_time_and_keeps_native_deadline_and_cost_caps(self):
+        self.now = 40
+        original = (self.budget.deadline_monotonic, self.budget.max_llm_calls,
+                    self.budget.max_estimated_cost_usd)
+        with policy.reviewer_window(budget=self.budget):
+            self.assertEqual(self.budget._timeout(policy.review_timeout_seconds(26)), 26)
+            self.now += 21  # The old 20-second transport cap would have failed.
+            self.assertGreater(self.budget.remaining(), 0)
+        self.assertEqual(original, (self.budget.deadline_monotonic,
+            self.budget.max_llm_calls, self.budget.max_estimated_cost_usd))
+        self.assertEqual(self.budget.llm_calls, 0)
+        self.assertEqual(self.budget.committed_cost_usd, 0)
+        self.assertIsNone(policy.current_window())
+
+    def test_late_review_is_shortened_and_finalization_stays_reserved(self):
+        self.now = 80
+        with policy.reviewer_window(budget=self.budget):
+            self.assertEqual(self.budget._timeout(policy.review_timeout_seconds(26)), 7)
+            self.now += 7
+        self.assertEqual(self.budget.remaining(), 5)
+        self.assertEqual(self.budget.deadline_monotonic, 92)
+
+    def test_no_review_dispatch_when_only_finalization_time_remains(self):
+        self.now = 88
+        dispatched = []
+        with self.assertRaises(native._V13BudgetExceeded):
+            with policy.reviewer_window(budget=self.budget):
+                dispatched.append(True)
+        self.assertEqual(dispatched, [])
+        self.assertIsNone(policy.current_window())
+
+    def test_configured_shorter_review_is_respected_and_runtime_ceiling_retained(self):
+        self.assertEqual(policy.review_timeout_seconds(12), 12)
+        self.assertEqual(policy.review_timeout_seconds(20), 20)
+        self.assertEqual(policy.review_timeout_seconds(26), 26)
+        self.assertEqual(policy.review_timeout_seconds(100), 35)
+        for value in (True, None, 0, -1, 20.0):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                policy.review_timeout_seconds(value)
 
 
 if __name__ == "__main__":

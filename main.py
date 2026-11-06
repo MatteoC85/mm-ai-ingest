@@ -12061,6 +12061,7 @@ def _v13_build_profile_from_plan(q: str, language: str, plan: Optional[dict]) ->
         runtime=_retrieval_query_fallbacks.V13BuildProfileFromPlanRuntime(
             _ask_evidence_fallback_profile=_ask_evidence_fallback_profile,
             _dedup_text_values=_dedup_text_values,
+            _ask_evidence_tokenize=_ask_evidence_tokenize,
         ),
     )
 
@@ -14214,7 +14215,8 @@ def _assistant_core_refine_retrieval(
     from machinemind.retrieval import root_time_budget
     return root_time_budget.optional_retrieval(
         request=request, decision=decision, retrieval=retrieval, budget=_v13_current_budget(),
-        producer_timeout=V13_FAST_TIMEOUT_SECONDS, review_timeout=min(20, V13_FAST_TIMEOUT_SECONDS),
+        producer_timeout=V13_FAST_TIMEOUT_SECONDS,
+        review_timeout=root_time_budget.review_timeout_seconds(V13_FAST_TIMEOUT_SECONDS),
         stage="facet_refinement",
         run=lambda candidate: _retrieval_evidence_orchestration.assistant_core_refine_retrieval(
             request, candidate, decision, runtime=_assistant_core_refine_retrieval_runtime()),
@@ -15109,7 +15111,8 @@ def _assistant_core_root_diagnostic_evidence_assurance(
         )
     return root_time_budget.optional_retrieval(
         request=request, decision=decision, retrieval=retrieval, budget=_v13_current_budget(),
-        producer_timeout=V13_FAST_TIMEOUT_SECONDS, review_timeout=min(20, V13_FAST_TIMEOUT_SECONDS),
+        producer_timeout=V13_FAST_TIMEOUT_SECONDS,
+        review_timeout=root_time_budget.review_timeout_seconds(V13_FAST_TIMEOUT_SECONDS),
         stage="diagnostic_assurance",
         run=lambda candidate: _retrieval_evidence_orchestration.assistant_core_root_diagnostic_evidence_assurance(
             request, candidate, decision, runtime=runtime),
@@ -15371,12 +15374,14 @@ def _assistant_core_adjudicate_root_cause_grounded(
     """Independent review selects immutable proposals, never rewrites the answer."""
     from machinemind.infrastructure import review_capture as _review_capture
     from machinemind.retrieval import root_response_quality as _root_quality
+    from machinemind.retrieval import root_time_budget
     capture_handle = None
     capture_token = None
     budget = _v13_current_budget()
     review_meta: dict = {"policy_version": _retrieval_review_packet.POLICY_VERSION}
     review_execution: dict = {"stage": "root_adjudicator", "outcome": "not_started",
-                             "attempt_limit": 1, "timeout_seconds": min(20, V13_FAST_TIMEOUT_SECONDS),
+                             "attempt_limit": 1,
+                             "timeout_seconds": root_time_budget.review_timeout_seconds(V13_FAST_TIMEOUT_SECONDS),
                              "provider_response_received": False,
                              "decision_policy": _root_quality.POLICY_VERSION}
 
@@ -15474,15 +15479,16 @@ def _assistant_core_adjudicate_root_cause_grounded(
         } if request.debug else {},
     )
     try:
-        parsed, model_used = _v13_json_models(
-            [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
-            models=[V13_FAST_MODEL],
-            json_schema=_root_quality.review_schema(frozen),
-            effort="low", reasoning_mode="",
-            timeout=min(20, V13_FAST_TIMEOUT_SECONDS),
-            max_output_tokens=min(3400, V13_FAST_MAX_OUTPUT_TOKENS),
-            company_id=request.company_id, purpose="assistant_core_root_cause_adjudicator",
-        )
+        with root_time_budget.reviewer_window(budget=budget):
+            parsed, model_used = _v13_json_models(
+                [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
+                models=[V13_FAST_MODEL],
+                json_schema=_root_quality.review_schema(frozen),
+                effort="low", reasoning_mode="",
+                timeout=root_time_budget.review_timeout_seconds(V13_FAST_TIMEOUT_SECONDS),
+                max_output_tokens=min(3400, V13_FAST_MAX_OUTPUT_TOKENS),
+                company_id=request.company_id, purpose="assistant_core_root_cause_adjudicator",
+            )
     except _V13BudgetExceeded:
         review_execution["elapsed_seconds"] = round(time_module.monotonic() - review_started, 3)
         return unavailable("validation_budget_exceeded", True)
@@ -15816,7 +15822,7 @@ def _assistant_core_synthesize_root_cause(
     }
     with root_time_budget.producer_window(
         request=request, decision=decision, budget=_v13_current_budget(),
-        review_timeout=min(20, V13_FAST_TIMEOUT_SECONDS),
+        review_timeout=root_time_budget.review_timeout_seconds(V13_FAST_TIMEOUT_SECONDS),
     ):
         response = _v13_generate_root_cause_response(
             q=retrieval_query,

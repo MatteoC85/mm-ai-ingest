@@ -585,9 +585,29 @@ def structured_ask(
         final_structured,
         model_citations,
     )
+    # A selected family has no second writer: the existing independent reviewer
+    # must translate its canonical draft. Detect only whether drafting needs that
+    # obligation; this heuristic is never a translation or semantic approval.
+    translation_required = False
+    if runtime.preserve_complete and procedure_sequence_mode:
+        for citation in ui_structured:
+            fields = _procedure_ui_fields(citation)
+            description = fields.get("description") or fields.get("short_description") or ""
+            sections = (runtime._procedure_ui_sections(description)
+                        if callable(runtime._procedure_ui_sections) else {"body": description})
+            texts = [str(value or "").strip() for value in (
+                sections.get("instruction"), sections.get("body"), sections.get("purpose"),
+                sections.get("recipients"), sections.get("safety"), fields.get("notes"))]
+            if any(text and not _looks_like_target_language(text, response_language) for text in texts):
+                translation_required = True
+                break
     answer_ui_model = _build_structured_procedure_ui_model(
         structured_citations=ui_structured,
-        manual_support_citations=manual_support,
+        # Keep all manual occurrences in the evidence manifest below. Do not
+        # turn untranslated extracted passages into a new final-step appendix:
+        # the same reviewer must integrate every applicable detail and precaution
+        # in the requested language, with its exact supporting source identity.
+        manual_support_citations=[] if translation_required else manual_support,
         grounded_points=grounded_points,
         response_language=response_language,
         q=q,
@@ -666,6 +686,8 @@ def structured_ask(
         # expansion) and must survive Assistant Core validation even when they
         # were not part of the original semantic retrieval top-k.
         "_assistant_core_validation_evidence": [_copy_candidate(c) for c in final_citations],
+        **({"_assistant_core_procedure_translation_language": response_language}
+           if translation_required else {}),
         # Server-owned synthesis provenance, never inferred from retrieved Step
         # citations or a model verdict. Only the deterministic bundle renderer
         # promises that visible ordinals reproduce the selected source Steps.

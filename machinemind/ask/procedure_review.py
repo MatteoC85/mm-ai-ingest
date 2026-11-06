@@ -57,6 +57,7 @@ _PROTOCOL_FAILURE_CODES = frozenset({
     "procedure_review_replace_invalid",
     "procedure_review_empty_success",
     "procedure_review_pass_changes_answer",
+    "procedure_review_translation_incomplete",
 })
 
 
@@ -636,10 +637,19 @@ def decode_review_wire_aliases(parsed: dict, aliases: dict, *, layout: dict | No
 def review_schema(legacy: dict, layout: dict, facets: list[str], types: list[str], *,
                   operation_boundary: bool = False, source_ordered: bool = False,
                   operation_source_ids: list[str] | None = None, wire_aliases: dict | None = None,
-                  reference_catalogue: dict | None = None) -> dict:
+                  reference_catalogue: dict | None = None, translation_language: str = "") -> dict:
     result = deepcopy(legacy)
     result["name"] = legacy["name"]  # backwards-readable verifier envelope
     schema = result["schema"]
+    if translation_language:
+        if not source_ordered or translation_language not in {"it", "en"}:
+            raise ValueError("procedure_review_translation_incomplete")
+        schema["properties"]["translation_review"] = {
+            "type": "object", "additionalProperties": False,
+            "properties": {"language": {"type": "string", "enum": [translation_language]},
+                "body_and_safety_complete": {"type": "boolean"}},
+            "required": ["language", "body_and_safety_complete"]}
+        schema["required"] = list(schema["required"]) + ["translation_review"]
     # Required facets and must-cover retrieval plans may be distinct. Their
     # union must fit in the verdict; never make coverage impossible or drop an
     # obligation merely because the old wire format allowed only twelve keys.
@@ -1207,6 +1217,31 @@ MICRO_PROTOCOL_INSTRUCTIONS = (
 )
 
 
+TRANSLATION_INSTRUCTIONS = (
+    "\nCROSS-LANGUAGE PROCEDURE (mandatory): the canonical draft may contain untranslated source "
+    "text. English/Italian headings or labels alone are not a translated answer. In this SAME review, "
+    "use edit for every affected block, including the preamble and titles: the primary explanation, "
+    "every action, condition and ALL precautions must be complete in RESPONSE_LANGUAGE. Translate "
+    "technical meaning faithfully, preserving negation, quantities, identifiers, operating modes, "
+    "STOP versus isolation, sequence and closure. Source step NUMBERS and separators remain immutable; "
+    "the textual title inside each block may be translated. Keep each original source warning verbatim "
+    "in its own Step as an explicitly labelled supporting quotation AFTER its complete translated "
+    "precaution. That original quotation is not a substitute for an understandable translated warning. "
+    "Prefer editing only the affected prefix/range while leaving existing original-warning units "
+    "untouched: place the complete translated precaution and quotation label before those units. "
+    "Do not re-emit unchanged source quotations merely to translate adjacent text. "
+    "Manual support remains in SOURCES even when not appended to the draft: inspect it for essential "
+    "detail, prerequisites, warnings and closure, integrate everything applicable in the main translated "
+    "instructions and retain supporting citation IDs. Never treat absent appendices as absent evidence "
+    "or silently omit a mandatory detail. Check your final resolved translation against every admitted "
+    "source and requirement, using the same operation-boundary proof. Set translation_review.language "
+    "to RESPONSE_LANGUAGE and body_and_safety_complete=true ONLY after verifying the entire resolved "
+    "body and every precaution in that language. If you cannot provide and verify it within this reply, "
+    "set that field false and reject; never approve an untranslated draft. No scope, safety, source-note, "
+    "citation, number, or operation-order requirement is waived."
+)
+
+
 PROTOCOL_INSTRUCTIONS = (
     "\nPROCEDURE REVIEW OUTPUT PROTOCOL: You remain the independent semantic and safety verifier. "
     "Check every mandatory facet, source instruction, precaution, numeric value, condition, and translation. "
@@ -1277,7 +1312,8 @@ def _source_notes_preserved(notes: tuple[dict, ...], *, layout: dict, reviewed: 
 
 def resolve_reply(parsed: dict, *, answer: str, layout: dict,
                   required_facets: list[str], required_types: list[str],
-                  source_ordered: bool = False, source_notes: tuple[dict, ...] = ()) -> dict:
+                  source_ordered: bool = False, source_notes: tuple[dict, ...] = (),
+                  translation_language: str = "") -> dict:
     """Apply a complete review to exactly its input; no provider retry on errors.
 
     Absent reply_mode is a legacy full-answer response. It follows the existing
@@ -1303,6 +1339,14 @@ def resolve_reply(parsed: dict, *, answer: str, layout: dict,
     if source_ordered and out.get("answer") != "":
         raise ValueError("procedure_review_source_sequence_answer_not_empty")
     complete = outcome in {"pass", "rewrite"}
+    if translation_language and complete:
+        language_review = out.get("translation_review")
+        if (not source_ordered or translation_language not in {"it", "en"}
+                or type(language_review) is not dict
+                or set(language_review) != {"language", "body_and_safety_complete"}
+                or language_review.get("language") != translation_language
+                or language_review.get("body_and_safety_complete") is not True):
+            raise ValueError("procedure_review_translation_incomplete")
     if complete and mode != "replace":
         if any(out.get(k) for k in ("missing_facets", "missing_answer_types", "missing_list_items")):
             raise ValueError("procedure_review_success_has_missing_requirements")
@@ -1355,4 +1399,9 @@ def resolve_reply(parsed: dict, *, answer: str, layout: dict,
         "edited_blocks": len(edits), "independent_semantic_review": True,
         "source_sequence_immutable": source_ordered,
         "source_note_bindings_complete": notes_preserved if source_ordered else None}
+    if translation_language:
+        out["procedure_review"]["translation_review"] = {
+            "language": translation_language,
+            "body_and_safety_complete": bool(complete and notes_preserved
+                and (out.get("translation_review") or {}).get("body_and_safety_complete") is True)}
     return out

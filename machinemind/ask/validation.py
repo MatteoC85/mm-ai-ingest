@@ -486,6 +486,8 @@ def validate_response(
         and out.get("_assistant_core_source_ordered_procedure") is True)
     required_family_review = bool(protected_procedure
         and out.get("_assistant_core_procedure_family_review_required") is True)
+    translation_language = (str(out.get("_assistant_core_procedure_translation_language") or "")
+                            if source_ordered_procedure else "")
     # These occurrences have just passed the same request admission as synthesis.
     # Preserve source-owned notes even when a free-text reviewer shortens prose.
     procedure_occurrences = [allowed[cid] for cid in
@@ -690,7 +692,8 @@ def validate_response(
                 answer=answer,
                 candidates=list(allowed.values()),
                 **({"repair_context": {"procedure_structure": procedure_structure,
-                                   "procedure_notes": source_notes if source_ordered_procedure else ()}}
+                                   "procedure_notes": source_notes if source_ordered_procedure else (),
+                                   "procedure_translation_language": translation_language}}
                    if procedure_structure.get("usable") else {}),
             )
             if required_family_review:
@@ -959,6 +962,12 @@ def validate_response(
                         and audit.get("source_note_bindings_complete") is True
                         and audit.get("output_answer_sha256") == _procedure_review.digest(
                             str(semantic_contract.get("answer") or "")))
+                    if translation_language:
+                        language_review = audit.get("translation_review") or {}
+                        complete_review = bool(complete_review
+                            and translation_language == request.response_language
+                            and language_review.get("language") == request.response_language
+                            and language_review.get("body_and_safety_complete") is True)
                 else:
                     boundary = semantic_contract.get("operation_boundary_validation") or {}
                     complete_review = bool(complete_review and boundary.get("complete") is True
@@ -1135,7 +1144,8 @@ def validate_response(
                         # this does not create another verifier call or alter its
                         # triggering conditions. Bind the actual final text.
                         **({"procedure_structure": dict(answer_contract_result["procedure_structure"]),
-                            "procedure_notes": source_notes if source_ordered_procedure else ()}
+                            "procedure_notes": source_notes if source_ordered_procedure else (),
+                            "procedure_translation_language": translation_language}
                            if answer_contract_result.get("procedure_structure", {}).get("usable") else {}),
                     }
                 else:
@@ -1193,6 +1203,7 @@ def validate_response(
         out.pop("_assistant_core_force_semantic_verify", None)
         out.pop("_assistant_core_source_ordered_procedure", None)
         out.pop("_assistant_core_procedure_family_review_required", None)
+        out.pop("_assistant_core_procedure_translation_language", None)
         out.pop("_assistant_core_repair_context", None)
         out.pop("_assistant_core_repair_needed", None)
         out.pop("_assistant_core_repair_attempted", None)

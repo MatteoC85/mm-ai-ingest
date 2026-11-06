@@ -83,6 +83,18 @@ def reserved_final_seconds(*, producer_timeout, review_timeout) -> float:
     return _seconds(producer_timeout) + _seconds(review_timeout) + FINALIZATION_RESERVE_SECONDS
 
 
+def review_timeout_seconds(configured: int) -> int:
+    """Use the existing fast-model timeout, with the existing runtime ceiling.
+
+    Reserving this same value before retrieval/production avoids giving review
+    an artificial 20-second sublimit while the request still has time left.
+    This does not extend the request, token or monetary allowance.
+    """
+    if type(configured) is not int or configured <= 0:
+        raise ValueError("Root review timeout must be a positive integer")
+    return min(35, configured)
+
+
 @contextmanager
 def _window(budget, seconds, *, optional):
     # Never modify the native request deadline, call allowance or cost ledger.
@@ -149,5 +161,15 @@ def producer_window(*, request, decision, budget, review_timeout):
     if allowance < MIN_PRODUCER_SECONDS:
         # Do not buy a short producer attempt that cannot leave a review window.
         raise native._V13BudgetExceeded("root_producer_deadline_reserve")
+    with _window(budget, allowance, optional=False):
+        yield
+
+
+@contextmanager
+def reviewer_window(*, budget):
+    """Keep finalization inside the existing deadline; never retry a review."""
+    allowance = float(budget.remaining()) - FINALIZATION_RESERVE_SECONDS
+    if allowance < 1.0:
+        raise native._V13BudgetExceeded("root_review_deadline_reserve")
     with _window(budget, allowance, optional=False):
         yield

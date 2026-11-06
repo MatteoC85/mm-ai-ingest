@@ -173,6 +173,45 @@ class BubbleAuthority:
                 raise AuthorityError("AUTHORITY_RESPONSE_INVALID")
         return rows
 
+    def _catalogs_with_steps(self, kinds, scope: ChunkReadScope, *, include_steps: bool):
+        """Overlap dependent Step reads with the other independent catalogs.
+
+        The Procedure worker alone reads its validated live parents and then
+        their bounded Step batches. All workers still join before any identity
+        is admitted; the callers retain their complete catalog/scope checks.
+        No result is shared with another fence and no extra read is introduced.
+        """
+        def read(kind):
+            spec = self.schema.source(kind)
+            rows = self._owned_rows(spec, scope)
+            batches = []
+            if include_steps and kind == SourceType.PROCEDURE:
+                parents, seen = [], set()
+                for row in rows:
+                    uid = row["_id"]
+                    if uid in seen or len(seen) >= self.directory.meter.limits.max_records:
+                        raise AuthorityError("AUTHORITY_CATALOG_UNSTABLE" if uid in seen else "AUTHORITY_CATALOG_TOO_LARGE")
+                    seen.add(uid)
+                    if not self._active(row, spec):
+                        continue
+                    machine = _ref(row, spec.machine_field, optional=True)
+                    if machine == _GENERAL:
+                        raise AuthorityError("AUTHORITY_SCHEMA_INVALID")
+                    parents.append(uid)
+                step = self.schema.source(SourceType.STEP)
+                for start in range(0, len(parents), 50):
+                    batch = tuple(parents[start:start + 50])
+                    children = self.directory.search(step.typename, ({"key": step.parent_field,
+                        "constraint_type": "in", "value": list(batch)},))
+                    if type(children) is not tuple:
+                        raise AuthorityError("AUTHORITY_RESPONSE_INVALID")
+                    batches.append((batch, children))
+            return rows, tuple(batches)
+
+        joined = self._read_batch(tuple(lambda kind=kind: read(kind) for kind in kinds))
+        return (tuple(rows for rows, _ in joined),
+                tuple(batch for _, batches in joined for batch in batches))
+
     @staticmethod
     def _identity(scope: ChunkReadScope, spec: SourceSchema, row: dict,
                   machine_id: str | None) -> SourceIdentity | None:
@@ -195,9 +234,7 @@ class BubbleAuthority:
         max_records = self.directory.meter.limits.max_records
         kinds = (SourceType.DOCUMENT, SourceType.PROCEDURE, SourceType.PROBLEM_SOLUTION,
                  SourceType.PHOTO, SourceType.VIDEO)
-        catalogs = self._read_batch(tuple(
-            lambda kind=kind: self._owned_rows(self.schema.source(kind), scope)
-            for kind in kinds))
+        catalogs, step_batches = self._catalogs_with_steps(kinds, scope, include_steps=True)
         for kind, rows in zip(kinds, catalogs):
             spec = self.schema.source(kind)
             for row in rows:
@@ -217,13 +254,7 @@ class BubbleAuthority:
                     result.add(source)
         step = self.schema.source(SourceType.STEP)
         # Parent-based queries avoid assuming a duplicated Step.company field.
-        parent_ids = tuple(parents)
-        for start in range(0, len(parent_ids), 50):
-            batch = parent_ids[start:start + 50]
-            rows = self.directory.search(step.typename, ({"key": step.parent_field,
-                "constraint_type": "in", "value": list(batch)},))
-            if type(rows) is not tuple:
-                raise AuthorityError("AUTHORITY_RESPONSE_INVALID")
+        for batch, rows in step_batches:
             for raw in rows:
                 row = _row(raw)
                 key = SourceType.STEP, row["_id"]
@@ -300,9 +331,8 @@ class BubbleAuthority:
         kinds = tuple(kind for kind in (SourceType.DOCUMENT, SourceType.PROCEDURE,
             SourceType.PROBLEM_SOLUTION, SourceType.PHOTO, SourceType.VIDEO)
             if kind in needed)
-        catalogs = self._read_batch(tuple(
-            lambda kind=kind: self._owned_rows(self.schema.source(kind), scope)
-            for kind in kinds))
+        catalogs, step_batches = self._catalogs_with_steps(kinds, scope,
+            include_steps=any(source.source_type == SourceType.STEP for source in expected))
         for kind, rows in zip(kinds, catalogs):
             spec = self.schema.source(kind)
             seen_ids = set()
@@ -322,14 +352,8 @@ class BubbleAuthority:
                     actual[key] = identity
         if any(source.source_type == SourceType.STEP for source in expected):
             step = self.schema.source(SourceType.STEP)
-            parent_ids = tuple(procedures)
             seen_steps = set()
-            for offset in range(0, len(parent_ids), 50):
-                batch = parent_ids[offset:offset + 50]
-                rows = self.directory.search(step.typename, ({"key": step.parent_field,
-                    "constraint_type": "in", "value": list(batch)},))
-                if type(rows) is not tuple:
-                    raise AuthorityError("AUTHORITY_RESPONSE_INVALID")
+            for batch, rows in step_batches:
                 for raw in rows:
                     row = _row(raw)
                     uid = row["_id"]

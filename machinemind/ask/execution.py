@@ -751,6 +751,8 @@ def verify_or_repair_answer(
     layout = _procedure_review.block_layout(answer) if compact_review else None
     source_ordered_review = bool(compact_review
         and (repair_context.get("procedure_structure") or {}).get("source_sequence_required") is True)
+    translation_language = (str(repair_context.get("procedure_translation_language") or "")
+                            if source_ordered_review else "")
     operation_boundary = bool(compact_review)
     review_facets = list(dict.fromkeys(list(decision.required_facets) + [
         item.facet for item in decision.facet_queries if item.must_cover]))
@@ -811,9 +813,12 @@ def verify_or_repair_answer(
         verifier_schema = _procedure_review.review_schema(verifier_schema, layout, review_facets, requirements,
             operation_boundary=operation_boundary, source_ordered=source_ordered_review,
             operation_source_ids=[str(c.get("citation_id") or "").strip() for c in ordered_candidates],
-            wire_aliases=wire_aliases, reference_catalogue=reference_catalogue)
+            wire_aliases=wire_aliases, reference_catalogue=reference_catalogue,
+            translation_language=translation_language)
         system_msg += (_procedure_review.MICRO_PROTOCOL_INSTRUCTIONS if wire_aliases is not None
                        else _procedure_review.PROTOCOL_INSTRUCTIONS)
+        if translation_language:
+            system_msg += _procedure_review.TRANSLATION_INSTRUCTIONS
         if operation_boundary:
             system_msg += (_procedure_review.REFERENCE_BOUNDARY_INSTRUCTIONS if source_ordered_review
                            else _procedure_review.OPERATION_BOUNDARY_INSTRUCTIONS)
@@ -1018,7 +1023,8 @@ def verify_or_repair_answer(
             out = _procedure_review.resolve_reply(out, answer=answer, layout=layout,
                 required_facets=review_facets, required_types=requirements,
                 source_ordered=source_ordered_review,
-                source_notes=tuple(repair_context.get("procedure_notes") or ()))
+                source_notes=tuple(repair_context.get("procedure_notes") or ()),
+                translation_language=translation_language)
     except ValueError as exc:
         if not source_ordered_review:
             raise
