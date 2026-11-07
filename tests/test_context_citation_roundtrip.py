@@ -11,6 +11,7 @@ import unittest
 
 sys.path[:0] = [str(Path(__file__).resolve().parents[1]), str(Path(__file__).resolve().parent)]
 from machinemind.ask import factual_context_review as review, request_completion
+from machinemind.ask.source_table_review import selection_notice
 from context_review_wire_fixture import encode_context_reply, original_context_sources
 import test_factual_context_review as plain_fixture
 import test_duplicate_table_context as table_fixture
@@ -179,7 +180,7 @@ class CitationRoundtripOwnedTests(unittest.TestCase):
         owned.SourceTableOwnedTests.tearDownClass()
 
     def test_plain_selected_inventory_roundtrip_through_owner_transport_hash_html_and_tenant_scopes(self):
-        note = 'These documented facts address the request without listing every manual fact.'
+        note = selection_notice('en')
         for company, machine, document in (('tenant-cobalt', 'unseen-mill', 'mill-guide'),
                                             ('tenant-ochre', 'unseen-valve', 'valve-guide')):
             with self.subTest(machine=machine), ExitStack() as cleanup:

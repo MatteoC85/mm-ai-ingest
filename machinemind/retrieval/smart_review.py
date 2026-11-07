@@ -633,7 +633,15 @@ def resolve(*, prepared, parsed, probability_band, continuity_policy=None):
         and is_unweighted_open(active) and question_index is not None
         and question_index in by_index and bool(targets)
         and set(targets).issubset({h['id'] for h in active}))
-    usable(total > 0 or excluded_terminal or unweighted_clarification,
+    # The existing server-owned reporting control below also needs no positive
+    # diagnostic weight. Only freshly accepted, open/unknown causes survive;
+    # the rejected or targetless technical question is discarded in its entirety.
+    unweighted_reporting = (
+        continuity_policy == continuity.POLICY_VERSION
+        and original.get('status') == 'in_progress' and original.get('final_ready') is False
+        and is_unweighted_open(active) and question_index is not None
+        and (question_rejected or not set(targets).intersection(h['id'] for h in active)))
+    usable(total > 0 or excluded_terminal or unweighted_clarification or unweighted_reporting,
            'no_positive_supported_hypothesis')
     accumulated = 0.0
     for index, h in enumerate(active):

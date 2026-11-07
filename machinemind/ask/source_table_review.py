@@ -19,6 +19,17 @@ _COVERAGE = re.compile(r'(T[1-9][0-9]*)=([0-9]+(?:,[0-9]+)*)')
 _INVENTORY = '[[FACTUAL_INVENTORY]]'
 MAX_TEXT = 30000
 
+
+def selection_notice(language: str) -> str:
+    """Scope disclaimer only; technical qualifications stay in reviewed content."""
+    notices = {
+        "en": "This answer presents a selection from the supplied sources, not an exhaustive inventory.",
+        "it": "Questa risposta presenta una selezione dalle fonti fornite, non un inventario esaustivo.",
+    }
+    if language not in notices:
+        raise ValueError("selection_scope_language_invalid")
+    return notices[language]
+
 INSTRUCTIONS = (
     ' SOURCE_TABLE_QUOTATIONS: whenever any TABLE_RECORD in a listed group supports '
     'the answer, you MUST select its [[SOURCE_TABLE:Gn]] as one whole expected_list_items '
@@ -70,7 +81,11 @@ def quotation_instructions(*, keyed_coverage: bool = False, selected_records_onl
             'Avoid redundant identical tables, but retain every distinct applicable owner context '
             'and qualification; identical cells do not establish assembly equivalence. Use the '
             'FACTUAL_INVENTORY template, with each source-table reference only in expected_list_items. '
-            'selection_scope_note must be a short reader-facing statement in RESPONSE_LANGUAGE '
+            'When the schema supplies one exact selection_scope_note, return that value unchanged. '
+            'It is only a scope disclaimer: put every technical applicability condition, model/assembly '
+            'qualification and other material limit in the relevant inventory item or editable template. '
+            'Never rely on the disclaimer to establish source support or requested-category coverage. '
+            'Otherwise selection_scope_note must be a short reader-facing statement in RESPONSE_LANGUAGE '
             'that this is a supported selection rather than an exhaustive inventory. It must not '
             'claim unselected records irrelevant or verified. The server inserts this note before '
             'the template and the independent reviewer judges that complete answer. All source, '
@@ -117,7 +132,8 @@ def record_instructions(*, derive_duplicate_records: bool = False, keyed_coverag
 
 
 def reference_schema(schema: dict, catalog: 'TableCatalog', *, derive_duplicate_records: bool = False,
-                     keyed_coverage: bool = False, selected_records_only: bool = False) -> dict:
+                     keyed_coverage: bool = False, selected_records_only: bool = False,
+                     expected_scope_note: str | None = None) -> dict:
     """Only an emitted catalog permits omission of mechanically bound records."""
     if not catalog.entries:
         return schema
@@ -129,6 +145,10 @@ def reference_schema(schema: dict, catalog: 'TableCatalog', *, derive_duplicate_
         out['schema']['properties']['selection_scope_note'] = {
             'type': 'string', 'minLength': 1, 'maxLength': 400,
             'description': 'Reader-facing RESPONSE_LANGUAGE statement that the answer is a supported selection, not an exhaustive inventory; no claim that unselected facts are irrelevant or verified.'}
+        if expected_scope_note is not None:
+            if expected_scope_note not in {selection_notice('en'), selection_notice('it')}:
+                raise ValueError('selection_scope_invalid')
+            out['schema']['properties']['selection_scope_note']['enum'] = [expected_scope_note]
         out['schema']['required'] = [*out['schema']['required'], 'selection_scope_note']
         out['reject_duplicate_keys'] = True
         return out
@@ -347,7 +367,8 @@ def selection_template(wire_reply: dict) -> str:
 
 def resolve_reply(result: dict, catalog: TableCatalog, *, admitted_citation_ids=None,
                   diagnostics: dict | None = None, derive_duplicate_records: bool = False,
-                  keyed_coverage: bool = False, selected_records_only: bool = False) -> dict:
+                  keyed_coverage: bool = False, selected_records_only: bool = False,
+                  expected_scope_note: str | None = None) -> dict:
     """Expand a whole inventory item without changing its ordered index.
 
     A reference binds to the owning citation and every record in that occurrence.
@@ -362,6 +383,9 @@ def resolve_reply(result: dict, catalog: TableCatalog, *, admitted_citation_ids=
         return {**result, 'outcome': 'no_sources', 'answer': '',
                 'reason': 'source_table_reference_invalid', '_terminal_review_failure': True}
     if selected_records_only is True and result.get('outcome') in {'pass', 'rewrite'}:
+        if expected_scope_note is not None and (expected_scope_note not in {selection_notice('en'), selection_notice('it')}
+                or result.get('selection_scope_note') != expected_scope_note):
+            return reject('selection_scope_invalid')
         if not catalog.entries or type(result.get('table_record_coverage')) is not list or result['table_record_coverage']:
             return reject('coverage_shape')
         try:

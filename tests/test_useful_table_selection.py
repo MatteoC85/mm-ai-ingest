@@ -24,7 +24,7 @@ import test_source_table_owned as owned
 import test_duplicate_table_context as duplicates
 from context_review_wire_fixture import encode_context_reply, original_context_sources
 
-NOTE='The following documented examples address the request; this is not the complete inventory.'
+NOTE=st.selection_notice('en')
 
 
 def wire(catalog,index=0):

@@ -9,6 +9,7 @@ from unittest.mock import patch
 sys.path[:0] = [str(Path(__file__).resolve().parents[1]), str(Path(__file__).resolve().parent)]
 from test_smart_review import SmartReviewEndpointTests, denied, review
 from test_smart_continuity_endpoints import direct_post
+from test_smart_review import parsed_review, wire_review
 
 
 class UnweightedEndpointTests(unittest.TestCase):
@@ -87,6 +88,38 @@ class UnweightedEndpointTests(unittest.TestCase):
             tampered = self.post('finalize', json.dumps(state))
             self.assertEqual(tampered.status_code, 400)
             self.assertEqual(tampered.json()['detail']['code'], 'SMART_DIAGNOSTIC_STATE_TAMPERED')
+
+    def test_unknown_with_rejected_next_question_retains_reporting_then_closes_inconclusive(self):
+        start = self.start()
+        answer_step = deepcopy(self.raw)
+        answer_step['question']['question_text'] = 'Start a cycle to obtain the missing configuration.'
+
+        def reject_question(*args, **kwargs):
+            # Use the real prepared proposal and wire decoder, not a bypass of
+            # the source reviewer or the signed endpoint state contract.
+            return wire_review(parsed_review(self.prepared[-1], rejected=(),
+                                            reject_question=True)), 'offline-review'
+
+        with patch.object(self.m, '_sd_llm_step_answer', return_value=answer_step), \
+             patch.object(self.m, '_v13_json_models', side_effect=reject_question):
+            response = self.post('answer', start['session_state_json'], question_id='Q1',
+                                 answer=dict(value='unknown', api_value='unknown'))
+        self.assertEqual(response.status_code, 200, response.text)
+        answer = response.json()
+        self.assert_unknown(answer)
+        self.assertFalse(answer['meta']['smart_review']['question_validated'])
+        self.assertTrue(answer['meta']['smart_review']['rejected_question_discarded'])
+        self.assertEqual(answer['question']['application_reporting_version'], review.continuity.REPORTING_VERSION)
+        self.assertNotIn('Start a cycle', json.dumps({k: v for k, v in answer.items() if k != 'session_state_json'}))
+        with patch.object(self.m, '_v13_json_models', side_effect=denied), \
+             patch.object(self.m, '_sd_llm_step_answer', side_effect=denied):
+            final = self.post('answer', answer['session_state_json'], question_id='Q2',
+                              answer=dict(value='unknown', api_value='unknown')).json()
+        self.assert_unknown(final)
+        self.assertTrue(final['final_ready'])
+        self.assertEqual(final['final_result']['most_likely_hypothesis_id'], '')
+        self.assertIn('inconclusive', final['final_summary_text'])
+        self.assertEqual(final['final_recommended_checks_json'], '[]')
 
     def test_finalizer_ignores_unreviewed_winner_and_preserves_reviewed_reasons_only(self):
         invented = 'Confirmed pump failure. Bypass the guard and restart.'

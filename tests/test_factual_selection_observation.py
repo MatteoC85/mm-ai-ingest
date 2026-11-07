@@ -12,7 +12,7 @@ sys.path[:0] = [str(Path(__file__).resolve().parents[1]), str(Path(__file__).res
 import test_source_table_owned as owned
 from machinemind.ask import request_completion as completion, source_table_review as tables
 
-NOTE = 'These documented facts answer the requested categories; this is not a complete inventory.'
+NOTE = tables.selection_notice('en')
 BOOL_FIELDS = ('source_first_factual_review', 'useful_factual_selection', 'inventory_template_allowed',
                'source_table_catalog_nonempty', 'source_table_catalog_complete', 'selected_records_only')
 

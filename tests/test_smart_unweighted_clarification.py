@@ -43,16 +43,21 @@ class UnweightedClarificationTests(unittest.TestCase):
         self.assertEqual(review.claims_digest(out), review.claims_digest(replayed))
 
     def test_rejected_question_cannot_use_zero_weight_clarification(self):
-        with self.assertRaisesRegex(review.SmartReviewError, 'no_positive_supported_hypothesis'):
-            self.resolve(reject_question=True)
+        out, _, summary = self.resolve(reject_question=True)
+        self.assertFalse(summary['question_validated'])
+        self.assertTrue(summary['rejected_question_discarded'])
+        self.assertEqual(summary['application_question'], continuity.REPORTING_VERSION)
+        self.assertNotEqual(out['question']['question_text'], self.step['question']['question_text'])
+        self.assertTrue(all(h['checks'] == [] for h in out['hypotheses']))
 
     def test_rejected_or_foreign_target_cannot_use_zero_weight_clarification(self):
-        self.step['question']['target_hypotheses'] = ['H2']
-        with self.assertRaisesRegex(review.SmartReviewError, 'no_positive_supported_hypothesis'):
-            self.resolve(rejected=(1,))
-        self.step['question']['target_hypotheses'] = ['foreign-target']
-        with self.assertRaisesRegex(review.SmartReviewError, 'no_positive_supported_hypothesis'):
-            self.resolve()
+        for target in ('H2', 'foreign-target'):
+            self.step['question']['target_hypotheses'] = [target]
+            out, _, summary = self.resolve(rejected=(1,))
+            self.assertEqual(summary['application_question'], continuity.REPORTING_VERSION)
+            self.assertEqual(out['question']['target_hypotheses'], ['H1', 'H3', 'H4'])
+            self.assertNotIn(target, out['question']['target_hypotheses'])
+            self.assertTrue(all(h['probability_pct'] == 0 for h in out['hypotheses']))
 
     def test_all_rejected_cannot_publish_prior_or_unreviewed_causes(self):
         with self.assertRaisesRegex(review.SmartReviewError, 'no_supported_hypotheses'):

@@ -137,7 +137,7 @@ class KeyedTableCoverageTests(unittest.TestCase):
         finally:f.close();owner.close()
 
     def test_useful_limited_owned_answer_still_requires_independent_acceptance_and_no_declared_gaps(self):
-        limitation='The supplied excerpts support the following information; this is not an exhaustive list of the entire manual.'
+        limitation=st.selection_notice('en')
         for missing in (False,True):
             def change(reply):
                 reply.update(answer='[[FACTUAL_INVENTORY]]',selection_scope_note=limitation,table_record_coverage=[])
