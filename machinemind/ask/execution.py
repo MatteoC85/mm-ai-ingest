@@ -744,8 +744,12 @@ def verify_or_repair_answer(
                 selected_records_only=selected_records_only)
     # Only the owned source-ordered procedure uses reference units. No model
     # output can activate it; manual/mixed/factual/Root/Smart keep their protocol.
+    # Match the final validator: a procedural request can also ask for a
+    # numeric specification or document explanation. Its safety/order proof
+    # remains mandatory even when information_task names that other facet.
     compact_review = bool(_guarded(runtime, request, decision)
-        and decision.information_task in {runtime.INFO_PROCEDURE_FULL, runtime.INFO_PROCEDURE_SEGMENT}
+        and (decision.information_task in {runtime.INFO_PROCEDURE_FULL, runtime.INFO_PROCEDURE_SEGMENT}
+             or decision.request_kind == "procedure")
         and (repair_context.get("procedure_structure") or {}).get("usable")
         and (repair_context.get("procedure_structure") or {}).get("answer_sha256") == _procedure_review.digest(answer))
     layout = _procedure_review.block_layout(answer) if compact_review else None
