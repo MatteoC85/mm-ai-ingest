@@ -133,7 +133,8 @@ class ReferenceTests(unittest.TestCase):
 
     def test_deleting_a_clause_keeps_other_units_and_cannot_reference_deleted_text(self):
         value=self.reply();value.update(outcome='rewrite',reply_mode='edit')
-        value['edits']=[{'block_id':'b1','original':interval(1),'replacement_parts':[]}]
+        value['edits']=[{'block_id':'b1','original':interval(0,1),'replacement_parts':['Release the guide. ']}]
+        value['operation_boundary']['precedence'][0]['action']=endpoint(kind='replacement')
         # This example has no source-note binding; real protected notes are checked by resolve_reply.
         result=self.execute(value)
         self.assertTrue(result['operation_boundary_validation']['complete'])
@@ -142,7 +143,8 @@ class ReferenceTests(unittest.TestCase):
     def test_preserved_source_notes_cannot_be_deleted_by_reference_edit(self):
         answer,layout,aliases,catalog,_=self.prepare()
         value=self.reply();value.update(outcome='rewrite',reply_mode='edit')
-        value['edits']=[{'block_id':'b1','original':interval(1),'replacement_parts':[]}]
+        value['edits']=[{'block_id':'b1','original':interval(0,1),'replacement_parts':['Release the guide. ']}]
+        value['operation_boundary']['precedence'][0]['action']=endpoint(kind='replacement')
         decoded,_=r.decode_reference_reply(value,aliases,layout=layout,catalog=catalog)
         result=r.resolve_reply(decoded,answer=answer,layout=layout,required_facets=['feed'],
             required_types=['ordered_actions'],source_ordered=True,

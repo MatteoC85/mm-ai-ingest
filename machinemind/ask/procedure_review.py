@@ -490,7 +490,7 @@ def decode_reference_reply(parsed: dict, aliases: dict, *, layout: dict,
         alias = edit["block_id"]; block = owner(alias, "blocks")
         start, end, _ = _reference_range(edit["original"], block["units"], stage="edit_original")
         parts = edit["replacement_parts"]
-        if (alias in changes or type(parts) is not list or not 0 <= len(parts) <= 16
+        if (alias in changes or type(parts) is not list or not 1 <= len(parts) <= 16
                 or any(type(part) is not str or not part.strip() for part in parts)):
             raise ValueError("procedure_reference_edit_invalid")
         replacement = "".join(parts)
@@ -790,7 +790,7 @@ def review_schema(legacy: dict, layout: dict, facets: list[str], types: list[str
             endpoints.append(obj({"block_id":owned, "kind":{"type":"string", "enum":["original"]},
                                   "range":interval(count)}))
             edits.append(obj({"block_id":owned, "original":interval(count),
-                "replacement_parts":{"type":"array", "minItems":0, "maxItems":16,
+                "replacement_parts":{"type":"array", "minItems":1, "maxItems":16,
                                      "items":{"type":"string", "minLength":1}}}))
         endpoints.append(obj({"block_id":{"type":"string", "enum":list(wire_aliases["blocks"])},
                               "kind":{"type":"string", "enum":["replacement"]}, "range":interval(16)}))
@@ -895,7 +895,11 @@ REFERENCE_BOUNDARY_INSTRUCTIONS = (
     "body exactly, including spaces/newlines; headings and separators are server-owned. Do not copy "
     "quotes into proofs. Each edit selects original:{first,last} inclusive IDs of its block and returns "
     "replacement_parts, an ordered list of literal strings concatenated with NO inserted separator. "
-    "Include needed spaces; an empty parts list deletes that span without adding text. One edit per block, all edits against originals. Parts are zero-indexed "
+    "Include needed spaces; every edit must return 1 to 16 non-empty parts. To delete text, extend "
+    "the selected original interval to include adjacent text that must survive, and return that "
+    "surviving text literally, with its spaces, in replacement_parts. Never return an empty parts "
+    "list or reference deleted text; update any affected endpoints to the surviving replacement "
+    "parts. One edit per block, all edits against originals. Parts are zero-indexed "
     "locally within that replacement. Split distinct actions/closures into separate parts when their "
     "order must be proved. A segmentation-only edit is allowed: its parts concatenate byte-for-byte "
     "to the selected original text; use rewrite/edit even though final wording is unchanged. Keep "
