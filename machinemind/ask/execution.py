@@ -401,7 +401,13 @@ def synthesize_ask(
         set(decision.required_answer_types)
         & {REQ_NUMERIC_VALUE, REQ_INTERFACE_LOCATIONS, REQ_STATE_SEQUENCE}
     )
-    if has_structured and (not composite_nonprocedure_contract or phase_context) and (
+    # A numeric limit or a named control does not make a requested procedure
+    # non-procedural. Preserve its canonical family/order before the mandatory
+    # review; that review still has to cover every mixed requirement and source.
+    structured_mixed_procedure = bool(_guarded(runtime, request, decision)
+                                      and structured_procedure_task)
+    if has_structured and (not composite_nonprocedure_contract or phase_context
+                           or structured_mixed_procedure) and (
         decision.request_kind == "procedure"
         or structured_procedure_task
     ):

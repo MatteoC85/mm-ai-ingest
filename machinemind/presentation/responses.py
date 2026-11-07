@@ -755,7 +755,7 @@ def assistant_ui_root_cause_html(resp: dict, *, response_language: str, _runtime
             rank_label = f'Possible cause {rank}' if is_en else f'Causa possibile {rank}'
             border = '#cbd5e1'
             heading_color = '#334155'
-        article.append('<section style="margin:0 0 20px 0;padding-left:14px;border-left:3px solid ' + border + ';"><p style="margin:0 0 4px 0;font-size:12px;line-height:1.4;font-weight:760;letter-spacing:.02em;text-transform:uppercase;color:' + heading_color + ';">' + assistant_ui_escape(rank_label, _runtime=_runtime) + '</p><h3 style="margin:0 0 7px 0;font-size:15px;line-height:1.45;font-weight:760;color:#111827;">' + assistant_ui_inline_markup(cause_text, _runtime=_runtime) + '</h3>')
+        article.append('<section style="margin:0 0 20px 0;padding-left:14px;border-left:3px solid ' + border + ';"><p style="margin:0 0 4px 0;font-size:14px;line-height:1.4;font-weight:760;letter-spacing:.02em;text-transform:uppercase;color:' + heading_color + ';">' + assistant_ui_escape(rank_label, _runtime=_runtime) + '</p><h3 style="margin:0 0 7px 0;font-size:16px;line-height:1.45;font-weight:760;color:#111827;">' + assistant_ui_inline_markup(cause_text, _runtime=_runtime) + '</h3>')
         if why:
             why_label = 'Why' if is_en else 'Perché'
             article.append('<p style="margin:0 0 9px 0;color:#4b5563;white-space:pre-line;"><strong style="color:#374151;">' + assistant_ui_escape(why_label, _runtime=_runtime) + ':</strong> ' + assistant_ui_inline_markup(why, _runtime=_runtime) + '</p>')

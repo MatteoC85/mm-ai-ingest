@@ -53,7 +53,7 @@ INSTRUCTIONS = (
     'inventory slots. Preserve [[FACTUAL_INVENTORY]] exactly once on its own line in a '
     'template edit. Immutable quotations remain verbatim documentary context, not new '
     'requested operations. Do not invent operations, sources, values or assembly equivalence. '
-    'read_only_answer permits no edits or rewrite. '
+    'read_only_answer permits no text edits. '
     'THEN audit every TABLE_CONTEXT_TARGET exactly once. Give one or two short context '
     'sentences and one or two supporting quotation references, including the owner. '
     'Preserve all applicable adjacent/outside-cell qualifications and documentary limits. '
@@ -83,9 +83,11 @@ INSTRUCTIONS = (
     'not automatic acceptance or permission to ignore a diagnostic. '
     'The server preserves current citations and adds valid quote owners. Use '
     'additional_citation_ids only for extra admitted support. Return strict schema JSON. '
-    'pass requires the unchanged complete safe answer, no edits/contexts/new support. '
-    'rewrite requires the entire assembled revision to meet all six checks; with table '
-    'contexts use rewrite even without edits. With no table targets return table_contexts=[]. '
+    'Use pass for the unchanged complete safe answer and rewrite for explicit edits, '
+    'contexts or extra support. Both approve the entire final assembled answer only '
+    'when all six checks pass; the server derives the operation from the validated '
+    'explicit changes, never from the label alone. With table contexts use rewrite '
+    'even without edits. With no table targets return table_contexts=[]. '
     'If any material claim/context remains unsupported or any check fails, return no_sources. '
     'reason is only a diagnostic enum code, never source text or reasoning; it cannot replace checks.'
 ) + enumeration_review.INFORMATIONAL_SCOPE_INSTRUCTIONS
@@ -891,12 +893,16 @@ def apply_review(first_reply, review_reply, frame: ReviewFrame):
         if str(exc) == 'documentary_limits_unchecked':
             return reject('factual_context_review_incomplete', verdict, str(exc))
         return reject(gate=str(exc))
-    if verdict == 'pass':
-        if edits or contexts or set(citations) != set(frame.current_citation_ids):
-            return reject(gate='pass_changed')
+    # Both successful labels assert the same six checks on the final assembled
+    # answer. The explicit, validated changes determine retain versus edit; a
+    # redundant operation label cannot invalidate an otherwise complete review.
+    # No changes are inferred, and no_sources/checks_false remain terminal above.
+    if not edits and not contexts:
         result = deepcopy(first_reply)
+        result['citation_ids'] = citations
+        verdict = 'rewrite' if set(citations) != set(frame.current_citation_ids) else 'pass'
     else:
-        if (not edits and not contexts) or not frame.editable_targets:
+        if not frame.editable_targets:
             return reject(gate='edit_target')
         items, template, seen = list(frame.items), frame.template, set()
         for edit in edits:
@@ -924,6 +930,7 @@ def apply_review(first_reply, review_reply, frame: ReviewFrame):
             return reject(gate='assembled_size')
         result = deepcopy(first_reply)
         result.update(answer=answer, expected_list_items=items, covered_list_items=[], citation_ids=citations)
+        verdict = 'rewrite'
     # The caller's draft was initially empty: an independent unchanged pass
     # does not turn the first-stage generation rewrite into a pass on emptiness.
     result['reason'] = 'factual_context_review_completed'

@@ -190,6 +190,15 @@ def _decision_observation(diagnostics: dict) -> dict:
     return result
 
 
+_INDEPENDENT_REVIEW_GATES = frozenset({
+    'accepted', 'frame_mismatch', 'reply_shape', 'source_frame', 'provider_unavailable',
+    'model_rejected', 'checks_false', 'citation_alias', 'citation_set', 'table_count',
+    'table_shape', 'table_target', 'documentary_limits_unchecked', 'quote_shape',
+    'quote_source', 'quote_not_literal', 'table_owner', 'table_marker', 'pass_changed',
+    'edit_target', 'template', 'assembled_size',
+})
+
+
 def record_contract_observation(stage: str, contract: dict, *, diagnostics: dict | None = None) -> None:
     """Bounded enums/counts survive errors; never retain answer or source text."""
     owner = current()
@@ -233,6 +242,12 @@ def record_contract_observation(stage: str, contract: dict, *, diagnostics: dict
                 row[key] = min(value, 100)
         if type(diagnostics.get("post_review_grounding_applied")) is bool:
             row["post_review_grounding_applied"] = diagnostics["post_review_grounding_applied"]
+        # A fixed parser category is safe without debug and survives a terminal
+        # error. No wire, text, identifiers, hashes or model reasoning are added.
+        if stage == 'semantic_review' and 'independent_review_gate' in diagnostics:
+            gate = diagnostics['independent_review_gate']
+            row['independent_review_gate'] = (gate if type(gate) is str
+                and gate in _INDEPENDENT_REVIEW_GATES else 'other')
     # Hashes are debug-only and computed/validated here. Never copy arbitrary
     # provider fields, response/source prose, identifiers or exception messages.
     if getattr(owner.payload, "debug", False) is True:
@@ -250,11 +265,7 @@ def record_contract_observation(stage: str, contract: dict, *, diagnostics: dict
                     'coverage_duplicate', 'item_shape', 'reference_unknown', 'reference_duplicate',
                     'selected_record_conflict', 'required_reference_missing', 'expanded_size'},
                 'independent_review_outcome': {'pass', 'rewrite', 'no_sources', 'unavailable', 'invalid'},
-                'independent_review_gate': {'accepted', 'frame_mismatch', 'reply_shape',
-                    'source_frame', 'provider_unavailable', 'model_rejected', 'checks_false',
-                    'citation_alias', 'citation_set', 'table_count', 'table_shape', 'table_target',
-                    'documentary_limits_unchecked', 'quote_shape', 'quote_source', 'quote_not_literal',
-                    'table_owner', 'table_marker', 'pass_changed', 'edit_target', 'template', 'assembled_size'},
+                'independent_review_gate': _INDEPENDENT_REVIEW_GATES,
             }.items():
                 value = diagnostics.get(key)
                 row[key] = value if type(value) is str and value in values else 'other'

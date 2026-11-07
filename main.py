@@ -3860,6 +3860,7 @@ def _lock_root_cause_result(
     retrieval_citations: list[dict],
     *,
     max_causes: int,
+    preserve_source_alternatives: bool = False,
 ) -> tuple[dict, list[dict]]:
     result = dict(result or {})
     possible_causes = list(result.get("possible_causes") or [])
@@ -4004,6 +4005,12 @@ def _lock_root_cause_result(
     per_set_counts: dict[str, int] = {}
 
     for row in deduped:
+        # One source can document several mechanisms. On the independently
+        # reviewed Root path, source identity is not a reason to discard a
+        # distinct proposal before the semantic reviewer can evaluate it.
+        if preserve_source_alternatives is True:
+            final_rows.append(row)
+            continue
         set_key = str(row.get("dominant_set") or "")
         count = per_set_counts.get(set_key, 0)
         if count == 0:
@@ -13297,6 +13304,7 @@ def _v13_generate_root_cause_response(
     retrieval: dict,
     debug: bool,
     root_literal_fallback_fields: bool = False,
+    root_preserve_source_alternatives: bool = False,
 ) -> dict:
     citations = list(retrieval.get("citations") or retrieval.get("candidates") or [])
     citations = citations[:V13_MAX_EVIDENCE_ITEMS_ROOT_CAUSE]
@@ -13413,6 +13421,7 @@ def _v13_generate_root_cause_response(
         grounded_result,
         grounded_citations,
         max_causes=max_causes,
+        preserve_source_alternatives=root_preserve_source_alternatives,
     )
     synthesis_grounded = bool(grounded_result.get("possible_causes") and grounded_citations)
 
@@ -15866,6 +15875,10 @@ def _assistant_core_synthesize_root_cause(
             retrieval=root_retrieval,
             debug=request.debug,
             root_literal_fallback_fields=(
+                request.requested_mode == MODE_ROOT_CAUSE
+                and decision.effective_mode == MODE_ROOT_CAUSE
+            ),
+            root_preserve_source_alternatives=(
                 request.requested_mode == MODE_ROOT_CAUSE
                 and decision.effective_mode == MODE_ROOT_CAUSE
             ),

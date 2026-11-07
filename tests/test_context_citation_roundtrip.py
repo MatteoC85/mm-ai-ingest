@@ -151,16 +151,22 @@ class CitationRoundtripTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '^factual_context_review_invalid$'):
             review.build_messages(frame, question='q', response_language='en', sources_block=sources + ' changed')
 
-    def test_pass_cannot_add_support_or_change_prose_and_read_only_cannot_rewrite(self):
+    def test_success_label_preserves_explicit_support_and_read_only_still_forbids_edits(self):
         for template in (True, False):
             first, frame, _, _, _, wire = self.plain(template)
-            bad = deepcopy(wire); bad['additional_citation_ids'] = ['S1']
-            self.assertEqual(review.apply_wire_review(first, bad, frame)['independent_context_review']['gate'], 'pass_changed')
-            bad = deepcopy(wire); bad['edits'] = [{'target':'item:0', 'text':'Changed'}]
-            self.assertEqual(review.apply_wire_review(first, bad, frame)['outcome'], 'no_sources')
-            if not template:
-                bad['outcome'] = 'rewrite'
-                self.assertEqual(review.apply_wire_review(first, bad, frame)['outcome'], 'no_sources')
+            extra = deepcopy(wire); extra['additional_citation_ids'] = ['S1']
+            result = review.apply_wire_review(first, extra, frame)
+            self.assertEqual(result['independent_context_review']['gate'], 'accepted')
+            self.assertEqual(result['answer'], first['answer'])
+            self.assertEqual(result['citation_ids'], ['manual:p1','manual:p2'])
+            for label in ('pass','rewrite'):
+                explicit = deepcopy(wire); explicit['outcome'] = label
+                explicit['edits'] = [{'target':'item:0','text':first['expected_list_items'][0]}]
+                result = review.apply_wire_review(first, explicit, frame)
+                if template:
+                    self.assertEqual(result['answer'], first['answer'])
+                else:
+                    self.assertEqual(result['outcome'], 'no_sources')
 
 
 class CitationRoundtripOwnedTests(unittest.TestCase):

@@ -12,7 +12,7 @@ from typing import Any
 
 from . import review_references
 
-POLICY_VERSION = "root-response-quality-v7"
+POLICY_VERSION = "root-response-quality-v8"
 
 MAX_WHY_UNITS = 8
 # These are punctuation ambiguities, not evidence or diagnostic classifications.

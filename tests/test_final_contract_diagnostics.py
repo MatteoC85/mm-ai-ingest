@@ -19,7 +19,7 @@ from machinemind.ask import request_completion
 
 
 class FinalContractDiagnosticsTests(unittest.TestCase):
-    def test_independent_gate_is_debug_only_bounded_and_content_free_after_terminal_failure(self):
+    def test_independent_gate_is_content_free_and_survives_nondebug_terminal_failure(self):
         for debug in (True,False,'true'):
             owner=self.owner(debug)
             try:
@@ -32,12 +32,13 @@ class FinalContractDiagnosticsTests(unittest.TestCase):
                 row=terminal['meta']['request_completion']['contract_checks'][-1]
                 self.assertEqual(row['reason'],'factual_context_review_invalid')
                 self.assertEqual(row['outcome'],'unavailable')
+                self.assertEqual(row['independent_review_gate'],'quote_not_literal')
                 if debug is True:
                     self.assertEqual(row['independent_review_gate'],'quote_not_literal')
                     self.assertEqual(row['independent_review_edit_count'],100)
                 else:
-                    self.assertNotIn('independent_review_gate',row)
                     self.assertNotIn('independent_review_outcome',row)
+                    self.assertNotIn('independent_review_edit_count',row)
                 self.assertNotIn('PRIVATE',json.dumps(terminal))
             finally:owner.close()
         owner=self.owner(True)

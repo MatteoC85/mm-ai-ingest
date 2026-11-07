@@ -116,7 +116,6 @@ class FactualContextReviewTests(unittest.TestCase):
             self.verdict(outcome='rewrite',edits=[{'target':'item:1','text':'Changed'}, {'target':'item:1','text':'Changed again'}]),
             self.verdict(outcome='rewrite',edits=[{'target':'item:1','text':'[[SOURCE_TABLE:G1]]'}]),
             self.verdict(outcome='rewrite',edits=[{'target':'item:1','text':'[[FACTUAL_INVENTORY]]'}]),
-            self.verdict(outcome='pass',edits=[{'target':'item:1','text':'Changed on pass'}]),
         ]
         for body in ('No inventory','inline [[FACTUAL_INVENTORY]]','[[FACTUAL_INVENTORY]]\n[[FACTUAL_INVENTORY]]'):
             variants.append(self.verdict(outcome='rewrite',edits=[{'target':'template-answer','text':body}]))
@@ -162,12 +161,13 @@ class FactualContextReviewTests(unittest.TestCase):
                 s=review.schema(frame)['schema']['properties']['edits']
                 self.assertEqual(s['maxItems'],0)
                 self.assertNotIn('enum',s['items']['properties']['target'])
-                self.assertEqual(review.apply_review(first,self.verdict(table=False,outcome='rewrite'),frame)['outcome'],'no_sources')
+                unchanged=review.apply_review(first,self.verdict(table=False,outcome='rewrite'),frame)
+                self.assertEqual(unchanged['answer'],first['answer'])
+                self.assertEqual(unchanged['independent_context_review']['outcome'],'pass')
 
     def test_table_context_must_cover_exact_targets_and_quote_emitted_owning_source(self):
         _,first,frame,_=self.candidate()
         changes=[lambda v:v.update(table_contexts=[]),
-                 lambda v:v.update(outcome='pass'),
                  lambda v:v['table_contexts'].append(deepcopy(v['table_contexts'][0])),
                  lambda v:v['table_contexts'][0].update(target='item:1'),
                  lambda v:v['table_contexts'][0].update(documentary_limits_checked=False),
