@@ -511,6 +511,9 @@ class _CoreIntake:
 
             rt = replace(self.preparation,
                 preserve_procedure_context=self._procedure_family_context,
+                procedure_context_sources=tuple(item.context.source for item in self.session.records(
+                    request=request, handles=self._family_context_handles,
+                    current_allowed_sources=self._current())),
                 _v13_merge_candidates=ranking.v13_merge_candidates,
                 _v13_score_candidates=lambda q, rows, **kw:
                     ranking.v13_score_candidates(q, rows, runtime=self.runtime.score, **kw),
@@ -623,11 +626,14 @@ class _CoreIntake:
             operation = GenericGenerationEvidence(request=self.request, session=self.session,
                 readers=self.readers, authorize=self.authorize, invoke=self.invoke,
                 runtime=replace(self.generation, preserve_procedure_context=getattr(
-                    self, "_procedure_family_context", False)), allow_structured=self.tasks is not None)
+                    self, "_procedure_family_context", False),
+                    procedure_context_sources=tuple(item.context.source for item in self.session.records(
+                        request=self.request, handles=self._family_context_handles,
+                        current_allowed_sources=self._current()))), allow_structured=self.tasks is not None)
             result, selections = operation.run(parameters["retrieval"], self._selection)
             self._generated_response, self._generated_selections = deepcopy(result), selections
             if self._response_flow is not None:
-                self._response_flow.generated(result, selections, ())
+                self._response_flow.generated(result, selections, operation.validation_selection)
             return result
         return self.invoke(work, self.request)
 

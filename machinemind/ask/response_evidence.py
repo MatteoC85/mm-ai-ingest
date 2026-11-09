@@ -375,7 +375,10 @@ class ResponseEvidenceFlow(TaskGenerationEvidence):
                         information_task=self.decision.information_task,
                         required_answer_types=self.decision.required_answer_types,
                         facet_queries=self.decision.facet_queries))
-                extension = [] if conditions_family else rows
+                # An owned-context generic writer hands off its exact emitted
+                # pack, including admitted optional support. Deferred search
+                # hits must not reappear only at independent review.
+                extension = [] if conditions_family or self.execution.preserve_procedure_context else rows
                 packet = review_evidence.compile_packet(primary=primary,
                     extension=extension, render=self.execution._v13_sources_block,
                     max_records=effective_max_records, max_context_chars=effective_context_chars)

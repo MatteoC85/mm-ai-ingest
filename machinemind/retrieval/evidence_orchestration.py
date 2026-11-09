@@ -1303,6 +1303,8 @@ class AssistantCorePrepareEvidenceRuntime:
     re: Any
     time_module: Any
     preserve_procedure_context: bool = False
+    # Supplied only by the request owner from current canonical family handles.
+    procedure_context_sources: tuple[Any, ...] = ()
 
 
 def assistant_core_prepare_evidence(request: AssistantCoreRequest, retrieval: dict, decision: AssistantCoreDecision, *, runtime: AssistantCorePrepareEvidenceRuntime, lineage: Optional[Callable[..., None]]=None) -> dict:
@@ -1374,6 +1376,17 @@ def assistant_core_prepare_evidence(request: AssistantCoreRequest, retrieval: di
     complete_family_context = bool(canonical_ask_selection
         and runtime.preserve_procedure_context and decision.request_kind == KIND_PROCEDURE
         and not decision.degraded)
+    if complete_family_context:
+        from ..evidence.contracts import EvidenceContractError, SourceIdentity, SourceType
+        from .supplemental_evidence import storage_key
+        owned_sources = runtime.procedure_context_sources
+        if (not owned_sources or any(not isinstance(source, SourceIdentity)
+                or source.scope.company_id != request.company_id
+                or source.scope.machine_id != request.machine_id
+                or source.source_type not in {SourceType.PROCEDURE, SourceType.STEP}
+                for source in owned_sources)):
+            raise EvidenceContractError("owned procedure context lacks canonical family identities")
+        family_keys = frozenset(storage_key(source) for source in owned_sources)
     if decision.effective_mode == MODE_SMART_DIAGNOSTIC:
         from . import smart_sources
         # Smart questions need observation/legend/Step evidence even when it
@@ -1712,7 +1725,16 @@ def assistant_core_prepare_evidence(request: AssistantCoreRequest, retrieval: di
             match = root_clue_support.support_match(decision, _v13_candidate_text(candidate))
             (supported if match.get("matched_support_part_ids") else remaining).append(candidate)
         scored = (supported + remaining)[:24]
-    elif not complete_family_context:
+    elif complete_family_context:
+        # Complete canonical bodies are required context; search hits remain
+        # ordinary optional support, subject to the existing dedup/count policy.
+        family_rows = [c for c in scored if c.get("bubble_document_id") in family_keys]
+        if {c.get("bubble_document_id") for c in family_rows} != family_keys:
+            raise EvidenceContractError("preparation lost a required canonical family record")
+        support = _dedup_citations_by_snippet(
+            [c for c in scored if c.get("bubble_document_id") not in family_keys], max_items=24)
+        scored = family_rows + support
+    else:
         scored = _dedup_citations_by_snippet(scored, max_items=24)
 
     diagnostic_mode = decision.effective_mode in {MODE_ROOT_CAUSE, MODE_SMART_DIAGNOSTIC}
@@ -1752,7 +1774,7 @@ def assistant_core_prepare_evidence(request: AssistantCoreRequest, retrieval: di
         narrow_scope=request.narrow_scope,
     )
 
-    top_candidates = scored if complete_family_context else scored[:12]
+    top_candidates = (family_rows + support[:12]) if complete_family_context else scored[:12]
     source_types = [str(c.get("source_type") or "") for c in top_candidates]
     has_procedure_sources = any(st in {"procedure", "step"} for st in source_types)
     top_similarity = float(deterministic_signals.get("top_similarity") or 0.0)
@@ -2071,10 +2093,14 @@ def assistant_core_prepare_evidence(request: AssistantCoreRequest, retrieval: di
         }
 
     if supported and complete_family_context:
-        # The owned context acquisition already selected this canonical family.
-        # Ranking/facet display limits cannot remove an observed closing/safety
-        # record. Provider/context capacities still fail closed downstream.
-        selected = scored
+        # Complete family context is independent of the ordinary optional ASK
+        # allowance. Its length cannot erase a short mandatory PDF value/menu;
+        # the shared rendered-context and provider-cost bounds still apply.
+        optional_pool = [c for c in selected_pool if c.get("bubble_document_id") not in family_keys]
+        optional_limit = limit
+        optional = (_assistant_core_facet_balanced_pool(optional_pool, must_cover_facets,
+                    limit=optional_limit) if must_cover_facets and optional_limit else optional_pool[:optional_limit])
+        selected = family_rows + optional
     elif supported and must_cover_facets:
         selected = _assistant_core_facet_balanced_pool(
             selected_pool, must_cover_facets, limit=limit

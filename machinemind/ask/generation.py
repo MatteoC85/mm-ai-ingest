@@ -77,6 +77,7 @@ class AskGenerationRuntime:
     # Internal session binding only; never selected by request payload metadata.
     preserve_procedure_points: bool = False
     preserve_procedure_context: bool = False
+    procedure_context_sources: tuple[Any, ...] = ()
 
 
 def generate_ask_response(
@@ -469,6 +470,9 @@ class GenericGenerationEvidence:
         self.selected, self.rendered = (), ()
         self.input_handles = ()
         self.provider_handles = None
+        self.provider_input_handles = None
+        self.provider_rows = None
+        self.validation_selection = ()
         self.generation_packet = None
         self.retrieval = self.retrieval_snapshot = None
         self.sources = ResidualSourceAdapters(request=request, session=session,
@@ -535,19 +539,37 @@ class GenericGenerationEvidence:
             if not self.allow_structured and any(item.context.source.source_type != SourceType.DOCUMENT
                    for item in self.records(handles)):
                 raise GenerationEvidenceError("canonical structured synthesis composition pending")
+            self.provider_input_handles = handles
             self.provider_handles = handles
+            self.provider_rows = rows
             task = str((self.retrieval.get("assistant_core_contract") or {}).get("information_task") or "")
             if (task in {self.runtime.INFO_PROCEDURE_FULL, self.runtime.INFO_PROCEDURE_SEGMENT}
                     or self.runtime.preserve_procedure_context):
                 from .review_evidence import complete_limits, compile_packet
                 _, bounds = self.session.read_contract(request=self.request,
                     current_allowed_sources=self.current())
-                max_records, max_chars = complete_limits(rows, render=self.runtime._v13_sources_block,
+                primary, extension = rows, []
+                if self.runtime.preserve_procedure_context:
+                    owned = frozenset(self.runtime.procedure_context_sources)
+                    if not owned:
+                        raise GenerationEvidenceError("canonical family identities missing from generation")
+                    primary, extension = [], []
+                    observed = set()
+                    for row, item in zip(rows, self.records(handles)):
+                        if item.context.source in owned:
+                            primary.append(row); observed.add(item.context.source)
+                        else:
+                            extension.append(row)
+                    if observed != owned:
+                        raise GenerationEvidenceError("generation lost a required canonical family record")
+                max_records, max_chars = complete_limits(primary, render=self.runtime._v13_sources_block,
                     max_records=len(rows), max_context_chars=parameters["max_context_chars"],
                     max_bytes=bounds.legacy.max_bytes)
-                packet = compile_packet(primary=rows, extension=[], render=self.runtime._v13_sources_block,
+                packet = compile_packet(primary=primary, extension=extension, render=self.runtime._v13_sources_block,
                     max_records=max_records, max_context_chars=max_chars)
                 self.generation_packet = packet.diagnostic(reused=False)
+                self.provider_rows = list(packet.rows)
+                self.provider_handles = self.handles(self.provider_rows)
                 result = packet.sources
             else:
                 result = self.runtime._v13_sources_block(rows, **parameters)
@@ -574,10 +596,10 @@ class GenericGenerationEvidence:
 
     def _render(self, *, grounded_points, citations, max_points, q):
         def work():
-            if q != self.request.query or self.handles(citations) != self.provider_handles:
+            if q != self.request.query or self.handles(citations) != self.provider_input_handles:
                 raise GenerationEvidenceError("renderer differs from model source occurrences")
             answer, selected = self.runtime._render_grounded_answer_points(
-                grounded_points=grounded_points, citations=citations,
+                grounded_points=grounded_points, citations=self.provider_rows,
                 max_points=max_points, q=q)
             self.handles(citations)
             self.selected = self.handles(selected)
@@ -722,6 +744,9 @@ class GenericGenerationEvidence:
                     result.setdefault("meta", {})["generation_evidence"] = dict(self.generation_packet)
                 if self.runtime.preserve_procedure_context:
                     result["_assistant_core_force_semantic_verify"] = True
+                    if self.provider_rows is not None:
+                        result["_assistant_core_validation_evidence"] = list(self.provider_rows)
+                        self.validation_selection = (AskSelection("candidates", self.provider_handles),)
                 return result, selection
             return self.invoke(work, self.request)
         finally:
@@ -729,5 +754,6 @@ class GenericGenerationEvidence:
             self.refs.clear(); self.link_refs.clear()
             self.input_handles = self.selected = self.rendered = ()
             self.provider_handles = None
+            self.provider_input_handles = self.provider_rows = None
             self.generation_packet = None
             self.retrieval = self.retrieval_snapshot = None
