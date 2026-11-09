@@ -1710,12 +1710,13 @@ class TaskGenerationEvidence(GenericGenerationEvidence):
             _assistant_core_overview_inventory_records=self._inventory,
             _assistant_core_overview_records_block=self._inventory_block)
 
-    def prepare_family_context(self, retrieval, selections, decision):
+    def prepare_family_context(self, retrieval, selections, decision, *, selected_parent_handle=None):
         """Acquire context from one observed canonical family, without a model.
 
-        This is not a Procedure answer or a new relevance decision. Only relevant
-        admitted Step occurrences anchor the read. A missing or ambiguous canonical
-        relation leaves the original evidence unchanged; current authority and page
+        This is not a Procedure answer or an authority decision. Relevant admitted
+        Step occurrences or the existing router's one owned catalog parent anchor
+        the read. Missing/ambiguous canonical relations leave evidence unchanged;
+        current authority and page
         capacity failures propagate. No title catalog or legacy relation inference
         may manufacture the anchor.
         """
@@ -1752,27 +1753,40 @@ class TaskGenerationEvidence(GenericGenerationEvidence):
                         and not {"procedure", "step"}.issubset(preferred)):
                     return retrieval, selections, False
                 original = retrieval.get("citations") or retrieval.get("candidates") or []
-                steps = [row for row in original if self.tasks._v12_evidence_role(row) == "step"
-                    and (float(row.get("semantic_similarity", row.get("similarity", 0)) or 0) >= .34
-                         or float(row.get("assistant_core_query_overlap") or 0) >= .035
-                         or bool(row.get("exact_code_hit")))]
-                if not steps:
-                    return retrieval, selections, False
-                keys = list(dict.fromkeys(storage_key(item.context.source)
-                    for item in self.records(self.handles(steps))))
-                relations = self.parent_rows(steps, company_id=self.request.company_id,
-                    machine_id=self.request.machine_id, child_source_keys=keys,
-                    text_chars=max(800, int(self.tasks.family.ASK_STRUCTURED_DIRECT_TEXT_CHARS or 5000)))
-                parents = {str(row["parent_source_key"]) for row in relations}
-                mapped = {str(row["child_source_key"]) for row in relations}
-                if len(parents) != 1 or mapped != set(keys):
-                    return retrieval, selections, False
-                relation = relations[0]
-                parent = self.tasks.family._v12_relation_procedure_candidate(
-                    parent_source_key=relation["parent_source_key"],
-                    machine_id=self.request.machine_id, page_number=relation["page_number"],
-                    parent_text=relation["parent_text"], fallback_title="")
-                self.page_view(relation, parent)
+                if selected_parent_handle is None:
+                    steps = [row for row in original if self.tasks._v12_evidence_role(row) == "step"
+                        and (float(row.get("semantic_similarity", row.get("similarity", 0)) or 0) >= .34
+                             or float(row.get("assistant_core_query_overlap") or 0) >= .035
+                             or bool(row.get("exact_code_hit")))]
+                    if not steps:
+                        return retrieval, selections, False
+                    keys = list(dict.fromkeys(storage_key(item.context.source)
+                        for item in self.records(self.handles(steps))))
+                    relations = self.parent_rows(steps, company_id=self.request.company_id,
+                        machine_id=self.request.machine_id, child_source_keys=keys,
+                        text_chars=max(800, int(self.tasks.family.ASK_STRUCTURED_DIRECT_TEXT_CHARS or 5000)))
+                    parents = {str(row["parent_source_key"]) for row in relations}
+                    mapped = {str(row["child_source_key"]) for row in relations}
+                    if len(parents) != 1 or mapped != set(keys):
+                        return retrieval, selections, False
+                    relation = relations[0]
+                    parent = self.tasks.family._v12_relation_procedure_candidate(
+                        parent_source_key=relation["parent_source_key"],
+                        machine_id=self.request.machine_id, page_number=relation["page_number"],
+                        parent_text=relation["parent_text"], fallback_title="")
+                    self.page_view(relation, parent)
+                else:
+                    # Only the owner passes this actual occurrence, selected by
+                    # the SAME existing semantic router from its admitted parent
+                    # catalog. It is a relevance choice, not an authority grant.
+                    item = self.records((selected_parent_handle,))[0]
+                    if (item.context.source.source_type != SourceType.PROCEDURE
+                            or item.context.source.scope.company_id != self.request.company_id
+                            or item.context.source.scope.machine_id != self.request.machine_id):
+                        raise GenerationEvidenceError("selected catalog parent outside request scope")
+                    parent = self._materialize((selected_parent_handle,))[0]
+                    relation = {"parent_source_key": storage_key(item.context.source)}
+                    keys = []
                 related = self.related_rows(parent, company_id=self.request.company_id,
                     machine_id=self.request.machine_id, parent_source_key=relation["parent_source_key"],
                     text_chars=max(800, int(self.tasks.expansion.ASK_STRUCTURED_DIRECT_TEXT_CHARS or 5000)))
@@ -1801,6 +1815,20 @@ class TaskGenerationEvidence(GenericGenerationEvidence):
                     procedure=parent, existing_steps=[], runtime=self.tasks.expansion,
                     trace=CanonicalRows())
                 self._check_family_ambiguity(children)
+                if selected_parent_handle is not None:
+                    keys = list(dict.fromkeys(storage_key(item.context.source)
+                        for item in self.records(self.handles(children))))
+                    relations = self.parent_rows(children, company_id=self.request.company_id,
+                        machine_id=self.request.machine_id, child_source_keys=keys,
+                        text_chars=max(800, int(self.tasks.family.ASK_STRUCTURED_DIRECT_TEXT_CHARS or 5000)))
+                    if ({str(row["parent_source_key"]) for row in relations} != {relation["parent_source_key"]}
+                            or {str(row["child_source_key"]) for row in relations} != set(keys)):
+                        raise GenerationEvidenceError("selected catalog family lacks exact canonical parent proof")
+                    fresh = relations[0]
+                    parent = self.tasks.family._v12_relation_procedure_candidate(
+                        parent_source_key=fresh["parent_source_key"], machine_id=self.request.machine_id,
+                        page_number=fresh["page_number"], parent_text=fresh["parent_text"], fallback_title="")
+                    self.page_view(fresh, parent)
                 # A seed outside this parent's observed child set is not a unique
                 # family even if a stale/raw annotation claims the same parent.
                 child_keys = {storage_key(i.context.source) for i in self.records(self.handles(children))}

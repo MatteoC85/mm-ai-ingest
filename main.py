@@ -13851,6 +13851,8 @@ def _assistant_core_deterministic_router_fallback(
     }
 
 def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) -> dict:
+    from machinemind.ask.request_completion import current as _current_ask_completion
+    protected_ask_catalog = bool(request.requested_mode == MODE_ASK and _current_ask_completion() is not None)
     is_root_cause = (
         str(request.requested_mode or "").strip().lower() == MODE_ROOT_CAUSE
     )
@@ -13873,6 +13875,25 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
         for c in supplied
         if str(c.get("citation_id") or "").strip()
     }
+    procedure_catalog_block = ""
+    if protected_ask_catalog:
+        catalog_parts, catalog_chars = [], 0
+        for candidate in candidates:
+            if (candidate.get("assistant_core_parent_catalog_entry") is not True
+                    or _assistant_core_candidate_source_type(candidate) != "procedure"):
+                continue
+            cid = str(candidate.get("citation_id") or "").strip()
+            text = _v13_candidate_text(candidate).strip()
+            if not cid or not text or len(catalog_parts) >= 12:
+                continue
+            part = f"[{cid}] {text[:600]}"
+            separator_chars = 2 if catalog_parts else 0
+            if catalog_chars + len(part) + separator_chars > 8000:
+                continue
+            catalog_parts.append(part)
+            catalog_chars += len(part) + separator_chars
+            supplied_ids.add(cid)
+        procedure_catalog_block = "\n\n".join(catalog_parts)
     if not evidence_block:
         evidence_block = "(no indexed evidence candidate was retrieved)"
 
@@ -13935,6 +13956,19 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
             "numeric facet with its unit/context as mandatory, alongside the requested "
             "checklist/safety facets. A pure numeric lookup without requested procedural "
             "preconditions does not acquire this scope.")
+    if procedure_catalog_block:
+        system_msg += (
+            " PROCEDURE_OPERATION_CATALOG contains bounded, possibly incomplete, admitted "
+            "parent-operation descriptions, not proof that a complete answer is available. "
+            "For a procedural request, independently identify the one catalog operation that "
+            "matches the complete USER_REQUEST by meaning, including requested phase and "
+            "explicit exclusions. Include that parent's shown ID in relevant_evidence_ids "
+            "when uniquely applicable, even when missing detailed Steps or values means "
+            "evidence_state is unsupported/refine. A numeric facet or a nearby Step from a "
+            "different operation must not replace the requested operation's identity. "
+            "Keep every required facet and answer type. If no operation is uniquely "
+            "applicable, do not select a parent. Selecting a parent grants no authority and "
+            "does not assert factual, safety or phase coverage.")
     if is_root_cause:
         # Factual arrays are constructed from the verified partition, not generated
         # a second time with potentially different wording.
@@ -13965,6 +13999,8 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
         f"SCOPE: {request.ai_scope}\n\n"
         f"USER_REQUEST:\n{request.query}\n\n"
         f"{epistemic_block}"
+        + (f"PROCEDURE_OPERATION_CATALOG:\n{procedure_catalog_block}\n\n" if procedure_catalog_block else "")
+        +
         f"INDEXED_EVIDENCE:\n{evidence_block}\n\n"
         "Return only the required JSON. Empty safety_reason and out_of_scope_reason unless the corresponding request_kind is selected."
     )

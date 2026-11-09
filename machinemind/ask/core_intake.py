@@ -27,7 +27,7 @@ from .validation import AskValidationRuntime
 from .response_evidence import ResponseEvidenceFlow
 from .generation import AskGenerationRuntime, GenericGenerationEvidence
 from .task_generation import TaskSynthesisRuntime, TaskGenerationEvidence
-from ..evidence.contracts import EvidenceContractError
+from ..evidence.contracts import EvidenceContractError, SourceType
 from ..evidence.ask_input import _same_value, ask_request_key
 from ..retrieval.ask_composition import AskEvidenceSession, AskSelection, RecordHandle
 from ..retrieval.production_adapters import ProductionReaderAdapters
@@ -110,6 +110,10 @@ class _CoreIntake:
         self._task_input = {}
         self._task_used = set()
         self._generated_validation_selection = None
+        self._procedure_catalog = {}
+        self._selected_catalog_parent = None
+        self._family_context_handles = ()
+        self._family_context_decision = None
         if type(consumers) is not bool or (consumers and
                 (generation is None or tasks is None or preparation is None)):
             raise CoreIntakeError("explicit complete synthesis composition required before consumers")
@@ -314,12 +318,106 @@ class _CoreIntake:
                 authorize=self.authorize, invoke=self.invoke,
                 max_trace_records=self.runtime.max_trace_records,
                 max_trace_bytes=self.runtime.max_trace_bytes)
-            return self._remember(result, selections)
+            self._remember(result, selections)
+            return self._add_procedure_catalog(request, result)
         return self.invoke(work, request)
+
+    def _add_procedure_catalog(self, request, data):
+        """Bounded discovery labels in the same admitted source collections.
+
+        The existing semantic router chooses an applicable operation; catalog
+        membership neither grants a source nor proves any answer obligation.
+        """
+        scope = self._scope()
+        if (request.requested_mode != "ask" or request.allowed_effective_modes != ("ask",)
+                or self.tasks is None or self.generation is None or scope.ai_scope != "machine_all"
+                or request.narrow_scope or scope.document_ids or scope.bubble_document_id):
+            return data
+        handles = self.readers.candidate_handles("read_structured_direct_page_evidence",
+            q=request.query, planner={"_ask_procedure_family_catalog": True}, top_k=12)
+        parents = []
+        seen_sources = set()
+        for handle, item in zip(handles, self._values(handles)):
+            source = self.session.records(request=request, handles=(handle,),
+                current_allowed_sources=self._current())[0].context.source
+            if (source.source_type != SourceType.PROCEDURE or source.scope.machine_id != request.machine_id
+                    or source in seen_sources):
+                continue
+            seen_sources.add(source)
+            view = deepcopy(item)
+            view.update(similarity=0.0, semantic_similarity=0.0, retrieval_score=0.0,
+                structured_direct_score=0.0, assistant_core_parent_catalog_entry=True)
+            derived = self.session.derive_batch(request=request, views=(((handle,), view),),
+                operation=CORE_INTAKE_VERSION+":router-procedure-catalog", current_allowed_sources=self._current())[0]
+            cid = str(view.get("citation_id") or "")
+            if not cid or cid in self._procedure_catalog:
+                raise CoreIntakeError("router catalog occurrence identity ambiguous")
+            self._procedure_catalog[cid] = derived
+            parents.append(derived)
+            if len(parents) == 12:
+                break
+        if not parents:
+            return data
+        updated, selections = dict(data), []
+        for selected in self._selection:
+            updated[selected.name] = list(data[selected.name]) + self._values(tuple(parents))
+            selections.append(AskSelection(selected.name, selected.records+tuple(parents)))
+        return self._remember(updated, tuple(selections))
+
+    def route(self, request, data):
+        def work():
+            self.select(request, data, None, "core.route.input")
+            result = self.core.hooks.route_semantically(request, data)
+            self.session.validate_records(request=request, handles=tuple(self._procedure_catalog.values()),
+                current_allowed_sources=self._current())
+            choices = {self._procedure_catalog[cid] for cid in (result.get("relevant_evidence_ids") or [])
+                if isinstance(cid, str) and cid in self._procedure_catalog} if isinstance(result, dict) else set()
+            identities = {item.context.source for item in self.session.records(request=request,
+                handles=tuple(choices), current_allowed_sources=self._current())}
+            self._selected_catalog_parent = next(iter(choices)) if len(identities) == 1 else None
+            return result
+        return self.invoke(work, request)
+
+    def _acquire_family_context(self, request, data, decision):
+        if self.tasks is None or self.generation is None:
+            return data
+        context = TaskGenerationEvidence(request=request, session=self.session,
+            readers=self.readers, authorize=self.authorize, invoke=self.invoke,
+            runtime=self.generation, tasks=self.tasks)
+        data, selections, recovered = context.prepare_family_context(data, self._selection, decision,
+            selected_parent_handle=self._selected_catalog_parent)
+        self._remember(data, selections)
+        if recovered:
+            selected = next(s for s in selections if s.name == "candidates")
+            values = self.session.records(request=request, handles=selected.records,
+                current_allowed_sources=self._current())
+            self._family_context_handles = tuple(handle for handle, item in zip(selected.records, values)
+                if item.context.source.source_type in {SourceType.PROCEDURE, SourceType.STEP})
+            self._family_context_decision = deepcopy(decision)
+        return data
+
+    def _restore_family_context(self, request, data, decision):
+        if not self._family_context_handles:
+            return data
+        if decision != self._family_context_decision:
+            raise CoreIntakeError("selected operation context changed decision")
+        updated, selections = dict(data), []
+        for selected in self._selection:
+            values = self.session.records(request=request, handles=selected.records,
+                current_allowed_sources=self._current())
+            extras = tuple(handle for handle, item in zip(selected.records, values)
+                if item.context.source.source_type not in {SourceType.PROCEDURE, SourceType.STEP})
+            handles = self._family_context_handles + extras
+            updated[selected.name] = self._values(handles)
+            selections.append(AskSelection(selected.name, handles))
+        return self._remember(updated, tuple(selections))
 
     def refine(self, request, data, decision):
         def work():
+            nonlocal data
             self.select(request, data, decision, "core.refine.input")
+            if self._selected_catalog_parent is not None:
+                data = self._acquire_family_context(request, data, decision)
             result, selections = producers.refine_records(request=request,
                 session=self.session, retrieval=data, selections=self._selection,
                 decision=decision, runtime=replace(self.runtime.refine,
@@ -329,7 +427,10 @@ class _CoreIntake:
                 initial_adapter=self._initial, authorize=self.authorize,
                 invoke=self.invoke, max_trace_records=self.runtime.max_trace_records,
                 max_trace_bytes=self.runtime.max_trace_bytes)
-            return self._remember(result, selections)
+            self._remember(result, selections)
+            # Keep FULL existing facet/manual refinement. It can supply a
+            # mandatory value/menu absent from the chosen Procedure family.
+            return self._restore_family_context(request, result, decision)
         return self.invoke(work, request)
 
     def select(self, request, data, decision, stage):
@@ -387,15 +488,10 @@ class _CoreIntake:
             if self._prepared:
                 raise CoreIntakeError("duplicate preparation boundary")
             self.select(request, data, decision, "core.prepare.input")
-            self._procedure_family_context = False
-            if self.tasks is not None and self.generation is not None:
-                context = TaskGenerationEvidence(request=request, session=self.session,
-                    readers=self.readers, authorize=self.authorize, invoke=self.invoke,
-                    runtime=self.generation, tasks=self.tasks)
-                data, selections, recovered = context.prepare_family_context(
-                    data, self._selection, decision)
-                self._remember(data, selections)
-                self._procedure_family_context = recovered
+            if not self._family_context_handles:
+                data = self._acquire_family_context(request, data, decision)
+            data = self._restore_family_context(request, data, decision)
+            self._procedure_family_context = bool(self._family_context_handles)
 
             def catalog(req, **params):
                 self._check(req)
@@ -584,7 +680,7 @@ class _CoreIntake:
             try:
                 self._check(request)
                 local_hooks = replace(self.core.hooks, retrieve_neutral=self.neutral,
-                    refine_retrieval=self.refine, prepare_evidence=self.prepare,
+                    route_semantically=self.route, refine_retrieval=self.refine, prepare_evidence=self.prepare,
                     build_no_evidence=self._build_empty_response if self.consumers else self.core.hooks.build_no_evidence)
                 # Same implementation, ONE run inside request_binding. This
                 # instance is an immutable per-request hooks container only.
@@ -609,6 +705,10 @@ class _CoreIntake:
                 self._generated_validation_selection = None
                 self._task_input.clear()
                 self._task_used.clear()
+                self._procedure_catalog.clear()
+                self._selected_catalog_parent = None
+                self._family_context_handles = ()
+                self._family_context_decision = None
         return self.owner_invoke(work, request)
 
 
