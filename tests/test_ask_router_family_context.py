@@ -20,6 +20,8 @@ from machinemind.ask.request_binding import AskRequestEvidence,run_core_request
 from machinemind.evidence.contracts import EvidenceContractError,SourceIdentity,SourceScope,SourceType,SourceFormat,ScopeLevel
 from machinemind.retrieval.ask_composition import AskSelection
 from machinemind.retrieval.page_evidence import _PageReadCapture
+from machinemind.retrieval.production_adapters import ProductionReaderAdapters
+from machinemind.retrieval import receipt_producers
 import test_ask_conditions_family_admission as owned
 import test_ask_procedure_context_recovery as context
 
@@ -34,8 +36,9 @@ def catalog():
 
 
 class RouterFixture(context.ContextFixture):
-    def __init__(self,test,*,choice='install',revoke=False,manual=None,**kw):
+    def __init__(self,test,*,choice='install',revoke=False,manual=None,relevant_choices=(),**kw):
         self.choice,self.revoke_catalog=choice,revoke
+        self.relevant_choices=relevant_choices
         self.router_raw=deepcopy(kw.get('raw') or context.router())
         self.refine_calls=[]
         super().__init__(test,rows=kw.pop('rows',catalog()),**kw)
@@ -76,9 +79,11 @@ class RouterFixture(context.ContextFixture):
         self.calls.append(('router',deepcopy(messages),deepcopy(kw)))
         self.test.assertIn('PROCEDURE_OPERATION_CATALOG:',messages[1]['content'])
         raw=deepcopy(self.router_raw)
-        choices=[self.choice] if isinstance(self.choice,str) else self.choice or []
-        raw['relevant_evidence_ids']=[next((cid for cid in self.owner._procedure_catalog
-            if cid.startswith('procedure:'+choice+':')),choice) for choice in choices]
+        def exact_id(choice):
+            return next((cid for cid in self.owner._procedure_catalog
+                if isinstance(choice,str) and cid.startswith('procedure:'+choice+':')),choice)
+        raw['selected_procedure_parent_id']=exact_id(self.choice)
+        raw['relevant_evidence_ids']=[exact_id(choice) for choice in self.relevant_choices]
         if self.revoke_catalog:self.allowance=frozenset(s for s in self.allowance if s.source_id!='install')
         return raw,'offline-router'
 
@@ -152,6 +157,8 @@ class AskRouterFamilyContextTests(unittest.TestCase):
             self.assertEqual([c[0] for c in h.calls],['router','writer','reviewer'])
             self.assertTrue(h.refine_calls)
             self.assertTrue(h.owner._response_flow.completed)
+            self.assertEqual(h.calls[0][2]['json_schema']['schema']['properties']['selected_procedure_parent_id']['type'],['string','null'])
+            self.assertNotIn('selected_procedure_parent_id',result['meta']['assistant_core_v2'])
             for _,_,_,body in h.rows[:5]:
                 self.assertIn(body,h.writer_packets[0]);self.assertIn(body,h.review_packets[0])
             self.assertNotIn('Rilasciare emergenze',h.writer_packets[0])
@@ -171,6 +178,68 @@ class AskRouterFamilyContextTests(unittest.TestCase):
                     self.assertFalse(h.owner._procedure_family_context)
                     self.assertTrue(h.refine_calls)
                 finally:h.close()
+
+    def test_explicit_null_does_not_promote_optional_parent_citations(self):
+        h=RouterFixture(self,choice=None,relevant_choices=('install',))
+        try:
+            self.assertEqual(h.run_core()['status'],'no_sources')
+            self.assertIsNone(h.owner._selected_catalog_parent)
+            self.assertFalse(h.owner._procedure_family_context)
+        finally:h.close()
+
+    def test_provider_parent_id_requires_exact_string_not_coercion(self):
+        for choice in (13,True,{'id':'install'},' procedure:install:p1','procedure:install:p1 '):
+            with self.subTest(choice=choice):
+                h=RouterFixture(self,choice=choice,relevant_choices=('install',))
+                try:
+                    self.assertEqual(h.run_core()['status'],'no_sources')
+                    self.assertIsNone(h.owner._selected_catalog_parent)
+                finally:h.close()
+
+    def test_selected_family_filters_later_enrichment_handles_before_preparation(self):
+        h=RouterFixture(self,manual='Calibration voltage: 24 V. Calibration display menu path: Service > Calibration > Voltage.')
+        checked=[]
+        real_prepare=receipt_producers.prepare_records
+        try:
+            original=h.owner._selection[0].records
+            manual=h.manual_pack[1][0].records
+            def prepare(**kw):
+                # These are real admitted source occurrences, not metadata IDs.
+                injected=original+manual
+                records=h.session.records(request=h.request,handles=injected,current_allowed_sources=h.allowance)
+                expected=tuple(handle for handle,item in zip(injected,records)
+                    if item.context.source.source_type not in {SourceType.PROCEDURE,SourceType.STEP}
+                    or item.context.source.source_id.startswith('install'))
+                callbacks=[('catalog',kw['source_callbacks']['catalog'],dict(req=h.request)),
+                    ('neighbors',kw['anchored_source_callbacks']['neighbors'],dict(company_id=h.request.company_id,
+                        machine_id=h.request.machine_id,response_language=h.request.response_language)),
+                    ('sections',kw['anchored_source_callbacks']['sections'],dict(request=h.request))]
+                with patch.object(ProductionReaderAdapters,'candidate_handles',return_value=injected):
+                    for name,callback,args in callbacks:
+                        self.assertEqual(callback(**args),expected)
+                        checked.append(name)
+                return real_prepare(**kw)
+            with patch.object(receipt_producers,'prepare_records',prepare):result=h.run_core()
+            self.assertEqual(result['status'],'answered')
+            self.assertEqual(checked,['catalog','neighbors','sections'])
+            self.assertIn(h.manual,h.writer_packets[0])
+            self.assertIn(h.manual,h.review_packets[0])
+            self.assertNotIn('lubrication indicator',h.writer_packets[0])
+            self.assertNotIn('lubrication indicator',h.review_packets[0])
+        finally:h.close()
+
+    def test_actual_core_owned_selection_keeps_context_for_nonprocedure_numeric_and_checks(self):
+        for task in ('numeric_specification','document_explanation'):
+            raw=context.router();raw.update(request_kind='factual',information_task=task,procedure_scope='')
+            h=RouterFixture(self,raw=raw)
+            try:
+                result=h.run_core()
+                self.assertEqual(result['status'],'answered')
+                self.assertTrue(h.owner._procedure_family_context)
+                self.assertEqual([c[0] for c in h.calls],['router','writer','reviewer'])
+                for _,_,_,body in h.rows[:5]:
+                    self.assertIn(body,h.writer_packets[0]);self.assertIn(body,h.review_packets[0])
+            finally:h.close()
 
     def test_revoked_catalog_parent_fails_before_refinement_writer(self):
         h=RouterFixture(self,revoke=True)
@@ -247,11 +316,40 @@ class AskRouterFamilyContextTests(unittest.TestCase):
             h.owner._add_procedure_catalog(h.request,h.prepared)
             data={**h.prepared,'candidates':h.owner._values(h.owner._selection[0].records)}
             captured=[]
-            def router(messages,**kw):captured.append(messages);return context.router(),'offline-router'
+            def router(messages,**kw):captured.append((messages,kw));return context.router(),'offline-router'
             with patch.object(self.m,'_v13_json_models',router):self.m._assistant_core_router_call(h.request,data)
             self.assertEqual(len(captured),1)
-            self.assertNotIn('PROCEDURE_OPERATION_CATALOG:',captured[0][1]['content'])
-            self.assertNotIn('possibly incomplete, admitted',captured[0][0]['content'])
+            self.assertNotIn('PROCEDURE_OPERATION_CATALOG:',captured[0][0][1]['content'])
+            self.assertNotIn('possibly incomplete, admitted',captured[0][0][0]['content'])
+            self.assertNotIn('selected_procedure_parent_id',captured[0][1]['json_schema']['schema']['properties'])
+        finally:h.close()
+
+    def test_root_and_smart_catalog_flags_keep_identical_existing_router_protocol(self):
+        h=RouterFixture(self)
+        try:
+            h.owner._add_procedure_catalog(h.request,h.prepared)
+            data={**h.prepared,'candidates':h.owner._values(h.owner._selection[0].records)}
+            for mode in ('root_cause','smart_diagnostic'):
+                captures=[]
+                def provider(messages,**kw):
+                    captures.append((deepcopy(messages),deepcopy(kw)))
+                    raw=context.router();raw['selected_procedure_parent_id']='forged'
+                    return raw,'offline-router'
+                for protected in (False,True):
+                    completion=(request_completion.RequestCompletion(runtime=self.m._assistant_core_request_flow_runtime(),
+                        payload=SimpleNamespace(company_id=h.request.company_id),started=time.monotonic()) if protected else None)
+                    try:
+                        request=replace(h.request,requested_mode=mode,allowed_effective_modes=(mode,),metadata={})
+                        with patch.object(self.m,'_v13_json_models',provider), \
+                             patch.object(self.m,'_v13_current_budget',return_value=SimpleNamespace(remaining=lambda:80.)):
+                            out=self.m._assistant_core_router_call(request,data)
+                        self.assertNotIn('selected_procedure_parent_id',out)
+                    finally:
+                        if completion:completion.close()
+                self.assertEqual(len(captures),2)
+                self.assertEqual(captures[0],captures[1])
+                self.assertNotIn('selected_procedure_parent_id',captures[0][1]['json_schema']['schema']['properties'])
+                self.assertNotIn('PROCEDURE_OPERATION_CATALOG:',captures[0][0][1]['content'])
         finally:h.close()
 
     def test_wrong_but_authorized_parent_keeps_only_its_family_and_review_rejects(self):
@@ -279,16 +377,21 @@ class AskRouterFamilyContextTests(unittest.TestCase):
                 chunk_full=('Operation description '+str(i)+' ')*100,assistant_core_parent_catalog_entry=True)
                 for i in range(20)])
             def model(messages,**kw):
-                captured.append(messages)
-                raw=context.router();raw['relevant_evidence_ids']=['catalog-19'];return raw,'offline-router'
+                captured.append((messages,kw))
+                raw=context.router();raw['relevant_evidence_ids']=['catalog-19']
+                raw['selected_procedure_parent_id']='catalog-19';return raw,'offline-router'
             with patch.object(self.m,'_v13_gate_candidate_block',return_value=('',[])), \
                  patch.object(self.m,'_v13_json_models',model):
                 response=self.m._assistant_core_router_call(h.request,data)
-            block=captured[0][1]['content'].split('PROCEDURE_OPERATION_CATALOG:\n',1)[1].split('\n\nINDEXED_EVIDENCE:',1)[0]
+            block=captured[0][0][1]['content'].split('PROCEDURE_OPERATION_CATALOG:\n',1)[1].split('\n\nINDEXED_EVIDENCE:',1)[0]
             self.assertLessEqual(len(block),8000)
             self.assertLessEqual(block.count('[catalog-'),12)
             self.assertNotIn('[catalog-19]',block)
             self.assertEqual(response['relevant_evidence_ids'],[])
+            self.assertIsNone(response['selected_procedure_parent_id'])
+            choices=captured[0][1]['json_schema']['schema']['properties']['selected_procedure_parent_id']['enum']
+            self.assertEqual(choices,[None]+['catalog-'+str(i) for i in range(block.count('[catalog-'))])
+            self.assertIn('selected_procedure_parent_id',captured[0][1]['json_schema']['schema']['required'])
         finally:completion.close();h.close()
 
     def test_display_metadata_without_private_catalog_handle_cannot_select_family(self):
@@ -305,7 +408,8 @@ class AskRouterFamilyContextTests(unittest.TestCase):
             h.owner._selection=(AskSelection('candidates',handles),AskSelection('citations',handles))
             h.owner.core=AssistantCoreV2(replace(h.owner.core.hooks,route_semantically=self.m._assistant_core_router_call))
             def model(messages,**kw):
-                raw=context.router();raw['relevant_evidence_ids']=[view['citation_id']];return raw,'offline-router'
+                raw=context.router();raw['relevant_evidence_ids']=[view['citation_id']]
+                raw['selected_procedure_parent_id']=view['citation_id'];return raw,'offline-router'
             with patch.object(self.m,'_v13_json_models',model):h.owner.route(h.request,data)
             self.assertIsNone(h.owner._selected_catalog_parent)
             self.assertEqual(h.owner._procedure_catalog,{})

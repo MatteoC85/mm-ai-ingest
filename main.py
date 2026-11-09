@@ -4,6 +4,7 @@ import asyncio
 import concurrent.futures
 import contextvars
 import functools
+from copy import deepcopy
 from dataclasses import replace as _dataclass_replace
 import threading
 import base64
@@ -13876,6 +13877,7 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
         if str(c.get("citation_id") or "").strip()
     }
     procedure_catalog_block = ""
+    procedure_catalog_ids = []
     if protected_ask_catalog:
         catalog_parts, catalog_chars = [], 0
         for candidate in candidates:
@@ -13891,6 +13893,7 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
             if catalog_chars + len(part) + separator_chars > 8000:
                 continue
             catalog_parts.append(part)
+            procedure_catalog_ids.append(cid)
             catalog_chars += len(part) + separator_chars
             supplied_ids.add(cid)
         procedure_catalog_block = "\n\n".join(catalog_parts)
@@ -13962,12 +13965,15 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
             "parent-operation descriptions, not proof that a complete answer is available. "
             "For a procedural request, independently identify the one catalog operation that "
             "matches the complete USER_REQUEST by meaning, including requested phase and "
-            "explicit exclusions. Include that parent's shown ID in relevant_evidence_ids "
-            "when uniquely applicable, even when missing detailed Steps or values means "
+            "explicit exclusions. Set selected_procedure_parent_id to that parent's exact "
+            "shown ID when uniquely applicable, independently of relevant_evidence_ids, "
+            "information_task and required answer shapes, even when missing detailed Steps or values means "
             "evidence_state is unsupported/refine. A numeric facet or a nearby Step from a "
             "different operation must not replace the requested operation's identity. "
             "Keep every required facet and answer type. If no operation is uniquely "
-            "applicable, do not select a parent. Selecting a parent grants no authority and "
+            "applicable, or the request is unsafe, out of scope or uninterpretable, set "
+            "selected_procedure_parent_id to null. Do not force optional evidence citations "
+            "to identify an operation. Selecting a parent grants no authority and "
             "does not assert factual, safety or phase coverage.")
     if is_root_cause:
         # Factual arrays are constructed from the verified partition, not generated
@@ -14040,23 +14046,31 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
                     + _smart_review.FINALIZATION_RESERVE_SECONDS)
             if router_timeout < 1:
                 raise _V13BudgetExceeded("smart_router_deadline_reserve")
+        router_schema = (
+            _retrieval_diagnostic_query.router_schema_with_diagnostic_basis(
+                build_router_schema(allowed_modes), original_query=request.query
+            ) if is_root_cause else (
+                _ask_factual_coverage.router_schema(
+                    _ask_procedure_scope.router_schema(
+                        _ask_request_readiness.router_schema(
+                            _retrieval_precision_facts.router_schema_with_scalar_target(build_router_schema(allowed_modes))
+                        )
+                    )
+                ) if request.requested_mode == MODE_ASK else build_router_schema(allowed_modes)
+            )
+        )
+        if procedure_catalog_ids:
+            # Private ASK wire field, consumed by its request-owned intake before
+            # decision normalization. Only descriptions actually sent are choices.
+            router_schema = deepcopy(router_schema)
+            router_schema["schema"]["properties"]["selected_procedure_parent_id"] = {
+                "type": ["string", "null"], "enum": [None, *procedure_catalog_ids],
+            }
+            router_schema["schema"]["required"].append("selected_procedure_parent_id")
         parsed, model_used = _v13_json_models(
             [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
             models=router_models,
-            json_schema=(
-                _retrieval_diagnostic_query.router_schema_with_diagnostic_basis(
-                    build_router_schema(allowed_modes), original_query=request.query
-                ) if is_root_cause else (
-                    _ask_factual_coverage.router_schema(
-                        _ask_procedure_scope.router_schema(
-                            _ask_request_readiness.router_schema(
-                                _retrieval_precision_facts.router_schema_with_scalar_target(build_router_schema(allowed_modes))
-                            )
-                        )
-                    )
-                    if request.requested_mode == MODE_ASK else build_router_schema(allowed_modes)
-                )
-            ),
+            json_schema=router_schema,
             effort=router_effort,
             reasoning_mode="",
             timeout=router_timeout,
@@ -14071,6 +14085,15 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
                 elapsed_seconds=round(time_module.monotonic() - router_started, 3),
             )
         out = dict(parsed or {})
+        if procedure_catalog_ids:
+            selected_parent = out.get("selected_procedure_parent_id")
+            # Do not repair whitespace/types or accept an un-emitted catalog ID.
+            out["selected_procedure_parent_id"] = (
+                selected_parent if type(selected_parent) is str
+                and selected_parent in procedure_catalog_ids else None
+            )
+        else:
+            out.pop("selected_procedure_parent_id", None)
         if profile is not None:
             profile = _retrieval_diagnostic_query.profile_from_router(out, profile)
             if isinstance(request.metadata, dict):

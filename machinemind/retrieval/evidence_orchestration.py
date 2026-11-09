@@ -1374,7 +1374,8 @@ def assistant_core_prepare_evidence(request: AssistantCoreRequest, retrieval: di
         and decision.effective_mode == MODE_ASK
     )
     complete_family_context = bool(canonical_ask_selection
-        and runtime.preserve_procedure_context and decision.request_kind == KIND_PROCEDURE
+        and runtime.preserve_procedure_context
+        and decision.request_kind not in {"unsafe_request", "out_of_scope", "ambiguous"}
         and not decision.degraded)
     if complete_family_context:
         from ..evidence.contracts import EvidenceContractError, SourceIdentity, SourceType

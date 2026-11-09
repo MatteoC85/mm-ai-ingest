@@ -1737,7 +1737,7 @@ class TaskGenerationEvidence(GenericGenerationEvidence):
                 if (scope.ai_scope != "machine_all"
                         or self.request.requested_mode != "ask"
                         or decision.effective_mode != "ask" or decision.degraded
-                        or decision.request_kind != "procedure"):
+                        or decision.request_kind in {"unsafe_request", "out_of_scope", "ambiguous"}):
                     return retrieval, selections, False
                 # This context lane serves mixed factual/check requests. Existing
                 # A full Procedure answer keeps its established producer policy.
@@ -1745,9 +1745,14 @@ class TaskGenerationEvidence(GenericGenerationEvidence):
                     return retrieval, selections, False
                 requirements = set(decision.required_answer_types)
                 requirements.update(f.answer_type for f in decision.facet_queries if f.must_cover)
-                if (not requirements.intersection({"checklist", "safety_conditions"})
-                        or not requirements.intersection({"numeric_value", "interface_locations", "state_sequence"})):
-                    return retrieval, selections, False
+                if selected_parent_handle is None:
+                    # Legacy seed recovery retains its existing mixed-shape
+                    # policy. An explicitly owned operation is context regardless
+                    # of whether the answer is numeric, checks or explanation.
+                    if (decision.request_kind != "procedure"
+                            or not requirements.intersection({"checklist", "safety_conditions"})
+                            or not requirements.intersection({"numeric_value", "interface_locations", "state_sequence"})):
+                        return retrieval, selections, False
                 preferred = set(decision.preferred_source_types)
                 if (decision.source_type_policy == "require" and preferred
                         and not {"procedure", "step"}.issubset(preferred)):

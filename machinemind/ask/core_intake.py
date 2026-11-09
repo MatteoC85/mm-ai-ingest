@@ -370,11 +370,18 @@ class _CoreIntake:
             result = self.core.hooks.route_semantically(request, data)
             self.session.validate_records(request=request, handles=tuple(self._procedure_catalog.values()),
                 current_allowed_sources=self._current())
-            choices = {self._procedure_catalog[cid] for cid in (result.get("relevant_evidence_ids") or [])
-                if isinstance(cid, str) and cid in self._procedure_catalog} if isinstance(result, dict) else set()
+            # The private router choice is independent of optional citations and
+            # output shape. Consume it here; public normalized decisions do not
+            # carry an occurrence or gain authority from a model-generated ID.
+            selected_id = result.get("selected_procedure_parent_id") if isinstance(result, dict) else None
+            choices = ({self._procedure_catalog[selected_id]}
+                if type(selected_id) is str and selected_id in self._procedure_catalog else set())
             identities = {item.context.source for item in self.session.records(request=request,
                 handles=tuple(choices), current_allowed_sources=self._current())}
             self._selected_catalog_parent = next(iter(choices)) if len(identities) == 1 else None
+            if isinstance(result, dict):
+                result = dict(result)
+                result.pop("selected_procedure_parent_id", None)
             return result
         return self.invoke(work, request)
 
@@ -493,21 +500,34 @@ class _CoreIntake:
             data = self._restore_family_context(request, data, decision)
             self._procedure_family_context = bool(self._family_context_handles)
 
+            def context_handles(handles):
+                if self._selected_catalog_parent is None or not self._family_context_handles:
+                    return handles
+                family = {item.context.source for item in self.session.records(request=request,
+                    handles=self._family_context_handles, current_allowed_sources=self._current())}
+                values = self.session.records(request=request, handles=handles,
+                    current_allowed_sources=self._current())
+                # Later enrichment may retain manual facts, but cannot introduce
+                # an unrelated structured operation before availability checks.
+                return tuple(handle for handle, item in zip(handles, values)
+                    if item.context.source.source_type not in {SourceType.PROCEDURE, SourceType.STEP}
+                    or item.context.source in family)
+
             def catalog(req, **params):
                 self._check(req)
                 scope = self._scope()
                 if scope.ai_scope != "machine_all":
                     return ()
-                return self.readers.candidate_handles("read_machine_catalog_page_evidence", **params)
+                return context_handles(self.readers.candidate_handles("read_machine_catalog_page_evidence", **params))
 
             def neighbors(**params):
-                return self.readers.candidate_handles("read_assurance_neighbor_page_evidence",
+                return context_handles(self.readers.candidate_handles("read_assurance_neighbor_page_evidence",
                     **self._parameters(params, selectors=False, language=True),
-                    response_language=request.response_language)
+                    response_language=request.response_language))
 
             def sections(*, request, **params):
                 self._check(request)
-                return self.readers.candidate_handles("read_enumeration_page_evidence", **params)
+                return context_handles(self.readers.candidate_handles("read_enumeration_page_evidence", **params))
 
             rt = replace(self.preparation,
                 preserve_procedure_context=self._procedure_family_context,

@@ -7,6 +7,8 @@ from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 import re
+import hashlib
+import json
 import sys
 import unittest
 
@@ -375,6 +377,131 @@ class AskProcedureContextRecoveryTests(unittest.TestCase):
             h.prepared['plan']['preserve_procedure_context'] = True
             h.owner._procedure_family_context = False
             self.assertFalse(h.runtime.preserve_procedure_context)
+        finally:h.close()
+
+    def test_explicit_owned_operation_is_independent_of_numeric_or_check_output_shape(self):
+        for changes in (dict(request_kind='factual',information_task='numeric_specification',
+                             required_answer_types=('numeric_value',),facet_queries=()),
+                        dict(request_kind='factual',information_task='document_explanation',
+                             required_answer_types=('checklist','safety_conditions'),facet_queries=())):
+            with self.subTest(changes=changes):
+                h=ContextFixture(self)
+                try:
+                    h.prepared=h.owner._add_procedure_catalog(h.request,h.prepared)
+                    parent=next(handle for cid,handle in h.owner._procedure_catalog.items()
+                        if cid.startswith('procedure:install:'))
+                    h.decision=replace(h.decision,**changes)
+                    before=deepcopy(h.decision)
+                    op=task_generation.TaskGenerationEvidence(request=h.request,session=h.session,
+                        readers=h.owner.readers,authorize=h.owner.authorize,invoke=h.owner.invoke,
+                        runtime=h.owner.generation,tasks=h.owner.tasks)
+                    out,selections,recovered=op.prepare_family_context(h.prepared,h.owner._selection,h.decision,
+                        selected_parent_handle=parent)
+                    self.assertTrue(recovered)
+                    self.assertEqual(h.decision,before)
+                    material='\n'.join(row['chunk_full'] for row in out['candidates'])
+                    for key,_,_,body in h.rows:
+                        if key.startswith(('procedure:install','step:install')):
+                            self.assertIn(body,material)
+                    self.assertEqual(h.calls,[])
+                finally:h.close()
+
+    def test_explicit_owner_choice_does_not_override_refusal_or_full_procedure_lane(self):
+        variants=[dict(request_kind=k) for k in ('unsafe_request','out_of_scope','ambiguous')]
+        variants += [dict(effective_mode=k) for k in ('root_cause','smart_diagnostic')]
+        variants += [dict(degraded=True),dict(information_task='procedure_full'),
+            dict(source_type_policy='require',preferred_source_types=('document',))]
+        for changes in variants:
+            with self.subTest(changes=changes):
+                h=ContextFixture(self)
+                try:
+                    data=h.owner._add_procedure_catalog(h.request,h.prepared)
+                    parent=next(iter(h.owner._procedure_catalog.values()))
+                    before=len(h.sql)
+                    op=task_generation.TaskGenerationEvidence(request=h.request,session=h.session,
+                        readers=h.owner.readers,authorize=h.owner.authorize,invoke=h.owner.invoke,
+                        runtime=h.owner.generation,tasks=h.owner.tasks)
+                    out,_,recovered=op.prepare_family_context(data,h.owner._selection,
+                        replace(h.decision,**changes),selected_parent_handle=parent)
+                    self.assertIs(out,data);self.assertFalse(recovered)
+                    self.assertEqual(len(h.sql),before);self.assertEqual(h.calls,[])
+                finally:h.close()
+
+    def test_real_r5_mixed_steps_recover_all_ten_current_steps_without_foreign_pressure(self):
+        # Private local QA evidence is read in place, never copied into the repo.
+        # A standalone checkout without that corpus explicitly skips this replay.
+        import test_ask_router_family_context as route_fixture
+        from machinemind.retrieval.chunk_evidence import build_chunk_read,_source_from_columns
+        work=Path(__file__).resolve().parents[2]
+        inputs=[(work/'phase6-ask-correction-r5-20261109/live-client/receipts/R5-A-ASK-02.json',
+                 'af8298183586f73146f45573af4a2b00928c33bafddae2d793fd9758514b0b3e'),
+                (work/'phase6-ask-source-audit-20261109/current-aurelis-proc002-and-catalog.json',
+                 '89620322db9e553fe738fba1e2a17b81c9dd6c1d361936ee2e996d5d5e1b8ee5'),
+                (work/'phase6-multicompany-20261109/CASE-PREREGISTRATION.json',
+                 'b8f93411fde49079f8d0214bda50c7aeb1a70d04934b2b905e1655b71888f85a')]
+        if not all(path.exists() for path,_ in inputs):self.skipTest('Private pinned R5/source corpus not present')
+        values=[]
+        for path,digest in inputs:
+            blob=path.read_bytes();self.assertEqual(hashlib.sha256(blob).hexdigest(),digest)
+            values.append(json.loads(blob.decode('utf-8-sig')))
+        receipt,source,prereg=values
+        meta=receipt['response']['meta'];raw=deepcopy(meta['assistant_core_v2'])
+        raw['relevant_evidence_ids']=[]  # Recorded normalized decision has no optional selections.
+        candidates=deepcopy(meta['assistant_core_evidence_admission']['deterministic_signals']['candidates'])
+        self.assertEqual(len(candidates),24)
+        self.assertEqual(sum(c['source_type']=='step' for c in candidates),17)
+        self.assertEqual(raw['information_task'],'numeric_specification')
+        proc=source['procedure'];pid=proc['procedure_id']
+        catalog=[]
+        for entry in source['procedures_catalog']:
+            item=deepcopy(proc if entry['procedure_id']==pid else entry)
+            item.setdefault('steps',[]);catalog.append(item)
+        # The base harness's initial one-Step receipt must really be a Step.
+        catalog.sort(key=lambda entry:entry['procedure_id']==pid)
+        query=next(c['prompt'] for c in prereg['cases'] if c['case_key']=='UI-A-ASK-02')
+        points=[(1,'The maximum permitted coil mass is 1000 kg. Check material identification, weight, diameter and unwinding direction.'),
+            (0,'Before loading and threading, stop the cycle, apply the company energy-isolation procedure and use trained personnel.'),
+            (2,'Use approved lifting equipment and authorized personnel. Do not stand under suspended loads.'),
+            (3,'Check full engagement of power and control connectors, cable integrity and absence of pinching. Work on connectors only with supplies isolated.'),
+            (4,'Wear cut-resistant gloves and eye protection and keep STOP pressed during strip handling. STOP does not replace energy isolation.'),
+            (5,'Do not enter the work area with the decoiler enabled.'),
+            (9,'The later permitted-mode low-speed unwinding test is separate from initial checks; stop if the strip tensions or whips.')]
+        class ActualR5(route_fixture.RouterFixture):
+            def reviewer(self,messages,**kw):
+                reply,model=super().reviewer(messages,**kw)
+                reply['covered_answer_types']=list(set(reply['covered_answer_types']) |
+                    {facet.answer_type for facet in self.decision.facet_queries if facet.must_cover})
+                return reply,model
+        h=ActualR5(self,raw=raw,query=query,rows=catalog,chosen=pid,choice=pid,
+            mass='1000 kg',writer_points=points)
+        try:
+            sql=[(c['bubble_document_id'],c['chunk_index'],c['page_from'],c['page_to'],c['snippet'],
+                c['chunk_full'],c['similarity'],c.get('embedding_list',[]),True,
+                h.request.company_id,h.request.machine_id) for c in candidates]
+            h.allowance|=frozenset(_source_from_columns(h.request.company_id,h.request.machine_id,c['bubble_document_id']) for c in candidates)
+            typed=build_chunk_read(scope=h.scope,kind='dense',rows=sql,candidates=candidates,limits=owned.limits_fixture(1,1)[0].limits)
+            registered=h.session.register(request=h.request,receipt=typed,current_allowed_sources=h.allowance)
+            exact=[dict(item.record) for item in h.session.records(request=h.request,
+                handles=registered.records,current_allowed_sources=h.allowance)]
+            h.prepared={**h.prepared,'candidates':exact,'citations':exact}
+            h.owner._selection=(AskSelection('candidates',registered.records),AskSelection('citations',registered.records))
+            self.assertFalse(any(proc['steps'][2]['description'] in c.get('chunk_full','') for c in candidates))
+            foreign=next(c['chunk_full'] for c in candidates if '5' in c['chunk_full'] and 'bar' in c['chunk_full']
+                and 'PROC-001' in c['chunk_full'])
+            result=h.run_core()
+            self.assertEqual(result['status'],'answered')
+            self.assertEqual([c[0] for c in h.calls],['router','writer','reviewer'])
+            for _,_,_,body in h.rows:
+                if body.startswith('SOURCE_TYPE: step'):
+                    self.assertIn(body,h.writer_packets[0]);self.assertIn(body,h.review_packets[0])
+            for packet in (h.writer_packets[0],h.review_packets[0]):
+                self.assertIn('Non sostare sotto carichi sospesi.',packet)
+                self.assertNotIn(foreign,packet)
+            self.assertIn('Do not stand under suspended loads',result['answer'])
+            self.assertNotRegex(result['answer'],r'5\s*[–-]\s*6\s*bar')
+            self.assertEqual(h.owner._generated_response['meta']['generation_evidence']['source_sha256'],
+                h.owner._response_flow._review_packet.diagnostic(reused=False)['source_sha256'])
+            self.assertTrue(result['meta']['assistant_core_validation']['answer_contract']['semantic_answer_bound'])
         finally:h.close()
 
 
