@@ -381,11 +381,21 @@ class _CoreIntake:
         The next consumer boundary still fails closed until it is composed.
         """
         def work():
+            nonlocal data
             if self.preparation is None:
                 raise CoreIntakeError("canonical preparation/consumer composition pending")
             if self._prepared:
                 raise CoreIntakeError("duplicate preparation boundary")
             self.select(request, data, decision, "core.prepare.input")
+            self._procedure_family_context = False
+            if self.tasks is not None and self.generation is not None:
+                context = TaskGenerationEvidence(request=request, session=self.session,
+                    readers=self.readers, authorize=self.authorize, invoke=self.invoke,
+                    runtime=self.generation, tasks=self.tasks)
+                data, selections, recovered = context.prepare_family_context(
+                    data, self._selection, decision)
+                self._remember(data, selections)
+                self._procedure_family_context = recovered
 
             def catalog(req, **params):
                 self._check(req)
@@ -404,6 +414,7 @@ class _CoreIntake:
                 return self.readers.candidate_handles("read_enumeration_page_evidence", **params)
 
             rt = replace(self.preparation,
+                preserve_procedure_context=self._procedure_family_context,
                 _v13_merge_candidates=ranking.v13_merge_candidates,
                 _v13_score_candidates=lambda q, rows, **kw:
                     ranking.v13_score_candidates(q, rows, runtime=self.runtime.score, **kw),
@@ -429,7 +440,8 @@ class _CoreIntake:
         if type(runtime) is not AskExecutionRuntime or runtime.evidence_admission is not None:
             raise CoreIntakeError("fresh existing execution runtime required")
         self._execution_snapshot = runtime
-        changes = {"_v13_generate_ask_response": self.generate}
+        changes = {"_v13_generate_ask_response": self.generate,
+                   "_procedure_context_available": self._procedure_context_available}
         if self.tasks is not None:
             changes.update(_v13_structured_ask=self.structured_generate,
                            _assistant_core_synthesize_machine_overview=self.overview_generate)
@@ -440,6 +452,10 @@ class _CoreIntake:
             self._response_flow = ResponseEvidenceFlow(self)
             updated = self._response_flow.execution_runtime(updated)
         return updated
+
+    def _procedure_context_available(self):
+        self._check(self.request)
+        return bool(self._prepared and getattr(self, "_procedure_family_context", False))
 
     def _validation_factory(self):
         runtime = self.runtimes.validation()
@@ -510,7 +526,8 @@ class _CoreIntake:
             self._generation_used = True
             operation = GenericGenerationEvidence(request=self.request, session=self.session,
                 readers=self.readers, authorize=self.authorize, invoke=self.invoke,
-                runtime=self.generation, allow_structured=self.tasks is not None)
+                runtime=replace(self.generation, preserve_procedure_context=getattr(
+                    self, "_procedure_family_context", False)), allow_structured=self.tasks is not None)
             result, selections = operation.run(parameters["retrieval"], self._selection)
             self._generated_response, self._generated_selections = deepcopy(result), selections
             if self._response_flow is not None:

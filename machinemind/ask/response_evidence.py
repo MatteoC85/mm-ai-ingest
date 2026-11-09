@@ -332,8 +332,9 @@ class ResponseEvidenceFlow(TaskGenerationEvidence):
                     or self.model_inputs is not None):
                 raise ResponseEvidenceError("one verifier sources block per call required")
             self.handles(rows)
-            if (self.synthesis is None or self.decision.information_task not in
-                    {self.execution.INFO_PROCEDURE_FULL, self.execution.INFO_PROCEDURE_SEGMENT}):
+            if (self.synthesis is None or (not self.execution.preserve_procedure_context
+                    and self.decision.information_task not in
+                    {self.execution.INFO_PROCEDURE_FULL, self.execution.INFO_PROCEDURE_SEGMENT})):
                 return None
             original, _, handles = self.synthesis
             primary = original.get("_assistant_core_validation_evidence", [])
@@ -349,7 +350,7 @@ class ResponseEvidenceFlow(TaskGenerationEvidence):
             self._seed({"candidates": primary}, (AskSelection("candidates", handles),))
             if self._review_packet is None:
                 effective_max_records, effective_context_chars = max_records, max_context_chars
-                if _completion() is not None:
+                if _completion() is not None or self.execution.preserve_procedure_context:
                     _, bounds = self.session.read_contract(request=self.request,
                         current_allowed_sources=self.current())
                     effective_max_records, effective_context_chars = _complete_review_limits(

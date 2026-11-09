@@ -1302,6 +1302,7 @@ class AssistantCorePrepareEvidenceRuntime:
     _v13_score_candidates: Callable[..., Any]
     re: Any
     time_module: Any
+    preserve_procedure_context: bool = False
 
 
 def assistant_core_prepare_evidence(request: AssistantCoreRequest, retrieval: dict, decision: AssistantCoreDecision, *, runtime: AssistantCorePrepareEvidenceRuntime, lineage: Optional[Callable[..., None]]=None) -> dict:
@@ -1370,6 +1371,9 @@ def assistant_core_prepare_evidence(request: AssistantCoreRequest, retrieval: di
         and getattr(request, "requested_mode", None) == MODE_ASK
         and decision.effective_mode == MODE_ASK
     )
+    complete_family_context = bool(canonical_ask_selection
+        and runtime.preserve_procedure_context and decision.request_kind == KIND_PROCEDURE
+        and not decision.degraded)
     if decision.effective_mode == MODE_SMART_DIAGNOSTIC:
         from . import smart_sources
         # Smart questions need observation/legend/Step evidence even when it
@@ -1423,6 +1427,8 @@ def assistant_core_prepare_evidence(request: AssistantCoreRequest, retrieval: di
         for x in decision.required_answer_types
         if str(x or "").strip()
     }
+    if complete_family_context:
+        required_answer_types.update(item.answer_type for item in decision.facet_queries if item.must_cover)
     must_cover_facets = _dedup_text_values(
         [item.facet for item in decision.facet_queries if bool(item.must_cover)]
         or list(decision.required_facets),
@@ -1706,7 +1712,7 @@ def assistant_core_prepare_evidence(request: AssistantCoreRequest, retrieval: di
             match = root_clue_support.support_match(decision, _v13_candidate_text(candidate))
             (supported if match.get("matched_support_part_ids") else remaining).append(candidate)
         scored = (supported + remaining)[:24]
-    else:
+    elif not complete_family_context:
         scored = _dedup_citations_by_snippet(scored, max_items=24)
 
     diagnostic_mode = decision.effective_mode in {MODE_ROOT_CAUSE, MODE_SMART_DIAGNOSTIC}
@@ -1746,7 +1752,7 @@ def assistant_core_prepare_evidence(request: AssistantCoreRequest, retrieval: di
         narrow_scope=request.narrow_scope,
     )
 
-    top_candidates = scored[:12]
+    top_candidates = scored if complete_family_context else scored[:12]
     source_types = [str(c.get("source_type") or "") for c in top_candidates]
     has_procedure_sources = any(st in {"procedure", "step"} for st in source_types)
     top_similarity = float(deterministic_signals.get("top_similarity") or 0.0)
@@ -1776,7 +1782,7 @@ def assistant_core_prepare_evidence(request: AssistantCoreRequest, retrieval: di
             # materially stronger similarity and cannot win merely by being numeric.
             or (
                 bool((c.get("assistant_core_numeric_signal") or {}).get("has_number_with_unit"))
-                and _contract_semantic(c) >= 0.30
+                and (_contract_semantic(c) >= 0.30 or complete_family_context)
             )
             or _contract_semantic(c) >= 0.46
         )
@@ -1919,12 +1925,15 @@ def assistant_core_prepare_evidence(request: AssistantCoreRequest, retrieval: di
         and decision.effective_mode == MODE_ASK
         and not decision.degraded
         and decision.request_kind not in {KIND_FAULT_DIAGNOSTIC, KIND_GUIDED_DIAGNOSTIC}
-        and decision.evidence_state in {EVIDENCE_SUPPORTED, EVIDENCE_PARTIAL, EVIDENCE_REFINE}
+        and (decision.evidence_state in {EVIDENCE_SUPPORTED, EVIDENCE_PARTIAL, EVIDENCE_REFINE}
+             or complete_family_context)
     ):
         baseline_strength = bool(
             top_candidates
             and independent_signal
             and (
+                complete_family_context
+                or
                 deterministic_state == "supported"
                 or top_similarity >= 0.38
                 or (
@@ -1942,7 +1951,10 @@ def assistant_core_prepare_evidence(request: AssistantCoreRequest, retrieval: di
         baseline_contract_viable = bool(
             (not needs_numeric or numeric_viable)
             and (not needs_interface or interface_viable)
-            and (not needs_sequence or sequence_viable)
+            # Canonical Step ordinals prove ordered context is available, not
+            # that any requested machine state/phase is semantically covered.
+            # Only the mandatory independent review may establish that coverage.
+            and (not needs_sequence or sequence_viable or complete_family_context)
             and (
                 not needs_ordered_actions
                 or has_procedure_sources
@@ -1954,6 +1966,7 @@ def assistant_core_prepare_evidence(request: AssistantCoreRequest, retrieval: di
             decision.source_type_policy != "require"
             or not preferred
             or preferred_viable
+            or complete_family_context
         )
         if baseline_strength and baseline_contract_viable and baseline_scope_viable:
             supported = True
@@ -2057,7 +2070,12 @@ def assistant_core_prepare_evidence(request: AssistantCoreRequest, retrieval: di
                                if str(facet).strip().casefold() not in covered_facets],
         }
 
-    if supported and must_cover_facets:
+    if supported and complete_family_context:
+        # The owned context acquisition already selected this canonical family.
+        # Ranking/facet display limits cannot remove an observed closing/safety
+        # record. Provider/context capacities still fail closed downstream.
+        selected = scored
+    elif supported and must_cover_facets:
         selected = _assistant_core_facet_balanced_pool(
             selected_pool, must_cover_facets, limit=limit
         )
@@ -2119,6 +2137,12 @@ def assistant_core_prepare_evidence(request: AssistantCoreRequest, retrieval: di
             "must_cover_facets": list(must_cover_facets),
             "effective_mode": decision.effective_mode,
             "router_evidence_state": decision.evidence_state,
+            **({"procedure_context_admission": {
+                "status": "available_for_independent_review",
+                "canonical_ordered_family_available": True,
+                "semantic_coverage_complete": False,
+                "source_of_authority": "request_owned_canonical_seed_relation_reads"}}
+               if complete_family_context else {}),
             "preferred_source_types": list(decision.preferred_source_types),
             "source_type_policy": decision.source_type_policy,
             "router_relevant_evidence_ids": list(decision.relevant_evidence_ids),

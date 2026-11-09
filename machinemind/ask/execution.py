@@ -95,6 +95,15 @@ class AskExecutionRuntime:
     evidence_admission: Optional[Callable[[Any, dict, Any, str], AskEvidenceAdmission]] = None
     evidence_observer: Any = None
     review_uses_remaining_window: bool = False
+    _procedure_context_available: Optional[Callable[[], bool]] = None
+
+    @property
+    def preserve_procedure_context(self) -> bool:
+        # Factories are constructed before Core preparation. Availability is
+        # supplied only by the live request owner, never copied from JSON or a
+        # pre-preparation snapshot. The same admission guards bind every use.
+        return bool(self._procedure_context_available is not None
+                    and self._procedure_context_available())
 
 
 def _review_timeout(runtime: AskExecutionRuntime, budget: Any, *, protected: bool, compact: bool) -> int:
@@ -407,7 +416,7 @@ def synthesize_ask(
     # review; that review still has to cover every mixed requirement and source.
     structured_mixed_procedure = bool(_guarded(runtime, request, decision)
                                       and structured_procedure_task)
-    if has_structured and (not composite_nonprocedure_contract or phase_context
+    if not runtime.preserve_procedure_context and has_structured and (not composite_nonprocedure_contract or phase_context
                            or structured_mixed_procedure) and (
         decision.request_kind == "procedure"
         or structured_procedure_task
@@ -452,7 +461,7 @@ def synthesize_ask(
     # Preserve the existing bounded repair window without forcing a verifier or
     # changing structured/legacy synthesis or their review policy.
     with (_synthesis_review_reserve(required=True)
-          if _guarded(runtime, request, decision) and structured_procedure_task
+          if _guarded(runtime, request, decision) and (structured_procedure_task or runtime.preserve_procedure_context)
           else nullcontext()):
         response = _v13_generate_ask_response(
             q=request.query,
@@ -559,7 +568,8 @@ def verify_or_repair_answer(
     packet = None
     packet_builder = getattr(runtime.evidence_observer, "procedure_review_sources", None)
     if (_guarded(runtime, request, decision) and callable(packet_builder)
-            and decision.information_task in {INFO_PROCEDURE_FULL, INFO_PROCEDURE_SEGMENT}):
+            and (decision.information_task in {INFO_PROCEDURE_FULL, INFO_PROCEDURE_SEGMENT}
+                 or runtime.preserve_procedure_context)):
         packet = packet_builder(candidates, max_records=24 if enumeration_requested else 18,
             max_context_chars=context_limit)
     review_evidence_diagnostic = {}
@@ -637,7 +647,10 @@ def verify_or_repair_answer(
         for x in decision.required_answer_types
         if str(x or "").strip()
     })
-    if (_guarded(runtime, request, decision) and not conditions_only
+    if _guarded(runtime, request, decision) and runtime.preserve_procedure_context:
+        requirements = sorted(set(requirements) | {
+            item.answer_type for item in decision.facet_queries if item.must_cover})
+    if (_guarded(runtime, request, decision) and not conditions_only and not runtime.preserve_procedure_context
             and (decision.information_task in {runtime.INFO_PROCEDURE_FULL, runtime.INFO_PROCEDURE_SEGMENT}
                  or decision.request_kind == "procedure")):
         requirements = sorted(set(requirements) | {REQ_ORDERED_ACTIONS})

@@ -9,6 +9,7 @@ from dataclasses import replace
 from pathlib import Path
 import sys
 import unittest
+from types import SimpleNamespace
 
 sys.path[:0] = [str(Path(__file__).resolve().parents[1]), str(Path(__file__).resolve().parent)]
 from machinemind.ingest.text_pdf import normalize_unicode_advanced
@@ -39,12 +40,20 @@ def preparation_cap(dedup):
             isinstance(target, ast.Name) and target.id == name for target in node.targets)
     start = next(i for i, n in enumerate(function.body) if assigns(n, "bound_root_support"))
     end = next(i for i, n in enumerate(function.body) if i > start and assigns(n, "diagnostic_mode"))
+    # This slice also reads preparation's request-owned ASK-context gate. Execute
+    # its REAL initialization rather than assuming an undeclared outer local.
+    # These Root/legacy/OFF cases own no ASK family-acquisition lineage or proof;
+    # the full owned-ASK pipeline is exercised by its separate integration tests.
+    initialization = [deepcopy(next(n for n in function.body if assigns(n, name)))
+        for name in ("canonical_ask_selection", "complete_family_context")]
     wrapper = ast.FunctionDef(name="run", args=ast.arguments(posonlyargs=[],
         args=[ast.arg(arg=n) for n in ("request", "decision", "scored")],
         kwonlyargs=[], kw_defaults=[], defaults=[]),
-        body=deepcopy(function.body[start:end]) + [ast.Return(value=ast.Name(id="scored", ctx=ast.Load()))],
+        body=initialization + deepcopy(function.body[start:end]) + [ast.Return(value=ast.Name(id="scored", ctx=ast.Load()))],
         decorator_list=[])
     namespace = {"__package__": orchestration.__package__, "MODE_ROOT_CAUSE": "root_cause",
+                 "MODE_ASK": "ask", "KIND_PROCEDURE": "procedure", "lineage": None,
+                 "runtime": SimpleNamespace(preserve_procedure_context=False),
                  "_dedup_citations_by_snippet": dedup, "_v13_candidate_text": candidate_text}
     exec(compile(ast.fix_missing_locations(ast.Module(body=[wrapper], type_ignores=[])),
                  str(path), "exec"), namespace)

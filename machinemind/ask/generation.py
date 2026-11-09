@@ -76,6 +76,7 @@ class AskGenerationRuntime:
     json: Any
     # Internal session binding only; never selected by request payload metadata.
     preserve_procedure_points: bool = False
+    preserve_procedure_context: bool = False
 
 
 def generate_ask_response(
@@ -139,7 +140,8 @@ def generate_ask_response(
         required_answer_types=contract.get("required_answer_types"), facet_queries=contract.get("facet_queries"),
         procedure_phase=contract.get("procedure_phase"), question=q))
     complete_procedure_context = bool(runtime.preserve_procedure_points
-        and information_task in {INFO_PROCEDURE_FULL, INFO_PROCEDURE_SEGMENT})
+        and (information_task in {INFO_PROCEDURE_FULL, INFO_PROCEDURE_SEGMENT}
+             or runtime.preserve_procedure_context))
     evidence_limit = 24 if overview_catalog_requested else V13_MAX_EVIDENCE_ITEMS_ASK
     # Preparation already bounds and admits this selection. A second display
     # cap can discard the closing actions of an operation selected for its start.
@@ -150,13 +152,17 @@ def generate_ask_response(
         for x in (contract.get("required_answer_types") or [])
         if str(x or "").strip()
     }
+    if runtime.preserve_procedure_context:
+        required_answer_types.update(item.get("answer_type") for item in contract.get("facet_queries", [])
+            if isinstance(item, dict) and item.get("must_cover") and item.get("answer_type"))
     if information_task == INFO_NUMERIC_SPECIFICATION:
         required_answer_types.add(REQ_NUMERIC_VALUE)
     elif information_task == INFO_INTERFACE_NAVIGATION:
         required_answer_types.add(REQ_INTERFACE_LOCATIONS)
     elif information_task == INFO_SEQUENCE_SYNCHRONIZATION:
         required_answer_types.add(REQ_STATE_SEQUENCE)
-    elif information_task in {INFO_PROCEDURE_FULL, INFO_PROCEDURE_SEGMENT} and not conditions_only:
+    elif (information_task in {INFO_PROCEDURE_FULL, INFO_PROCEDURE_SEGMENT}
+          and not conditions_only and not runtime.preserve_procedure_context):
         required_answer_types.add(REQ_ORDERED_ACTIONS)
     required_facets = _dedup_text_values(contract.get("required_facets") or [], limit=12)
     fail_closed = bool(contract.get("fail_closed"))
@@ -208,6 +214,15 @@ def generate_ask_response(
         "If SOURCES do not support the answer, return no_sources. Reply in the requested language."
     )
     system_msg += NUMERIC_PREMISE_CORRECTION_INSTRUCTION
+    if runtime.preserve_procedure_context:
+        system_msg += (
+            " The complete canonical operation family is evidence context, not an instruction "
+            "to perform every Step. Answer the complete QUESTION with every supported mandatory "
+            "value, check and applicable precaution. Preserve explicit phase boundaries, "
+            "negations, STOP/hold/isolation states and authorized access. Read all Step notes "
+            "for conditions applying to the requested phase; do not turn later testing or "
+            "startup into an initial prerequisite or an unrequested action. If a mandatory "
+            "requirement is unavailable, return no_sources rather than guessing.")
     if REQ_NUMERIC_VALUE in required_answer_types:
         system_msg += " The answer must state the requested value with its unit/context; a nearby qualitative statement or another unrelated number is insufficient."
     if REQ_INTERFACE_LOCATIONS in required_answer_types:
@@ -318,8 +333,7 @@ def generate_ask_response(
                 ),
             ),
         )
-        if (runtime.preserve_procedure_points
-                and information_task in {INFO_PROCEDURE_FULL, INFO_PROCEDURE_SEGMENT}):
+        if complete_procedure_context:
             # The generic schema already bounds the answer to eight points.
             # Unlike ProcedureBundle, a manual answer has no deterministic Step
             # reconstruction after rendering: the UI cap must not delete actions.
@@ -523,7 +537,8 @@ class GenericGenerationEvidence:
                 raise GenerationEvidenceError("canonical structured synthesis composition pending")
             self.provider_handles = handles
             task = str((self.retrieval.get("assistant_core_contract") or {}).get("information_task") or "")
-            if task in {self.runtime.INFO_PROCEDURE_FULL, self.runtime.INFO_PROCEDURE_SEGMENT}:
+            if (task in {self.runtime.INFO_PROCEDURE_FULL, self.runtime.INFO_PROCEDURE_SEGMENT}
+                    or self.runtime.preserve_procedure_context):
                 from .review_evidence import complete_limits, compile_packet
                 _, bounds = self.session.read_contract(request=self.request,
                     current_allowed_sources=self.current())
@@ -705,6 +720,8 @@ class GenericGenerationEvidence:
                     current_allowed_sources=self.current())
                 if self.generation_packet is not None:
                     result.setdefault("meta", {})["generation_evidence"] = dict(self.generation_packet)
+                if self.runtime.preserve_procedure_context:
+                    result["_assistant_core_force_semantic_verify"] = True
                 return result, selection
             return self.invoke(work, self.request)
         finally:

@@ -1710,6 +1710,132 @@ class TaskGenerationEvidence(GenericGenerationEvidence):
             _assistant_core_overview_inventory_records=self._inventory,
             _assistant_core_overview_records_block=self._inventory_block)
 
+    def prepare_family_context(self, retrieval, selections, decision):
+        """Acquire context from one observed canonical family, without a model.
+
+        This is not a Procedure answer or a new relevance decision. Only relevant
+        admitted Step occurrences anchor the read. A missing or ambiguous canonical
+        relation leaves the original evidence unchanged; current authority and page
+        capacity failures propagate. No title catalog or legacy relation inference
+        may manufacture the anchor.
+        """
+        if self.used:
+            raise GenerationEvidenceError("single family context preparation required")
+        self.used, self.active = True, True
+        try:
+            def work():
+                self.session.admission(request=self.request, retrieval=retrieval,
+                    selections=selections, current_allowed_sources=self.current())
+                self.input_handles = tuple(h for s in selections for h in s.records)
+                self.all_handles = self.input_handles
+                for selection in selections:
+                    for row, handle in zip(retrieval[selection.name], selection.records):
+                        self._bind(row, handle)
+                scope, _ = self.session.read_contract(request=self.request,
+                    current_allowed_sources=self.current())
+                if (scope.ai_scope != "machine_all"
+                        or self.request.requested_mode != "ask"
+                        or decision.effective_mode != "ask" or decision.degraded
+                        or decision.request_kind != "procedure"):
+                    return retrieval, selections, False
+                # This context lane serves mixed factual/check requests. Existing
+                # A full Procedure answer keeps its established producer policy.
+                if decision.information_task == self.tasks.INFO_PROCEDURE_FULL:
+                    return retrieval, selections, False
+                requirements = set(decision.required_answer_types)
+                requirements.update(f.answer_type for f in decision.facet_queries if f.must_cover)
+                if (not requirements.intersection({"checklist", "safety_conditions"})
+                        or not requirements.intersection({"numeric_value", "interface_locations", "state_sequence"})):
+                    return retrieval, selections, False
+                preferred = set(decision.preferred_source_types)
+                if (decision.source_type_policy == "require" and preferred
+                        and not {"procedure", "step"}.issubset(preferred)):
+                    return retrieval, selections, False
+                original = retrieval.get("citations") or retrieval.get("candidates") or []
+                steps = [row for row in original if self.tasks._v12_evidence_role(row) == "step"
+                    and (float(row.get("semantic_similarity", row.get("similarity", 0)) or 0) >= .34
+                         or float(row.get("assistant_core_query_overlap") or 0) >= .035
+                         or bool(row.get("exact_code_hit")))]
+                if not steps:
+                    return retrieval, selections, False
+                keys = list(dict.fromkeys(storage_key(item.context.source)
+                    for item in self.records(self.handles(steps))))
+                relations = self.parent_rows(steps, company_id=self.request.company_id,
+                    machine_id=self.request.machine_id, child_source_keys=keys,
+                    text_chars=max(800, int(self.tasks.family.ASK_STRUCTURED_DIRECT_TEXT_CHARS or 5000)))
+                parents = {str(row["parent_source_key"]) for row in relations}
+                mapped = {str(row["child_source_key"]) for row in relations}
+                if len(parents) != 1 or mapped != set(keys):
+                    return retrieval, selections, False
+                relation = relations[0]
+                parent = self.tasks.family._v12_relation_procedure_candidate(
+                    parent_source_key=relation["parent_source_key"],
+                    machine_id=self.request.machine_id, page_number=relation["page_number"],
+                    parent_text=relation["parent_text"], fallback_title="")
+                self.page_view(relation, parent)
+                related = self.related_rows(parent, company_id=self.request.company_id,
+                    machine_id=self.request.machine_id, parent_source_key=relation["parent_source_key"],
+                    text_chars=max(800, int(self.tasks.expansion.ASK_STRUCTURED_DIRECT_TEXT_CHARS or 5000)))
+                if not related:
+                    return retrieval, selections, False
+                if "state_sequence" in requirements and len(related) < 2:
+                    return retrieval, selections, False
+                if (any(not isinstance(row[1], int) or row[1] <= 0 for row in related)
+                        or len({row[0] for row in related}) != len(related)
+                        or len({row[1] for row in related}) != len(related)):
+                    raise GenerationEvidenceError("family context has ambiguous canonical child order")
+                # Reuse the existing canonical converter with the observed rows;
+                # do not permit its legacy machine-wide fallback in this lane.
+                operation = self
+                class CanonicalRows:
+                    copy = operation.copy
+                    page_view = operation.page_view
+                    def related_rows(self, procedure, **parameters):
+                        if procedure is not parent:
+                            raise GenerationEvidenceError("family context parent changed")
+                        return related
+                    def fallback_rows(self, **parameters):
+                        raise GenerationEvidenceError("context requires canonical related Steps")
+                children = structured.v12_expand_primary_procedure_steps(
+                    company_id=self.request.company_id, machine_id=self.request.machine_id,
+                    procedure=parent, existing_steps=[], runtime=self.tasks.expansion,
+                    trace=CanonicalRows())
+                self._check_family_ambiguity(children)
+                # A seed outside this parent's observed child set is not a unique
+                # family even if a stale/raw annotation claims the same parent.
+                child_keys = {storage_key(i.context.source) for i in self.records(self.handles(children))}
+                if not set(keys).issubset(child_keys):
+                    return retrieval, selections, False
+                if len({self.tasks._v12_step_sort_key(row)[0] for row in children}) != len(children):
+                    raise GenerationEvidenceError("family context has ambiguous Step ordinals")
+                complete = []
+                for row in [parent] + children:
+                    view = self.copy(row)
+                    # Legacy converters assign .94/.96 to canonical pages as a
+                    # rendering preference. A relation is not an observed dense
+                    # similarity. Keep availability in the owned context proof,
+                    # never manufacture semantic/lexical scores on fresh pages.
+                    view.update(similarity=0.0,semantic_similarity=0.0,
+                        retrieval_score=0.0,structured_direct_score=0.0)
+                    complete.append(view)
+                # Full observed bodies have explicit occurrence handles. Retain
+                # non-procedural corroboration, excluding other Procedure families.
+                extras = [row for row in original
+                    if self.tasks._v12_evidence_role(row) not in {"procedure", "step"}]
+                rows = complete + extras
+                handles = self.handles(rows)
+                updated = {**retrieval, "candidates": rows, "citations": rows}
+                out = (AskSelection("candidates", handles), AskSelection("citations", handles))
+                self.session.admission(request=self.request, retrieval=updated,
+                    selections=out, current_allowed_sources=self.current())
+                return updated, out, True
+            return self.invoke(work, self.request)
+        finally:
+            self.active = False
+            self.refs.clear(); self.link_refs.clear(); self.drafts.clear(); self.raw_refs.clear()
+            self._complete_pages.clear(); self._ambiguous_step_sources.clear()
+            self.all_handles = self.input_handles = ()
+
     def run_task(self,kind,retrieval,selections,decision):
         if self.used or kind not in {"structured","overview"}:
             raise GenerationEvidenceError("single explicit task synthesis operation required")

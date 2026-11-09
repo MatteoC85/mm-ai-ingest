@@ -482,6 +482,8 @@ def validate_response(
              or getattr(decision, "request_kind", None) == runtime.KIND_PROCEDURE)
         and callable(runtime.source_fields) and callable(runtime.source_sections)
     )
+    procedure_context_only = bool(protected_procedure
+        and runtime.execution_runtime.preserve_procedure_context)
     source_ordered_procedure = bool(protected_procedure
         and out.get("_assistant_core_source_ordered_procedure") is True)
     required_family_review = bool(protected_procedure
@@ -712,6 +714,8 @@ def validate_response(
                 REQ_SAFETY_CONDITIONS,
                 REQ_ORDERED_ACTIONS,
             }
+            if procedure_context_only:
+                hard_requirements.update(item.answer_type for item in decision.facet_queries if item.must_cover)
 
             if outcome in {"pass", "rewrite"} and repaired_answer:
                 answer = repaired_answer
@@ -787,19 +791,21 @@ def validate_response(
                     out["rg_links"] = []
                 citations = list(out.get("citations") or [])
 
-                if (semantic_contract_pass and required_family_review
+                if (semantic_contract_pass and (required_family_review or procedure_context_only)
                         and (semantic_contract.get("procedure_review") or {}).get("reply_mode") == "replace"
                         and not source_ordered_procedure
-                        and family_context_contract(
+                        and (procedure_context_only or family_context_contract(
                             procedure_scope=getattr(decision, "procedure_scope", ""),
                             procedure_phase=getattr(decision, "procedure_phase", ()),
                             question=request.query, information_task=decision.information_task,
                             required_answer_types=decision.required_answer_types,
-                            facet_queries=decision.facet_queries)
+                            facet_queries=decision.facet_queries))
                         and (set(decision.required_facets) | {
                             item.facet for item in decision.facet_queries if item.must_cover
                         }).issubset(semantic_contract.get("covered_facets") or [])
-                        and set(decision.required_answer_types).issubset(
+                        and (set(decision.required_answer_types) | ({item.answer_type
+                            for item in decision.facet_queries if item.must_cover}
+                            if procedure_context_only else set())).issubset(
                             semantic_contract.get("covered_answer_types") or [])
                         and (semantic_contract.get("procedure_review") or {}).get("independent_semantic_review") is True
                         and (semantic_contract.get("operation_boundary_validation") or {}).get("complete") is True
@@ -935,7 +941,9 @@ def validate_response(
                     required_answer_types=decision.required_answer_types,
                     facet_queries=decision.facet_queries))
                 required_types = set(decision.required_answer_types)
-                if not conditions_only:
+                if procedure_context_only:
+                    required_types.update(item.answer_type for item in decision.facet_queries if item.must_cover)
+                if not conditions_only and not procedure_context_only:
                     required_types.add(REQ_ORDERED_ACTIONS)
                 complete_review = bool(semantic_contract_pass
                     and required_facets.issubset(semantic_contract.get("covered_facets") or [])
