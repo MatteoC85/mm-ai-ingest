@@ -37,6 +37,7 @@ from google.cloud import tasks_v2
 from urllib.parse import urlparse, unquote
 
 from machinemind.ask import routing_runtime as _ask_routing_runtime
+from machinemind.ask import router_wire as _ask_router_wire
 from machinemind.ask import request_readiness as _ask_request_readiness
 from machinemind.ask import procedure_scope as _ask_procedure_scope
 from machinemind.ask import factual_coverage as _ask_factual_coverage
@@ -14033,6 +14034,8 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
         if isinstance(request.metadata, dict):
             request.metadata[_retrieval_diagnostic_query.ROUTER_EXECUTION_KEY] = router_execution
     router_started = time_module.monotonic()
+    ask_router_plan = None
+    ask_router_configuration_failed = False
     try:
         if request.requested_mode == MODE_SMART_DIAGNOSTIC:
             budget = _v13_current_budget()
@@ -14046,6 +14049,18 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
                     + _smart_review.FINALIZATION_RESERVE_SECONDS)
             if router_timeout < 1:
                 raise _V13BudgetExceeded("smart_router_deadline_reserve")
+        if protected_ask_catalog:
+            try:
+                ask_router_plan = _ask_routing_runtime.router_attempt_plan(
+                    request.requested_mode, router_models, router_timeout,
+                    allowed_effective_modes=request.allowed_effective_modes,
+                    compact_wire=True)
+            except Exception:
+                ask_router_configuration_failed = True
+                raise _ask_routing_runtime.AskRouterUnavailable() from None
+            if ask_router_plan is not None:
+                router_models = list(ask_router_plan["models"])
+                router_timeout = int(ask_router_plan["timeout_seconds"])
         router_schema = (
             _retrieval_diagnostic_query.router_schema_with_diagnostic_basis(
                 build_router_schema(allowed_modes), original_query=request.query
@@ -14067,6 +14082,10 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
                 "type": ["string", "null"], "enum": [None, *procedure_catalog_ids],
             }
             router_schema["schema"]["required"].append("selected_procedure_parent_id")
+        canonical_router_schema = router_schema
+        if ask_router_plan is not None:
+            router_schema = _ask_router_wire.schema(canonical_router_schema)
+            system_msg += _ask_router_wire.INSTRUCTION
         parsed, model_used = _v13_json_models(
             [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
             models=router_models,
@@ -14084,7 +14103,9 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
                 model_used=model_used,
                 elapsed_seconds=round(time_module.monotonic() - router_started, 3),
             )
-        out = dict(parsed or {})
+        out = (_ask_router_wire.expand(parsed, canonical_router_schema,
+                   allowed_effective_modes=request.allowed_effective_modes)
+               if ask_router_plan is not None else dict(parsed or {}))
         if procedure_catalog_ids:
             selected_parent = out.get("selected_procedure_parent_id")
             # Do not repair whitespace/types or accept an un-emitted catalog ID.
@@ -14107,6 +14128,10 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
         out = _assistant_core_relax_diagnostic_router_contract(out, request)
         out["router_model"] = model_used
     except Exception as exc:
+        if ask_router_plan is not None or ask_router_configuration_failed:
+            # A missing or malformed semantic plan cannot become a guessed
+            # router decision. The request owner retains actual liabilities.
+            raise _ask_routing_runtime.AskRouterUnavailable() from None
         if request.requested_mode == MODE_SMART_DIAGNOSTIC:
             if isinstance(request.metadata, dict):
                 request.metadata["smart_router_error_class"] = _sd_diagnostic_error_class(type(exc).__name__)

@@ -5,6 +5,8 @@ selected with payload metadata; OFF, Root Cause and Smart are unchanged.
 The ASK semantic router uses low reasoning effort and prefers its configured fallback.
 Schema, output caps, retry count and deadlines are unchanged.
 A successful fallback never settles a previous unknown provider outcome.
+Compact protected ASK uses one existing preferred router attempt within the old
+total routing-stage allowance. All provider accounting remains in the same ledger.
 """
 from __future__ import annotations
 from contextvars import ContextVar
@@ -15,7 +17,15 @@ import time
 from machinemind.infrastructure.provider_failures import FAILURE_CODES
 
 VERSION = "ask-router-economical-accounting-v2"
+ATTEMPT_POLICY_VERSION = "ask-compact-router-single-attempt-v1"
+ROUTER_PHASE_TIMEOUT_CEILING_SECONDS = 20
 _ACTIVE = ContextVar("mm_protected_ask_routing_runtime", default=None)
+
+
+class AskRouterUnavailable(RuntimeError):
+    """Fixed technical failure, never user ambiguity or missing source evidence."""
+    def __init__(self):
+        super().__init__("ASK_SEMANTIC_ROUTER_UNAVAILABLE")
 
 
 def _safe_name(value):
@@ -161,6 +171,35 @@ def router_effort(requested_mode, configured):
     if execution is not None and execution.active and requested_mode == "ask":
         return "low"
     return configured
+
+
+def router_attempt_plan(requested_mode, preferred_models, per_attempt_timeout, *,
+                        allowed_effective_modes=(), compact_wire=False):
+    """One existing preferred model only in the owned compact ASK lane.
+
+    ``preferred_models`` is already ordered by ``router_models``. Never reverse
+    it again or introduce another model. A timeout keeps its full real unknown
+    reservation; this stage policy grants no retry, cost or deadline credit.
+    Returning None leaves every non-opted-in call's original policy untouched.
+    """
+    execution = _ACTIVE.get()
+    if not (execution is not None and execution.active and requested_mode == "ask"
+            and type(allowed_effective_modes) is tuple
+            and allowed_effective_modes == ("ask",) and compact_wire is True):
+        return None
+    if (type(preferred_models) not in (list, tuple)
+            or any(type(model) is not str for model in preferred_models)):
+        raise ValueError("ASK_ROUTER_CONFIGURED_MODELS_REQUIRED")
+    candidates = list(dict.fromkeys(model.strip() for model in preferred_models if model.strip()))
+    if not candidates or len(candidates) > 2:
+        raise ValueError("ASK_ROUTER_CONFIGURED_PRIMARY_REQUIRED")
+    if type(per_attempt_timeout) is not int or per_attempt_timeout < 1:
+        raise ValueError("ASK_ROUTER_POSITIVE_TIMEOUT_REQUIRED")
+    old_allowance = per_attempt_timeout * len(candidates)
+    return {"policy_version": ATTEMPT_POLICY_VERSION, "models": candidates[:1],
+            "timeout_seconds": min(ROUTER_PHASE_TIMEOUT_CEILING_SECONDS, old_allowance),
+            "previous_stage_allowance_seconds": old_allowance,
+            "attempt_limit": 1, "automatic_fallback": False}
 
 
 def record_ledger(ledger):
