@@ -58,6 +58,7 @@ _PROTOCOL_FAILURE_CODES = frozenset({
     "procedure_review_empty_success",
     "procedure_review_pass_changes_answer",
     "procedure_review_translation_incomplete",
+    "procedure_review_judge_reply_invalid",
 })
 
 
@@ -637,7 +638,11 @@ def decode_review_wire_aliases(parsed: dict, aliases: dict, *, layout: dict | No
 def review_schema(legacy: dict, layout: dict, facets: list[str], types: list[str], *,
                   operation_boundary: bool = False, source_ordered: bool = False,
                   operation_source_ids: list[str] | None = None, wire_aliases: dict | None = None,
-                  reference_catalogue: dict | None = None, translation_language: str = "") -> dict:
+                  reference_catalogue: dict | None = None, translation_language: str = "",
+                  judge_only: bool = False) -> dict:
+    if judge_only and (not source_ordered or not operation_boundary
+                       or wire_aliases is None or reference_catalogue is None or translation_language):
+        raise ValueError("procedure_review_judge_reply_invalid")
     result = deepcopy(legacy)
     result["name"] = legacy["name"]  # backwards-readable verifier envelope
     schema = result["schema"]
@@ -667,7 +672,12 @@ def review_schema(legacy: dict, layout: dict, facets: list[str], types: list[str
     # rewrite every body, but cannot replace that sequence with a free-text
     # numbered list. Unsupported or incomplete evidence remains a rejection.
     schema["properties"]["reply_mode"] = {"type": "string", "enum": (
+        ["retain", "reject"] if judge_only else
         ["retain", "edit", "reject"] if source_ordered else ["replace", "retain", "edit"])}
+    if judge_only:
+        schema["properties"]["outcome"] = {"type": "string", "enum": ["pass", "no_sources"]}
+        if "outcome" not in schema["required"]:
+            schema["required"].append("outcome")
     if source_ordered:
         schema["properties"]["answer"] = {"type": "string", "enum": [""]}
     schema["properties"]["edits"] = {"type": "array", "items": {
@@ -792,8 +802,9 @@ def review_schema(legacy: dict, layout: dict, facets: list[str], types: list[str
             edits.append(obj({"block_id":owned, "original":interval(count),
                 "replacement_parts":{"type":"array", "minItems":1, "maxItems":16,
                                      "items":{"type":"string", "minLength":1}}}))
-        endpoints.append(obj({"block_id":{"type":"string", "enum":list(wire_aliases["blocks"])},
-                              "kind":{"type":"string", "enum":["replacement"]}, "range":interval(16)}))
+        if not judge_only:
+            endpoints.append(obj({"block_id":{"type":"string", "enum":list(wire_aliases["blocks"])},
+                                  "kind":{"type":"string", "enum":["replacement"]}, "range":interval(16)}))
         for count, owners in groups("sources"):
             proofs.append(obj({"source":{"type":"string", "enum":owners}, "range":interval(count)}))
         definitions["procedure_answer_reference"] = {"anyOf":endpoints}
@@ -807,7 +818,29 @@ def review_schema(legacy: dict, layout: dict, facets: list[str], types: list[str
                               "next":{"$ref":"#/$defs/procedure_answer_reference"},
                               "proof":{"$ref":"#/$defs/procedure_source_reference"}}
         edge["required"] = list(edge["properties"])
+    if judge_only:
+        schema["properties"]["edits"]["maxItems"] = 0
     return result
+
+
+def validate_judge_reply(parsed: dict) -> None:
+    """Reject an unsolicited rewrite; never silently retain or drop its proof.
+
+    This is only a restricted producer profile. Existing source, coverage,
+    answer binding, note, closure and final-contract checks still follow it.
+    """
+    if (parsed.get("answer") != "" or parsed.get("edits") != []
+            or (parsed.get("reply_mode"), parsed.get("outcome")) not in {
+                ("retain", "pass"), ("reject", "no_sources")}):
+        raise ValueError("procedure_review_judge_reply_invalid")
+    audit = parsed.get("operation_boundary")
+    if type(audit) is dict and type(audit.get("precedence")) is list:
+        for edge in audit["precedence"]:
+            if type(edge) is dict:
+                for name in ("action", "next"):
+                    ref = edge.get(name)
+                    if type(ref) is dict and ref.get("kind") != "original":
+                        raise ValueError("procedure_review_judge_reply_invalid")
 
 
 OPERATION_BOUNDARY_INSTRUCTIONS = (
@@ -1218,6 +1251,45 @@ MICRO_PROTOCOL_INSTRUCTIONS = (
     "allowed), answer='', edits=[] and unresolved keys. Successful coverage must never conceal an "
     "omitted Step. Keep covered/missing contract keys verbatim. All evidence, authority, no-invention "
     "and safety requirements remain mandatory."
+)
+
+
+JUDGE_PROTOCOL_INSTRUCTIONS = (
+    "\nCOMPLETE LITERAL DRAFT REVIEW: You are its independent semantic and safety judge, not "
+    "its editor. In this profile, any general permission above to rewrite or edit does not apply. "
+    "The server has preserved the admitted source occurrences, numbers and notes in the current "
+    "draft; that is representation only, never proof of relevance, coverage, accuracy or safety. "
+    "Check the complete QUESTION, every mandatory facet and answer type, numeric value and unit, "
+    "source relationship, phase scope, prerequisite, closure and every block against SOURCES. "
+    "Supported equivalent wording need not repeat a requirement verbatim. If the existing complete "
+    "draft is useful, fully supported and safe, return outcome=pass, reply_mode=retain, answer='', "
+    "edits=[]. If any actual unsupported claim, missing mandatory instruction, unsafe order, "
+    "unavailable prerequisite or required correction remains, return outcome=no_sources, "
+    "reply_mode=reject, answer='', edits=[] and the unresolved coverage keys. Never force approval "
+    "because the source representation is complete. Do not repair, add prose, reformat, generate "
+    "replacement parts, or reference output that you would have written. Source headings, action "
+    "order, notes and all source/authority/no-invention requirements remain mandatory."
+)
+
+
+JUDGE_REFERENCE_INSTRUCTIONS = (
+    "\nLITERAL DRAFT AUDIT: SOURCES and PROCEDURE_BLOCKS are complete, lossless original units, "
+    "not semantic approval. Review every unchanged block and its complete source operation, "
+    "including prerequisites and any required safe closure or terminal hold. Keep standing "
+    "isolation/STOP/PPE invariants; never invent restart or re-energization. Preserve before-only "
+    "boundaries. Set operation_boundary.complete=true only after this whole-procedure semantic "
+    "and safety review. checked_blocks lists every supplied block alias exactly once. No edit is "
+    "permitted, so no newly generated operation or replacement-part namespace exists. Empty "
+    "precedence/change_edges is valid only after independently finding the unchanged draft safe "
+    "and no material edit or affected dependency to prove. If you use an explicit source-backed "
+    "precedence edge, action and next are {block_id,kind:'original',range:{first,last}}; proof is "
+    "{source,range:{first,last}}. All indices are inclusive and zero-based in that supplied owner, "
+    "0 <= first <= last < its original unit count. They never refer to replacement text. Select "
+    "the exact original relationship, not merely similar words. change_edges uses the zero-based "
+    "precedence edge_index and resolution. A restored edge ends the opening before the closure; "
+    "a documented_terminal_state needs exact source support, never an invented restoration. "
+    "A genuinely missing condition, unsafe order or unavailable closure requires rejection, not "
+    "an edit, clamped reference, guessed proof, or approval."
 )
 
 

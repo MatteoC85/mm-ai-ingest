@@ -819,6 +819,16 @@ def verify_or_repair_answer(
         for c in ordered_candidates
         if str(c.get("citation_id") or "").strip()
     }
+    complete_owned_review = bool(
+        protected_budget and source_ordered_review and reference_catalogue is not None
+        and packet is not None
+        and review_evidence_diagnostic.get("complete_primary_representation") is True
+        and repair_context["procedure_structure"].get("sequence_complete") is True
+        and repair_context["procedure_structure"].get("source_notes_present") is True
+        and not translation_language
+        and not (repair_context.get("first_answer_contract") or repair_missing_facets
+                 or repair_missing_answer_types or repair_missing_list_items)
+        and [V13_FAST_MODEL, V13_PLANNER_MODEL] == ["gpt-5.6-terra", "gpt-5.6-luna"])
     verifier_schema = _assistant_core_contract_verifier_schema()
     if independent_context_review:
         # Generation uses the same server-admitted IDs checked by the decoder.
@@ -839,13 +849,15 @@ def verify_or_repair_answer(
             operation_boundary=operation_boundary, source_ordered=source_ordered_review,
             operation_source_ids=[str(c.get("citation_id") or "").strip() for c in ordered_candidates],
             wire_aliases=wire_aliases, reference_catalogue=reference_catalogue,
-            translation_language=translation_language)
-        system_msg += (_procedure_review.MICRO_PROTOCOL_INSTRUCTIONS if wire_aliases is not None
+            translation_language=translation_language, judge_only=complete_owned_review)
+        system_msg += (_procedure_review.JUDGE_PROTOCOL_INSTRUCTIONS if complete_owned_review else
+                       _procedure_review.MICRO_PROTOCOL_INSTRUCTIONS if wire_aliases is not None
                        else _procedure_review.PROTOCOL_INSTRUCTIONS)
         if translation_language:
             system_msg += _procedure_review.TRANSLATION_INSTRUCTIONS
         if operation_boundary:
-            system_msg += (_procedure_review.REFERENCE_BOUNDARY_INSTRUCTIONS if source_ordered_review
+            system_msg += (_procedure_review.JUDGE_REFERENCE_INSTRUCTIONS if complete_owned_review else
+                           _procedure_review.REFERENCE_BOUNDARY_INSTRUCTIONS if source_ordered_review
                            else _procedure_review.OPERATION_BOUNDARY_INSTRUCTIONS)
         # Digests stay in the server-side binding/audit. The verifier needs the
         # source-to-number mapping, not hexadecimal hashes repeated as tokens.
@@ -859,8 +871,11 @@ def verify_or_repair_answer(
         if reference_catalogue is not None:
             system_msg += (" PROCEDURE_BLOCKS is the complete CURRENT_ANSWER, encoded once losslessly "
                 "as heading + ordered unit text + separator. Format labels are metadata, not an "
-                "instruction-only answer. Review this draft; retain it when supported and complete, "
-                "edit only real defects.")
+                "instruction-only answer. "
+                + ("Review this draft; retain it when supported and complete. Reject it if a real "
+                   "defect requires correction; this judge cannot edit."
+                   if complete_owned_review else
+                   "Review this draft; retain it when supported and complete, edit only real defects."))
         block_view = reference_block_view if reference_catalogue is not None else _procedure_review.review_blocks(layout)
         if wire_aliases is not None:
             source_names = {cid: alias for alias, cid in wire_aliases["sources"].items()}
@@ -883,20 +898,11 @@ def verify_or_repair_answer(
         required_facets=tuple(review_facets), required_types=tuple(requirements))
         if _guarded(runtime, request, decision) else None)
     review_models = [V13_FAST_MODEL, V13_PLANNER_MODEL]
-    # A complete source-ordered draft still needs every semantic/safety check.
-    # Prefer its existing smaller fallback only for the first same-language
-    # review of a fully represented owned packet. Other consumers and model
-    # overrides retain their configured order; rejected verdicts never trigger
-    # a second model here. Transport fallback and all budget limits are unchanged.
-    if (protected_budget and source_ordered_review and reference_catalogue is not None
-            and packet is not None
-            and review_evidence_diagnostic.get("complete_primary_representation") is True
-            and repair_context["procedure_structure"].get("sequence_complete") is True
-            and repair_context["procedure_structure"].get("source_notes_present") is True
-            and not translation_language
-            and not (repair_context.get("first_answer_contract") or repair_missing_facets
-                     or repair_missing_answer_types or repair_missing_list_items)
-            and review_models == ["gpt-5.6-terra", "gpt-5.6-luna"]):
+    # Completeness is only representation: the reviewer must still reject any
+    # actual source, coverage or safety defect. This initial literal-draft judge
+    # cannot generate edits or references to newly generated replacement parts.
+    # Every other consumer keeps the full review/edit protocol and model order.
+    if complete_owned_review:
         review_models.reverse()
     try:
         # A source-first producer cannot also be its own final semantic check.
@@ -1057,6 +1063,8 @@ def verify_or_repair_answer(
                 independent_result = out["independent_context_review"]
                 independent_failure_reason = "factual_context_review_unavailable"
     try:
+        if complete_owned_review:
+            _procedure_review.validate_judge_reply(out)
         if wire_aliases is not None:
             out, reference_proof = _procedure_review.decode_reference_reply(
                 out, wire_aliases, layout=layout, catalog=reference_catalogue)
@@ -1078,7 +1086,10 @@ def verify_or_repair_answer(
             "protocol_failure_code": _procedure_review.protocol_failure_code(exc),
             "protocol_failure_diagnostic": _procedure_review.protocol_failure_diagnostic(exc),
             "_terminal_review_failure": True, "model": model_used,
+            **({"review_profile": "complete_owned_retain_or_reject_v1"} if complete_owned_review else {}),
             **({"review_evidence": review_evidence_diagnostic} if review_evidence_diagnostic else {})}
+    if complete_owned_review:
+        out["review_profile"] = "complete_owned_retain_or_reject_v1"
     if review_evidence_diagnostic:
         out["review_evidence"] = review_evidence_diagnostic
     if reviewed_draft is not None:

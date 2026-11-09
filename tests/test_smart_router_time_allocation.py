@@ -96,7 +96,8 @@ class SmartRouterAllocationTests(unittest.TestCase):
              patch.object(self.m.requests,'post',side_effect=provider) as post:
             self.m._assistant_core_router_call(self.request(),{'candidates':[]})
             self.assertGreaterEqual(self.budget.remaining(),39)
-            self.assertLessEqual(self.budget.remaining(),76)
+            # Fake-clock subtraction can leave a subnanosecond float residual.
+            self.assertLessEqual(self.budget.remaining(),76 + 1e-9)
         post.assert_called_once()
         self.assertEqual(self.budget.call_log[0]['accounting_state'],'settled')
         self.assertEqual(self.budget.retry_events,[])

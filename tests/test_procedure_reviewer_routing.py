@@ -52,6 +52,8 @@ class ProcedureReviewerRoutingTests(unittest.TestCase):
 
     def scenario(self, *, variant=None, wire_change=None, fallback_failure=None,
                  execution_module=None, **fixture):
+        fixture.setdefault('reply_mode', 'edit' if wire_change in {'out_of_bounds','wrong_number'}
+                           or fixture.get('note_mutation') else 'retain')
         # The external offline comparison can supply the actual pre-change
         # module. It never synthesizes a "baseline" by rewriting model options.
         target = execution_module or execution
@@ -73,6 +75,9 @@ class ProcedureReviewerRoutingTests(unittest.TestCase):
                 context['procedure_structure']['source_sequence_required'] = False
             if variant == 'stale_draft':
                 context['procedure_structure']['answer_sha256'] = '0' * 64
+            if variant == 'missing_draft_note':
+                kw['answer'] = kw['answer'].replace('Keep STOP pressed.','')
+                context['procedure_structure']['answer_sha256'] = execution._procedure_review.digest(kw['answer'])
             if variant == 'translation':
                 context['procedure_translation_language'] = 'en'
             repair_variants = {'prior_contract':'first_answer_contract',
@@ -130,6 +135,13 @@ class ProcedureReviewerRoutingTests(unittest.TestCase):
                     elif wire_change == 'missing_facets':
                         out['covered_facets'] = []
                         out['missing_facets'] = ['safety']
+                    elif wire_change == 'missing_types':
+                        out['covered_answer_types'] = []
+                        out['missing_answer_types'] = ['safety_conditions']
+                    elif wire_change == 'boundary_incomplete':
+                        out['operation_boundary']['complete'] = False
+                    elif wire_change == 'missing_checked_block':
+                        out['operation_boundary']['checked_blocks'].pop()
                     elif wire_change == 'wrong_number':
                         out['edits'][0]['replacement_parts'] = ['9. Feed while guards are open.']
                     return out
@@ -167,19 +179,17 @@ class ProcedureReviewerRoutingTests(unittest.TestCase):
         return result, captured, attempts, sum(simulated_seconds), answer
 
     def test_complete_owned_packet_uses_existing_luna_first_and_real_final_guards(self):
-        for mode in ('retain', 'edit'):
-            with self.subTest(mode=mode):
-                result, calls, attempts, _, answer = self.scenario(reply_mode=mode)
-                self.assertEqual(attempts, ['gpt-5.6-luna'])
-                self.assertEqual(calls[0][1]['models'], ['gpt-5.6-luna','gpt-5.6-terra'])
-                self.assertEqual(calls[0][1]['effort'], 'low')
-                self.assertEqual(calls[0][1]['max_output_tokens'], 3200)
-                contract = result['meta']['assistant_core_validation']['answer_contract']
-                self.assertTrue(contract['complete'])
-                self.assertTrue(contract['semantic_answer_bound'])
-                self.assertTrue(contract['semantic_verifier']['operation_boundary_validation']['complete'])
-                self.assertTrue(contract['semantic_verifier']['procedure_review']['source_note_bindings_complete'])
-                self.assertEqual(result['answer'].splitlines(), [x for x in answer.splitlines() if x])
+        result, calls, attempts, _, answer = self.scenario(reply_mode='retain')
+        self.assertEqual(attempts, ['gpt-5.6-luna'])
+        self.assertEqual(calls[0][1]['models'], ['gpt-5.6-luna','gpt-5.6-terra'])
+        self.assertEqual(calls[0][1]['effort'], 'low')
+        self.assertEqual(calls[0][1]['max_output_tokens'], 3200)
+        contract = result['meta']['assistant_core_validation']['answer_contract']
+        self.assertTrue(contract['complete'])
+        self.assertTrue(contract['semantic_answer_bound'])
+        self.assertTrue(contract['semantic_verifier']['operation_boundary_validation']['complete'])
+        self.assertTrue(contract['semantic_verifier']['procedure_review']['source_note_bindings_complete'])
+        self.assertEqual(result['answer'].splitlines(), [x for x in answer.splitlines() if x])
 
     def test_all_ineligible_boundaries_keep_configured_order(self):
         variants = ('missing_packet','incomplete_packet','sequence_incomplete','notes_missing',
@@ -201,7 +211,9 @@ class ProcedureReviewerRoutingTests(unittest.TestCase):
         parameters = calls[0][1]
         schema = parameters['json_schema']['schema']
         props = schema['properties']
-        self.assertEqual(props['reply_mode']['enum'], ['retain','edit','reject'])
+        self.assertEqual(props['reply_mode']['enum'], ['retain','reject'])
+        self.assertEqual(props['outcome']['enum'], ['pass','no_sources'])
+        self.assertEqual(props['edits']['maxItems'], 0)
         self.assertEqual(props['answer']['enum'], [''])
         self.assertEqual(props['citation_ids']['items']['enum'], ['s1','s2','s3'])
         self.assertIn('operation_boundary', schema['required'])
