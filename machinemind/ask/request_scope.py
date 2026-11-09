@@ -19,13 +19,18 @@ def conditions_only_contract(*, procedure_scope, information_task,
         return False
     requirements = set(required_answer_types or ())
     checks = {"checklist", "safety_conditions"}
-    if not requirements.intersection(checks) or not requirements.issubset(checks | {"explanation"}):
+    mixed_numeric = "numeric_value" in requirements
+    allowed = checks | {"explanation"} | ({"numeric_value"} if mixed_numeric else set())
+    if not requirements.intersection(checks) or not requirements.issubset(allowed):
         return False
     mandatory = []
     for facet in facet_queries or ():
         field = facet.get if isinstance(facet, Mapping) else lambda key, default=None: getattr(facet, key, default)
         if field("must_cover") is True:
             mandatory.append(field("answer_type"))
+    if mixed_numeric:
+        return ("numeric_value" in mandatory and bool(set(mandatory).intersection(checks))
+                and all(kind in checks | {"numeric_value"} for kind in mandatory))
     return bool(mandatory) and all(kind in checks for kind in mandatory)
 
 
@@ -84,13 +89,29 @@ def bind_conditions_requirements_to_question(decision):
     """
     if decision.effective_mode != "ask" or decision.request_kind in {"ambiguous", "unsafe_request", "out_of_scope"}:
         return decision
+    # A numeric precondition does not turn a phase-limited procedural checklist
+    # into an isolated lookup. Canonicalize only the router's explicit compound
+    # shape; preserve every numeric obligation and every retrieval query. The
+    # source-family selector and ordinary safety/coverage gates still decide.
+    if (decision.request_kind == "procedure" and decision.information_task == "numeric_specification"
+            and "numeric_value" in decision.required_answer_types
+            and conditions_only_contract(procedure_scope=decision.procedure_scope,
+                information_task="procedure_segment", required_answer_types=decision.required_answer_types,
+                facet_queries=decision.facet_queries)):
+        decision = replace(decision, information_task="procedure_segment")
     if not conditions_only_contract(procedure_scope=decision.procedure_scope,
             information_task=decision.information_task,
             required_answer_types=decision.required_answer_types,
             facet_queries=decision.facet_queries):
         return decision
-    anchor = next(i for i, facet in enumerate(decision.facet_queries) if facet.must_cover)
+    mixed_numeric = "numeric_value" in decision.required_answer_types
+    anchor = next(i for i, facet in enumerate(decision.facet_queries)
+                  if facet.must_cover and (not mixed_numeric or facet.answer_type in {"checklist", "safety_conditions"}))
     facets = tuple(replace(facet,
         facet=QUESTION_CONDITIONS_REQUIREMENT if i == anchor else facet.facet,
-        must_cover=i == anchor) for i, facet in enumerate(decision.facet_queries))
-    return replace(decision, required_facets=(QUESTION_CONDITIONS_REQUIREMENT,), facet_queries=facets)
+        must_cover=i == anchor or (mixed_numeric and facet.answer_type == "numeric_value" and facet.must_cover))
+        for i, facet in enumerate(decision.facet_queries))
+    numeric_facets = tuple(facet.facet for facet in facets
+                          if mixed_numeric and facet.must_cover and facet.answer_type == "numeric_value")
+    return replace(decision, required_facets=tuple(dict.fromkeys((QUESTION_CONDITIONS_REQUIREMENT, *numeric_facets))),
+                   facet_queries=facets)

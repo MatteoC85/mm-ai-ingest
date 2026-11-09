@@ -13927,7 +13927,14 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
             "supply query variants, but must not narrow a broad category to the components or "
             "subtopics that happen to appear in the first retrieved excerpts. In a compound "
             "question, a modifier belonging to one category does not automatically restrict "
-            "the other categories. Preserve explicit user exclusions and phase boundaries.")
+            "the other categories. Preserve explicit user exclusions and phase boundaries. "
+            "For ASK only, a procedural request limited to prerequisites/checks has "
+            "procedure_scope=conditions_only and information_task=procedure_segment even "
+            "when it also asks for a numeric limit or capacity. This is the exception to "
+            "the general numeric-primary rule above: retain numeric_value and every "
+            "numeric facet with its unit/context as mandatory, alongside the requested "
+            "checklist/safety facets. A pure numeric lookup without requested procedural "
+            "preconditions does not acquire this scope.")
     if is_root_cause:
         # Factual arrays are constructed from the verified partition, not generated
         # a second time with potentially different wording.
