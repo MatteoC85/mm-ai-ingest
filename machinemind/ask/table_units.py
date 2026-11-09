@@ -1,7 +1,8 @@
 """Numeric dimensions from the existing, bounded PDF cell serialization.
 
 This is representation parsing, not semantic entailment or evidence authority.
-It never edits source text, converts values, or assigns a unit across columns.
+It never edits source text or converts values. Cross-column dimensions require
+an explicit, unmerged label/value/unit row; proximity alone is not ownership.
 """
 import json
 import re
@@ -76,7 +77,10 @@ def numeric_cells(text, *, unit_token, number_atom, normalize_unit):
     Repeated cell labels are self-contained. Otherwise inheritance requires a
     contiguous table, identical column count and an explicit unit-only heading
     relationship. Prose, row restart, malformed layout and unassigned text end
-    that relationship. Only whole numeric/range/comparison cells are projected.
+    that relationship. A separate unit cell is admitted only in a complete
+    three-column label/value/unit row. Whole numeric/range/comparison cells and
+    bounded numeric alternatives are projected; footnotes stay in source text
+    for independent semantic review, rather than becoming numeric permission.
     """
     unit = re.compile(rf'(?<![\w])(?P<unit>{unit_token})(?![\w])', re.IGNORECASE)
     prefix = re.compile(rf'^\s*\[\s*(?P<unit>{unit_token})\s*\]\s*', re.IGNORECASE)
@@ -86,6 +90,29 @@ def numeric_cells(text, *, unit_token, number_atom, normalize_unit):
         rf'below|above|under|over|da|from|[<>≤≥]=?)\s*)?'
         rf'(?P<first>{number_atom})(?:\s*(?:to|a|and|e|[-–—÷])\s*'
         rf'(?P<last>{number_atom}))?\s*(?P<unit>{unit_token})?\s*$', re.IGNORECASE)
+    pure_unit = re.compile(rf'^\s*(?P<bracket>\[\s*)?(?P<unit>{unit_token})'
+                           rf'(?(bracket)\s*\])\s*$', re.IGNORECASE)
+    option = re.compile(rf'^\s*(?P<value>{number_atom})\s*(?:[*†‡])?\s*$')
+    bracketed_unit = re.compile(rf'\[\s*(?P<unit>{unit_token})\s*\]', re.IGNORECASE)
+
+    def quantities(body):
+        before = prefix.match(body)
+        body = body[before.end():] if before else body
+        values = numeric.fullmatch(body)
+        if values:
+            return ([values[k] for k in ('first', 'last') if values[k]],
+                    [x for x in (before['unit'] if before else None, values['unit']) if x])
+        # Slash alternatives require whitespace on both sides. Neither
+        # arithmetic (160/2, 160*2) nor partly numeric designations (500WF)
+        # establish a dimensional value. A single footnote marker is literal
+        # source notation; it does not remove or approve its qualification.
+        parts = re.split(r'\s+/\s+', body)
+        if not 1 <= len(parts) <= 64:
+            return None
+        parsed = [option.fullmatch(part) for part in parts]
+        if not all(parsed) or (len(parts) == 1 and not re.search(r'[*†‡]\s*$', body)):
+            return None
+        return ([part['value'] for part in parsed], [before['unit']] if before else [])
 
     def heading(value):
         matches = list(unit.finditer(value))
@@ -145,6 +172,25 @@ def numeric_cells(text, *, unit_token, number_atom, normalize_unit):
                     proposed[col] = dimension
             headings = {col: value for col, value in proposed.items() if col not in ambiguous}
         else:
+            row_units = {}
+            # Require the entire canonical row, exact geometry and a unit-only
+            # third cell. A neighbouring word, merged cell or another row/table
+            # can never lend its unit to a bare number. Bracketed dimensions in
+            # the row label are additional consistency checks, not inference.
+            if (columns == 3 and first == last and len(cells) == 3
+                    and all(c['left'] == c['right'] and c['top'] == c['bottom'] == first
+                            for c in cells)):
+                by_column = {c['left']: c for c in cells}
+                if set(by_column) == {1, 2, 3}:
+                    label, value, unit_cell = (by_column[i] for i in (1, 2, 3))
+                    dimension = pure_unit.fullmatch(unit_cell['value'])
+                    # nm and N m share the legacy normalizer. Do not newly
+                    # infer that ambiguous dimension from separate row cells.
+                    if (dimension and normalize_unit(dimension['unit']) != 'nm'
+                            and re.search(r'[^\W\d_]', label['value'], re.UNICODE)
+                            and not pure_unit.fullmatch(label['value'])):
+                        row_units[value['left']] = (dimension['unit'],
+                            [m['unit'] for m in bracketed_unit.finditer(label['value'])])
             for cell in cells:
                 if cell['left'] != cell['right']:
                     continue
@@ -157,20 +203,24 @@ def numeric_cells(text, *, unit_token, number_atom, normalize_unit):
                     # An explicit label is authoritative for its own cell;
                     # missing/ambiguous units cannot borrow a prior heading.
                     inherited = local
+                row_dimension = row_units.get(cell['left'])
+                if row_dimension:
+                    row_unit, label_units = row_dimension
+                    if ((inherited and normalize_unit(inherited) != normalize_unit(row_unit))
+                            or any(normalize_unit(x) != normalize_unit(row_unit) for x in label_units)):
+                        label_conflict = True
+                    inherited = row_unit
                 if not inherited:
                     continue
                 body = cell['value'].strip()
-                before = prefix.match(body)
-                if before:
-                    body = body[before.end():]
-                values = numeric.fullmatch(body)
-                if not values:
+                values = quantities(body)
+                if values is None:
                     continue
-                explicit = [x for x in (before['unit'] if before else None, values['unit']) if x]
+                numbers, explicit = values
                 if label_conflict or any(normalize_unit(x) != normalize_unit(inherited) for x in explicit):
                     blocked.append(cell['span'])
                     continue
                 owned.append(cell['span'])
-                typed.extend((values[k], inherited) for k in ('first', 'last') if values[k])
+                typed.extend((raw, inherited) for raw in numbers)
         offset += len(raw_line)
     return typed, owned, blocked

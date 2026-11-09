@@ -6,6 +6,8 @@ references; it does not invent authority or create another Core/session. Dedicat
 structured/overview synthesis, validation/repair and cache remain separate gates.
 """
 from __future__ import annotations
+
+from machinemind.ask.numeric_premise_contract import NUMERIC_PREMISE_CORRECTION_INSTRUCTION
 from copy import deepcopy
 from dataclasses import dataclass, replace
 import re
@@ -205,6 +207,7 @@ def generate_ask_response(
         "For photo/video records, use metadata only and never claim visual/audio inspection. Do not expose citation ids or internal Bubble ids in visible text. "
         "If SOURCES do not support the answer, return no_sources. Reply in the requested language."
     )
+    system_msg += NUMERIC_PREMISE_CORRECTION_INSTRUCTION
     if REQ_NUMERIC_VALUE in required_answer_types:
         system_msg += " The answer must state the requested value with its unit/context; a nearby qualitative statement or another unrelated number is insufficient."
     if REQ_INTERFACE_LOCATIONS in required_answer_types:

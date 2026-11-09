@@ -2,8 +2,8 @@
 
 Only the authenticated composition root creates this context. It cannot be
 selected with payload metadata; OFF, Root Cause and Smart are unchanged.
-The only provider change is low reasoning effort for the ASK semantic router.
-Prompts, schema, model order, output caps, retries and deadlines are unchanged.
+The ASK semantic router uses low reasoning effort and prefers its configured fallback.
+Schema, output caps, retry count and deadlines are unchanged.
 A successful fallback never settles a previous unknown provider outcome.
 """
 from __future__ import annotations
@@ -14,7 +14,7 @@ import re
 import time
 from machinemind.infrastructure.provider_failures import FAILURE_CODES
 
-VERSION = "ask-router-low-accounting-v1"
+VERSION = "ask-router-economical-accounting-v2"
 _ACTIVE = ContextVar("mm_protected_ask_routing_runtime", default=None)
 
 
@@ -115,7 +115,7 @@ class ProtectedExecution:
                     for r in router]
         out = dict(response)
         out["meta"] = {**dict(response.get("meta") or {}), "protected_execution": {
-            "version": VERSION, "router_effort": "low",
+            "version": VERSION, "router_effort": "low", "router_order": "configured_fallback_first",
             "elapsed_sync_seconds": round(max(0.0, time.monotonic() - self.started), 3),
             "timing_scope": "protected_sync_entry_to_after_final_authority_checks",
             "accounting": accounting_state(ledger), "router_attempts": attempts,
@@ -142,6 +142,18 @@ def deactivate(token):
         execution.active = False
         execution.ledger = None
     _ACTIVE.reset(token)
+
+
+def router_models(requested_mode, configured):
+    """Prefer the cheaper configured router only inside protected ASK.
+
+    Keep the configured primary as fallback; never add models or retries.
+    Root, Smart and legacy/off contexts preserve their original ordering.
+    """
+    execution = _ACTIVE.get()
+    if execution is not None and execution.active and requested_mode == "ask":
+        return list(reversed(configured)) if len(configured) == 2 else list(configured)
+    return list(configured)
 
 
 def router_effort(requested_mode, configured):

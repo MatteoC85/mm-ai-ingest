@@ -13964,6 +13964,7 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
     router_models = _dedup_text_values(
         [ASSISTANT_CORE_ROUTER_MODEL, ASSISTANT_CORE_ROUTER_FALLBACK_MODEL], limit=2,
     )
+    router_models = _ask_routing_runtime.router_models(request.requested_mode, router_models)
     router_effort = _ask_routing_runtime.router_effort(request.requested_mode, ASSISTANT_CORE_ROUTER_EFFORT)
     if request.requested_mode == MODE_SMART_DIAGNOSTIC:
         smart_plan = _smart_routing.attempt_plan(ASSISTANT_CORE_ROUTER_MODEL,

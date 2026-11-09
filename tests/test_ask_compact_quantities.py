@@ -34,10 +34,15 @@ class CompactQuantityTests(unittest.TestCase):
    self.supported(f'Value: **{number} {unit}**.',f'Value: {number}{unit}.')
   self.supported('Flow: 0.85 m³/min.','Flow: 0.85m3/min.')
   self.supported('Power: 1 KW.','Power: 1kW.')
- def test_wrong_units_values_and_unrequested_conversions_still_fail(self):
+ def test_wrong_units_values_and_inexact_or_unsupported_conversions_still_fail(self):
+  # ASK now admits exact W/kW scalar equivalence. It still cannot infer a
+  # dimension, change a value, or choose a locale for ambiguous punctuation.
+  self.supported('Power: 1000 W.','Power: 1kW.')
   for answer,source in (('Air supply: .75 CFM.','Water cooling: .75l/min.'),
    ('Water flow: .75 l/min.','Air supply: .75CFM.'),('Pressure: 100 bar.','Pressure: 100psi.'),
-   ('Power: 1 W.','Power: 1kW.'),('Power: 1000 W.','Power: 1kW.'),
+   ('Power: 1 W.','Power: 1kW.'),('Power: 1001 W.','Power: 1kW.'),
+   ('Power: 1000 W.','Current: 1 A.'),('Power: 1000 W.','Power: 1.000kW.'),
+   ('Power: 1 kW.','Power: 1,000W.'),
    ('Flow: 30 l/min.','Flow: 30CFM.'),('Pressure: 7 bar.','Pressure: 100psi.'),
    ('Pressure: 101 psi.','Pressure: 100psi.'),('Flow: .76 l/min.','Flow: .75l/min.')):
    with self.subTest(answer=answer,source=source):self.rejected(answer,source)

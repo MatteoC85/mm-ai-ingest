@@ -26,6 +26,7 @@ from . import source_table_review as _source_table_review
 from . import factual_context_review as _factual_context_review
 from . import review_source_wire as _review_source_wire
 from . import phase_trace
+from .numeric_premise_contract import NUMERIC_PREMISE_CORRECTION_INSTRUCTION
 from .request_scope import conditions_only_contract, bounded_phase_contract
 from .request_completion import current as _current_completion
 from .request_completion import record_contract_observation as _record_contract_observation
@@ -541,6 +542,13 @@ def verify_or_repair_answer(
     factual_list_review = _enumeration_review.applies(request, decision,
         protected=_guarded(runtime, request, decision), enumeration=enumeration_requested)
     independent_context_review = bool(factual_list_review and not str(answer or "").strip())
+    if (protected_budget and independent_context_review
+            and budget.llm_calls + 2 > budget.max_llm_calls):
+        # This boundary is a producer, not a final approval. Do not pay for its
+        # candidate if the existing call cap cannot admit its mandatory separate
+        # semantic judge. Provider failures still retain their real liability;
+        # this planning check grants no call, retry credit or larger cost cap.
+        raise _V13BudgetExceeded("protected factual producer lacks a mandatory review call slot")
     factual_coverage_intent = getattr(decision, 'factual_coverage', 'unspecified')
     useful_factual_selection = bool(independent_context_review
         and factual_coverage_intent == 'useful')
@@ -684,6 +692,8 @@ def verify_or_repair_answer(
         "When repair fields are non-empty, this is the one bounded repair attempt: return a complete replacement, not an addendum, preserving all correct supported content. "
         "When MACHINE_CATALOG is present, inspect every catalog row before deriving expected_list_items; low ranking or different wording is not permission to omit an explicitly documented machine assembly or auxiliary system."
     )
+    if protected_budget:
+        system_msg += " " + NUMERIC_PREMISE_CORRECTION_INSTRUCTION
     if useful_factual_selection:
         system_msg = _enumeration_review.useful_verifier_instructions(system_msg)
     if conditions_only:
@@ -926,6 +936,13 @@ def verify_or_repair_answer(
                 reasoning_mode="",
                 timeout=_review_timeout(runtime, budget, protected=protected_budget, compact=compact_review),
                 max_output_tokens=min(4000, max(3200, V13_FAST_MAX_OUTPUT_TOKENS)),
+                # A structured review with a silently reduced token ceiling can
+                # spend the remaining budget without producing a valid verdict.
+                # Admit the entire configured envelope before dispatch, so the
+                # transport may skip only its typed, unsent capacity rejection
+                # and consider the next existing model under the same ledger.
+                # Legacy/OFF, Root and Smart retain their original admission.
+                **({"require_full_output": True} if protected_budget else {}),
                 company_id=request.company_id,
                 purpose="assistant_core_answer_contract_verifier",
             )
@@ -1020,6 +1037,8 @@ def verify_or_repair_answer(
                 messages = _factual_context_review.build_messages(frame,
                     question=request.query, response_language=request.response_language,
                     sources_block=sources_block)
+                messages[0] = {**messages[0], "content": messages[0]["content"]
+                    + " " + NUMERIC_PREMISE_CORRECTION_INSTRUCTION}
                 _admit_input(request,
                     {"candidates": ordered_candidates if packet is not None else candidates},
                     decision, runtime=runtime, stage="verifier.provider")

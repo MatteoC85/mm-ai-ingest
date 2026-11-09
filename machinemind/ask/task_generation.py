@@ -3,6 +3,8 @@ Protected conditions use the existing family selector and grounded writer under
 the same request budget. Evidence binding is supplied only by the owned Core.
 """
 from __future__ import annotations
+
+from machinemind.ask.numeric_premise_contract import NUMERIC_PREMISE_CORRECTION_INSTRUCTION
 from dataclasses import dataclass, replace
 from copy import deepcopy
 import json
@@ -432,6 +434,7 @@ def structured_ask(
         "For P&S records, report problem, solution and notes. For photo/video records, use title/description metadata only and never claim visual or audio inspection. "
         "Every visible point must be grounded in citation_ids from SOURCES. Do not expose raw ids in text. Reply in the requested language."
     )
+    system_msg += NUMERIC_PREMISE_CORRECTION_INSTRUCTION
     if conditions_only:
         system_msg += (
             " PROCEDURE_SCOPE=conditions_only: the supplied complete family is context for the "

@@ -3,7 +3,8 @@
 The inherited unit fix is deliberately NOT installed in main's shared legacy
 parser: that parser is still used by Root Cause. Only the protected ASK
 intake runtime factory binds this module. There are no model calls, permissions,
-query policies, source preferences or unit conversions here.
+query policies or source preferences here. Exact W/kW comparisons require an
+unambiguous scalar on both sides; unit names alone never establish equality.
 
 All numeric precision, bracket matching and rejection rules are those of the
 reviewed unit candidate. The legacy parser remains frozen until its own phase.
@@ -11,6 +12,8 @@ reviewed unit candidate. The legacy parser remains frozen until its own phase.
 from __future__ import annotations
 import re
 from dataclasses import replace
+from decimal import Decimal, InvalidOperation
+from fractions import Fraction
 from typing import Optional
 from ..ingest.text_pdf import normalize_unicode_advanced as _normalize_unicode_advanced
 from .validation import AskValidationRuntime
@@ -150,6 +153,52 @@ def _assistant_core_numeric_variants(value: str) -> set[str]:
         if canonical is not None:
             out.add(canonical)
     return {x for x in out if x}
+
+
+def _exact_power_quantity(raw: str, unit: str) -> Optional[Fraction]:
+    """Compare explicit power scalars exactly, without locale/float guesses.
+
+    Legacy same-unit matching retains its existing numeric variants. Crossing
+    units is stricter: a single separator with three trailing digits may be
+    decimal or grouping, so cannot justify a conversion. No scientific notation,
+    arithmetic, unknown dimension or Decimal-context rounding is admitted.
+    """
+    scale = {'w': 1, 'kw': 1000}.get(_assistant_core_normalize_unit(unit))
+    value = str(raw or '').strip().replace('\u00a0', ' ')
+    if scale is None or not value or len(value) > 256:
+        return None
+    if ' ' in value:
+        if not re.fullmatch(r'[-+]?\d{1,3}(?: \d{3})+(?:[.,]\d+)?', value):
+            return None
+        value = value.replace(' ', '')
+    if re.fullmatch(r'[-+]?\d+', value):
+        canonical = value
+    elif value.count('.') + value.count(',') == 1:
+        if (not re.fullmatch(r'[-+]?(?:\d+[.,]\d+|[.,]\d+)', value)
+                or re.fullmatch(r'[-+]?\d+[.,]\d{3}', value)):
+            return None
+        canonical = value.replace(',', '.')
+    elif '.' in value and ',' in value:
+        decimal = '.' if value.rfind('.') > value.rfind(',') else ','
+        grouping = ',' if decimal == '.' else '.'
+        integer, _, fraction = value.rpartition(decimal)
+        if not (re.fullmatch(r'[-+]?\d{1,3}(?:' + re.escape(grouping) + r'\d{3})+', integer)
+                and fraction.isdigit()):
+            return None
+        canonical = integer.replace(grouping, '') + '.' + fraction
+    elif re.fullmatch(r'[-+]?\d{1,3}(?:\.\d{3}){2,}', value):
+        canonical = value.replace('.', '')
+    elif re.fullmatch(r'[-+]?\d{1,3}(?:,\d{3}){2,}', value):
+        canonical = value.replace(',', '')
+    else:
+        return None
+    try:
+        # Fraction(Decimal) is exact. Multiplying Decimal directly would use
+        # its current precision and can make unequal long scalars look equal.
+        return Fraction(Decimal(canonical)) * scale
+    except (InvalidOperation, ValueError, OverflowError):
+        return None
+
 
 def _assistant_core_is_list_marker(value: str, start: int, end: int, raw: str) -> bool:
     line_start = value.rfind("\n", 0, start) + 1
@@ -330,6 +379,7 @@ def _assistant_core_claim_supported(
     candidates = source_claims if source_claims is not None else _assistant_core_claims(source_text)
     claim_variants = {str(v or "").casefold() for v in (claim.get("variants") or set()) if str(v or "")}
     claim_unit = str(claim.get("unit") or "")
+    exact_power = _exact_power_quantity(claim.get('raw'), claim_unit)
     for source_claim in candidates:
         if str(source_claim.get("kind") or "") != "number":
             continue
@@ -338,12 +388,14 @@ def _assistant_core_claim_supported(
             for v in (source_claim.get("variants") or set())
             if str(v or "")
         }
-        if not (claim_variants & source_variants):
-            continue
         source_unit = str(source_claim.get("unit") or "")
-        if not claim_unit:
-            return True
-        if _assistant_core_units_equivalent(claim_unit, source_unit):
+        if claim_variants & source_variants:
+            if not claim_unit:
+                return True
+            if _assistant_core_units_equivalent(claim_unit, source_unit):
+                return True
+        if (exact_power is not None and claim_unit != source_unit
+                and exact_power == _exact_power_quantity(source_claim.get('raw'), source_unit)):
             return True
     return False
 
