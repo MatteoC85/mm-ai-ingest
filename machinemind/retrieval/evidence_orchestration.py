@@ -1696,7 +1696,10 @@ def assistant_core_prepare_evidence(request: AssistantCoreRequest, retrieval: di
     # router mistake must never erase all otherwise relevant evidence. Enforce the
     # type only when at least one preferred candidate is independently viable.
     if decision.source_type_policy == "require" and preferred and preferred_viable:
-        filtered = [c for c in scored if str(c.get("source_type") or "") in preferred]
+        filtered = [c for c in scored if str(c.get("source_type") or "") in preferred
+            or (complete_family_context and "procedure" in preferred
+                and str(c.get("source_type") or "") == "step"
+                and c.get("bubble_document_id") in family_keys)]
         if filtered:
             scored = filtered
 

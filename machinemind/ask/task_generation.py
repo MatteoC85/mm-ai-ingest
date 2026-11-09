@@ -1754,8 +1754,18 @@ class TaskGenerationEvidence(GenericGenerationEvidence):
                             or not requirements.intersection({"numeric_value", "interface_locations", "state_sequence"})):
                         return retrieval, selections, False
                 preferred = set(decision.preferred_source_types)
+                # An explicitly owned Procedure includes its canonically related
+                # Steps as context, even when the router names only the parent
+                # source type. This does not admit other families or widen a
+                # manual-only, Step-only, or narrowed source request.
+                owned_parent_context_allowed = (
+                    selected_parent_handle is not None and "procedure" in preferred
+                    and not self.request.narrow_scope
+                    and not scope.document_ids and not scope.bubble_document_id
+                )
                 if (decision.source_type_policy == "require" and preferred
-                        and not {"procedure", "step"}.issubset(preferred)):
+                        and not {"procedure", "step"}.issubset(preferred)
+                        and not owned_parent_context_allowed):
                     return retrieval, selections, False
                 original = retrieval.get("citations") or retrieval.get("candidates") or []
                 if selected_parent_handle is None:

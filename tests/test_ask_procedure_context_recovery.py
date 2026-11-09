@@ -505,4 +505,171 @@ class AskProcedureContextRecoveryTests(unittest.TestCase):
         finally:h.close()
 
 
+
+    def test_actual_r7_required_parent_type_keeps_complete_family_and_manual_support(self):
+        # The actual private pp was not recorded: force a VALID owned choice only
+        # for this counterfactual. All other normalized values and 24 rows are real.
+        import test_ask_router_family_context as route_fixture
+        from machinemind.retrieval.chunk_evidence import build_chunk_read,_source_from_columns
+        work=Path(__file__).resolve().parents[2]
+        inputs=[(work/'phase6-ask-correction-r7-20261109/live-client/receipts/R7-A-ASK-02.json',
+                 '4a4c0ea4f269f472fdafa849bf443b681c451d50380eb5996142c108e3ab17ef'),
+                (work/'phase6-ask-source-audit-20261109/current-aurelis-proc002-and-catalog.json',
+                 '89620322db9e553fe738fba1e2a17b81c9dd6c1d361936ee2e996d5d5e1b8ee5'),
+                (work/'phase6-multicompany-20261109/CASE-PREREGISTRATION.json',
+                 'b8f93411fde49079f8d0214bda50c7aeb1a70d04934b2b905e1655b71888f85a')]
+        if not all(p.exists()for p,_ in inputs):self.skipTest('Private pinned R7/source corpus not present')
+        values=[]
+        for p,digest in inputs:
+            blob=p.read_bytes();self.assertEqual(hashlib.sha256(blob).hexdigest(),digest)
+            values.append(json.loads(blob.decode('utf-8-sig')))
+        receipt,source,prereg=values;meta=receipt['response']['meta']
+        actual=deepcopy(meta['assistant_core_v2'])
+        actual['relevant_evidence_ids']=list(meta['assistant_core_evidence_admission']['router_relevant_evidence_ids'])
+        self.assertEqual(actual['source_type_policy'],'require')
+        self.assertEqual(actual['preferred_source_types'],['procedure','document','md_photo'])
+        candidates=deepcopy(meta['assistant_core_evidence_admission']['deterministic_signals']['candidates'])
+        self.assertEqual(len(candidates),24)
+        self.assertEqual(sum(c['source_type']=='step'for c in candidates),0)
+        proc=source['procedure'];pid=proc['procedure_id'];catalog=[]
+        for entry in source['procedures_catalog']:
+            item=deepcopy(proc if entry['procedure_id']==pid else entry)
+            item.setdefault('steps',[]);catalog.append(item)
+        catalog.sort(key=lambda e:e['procedure_id']==pid)
+        query=next(c['prompt']for c in prereg['cases']if c['case_key']=='UI-A-ASK-02')
+        points=[(1,'The maximum permitted coil mass is 1000 kg. Check material identification, weight, diameter and unwinding direction.'),
+            (0,'Before loading and threading, stop the cycle, apply the company energy-isolation procedure and use trained personnel.'),
+            (2,'Use approved lifting equipment and authorized personnel. Do not stand under suspended loads.'),
+            (3,'Check full engagement of power and control connectors, cable integrity and absence of pinching. Work on connectors only with supplies isolated.'),
+            (4,'Wear cut-resistant gloves and eye protection and keep STOP pressed during strip handling. STOP does not replace energy isolation.'),
+            (5,'Do not enter the work area with the decoiler enabled.'),
+            (9,'The later permitted-mode low-speed unwinding test is separate from initial checks; stop if the strip tensions or whips.')]
+        class ActualR7(route_fixture.RouterFixture):
+            def reviewer(self,messages,**kw):
+                reply,model=super().reviewer(messages,**kw)
+                if not self.reject_review:
+                    reply['covered_answer_types']=list(set(reply['covered_answer_types']) |
+                        {f.answer_type for f in self.decision.facet_queries if f.must_cover})
+                else:
+                    reply['missing_answer_types']=list(self.decision.required_answer_types)
+                return reply,model
+        for manual,reject in ((False,False),(True,False),(False,True)):
+            with self.subTest(manual_only_support=manual,review_rejects=reject):
+                raw=deepcopy(actual);question=query;support=None
+                if manual:
+                    support='Calibration voltage: 24 V. Calibration display menu path: Service > Calibration > Voltage.'
+                    question+=' Also give the calibration voltage and calibration display menu path.'
+                    raw['required_answer_types'].append('interface_locations')
+                    facet=dict(facet='calibration voltage and display menu path',answer_type='interface_locations',must_cover=True,
+                        dense_queries=['calibration voltage display menu'],lexical_queries=['calibration voltage display menu'],exact_terms=[],preferred_source_types=['document'])
+                    raw['facet_queries'].append(facet);raw['required_facets'].append(facet['facet'])
+                h=ActualR7(self,raw=raw,query=question,rows=deepcopy(catalog),chosen=pid,choice=pid,
+                    relevant_choices=tuple(actual['relevant_evidence_ids']),mass='1000 kg',writer_points=points,
+                    manual=support,reject_review=reject)
+                try:
+                    h.decision=normalize_decision(h.request,raw)
+                    sql=[(c['bubble_document_id'],c['chunk_index'],c['page_from'],c['page_to'],c['snippet'],c['chunk_full'],
+                        c['similarity'],c.get('embedding_list',[]),True,h.request.company_id,h.request.machine_id)for c in candidates]
+                    h.allowance|=frozenset(_source_from_columns(h.request.company_id,h.request.machine_id,c['bubble_document_id'])for c in candidates)
+                    typed=build_chunk_read(scope=h.scope,kind='dense',rows=sql,candidates=candidates,limits=owned.limits_fixture(1,1)[0].limits)
+                    registered=h.session.register(request=h.request,receipt=typed,current_allowed_sources=h.allowance)
+                    exact=[dict(item.record)for item in h.session.records(request=h.request,handles=registered.records,current_allowed_sources=h.allowance)]
+                    h.prepared={**h.prepared,'candidates':exact,'citations':exact}
+                    h.owner._selection=(AskSelection('candidates',registered.records),AskSelection('citations',registered.records))
+                    result=h.run_core()
+                    self.assertEqual(result['status'],'no_sources'if reject else'answered',result)
+                    self.assertTrue(h.owner._procedure_family_context)
+                    self.assertTrue(h.refine_calls)
+                    self.assertEqual([c[0]for c in h.calls],['router','writer','reviewer'])
+                    expected=[body for key,_,_,body in h.rows if key=='procedure:'+pid or key.startswith('step:')]
+                    self.assertEqual(len(expected),11)
+                    for body in expected:
+                        self.assertIn(body,h.writer_packets[0]);self.assertIn(body,h.review_packets[0])
+                    for packet in (h.writer_packets[0],h.review_packets[0]):
+                        self.assertIn('Non sostare sotto carichi sospesi.',packet)
+                        self.assertNotIn('SOURCE_TYPE: procedure\nTITLE: Lubrificazione',packet)
+                        self.assertNotRegex(packet,r'PROC-001[^\n]*\n[^\n]*5\s*[–-]\s*6\s*bar')
+                    if not reject:
+                        self.assertIn('Do not stand under suspended loads',result['answer'])
+                        self.assertEqual(h.owner._generated_response['meta']['generation_evidence']['source_sha256'],
+                            h.owner._response_flow._review_packet.diagnostic(reused=False)['source_sha256'])
+                    if manual:
+                        self.assertIn(support,h.writer_packets[0]);self.assertIn(support,h.review_packets[0])
+                        self.assertIn('24 V',result['answer'])
+                        self.assertIn('Service > Calibration > Voltage',result['answer'])
+                finally:h.close()
+
+    def test_required_parent_type_exception_does_not_expand_manual_step_or_narrow_scope(self):
+        import test_ask_router_family_context as route_fixture
+        from unittest.mock import patch
+        raw=router();raw.update(request_kind='factual',information_task='numeric_specification',
+            source_type_policy='require',preferred_source_types=['procedure','document','md_photo'])
+        def operation(h,parent,decision):
+            op=task_generation.TaskGenerationEvidence(request=h.request,session=h.session,readers=h.owner.readers,
+                authorize=h.owner.authorize,invoke=h.owner.invoke,runtime=h.owner.generation,tasks=h.owner.tasks)
+            before=len(h.sql)
+            result=op.prepare_family_context(h.prepared,h.owner._selection,decision,selected_parent_handle=parent)
+            self.assertFalse(result[2]);self.assertEqual(len(h.sql),before);self.assertEqual(h.calls,[])
+        for preferred in (('document',),('step',),('md_photo',),('step','document')):
+            h=route_fixture.RouterFixture(self,raw=raw)
+            try:
+                parent=next(handle for handle,item in zip(h.owner._selection[0].records,
+                    h.session.records(request=h.request,handles=h.owner._selection[0].records,current_allowed_sources=h.allowance))
+                    if item.context.source.source_type==SourceType.PROCEDURE and item.context.source.source_id=='install')
+                operation(h,parent,replace(h.decision,source_type_policy='require',preferred_source_types=preferred))
+            finally:h.close()
+        # Construct a genuinely narrowed owner BEFORE its session/readers exist.
+        factory=owned.condition_fixtures.AskConditionsPipelineTests
+        original=factory.request_decision
+        def narrow(instance,*args,**kw):
+            request,decision=original(instance,*args,**kw)
+            return replace(request,narrow_scope=True),decision
+        with patch.object(factory,'request_decision',narrow):h=route_fixture.RouterFixture(self,raw=raw)
+        try:
+            self.assertTrue(h.request.narrow_scope)
+            parent=next(handle for handle,item in zip(h.owner._selection[0].records,
+                h.session.records(request=h.request,handles=h.owner._selection[0].records,current_allowed_sources=h.allowance))
+                if item.context.source.source_type==SourceType.PROCEDURE and item.context.source.source_id=='install')
+            operation(h,parent,replace(h.decision,source_type_policy='require',preferred_source_types=('procedure','document')))
+        finally:h.close()
+
+    def test_required_parent_type_exception_still_rejects_foreign_or_revoked_handles(self):
+        import test_ask_router_family_context as route_fixture
+        raw=router();raw.update(request_kind='factual',information_task='numeric_specification',
+            source_type_policy='require',preferred_source_types=['procedure','document','md_photo'])
+        h,other=route_fixture.RouterFixture(self,raw=raw),route_fixture.RouterFixture(self,raw=raw)
+        try:
+            foreign=next(handle for handle,item in zip(other.owner._selection[0].records,
+                other.session.records(request=other.request,handles=other.owner._selection[0].records,current_allowed_sources=other.allowance))
+                if item.context.source.source_type==SourceType.PROCEDURE)
+            foreign_value=other.owner._values((foreign,))[0]
+            self.assertIn(foreign_value['citation_id'],[c['citation_id']for c in h.prepared['candidates']])
+            self.assertIn(foreign_value['bubble_document_id'],[c['bubble_document_id']for c in h.prepared['candidates']])
+            op=task_generation.TaskGenerationEvidence(request=h.request,session=h.session,readers=h.owner.readers,
+                authorize=h.owner.authorize,invoke=h.owner.invoke,runtime=h.owner.generation,tasks=h.owner.tasks)
+            with self.assertRaises(EvidenceContractError):op.prepare_family_context(h.prepared,h.owner._selection,
+                replace(h.decision,source_type_policy='require',preferred_source_types=('procedure','document')),selected_parent_handle=foreign)
+            self.assertEqual(h.calls+other.calls,[])
+        finally:h.close();other.close()
+        h=route_fixture.RouterFixture(self,raw=raw)
+        try:
+            values=h.session.records(request=h.request,handles=h.owner._selection[0].records,current_allowed_sources=h.allowance)
+            pairs=list(zip(h.owner._selection[0].records,values))
+            foreign=next(handle for handle,item in pairs if item.context.source.source_type==SourceType.STEP
+                and item.context.source.source_id.startswith('startup'))
+            target=next(dict(item.record)for _,item in pairs if item.context.source.source_type==SourceType.STEP
+                and item.context.source.source_id.startswith('install'))
+            alias=deepcopy(h.owner._values((foreign,))[0])
+            alias.update(citation_id=target['citation_id'],bubble_document_id=target['bubble_document_id'])
+            with self.assertRaises(EvidenceContractError):h.session.derive_batch(request=h.request,
+                views=(((foreign,),alias),),operation='offline-same-ID-wrong-parent-relabel',current_allowed_sources=h.allowance)
+            self.assertEqual(h.calls,[])
+        finally:h.close()
+        h=route_fixture.RouterFixture(self,raw=raw,revoke=True)
+        try:
+            with self.assertRaises(EvidenceContractError):h.run_core()
+            self.assertEqual([call[0]for call in h.calls],['router'])
+            self.assertEqual(h.refine_calls,[])
+        finally:h.close()
+
 if __name__ == '__main__':unittest.main()
