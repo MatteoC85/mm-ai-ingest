@@ -407,6 +407,7 @@ from machinemind.infrastructure.database import (
     vector_literal as _infrastructure_vector_literal,
 )
 from machinemind.infrastructure import openai_transport as _openai_transport
+from machinemind.infrastructure import ask_input_count as _ask_input_count
 
 
 def _db_conn():
@@ -10993,6 +10994,12 @@ def _v13_responses_json(
     if purpose == "assistant_core_root_cause_adjudicator":
         from machinemind.infrastructure.review_capture import observe_post
         post_fn = observe_post(post_fn, purpose=purpose)
+    input_count_options = {}
+    if purpose in _ask_input_count.PURPOSES:
+        counter = _ask_input_count.for_owner(_v13_current_budget())
+        if counter is not None:
+            input_count_options = {"input_counter": counter,
+                "before_counted_dispatch": lambda: before_egress(purpose)}
     return _openai_transport.responses_json(
         messages,
         model=model,
@@ -11009,6 +11016,7 @@ def _v13_responses_json(
         current_budget_fn=_v13_current_budget,
         response_text_fn=_v13_response_text,
         safety_identifier_fn=_v13_safety_identifier,
+        **input_count_options,
         **({"require_full_output": True} if require_full_output else {}),
     )
 

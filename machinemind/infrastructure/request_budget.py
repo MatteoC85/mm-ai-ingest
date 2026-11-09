@@ -214,7 +214,7 @@ class _V13RequestBudget:
 
     def reserve_call(self, *, model: str, purpose: str, requested_timeout: int,
                      max_output_tokens: int, messages: list[dict], request_payload: Optional[dict] = None,
-                     require_full_output: bool = False) -> tuple[int, int, int]:
+                     require_full_output: bool = False, _input_count_proof=None) -> tuple[int, int, int]:
         with self._lock:
             self._admission()
             for control in (self._control, _REQUEST_CONTROL_CTX.get()):
@@ -230,6 +230,17 @@ class _V13RequestBudget:
             requested = 2000 if max_output_tokens is None else int(max_output_tokens)
             if requested <= 0:
                 raise _V13BudgetExceeded("Invalid output token ceiling")
+            if _input_count_proof is not None:
+                from .ask_input_count import consume
+                try:
+                    counted = consume(_input_count_proof, budget=self, purpose=purpose,
+                        model=model, payload=request_payload, requested=requested)
+                    if type(counted) is not int or not 0 < counted <= bound:
+                        raise ValueError("input_count_bound")
+                except Exception:
+                    raise _V13BudgetExceeded("Invalid private input count proof") from None
+                bound = counted
+                input_cost = bound * input_rate * 1.25 / 1_000_000.0
             available = self.remaining_cost_usd - input_cost
             cap = min(requested, max(0, math.floor(available * 1_000_000.0 / output_rate))) if output_rate else (requested if available >= 0 else 0)
             if type(require_full_output) is not bool:
@@ -403,7 +414,7 @@ class _V13RequestBudget:
         with self._lock:
             pending, uncertain = self._liability("pending"), self._liability("uncertain")
             clean = lambda row: {k: v for k, v in row.items() if not k.startswith("_")}
-            return dict(engine="v13", budget_policy_version=BUDGET_POLICY_VERSION, route=self.route,
+            result = dict(engine="v13", budget_policy_version=BUDGET_POLICY_VERSION, route=self.route,
                         elapsed_seconds=round(self.elapsed(), 3), deadline_seconds=self.deadline_seconds,
                         llm_calls=self.llm_calls, max_llm_calls=self.max_llm_calls, base_max_llm_calls=self.base_max_llm_calls,
                         absolute_max_llm_calls=self.absolute_max_llm_calls, retry_allowance_calls=self.retry_allowance_calls,
@@ -420,6 +431,11 @@ class _V13RequestBudget:
                         refinement_used=bool(self.refinement_used), semantic_cache=self.semantic_cache,
                         evidence_gate=dict(self.evidence_gate or {}), retrieval_assurance=dict(self.retrieval_assurance or {}),
                         calls=[clean(row) for row in self.call_log], embeddings=[clean(row) for row in self.embedding_log])
+            from .ask_input_count import snapshot
+            counted = snapshot(self)
+            if counted is not None:
+                result["input_count_preflight"] = counted
+            return result
 
 
 _V13_BUDGET_CTX = contextvars.ContextVar("machinemind_v13_budget", default=None)

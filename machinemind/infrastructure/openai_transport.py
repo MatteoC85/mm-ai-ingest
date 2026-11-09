@@ -10,12 +10,13 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from copy import deepcopy
 from collections.abc import Callable
 from typing import Any, Optional, Type
 from machinemind.ask.phase_trace import span as _phase_span
 from machinemind.ask.request_completion import provider_timeout as _provider_timeout
 from .provider_failures import ProviderResponseError, http_failure, response_status_failure
-from .request_budget import _V13OutputCapacityInsufficient
+from .request_budget import _V13OutputCapacityInsufficient, _V13BudgetExceeded
 
 PostFn = Callable[..., Any]
 BudgetResolver = Callable[[], Any]
@@ -350,7 +351,8 @@ def responses_json(messages: list[dict], *, model: str, json_schema: dict, effor
                    reasoning_mode: str = "", timeout: int, max_output_tokens: int,
                    company_id: str, purpose: str, api_key: str, url: str, post_fn: PostFn,
                    current_budget_fn: BudgetResolver, response_text_fn: Callable[[dict], str],
-                   safety_identifier_fn: Callable[[str], str], require_full_output: bool = False) -> dict:
+                   safety_identifier_fn: Callable[[str], str], require_full_output: bool = False,
+                   input_counter=None, before_counted_dispatch: Optional[Callable[[], None]] = None) -> dict:
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY missing")
     budget = current_budget_fn()
@@ -365,12 +367,43 @@ def responses_json(messages: list[dict], *, model: str, json_schema: dict, effor
     if reasoning_mode:
         payload["reasoning"]["mode"] = reasoning_mode
     timeout = _provider_timeout(purpose, timeout)
-    timeout, cap, index = budget.reserve_call(model=model, purpose=purpose, requested_timeout=timeout,
-                                              max_output_tokens=max_output_tokens, messages=messages,
-                                              request_payload=payload,
-                                              **({"require_full_output": True} if require_full_output else {}))
+    proof = None
+    try:
+        timeout, cap, index = budget.reserve_call(model=model, purpose=purpose, requested_timeout=timeout,
+            max_output_tokens=max_output_tokens, messages=messages, request_payload=payload,
+            **({"require_full_output": True} if require_full_output else {}))
+    except _V13BudgetExceeded as original_error:
+        from . import ask_input_count
+        if (type(input_counter) is not ask_input_count._Session or input_counter.budget is not budget
+                or not ask_input_count.eligible_refusal(budget, original_error, purpose=purpose,
+                    max_output_tokens=max_output_tokens, model=model)):
+            raise
+        payload = deepcopy(payload)  # this counted request owns its frozen input/schema
+        messages = payload["input"]
+        proof = input_counter.count(purpose=purpose, payload=payload, requested=max_output_tokens,
+            api_key=api_key, post_fn=post_fn, url=url, old_error=original_error)
+        if proof is None:
+            raise original_error
+        # The FREE read may use wall time. Reauthorize and recheck the original
+        # request deadline before considering the same, still-unsent paid call.
+        if before_counted_dispatch is not None:
+            try:
+                before_counted_dispatch()
+            except _V13BudgetExceeded:
+                raise
+            except Exception as denied:
+                raise ask_input_count._RevalidationDenied(denied) from None
+        timeout = _provider_timeout(purpose, timeout)
+        timeout, cap, index = budget.reserve_call(model=model, purpose=purpose, requested_timeout=timeout,
+            max_output_tokens=max_output_tokens, messages=messages, request_payload=payload,
+            _input_count_proof=proof, **({"require_full_output": True} if require_full_output else {}))
     payload["max_output_tokens"] = cap
     try:
+        if proof is not None:
+            try:
+                ask_input_count.finalize(proof, budget=budget, payload=payload, index=index)
+            except Exception:
+                raise _V13BudgetExceeded("Invalid private counted dispatch proof") from None
         data = _send_json(url=url, headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
                           payload=payload, timeout=timeout, post_fn=post_fn, budget=budget, call_index=index,
                           purpose=purpose)
@@ -393,6 +426,7 @@ def json_models(messages: list[dict], *, models: list[str], json_schema: dict, e
                 current_budget_fn: BudgetResolver, responses_json_fn: Callable[..., dict],
                 chat_json_fn: Callable[..., dict], budget_exceeded_type: Type[BaseException],
                 require_full_output: bool = False) -> tuple[dict, str]:
+    from .ask_input_count import _RevalidationDenied
     candidates = normalize_models_fn(models) or [default_model]
     errors, failed_attempts = [], 0
     last_capacity_error = None
@@ -416,6 +450,8 @@ def json_models(messages: list[dict], *, models: list[str], json_schema: dict, e
             if failed_attempts:
                 budget.grant_retry_allowance(failed_attempts=failed_attempts, reason=f"{purpose}:model_fallback_succeeded")
             return parsed, model
+        except _RevalidationDenied as denied:
+            raise denied.original from None  # preserve authority category without any provider fallback
         except _V13OutputCapacityInsufficient as exc:
             if not require_full_output or int(budget.llm_calls) != calls_before:
                 raise
