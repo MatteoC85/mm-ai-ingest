@@ -21513,8 +21513,9 @@ def _sd_validate_state_binding(
 def _sd_final_result_for_display(final_result: dict, hypotheses: list[dict], language: str) -> dict:
     """Clarify unconfirmed conclusions without changing signed diagnostic state.
 
-    Replace only the server's canonical lead; reviewed explanations, pending
-    questions and safety text remain literal. IDs, weights and checks are copied.
+    Clarify the server's canonical lead; reviewed explanations, pending questions
+    and safety text remain literal. An unconfirmed positive top tie has no public
+    selected winner. Signed state, per-hypothesis weights and checks are copied.
     """
     displayed = dict(final_result)
     active = [h for h in hypotheses if isinstance(h, dict) and h.get("status") != "excluded"]
@@ -21546,6 +21547,17 @@ def _sd_final_result_for_display(final_result: dict, hypotheses: list[dict], lan
             lead += " Un peso relativo del 100% non conferma un guasto."
         lead += f"\n\nIpotesi documentata ancora da verificare: {label}."
     displayed["summary"] = lead + summary[len(prefix):]
+    if tied and max(weights) > 0.0:
+        # Bubble renders these final selection fields separately from summary.
+        # A tie supplies no single leading hypothesis. Project a neutral final
+        # selection, retaining the signed state and per-hypothesis weights.
+        displayed.update(
+            most_likely_hypothesis_id="",
+            most_likely_label=("No leading hypothesis identified" if is_en
+                               else "Nessuna ipotesi prevalente identificata"),
+            probability_pct=0.0,
+            probability_band="unknown",
+        )
     return displayed
 
 

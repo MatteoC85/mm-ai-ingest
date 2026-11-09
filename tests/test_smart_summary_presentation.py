@@ -26,8 +26,14 @@ class SmartSummaryPresentationTests(unittest.TestCase):
         before = deepcopy((final, hypotheses))
         displayed = self.m._sd_final_result_for_display(final, hypotheses, language)
         self.assertEqual((final, hypotheses), before)
-        self.assertEqual({k: v for k, v in displayed.items() if k != 'summary'},
-                         {k: v for k, v in final.items() if k != 'summary'})
+        active = [h for h in hypotheses if h.get('status') != 'excluded']
+        weights = [round(float(h.get('probability_pct') or 0), 1) for h in active]
+        tied = bool(weights and max(weights) > 0 and weights.count(max(weights)) > 1
+                    and not any(h.get('status') == 'confirmed' for h in active))
+        projected = {'summary', 'most_likely_hypothesis_id', 'most_likely_label',
+                     'probability_pct', 'probability_band'} if tied else {'summary'}
+        self.assertEqual({k: v for k, v in displayed.items() if k not in projected},
+                         {k: v for k, v in final.items() if k not in projected})
         old_lead = ('Most supported hypothesis: ' if language == 'en' else 'Ipotesi più supportata: ')
         if final['summary'].startswith(old_lead):
             tail = final['summary'][len(old_lead + final['most_likely_label'] + '.'):]
@@ -42,8 +48,10 @@ class SmartSummaryPresentationTests(unittest.TestCase):
                 self.assertIn(phrase, displayed['summary'])
                 self.assertNotIn('Most supported hypothesis:', displayed['summary'])
                 self.assertNotIn('Ipotesi più supportata:', displayed['summary'])
-                self.assertEqual(displayed['most_likely_hypothesis_id'], final['most_likely_hypothesis_id'])
-                self.assertEqual(displayed['probability_pct'], 50)
+                self.assertEqual(displayed['most_likely_hypothesis_id'], '')
+                self.assertIn('prevalente' if language == 'it' else 'leading', displayed['most_likely_label'])
+                self.assertEqual(displayed['probability_pct'], 0)
+                self.assertEqual(displayed['probability_band'], 'unknown')
 
     def test_it_en_single_100_is_explicitly_not_confirmation(self):
         for language, phrase in [('it', '100% non conferma'), ('en', '100% does not confirm')]:

@@ -882,6 +882,22 @@ def verify_or_repair_answer(
         answer, request_key=ask_request_key(request),
         required_facets=tuple(review_facets), required_types=tuple(requirements))
         if _guarded(runtime, request, decision) else None)
+    review_models = [V13_FAST_MODEL, V13_PLANNER_MODEL]
+    # A complete source-ordered draft still needs every semantic/safety check.
+    # Prefer its existing smaller fallback only for the first same-language
+    # review of a fully represented owned packet. Other consumers and model
+    # overrides retain their configured order; rejected verdicts never trigger
+    # a second model here. Transport fallback and all budget limits are unchanged.
+    if (protected_budget and source_ordered_review and reference_catalogue is not None
+            and packet is not None
+            and review_evidence_diagnostic.get("complete_primary_representation") is True
+            and repair_context["procedure_structure"].get("sequence_complete") is True
+            and repair_context["procedure_structure"].get("source_notes_present") is True
+            and not translation_language
+            and not (repair_context.get("first_answer_contract") or repair_missing_facets
+                     or repair_missing_answer_types or repair_missing_list_items)
+            and review_models == ["gpt-5.6-terra", "gpt-5.6-luna"]):
+        review_models.reverse()
     try:
         # A source-first producer cannot also be its own final semantic check.
         # Reserve the follow-up window across every initial provider fallback.
@@ -891,7 +907,7 @@ def verify_or_repair_answer(
                     {"role": "system", "content": system_msg},
                     {"role": "user", "content": user_msg},
                 ],
-                models=[V13_FAST_MODEL, V13_PLANNER_MODEL],
+                models=review_models,
                 json_schema=verifier_schema,
                 # This source-first draft still requires the independent semantic
                 # review below. Keep its bounded output for the wire inventory;
