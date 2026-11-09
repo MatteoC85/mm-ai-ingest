@@ -21,6 +21,7 @@ from ..evidence.copying import deepcopy
 from dataclasses import replace
 from math import isfinite
 from typing import Any, Callable
+from ..ask.phase_trace import hot as _phase_hot
 
 from . import candidate_ranking as ranking
 from .ask_composition import AskEvidenceSession, RecordHandle, RegisteredRead, AskSelection, _check_derived_locator
@@ -32,6 +33,7 @@ from ..evidence.ask_input import _same_value as _legacy_same_value
 from ..evidence.legacy_compatibility import _LegacyWitness, _witness_size, _WitnessBudget
 
 
+@_phase_hot("receipt.same_value")
 def _same_value(left, right):
     # Journal witnesses are immutable; old consumers still receive plain dicts.
     if type(right) is _LegacyWitness:
@@ -42,6 +44,7 @@ def _same_value(left, right):
         return left.matches(right)
     return _legacy_same_value(left, right)
 from ..evidence.record_adapters import adapt_candidate
+adapt_candidate = _phase_hot("receipt.adapt_candidate")(adapt_candidate)
 
 PRODUCER_VERSION = "ask-receipt-lineage-p6b4g-v1"
 

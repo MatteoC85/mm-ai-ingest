@@ -23,6 +23,7 @@ import hashlib
 import json
 import math
 from typing import Any, Iterable
+from ..ask.phase_trace import hot as _phase_hot
 
 from .adapter_types import AdapterContext, AdapterLimits, AdaptationResult
 from .assembly import (AssemblyLimits, EvidenceAssembly, EvidenceAssemblyError,
@@ -466,6 +467,7 @@ class _LegacyWitness(Mapping):
         object.__setattr__(self, "numeric_payloads", payloads)
 
     @classmethod
+    @_phase_hot("legacy.capture")
     def capture(cls, value, limits):
         freezer = _Freezer(limits)
         tree = freezer.freeze(value)
