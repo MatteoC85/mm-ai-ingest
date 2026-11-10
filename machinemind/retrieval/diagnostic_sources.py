@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from collections import deque
 from typing import Any, Callable, Iterable, Mapping, Sequence
 import math
+import hashlib
 import re
 import unicodedata
 
@@ -84,6 +85,7 @@ class DiagnosticCandidateAssessment:
     support_query_sha256: str
     support_source_text_sha256: str
     support_policy_version: str
+    router_context_selected: bool
 
 
 @dataclass(frozen=True)
@@ -331,6 +333,14 @@ def assess_root_cause_candidate(
         and isinstance(source_sha, str) and re.fullmatch(r"[0-9a-f]{64}", source_sha)
         and isinstance(support_policy, str) and 0 < len(support_policy) <= 128
     )
+    # This is source-context recall, never a new observed fact or causal proof.
+    # Only the current callback can establish that the unchanged source body was
+    # in the router's original snapshot and that its ID was actually selected.
+    body = str(item.get("chunk_full") or item.get("snippet") or item.get("snippet_clean") or "").strip()
+    router_context_selected = bool(valid_support
+        and support.get("router_context_selected") is True
+        and support.get("router_context_source_id") == stable_key
+        and source_sha == hashlib.sha256(body.encode("utf-8")).hexdigest())
 
     return DiagnosticCandidateAssessment(
         candidate=item,
@@ -358,6 +368,7 @@ def assess_root_cause_candidate(
         support_query_sha256=query_sha if valid_support else "",
         support_source_text_sha256=source_sha if valid_support else "",
         support_policy_version=support_policy if valid_support else "",
+        router_context_selected=router_context_selected,
     )
 
 
@@ -370,7 +381,7 @@ def _supported_core_context(
         and assessment.quality >= policy.absolute_quality_floor
         and assessment.causal_support >= 0.08
         and assessment.subsystem_support > 0.0
-        and assessment.matched_support_part_ids
+        and (assessment.matched_support_part_ids or assessment.router_context_selected)
         and not assessment.candidate.get("hard_excluded")
         and assessment.candidate.get("assistant_core_root_viable") is True
     )
@@ -725,6 +736,7 @@ def select_root_cause_candidates(
                 "selected": item.stable_key in selected_ids,
                 "not_selected_reason": rejection_reasons.get(item.stable_key, ""),
                 "matched_support_part_ids": list(item.matched_support_part_ids),
+                "router_context_selected": item.router_context_selected,
                 "query_sha256": item.support_query_sha256,
                 "source_text_sha256": item.support_source_text_sha256,
                 "support_policy_version": item.support_policy_version,

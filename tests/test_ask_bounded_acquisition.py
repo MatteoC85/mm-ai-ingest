@@ -249,6 +249,7 @@ class AskBoundedAcquisitionTests(unittest.TestCase):
         intake.core, intake.runtimes, intake.generation = AssistantCoreV2(hooks), runtimes, object()
         intake.session, intake.consumers, intake._response_flow = object(), False, None
         intake._task_input, intake._task_used = {}, set()
+        intake._procedure_catalog = {}  # Synthetic __new__ owner must include constructor cleanup state.
         intake._check = lambda req: None
         intake.authorize = lambda req: frozenset()
         intake.owner_invoke = lambda fn, req: fn()

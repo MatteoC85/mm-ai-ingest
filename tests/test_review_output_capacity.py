@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
-from machinemind.infrastructure import request_budget as budgets, openai_transport as transport
+from machinemind.infrastructure import request_budget as budgets, openai_transport as transport, ask_input_count
 
 def deny(*args,**kwargs):raise AssertionError('OFFLINE_EXTERNAL_IO_DENIED')
 
@@ -168,7 +168,7 @@ class ReviewOutputCapacityTests(unittest.TestCase):
         nodes=[n for n in tree.body if isinstance(n,ast.FunctionDef)and n.name in names]
         calls=[]
         fake=SimpleNamespace(**{name:(lambda *a,**kw:calls.append(kw))for name in ('json_models','responses_json','chat_json')})
-        namespace={'Optional':Optional,'_openai_transport':fake,'OPENAI_API_KEY':'offline-unused',
+        namespace={'Optional':Optional,'_openai_transport':fake,'_ask_input_count':ask_input_count,'OPENAI_API_KEY':'offline-unused',
             'OPENAI_RESPONSES_URL':'https://offline.invalid/responses','OPENAI_CHAT_URL':'https://offline.invalid/chat',
             'OPENAI_CHAT_MODEL':'legacy','V13_FAST_MODEL':'gpt-5.6-terra','requests':SimpleNamespace(post=deny),
             '_v13_current_budget':lambda:self.budget,'_v13_response_text':transport.response_text,

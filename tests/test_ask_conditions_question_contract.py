@@ -8,6 +8,7 @@ from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 import json
+import re
 import sys
 from types import SimpleNamespace
 import unittest
@@ -195,7 +196,17 @@ class AskConditionsQuestionContractTests(unittest.TestCase):
         raw=raw_decision();raw.update(procedure_scope='execution_steps',information_task='procedure_full',
             required_answer_types=['ordered_actions','safety_conditions'])
         x=self.owned('Descrivi la procedura completa di inserimento cartuccia.', 'it',raw=raw,finish=False)
-        self.assertIn(x['rows'][-1][3],x['review'])
+        # Reference wire encodes each actual source body once in ordered units.
+        # Assert the complete original extension is present after lossless decoding.
+        decoded_sources = []
+        for match in re.finditer(r'\nSOURCE_UNITS [^:\n]+:', x['review']):
+            units, _ = json.JSONDecoder().raw_decode(x['review'][match.end():])
+            self.assertEqual([u[0] for u in units], list(range(len(units))))
+            decoded_sources.append(''.join(u[1] for u in units))
+        if decoded_sources:
+            self.assertIn(x['rows'][-1][3], decoded_sources)
+        else:
+            self.assertIn(x['rows'][-1][3], x['review'])
         self.assertEqual(x['decision'].required_facets,tuple(raw['required_facets']))
 
     def test_manual_fallback_keeps_extensions_and_rejects_a_spoofed_family_flag(self):

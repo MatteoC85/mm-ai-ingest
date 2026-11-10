@@ -33,14 +33,16 @@ class RootClueSupport:
     parts: tuple[dq.RequestPart, ...]
     _binding_sha256: str = field(repr=False)
     _seal: object = field(repr=False, compare=False)
+    router_source_hashes: tuple[tuple[str, str], ...] = ()
 
     def __deepcopy__(self, memo: dict) -> "RootClueSupport":
         # Every field is immutable; preserve the server-only provenance marker.
         return self
 
 
-def _binding(query: str, company: str, machine: str, parts: tuple) -> str:
-    wire = [query, company, machine, [p.to_dict() for p in parts]]
+def _binding(query: str, company: str, machine: str, parts: tuple,
+             router_sources: tuple = ()) -> str:
+    wire = [query, company, machine, [p.to_dict() for p in parts], router_sources]
     return hashlib.sha256(json.dumps(wire, ensure_ascii=False, sort_keys=True,
                                     separators=(",", ":")).encode()).hexdigest()
 
@@ -53,22 +55,54 @@ def _valid(value: Any) -> bool:
     if (not isinstance(value.original_query, str) or not isinstance(value.parts, tuple)
             or not all(isinstance(p, dq.RequestPart) for p in value.parts)):
         return False
-    if value._binding_sha256 != _binding(value.original_query, value.company_id, value.machine_id, value.parts):
+    if not _valid_router_sources(value.router_source_hashes):
+        return False
+    if value._binding_sha256 != _binding(value.original_query, value.company_id, value.machine_id,
+                                        value.parts, value.router_source_hashes):
         return False
     checked, error = dq._partition([p.to_dict() for p in value.parts], value.original_query)
     return not error and checked == value.parts
 
 
+def _valid_router_sources(value: Any) -> bool:
+    return bool(isinstance(value, tuple) and len(value) <= 64
+                and all(isinstance(row, tuple) and len(row) == 2
+                        and isinstance(row[0], str) and 0 < len(row[0]) <= 512
+                        and isinstance(row[1], str) and re.fullmatch(r"[0-9a-f]{64}", row[1])
+                        for row in value)
+                and len({row[0] for row in value}) == len(value))
+
+
+def snapshot_router_sources(sources: Any) -> tuple[tuple[str, str], ...]:
+    """Snapshot source identity BEFORE routing; ambiguous duplicate IDs get no lane."""
+    if not isinstance(sources, (tuple, list)) or len(sources) > 64:
+        return ()
+    hashes, ambiguous = {}, set()
+    for row in sources:
+        if (not isinstance(row, (tuple, list)) or len(row) != 2
+                or not isinstance(row[0], str) or not 0 < len(row[0]) <= 512
+                or not isinstance(row[1], str) or not row[1].strip()):
+            continue
+        cid, text = row
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        if cid in hashes and hashes[cid] != digest:
+            ambiguous.add(cid)
+        hashes[cid] = digest
+    return tuple(sorted((cid, digest) for cid, digest in hashes.items() if cid not in ambiguous))
+
+
 def from_profile(profile: dq.DiagnosticQueryProfile, *, company_id: str,
-                 machine_id: str) -> RootClueSupport | None:
+                 machine_id: str, router_sources: tuple = ()) -> RootClueSupport | None:
     if profile.interpretation_status != "valid" or not profile.diagnostic_projection:
         return None
     support, gaps, error = dq._basis_parts(profile)
     if error or gaps or not support:
         return None
+    bindings = router_sources if _valid_router_sources(router_sources) else ()
     value = RootClueSupport(profile.original_query, dq.query_fingerprint(profile.original_query),
                             str(company_id), str(machine_id), profile.parts,
-                            _binding(profile.original_query, str(company_id), str(machine_id), profile.parts), _SEAL)
+                            _binding(profile.original_query, str(company_id), str(machine_id), profile.parts,
+                                     bindings), _SEAL, bindings)
     return value if _valid(value) else None
 
 
@@ -126,7 +160,7 @@ def _part_matches(part: dq.RequestPart, text: str, exact_terms: tuple[str, ...],
                for variant in (part.quote, *part.retrieval_aliases))
 
 
-def support_match(decision: Any, text: str) -> dict:
+def support_match(decision: Any, text: str, *, source_id: str = "") -> dict:
     """Compute new matches; neither a candidate flag nor a cached verdict is input."""
     value = getattr(decision, "root_clue_support", None)
     if getattr(decision, "effective_mode", None) != "root_cause" or not _valid(value):
@@ -134,9 +168,16 @@ def support_match(decision: Any, text: str) -> dict:
     matched = [f"{p.start}:{p.end}:{p.role}" for p in value.parts
                if p.role in dq.FACT_ROLES and p.basis_use == "support"
                and _part_matches(p, text, _exact_terms(decision), _coverage)]
+    source_digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    relevant = getattr(decision, "relevant_evidence_ids", ())
+    router_context = bool(isinstance(source_id, str) and source_id
+                          and isinstance(relevant, tuple) and source_id in relevant
+                          and dict(value.router_source_hashes).get(source_id) == source_digest)
     return {"matched_support_part_ids": tuple(dict.fromkeys(matched)),
             "query_sha256": value.query_sha256,
-            "source_text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "source_text_sha256": source_digest,
+            "router_context_selected": router_context,
+            "router_context_source_id": source_id if router_context else "",
             "policy_version": POLICY_VERSION}
 
 

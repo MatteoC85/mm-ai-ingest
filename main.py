@@ -13880,6 +13880,9 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
         if isinstance(c, dict)
     ]
     evidence_block, supplied = _v13_gate_candidate_block(retrieval_query, candidates)
+    root_router_source_hashes = (_root_clue_support.snapshot_router_sources([
+        (str(c.get("citation_id") or "").strip(), _v13_candidate_text(c)) for c in supplied
+    ]) if is_root_cause else ())
     supplied_ids = {
         str(c.get("citation_id") or "").strip()
         for c in supplied
@@ -14219,6 +14222,7 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
         if basis_result.summary.get("admitted"):
             out[_root_clue_support.WIRE_KEY] = _root_clue_support.from_profile(
                 profile, company_id=request.company_id, machine_id=request.machine_id,
+                router_sources=root_router_source_hashes,
             )
     if request.requested_mode == MODE_ASK and isinstance(request.metadata, dict):
         target = _retrieval_precision_facts.scalar_target_from_router(request.query, out)
@@ -15267,7 +15271,8 @@ def _assistant_core_root_source_selection(
             stable_key=_DIAGNOSTIC_SOURCE_RUNTIME().stable_key,
             family_key=_DIAGNOSTIC_SOURCE_RUNTIME().family_key,
             support_match=lambda candidate: _root_clue_support.support_match(
-                decision, _v13_candidate_text(candidate)),
+                decision, _v13_candidate_text(candidate),
+                source_id=_assistant_core_candidate_stable_key(candidate)),
         ) if decision is not None else _DIAGNOSTIC_SOURCE_RUNTIME()),
     )
 

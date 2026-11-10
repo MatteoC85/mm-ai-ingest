@@ -153,6 +153,7 @@ def generate_ask_response(
         for x in (contract.get("required_answer_types") or [])
         if str(x or "").strip()
     }
+    declared_answer_types = frozenset(required_answer_types)
     if runtime.preserve_procedure_context:
         required_answer_types.update(item.get("answer_type") for item in contract.get("facet_queries", [])
             if isinstance(item, dict) and item.get("must_cover") and item.get("answer_type"))
@@ -192,25 +193,31 @@ def generate_ask_response(
     # missing facets are resolved. The existing independent judge still decides.
     mandatory_facets = [item for item in contract.get("facet_queries", [])
         if isinstance(item, dict) and item.get("must_cover") is True]
-    composition_answer_types = required_answer_types | {
+    composition_answer_types = declared_answer_types | {
         item.get("answer_type") for item in mandatory_facets}
     prepared_decision = retrieval.get("assistant_core_decision") or {}
     finite_factual_composition = bool(
         runtime.preserve_procedure_points and contract.get("fail_closed") is True
-        and information_task == INFO_NUMERIC_SPECIFICATION
-        and required_answer_types and mandatory_facets
+        and information_task in {INFO_NUMERIC_SPECIFICATION, "document_explanation"}
+        and declared_answer_types and mandatory_facets
         and REQ_NUMERIC_VALUE in composition_answer_types
         and composition_answer_types <= {REQ_NUMERIC_VALUE, REQ_SAFETY_CONDITIONS, "explanation"}
         and prepared_decision.get("request_kind") == "factual"
         and prepared_decision.get("effective_mode") == "ask"
         and prepared_decision.get("enumeration_requested") is False
         and not overview_catalog_requested and not machine_catalog_digest)
+    complete_family_composition = bool(runtime.preserve_procedure_context
+        and runtime.procedure_context_sources)
     source_backed_composition = bool(
         V13_FAST_MODEL == "gpt-5.6-terra" and runtime.preserve_procedure_points
-        and ((runtime.preserve_procedure_context and runtime.procedure_context_sources)
-             or finite_factual_composition))
+        and (complete_family_composition or finite_factual_composition))
     if source_backed_composition:
-        model, effort, reasoning_mode = V13_FAST_MODEL, "none", ""
+        # A complete operation family still needs phase/condition reasoning in
+        # its draft; the separate semantic judge remains unchanged. Finite
+        # nonprocedural fact correction keeps the existing NONE composition.
+        model = V13_FAST_MODEL
+        effort = "low" if complete_family_composition else "none"
+        reasoning_mode = ""
     context_chars = V13_FAST_CONTEXT_CHARS if policy_model == V13_FAST_MODEL else V13_HEAVY_CONTEXT_CHARS
     if overview_catalog_requested:
         context_chars = max(context_chars, 28000)

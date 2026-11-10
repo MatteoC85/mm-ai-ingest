@@ -209,14 +209,33 @@ class OwnedFamilyFixture:
     def reviewer(self, messages, **kwargs):
         self.calls.append(('reviewer', deepcopy(messages), deepcopy(kwargs)))
         self.review_packets.append(messages[1]['content'])
-        current = messages[1]['content'].split('CURRENT_ANSWER:\n', 1)[1].split('\n\nSOURCES:', 1)[0]
+        wire = messages[1]['content']
+        block_view = None
+        if '\n\nPROCEDURE_BLOCKS:\n' in wire:
+            block_view, _ = json.JSONDecoder().raw_decode(wire.split('\n\nPROCEDURE_BLOCKS:\n', 1)[1])
+        if 'CURRENT_ANSWER_FORMAT: lossless PROCEDURE_BLOCKS' in wire:
+            self.test.assertIsInstance(block_view, list)
+            parts = []
+            for block in block_view:
+                self.test.assertIsInstance(block['heading'], str)
+                self.test.assertIsInstance(block['separator'], str)
+                self.test.assertEqual([u[0] for u in block['units']], list(range(len(block['units']))))
+                self.test.assertTrue(all(type(u[0]) is int and isinstance(u[1], str) for u in block['units']))
+                parts.append(block['heading'] + ''.join(u[1] for u in block['units']) + block['separator'])
+            current = ''.join(parts)
+        else:
+            current = wire.split('CURRENT_ANSWER:\n', 1)[1].split('\n\nSOURCES:', 1)[0]
+        # Decode the actual provider wire, including added source notes. The
+        # earlier generated response is not the current reviewed draft oracle.
+        checked_blocks = ([b['block_id'] for b in block_view] if block_view is not None
+                          else [b['block_id'] for b in procedure_review.block_layout(current)['blocks']])
         ids = [row['citation_id'] for row in self.generated['citations']]
         reply = {'outcome':'pass', 'reply_mode':'retain', 'answer':'', 'edits':[], 'reason':'offline fixture',
             'covered_facets':list(self.decision.required_facets), 'missing_facets':[],
             'covered_answer_types':list(self.decision.required_answer_types), 'missing_answer_types':[],
             'expected_list_items':[], 'covered_list_items':[], 'missing_list_items':[], 'enumeration_requested':False,
             'citation_ids':ids, 'operation_boundary':{'complete':True,
-                'checked_blocks':[b['block_id'] for b in procedure_review.block_layout(current)['blocks']], 'changes':[]}}
+                'checked_blocks':checked_blocks, 'changes':[]}}
         return self.reply(reply, 'offline-reviewer', messages, kwargs)
 
     def run(self, *, validate=True):

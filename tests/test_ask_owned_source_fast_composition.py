@@ -30,7 +30,7 @@ class OwnedSourceFastCompositionTests(unittest.TestCase):
   writer=next(c for c in h.calls if c[0]=='writer');reviewer=next(c for c in h.calls if c[0]=='reviewer')
   baseline=self.m._v13_choose_ask_model(h.request.query,h.prepared,narrow_scope=h.request.narrow_scope)
   self.assertEqual(baseline[0],self.m.V13_HEAVY_MODEL)
-  self.assertEqual(writer[2]['models'],[self.m.V13_FAST_MODEL]);self.assertEqual(writer[2]['effort'],'none')
+  self.assertEqual(writer[2]['models'],[self.m.V13_FAST_MODEL]);self.assertEqual(writer[2]['effort'],'low')
   self.assertEqual(writer[2]['reasoning_mode'],'')
   self.assertEqual(writer[2]['max_output_tokens'],h.owner.generation.V13_HEAVY_MAX_OUTPUT_TOKENS)
   self.assertEqual(writer[2]['timeout'],h.owner.generation.V13_HEAVY_TIMEOUT_SECONDS)
@@ -42,7 +42,7 @@ class OwnedSourceFastCompositionTests(unittest.TestCase):
  def completion(self,h):
   return request_completion.RequestCompletion(runtime=self.m._assistant_core_request_flow_runtime(),
    payload=SimpleNamespace(company_id=h.request.company_id),started=time.monotonic())
- def test_current_owned_family_uses_fast_none_with_original_heavy_packet_caps_and_judge(self):
+ def test_current_owned_family_uses_fast_low_with_original_heavy_packet_caps_and_judge(self):
   h=context.ContextFixture(self,query='Before inserting the cartridge, which documented mass limit, lifting checks, electrical checks and safety conditions apply, and which low-speed test belongs later?')
   completion=self.completion(h)
   try:
@@ -105,14 +105,14 @@ class OwnedSourceFastCompositionTests(unittest.TestCase):
   self.assertEqual(len(fixtures),3)
   for h in fixtures:
    writer=next(c for c in h.calls if c[0]=='writer');reviewer=next(c for c in h.calls if c[0]=='reviewer')
-   self.assertEqual(writer[2]['models'],[self.m.V13_FAST_MODEL]);self.assertEqual(writer[2]['effort'],'none')
+   self.assertEqual(writer[2]['models'],[self.m.V13_FAST_MODEL]);self.assertEqual(writer[2]['effort'],'low')
    self.assertEqual(writer[2]['max_output_tokens'],h.owner.generation.V13_HEAVY_MAX_OUTPUT_TOKENS)
    self.assertEqual(reviewer[2]['effort'],'low');self.assertIn('Non sostare sotto carichi sospesi.',h.writer_packets[0])
    self.assertIn('Non sostare sotto carichi sospesi.',h.review_packets[0])
 
- def test_real_owned_finite_numeric_manual_draft_uses_fast_without_claiming_family_completeness(self):
+ def _finite_manual_case(self,information_task):
   raw={'request_kind':'factual','effective_mode':'ask','confidence':.98,'requested_mode_fit':True,
-   'evidence_state':'supported','evidence_policy':'machine_sources_required','information_task':'numeric_specification',
+   'evidence_state':'supported','evidence_policy':'machine_sources_required','information_task':information_task,
    'procedure_scope':'other','required_answer_types':['numeric_value','safety_conditions','explanation'],
    'preferred_source_types':['document'],'source_type_policy':'require','required_facets':['maximum mass and proposed mass','STOP versus energy isolation','why the proposed mass is outside the limit'],
    'facet_queries':[{'facet':'maximum mass and proposed mass','answer_type':'numeric_value','must_cover':True,
@@ -143,6 +143,10 @@ class OwnedSourceFastCompositionTests(unittest.TestCase):
    self.assertIn(text,h.writer_packets[0]);self.assertIn(text,h.review_packets[0])
    self.assertIn('40 kg',result['answer']);self.assertIn('does not isolate',result['answer'])
   finally:h.close()
+ def test_real_owned_finite_numeric_manual_draft_stays_NONE_without_family(self):
+  self._finite_manual_case("numeric_specification")
+ def test_real_owned_finite_document_explanation_draft_uses_NONE_without_family(self):
+  self._finite_manual_case("document_explanation")
  def test_mandatory_facet_union_nonfactual_enum_catalog_or_missing_proof_keep_original_writer(self):
   h=context.ContextFixture(self)
   try:
@@ -153,8 +157,14 @@ class OwnedSourceFastCompositionTests(unittest.TestCase):
       'required_answer_types':['numeric_value','safety_conditions'],
       'facet_queries':[{'facet':'numeric limit','must_cover':True,'answer_type':'numeric_value'}]}}
    variants=[]
-   for answer_type in ('checklist','ordered_actions','state_sequence','interface_locations'):
-    v=deepcopy(base);v['assistant_core_contract']['facet_queries'].append({'facet':'mandatory secondary obligation','must_cover':True,'answer_type':answer_type});variants.append(v)
+   for task in ("numeric_specification","document_explanation"):
+    for answer_type in ("checklist","ordered_actions","state_sequence","interface_locations"):
+     v=deepcopy(base);v["assistant_core_contract"]["information_task"]=task
+     v["assistant_core_contract"]["facet_queries"].append({"facet":"mandatory secondary obligation","must_cover":True,"answer_type":answer_type});variants.append(v)
+    v=deepcopy(base);v["assistant_core_contract"]["information_task"]=task
+    v["assistant_core_contract"]["required_answer_types"]=["safety_conditions","explanation"]
+    v["assistant_core_contract"]["facet_queries"]=[{"facet":"STOP condition","must_cover":True,"answer_type":"safety_conditions"}]
+    variants.append(v)
    for key,value in (('request_kind','procedure'),('effective_mode','root_cause'),('enumeration_requested',True)):
     v=deepcopy(base);v['assistant_core_decision'][key]=value;variants.append(v)
    v=deepcopy(base);v['assistant_core_decision'].pop('enumeration_requested');variants.append(v)
