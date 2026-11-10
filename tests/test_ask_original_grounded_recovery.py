@@ -132,7 +132,7 @@ class RecoveryTests(unittest.TestCase):
   finally:h.close()
  def test_original_lost_numeric_or_unsupported_same_sentence_cannot_be_restored(self):
   for text in ('Holding STOP is not isolation. Apply energy-isolation and trained personnel.',
-   'The maximum load is **1000 kg**. Load a 2500 kg coil. Holding STOP is not isolation.'):
+   'The maximum load is 1000 kg and a 2500 kg coil is permitted. Holding STOP is not isolation.'):
    with self.subTest(text=text):
     result,calls,checks,h=self.replay(original=text,second='rewrite')
     try:

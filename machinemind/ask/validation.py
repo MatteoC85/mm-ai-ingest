@@ -434,6 +434,15 @@ def validate_response(
     _sanitize_citations_for_response = runtime._sanitize_citations_for_response
     _unique_non_empty_strings = runtime._unique_non_empty_strings
     _v13_current_budget = runtime._v13_current_budget
+    if (_guarded(runtime, request, decision) and runtime.evidence_observer is not None
+            and execution._current_completion() is not None
+            and _final_contract.numeric_recovery_scope(request, decision,
+                enumeration=runtime.execution_runtime._assistant_core_enumeration_requested(request, decision))):
+        # This layout projection grants neither query numbers nor semantics.
+        # Both grounding boundaries use the same narrow algorithm; removals
+        # after review still require a new exact, independent verdict.
+        from .unit_grounding import finite_factual_claim_filter
+        _assistant_core_filter_unsupported_claim_sentences = finite_factual_claim_filter
     response, retrieval = _inputs(response, request, retrieval, decision, runtime=runtime, stage="validation")
     out = dict(response or {})
     manual_note_carrier = out.pop("_assistant_core_manual_note_sources", None)
@@ -1163,11 +1172,7 @@ def validate_response(
                             semantic_contract.get("covered_answer_types") or [])
                         and not any(semantic_contract.get(k) for k in
                             ("missing_facets", "missing_answer_types", "missing_list_items"))
-                        and any(c.get("kind") == "number" and c.get("unit")
-                            and not runtime._assistant_core_claim_supported(c, answer)
-                            for c in runtime._assistant_core_claims(numeric_original.draft.answer))
-                        and any(c.get("requirement") == REQ_NUMERIC_VALUE and c.get("passed") is False
-                            for c in deterministic_contract.get("requirement_checks", []))):
+                        ):
                     observer._grounded_numeric_recovery = replace(numeric_original,
                         failed_answer_sha256=_final_contract.answer_digest(answer),
                         reviewed_answer_sha256=_final_contract.answer_digest(

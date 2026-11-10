@@ -436,6 +436,118 @@ def _assistant_core_filter_unsupported_claim_sentences(text: str, source_text: s
     return "\n".join(kept).strip(), removed
 
 
+_FINITE_DEPENDENT_PREFIX = re.compile(
+    r"^\s*(?:for|on|in|under|from|per|su|sul|sulla|nel|nella|"
+    r"it\s+is\s+(?:false|untrue|incorrect)|(?:è|e)\s+falso)\b", re.I)
+_FINITE_SCOPE_OPERATOR = re.compile(
+    r"\b(?:if|when|unless|only|except|provided|assuming|false|untrue|because|while|until|before|after|without|"
+    r"se|quando|qualora|solo|salvo|purché|falso|perché|poiché|finché|prima|dopo|senza)\b|"
+    r"not\s+true|non\s+(?:è|e)\s+vero", re.I)
+_FINITE_CONTEXT_SWITCH = re.compile(
+    r"\b(?:for|on|in|under|from|per|su|sul|sulla|nel|nella)\s+"
+    r"(?:(?:a|an|the|un|uno|una|il|lo|la|un'altra|un'altro)\s+)?"
+    r"(?:other|another|different|alternative|altro|altra|altri|altre|diverso|diversa|"
+    r"model|machine|assembly|modello|macchina|gruppo)\b", re.I)
+_FINITE_DENIAL = re.compile(
+    r"\b(?:is|are)\s+(?:not\s+(?:permitted|allowed|compatible|admissible)|prohibited|forbidden)\b|"
+    r"\b(?:must|may|can)\s+not\s+(?:be\s+)?(?:loaded|used)\b|"
+    r"\bnon\s+(?:è|e|sono)\s+(?:consentit[oaie]|ammess[oaie]|compatibil[ei])\b|"
+    r"\b(?:è|e|sono)\s+(?:vietat[oaie]|proibit[oaie])\b|"
+    r"^\s*(?:do\s+not\s+(?:load|use)|non\s+(?:caricare|usare|utilizzare))\b", re.I)
+_FINITE_FACT_PREDICATE = re.compile(r"\b(?:is|are|equals|è|e|sono)\b|\bpari\s+a\b", re.I)
+_FINITE_DEPENDENT_FACT = re.compile(
+    r"^\s*(?:it|this|that|these|those|they|its|quest[oaie]|ciò|esso|essa|essi|esse|tale|tali)\b", re.I)
+
+
+def _finite_denial_and_fact(denial: str, fact: str, source_text: str, source_claims: list[dict]) -> bool:
+    """A narrow clause boundary, not permission for the denied quantity."""
+    if (_FINITE_DEPENDENT_PREFIX.search(denial) or _FINITE_SCOPE_OPERATOR.search(denial)
+            or _FINITE_CONTEXT_SWITCH.search(denial)
+            or not _FINITE_DENIAL.search(denial) or _FINITE_DEPENDENT_FACT.search(fact)):
+        return False
+    denied = _assistant_core_claims(denial)
+    denied_numbers = [c for c in denied if c["kind"] == "number"]
+    kept = _assistant_core_claims(fact)
+    kept_numbers = [c for c in kept if c["kind"] == "number"]
+    if (len(denied_numbers) != 1 or not denied_numbers[0].get("unit")
+            or _assistant_core_claim_supported(denied_numbers[0], source_text, source_claims)
+            or any(c["kind"] != "number" and not _assistant_core_claim_supported(c, source_text, source_claims)
+                   for c in denied)
+            or len(kept_numbers) != 1 or not kept_numbers[0].get("unit")
+            or not all(_assistant_core_claim_supported(c, source_text, source_claims) for c in kept)):
+        return False
+    # A bare value, continuation or shared-unit fragment is not an autonomous
+    # factual statement. Never infer omitted units or copy a lost prerequisite.
+    value_at = fact.find(str(kept_numbers[0]["raw"]))
+    return value_at > 0 and _FINITE_FACT_PREDICATE.search(fact[:value_at]) is not None
+
+
+def _finite_outer_delimiters(text: str, delimiters: str = ":;") -> list[int]:
+    stack: list[str] = []
+    quote = ""
+    positions: list[int] = []
+    for i, char in enumerate(text):
+        if quote:
+            if char == quote and (i == 0 or text[i-1] != "\\"):
+                quote = ""
+            continue
+        if (char in "\"'“‘" or ord(char) == 96) and not (
+                char == "'" and i and i+1 < len(text) and text[i-1].isalnum() and text[i+1].isalnum()):
+            quote = {"“": "”", "‘": "’"}.get(char, char)
+        elif char == "”" or (char == "’" and not (
+                i and i+1 < len(text) and text[i-1].isalnum() and text[i+1].isalnum())):
+            return []
+        elif char in "([{":
+            stack.append(char)
+        elif char in ")]}":
+            if not stack or "([{".index(stack.pop()) != ")]}".index(char):
+                return []
+        elif char in delimiters and not stack and i+1 < len(text) and text[i+1].isspace():
+            positions.append(i)
+    return [] if quote or stack else positions
+
+
+def finite_factual_claim_filter(text: str, source_text: str) -> tuple[str, list[str]]:
+    """Opt-in finite factual ASK only. All unsupported claims are still removed.
+
+    Colon/semicolon splits require an explicit unsupported denial and one
+    autonomous source-supported quantity statement. Scope/negation antecedents,
+    quotations, identifiers and shared ranges remain in one unit and fail closed.
+    Whole-question review and final text binding remain separate obligations.
+    """
+    source_claims = _assistant_core_claims(source_text)
+    units: list[str] = []
+    for unit in _assistant_core_sentence_units(str(text or "")):
+        pieces: list[str] = []
+        start = 0
+        outer_periods = _finite_outer_delimiters(unit, ".")
+        for match in re.finditer(r"(?P<mark>\*\*|__|\*)\.\s+(?=[A-ZÀ-ÖØ-Þ0-9])", unit):
+            mark = match.group("mark")
+            prefix = unit[:match.start()+len(mark)]
+            if (match.start()+len(mark) in outer_periods
+                    and prefix.count(mark) >= 2 and prefix.count(mark) % 2 == 0
+                    and not _FINITE_DEPENDENT_PREFIX.search(prefix)
+                    and not _FINITE_SCOPE_OPERATOR.search(prefix)
+                    and not _FINITE_CONTEXT_SWITCH.search(prefix)
+                    and not any(c["kind"] == "code" and not _assistant_core_claim_supported(
+                        c, source_text, source_claims) for c in _assistant_core_claims(prefix))):
+                pieces.append(unit[start:match.start()+len(mark)+1].strip())
+                start = match.end()
+        pieces.append(unit[start:].strip())
+        for piece in pieces:
+            divided = False
+            for pos in _finite_outer_delimiters(piece):
+                left, right = piece[:pos].strip(), piece[pos+1:].strip()
+                if (_finite_denial_and_fact(left, right, source_text, source_claims)
+                        or _finite_denial_and_fact(right, left, source_text, source_claims)):
+                    units.extend((left, right))
+                    divided = True
+                    break
+            if not divided:
+                units.append(piece)
+    return _assistant_core_filter_unsupported_claim_sentences("\n".join(units), source_text)
+
+
 def bind_validation(runtime: AskValidationRuntime) -> AskValidationRuntime:
     """Return a private ASK runtime; do not mutate main or the shared Core."""
     if type(runtime) is not AskValidationRuntime:
