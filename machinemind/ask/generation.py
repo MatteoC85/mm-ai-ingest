@@ -339,14 +339,22 @@ def generate_ask_response(
 
     parsed: dict = {}
     model_used = model
+    from .request_completion import begin_private_ordinary_writer, finish_private_ordinary_writer
+    private_writer = None
     try:
+        writer_messages = [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}]
+        writer_schema = _ask_evidence_answer_schema()
+        writer_models = [model, V13_FAST_MODEL] if model != V13_FAST_MODEL else [model]
+        private_writer = (begin_private_ordinary_writer(query=q, company_id=company_id,
+            provider_input={"messages": writer_messages, "json_schema": writer_schema, "models": writer_models,
+                "effort": effort, "reasoning_mode": reasoning_mode, "sources_block": sources_block,
+                "max_output_tokens": V13_HEAVY_MAX_OUTPUT_TOKENS if policy_model == V13_HEAVY_MODEL else V13_FAST_MAX_OUTPUT_TOKENS,
+                "timeout": V13_HEAVY_TIMEOUT_SECONDS if policy_model == V13_HEAVY_MODEL else V13_FAST_TIMEOUT_SECONDS})
+            if runtime.preserve_procedure_points else None)
         parsed, model_used = _v13_json_models(
-            [
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_msg},
-            ],
-            models=[model, V13_FAST_MODEL] if model != V13_FAST_MODEL else [model],
-            json_schema=_ask_evidence_answer_schema(),
+            writer_messages,
+            models=writer_models,
+            json_schema=writer_schema,
             effort=effort,
             reasoning_mode=reasoning_mode,
             timeout=V13_HEAVY_TIMEOUT_SECONDS if policy_model == V13_HEAVY_MODEL else V13_FAST_TIMEOUT_SECONDS,
@@ -354,6 +362,7 @@ def generate_ask_response(
             company_id=company_id,
             purpose="ask_final_synthesis",
         )
+        finish_private_ordinary_writer(private_writer, actual_reply=parsed, model_used=model_used)
     except _V13BudgetExceeded:
         raise
     except Exception as exc:

@@ -88,6 +88,127 @@ def record_private_factual_review(*, request, **body) -> None:
         owner._private_review_envelope = None  # No plaintext/error fallback.
 
 
+def _ordinary_private_owner():
+    owner = current()
+    if (owner is None or getattr(owner.payload, 'debug', False) is not True
+            or owner._private_review_invalidated):
+        return None
+    return owner
+
+
+def begin_private_ordinary_writer(*, query, company_id, provider_input):
+    """Snapshot exact call inputs in this debug owner's bounded RAM only."""
+    owner = _ordinary_private_owner()
+    if owner is None:
+        return None
+    try:
+        if (str(query or '').strip() != str(getattr(owner.payload, 'query', '') or '').strip()
+                or str(company_id or '') != str(owner.payload.company_id or '')
+                or owner.budget.remaining() <= 0):
+            return None
+        if owner._private_ordinary_writer is not None or owner._private_review_attempted:
+            owner._private_review_invalidated = True
+            owner._private_review_envelope = None
+            owner._private_ordinary_writer = None
+            return None
+        from .private_review_diagnostics import _plain, canonical, MAX_PLAINTEXT_BYTES
+        snapshot = dict(provider_input)
+        schema = snapshot.pop('json_schema', None)
+        if schema is not None:
+            snapshot['json_schema_json'] = json.dumps(schema, ensure_ascii=False, sort_keys=True,
+                separators=(',', ':'), allow_nan=False)
+        snapshot = _plain(snapshot)
+        if len(canonical(snapshot)) > MAX_PLAINTEXT_BYTES:
+            return None
+        token = object()
+        owner._private_ordinary_writer = {'token': token, 'binding': owner._private_review_binding(),
+            'input': snapshot, 'reply': None, 'review': None}
+        return token
+    except Exception:
+        return None  # No source/error/plaintext fallback, no verdict change.
+
+
+def finish_private_ordinary_writer(token, *, actual_reply, model_used):
+    owner = _ordinary_private_owner()
+    if owner is None or token is None:
+        return
+    try:
+        entry = owner._private_ordinary_writer
+        if (type(entry) is not dict or entry['token'] is not token
+                or entry['binding'] != owner._private_review_binding()
+                or type(actual_reply) is not dict):
+            return
+        from .private_review_diagnostics import _plain, canonical, MAX_PLAINTEXT_BYTES
+        reply = _plain(actual_reply)
+        if len(canonical(reply)) + len(canonical(entry['input'])) > MAX_PLAINTEXT_BYTES:
+            owner._private_ordinary_writer = None
+            return
+        entry['reply'] = reply
+        entry['model_used'] = str(model_used or '')
+    except Exception:
+        owner._private_ordinary_writer = None
+
+
+def begin_private_ordinary_review(*, request, answer, sources_block, provider_input):
+    owner = _ordinary_private_owner()
+    if owner is None:
+        return None
+    try:
+        entry = owner._private_ordinary_writer
+        if (type(entry) is not dict or type(entry.get('reply')) is not dict
+                or entry['binding'] != owner._private_review_binding()
+                or getattr(request, 'requested_mode', None) != 'ask'
+                or str(request.company_id or '') != str(owner.payload.company_id or '')
+                or str(getattr(request, 'machine_id', '') or '') != str(getattr(owner.payload, 'machine_id', '') or '')
+                or str(request.query or '').strip() != str(getattr(owner.payload, 'query', '') or '').strip()):
+            return None
+        from .private_review_diagnostics import _plain, canonical, MAX_PLAINTEXT_BYTES
+        inputs = dict(provider_input)
+        schema = inputs.pop('json_schema', None)
+        if schema is not None:
+            inputs['json_schema_json'] = json.dumps(schema, ensure_ascii=False, sort_keys=True,
+                separators=(',', ':'), allow_nan=False)
+        snapshot = _plain({'provider_input': inputs, 'current_answer': answer,
+            'sources_block': sources_block})
+        if len(canonical(snapshot)) + len(canonical(entry['input'])) > MAX_PLAINTEXT_BYTES:
+            owner._private_ordinary_writer = None
+            return None
+        token = object()
+        entry['review'] = {'token': token, 'request': request, 'input': snapshot}
+        return token
+    except Exception:
+        return None
+
+
+def finish_private_ordinary_review(token, *, actual_reply, model_used):
+    owner = _ordinary_private_owner()
+    if owner is None or token is None:
+        return
+    try:
+        entry = owner._private_ordinary_writer
+        review = entry.get('review') if type(entry) is dict else None
+        if (type(review) is not dict or review['token'] is not token
+                or entry['binding'] != owner._private_review_binding()
+                or type(actual_reply) is not dict):
+            return
+        # Consume before encryption: a reentrant/foreign/second callback cannot
+        # republish this plaintext. Existing seal/finish own all publication.
+        owner._private_ordinary_writer = None
+        frame = review['input']
+        record_private_factual_review(request=review['request'],
+            first_wire_reply=entry['reply'],
+            expanded_candidate={'protocol': 'ordinary_ask_first_consumer_review_v1',
+                'current_answer': frame['current_answer'], 'writer_input': entry['input'],
+                'writer_model_used': entry['model_used']},
+            review_frame={'protocol': 'ordinary_ask_first_consumer_review_v1',
+                **frame['provider_input'], 'review_model_used': str(model_used or '')},
+            table_catalog=None, actual_review_reply=actual_reply,
+            sources_block=frame['sources_block'],
+            response_language=review['request'].response_language, selected_records_only=False)
+    except Exception:
+        owner._private_ordinary_writer = None  # Diagnostics never alter a verdict.
+
+
 def check_io_time() -> None:
     owner = current()
     if owner is None:
@@ -422,6 +543,7 @@ class RequestCompletion:
         self._private_review_envelope = None
         self._private_review_attempted = False
         self._private_review_invalidated = False
+        self._private_ordinary_writer = None
 
     def _private_review_binding(self):
         return {'commit_sha': os.environ.get('COMMIT_SHA', '').lower(),
@@ -634,6 +756,7 @@ class RequestCompletion:
                 self.contract_checks.clear()
                 self._private_review_invalidated = True
                 self._private_review_envelope = None
+                self._private_ordinary_writer = None
                 self._terminal = self.payload = self.runtime = None
 
 

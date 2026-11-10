@@ -31,6 +31,7 @@ from .request_scope import conditions_only_contract, bounded_phase_contract
 from .request_completion import current as _current_completion
 from .request_completion import record_contract_observation as _record_contract_observation
 from .request_completion import record_private_factual_review as _record_private_factual_review
+from .request_completion import begin_private_ordinary_review, finish_private_ordinary_review
 from .request_completion import synthesis_review_reserve as _synthesis_review_reserve
 from .request_completion import independent_review_reserve as _independent_review_reserve
 from ..evidence.ask_input import AskEvidenceAdmission, apply_ask_evidence_input, ask_request_key
@@ -933,15 +934,18 @@ def verify_or_repair_answer(
     # Every other consumer keeps the full review/edit protocol and model order.
     if complete_owned_review:
         review_models.reverse()
+    review_messages = [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}]
+    private_review = (begin_private_ordinary_review(request=request, answer=answer, sources_block=sources_block,
+        provider_input={"messages": review_messages, "json_schema": verifier_schema, "models": review_models,
+            "effort": "low" if protected_budget else V13_FAST_EFFORT,
+            "reasoning_mode": "", "max_output_tokens": min(4000, max(3200, V13_FAST_MAX_OUTPUT_TOKENS))})
+        if _guarded(runtime, request, decision) and not independent_context_review else None)
     try:
         # A source-first producer cannot also be its own final semantic check.
         # Reserve the follow-up window across every initial provider fallback.
         with (_independent_review_reserve(required=True) if independent_context_review else nullcontext()):
             parsed, model_used = _v13_json_models(
-                [
-                    {"role": "system", "content": system_msg},
-                    {"role": "user", "content": user_msg},
-                ],
+                review_messages,
                 models=review_models,
                 json_schema=verifier_schema,
                 # This source-first draft still requires the independent semantic
@@ -975,6 +979,7 @@ def verify_or_repair_answer(
         print("ASSISTANT_CORE_CONTRACT_VERIFIER_FAIL", str(exc)[:700])
         return {"outcome": "unavailable", "answer": answer, "reason": str(exc)[:300]}
 
+    finish_private_ordinary_review(private_review, actual_reply=parsed, model_used=model_used)
     out = dict(parsed or {})
     wire_reply = deepcopy(out) if independent_context_review else None
     inventory_diagnostics = {}
