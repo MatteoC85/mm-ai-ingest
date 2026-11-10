@@ -199,12 +199,13 @@ def bind_ask_execution(runtime: AskExecutionRuntime, *, session: AskEvidenceSess
         return hook(request, retrieval, decision)
 
     def verify(*, request: Any, decision: Any, answer: str, candidates: list[dict],
-               repair_context: Optional[dict] = None) -> dict:
+               repair_context: Optional[dict] = None, _grounded_recovery: Any = None) -> dict:
         if not _ask_path(request, decision):
             return runtime._assistant_core_verify_or_repair_answer(request=request,
                 decision=decision, answer=answer, candidates=candidates, repair_context=repair_context)
         return verify_or_repair_answer(request=request, decision=decision, answer=answer,
-            candidates=candidates, repair_context=repair_context, runtime=bound)
+            candidates=candidates, repair_context=repair_context, runtime=bound,
+            **({"_grounded_recovery": _grounded_recovery} if _grounded_recovery is not None else {}))
 
     def recover(*, request: Any, decision: Any, retrieval: dict, reason: str) -> dict | None:
         if not _ask_path(request, decision):
@@ -504,6 +505,7 @@ def verify_or_repair_answer(
     candidates: list[dict],
     repair_context: Optional[dict] = None,
     runtime: AskExecutionRuntime,
+    _grounded_recovery: Any = None,
 ) -> dict:
     INFO_PROCEDURE_FULL = runtime.INFO_PROCEDURE_FULL
     INFO_PROCEDURE_SEGMENT = runtime.INFO_PROCEDURE_SEGMENT
@@ -537,6 +539,16 @@ def verify_or_repair_answer(
     admitted = _admit_input(request, {"candidates": candidates}, decision,
         runtime=runtime, stage="verifier.input")
     candidates = admitted["candidates"]
+    original_retain_only = _grounded_recovery is not None
+    if original_retain_only:
+        if (not _guarded(runtime, request, decision)
+                or type(_grounded_recovery) is not _final_contract.GroundedNumericDraft
+                or answer != _grounded_recovery.draft.answer
+                or getattr(runtime.evidence_observer, "stack", [])[-2:] != [
+                    "repair_response", "verify_or_repair_answer"]):
+            raise EvidenceContractError("grounded_numeric_recovery_boundary_invalid")
+        _grounded_recovery.check(owner=runtime.evidence_observer, request_key=ask_request_key(request),
+            candidates=candidates, evidence_text=_assistant_core_candidate_evidence_text)
     budget = _v13_current_budget()
     protected_budget = _guarded(runtime, request, decision) and _current_completion() is not None
     if protected_budget:
@@ -648,7 +660,7 @@ def verify_or_repair_answer(
         for x in decision.required_answer_types
         if str(x or "").strip()
     })
-    if _guarded(runtime, request, decision) and runtime.preserve_procedure_context:
+    if _guarded(runtime, request, decision) and (runtime.preserve_procedure_context or original_retain_only):
         requirements = sorted(set(requirements) | {
             item.answer_type for item in decision.facet_queries if item.must_cover})
     if (_guarded(runtime, request, decision) and not conditions_only and not runtime.preserve_procedure_context
@@ -796,6 +808,10 @@ def verify_or_repair_answer(
     operation_boundary = bool(compact_review)
     review_facets = list(dict.fromkeys(list(decision.required_facets) + [
         item.facet for item in decision.facet_queries if item.must_cover]))
+    if original_retain_only and (
+            tuple(review_facets) != _grounded_recovery.draft.required_facets
+            or tuple(requirements) != _grounded_recovery.draft.required_types):
+        raise EvidenceContractError("grounded_numeric_recovery_requirements_changed")
     wire_aliases = (_procedure_review.review_wire_aliases(layout,
         [str(c.get("citation_id") or "").strip() for c in ordered_candidates]) if source_ordered_review else None)
     reference_catalogue = reference_proof = None
@@ -860,6 +876,11 @@ def verify_or_repair_answer(
                  or repair_missing_answer_types or repair_missing_list_items)
         and [V13_FAST_MODEL, V13_PLANNER_MODEL] == ["gpt-5.6-terra", "gpt-5.6-luna"])
     verifier_schema = _assistant_core_contract_verifier_schema()
+    if original_retain_only:
+        if factual_list_review or compact_review or independent_context_review:
+            raise EvidenceContractError("grounded_numeric_recovery_scope_changed")
+        verifier_schema = _final_contract.numeric_recovery_schema(verifier_schema)
+        system_msg += _final_contract.NUMERIC_RECOVERY_INSTRUCTION
     if independent_context_review:
         # Generation uses the same server-admitted IDs checked by the decoder.
         # This constrains representation only; the independent source, safety
@@ -1135,7 +1156,20 @@ def verify_or_repair_answer(
         out["review_profile"] = "complete_owned_retain_or_reject_v1"
     if review_evidence_diagnostic:
         out["review_evidence"] = review_evidence_diagnostic
-    if reviewed_draft is not None:
+    if original_retain_only:
+        # The private mode cannot approve any generated replacement, even if a
+        # provider ignores its restricted schema or labels changed text PASS.
+        if out.get("outcome") != "pass" or out.get("answer") != "":
+            return {"outcome": "no_sources", "answer": "", "citation_ids": [],
+                "reason": "grounded_original_not_approved_unchanged", "model": model_used}
+        try:
+            out = _final_contract.resolve_unchanged_pass(out, draft=reviewed_draft,
+                request_key=ask_request_key(request))
+        except EvidenceContractError:
+            return {"outcome": "no_sources", "answer": "", "citation_ids": [],
+                "reason": "grounded_original_pass_invalid", "model": model_used}
+        out["review_profile"] = "grounded_original_retain_only_v1"
+    elif reviewed_draft is not None:
         out = _final_contract.resolve_unchanged_pass(out, draft=reviewed_draft,
             request_key=ask_request_key(request))
     out["model"] = model_used
@@ -1320,13 +1354,33 @@ def repair_response(
         return out
 
     budget.refinement_used = True
-    verified = _assistant_core_verify_or_repair_answer(
-        request=request,
-        decision=decision,
-        answer=first_answer,
-        candidates=candidates,
-        repair_context=context,
-    )
+    observer = runtime.evidence_observer
+    recovery = getattr(observer, "_grounded_numeric_recovery", None)
+    if recovery is not None:
+        if type(recovery) is not _final_contract.GroundedNumericDraft:
+            raise EvidenceContractError("grounded_numeric_recovery_shape_invalid")
+        recovery.check(owner=observer, request_key=ask_request_key(request), candidates=candidates,
+            evidence_text=runtime._assistant_core_candidate_evidence_text, failed_answer=first_answer)
+        reviewed = (context.get("first_answer_contract") or {}).get("semantic_verifier") or {}
+        if recovery.reviewed_answer_sha256 != _final_contract.answer_digest(str(reviewed.get("answer") or "")):
+            raise EvidenceContractError("grounded_numeric_recovery_review_changed")
+        first_answer = recovery.draft.answer
+        # The second judgment earns its own coverage; the previous verdict is
+        # not evidence that this preserved draft is safe or complete.
+        context = {**context, "first_answer_contract": {}, "missing_answer_facets": [],
+            "missing_answer_types": [], "missing_list_items": []}
+    try:
+        verified = _assistant_core_verify_or_repair_answer(
+            request=request,
+            decision=decision,
+            answer=first_answer,
+            candidates=candidates,
+            repair_context=context,
+            **({"_grounded_recovery": recovery} if recovery is not None else {}),
+        )
+    finally:
+        if recovery is not None:
+            observer._grounded_numeric_recovery = None
     outcome = str(verified.get("outcome") or "").strip().lower()
     repaired_answer = _assistant_core_redact_internal_text(verified.get("answer") or "")
     missing_facets = [

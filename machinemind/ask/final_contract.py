@@ -106,6 +106,62 @@ def resolve_unchanged_pass(parsed: dict, *, draft: ReviewedDraft,
     return out
 
 
+@dataclass(frozen=True, slots=True)
+class GroundedNumericDraft:
+    """Private same-owner recovery input, never a semantic acceptance grant."""
+    draft: ReviewedDraft
+    owner: Any = field(repr=False, compare=False)
+    source_bindings: tuple[tuple[str, str], ...]
+    failed_answer_sha256: str = ""
+    reviewed_answer_sha256: str = ""
+
+    def check(self, *, owner: Any, request_key: Any, candidates: list[dict],
+              evidence_text: Callable, failed_answer: str | None = None) -> None:
+        if (type(self) is not GroundedNumericDraft or self.owner is not owner
+                or getattr(owner, "_grounded_numeric_recovery", None) is not self
+                or self.draft.request_key != request_key
+                or (failed_answer is not None
+                    and self.failed_answer_sha256 != answer_digest(failed_answer))):
+            raise EvidenceContractError("grounded_numeric_recovery_owner_changed")
+        current = {str(row.get("citation_id") or ""): answer_digest(evidence_text(row))
+                   for row in candidates}
+        if not self.source_bindings or any(current.get(cid) != digest
+                for cid, digest in self.source_bindings):
+            raise EvidenceContractError("grounded_numeric_recovery_sources_changed")
+
+
+def numeric_recovery_scope(request: Any, decision: Any, *, enumeration: bool) -> bool:
+    """Only finite factual ASK; mandatory per-facet types remain obligations."""
+    types = set(decision.required_answer_types) | {
+        item.answer_type for item in decision.facet_queries if item.must_cover}
+    return bool(request.requested_mode == "ask" and decision.effective_mode == "ask"
+        and decision.request_kind == "factual"
+        and decision.information_task in {"numeric_specification", "document_explanation"}
+        and not enumeration and "numeric_value" in types
+        and types <= {"numeric_value", "safety_conditions", "explanation"})
+
+
+def numeric_recovery_schema(schema: dict) -> dict:
+    out = deepcopy(schema)
+    out["name"] += "_original_retain_only"
+    out["schema"]["properties"]["outcome"]["enum"] = ["pass", "no_sources"]
+    out["schema"]["properties"]["answer"] = {"type": "string", "enum": [""]}
+    return out
+
+
+NUMERIC_RECOVERY_INSTRUCTION = (
+    " RECOVERED_ORIGINAL_RETAIN_OR_REJECT: CURRENT_ANSWER is a preserved, same-request "
+    "grounded draft. A prior replacement lost required supported information during "
+    "grounding; that replacement and its coverage are NOT approval of this draft. "
+    "Independently recheck the complete QUESTION, every mandatory facet and type, "
+    "all source applicability, qualifiers and safety requirements against current SOURCES. "
+    "Return outcome=pass with answer empty only if CURRENT_ANSWER is already fully "
+    "supported and complete. Otherwise return no_sources with answer empty. "
+    "Do not rewrite, add, omit, reformat or invent any answer content. "
+    "A numeric match alone does not establish semantic or safety coverage."
+)
+
+
 def bind_source_fields(runtime: Any, *, fields: Callable, sections: Callable):
     if not callable(fields) or not callable(sections):
         raise TypeError("structured source readers required")

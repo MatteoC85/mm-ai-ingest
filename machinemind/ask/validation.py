@@ -677,6 +677,35 @@ def validate_response(
             projected_manual_notes.append({**note, "text": projected_note})
         manual_note_bindings = projected_manual_notes
         manual_note_original = answer
+        # The immutable recovery input stays on this existing request owner,
+        # outside the response envelope; it grants no semantic acceptance.
+        numeric_original = None
+        observer = runtime.evidence_observer
+        first_consumer = bool(_guarded(runtime, request, decision) and observer is not None
+            and execution._current_completion() is not None
+            and not out.get("_assistant_core_repair_attempted")
+            and not semantic_contract and not protected_procedure)
+        if first_consumer:
+            observer._grounded_numeric_recovery = None
+            if _final_contract.numeric_recovery_scope(request, decision,
+                    enumeration=runtime.execution_runtime._assistant_core_enumeration_requested(request, decision)):
+                original_sources = [allowed[cid] for cid in
+                    (str(c.get("citation_id") or "") for c in citations) if cid in allowed]
+                original_support = "\n".join(_assistant_core_candidate_evidence_text(c) for c in original_sources)
+                claims = runtime._assistant_core_claims(answer)
+                # Source-owned quantity support is necessary, not semantic
+                # coverage. In particular, correcting a false numeric premise
+                # need not repeat the user's unsupported value.
+                if (original_sources and any(c.get("kind") == "number" and c.get("unit") for c in claims)
+                        and all(runtime._assistant_core_claim_supported(c, original_support) for c in claims)):
+                    numeric_original = _final_contract.GroundedNumericDraft(
+                        _final_contract.capture_reviewed_draft(answer, request_key=ask_request_key(request),
+                            required_facets=tuple(dict.fromkeys(list(decision.required_facets) + [
+                                item.facet for item in decision.facet_queries if item.must_cover])),
+                            required_types=tuple(sorted(set(decision.required_answer_types) | {
+                                item.answer_type for item in decision.facet_queries if item.must_cover}))),
+                        observer, tuple((str(c.get("citation_id")), _final_contract.answer_digest(
+                            _assistant_core_candidate_evidence_text(c))) for c in original_sources))
         if (
             not semantic_contract_pass
             and str(out.get("status") or "").lower() == "answered"
@@ -1124,6 +1153,25 @@ def validate_response(
                             and budget_for_repair.remaining() >= 9.0
                             and budget_for_repair.estimated_cost_usd < budget_for_repair.max_estimated_cost_usd
                         )
+                if (repair_available and numeric_original is not None
+                        and semantic_contract.get("outcome") == "rewrite" and semantic_contract_pass
+                        and post_review_removed_claims_count > 0
+                        and answer_contract_result.get("reason") == "semantic_answer_changed_after_review"
+                        and set(numeric_original.draft.required_facets).issubset(
+                            semantic_contract.get("covered_facets") or [])
+                        and set(numeric_original.draft.required_types).issubset(
+                            semantic_contract.get("covered_answer_types") or [])
+                        and not any(semantic_contract.get(k) for k in
+                            ("missing_facets", "missing_answer_types", "missing_list_items"))
+                        and any(c.get("kind") == "number" and c.get("unit")
+                            and not runtime._assistant_core_claim_supported(c, answer)
+                            for c in runtime._assistant_core_claims(numeric_original.draft.answer))
+                        and any(c.get("requirement") == REQ_NUMERIC_VALUE and c.get("passed") is False
+                            for c in deterministic_contract.get("requirement_checks", []))):
+                    observer._grounded_numeric_recovery = replace(numeric_original,
+                        failed_answer_sha256=_final_contract.answer_digest(answer),
+                        reviewed_answer_sha256=_final_contract.answer_digest(
+                            str(semantic_contract.get("answer") or "")))
                 if repair_available:
                     # Keep the grounded response only for one admitted repair.
                     out["_assistant_core_repair_needed"] = True
