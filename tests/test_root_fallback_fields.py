@@ -31,7 +31,8 @@ def unique(values, limit):
 def load_main_functions(namespace):
     path = Path(__file__).resolve().parents[1] / "main.py"
     names = {"_v13_root_fallback_from_evidence", "_v13_generate_root_cause_response",
-             "_assistant_core_synthesize_root_cause"}
+             "_assistant_core_synthesize_root_cause", "_root_cause_response_schema",
+             "_ground_root_cause_result", "_extract_citation_ids_from_root_cause_json"}
     nodes = [node for node in ast.parse(path.read_text(encoding="utf-8")).body
              if isinstance(node, ast.FunctionDef) and node.name in names]
     assert len(nodes) == len(names)
@@ -95,6 +96,17 @@ class RootFallbackIntegrationTests(unittest.TestCase):
 
         def model(messages, **kwargs):
             self.calls.append((deepcopy(messages), deepcopy(kwargs)))
+            if kwargs["json_schema"]["name"] == "root_cause_producer_applicability_v1":
+                # The owned Root writer now requires a private typed proposal.
+                # Empty output still exercises legacy/default fallback below.
+                fields = root_fallback.ps_fields(SOURCE)
+                return {"problem_summary": "Unconfirmed documentary case.",
+                    "possible_causes": [{"rank": 1, "cause": fields["title"],
+                        "why": fields["description"], "checks": [],
+                        "citations": [self.source["citation_id"]],
+                        "applicability": {"status": "source_scoped_unverified",
+                            "statement": "This explanation concerns the documented case; its applicability to current equipment is unverified."}}],
+                    "recommended_next_checks": []}, "offline-model"
             return {}, "offline-model"
 
         def review(**kwargs):
@@ -124,8 +136,6 @@ class RootFallbackIntegrationTests(unittest.TestCase):
                     "sources_block": "\n".join(row["chunk_full"] for row in rows), "summary": {}}),
             "_v13_assurance_prompt_block": lambda retrieval: "",
             "_v13_json_models": model,
-            "_root_cause_response_schema": lambda **kwargs: {},
-            "_ground_root_cause_result": lambda **kwargs: ({"possible_causes": []}, []),
             "_compact_root_cause_result_citations_by_family": lambda **kwargs: (kwargs["result"], kwargs["citations"]),
             "_lock_root_cause_result": lambda result, rows, **kwargs: (result, rows),
             "_sanitize_citations_for_response": lambda rows, **kwargs: deepcopy(rows),
@@ -224,6 +234,9 @@ class RootFallbackIntegrationTests(unittest.TestCase):
                 else:
                     self.assertEqual(draft["why"], "REPORTED CONDITION")
                 self.assertEqual(self.calls[0][1]["max_output_tokens"], 3400)
+                expected_schema = ("root_cause_producer_applicability_v1"
+                    if requested == effective == "root_cause" else "root_cause_finder_v1")
+                self.assertEqual(self.calls[0][1]["json_schema"]["name"], expected_schema)
                 self.assertEqual(self.source, before)
 
 

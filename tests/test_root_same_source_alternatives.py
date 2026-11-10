@@ -90,7 +90,15 @@ class SameSourceAlternativesTests(unittest.TestCase):
         self.fixture.reviews.clear()
         def model(messages, **kwargs):
             self.fixture.calls.append((messages, kwargs))
-            return {'problem_summary': 'Diagnostic alarm, causes unconfirmed.', 'possible_causes': deepcopy(self.causes)}, 'offline-model'
+            reply = {'problem_summary': 'Diagnostic alarm, causes unconfirmed.',
+                     'possible_causes': deepcopy(self.causes), 'recommended_next_checks': []}
+            if kwargs['json_schema']['name'] == 'root_cause_producer_applicability_v1':
+                for cause in reply['possible_causes']:
+                    cause['applicability'] = {'status': 'source_scoped_unverified',
+                        'statement': 'These mechanisms concern the cited documented configuration; its applicability to current equipment is unverified.'}
+                    cause['checks'] = [{'intent': 'already_available_observation_or_record', 'text': text}
+                                       for text in cause['checks']]
+            return reply, 'offline-model'
         self.ns['_v13_json_models'] = model
         request = SimpleNamespace(query='Which documented mechanisms could explain this alarm?',
             company_id='synthetic', response_language='en', requested_mode=requested,
@@ -109,6 +117,7 @@ class SameSourceAlternativesTests(unittest.TestCase):
         self.assertTrue(result['review_required'])
         self.assertEqual(self.fixture.calls[0][1]['max_output_tokens'], 3400)
         self.assertEqual(self.fixture.calls[0][1]['timeout'], 26)
+        self.assertEqual(self.fixture.calls[0][1]['json_schema']['name'], 'root_cause_producer_applicability_v1')
 
     def test_requested_and_effective_root_are_both_required(self):
         for requested, effective in [('ask', 'root_cause'), ('root_cause', 'ask'), ('smart', 'root_cause'), ('root_cause', 'smart')]:

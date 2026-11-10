@@ -13330,6 +13330,7 @@ def _v13_generate_root_cause_response(
     debug: bool,
     root_literal_fallback_fields: bool = False,
     root_preserve_source_alternatives: bool = False,
+    root_producer_applicability_contract: bool = False,
 ) -> dict:
     citations = list(retrieval.get("citations") or retrieval.get("candidates") or [])
     citations = citations[:V13_MAX_EVIDENCE_ITEMS_ROOT_CAUSE]
@@ -13392,6 +13393,10 @@ def _v13_generate_root_cause_response(
     )
     from machinemind.retrieval import root_response_quality as _root_quality
     system_msg += "\n\n" + _root_quality.SYNTHESIS_INSTRUCTION
+    producer_schema = _root_cause_response_schema(max_causes=max_causes)
+    if root_producer_applicability_contract:
+        producer_schema = _root_quality.producer_schema(producer_schema)
+        system_msg += "\n\n" + _root_quality.PRODUCER_CONTRACT_INSTRUCTION
     observation_packet = contract.get("request_observations")
     observation_block = ""
     if isinstance(observation_packet, dict) and observation_packet.get("policy_version") == _retrieval_diagnostic_query.POLICY_VERSION:
@@ -13418,7 +13423,7 @@ def _v13_generate_root_cause_response(
                 {"role": "user", "content": user_msg},
             ],
             models=[model, V13_FAST_MODEL] if model != V13_FAST_MODEL else [model],
-            json_schema=_root_cause_response_schema(max_causes=max_causes),
+            json_schema=producer_schema,
             effort=effort,
             reasoning_mode=reasoning_mode,
             timeout=V13_HEAVY_TIMEOUT_SECONDS if model == V13_HEAVY_MODEL else V13_FAST_TIMEOUT_SECONDS,
@@ -13431,6 +13436,23 @@ def _v13_generate_root_cause_response(
     except Exception as exc:
         print("V13_ROOT_CAUSE_SYNTHESIS_FAIL", str(exc)[:900])
         parsed = {}
+
+    if root_producer_applicability_contract:
+        try:
+            parsed = _root_quality.normalize_producer_result(parsed, max_causes=max_causes)
+        except _root_quality.ProducerContractError as exc:
+            return {
+                "ok": False, "status": "error", "result_code": "TECHNICAL_ERROR",
+                "symptom": q, "language": response_language,
+                "problem_summary": "", "possible_causes": [],
+                "recommended_next_checks": [], "citations": [], "rg_links": [],
+                "top_k": top_k, "similarity_max": None, "chat_model": model_used,
+                "meta": {"cacheable": False, "semantic_cacheable": False,
+                    "root_synthesis_packet": source_packet["summary"],
+                    "root_producer_contract": {
+                        "policy_version": _root_quality.PRODUCER_CONTRACT_VERSION,
+                        "outcome": "invalid_producer_contract", "reason": str(exc)}},
+            }
 
     grounded_result, grounded_citations = _ground_root_cause_result(
         result=parsed,
@@ -13449,6 +13471,21 @@ def _v13_generate_root_cause_response(
         preserve_source_alternatives=root_preserve_source_alternatives,
     )
     synthesis_grounded = bool(grounded_result.get("possible_causes") and grounded_citations)
+
+    if root_producer_applicability_contract and not grounded_result.get("possible_causes"):
+        return {
+            "ok": False, "status": "error", "result_code": "TECHNICAL_ERROR",
+            "symptom": q, "language": response_language,
+            "problem_summary": "", "possible_causes": [],
+            "recommended_next_checks": [], "citations": [], "rg_links": [],
+            "top_k": top_k, "similarity_max": None, "chat_model": model_used,
+            "meta": {"cacheable": False, "semantic_cacheable": False,
+                "root_synthesis_packet": source_packet["summary"],
+                "root_producer_contract": {
+                    "policy_version": _root_quality.PRODUCER_CONTRACT_VERSION,
+                    "outcome": "invalid_producer_contract",
+                    "reason": "no_grounded_producer_proposals"}},
+        }
 
     if not grounded_result.get("possible_causes"):
         grounded_result, grounded_citations = _v13_root_fallback_from_evidence(
@@ -16003,6 +16040,10 @@ def _assistant_core_synthesize_root_cause(
             retrieval=root_retrieval,
             debug=request.debug,
             root_literal_fallback_fields=(
+                request.requested_mode == MODE_ROOT_CAUSE
+                and decision.effective_mode == MODE_ROOT_CAUSE
+            ),
+            root_producer_applicability_contract=(
                 request.requested_mode == MODE_ROOT_CAUSE
                 and decision.effective_mode == MODE_ROOT_CAUSE
             ),

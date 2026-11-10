@@ -14,6 +14,139 @@ from . import review_references
 
 POLICY_VERSION = "root-response-quality-v8"
 
+PRODUCER_CONTRACT_VERSION = "root-producer-applicability-v1"
+
+PRODUCER_CONTRACT_INSTRUCTION = """
+The private producer contract separates two different uncertainties. applicability
+states whether the cited configuration actually applies to the reported equipment;
+the existing why separately preserves whether the causal enabling state was observed.
+An attached/routed source is not proof of installed configuration. When that
+relationship is unverified, choose source_scoped_unverified and write an explicit,
+self-contained statement that the explanation concerns the configuration documented
+by the cited source and that its applicability to the reported equipment is unverified.
+Do not substitute unknown component position/state for that applicability statement.
+Use established_by_sources_and_observations only when literal source content and
+reported facts establish the relevant relationship, never from an identifier or
+routing alone. known_incompatible cannot become a hypothesis through conditional words.
+
+Classify each original check by what it actually requests: an observation or record
+ALREADY available, a NEW observation, or an intervention. With unverified applicability,
+return only already_available_observation_or_record checks. If no such record exists,
+leave the state unknown; do not append an authorized/manual/slow-cycle fallback.
+A classification is not evidence or safety authorization. The independent reviewer
+will judge the complete original rendered statement, mechanism and retained check text.
+Return recommended_next_checks=[]; the server derives that list from retained checks.
+""".strip()
+
+
+class ProducerContractError(ValueError):
+    """The opted-in writer did not return its private typed proposal contract."""
+
+
+def producer_schema(base_schema: dict[str, Any]) -> dict[str, Any]:
+    """Clone only this writer's provider schema; the public/default schema is untouched."""
+    result = deepcopy(base_schema)
+    result["name"] = "root_cause_producer_applicability_v1"
+    schema = result["schema"]
+    cause = schema["properties"]["possible_causes"]["items"]
+    cause["properties"]["applicability"] = {
+        "type": "object", "additionalProperties": False,
+        "properties": {
+            "status": {"type": "string", "enum": [
+                "source_scoped_unverified", "established_by_sources_and_observations",
+                "known_incompatible"]},
+            "statement": {"type": "string"},
+        },
+        "required": ["status", "statement"],
+    }
+    cause["required"].append("applicability")
+    cause["properties"]["checks"]["items"] = {
+        "type": "object", "additionalProperties": False,
+        "properties": {
+            "intent": {"type": "string", "enum": [
+                "already_available_observation_or_record", "new_observation", "intervention"]},
+            "text": {"type": "string"},
+        },
+        "required": ["intent", "text"],
+    }
+    schema["properties"]["recommended_next_checks"]["maxItems"] = 0
+    return result
+
+
+def normalize_producer_result(parsed: Any, *, max_causes: int) -> dict[str, Any]:
+    """Prepare original public-shaped text BEFORE grounding and immutable review.
+
+    Model statuses/intent labels confer no target, applicability or safety proof.
+    Misclassified retained text must still pass the unchanged independent reviewer.
+    """
+    def fail(code: str):
+        raise ProducerContractError(code)
+
+    def obj(value: Any, fields: set[str], code: str) -> dict[str, Any]:
+        if type(value) is not dict or set(value) != fields:
+            fail(code)
+        return value
+
+    def text(value: Any, code: str) -> str:
+        if type(value) is not str or not value.strip():
+            fail(code)
+        return value
+
+    top = obj(parsed, {"problem_summary", "possible_causes", "recommended_next_checks"},
+              "invalid_producer_top_level")
+    summary = text(top["problem_summary"], "invalid_producer_problem_summary")
+    rows = top["possible_causes"]
+    limit = max(1, min(int(max_causes or 1), 3))
+    if type(rows) is not list or len(rows) > limit:
+        fail("invalid_producer_causes")
+    if type(top["recommended_next_checks"]) is not list or top["recommended_next_checks"]:
+        fail("untyped_producer_next_checks")
+    causes = []
+    next_checks = []
+    for row in rows:
+        row = obj(row, {"rank", "cause", "why", "checks", "citations", "applicability"},
+                  "invalid_producer_cause")
+        if type(row["rank"]) is not int or row["rank"] < 1:
+            fail("invalid_producer_rank")
+        cause = text(row["cause"], "invalid_producer_cause_text")
+        why = text(row["why"], "invalid_producer_why")
+        app = obj(row["applicability"], {"status", "statement"},
+                  "invalid_producer_applicability")
+        status = app["status"]
+        if type(status) is not str or status not in {
+                "source_scoped_unverified", "established_by_sources_and_observations",
+                "known_incompatible"}:
+            fail("invalid_producer_applicability_status")
+        statement = text(app["statement"], "invalid_producer_applicability_statement")
+        if type(row["citations"]) is not list or not row["citations"]:
+            fail("invalid_producer_citations")
+        for cid in row["citations"]:
+            text(cid, "invalid_producer_citation")
+        if type(row["checks"]) is not list:
+            fail("invalid_producer_checks")
+        retained = []
+        for check in row["checks"]:
+            check = obj(check, {"intent", "text"}, "invalid_producer_check")
+            intent = check["intent"]
+            if type(intent) is not str or intent not in {
+                    "already_available_observation_or_record", "new_observation", "intervention"}:
+                fail("invalid_producer_check_intent")
+            check_text = text(check["text"], "invalid_producer_check_text")
+            if status == "source_scoped_unverified" and intent != "already_available_observation_or_record":
+                continue
+            retained.append(check_text)
+        if status == "known_incompatible":
+            continue
+        causes.append({"rank": row["rank"], "cause": cause,
+            "why": statement + "\n\n" + why, "checks": retained,
+            "citations": list(row["citations"])})
+        next_checks.extend(retained)
+    if not causes:
+        fail("no_admissible_producer_proposals")
+    return {"problem_summary": summary, "possible_causes": causes,
+            "recommended_next_checks": list(dict.fromkeys(next_checks))}
+
+
 MAX_WHY_UNITS = 8
 # These are punctuation ambiguities, not evidence or diagnostic classifications.
 _ABBREVIATIONS = frozenset({"approx", "prof", "dott", "sign", "resp", "incl", "dept", "assn", "misc"})
