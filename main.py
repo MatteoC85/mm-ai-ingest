@@ -13953,6 +13953,9 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
         "Do not invent components, facts, alarms, values, steps, causes, or evidence IDs. relevant_evidence_ids may contain only IDs shown in INDEXED_EVIDENCE."
     )
     if request.requested_mode == MODE_ASK:
+        system_msg = system_msg.replace(
+            "When the user asks for types, groups, parameters, options, controls, principal components, or several requested items, include checklist in required_answer_types and split the requested categories into separate required facets so completeness can be verified. ",
+            "Include checklist in required_answer_types when USER_REQUEST semantically asks for an operational or maintenance checklist, or an item set/inventory such as types, groups, parameters, options, controls or components. Preserve genuine maintenance coverage of frequencies, locations and inspection-versus-replacement conditions, even for finite named categories or terse multilingual wording without list keywords. Several finite factual assertions, numerical premises or equivalence claims to confirm or correct do not by themselves request an inventory or procedure: do not add checklist merely to present those answers as bullets. Preserve every independently requested category as a must-cover facet and retain numeric_value, explanation, safety_conditions and all material qualifiers as applicable. An actually requested operational or maintenance checklist still requires checklist and every applicable operating prerequisite, including when it also asks for a value. ")
         system_msg += (
             " For ASK, derive the mandatory categories from the complete USER_REQUEST before "
             "using INDEXED_EVIDENCE to refine retrieval. Preserve each independently requested "

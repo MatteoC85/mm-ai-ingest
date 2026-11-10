@@ -10,11 +10,12 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 sys.path[:0] = [str(Path(__file__).resolve().parents[1]), str(Path(__file__).resolve().parent)]
 from machinemind.ask import generation
 from machinemind.evidence.contracts import SourceIdentity, SourceScope, SourceType, SourceFormat, ScopeLevel
-from machinemind.infrastructure import openai_transport, request_budget
+from machinemind.infrastructure import openai_transport, request_budget, ask_input_count
 from machinemind.retrieval.ask_composition import AskSelection
 from machinemind.retrieval.page_evidence import _PageReadCapture
 import test_ask_conditions_family_admission as owned
@@ -181,7 +182,7 @@ class AskBoundedProcedureSupportTests(unittest.TestCase):
 
     def test_required_family_alone_exceeds_real_cost_capacity_without_body_clipping(self):
         rows = router.catalog()
-        for i in range(5, 13):
+        for i in range(5, 17):
             rows[0]['steps'].append(dict(step_id='install'+str(i), step_number=i,
                 title='Complete documented condition '+str(i), description='Documented isolation condition '+str(i)+'.'))
         h = TransportFixture(self, rows=rows)
@@ -193,8 +194,39 @@ class AskBoundedProcedureSupportTests(unittest.TestCase):
             h.children['procedure:install'] = [(key, ordinal, mid, page,
                 next(r[3] for r in h.rows if r[0] == key))
                 for key, ordinal, mid, page, _ in h.children['procedure:install']]
-            with self.assertRaises(request_budget._V13BudgetExceeded): h.run_core()
+            observed = {}
+            original_reply = h.reply
+            def observe_budget(*args, **kwargs):
+                observed["budget"] = request_budget._v13_current_budget()
+                return original_reply(*args, **kwargs)
+            h.reply = observe_budget
+            original_meter = request_budget._text_input_bound
+            def observe_meter(*args, **kwargs):
+                measured = original_meter(*args, **kwargs)
+                observed["input_bound"] = measured[0]
+                return measured
+            # This fixture calls the native transport directly without a count
+            # owner. An unavailable FREE count must not masquerade as this test.
+            with patch.object(ask_input_count._Session, "count", side_effect=AssertionError("unexpected count")) as count, \
+                    patch.object(request_budget, "_text_input_bound", side_effect=observe_meter):
+                with self.assertRaises(request_budget._V13BudgetExceeded) as failure: h.run_core()
+                count.assert_not_called()
+            self.assertIn("insufficient reserved cost for useful output", str(failure.exception))
             self.assertEqual(h.transport_posts, [])
+            budget = observed["budget"]
+            self.assertEqual(budget.llm_calls, 1)
+            self.assertEqual(budget.call_log, [h.prior_row])
+            self.assertEqual(budget.estimated_cost_usd, .01876867)
+            input_rate, output_rate = request_budget._v13_model_rates(self.m.V13_FAST_MODEL)
+            minimum_cost = observed["input_bound"] * input_rate * 1.25 / 1_000_000 + 800 * output_rate / 1_000_000
+            self.assertGreater(minimum_cost, budget.remaining_cost_usd)
+            print("NATIVE_REQUIRED_FAMILY_CAPACITY", json.dumps({"required_large_steps":12,
+                "input_bound":observed["input_bound"], "minimum800_cost_usd":minimum_cost,
+                "remaining_cost_usd":budget.remaining_cost_usd, "CREATE_posts":0, "FREE_count_posts":0}))
+            self.assertEqual(budget.public_meta()["uncertain_cost_usd"], 0.)
+            self.assertTrue(budget.public_meta()["accounting_complete"])
+            self.assertEqual((budget.max_estimated_cost_usd, budget.max_llm_calls, budget.deadline_monotonic),
+                h.original_limits)
             self.assertEqual([x[0] for x in h.calls], ['router','writer'])
             for _, _, _, body in h.rows:
                 if 'Complete documented condition' in body: self.assertIn(body, h.writer_packets[0])

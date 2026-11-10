@@ -41,6 +41,7 @@ def replay(case,output_tokens,*,free_post=None,include_real_manual_pool=True,bou
   case.assertEqual(h.owner.generation.V13_FAST_MODEL,'gpt-5.6-terra')
   case.assertEqual(h.owner.generation.V13_HEAVY_MAX_OUTPUT_TOKENS,6000)
   case.assertEqual(h.owner.generation.V13_FAST_MAX_OUTPUT_TOKENS,3000)
+  case.assertEqual(h.m._v13_choose_ask_model(h.request.query,h.prepared,narrow_scope=h.request.narrow_scope)[0],'gpt-5.6-sol')
   if include_real_manual_pool:
    pool_path=W/'phase6-ask-correction-r5-20261109/review/read-only-manual-capture/AURELIS-CURRENT-MANUAL-POOL.json'
    assert hashlib.sha256(pool_path.read_bytes()).hexdigest()=='806142ca4ed85b51d220800b489ca379f952f8185a2f4f54ac7d2d2109f4873e'
@@ -86,28 +87,30 @@ def replay(case,output_tokens,*,free_post=None,include_real_manual_pool=True,bou
    selected=kw['models'][0]
    if boundary_padding and kw['purpose']=='ask_final_synthesis':
     messages=deepcopy(messages);messages[0]['content']+='\n'*boundary_padding
-   if kw['purpose']=='ask_final_synthesis':case.assertEqual(selected,'gpt-5.6-sol')
+   if kw['purpose']=='ask_final_synthesis':
+    case.assertEqual(selected,'gpt-5.6-terra');case.assertEqual(kw['effort'],'none')
+    case.assertEqual(kw['max_output_tokens'],6000)
    if kw['purpose']=='assistant_core_answer_contract_verifier':case.assertEqual(selected,'gpt-5.6-terra')
    def post(url,**options):
     if url==counter.ENDPOINT:
      record['count_posts']+=1;projection=json.loads(options['data'])
-     record['count_payloads'].append({'model':projection['model'],'projection_sha256':counter._sha(projection),'input_UTF8_bytes':len(options['data'])})
+     record['count_payloads'].append({'purpose':kw['purpose'],'model':projection['model'],'projection_sha256':counter._sha(projection),'input_UTF8_bytes':len(options['data'])})
      if free_post is not None:
       response=free_post(url,**options)
       # The production private counter consumes and verifies the real FREE reply.
       return response
-     tokens=11000 if selected=='gpt-5.6-sol' else 14000
-     last_count[selected]=tokens
+     tokens=11000 if kw['purpose']=='ask_final_synthesis' else 14000
+     last_count[kw['purpose']]=tokens
      return CountResponse({'object':'response.input_tokens','input_tokens':tokens})
     case.assertEqual(url,counter.CREATE_ENDPOINT);record['fake_create_posts']+=1
-    payload=options['json'];used_output=output_tokens if selected=='gpt-5.6-sol' else 1800
+    payload=options['json'];used_output=output_tokens if kw['purpose']=='ask_final_synthesis' else 1800
     case.assertGreaterEqual(payload['max_output_tokens'],used_output)
     record['quotes'].append({'purpose':kw['purpose'],'model':selected,'requested_output_tokens':kw['max_output_tokens'],
      'effective_output_tokens':payload['max_output_tokens'],'actual_fixture_output_tokens':used_output,
      'native_reserved_input_tokens':b.call_log[-1]['reserved_input_tokens'],'native_reserved_cost_usd':b.call_log[-1]['reserved_cost_usd'],
      'remaining_before_settlement_usd':b.remaining_cost_usd,'full_payload_sha256':counter._sha(payload)})
     # Controlled positive usage, not a tokenization or live quality assertion.
-    input_usage=last_count.get(selected,11000 if selected=='gpt-5.6-sol' else 14000)
+    input_usage=last_count.get(kw['purpose'],11000 if kw['purpose']=='ask_final_synthesis' else 14000)
     return types.SimpleNamespace(status_code=200,json=lambda:{'status':'completed','service_tier':'default','output_text':json.dumps(oracle),
      'usage':{'input_tokens':input_usage,'output_tokens':used_output}})
    with patch.object(h.m.requests,'post',post):
@@ -163,7 +166,7 @@ class ExactCountProductionReplayTests(unittest.TestCase):
    for output in (800,1500,2600):
     with self.subTest(output=output):
      case=actual.AskProcedureContextRecoveryTests();case.m=self.m
-     self.records.append(replay(case,output,boundary_padding=6000))
+     self.records.append(replay(case,output,boundary_padding=60000))
   self.assertTrue(all(row['count_posts']>=1 for row in self.records))
  def test_unpadded_actual_source_packet_fits_old_writer_bound_without_free_writer_count(self):
   with ExitStack()as stack:
@@ -171,7 +174,8 @@ class ExactCountProductionReplayTests(unittest.TestCase):
    for output in (800,1500):
     case=actual.AskProcedureContextRecoveryTests();case.m=self.m
     row=replay(case,output)
-    self.assertEqual(row['quotes'][0]['effective_output_tokens'],1639)
-    self.assertFalse(any(p['model']=='gpt-5.6-sol'for p in row['count_payloads']))
+    self.assertEqual(row['quotes'][0]['effective_output_tokens'],6000)
+    self.assertEqual(row['quotes'][0]['actual_fixture_output_tokens'],output)
+    self.assertFalse(any(p['purpose']=='ask_final_synthesis'for p in row['count_payloads']))
 
 if __name__=='__main__':unittest.main(verbosity=2)

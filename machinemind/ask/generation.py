@@ -184,7 +184,34 @@ def generate_ask_response(
         retrieval,
         narrow_scope=narrow_scope,
     )
-    context_chars = V13_FAST_CONTEXT_CHARS if model == V13_FAST_MODEL else V13_HEAVY_CONTEXT_CHARS
+    # The original policy still owns packet size, output ceiling and timeout.
+    # The internal owner enables complete-family or finite-factual composition;
+    # payload metadata, scores or a partial structured seed cannot enable it.
+    policy_model = model
+    # Finite factual composition is an owned writer policy, not a claim that
+    # missing facets are resolved. The existing independent judge still decides.
+    mandatory_facets = [item for item in contract.get("facet_queries", [])
+        if isinstance(item, dict) and item.get("must_cover") is True]
+    composition_answer_types = required_answer_types | {
+        item.get("answer_type") for item in mandatory_facets}
+    prepared_decision = retrieval.get("assistant_core_decision") or {}
+    finite_factual_composition = bool(
+        runtime.preserve_procedure_points and contract.get("fail_closed") is True
+        and information_task == INFO_NUMERIC_SPECIFICATION
+        and required_answer_types and mandatory_facets
+        and REQ_NUMERIC_VALUE in composition_answer_types
+        and composition_answer_types <= {REQ_NUMERIC_VALUE, REQ_SAFETY_CONDITIONS, "explanation"}
+        and prepared_decision.get("request_kind") == "factual"
+        and prepared_decision.get("effective_mode") == "ask"
+        and prepared_decision.get("enumeration_requested") is False
+        and not overview_catalog_requested and not machine_catalog_digest)
+    source_backed_composition = bool(
+        V13_FAST_MODEL == "gpt-5.6-terra" and runtime.preserve_procedure_points
+        and ((runtime.preserve_procedure_context and runtime.procedure_context_sources)
+             or finite_factual_composition))
+    if source_backed_composition:
+        model, effort, reasoning_mode = V13_FAST_MODEL, "none", ""
+    context_chars = V13_FAST_CONTEXT_CHARS if policy_model == V13_FAST_MODEL else V13_HEAVY_CONTEXT_CHARS
     if overview_catalog_requested:
         context_chars = max(context_chars, 28000)
     sources_block = _v13_sources_block(candidates, max_context_chars=context_chars)
@@ -309,8 +336,8 @@ def generate_ask_response(
             json_schema=_ask_evidence_answer_schema(),
             effort=effort,
             reasoning_mode=reasoning_mode,
-            timeout=V13_HEAVY_TIMEOUT_SECONDS if model == V13_HEAVY_MODEL else V13_FAST_TIMEOUT_SECONDS,
-            max_output_tokens=V13_HEAVY_MAX_OUTPUT_TOKENS if model == V13_HEAVY_MODEL else V13_FAST_MAX_OUTPUT_TOKENS,
+            timeout=V13_HEAVY_TIMEOUT_SECONDS if policy_model == V13_HEAVY_MODEL else V13_FAST_TIMEOUT_SECONDS,
+            max_output_tokens=V13_HEAVY_MAX_OUTPUT_TOKENS if policy_model == V13_HEAVY_MODEL else V13_FAST_MAX_OUTPUT_TOKENS,
             company_id=company_id,
             purpose="ask_final_synthesis",
         )
