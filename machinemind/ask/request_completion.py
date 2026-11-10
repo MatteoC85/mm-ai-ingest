@@ -96,6 +96,44 @@ def _ordinary_private_owner():
     return owner
 
 
+def record_private_source_selection(*, intake, stage, router_result=None) -> None:
+    """Observe a real current intake only inside this debug owner's cipher body."""
+    owner = _ordinary_private_owner()
+    if owner is None:
+        return
+    try:
+        from .core_intake import _CoreIntake
+        if type(intake) is not _CoreIntake or stage not in {"router", "pre_p4"}:
+            return
+        request = intake.request
+        if (getattr(request, "requested_mode", None) != "ask"
+                or request.allowed_effective_modes != ("ask",)
+                or str(request.company_id or "") != str(owner.payload.company_id or "")
+                or str(request.machine_id or "") != str(getattr(owner.payload, "machine_id", "") or "")
+                or str(request.query or "").strip() != str(getattr(owner.payload, "query", "") or "").strip()
+                or owner.budget.remaining() <= 0 or owner._private_review_attempted):
+            return
+        binding = owner._private_review_binding()
+        previous = owner._private_source_selection
+        if previous is not None and (previous[0] is not intake or previous[1] != binding):
+            owner._private_source_selection = None
+            return
+        from .private_review_diagnostics import _plain, canonical
+        snapshot = _plain(intake._private_source_selection_snapshot(stage=stage, router_result=router_result))
+        context = deepcopy(previous[2]) if previous is not None else {}
+        if stage in context:
+            owner._private_source_selection = None
+            return
+        context[stage] = snapshot
+        if len(canonical(context)) > 65536:
+            owner._private_source_selection = None
+            return
+        if current() is owner and owner.active:
+            owner._private_source_selection = (intake, binding, context)
+    except Exception:
+        owner._private_source_selection = None  # No plaintext/error/verdict fallback.
+
+
 def begin_private_ordinary_writer(*, query, company_id, provider_input):
     """Snapshot exact call inputs in this debug owner's bounded RAM only."""
     owner = _ordinary_private_owner()
@@ -123,6 +161,9 @@ def begin_private_ordinary_writer(*, query, company_id, provider_input):
         token = object()
         owner._private_ordinary_writer = {'token': token, 'binding': owner._private_review_binding(),
             'input': snapshot, 'reply': None, 'review': None}
+        selection = owner._private_source_selection
+        if selection is not None and selection[1] == owner._private_review_binding():
+            owner._private_ordinary_writer['source_selection'] = deepcopy(selection[2])
         return token
     except Exception:
         return None  # No source/error/plaintext fallback, no verdict change.
@@ -199,7 +240,8 @@ def finish_private_ordinary_review(token, *, actual_reply, model_used):
             first_wire_reply=entry['reply'],
             expanded_candidate={'protocol': 'ordinary_ask_first_consumer_review_v1',
                 'current_answer': frame['current_answer'], 'writer_input': entry['input'],
-                'writer_model_used': entry['model_used']},
+                'writer_model_used': entry['model_used'],
+                **({'source_selection': entry['source_selection']} if 'source_selection' in entry else {})},
             review_frame={'protocol': 'ordinary_ask_first_consumer_review_v1',
                 **frame['provider_input'], 'review_model_used': str(model_used or '')},
             table_catalog=None, actual_review_reply=actual_reply,
@@ -544,6 +586,7 @@ class RequestCompletion:
         self._private_review_attempted = False
         self._private_review_invalidated = False
         self._private_ordinary_writer = None
+        self._private_source_selection = None
 
     def _private_review_binding(self):
         return {'commit_sha': os.environ.get('COMMIT_SHA', '').lower(),
@@ -757,6 +800,7 @@ class RequestCompletion:
                 self._private_review_invalidated = True
                 self._private_review_envelope = None
                 self._private_ordinary_writer = None
+                self._private_source_selection = None
                 self._terminal = self.payload = self.runtime = None
 
 

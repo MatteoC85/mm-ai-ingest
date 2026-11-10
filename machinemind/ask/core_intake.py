@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from ..evidence.copying import deepcopy
 from dataclasses import dataclass, replace
+from collections import Counter
+import sys
 from typing import Any, Callable
 
 from assistant_core_v2 import AssistantCoreV2, AssistantCoreHooks
@@ -31,6 +33,7 @@ from ..evidence.contracts import EvidenceContractError, SourceType
 from ..evidence.ask_input import _same_value, ask_request_key
 from ..retrieval.ask_composition import AskEvidenceSession, AskSelection, RecordHandle
 from ..retrieval.production_adapters import ProductionReaderAdapters
+from ..retrieval.page_evidence import PageEvidenceRead
 from ..retrieval import candidate_ranking as ranking, evidence_orchestration as orchestration
 from ..retrieval import receipt_producers as producers, source_management, lexical
 
@@ -111,6 +114,10 @@ class _CoreIntake:
         self._task_used = set()
         self._generated_validation_selection = None
         self._procedure_catalog = {}
+        self._procedure_catalog_read = None
+        self._procedure_catalog_null_choice = False
+        self._catalog_context_optional = False
+        self._factual_catalog_declined = False
         self._selected_catalog_parent = None
         self._family_context_handles = ()
         self._family_context_decision = None
@@ -333,8 +340,14 @@ class _CoreIntake:
                 or self.tasks is None or self.generation is None or scope.ai_scope != "machine_all"
                 or request.narrow_scope or scope.document_ids or scope.bubble_document_id):
             return data
-        handles = self.readers.candidate_handles("read_structured_direct_page_evidence",
+        registered = self.readers.read("read_structured_direct_page_evidence",
             q=request.query, planner={"_ask_procedure_family_catalog": True}, top_k=12)
+        handles = registered.records
+        receipt = self.session.inspect_read(request=request, handle=registered.read,
+            current_allowed_sources=self._current())
+        if type(receipt) is not PageEvidenceRead or receipt.layout != "retrieval_candidate":
+            raise CoreIntakeError("current procedure catalog requires candidate page read")
+        self._procedure_catalog_read = registered.read
         parents = []
         seen_sources = set()
         for handle, item in zip(handles, self._values(handles)):
@@ -364,6 +377,48 @@ class _CoreIntake:
             selections.append(AskSelection(selected.name, selected.records+tuple(parents)))
         return self._remember(updated, tuple(selections))
 
+    def _private_source_selection_snapshot(self, *, stage, router_result=None):
+        """Debug observer only: current typed IDs, never source bodies or grants."""
+        self._check(self.request)
+        if stage not in {"router", "pre_p4"}:
+            raise CoreIntakeError("private source selection stage invalid")
+        allowed = self._current()
+        selection = next((item for item in self._selection if item.name == "candidates"), None)
+        if selection is None:
+            selection = next((item for item in self._selection if item.name == "citations"), None)
+        values = self.session.records(request=self.request,
+            handles=selection.records if selection is not None else (), current_allowed_sources=allowed)
+        rows = [{"citation_id": str(item.record.get("citation_id") or ""),
+                 "source_type": item.context.source.source_type.value} for item in values]
+        if any(not row["citation_id"] or len(row["citation_id"]) > 256 for row in rows):
+            raise CoreIntakeError("private source selection identity unbounded")
+        parent = self.session.records(request=self.request,
+            handles=(self._selected_catalog_parent,) if self._selected_catalog_parent is not None else (),
+            current_allowed_sources=allowed)
+        selected_parent = str(parent[0].record.get("citation_id") or "") if parent else None
+        if stage == "router":
+            relevant = set(router_result.get("relevant_evidence_ids") or ()) if type(router_result) is dict else set()
+            chosen = [row for row in rows if row["citation_id"] in relevant]
+            return {"owner_available_catalog_ids": list(self._procedure_catalog)[:12],
+                "owner_available_catalog_count": len(self._procedure_catalog),
+                "owner_catalog_is_not_claimed_actual_emitted_enum": True,
+                "selected_parent_id": selected_parent,
+                "router_relevant_rows": chosen[:256], "router_relevant_count": len(chosen),
+                "router_relevant_rows_truncated": len(chosen) > 256}
+        family = self.session.records(request=self.request, handles=self._family_context_handles,
+            current_allowed_sources=allowed)
+        steps = [str(item.record.get("citation_id") or "") for item in family
+                 if item.context.source.source_type == SourceType.STEP]
+        counts = {}
+        for row in rows:
+            counts[row["source_type"]] = counts.get(row["source_type"], 0) + 1
+        return {"selected_parent_id": selected_parent,
+            "selected_family_step_ids": steps[:256], "selected_family_step_count": len(steps),
+            "selected_family_steps_truncated": len(steps) > 256,
+            "candidate_count": len(rows), "candidate_type_counts": counts,
+            "candidate_rows": rows[:256], "candidate_rows_truncated": len(rows) > 256,
+            "snapshot_stage": "after_family_restore_before_P4_prepare"}
+
     def route(self, request, data):
         def work():
             self.select(request, data, None, "core.route.input")
@@ -374,25 +429,124 @@ class _CoreIntake:
             # output shape. Consume it here; public normalized decisions do not
             # carry an occurrence or gain authority from a model-generated ID.
             selected_id = result.get("selected_procedure_parent_id") if isinstance(result, dict) else None
+            self._catalog_context_optional = False
+            self._factual_catalog_declined = False
+            self._procedure_catalog_null_choice = (isinstance(result, dict)
+                and result.get("_ask_catalog_explicit_null") is True and selected_id is None)
+            if self._procedure_catalog_null_choice:
+                relevant = result.get("relevant_evidence_ids")
+                selected = next((s for s in self._selection if s.name == "candidates"), None)
+                current = self.session.records(request=request,
+                    handles=selected.records if selected is not None else (), current_allowed_sources=self._current())
+                by_id = {str(item.record.get("citation_id") or ""): item for item in current}
+                self._procedure_catalog_null_choice = (type(relevant) is list
+                    and all(type(cid) is str and cid in by_id for cid in relevant)
+                    and not any(by_id[cid].context.source.source_type == SourceType.STEP for cid in relevant))
             choices = ({self._procedure_catalog[selected_id]}
                 if type(selected_id) is str and selected_id in self._procedure_catalog else set())
             identities = {item.context.source for item in self.session.records(request=request,
                 handles=tuple(choices), current_allowed_sources=self._current())}
             self._selected_catalog_parent = next(iter(choices)) if len(identities) == 1 else None
+            from .request_completion import record_private_source_selection
+            record_private_source_selection(intake=self, stage="router", router_result=result)
             if isinstance(result, dict):
                 result = dict(result)
                 result.pop("selected_procedure_parent_id", None)
+                result.pop("_ask_catalog_explicit_null", None)
             return result
         return self.invoke(work, request)
+
+    def _factual_catalog_parent(self, request, decision):
+        """Discover context from a unique current catalog anchor, never coverage.
+
+        Purely factual requests need not ask the semantic router to choose a
+        Procedure. On an explicit null choice, use the SAME router's numeric
+        facet probes to recall one canonical family. No question numbers, raw
+        request metadata, concatenated probes or semantic scores grant a source.
+        """
+        if (not getattr(self, "_procedure_catalog_null_choice", False)
+                or getattr(self, "_factual_catalog_declined", False) or self.tasks is None
+                or self._procedure_catalog_read is None or not 0 < len(self._procedure_catalog) < 12):
+            return None
+        scope = self._scope()
+        requirements = set(decision.required_answer_types)
+        requirements.update(f.answer_type for f in decision.facet_queries if f.must_cover)
+        if (request.requested_mode != "ask" or request.allowed_effective_modes != ("ask",)
+                or decision.effective_mode != "ask" or decision.degraded
+                or decision.request_kind != "factual"
+                or decision.information_task not in {"numeric_specification", "document_explanation"}
+                or decision.evidence_state not in {"refine", "partial", "unsupported"}
+                or "numeric_value" not in requirements
+                or not requirements <= {"numeric_value", "explanation", "safety_conditions"}
+                or decision.source_type_policy not in {"none", "prefer"} or decision.diagnostic_exclusions
+                or scope.ai_scope != "machine_all" or request.narrow_scope
+                or scope.document_ids or scope.bubble_document_id):
+            return None
+        receipt = self.session.inspect_read(request=request, handle=self._procedure_catalog_read,
+            current_allowed_sources=self._current())
+        # The existing unfiltered catalog SQL scans at least 100 pages. A smaller
+        # one-batch observation is unsaturated. Compare raw parent identities as
+        # well: snippet deduplication must not hide a competing operation.
+        if (type(receipt) is not PageEvidenceRead or receipt.scope != scope
+                or receipt.kind != "structured_direct" or receipt.query_count != 1
+                or len(receipt.observations) >= 100):
+            return None
+        observed = [o.source for o in receipt.observations
+            if o.source.source_type == SourceType.PROCEDURE
+            and o.source.scope.company_id == request.company_id
+            and o.source.scope.machine_id == request.machine_id]
+        pairs = tuple(self._procedure_catalog.items())
+        records = self.session.records(request=request, handles=tuple(h for _, h in pairs),
+            current_allowed_sources=self._current())
+        current = tuple(item.context.source for item in records)
+        if len(set(observed)) != len(observed) or set(current) != set(observed):
+            return None
+        terms = self.tasks._content_term_set
+        titles = {handle: {term for term in terms(str(self.tasks._procedure_ui_fields(
+            dict(item.record)).get("title") or ""), limit=80) if term.isalpha()}
+            for (_, handle), item in zip(pairs, records)}
+        frequency = Counter(term for words in titles.values() for term in words)
+        choices = set()
+        for facet in decision.facet_queries:
+            if not facet.must_cover or facet.answer_type != "numeric_value":
+                continue
+            for probe in (*facet.lexical_queries, *facet.dense_queries):
+                query_terms = {term for term in terms(probe, limit=80) if term.isalpha()}
+                for handle, words in titles.items():
+                    hits = query_terms & words
+                    if len(hits) >= 2 and any(frequency[term] == 1 for term in hits):
+                        choices.add(handle)
+        return next(iter(choices)) if len(choices) == 1 else None
 
     def _acquire_family_context(self, request, data, decision):
         if self.tasks is None or self.generation is None:
             return data
+        if self._selected_catalog_parent is None:
+            self._selected_catalog_parent = self._factual_catalog_parent(request, decision)
+            self._catalog_context_optional = self._selected_catalog_parent is not None
         context = TaskGenerationEvidence(request=request, session=self.session,
             readers=self.readers, authorize=self.authorize, invoke=self.invoke,
             runtime=self.generation, tasks=self.tasks)
+        original = data
         data, selections, recovered = context.prepare_family_context(data, self._selection, decision,
             selected_parent_handle=self._selected_catalog_parent)
+        if self._catalog_context_optional:
+            family = [row for row in data.get("candidates", [])
+                if self.tasks._v12_evidence_role(row) in {"procedure", "step"}]
+            # An optional recall must fit the pre-existing ordinary writer and
+            # independent-review source bounds. Never ask complete_limits to
+            # inflate them or clip a family to make it fit.
+            # P4 can change ordinary policy confidence after this read. Fit
+            # BOTH existing writer contexts, not a pre-refinement model guess.
+            writer_chars = min(self.generation.V13_FAST_CONTEXT_CHARS,
+                self.generation.V13_HEAVY_CONTEXT_CHARS)
+            review_chars = min(24000, max(self.generation.V13_FAST_CONTEXT_CHARS, 22000))
+            rendered = self.generation._v13_sources_block(family, max_context_chars=sys.maxsize) if recovered else ""
+            if not recovered or len(rendered) > min(writer_chars, review_chars):
+                self._selected_catalog_parent = None
+                self._catalog_context_optional = False
+                self._factual_catalog_declined = True
+                return original
         self._remember(data, selections)
         if recovered:
             selected = next(s for s in selections if s.name == "candidates")
@@ -423,6 +577,9 @@ class _CoreIntake:
         def work():
             nonlocal data
             self.select(request, data, decision, "core.refine.input")
+            if self._selected_catalog_parent is None:
+                self._selected_catalog_parent = self._factual_catalog_parent(request, decision)
+                self._catalog_context_optional = self._selected_catalog_parent is not None
             if self._selected_catalog_parent is not None:
                 data = self._acquire_family_context(request, data, decision)
             result, selections = producers.refine_records(request=request,
@@ -498,6 +655,8 @@ class _CoreIntake:
             if not self._family_context_handles:
                 data = self._acquire_family_context(request, data, decision)
             data = self._restore_family_context(request, data, decision)
+            from .request_completion import record_private_source_selection
+            record_private_source_selection(intake=self, stage="pre_p4")
             self._procedure_family_context = bool(self._family_context_handles)
 
             def context_handles(handles):
@@ -732,6 +891,10 @@ class _CoreIntake:
                 self._task_input.clear()
                 self._task_used.clear()
                 self._procedure_catalog.clear()
+                self._procedure_catalog_read = None
+                self._procedure_catalog_null_choice = False
+                self._catalog_context_optional = False
+                self._factual_catalog_declined = False
                 self._selected_catalog_parent = None
                 self._family_context_handles = ()
                 self._family_context_decision = None

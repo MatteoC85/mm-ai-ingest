@@ -14179,12 +14179,18 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
         if procedure_catalog_ids:
             selected_parent = out.get("selected_procedure_parent_id")
             # Do not repair whitespace/types or accept an un-emitted catalog ID.
+            relevance = out.get("relevant_evidence_ids")
+            out["_ask_catalog_explicit_null"] = (
+                "selected_procedure_parent_id" in out and selected_parent is None
+                and type(relevance) is list
+                and all(type(cid) is str and cid in supplied_ids for cid in relevance))
             out["selected_procedure_parent_id"] = (
                 selected_parent if type(selected_parent) is str
                 and selected_parent in procedure_catalog_ids else None
             )
         else:
             out.pop("selected_procedure_parent_id", None)
+            out.pop("_ask_catalog_explicit_null", None)
         if profile is not None:
             profile = _retrieval_diagnostic_query.profile_from_router(out, profile)
             if isinstance(request.metadata, dict):

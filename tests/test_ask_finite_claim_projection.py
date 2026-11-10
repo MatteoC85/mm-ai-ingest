@@ -85,7 +85,32 @@ class Projection(unittest.TestCase):
    old_functions={n.name:ast.dump(n,include_attributes=False)for n in old.body if isinstance(n,ast.FunctionDef)}
    new_functions={n.name:ast.dump(n,include_attributes=False)for n in new.body if isinstance(n,ast.FunctionDef)}
    self.assertTrue(all(new_functions[k]==v for k,v in old_functions.items()))
-   for name in('main.py','machinemind/ask/execution.py','machinemind/ask/final_contract.py'):
+   # R18 adds only this private router-null proof; all other main AST stays exact.
+   private_nodes = [
+    'relevance = out.get("relevant_evidence_ids")',
+    'out["_ask_catalog_explicit_null"] = ("selected_procedure_parent_id" in out and selected_parent is None and type(relevance) is list and all(type(cid) is str and cid in supplied_ids for cid in relevance))',
+    'out.pop("_ask_catalog_explicit_null", None)',
+   ]
+   expected = [ast.dump(ast.parse(text).body[0],include_attributes=False)for text in private_nodes]
+   class PrivateNullOnly(ast.NodeTransformer):
+    def __init__(self):self.seen=[0,0,0]
+    def visit_FunctionDef(self,node):
+     if node.name!='_assistant_core_router_call':return node
+     return self.generic_visit(node)
+    def strip_exact(self,node):
+     value=ast.dump(node,include_attributes=False)
+     if value in expected:
+      self.seen[expected.index(value)]+=1
+      return None
+     return self.generic_visit(node)
+    visit_Assign=strip_exact
+    visit_Expr=strip_exact
+   scrub=PrivateNullOnly()
+   current_main=scrub.visit(ast.parse((ROOT/'main.py').read_text(encoding='utf-8')))
+   self.assertEqual(scrub.seen,[1,1,1])
+   self.assertEqual(ast.dump(ast.parse(z.read('main.py').decode()),include_attributes=False),
+    ast.dump(current_main,include_attributes=False))
+   for name in('machinemind/ask/execution.py','machinemind/ask/final_contract.py'):
     self.assertEqual(z.read(name),(ROOT/name).read_bytes())
 class WholeCore(unittest.TestCase):
  @classmethod
