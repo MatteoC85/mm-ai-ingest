@@ -322,7 +322,7 @@ class DedupCitationsBySnippetRuntime:
     _normalize_unicode_advanced: Callable[..., Any]
 
 
-def dedup_citations_by_snippet(citations: list[dict], max_items: int, *, runtime: DedupCitationsBySnippetRuntime, lineage: Optional[Callable[..., None]]=None) -> list[dict]:
+def dedup_citations_by_snippet(citations: list[dict], max_items: int, *, runtime: DedupCitationsBySnippetRuntime, lineage: Optional[Callable[..., None]]=None, context_selected: Optional[Callable[[dict], bool]]=None) -> list[dict]:
     _normalize_unicode_advanced = runtime._normalize_unicode_advanced
     def norm(s: str) -> str:
         # Deduplication must compare the available evidence, not its UI preview.
@@ -352,7 +352,9 @@ def dedup_citations_by_snippet(citations: list[dict], max_items: int, *, runtime
             k = str(c.get("citation_id") or "").strip()
 
         prev = best.get(k)
-        if prev is None or priority(c) > priority(prev):
+        selected = bool(context_selected(c)) if context_selected is not None else False
+        previous_selected = bool(context_selected(prev)) if prev is not None and context_selected is not None else False
+        if prev is None or (selected, priority(c)) > (previous_selected, priority(prev)):
             best[k] = c
             if lineage is not None:
                 chosen[k] = item_index
@@ -365,6 +367,7 @@ def dedup_citations_by_snippet(citations: list[dict], max_items: int, *, runtime
     out = list(best.values())
     out.sort(
         key=lambda x: (
+            -int(bool(context_selected(x))) if context_selected is not None else 0,
             -priority(x)[0],
             -priority(x)[1],
             -priority(x)[2],

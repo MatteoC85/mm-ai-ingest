@@ -125,7 +125,8 @@ class SmartDiagnosticQualityTests(unittest.TestCase):
             response = self.post("finalize")
         self.assertEqual(response.status_code, 200, response.text)
         body = response.json()
-        self.assertEqual(body["final_result"]["most_likely_hypothesis_id"], "H2")
+        self.assertEqual(body["final_result"]["most_likely_hypothesis_id"], "")
+        self.assertEqual(json.loads(body["session_state_json"])["final_result"]["most_likely_hypothesis_id"], "H2")
         self.assertEqual(body["operator_summary"], body["final_summary_text"])
 
     def test_answer_final_cannot_select_excluded_or_invent_summary_checks(self):
@@ -135,7 +136,8 @@ class SmartDiagnosticQualityTests(unittest.TestCase):
         with patch.object(self.m, "_sd_llm_step_answer", return_value=parsed):
             response = self.post("answer")
         body = response.json()
-        self.assertEqual(body["final_result"]["most_likely_hypothesis_id"], "H2")
+        self.assertEqual(body["final_result"]["most_likely_hypothesis_id"], "")
+        self.assertEqual(json.loads(body["session_state_json"])["final_result"]["most_likely_hypothesis_id"], "H2")
         self.assertEqual(body["operator_summary"], body["final_summary_text"])
         self.assertEqual(body["final_result"]["recommended_checks"], ["Observe the position input on the HMI."])
 
@@ -323,7 +325,8 @@ class SmartDiagnosticQualityTests(unittest.TestCase):
         self.assertEqual(second.status_code, 200, second.text)
         body = second.json()
         self.assertTrue(body["final_ready"])
-        self.assertEqual(body["final_result"]["most_likely_hypothesis_id"], "H2")
+        self.assertEqual(body["final_result"]["most_likely_hypothesis_id"], "")
+        self.assertEqual(json.loads(body["session_state_json"])["final_result"]["most_likely_hypothesis_id"], "H2")
         self.assertEqual(len(json.loads(body["session_state_json"])["history"]), 2)
 
     def test_model_cannot_add_unadmitted_hypothesis_or_question_target(self):
@@ -342,8 +345,10 @@ class SmartDiagnosticQualityTests(unittest.TestCase):
         with patch.object(self.m, "_sd_llm_finalize", return_value={"most_likely_hypothesis_id": "H2", "most_likely_label": "Invented", "probability_pct": 100, "recommended_checks": ["Invented operation"]}):
             response = self.post("finalize")
         body = response.json()
-        self.assertEqual(body["final_most_likely_label"], "Supply pressure loss")
-        self.assertEqual(body["final_probability_pct"], 60)
+        self.assertEqual(body["final_most_likely_label"], "No cause identified")
+        self.assertEqual(json.loads(body["session_state_json"])["final_result"]["most_likely_label"], "Supply pressure loss")
+        self.assertEqual(body["final_probability_pct"], 0)
+        self.assertEqual(json.loads(body["session_state_json"])["final_result"]["probability_pct"], 60)
         self.assertEqual(json.loads(body["final_result_json"]), body["final_result"])
         self.assertEqual(json.loads(body["citations_json"]), body["citations"])
         self.assertIn("manual:p8", {c["citation_id"] for c in body["citations"]})

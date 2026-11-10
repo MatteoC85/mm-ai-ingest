@@ -789,7 +789,7 @@ class SmartReviewEndpointTests(unittest.TestCase):
         self.assertEqual(start['question']['safety_note'].count(review.SAFETY_POLICY_TEXT['en']), 1)
         self.assertEqual(start['safety_note'], start['question']['safety_note'])
         answer_step = copy.deepcopy(self.raw)
-        answer_step['hypotheses'] = start['hypotheses']
+        answer_step['hypotheses'] = json.loads(start['session_state_json'])['hypotheses']
         answer_step['question']['question_text'] = 'Does the HMI show the material detection signal?'
         answer_step['question']['target_hypotheses'] = [h['id'] for h in start['hypotheses']]
         with patch.object(self.m, '_sd_llm_step_answer', return_value=answer_step):
@@ -839,7 +839,8 @@ class SmartReviewEndpointTests(unittest.TestCase):
         before = self.provider.call_count
         final = self.post('finalize', answer['session_state_json'])
         self.assertEqual(final.status_code, 200, final.text)
-        self.assertEqual(final.json()['final_result']['most_likely_hypothesis_id'], ids[0])
+        self.assertEqual(final.json()['final_result']['most_likely_hypothesis_id'], '')
+        self.assertEqual(json.loads(final.json()['session_state_json'])['final_result']['most_likely_hypothesis_id'], ids[0])
         again = self.post('finalize', final.json()['session_state_json'])
         self.assertEqual(again.status_code, 200, again.text)
         self.assertEqual(again.json()['final_result'], final.json()['final_result'])
@@ -935,7 +936,8 @@ class SmartReviewEndpointTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         final = response.json()
         self.assertTrue(final['final_ready'])
-        self.assertEqual(final['final_result']['most_likely_hypothesis_id'], 'H1')
+        self.assertEqual(final['final_result']['most_likely_hypothesis_id'], '')
+        self.assertEqual(json.loads(final['session_state_json'])['final_result']['most_likely_hypothesis_id'], 'H1')
         self.assertIn('replacement remains unknown', final['final_result']['summary'])
         self.assertIn('not statistical certainty or a confirmed diagnosis', final['final_result']['summary'])
         self.assertTrue(final['citations'])

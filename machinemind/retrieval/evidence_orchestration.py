@@ -1712,6 +1712,7 @@ def assistant_core_prepare_evidence(request: AssistantCoreRequest, retrieval: di
         )
     )
     bound_root_support = False
+    root_context_selected = None
     if (getattr(request, "requested_mode", None) == MODE_ROOT_CAUSE
             and decision.effective_mode == MODE_ROOT_CAUSE):
         from . import root_clue_support
@@ -1720,14 +1721,27 @@ def assistant_core_prepare_evidence(request: AssistantCoreRequest, retrieval: di
             company_id=request.company_id, machine_id=request.machine_id,
         ) is not None
     if bound_root_support:
-        # The canonical deduplicator sorts again before truncating. Preserve its
-        # representatives and order, then apply source-backed factual coverage
-        # before the same cap; query tags and cached candidate flags cannot help.
-        unique = _dedup_citations_by_snippet(scored, max_items=len(scored))
+        def current_root_context(candidate):
+            if (decision.degraded or bool(candidate.get("hard_excluded"))
+                    or candidate.get("company_id") not in (None, "", request.company_id)
+                    or candidate.get("machine_id") not in (None, "", request.machine_id)):
+                return False
+            return root_clue_support.support_match(
+                decision, _v13_candidate_text(candidate),
+                source_id=str(candidate.get("citation_id") or "").strip(),
+            ).get("router_context_selected") is True
+        if any(current_root_context(candidate) for candidate in scored):
+            root_context_selected = current_root_context
+        # Retain the exact current selected occurrence even when another alias
+        # has a higher display score. No row metadata grants this predicate.
+        unique = _dedup_citations_by_snippet(scored, max_items=len(scored),
+            **({"context_selected": root_context_selected} if root_context_selected is not None else {}))
         supported, remaining = [], []
         for candidate in unique:
-            match = root_clue_support.support_match(decision, _v13_candidate_text(candidate))
-            (supported if match.get("matched_support_part_ids") else remaining).append(candidate)
+            match = root_clue_support.support_match(decision, _v13_candidate_text(candidate),
+                source_id=str(candidate.get("citation_id") or "").strip())
+            (supported if match.get("matched_support_part_ids") or (
+                root_context_selected is not None and root_context_selected(candidate)) else remaining).append(candidate)
         scored = (supported + remaining)[:24]
     elif complete_family_context:
         # Complete canonical bodies are required context; search hits remain
@@ -1743,7 +1757,8 @@ def assistant_core_prepare_evidence(request: AssistantCoreRequest, retrieval: di
 
     diagnostic_mode = decision.effective_mode in {MODE_ROOT_CAUSE, MODE_SMART_DIAGNOSTIC}
     if diagnostic_mode:
-        scored = _v13_rescore_root_candidates(retrieval_query, scored)
+        scored = _v13_rescore_root_candidates(retrieval_query, scored,
+            **({"context_selected": root_context_selected} if root_context_selected is not None else {}))
         for candidate in scored:
             diagnostic_priority = _assistant_core_diagnostic_priority_metrics(candidate, decision)
             candidate["assistant_core_diagnostic_priority"] = dict(diagnostic_priority)
@@ -2150,6 +2165,9 @@ def assistant_core_prepare_evidence(request: AssistantCoreRequest, retrieval: di
             "diagnostic_exclusions": list(decision.diagnostic_exclusions),
             "missing_information": list(decision.missing_information),
             "fail_closed": True,
+            **({'factual_coverage': decision.factual_coverage}
+               if request.requested_mode == MODE_ASK and decision.effective_mode == MODE_ASK
+               and getattr(decision, 'factual_coverage', '') == 'specific_assertions' else {}),
             "overview_catalog_requested": bool(overview_catalog_requested),
             "machine_catalog_digest": machine_catalog_digest,
             "machine_catalog_source_ids": [

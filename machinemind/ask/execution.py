@@ -707,6 +707,12 @@ def verify_or_repair_answer(
     )
     if protected_budget:
         system_msg += " " + NUMERIC_PREMISE_CORRECTION_INSTRUCTION
+        from . import factual_coverage as _factual_scope
+        if (_guarded(runtime, request, decision)
+                and _factual_scope.is_specific_assertions(decision,
+                    requested_mode=request.requested_mode, effective_mode=decision.effective_mode,
+                    request_kind=decision.request_kind)):
+            system_msg += _factual_scope.SPECIFIC_ASSERTIONS_ANSWER_INSTRUCTION
     if useful_factual_selection:
         system_msg = _enumeration_review.useful_verifier_instructions(system_msg)
     if conditions_only:

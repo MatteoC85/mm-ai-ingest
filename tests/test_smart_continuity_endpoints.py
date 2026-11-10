@@ -48,7 +48,9 @@ class SmartContinuityEndpointTests(unittest.TestCase):
         self.assertFalse(start['meta']['smart_review']['question_validated'])
         self.assertTrue(start['meta']['smart_review']['rejected_question_discarded'])
         self.assertEqual(start['h1_probability_band'], 'unknown')
-        self.assertEqual(start['h1_probability_pct'], 50)
+        self.assertEqual(start['h1_probability_pct'], 0)
+        self.assertEqual(start['hypotheses'][0]['relative_weight_pct'], 50)
+        self.assertEqual(state['hypotheses'][0]['probability_pct'], 50)
         self.m._sd_validate_state_binding(state, company_id='fixture-company', machine_id='fixture-machine',
                                           session_id='fixture-session', question_id='Q1')
         with patch.object(self.m, '_v13_json_models', side_effect=denied):

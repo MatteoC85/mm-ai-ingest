@@ -44,7 +44,7 @@ class SmartProtocolInconclusiveTests(unittest.TestCase):
         self.assertEqual(result['status'], 'completed')
         self.assertTrue(result['final_ready'])
         self.assertEqual(result['hypotheses'], [])
-        self.assertEqual(result['final_most_likely_label'], '')
+        self.assertEqual(result['final_most_likely_label'], 'No cause identified')
         self.assertEqual(result['final_result']['most_likely_hypothesis_id'], '')
         self.assertEqual(result['final_probability_pct'], 0)
         self.assertEqual(result['final_probability_band'], 'unknown')

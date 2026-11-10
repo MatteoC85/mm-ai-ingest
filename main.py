@@ -197,6 +197,7 @@ from machinemind.retrieval import precision_facts as _retrieval_precision_facts
 from machinemind.retrieval import review_packet as _retrieval_review_packet
 from machinemind.retrieval import review_decisions as _retrieval_review_decisions
 from machinemind.retrieval import review_references as _retrieval_review_references
+from machinemind.retrieval import smart_presentation as _smart_presentation
 from machinemind.retrieval import smart_review as _smart_review
 from machinemind.retrieval import smart_protocol as _smart_protocol
 from machinemind.retrieval import smart_evidence as _smart_evidence
@@ -3014,13 +3015,14 @@ def _db_find_entity_chunk(
     )
 
 
-def _dedup_citations_by_snippet(citations: list[dict], max_items: int) -> list[dict]:
+def _dedup_citations_by_snippet(citations: list[dict], max_items: int, *, context_selected=None) -> list[dict]:
     return _retrieval_candidate_ranking.dedup_citations_by_snippet(
         citations,
         max_items,
         runtime=_retrieval_candidate_ranking.DedupCitationsBySnippetRuntime(
             _normalize_unicode_advanced=_normalize_unicode_advanced,
         ),
+        **({"context_selected": context_selected} if context_selected is not None else {}),
     )
 
 
@@ -7838,6 +7840,7 @@ def _merge_matrix_supported_causes(
 def _dedup_root_cause_candidates_semantic(
     citations: list[dict],
     max_items: int,
+    *, context_selected=None,
 ) -> list[dict]:
     return _retrieval_source_management.dedup_root_cause_candidates_semantic(
         citations,
@@ -7846,6 +7849,7 @@ def _dedup_root_cause_candidates_semantic(
             _normalize_unicode_advanced=_normalize_unicode_advanced,
             re=re,
         ),
+        **({"context_selected": context_selected} if context_selected is not None else {}),
     )
 
 def _root_cause_evidence_family_key(c: dict) -> str:
@@ -7860,6 +7864,7 @@ def _root_cause_evidence_family_key(c: dict) -> str:
 def _prioritize_root_cause_coverage(
     citations: list[dict],
     max_items: int,
+    *, context_selected=None,
 ) -> list[dict]:
     return _retrieval_source_management.prioritize_root_cause_coverage(
         citations,
@@ -7867,6 +7872,7 @@ def _prioritize_root_cause_coverage(
         runtime=_retrieval_source_management.PrioritizeRootCauseCoverageRuntime(
             _root_cause_evidence_family_key=_root_cause_evidence_family_key,
         ),
+        **({"context_selected": context_selected} if context_selected is not None else {}),
     )
 
 
@@ -12036,7 +12042,16 @@ def _v13_score_candidates(q: str, candidates: list[dict], *, preserve_complete: 
     )
 
 
-def _v13_rescore_root_candidates(q: str, candidates: list[dict]) -> list[dict]:
+def _v13_rescore_root_candidates(q: str, candidates: list[dict], *, context_selected=None) -> list[dict]:
+    # Only P4 supplies the current request's verified router-context predicate.
+    # The scorer, exclusion gates and existing 24/20 selection bounds are unchanged.
+    dedup = _dedup_root_cause_candidates_semantic
+    coverage = _prioritize_root_cause_coverage
+    if context_selected is not None:
+        dedup = lambda rows, max_items: _dedup_root_cause_candidates_semantic(
+            rows, max_items, context_selected=context_selected)
+        coverage = lambda rows, max_items: _prioritize_root_cause_coverage(
+            rows, max_items, context_selected=context_selected)
     return _retrieval_candidate_ranking.v13_rescore_root_candidates(
         q,
         candidates,
@@ -12045,8 +12060,8 @@ def _v13_rescore_root_candidates(q: str, candidates: list[dict]) -> list[dict]:
             ROOT_CAUSE_HARD_EXCLUDE_PENALTY=ROOT_CAUSE_HARD_EXCLUDE_PENALTY,
             _classify_diagnostic_role_from_text=_classify_diagnostic_role_from_text,
             _collect_candidate_keywords=_collect_candidate_keywords,
-            _dedup_root_cause_candidates_semantic=_dedup_root_cause_candidates_semantic,
-            _prioritize_root_cause_coverage=_prioritize_root_cause_coverage,
+            _dedup_root_cause_candidates_semantic=dedup,
+            _prioritize_root_cause_coverage=coverage,
             _query_symptom_profile=_query_symptom_profile,
             _root_cause_target_subsystems=_root_cause_target_subsystems,
             _score_root_cause_causal_strength=_score_root_cause_causal_strength,
@@ -13863,6 +13878,8 @@ def _assistant_core_deterministic_router_fallback(
 def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) -> dict:
     from machinemind.ask.request_completion import current as _current_ask_completion
     protected_ask_catalog = bool(request.requested_mode == MODE_ASK and _current_ask_completion() is not None)
+    specific_assertions_wire = bool(protected_ask_catalog
+        and tuple(request.allowed_effective_modes) == (MODE_ASK,))
     is_root_cause = (
         str(request.requested_mode or "").strip().lower() == MODE_ROOT_CAUSE
     )
@@ -14004,6 +14021,8 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
         system_msg += _ask_request_readiness.INSTRUCTION
         system_msg += _ask_procedure_scope.INSTRUCTION
         system_msg += _ask_factual_coverage.INSTRUCTION
+        if specific_assertions_wire:
+            system_msg += _ask_factual_coverage.SPECIFIC_ASSERTIONS_ROUTER_INSTRUCTION
     # USER_REQUEST remains unmodified. Root receives only a lossless reference
     # index alongside it, with no preclassified observations or unknowns.
     epistemic_block = (
@@ -14084,7 +14103,7 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
                         _ask_request_readiness.router_schema(
                             _retrieval_precision_facts.router_schema_with_scalar_target(build_router_schema(allowed_modes))
                         )
-                    )
+                    ), specific_assertions=specific_assertions_wire
                 ) if request.requested_mode == MODE_ASK else build_router_schema(allowed_modes)
             )
         )
@@ -14181,6 +14200,7 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
         return fallback
     if request.requested_mode == MODE_ASK:
         out = _ask_request_readiness.apply_readiness(out, language=request.response_language)
+        out = _ask_factual_coverage.bind_specific_assertions(out, enabled=specific_assertions_wire)
     shape_correctable = (out.get("request_kind") not in {KIND_UNSAFE_REQUEST, KIND_OUT_OF_SCOPE}
                          and out.get("evidence_state") != EVIDENCE_CLARIFY)
     # Deterministic surface-shape correction: a successful router may still
@@ -21629,7 +21649,7 @@ def _sd_final_result_for_display(final_result: dict, hypotheses: list[dict], lan
     active = [h for h in hypotheses if isinstance(h, dict) and h.get("status") != "excluded"]
     selected_id = str(final_result.get("most_likely_hypothesis_id") or "")
     if (not selected_id or not any(h.get("id") == selected_id for h in active)
-            or any(h.get("status") == "confirmed" for h in active)):
+            or any(h.get("id") == selected_id and h.get("status") == "confirmed" for h in active)):
         return displayed
     is_en = str(language or "").lower().startswith("en")
     label = str(final_result.get("most_likely_label") or "")
@@ -21800,6 +21820,11 @@ def _sd_response_from_step(
                 operator_summary = str(displayed_final.get("summary") or "")
         final_result = displayed_final
 
+    # Public confidence projection follows signing and validated source replay.
+    final_result, hypotheses, public_outcome = _smart_presentation.project(
+        final_result=final_result, hypotheses=hypotheses, final_ready=final_ready,
+        status=status, language=language)
+
     resp = {
         "ok": True,
         "status": status,
@@ -21834,6 +21859,8 @@ def _sd_response_from_step(
             "source_manifest": source_manifest_meta,
         },
     }
+    if public_outcome:
+        resp["meta"]["diagnostic_outcome"] = public_outcome
     _sd_flatten_question(resp, question)
     if current_state.get("protocol_inconclusive"):
         resp["meta"].update(cacheable=False, semantic_cacheable=False,

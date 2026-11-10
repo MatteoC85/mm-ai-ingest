@@ -118,6 +118,11 @@ def assistant_core_enumeration_requested(
     consumers retain the existing lexical signal. Enumeration remains scoped to
     the actual question, including explicit limits and exclusions.
     """
+    from ..ask.factual_coverage import is_specific_assertions
+    if is_specific_assertions(decision, requested_mode=getattr(request, 'requested_mode', ''),
+            effective_mode=getattr(decision, 'effective_mode', ''),
+            request_kind=getattr(decision, 'request_kind', '')):
+        return False
     if (getattr(request, "requested_mode", None) == "ask"
             and getattr(decision, "effective_mode", None) == "ask"
             and getattr(decision, "request_kind", None) == "factual"

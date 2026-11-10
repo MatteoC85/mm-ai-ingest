@@ -625,7 +625,7 @@ class DedupRootCauseCandidatesSemanticRuntime:
     re: Any
 
 
-def dedup_root_cause_candidates_semantic(citations: list[dict], max_items: int, *, runtime: DedupRootCauseCandidatesSemanticRuntime) -> list[dict]:
+def dedup_root_cause_candidates_semantic(citations: list[dict], max_items: int, *, runtime: DedupRootCauseCandidatesSemanticRuntime, context_selected: Optional[Callable[[dict], bool]]=None) -> list[dict]:
     re = runtime.re
     def _sig(c: dict) -> tuple:
         # Preview prefixes and page coordinates are not semantic identity.
@@ -662,12 +662,16 @@ def dedup_root_cause_candidates_semantic(citations: list[dict], max_items: int, 
             float(c.get("similarity", 0.0)),
         )
 
+        if context_selected is not None:
+            prev_tuple = (bool(context_selected(prev)), *prev_tuple)
+            cur_tuple = (bool(context_selected(c)), *cur_tuple)
         if cur_tuple > prev_tuple:
             best[k] = c
 
     out = list(best.values())
     out.sort(
         key=lambda x: (
+            bool(context_selected(x)) if context_selected is not None else False,
             float(x.get("causal_strength_score", 0.0)),
             float(x.get("semantic_score", 0.0)),
             float(x.get("similarity", 0.0)),
@@ -692,7 +696,7 @@ class PrioritizeRootCauseCoverageRuntime:
     _root_cause_evidence_family_key: Callable[..., Any]
 
 
-def prioritize_root_cause_coverage(citations: list[dict], max_items: int, *, runtime: PrioritizeRootCauseCoverageRuntime) -> list[dict]:
+def prioritize_root_cause_coverage(citations: list[dict], max_items: int, *, runtime: PrioritizeRootCauseCoverageRuntime, context_selected: Optional[Callable[[dict], bool]]=None) -> list[dict]:
     _root_cause_evidence_family_key = runtime._root_cause_evidence_family_key
     if not citations:
         return []
@@ -710,6 +714,22 @@ def prioritize_root_cause_coverage(citations: list[dict], max_items: int, *, run
     out: list[dict] = []
     used_ids = set()
     used_families = set()
+
+    if context_selected is not None:
+        if max_items <= 0:
+            return []
+        # A current router-selected occurrence remains context, not a new fact.
+        # Seed it before family diversity can erase a second mechanism from the
+        # same family. The original global limit still bounds every occurrence.
+        for c in ordered:
+            cid = str(c.get("citation_id") or "").strip()
+            if not cid or cid in used_ids or not context_selected(c):
+                continue
+            used_ids.add(cid)
+            used_families.add(_root_cause_evidence_family_key(c))
+            out.append(c)
+            if len(out) >= max_items:
+                return out[:max_items]
 
     # primo pass: massimizza copertura famiglie diverse
     for c in ordered:

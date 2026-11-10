@@ -81,7 +81,7 @@ class SmartFinalSelectionProjectionTests(unittest.TestCase):
         self.assertEqual(final,json.loads(body['final_result_json']))
         self.assertEqual(final,again.json()['final_result'])
         self.assertEqual(final['most_likely_hypothesis_id'],'')
-        self.assertEqual(final['most_likely_label'],'No leading hypothesis identified')
+        self.assertEqual(final['most_likely_label'],'No cause identified')
         self.assertEqual(body['final_most_likely_label'],final['most_likely_label'])
         self.assertEqual(body['final_probability_pct'],0)
         self.assertEqual(body['final_probability_band'],'unknown')
@@ -89,7 +89,8 @@ class SmartFinalSelectionProjectionTests(unittest.TestCase):
         self.assertEqual(final['summary'],body['final_summary_text'])
         self.assertIn('are equal',body['final_summary_text'])
         self.assertEqual(body['hypotheses'],start['hypotheses'])
-        self.assertEqual([h['probability_pct'] for h in body['hypotheses']],[50,50])
+        self.assertEqual([h['probability_pct'] for h in body['hypotheses']],[0,0])
+        self.assertEqual([h['relative_weight_pct'] for h in body['hypotheses']],[50,50])
         after=json.loads(body['session_state_json'])
         for key in ('hypotheses','history','grounding_review','grounding_packet'):
             self.assertEqual(after[key],before[key])
