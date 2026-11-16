@@ -16256,8 +16256,9 @@ def _assistant_core_verified_documentary_context(
         with root_time_budget.documentary_window(budget=budget, configured_timeout=V13_FAST_TIMEOUT_SECONDS) as timeout:
             result, _ = _v13_json_models(
                 [{"role": "system", "content": _root_documentary.REVIEW_INSTRUCTION + packet_instruction},
-                 {"role": "user", "content": user + "\nIMMUTABLE_CLAIMS: " + json.dumps(claims, ensure_ascii=False)}],
-                models=[V13_FAST_MODEL], json_schema=_root_documentary.review_schema(claims, excerpts),
+                 {"role": "user", "content": user + "\nIMMUTABLE_CLAIMS: " + json.dumps(claims, ensure_ascii=False)
+                  + "\nPROOF_SLOTS: " + json.dumps(_root_documentary.proof_slots(claims), ensure_ascii=False)}],
+                models=[V13_FAST_MODEL], json_schema=_root_documentary.review_schema(claims),
                 effort="low", reasoning_mode="", timeout=timeout,
                 max_output_tokens=min(2200, V13_FAST_MAX_OUTPUT_TOKENS), company_id=request.company_id,
                 purpose="assistant_core_root_documentary_reviewer",
