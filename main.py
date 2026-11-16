@@ -16225,17 +16225,16 @@ def _assistant_core_verified_documentary_context(
         diagnostic["source_count"] = len(rows)
         diagnostic["distinct_document_count"] = len({row["bubble_document_id"] for row in rows})
     excerpts = {row["citation_id"]: row["text"] for row in packed["validator_records"]}
-    user = (
+    request_context = (
         f"RESPONSE_LANGUAGE: {request.response_language}\n"
         f"ORIGINAL_REQUEST: {json.dumps(request.query, ensure_ascii=False)}\n"
         f"DOCUMENTARY_QUESTIONS: {json.dumps(documentary.questions, ensure_ascii=False)}\n"
-        f"REVIEW_PACKET: {packed['model_json']}"
     )
     packet_instruction = " " + _retrieval_review_packet.INSTRUCTION
     typed_claims = _root_documentary.typed_entry_claims(
         packed["validator_records"], documentary.reported_label, request.response_language,
     )
-    producer_user = user
+    producer_user = request_context + f"REVIEW_PACKET: {packed['model_json']}"
     producer_instruction = _root_documentary.PRODUCER_INSTRUCTION
     if typed_claims:
         producer_user += "\nSOURCE_BOUND_TYPES: " + json.dumps(typed_claims, ensure_ascii=False)
@@ -16270,13 +16269,18 @@ def _assistant_core_verified_documentary_context(
         if documentary.binding != _root_documentary.request_binding(request):
             note("request_binding_changed")
             return None
+        evidence = _root_documentary.review_evidence(packed, claims)
+        if evidence is None:
+            note("invalid_review_evidence")
+            return None
         stage = "reviewer"
         with root_time_budget.documentary_window(budget=budget, configured_timeout=V13_FAST_TIMEOUT_SECONDS) as timeout:
             result, _ = _v13_json_models(
                 [{"role": "system", "content": _root_documentary.REVIEW_INSTRUCTION + packet_instruction},
-                 {"role": "user", "content": user + "\nIMMUTABLE_CLAIMS: " + json.dumps(claims, ensure_ascii=False)
+                 {"role": "user", "content": request_context + f"REVIEW_PACKET: {evidence.model_json}"
+                  + "\nIMMUTABLE_CLAIMS: " + json.dumps(claims, ensure_ascii=False)
                   + "\nPROOF_SLOTS: " + json.dumps(_root_documentary.proof_slots(claims), ensure_ascii=False)}],
-                models=[V13_FAST_MODEL], json_schema=_root_documentary.review_schema(claims),
+                models=[V13_FAST_MODEL], json_schema=_root_documentary.review_schema(claims, evidence),
                 effort="low", reasoning_mode="", timeout=timeout,
                 max_output_tokens=min(2200, V13_FAST_MAX_OUTPUT_TOKENS), company_id=request.company_id,
                 purpose="assistant_core_root_documentary_reviewer",
@@ -16293,7 +16297,7 @@ def _assistant_core_verified_documentary_context(
     if documentary.binding != _root_documentary.request_binding(request):
         note("request_binding_changed")
         return None
-    outcome = _root_documentary.review_outcome(result, claims, excerpts)
+    outcome = _root_documentary.review_outcome(result, claims, evidence)
     note(outcome)
     if diagnostic is not None and outcome == "review_rejected":
         diagnostic["review_reason"] = result["reason"]

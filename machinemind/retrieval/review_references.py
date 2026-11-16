@@ -169,14 +169,17 @@ def schema(frozen: dict[str, Any] | None = None) -> dict[str, Any]:
     return result
 
 
-def slices(text: str) -> list[tuple[int,int]]:
+def slices(text: str, *, max_chars: int = MAX_UNIT_CHARS,
+           min_chars: int | None = None) -> list[tuple[int,int]]:
     """Lossless mechanical partition: no word, number or whitespace is removed."""
     if not isinstance(text,str):raise ReferenceError('nontext_block')
+    cut_floor = max_chars // 2 if min_chars is None else min_chars - 1
+    if not 0 <= cut_floor < max_chars:raise ReferenceError('invalid_slice_bounds')
     spans=[]; start=0
     while start<len(text):
-        end=min(start+MAX_UNIT_CHARS,len(text))
+        end=min(start+max_chars,len(text))
         if end<len(text):
-            cut=text.rfind('\n',start+MAX_UNIT_CHARS//2,end)
+            cut=text.rfind('\n',start+cut_floor,end)
             if cut>=0:end=cut+1
         spans.append((start,end));start=end
     return spans
