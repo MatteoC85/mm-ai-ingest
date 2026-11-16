@@ -16200,18 +16200,29 @@ def _assistant_core_build_no_evidence(
 def _assistant_core_verified_documentary_context(
     request: AssistantCoreRequest,
     documentary: _root_documentary.BoundRequest,
+    *,
+    diagnostic: dict | None = None,
 ) -> tuple[str, list[dict]] | None:
     from machinemind.retrieval import root_time_budget
 
+    def note(state):
+        if diagnostic is not None:
+            diagnostic["outcome"] = state
+
     budget = _v13_current_budget()
     if not _root_documentary.has_documentary_window(budget):
+        note("insufficient_window")
         return None
     packet = _root_documentary.scoped_packet(
         request, documentary, company_general_sentinel=COMPANY_GENERAL_MACHINE_SENTINEL,
     )
     if packet is None:
+        note("invalid_scoped_packet")
         return None
     rows, packed = packet
+    if diagnostic is not None:
+        diagnostic["source_count"] = len(rows)
+        diagnostic["distinct_document_count"] = len({row["bubble_document_id"] for row in rows})
     excerpts = {row["citation_id"]: row["text"] for row in packed["validator_records"]}
     user = (
         f"RESPONSE_LANGUAGE: {request.response_language}\n"
@@ -16220,6 +16231,7 @@ def _assistant_core_verified_documentary_context(
         f"REVIEW_PACKET: {packed['model_json']}"
     )
     packet_instruction = " " + _retrieval_review_packet.INSTRUCTION
+    stage = "producer"
     try:
         with root_time_budget.documentary_window(
             budget=budget, configured_timeout=V13_FAST_TIMEOUT_SECONDS, reserve_review=True,
@@ -16233,8 +16245,13 @@ def _assistant_core_verified_documentary_context(
                 purpose="assistant_core_root_documentary_producer",
             )
         claims = _root_documentary.freeze_claims(draft, excerpts)
-        if not claims or documentary.binding != _root_documentary.request_binding(request):
+        if not claims:
+            note("no_valid_documentary_claims")
             return None
+        if documentary.binding != _root_documentary.request_binding(request):
+            note("request_binding_changed")
+            return None
+        stage = "reviewer"
         with root_time_budget.documentary_window(budget=budget, configured_timeout=V13_FAST_TIMEOUT_SECONDS) as timeout:
             result, _ = _v13_json_models(
                 [{"role": "system", "content": _root_documentary.REVIEW_INSTRUCTION + packet_instruction},
@@ -16248,10 +16265,17 @@ def _assistant_core_verified_documentary_context(
         raise
     except Exception:
         # The native dispatch ledger retains known costs and uncertain attempts.
+        note(stage + "_failed")
         return None
-    if (root_time_budget.documentary_remaining(budget) <= 0.0
-            or documentary.binding != _root_documentary.request_binding(request)
-            or not _root_documentary.approved(result, claims, excerpts)):
+    if root_time_budget.documentary_remaining(budget) <= 0.0:
+        note("documentary_window_expired")
+        return None
+    if documentary.binding != _root_documentary.request_binding(request):
+        note("request_binding_changed")
+        return None
+    outcome = _root_documentary.review_outcome(result, claims, excerpts)
+    note(outcome)
+    if outcome != "verified":
         return None
     selected_ids = {cid for _, citations in claims for cid in citations}
     selected = [row for row in rows if row["citation_id"] in selected_ids]
@@ -16293,7 +16317,10 @@ def _assistant_core_build_clarification(
         if request.requested_mode == MODE_ROOT_CAUSE and isinstance(request.metadata, dict):
             documentary = request.metadata.pop(_root_documentary.PRIVATE_KEY, None)
             if type(documentary) is _root_documentary.BoundRequest and not decision.degraded:
-                verified = _assistant_core_verified_documentary_context(request, documentary)
+                diagnostic = {} if request.debug else None
+                verified = _assistant_core_verified_documentary_context(request, documentary, diagnostic=diagnostic)
+                if diagnostic is not None:
+                    meta["root_documentary_diagnostic"] = diagnostic
                 if verified is not None:
                     text, selected = verified
                     citations = _sanitize_citations_for_response(selected, company_id=request.company_id)
@@ -16304,6 +16331,8 @@ def _assistant_core_build_clarification(
                             grounding="indexed_machine_sources",
                         )
                         meta["root_documentary_verified"] = True
+                    elif diagnostic is not None:
+                        diagnostic["outcome"] = "public_citation_binding_mismatch"
     else:
         base["answer"] = question
     return base
