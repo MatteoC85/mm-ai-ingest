@@ -349,8 +349,9 @@ class ActualRootRouterSegmentTests(unittest.TestCase):
             return value
 
         captured = []
-        def routed(*, compact, case_raw=raw, query=QUERY, malformed=False):
-            req = replace(self.request(), query=query, allowed_effective_modes=modes if compact else tuple(reversed(modes)))
+        def routed(*, compact, case_raw=raw, query=QUERY, malformed=False, debug=False):
+            req = replace(self.request(), query=query, debug=debug,
+                          allowed_effective_modes=modes if compact else tuple(reversed(modes)))
             def provider(messages, **options):
                 captured.append((messages, options))
                 model_result = encode(case_raw) if compact else deepcopy(case_raw)
@@ -389,6 +390,19 @@ class ActualRootRouterSegmentTests(unittest.TestCase):
         with self.assertRaises(wire.RouterWireError):
             wire.expand(wrong_source, canonical_schema, compact_schema)
 
+        with patch.object(m, "ASSISTANT_CORE_ROUTER_MODEL", "gpt-5.6-terra"), \
+                patch.object(m, "ASSISTANT_CORE_ROUTER_EFFORT", "medium"), patch.dict(os.environ):
+            os.environ.pop("MM_ASSISTANT_CORE_ROUTER_EFFORT", None)
+            os.environ.pop("MM_ROOT_COMPACT_ROUTER_LOW_EFFORT", None)
+            before_effort, before_result = routed(compact=True, debug=True)
+            os.environ["MM_ROOT_COMPACT_ROUTER_LOW_EFFORT"] = "1"
+            after_effort, after_result = routed(compact=True, debug=True)
+        self.assertEqual(before_result, after_result)
+        self.assertEqual(before_effort.metadata[dq.BASIS_METADATA_KEY], after_effort.metadata[dq.BASIS_METADATA_KEY])
+        self.assertEqual(before_effort.metadata[dq.ROUTER_EXECUTION_KEY]["effort"], "medium")
+        self.assertEqual(after_effort.metadata[dq.ROUTER_EXECUTION_KEY]["effort"], "low")
+        self.assertNotIn("effort", compact_request.metadata[dq.ROUTER_EXECUTION_KEY])
+
         query = "Where is the machine's alarm history available?"
         factual = reply(query, [("request", query, "context")], state="not_diagnostic", mode="ask")
         factual = {**raw, **factual, "request_kind": "factual", "information_task": "interface_navigation",
@@ -407,6 +421,72 @@ class ActualRootRouterSegmentTests(unittest.TestCase):
         self.assertEqual(prohibited["evidence_state"], "clarify")
         self.assertEqual(prohibited["relevant_evidence_ids"], [])
         self.assertEqual(rejected.metadata[dq.BASIS_METADATA_KEY]["reason"], "router_execution_failed")
+
+    def test_compact_root_low_effort_requires_candidate_opt_in_and_default_terra(self):
+        from dataclasses import replace
+
+        m = self.m
+        flag = "MM_ROOT_COMPACT_ROUTER_LOW_EFFORT"
+        configured_env = "MM_ASSISTANT_CORE_ROUTER_EFFORT"
+        terra = "gpt-5.6-terra"
+        pinned_modes = ("root_cause", "ask")
+        observed = []
+
+        cases = (
+            # flag, explicit environment, effective config, model, modes, expected
+            (None, None, "medium", terra, pinned_modes, "medium"),
+            ("1", None, "medium", terra, pinned_modes, "low"),
+            ("true", None, "medium", terra, pinned_modes, "medium"),
+            ("1", "", "medium", terra, pinned_modes, "medium"),
+            ("1", "medium", "medium", terra, pinned_modes, "medium"),
+            ("1", "low", "low", terra, pinned_modes, "low"),
+            ("1", "high", "high", terra, pinned_modes, "high"),
+            ("1", None, "high", terra, pinned_modes, "high"),
+            ("1", None, "medium", "gpt-5.6-luna", pinned_modes, "medium"),
+            ("1", None, "medium", terra, tuple(reversed(pinned_modes)), "medium"),
+            ("1", "private-operator-override", "private-operator-override", terra, pinned_modes, "private-operator-override"),
+        )
+        for opt_in, explicit, configured, model, modes, expected in cases:
+            with self.subTest(opt_in=opt_in, explicit=explicit, configured=configured, model=model, modes=modes):
+                req = replace(self.request(), debug=True, allowed_effective_modes=modes)
+                calls = []
+
+                def provider(messages, **options):
+                    calls.append((deepcopy(messages), deepcopy(options)))
+                    raise TimeoutError("offline timeout")
+
+                with patch.dict(os.environ):
+                    for key, value in ((flag, opt_in), (configured_env, explicit)):
+                        if value is None:
+                            os.environ.pop(key, None)
+                        else:
+                            os.environ[key] = value
+                    with patch.object(m, "ASSISTANT_CORE_ROUTER_EFFORT", configured), \
+                            patch.object(m, "ASSISTANT_CORE_ROUTER_MODEL", model), \
+                            patch.object(m, "ASSISTANT_CORE_ROUTER_FALLBACK_MODEL", "existing-fallback"), \
+                            patch.object(m, "ASSISTANT_CORE_ROUTER_TIMEOUT_SECONDS", 15), \
+                            patch.object(m, "_v13_json_models", provider), \
+                            patch.object(m, "_v13_gate_candidate_block", return_value=("Exact source evidence.", [])):
+                        output = m._assistant_core_router_call(req, {})
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(calls[0][1]["effort"], expected)
+                self.assertEqual(calls[0][1]["models"], [model])
+                self.assertEqual(calls[0][1]["timeout"], 30)
+                self.assertEqual(output["evidence_state"], "clarify")
+                self.assertEqual(output["relevant_evidence_ids"], [])
+                execution = req.metadata[dq.ROUTER_EXECUTION_KEY]
+                self.assertEqual(execution["effort"], expected if expected in {"low", "medium", "high"} else "configured")
+                self.assertEqual(execution["outcome"], "provider_error")
+                self.assertFalse(execution["provider_response_received"])
+                self.assertFalse(req.metadata[dq.BASIS_METADATA_KEY]["admitted"])
+                self.assertNotIn(m._root_documentary.PRIVATE_KEY, req.metadata)
+                observed.append((calls[0], output))
+
+        (old_messages, old_options), old_output = observed[0]
+        (new_messages, new_options), new_output = observed[1]
+        self.assertEqual(old_messages, new_messages)
+        self.assertEqual({**old_options, "effort": "low"}, new_options)
+        self.assertEqual(old_output, new_output)
 
     def test_documentary_rejection_has_only_one_sealed_claim_in_internal_debug(self):
         from dataclasses import replace

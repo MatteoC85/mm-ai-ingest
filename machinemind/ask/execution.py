@@ -829,7 +829,8 @@ def verify_or_repair_answer(
             and not (repair_first_contract or repair_missing_facets
                      or repair_missing_answer_types or repair_missing_list_items)
             and V13_FAST_MODEL == "gpt-5.6-terra"
-            and answer.strip() and not (catalog_digest or enumeration_requested)
+            and answer.strip() and not catalog_digest
+            and (not enumeration_requested or (conditions_only and REQ_CHECKLIST in mandatory_types))
             and decision.request_kind in {"factual", "procedure"}
             and decision.procedure_scope == "conditions_only" and not any(decision.procedure_phase)
             and decision.information_task in {"numeric_specification", INFO_PROCEDURE_SEGMENT}

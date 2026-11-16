@@ -196,21 +196,21 @@ def generate_ask_response(
     mandatory_answer_types = {item.get("answer_type") for item in mandatory_facets}
     composition_answer_types = declared_answer_types | mandatory_answer_types
     prepared_decision = retrieval.get("assistant_core_decision") or {}
+    enumeration_requested = prepared_decision.get("enumeration_requested")
     finite_owned_request = bool(
         runtime.preserve_procedure_points and contract.get("fail_closed") is True
         and declared_answer_types and mandatory_facets
         and prepared_decision.get("effective_mode") == "ask"
-        and prepared_decision.get("enumeration_requested") is False
         and not overview_catalog_requested and not machine_catalog_digest)
     finite_factual_composition = bool(
-        finite_owned_request
+        finite_owned_request and enumeration_requested is False
         and information_task in {INFO_NUMERIC_SPECIFICATION, "document_explanation"}
         and REQ_NUMERIC_VALUE in composition_answer_types
         and composition_answer_types <= {REQ_NUMERIC_VALUE, REQ_SAFETY_CONDITIONS, "explanation"}
         and prepared_decision.get("request_kind") == "factual")
     complete_family_composition = bool(runtime.preserve_procedure_context
         and runtime.procedure_context_sources)
-    conditions_numeric_composition = bool(
+    conditions_numeric_scope = bool(
         complete_family_composition and finite_owned_request
         and contract.get("procedure_scope") == "conditions_only"
         and not any(contract.get("procedure_phase") or ())
@@ -220,6 +220,12 @@ def generate_ask_response(
         and mandatory_answer_types & {REQ_CHECKLIST, REQ_SAFETY_CONDITIONS}
         and composition_answer_types <= {
             REQ_NUMERIC_VALUE, REQ_CHECKLIST, REQ_SAFETY_CONDITIONS, "explanation"})
+    conditions_numeric_composition = conditions_numeric_scope and enumeration_requested is False
+    # A typed prerequisite checklist may legitimately carry P4's lexical
+    # enumeration flag. Keep its LOW effort and the existing checklist review.
+    # Only the staged transport can recognize this separately bounded scope.
+    enumerated_conditions_stage_scope = (
+        conditions_numeric_scope and conditions_only and enumeration_requested is True)
     source_backed_composition = bool(
         V13_FAST_MODEL == "gpt-5.6-terra" and runtime.preserve_procedure_points
         and (complete_family_composition or finite_factual_composition))
@@ -381,7 +387,8 @@ def generate_ask_response(
                 "timeout": V13_HEAVY_TIMEOUT_SECONDS if policy_model == V13_HEAVY_MODEL else V13_FAST_TIMEOUT_SECONDS})
             if runtime.preserve_procedure_points else None)
         with ask_fast_stage.allow(ask_fast_stage.WRITER,
-                eligible=source_backed_composition and (finite_factual_composition or conditions_numeric_composition)):
+                eligible=source_backed_composition and (finite_factual_composition
+                    or conditions_numeric_composition or enumerated_conditions_stage_scope)):
             parsed, model_used = _v13_json_models(
                 writer_messages,
                 models=writer_models,

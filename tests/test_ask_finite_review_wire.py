@@ -1,15 +1,18 @@
 """Offline replay of finite-condition verdicts and the real owned source flow."""
 from copy import deepcopy
+from dataclasses import replace
 import json
 from pathlib import Path
 import re
 import sys
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 sys.path[:0] = [str(Path(__file__).resolve().parents[1]), str(Path(__file__).resolve().parent)]
 from machinemind.ask import finite_review_wire as wire
-from machinemind.ask import review_source_wire
+from machinemind.ask import execution, review_source_wire
+from machinemind.infrastructure import request_budget
 import test_ask_procedure_context_recovery as actual
 import test_ask_router_family_context as route
 
@@ -105,6 +108,72 @@ class FiniteReviewWireTests(unittest.TestCase):
                 self.assertIsNone(wire.prepare(sources, **common))
         self.assertIsNone(wire.prepare(f"{header}\nBody", **{**common, "answer": "Literal @f1"}))
 
+    def test_required_checklist_enumeration_keeps_independent_list_coverage(self):
+        m = self.m
+        request = m.AssistantCoreRequest(query="Which checks apply before loading and what mass is allowed?",
+            requested_mode="ask", response_language="en", company_id="offline-company",
+            machine_id="offline-machine", ai_scope="machine_all", top_k=6)
+        types = ("numeric_value", "checklist")
+        facets = ("maximum documented load mass including unit and applicable configuration",
+                  "complete required initial checks with distinct labels before the stated operation")
+        decision = m.AssistantCoreDecision(request_kind="factual", effective_mode="ask", confidence=.99,
+            requested_mode_fit=True, evidence_state=m.EVIDENCE_SUPPORTED, evidence_policy="evidence_required",
+            information_task="procedure_segment", procedure_scope="conditions_only",
+            required_answer_types=types, required_facets=facets,
+            facet_queries=tuple(m.AssistantCoreFacetQuery(facet=label, answer_type=kind, must_cover=True)
+                                for label, kind in zip(facets, types, strict=True)))
+        ids = [f"manual-{chr(97 + index) * 120}:p2-2:c0" for index in range(4)]
+        body = "Check cable integrity. Use eye protection. Verify protective earth continuity. Maximum mass: 1000 kg."
+        rows = [{"citation_id": cid, "bubble_document_id": cid.split(":")[0], "chunk_full": body,
+                 "source_type": "document", "page_from": 2, "page_to": 2} for cid in ids]
+        sources = m._v13_sources_block(rows, max_context_chars=22000)
+        diagnostic = {"complete_primary_representation": True, "reused_request_packet": False,
+                      "required_records": len(rows), "emitted_citation_ids": ids}
+        observer = SimpleNamespace(consume=lambda _method, _parameters, call: call(),
+            procedure_review_sources=lambda _rows, **_kwargs: (rows, sources, diagnostic))
+        draft = "Check cable integrity. Use eye protection. The maximum mass is 1000 kg."
+
+        def review(items, *, alternate=decision, enable_aliases=True, catalog=""):
+            def provider(messages, **_options):
+                content = messages[1]["content"]
+                self.assertIn("ENUMERATION_REQUESTED: true", content)
+                has_aliases = "ANSWER_TYPE_LABELS:" in content
+                self.assertEqual(has_aliases, enable_aliases)
+                if has_aliases:
+                    frame = wire.prepare(sources, citation_ids=tuple(ids), facets=facets, types=types,
+                                         question=request.query, answer=draft)
+                    source = content.split("\n\nSOURCES:\n", 1)[1].split("\n\nReturn only the required JSON.", 1)[0]
+                    self.assertTrue(review_source_wire.restore_sources_block(source) == frame.sources)
+                reply = {"outcome": "pass", "reason": "Offline source review", "answer": "",
+                         "citation_ids": [ids[0]], "covered_facets": list(facets), "missing_facets": [],
+                         "covered_answer_types": list(types), "missing_answer_types": [],
+                         "enumeration_requested": True, "expected_list_items": items,
+                         "covered_list_items": items, "missing_list_items": []}
+                return (encode_verdict(reply, frame) if has_aliases else reply), "offline-reviewer"
+
+            runtime = replace(m._assistant_core_ask_execution_runtime(), evidence_admission=lambda *args: None,
+                evidence_observer=observer, _procedure_context_available=lambda: True,
+                _v13_current_budget=lambda: m._assistant_core_new_budget("ask"), _v13_json_models=provider,
+                _assistant_core_enumeration_requested=lambda *_: True,
+                _assistant_core_machine_catalog_digest=lambda _: catalog)
+            with (patch.object(execution, "_admit_input", side_effect=lambda _req, data, _dec, **_kwargs: data),
+                  patch.object(execution, "_current_completion", return_value=object())):
+                return execution.verify_or_repair_answer(request=request, decision=alternate, answer=draft,
+                                                         candidates=rows, runtime=runtime)
+
+        listed = ["Check cable integrity", "Use eye protection"]
+        accepted = review(listed)
+        self.assertEqual(accepted["expected_list_items"], listed)
+        self.assertEqual(accepted["outcome"], "pass")
+        missing = "Verify protective earth continuity"
+        verdict = review([*listed, missing])
+        self.assertEqual(verdict["missing_list_items"], [missing])
+        self.assertEqual(verdict["reason"], "missing_supported_list_items")
+        self.assertNotEqual(verdict["outcome"], "pass")
+        self.assertEqual(review(listed, enable_aliases=False, catalog="admitted machine inventory")["outcome"], "pass")
+        self.assertEqual(review(listed, enable_aliases=False,
+            alternate=replace(decision, procedure_scope=""))["outcome"], "pass")
+
     def test_line_dictionary_keeps_each_source_header_and_restores_literal_text(self):
         ids = tuple(f"manual-{index}:p{index}-{index}:c0" for index in range(1, 4))
         shared = "Before work, verify the recorded isolation for this configuration. " * 9
@@ -124,6 +193,7 @@ class FiniteReviewWireTests(unittest.TestCase):
         captures = {False: [], True: []}
         original = route.RouterFixture.run_core
         prepare_wire = wire.prepare
+        now = request_budget._monotonic()
         for enabled in captures:
             def wrapped(fixture):
                 reviewer = fixture.reviewer
@@ -151,8 +221,11 @@ class FiniteReviewWireTests(unittest.TestCase):
                 fixture.reviewer = provider
                 return original(fixture)
             case = actual.AskProcedureContextRecoveryTests()
-            with patch.object(route.RouterFixture, "run_core", wrapped), patch.object(
-                    wire, "prepare", prepare_wire if enabled else lambda *args, **kwargs: None):
+            # Compare the same remaining budget in both presentation arms.
+            # CPU scheduling must not change their integer reviewer timeout.
+            with (patch.object(route.RouterFixture, "run_core", wrapped),
+                  patch.object(wire, "prepare", prepare_wire if enabled else lambda *args, **kwargs: None),
+                  patch.object(request_budget, "_monotonic", return_value=now)):
                 case.test_actual_r7_required_parent_type_keeps_complete_family_and_manual_support()
         for index, expected in enumerate((True, False, True)):
             old, new = (captures[enabled][index] for enabled in (False, True))

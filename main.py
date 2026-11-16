@@ -14104,10 +14104,19 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
         plan = _retrieval_diagnostic_query.router_attempt_plan(router_models, int(router_timeout))
         router_models = list(plan["models"])
         router_timeout = int(plan["timeout_seconds"])
+        if (compact_root and os.environ.get("MM_ROOT_COMPACT_ROUTER_LOW_EFFORT") == "1"
+                and "MM_ASSISTANT_CORE_ROUTER_EFFORT" not in os.environ
+                and router_models == ["gpt-5.6-terra"] and router_effort == "medium"):
+            router_effort = "low"
         router_execution = {
             **plan, "outcome": "started", "provider_response_received": False,
             "max_output_tokens": ASSISTANT_CORE_ROUTER_MAX_OUTPUT_TOKENS,
         }
+        if request.debug:
+            router_execution["effort"] = (
+                router_effort if router_effort in {"none", "minimal", "low", "medium", "high", "xhigh"}
+                else "configured"
+            )
         if isinstance(request.metadata, dict):
             request.metadata[_retrieval_diagnostic_query.ROUTER_EXECUTION_KEY] = router_execution
     router_started = time_module.monotonic()
