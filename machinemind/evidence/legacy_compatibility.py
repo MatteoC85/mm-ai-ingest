@@ -665,6 +665,14 @@ class _Snapshot:
     evidence_id: str
     payload: _Frozen = field(repr=False)
     digest: str
+    _journal_witness: _LegacyWitness | None = field(default=None, repr=False, compare=False)
+
+
+@dataclass(frozen=True, slots=True)
+class _JournalRecordView:
+    layout: str
+    record: _LegacyWitness = field(repr=False)
+    indexed_text: str | None = field(repr=False)
 
 
 def _digest(payload: _Frozen) -> str:
@@ -681,6 +689,7 @@ class _ConversionProof:
     assembly: EvidenceAssembly = field(repr=False)
     snapshots: tuple[_Snapshot, ...] = field(repr=False)
     adapter_limits: AdapterLimits
+    journal_limits: LegacyLimits | None = field(default=None, repr=False)
     entries: tuple = field(init=False, repr=False, compare=False)
 
     def __post_init__(self):
@@ -771,6 +780,7 @@ def build_legacy_bundle(records: Iterable[LegacyRecordInput], *, company_id: str
     freezer = _Freezer(legacy_limits)
     results, snapshots = [], []
     snapshot_bytes = 0
+    retain_journal_witnesses = _CURRENT_PAYLOAD_POOL.get() is not None
     for item in records:
         if len(results) >= assembly_limits.max_occurrences:
             raise EvidenceAssemblyError("occurrence budget exceeded")
@@ -780,7 +790,21 @@ def build_legacy_bundle(records: Iterable[LegacyRecordInput], *, company_id: str
             r.target not in allowed_sources for r in item.context.relations
         ):
             raise EvidenceAssemblyError("provider binding outside assembly allowance")
-        frozen = freezer.freeze(item.record)
+        witness = None
+        if retain_journal_witnesses:
+            # Per-occurrence accounting from the same validated tree, while the
+            # freezer still enforces its original cumulative node/byte limits.
+            nodes, scalars = freezer.nodes, freezer.scalar_bytes
+            canonical, retained = freezer.canonical_bytes, freezer.retained_bytes
+            freezer.max_depth_seen = 0
+            freezer.numeric_payloads.clear()
+            frozen = freezer.freeze(item.record)
+            witness = _LegacyWitness._from_profile(
+                frozen, freezer.canonical_bytes - canonical,
+                (freezer.nodes - nodes, freezer.scalar_bytes - scalars, freezer.max_depth_seen),
+                freezer.retained_bytes - retained, tuple(freezer.numeric_payloads.values()))
+        else:
+            frozen = freezer.freeze(item.record)
         serialized = _wire_json(frozen).encode("utf-8")
         snapshot_bytes += len(serialized)
         if snapshot_bytes > legacy_limits.max_bytes:
@@ -790,14 +814,15 @@ def build_legacy_bundle(records: Iterable[LegacyRecordInput], *, company_id: str
                         context=item.context, limits=adapter_limits)
         results.append(result)
         snapshots.append(_Snapshot(item.layout, item.context.source, result.entry.evidence.evidence_id,
-                                   frozen, hashlib.sha256(serialized).hexdigest()))
+                                   frozen, hashlib.sha256(serialized).hexdigest(), witness))
     assembly = assemble_evidence(results, company_id=company_id, allowed_sources=allowed_sources,
                                  limits=assembly_limits)
     size = snapshot_bytes + len(assembly.to_json().encode("utf-8"))
     snapshots = tuple(snapshots)
     # Both the adaptation and assembly were just computed from these immutable
     # snapshots. The constructor still performs all original integrity checks.
-    proof = _ConversionProof(assembly, snapshots, adapter_limits)
+    proof = _ConversionProof(assembly, snapshots, adapter_limits,
+                             legacy_limits if retain_journal_witnesses else None)
     return LegacyEvidenceBundle(assembly, snapshots, legacy_limits, size, proof)
 
 
@@ -813,6 +838,15 @@ def restore_legacy_records(bundle: LegacyEvidenceBundle, *, company_id: str,
     The original field names, values, order, duplicates and types are preserved;
     missing fields stay missing. Signed URLs in raw transport stay unverified.
     """
+    return _restore_legacy_records(bundle, company_id=company_id,
+        allowed_sources=allowed_sources, adapter_limits=adapter_limits, positions=positions)
+
+
+def _restore_legacy_records(bundle: LegacyEvidenceBundle, *, company_id: str,
+                            allowed_sources: frozenset[SourceIdentity], adapter_limits: AdapterLimits,
+                            positions: tuple[int, ...] | None = None,
+                            journal_limits: LegacyLimits | None = None
+                            ) -> tuple[LegacyRecordView | _JournalRecordView, ...]:
     _allowance(company_id, allowed_sources)
     if not isinstance(bundle, LegacyEvidenceBundle) or not isinstance(adapter_limits, AdapterLimits):
         raise EvidenceAssemblyError("bundle and explicit adapter limits required")
@@ -834,8 +868,14 @@ def restore_legacy_records(bundle: LegacyEvidenceBundle, *, company_id: str,
         evidence = entry.evidence
         if evidence.source not in allowed_sources or any(r.target not in allowed_sources for r in evidence.relations):
             raise EvidenceAssemblyError("restore outside current provider allowance")
-        raw = _thaw(snapshot.payload)
         indexed = evidence.text if snapshot.layout == "structured_source_snapshot" else None
+        witness = snapshot._journal_witness
+        if (conversion_valid and journal_limits is not None and journal_limits == bundle.limits
+                and journal_limits == bundle._conversion_proof.journal_limits
+                and type(witness) is _LegacyWitness and witness._tree is snapshot.payload):
+            output.append(_JournalRecordView(snapshot.layout, witness, indexed))
+            continue
+        raw = _thaw(snapshot.payload)
         if not conversion_valid:
             # Hand-built/replaced bundles and changed adapter limits retain the
             # original full re-adaptation. Current authorization above is ALWAYS

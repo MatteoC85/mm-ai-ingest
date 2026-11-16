@@ -31,7 +31,7 @@ from ..evidence.contracts import (
 from ..evidence.legacy_compatibility import (
     LegacyEvidenceBundle, LegacyRecordInput, build_legacy_bundle,
     restore_legacy_records, _has_validated_conversion, _occurrence_entries,
-    _PayloadPool, _payload_scope,
+    _PayloadPool, _payload_scope, _restore_legacy_records,
 )
 
 COMPOSITION_VERSION = "ask-request-evidence-composition-p6b4a-v1"
@@ -330,7 +330,8 @@ class AskEvidenceSession:
         # Full read inspection separately requires every snapshot dependency.
         return node
 
-    def _inputs(self, handles: tuple[RecordHandle, ...], current: frozenset[SourceIdentity]) -> tuple[LegacyRecordInput, ...]:
+    def _inputs(self, handles: tuple[RecordHandle, ...], current: frozenset[SourceIdentity],
+                *, for_journal: bool = False) -> tuple[LegacyRecordInput, ...]:
         if type(handles) is not tuple or len(handles) > self._limits.evidence.assembly.max_occurrences:
             raise AskCompositionError("bounded immutable occurrence selection required")
         nodes = tuple(self._node(h, current) for h in handles)
@@ -343,9 +344,10 @@ class AskEvidenceSession:
             width = bundle.assembly.limits.max_occurrences
             for start in range(0, len(occurrences), width):
                 group = occurrences[start:start + width]
-                views = restore_legacy_records(bundle, company_id=self._scope.company_id,
+                views = _restore_legacy_records(bundle, company_id=self._scope.company_id,
                     allowed_sources=current, adapter_limits=self._limits.evidence.adapter,
-                    positions=tuple(n.offset for _, n in group))
+                    positions=tuple(n.offset for _, n in group),
+                    journal_limits=self._limits.evidence.legacy if for_journal else None)
                 for (index, node), view in zip(group, views):
                     restored[index] = LegacyRecordInput(node.layout, view.record,
                         AdapterContext(node.source, node.provenance, current,
@@ -430,6 +432,14 @@ class AskEvidenceSession:
             self._check_request(request)
             self._check_allowance(current_allowed_sources)
             return self._inputs(handles, current_allowed_sources)
+
+    def _journal_records(self, *, request: Any, handles: tuple[RecordHandle, ...],
+                         current_allowed_sources: frozenset[SourceIdentity]) -> tuple[LegacyRecordInput, ...]:
+        """Borrow immutable occurrences for a private ASK receipt journal."""
+        with self._lock:
+            self._check_request(request)
+            self._check_allowance(current_allowed_sources)
+            return self._inputs(handles, current_allowed_sources, for_journal=True)
 
     def validate_records(self, *, request: Any, handles: tuple[RecordHandle, ...],
                          current_allowed_sources: frozenset[SourceIdentity]) -> None:

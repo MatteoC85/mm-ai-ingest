@@ -16277,6 +16277,8 @@ def _assistant_core_verified_documentary_context(
         return None
     outcome = _root_documentary.review_outcome(result, claims, excerpts)
     note(outcome)
+    if diagnostic is not None and outcome == "review_rejected":
+        diagnostic["review_reason"] = result["reason"]
     if outcome != "verified":
         return None
     selected_ids = {cid for _, citations in claims for cid in citations}

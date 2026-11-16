@@ -18,12 +18,12 @@ class DocumentaryProofSlots(unittest.TestCase):
         excerpts = {"a": "Source A excerpt, condition A", "b": "Source B excerpt"}
         first, second, third = (row["slot"] for row in documentary.proof_slots(claims))
         proofs = {first: "Source A excerpt", second: "Source B excerpt", third: "condition A"}
-        self.assertTrue(documentary.approved({"verdict": "approve", "proofs": proofs}, claims, excerpts))
+        self.assertTrue(documentary.approved({"verdict": "approve", "reason": "supported", "proofs": proofs}, claims, excerpts))
         for invalid in ({first: proofs[first], second: proofs[second]}, {**proofs, "other": "Source A excerpt"},
                         {**proofs, second: "Source A excerpt"}, {**proofs, third: ""}):
             with self.subTest(invalid=invalid):
-                self.assertFalse(documentary.approved({"verdict": "approve", "proofs": invalid}, claims, excerpts))
-        self.assertFalse(documentary.approved({"verdict": "reject", "proofs": proofs}, claims, excerpts))
+                self.assertFalse(documentary.approved({"verdict": "approve", "reason": "supported", "proofs": invalid}, claims, excerpts))
+        self.assertFalse(documentary.approved({"verdict": "reject", "reason": "wrong_source", "proofs": proofs}, claims, excerpts))
 
 
 if __name__ == "__main__":

@@ -34,6 +34,70 @@ def copying_operator(rows, *, lineage):
 
 
 class EvidenceJournalCpuTests(unittest.TestCase):
+    def scoped_bundle(self):
+        trace, rows = outer_fixture(2)
+        rows[0]['embedding'][0] = -0.0
+        rows[0]['extra'] = {'mixed': (True, [3, {'é': 'π'}])}
+        contexts = [root.context for root in trace.roots.values()]
+        kwargs = dict(company_id=contexts[0].source.scope.company_id,
+                      allowed_sources=contexts[0].allowed_sources,
+                      adapter_limits=trace.limits.adapter)
+        inputs = tuple(legacy.LegacyRecordInput('retrieval_candidate', row, context)
+                       for row, context in zip(rows, contexts))
+        pool = legacy._PayloadPool(trace.max_bytes)
+        try:
+            with legacy._payload_scope(pool):
+                bundle = legacy.build_legacy_bundle(inputs, assembly_limits=trace.limits.assembly,
+                    legacy_limits=trace.limits.legacy, **kwargs)
+        finally:
+            pool.close()
+        return bundle, trace, rows, kwargs
+
+    def test_bundle_reuses_exact_occurrence_profiles_with_original_logical_charges(self):
+        bundle, trace, rows, kwargs = self.scoped_bundle()
+        views = legacy._restore_legacy_records(bundle, journal_limits=bundle.limits,
+                                               positions=(1, 0, 0), **kwargs)
+        self.assertIs(views[1].record, views[2].record)
+        for row, view in zip((rows[1], rows[0], rows[0]), views):
+            original = legacy._LegacyWitness.capture(row, bundle.limits)
+            self.assertTrue(view.record.matches(row))
+            self.assertEqual(view.record._limits_profile, original._limits_profile)
+            self.assertEqual(view.record.size_bytes, original.size_bytes)
+            self.assertEqual(view.record.retained_metadata_bytes, original.retained_metadata_bytes)
+        inputs = tuple(legacy.LegacyRecordInput(view.layout, view.record, root.context)
+                       for view, root in zip((views[1], views[0]), trace.roots.values()))
+        fresh = production._PreparationTrace(limits=trace.limits,
+                                            max_records=trace.max_records, max_bytes=trace.max_bytes)
+        with patch.object(legacy._LegacyWitness, 'capture', wraps=legacy._LegacyWitness.capture) as capture:
+            output = fresh.materialize(tuple(trace.roots), inputs)
+        self.assertEqual(capture.call_count, 0)
+        self.assertEqual(fresh._witness_budget.logical_bytes, sum(view.record.size_bytes for view in views[:2]))
+        self.assertEqual(output, rows)
+        output[0]['embedding'][0] = 0.0
+        self.assertTrue(views[2].record.matches(rows[0]))
+        with self.assertRaises(production.EvidenceProductionError):
+            fresh.entry(output[0])
+
+    def test_public_restore_and_mismatched_or_unproven_bundle_still_materialize(self):
+        bundle, _, _, kwargs = self.scoped_bundle()
+        views = legacy.restore_legacy_records(bundle, positions=(0, 0), **kwargs)
+        self.assertIs(type(views[0].record), dict)
+        self.assertIsNot(views[0].record['embedding'], views[1].record['embedding'])
+        stricter = replace(bundle.limits, max_nodes=bundle.limits.max_nodes - 1)
+        for value, limits in ((bundle, stricter), (replace(bundle, limits=stricter), stricter),
+                              (replace(bundle, _conversion_proof=None), bundle.limits)):
+            result = legacy._restore_legacy_records(value, journal_limits=limits, **kwargs)
+            self.assertTrue(all(type(view.record) is dict for view in result))
+
+    def test_witness_reuse_obeys_current_authority_and_bundle_integrity(self):
+        bundle, _, _, kwargs = self.scoped_bundle()
+        with self.assertRaisesRegex(legacy.EvidenceAssemblyError, 'allowance'):
+            legacy._restore_legacy_records(bundle, journal_limits=bundle.limits,
+                                           **{**kwargs, 'allowed_sources': frozenset()})
+        forged = replace(bundle._snapshots[0], digest='0' * 64)
+        with self.assertRaisesRegex(legacy.EvidenceAssemblyError, 'snapshot integrity'):
+            replace(bundle, _snapshots=(forged, *bundle._snapshots[1:]))
+
     def test_mutable_original_and_copy_are_both_rechecked(self):
         for boundary in ('original', 'copy'):
             for field, value in (('embedding', [0.0, 1.0]), ('page_from', 9),

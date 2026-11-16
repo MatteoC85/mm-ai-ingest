@@ -510,13 +510,16 @@ class _PreparationTrace:
         for h, item in zip(handles, inputs):
             if item.layout != "retrieval_candidate":
                 raise EvidenceProductionError("page conversion must precede preparation")
-            # The journal's parent is private and immutable. Legacy callbacks
-            # still receive a detached mutable copy, with the original alias
-            # semantics. Parent evidence can reuse its pure conversion without
-            # walking an inaccessible mutable duplicate of every dense vector.
-            parent = _LegacyWitness.capture(item.record, self.limits.legacy)
+            # A session witness is the exact already-frozen occurrence selected
+            # by its authorized handle. Only the journal keeps it. Each legacy
+            # callback occurrence receives a fresh mutable materialization.
+            if type(item.record) is _LegacyWitness:
+                parent = item.record
+                value = parent.detached()
+            else:
+                parent = _LegacyWitness.capture(item.record, self.limits.legacy)
+                value = deepcopy(item.record)
             self.roots[h] = replace(item, record=parent)
-            value = deepcopy(item.record)
             self.add(value, (h,), context=item.context, root_copy=True)
             out.append(value)
         return out
@@ -691,7 +694,7 @@ def prepare_records(*, request: Any, session: AskEvidenceSession,
                     for k, v in retrieval.items()}
         try:
             for selection in selections:
-                inputs = session.records(request=request, handles=selection.records,
+                inputs = session._journal_records(request=request, handles=selection.records,
                                          current_allowed_sources=before)
                 values = journal.materialize(selection.records, inputs)
                 supplied[selection.name] = values if selection.container_kind == "list" else tuple(values)
@@ -731,7 +734,7 @@ def prepare_records(*, request: Any, session: AskEvidenceSession,
                             or any(type(h) is not RecordHandle for h in handles)):
                         raise EvidenceProductionError("source adapter must return bounded explicit handles")
                     after = invoke(authorize, request, request)
-                    inputs = session.records(request=request, handles=handles,
+                    inputs = session._journal_records(request=request, handles=handles,
                                              current_allowed_sources=after)
                     return journal.materialize(handles, inputs)
                 return journal.run(read)
@@ -939,7 +942,7 @@ def retrieve_initial_records(*, request: Any, session: AskEvidenceSession,
                     after = invoke(authorize, request, request)
                     session.validate_records(request=request, handles=tuple(journal.roots),
                                     current_allowed_sources=after)
-                    inputs = session.records(request=request, handles=result,
+                    inputs = session._journal_records(request=request, handles=result,
                                              current_allowed_sources=after)
                     records = journal.materialize(result, inputs)
                     if name == "dense":
@@ -1218,7 +1221,7 @@ class _OuterRetrievalTrace(_PreparationTrace):
         # Reuse only an explicitly selected HANDLE, never a content/ID match.
         objects = {}
         for selection in selections:
-            values = self.session.records(request=self.request, handles=selection.records,
+            values = self.session._journal_records(request=self.request, handles=selection.records,
                                           current_allowed_sources=allowed)
             items = []
             for handle, value in zip(selection.records, values):
@@ -1265,7 +1268,7 @@ class _OuterRetrievalTrace(_PreparationTrace):
                     or any(type(h) is not RecordHandle for h in hs)):
                 raise EvidenceProductionError("title adapter requires bounded explicit handles")
             allowed = self.current()
-            values = self.session.records(request=self.request, handles=hs, current_allowed_sources=allowed)
+            values = self.session._journal_records(request=self.request, handles=hs, current_allowed_sources=allowed)
             return self.materialize(hs, values)
         return self.run(read)
 
