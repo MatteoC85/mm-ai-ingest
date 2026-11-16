@@ -122,7 +122,8 @@ def connect_database(
     from machinemind.retrieval import root_time_budget
     root_window = root_time_budget.current_window()
     if root_window is None or not root_window.optional:
-        return connect_fn(**kwargs)
+        from .ask_read_connection import connect
+        return connect(connect_fn, kwargs, budget)
     if assurance_deadline > 0.0:
         from dataclasses import replace
         root_window = replace(root_window, deadline=min(root_window.deadline, assurance_deadline))

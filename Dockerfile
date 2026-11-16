@@ -3,6 +3,7 @@ WORKDIR /app
 # This candidate's protected ASK profile is part of its immutable image.
 ENV MM_ASK_NATIVE_FAST_PROFILE=stage-gpt6-fast-v1
 ENV MM_ROOT_COMPACT_ROUTER_LOW_EFFORT=1
+ENV MM_ASK_BATCH_DB_REUSE=owned-v1
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY main.py assistant_core_v2.py ./

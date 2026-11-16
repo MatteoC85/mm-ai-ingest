@@ -298,10 +298,17 @@ class _CoreIntake:
             "structured_dense": lambda **kw: self._read("read_structured_dense_chunk_evidence", kw, selectors=False),
             "structured_direct": lambda **kw: self._read("read_structured_direct_page_evidence", kw, selectors=False),
         }
-        return producers.retrieve_initial_records(request=self.request, session=self.session,
-            runtime=rt, source_callbacks=callbacks, authorize=self.authorize,
-            invoke=self.invoke, max_trace_records=self.runtime.max_trace_records,
-            max_trace_bytes=self.runtime.max_trace_bytes, **params)
+        from contextlib import nullcontext
+        from ..infrastructure import ask_read_connection
+        plan = params.get("plan") or {}
+        owned_ask_batch = (self.request.requested_mode == "ask"
+            and self.request.allowed_effective_modes == ("ask",)
+            and params.get("mode") == "neutral" and plan.get("_ask_facet_batch") is True)
+        with (ask_read_connection.batch(self.readers) if owned_ask_batch else nullcontext()):
+            return producers.retrieve_initial_records(request=self.request, session=self.session,
+                runtime=rt, source_callbacks=callbacks, authorize=self.authorize,
+                invoke=self.invoke, max_trace_records=self.runtime.max_trace_records,
+                max_trace_bytes=self.runtime.max_trace_bytes, **params)
 
     def _score(self, q, rows, *, lineage=None):
         return ranking.v13_score_candidates(q, rows, runtime=self.runtime.score,

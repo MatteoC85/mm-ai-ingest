@@ -18,6 +18,7 @@ from . import dense, lexical, document_readers, structured, context_expansion, e
 from .ask_composition import AskEvidenceSession, RecordHandle, RegisteredRead
 from .receipt_producers import acquire_read
 from ..evidence.contracts import EvidenceContractError, canonical_json
+from ..infrastructure import ask_read_connection
 
 PRODUCTION_ADAPTER_VERSION = "production-readers-p6b4l-v1"
 
@@ -178,10 +179,15 @@ class ProductionReaderAdapters:
                     signature(spec.reader).bind(**kwargs)
                 except TypeError:
                     raise EvidenceContractError("reader adapter arguments do not match its contract") from None
-                return spec.reader(**kwargs)
+                with ask_read_connection.reader(self, name):
+                    return spec.reader(**kwargs)
 
-            result = acquire_read(request=self._request, session=self._session, reader=reader,
-                authorize=self._authorize, invoke=self._invoke)
+            try:
+                result = acquire_read(request=self._request, session=self._session, reader=reader,
+                                      authorize=self._authorize, invoke=self._invoke)
+            except BaseException:
+                ask_read_connection.discard(self)
+                raise
             if (memo is not None and len(self._memo) < 128
                     and self._invoke(self._memo_epoch, self._request) == memo_key[1]):
                 self._memo[memo_key] = result

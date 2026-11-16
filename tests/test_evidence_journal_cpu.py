@@ -5,6 +5,7 @@ with synthetic records and the same request-local immutable numeric pool.
 """
 from copy import deepcopy
 from dataclasses import replace
+import json
 from pathlib import Path
 import sys
 import unittest
@@ -221,6 +222,23 @@ class EvidenceJournalCpuTests(unittest.TestCase):
         reordered = {'b': original['b'], 'a': original['a']}
         self.assertFalse(witness.matches(reordered))
         self.assertFalse(ask_input._same_value(original, reordered))
+
+    def test_scalar_and_key_width_matches_wire_at_exact_limits(self):
+        key, text = 'α\n"key', '😀\\\x00\ud800'
+        row = {key: [text, -0.0, 1e-91, -123, True, False, None]}
+        leaves = [('str', key), ('str', text), ('float', -0.0),
+                  ('float', 1e-91), ('int', -123), ('bool', True),
+                  ('bool', False), ('null', None)]
+        amount = sum(len(json.dumps([kind, val], ensure_ascii=True, separators=(',', ':')))
+                     for kind, val in leaves)
+        bounds = legacy.LegacyLimits(max_depth=2, max_nodes=10, max_bytes=amount)
+        witness = legacy._LegacyWitness.capture(row, bounds)
+        self.assertEqual(witness._limits_profile, (10, amount, 2))
+        self.assertEqual(witness.size_bytes, legacy._frozen_canonical_size(witness._tree))
+        self.assertTrue(witness.matches(deepcopy(row)))
+        for field in ('max_depth', 'max_nodes', 'max_bytes'):
+            with self.subTest(field=field), self.assertRaises(legacy.EvidenceAssemblyError):
+                legacy._LegacyWitness.capture(row, replace(bounds, **{field: getattr(bounds, field)-1}))
 
 
 def benchmark(output=None, rounds=5):

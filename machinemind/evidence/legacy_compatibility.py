@@ -247,16 +247,26 @@ class _Freezer:
         if value is None or typ in (str, bool, int, float):
             if typ is float and not math.isfinite(value):
                 raise EvidenceAssemblyError("non-finite legacy value")
-            kind = "null" if value is None else {str:"str", bool:"bool", int:"int", float:"float"}[typ]
-            # A cheap lower bound precedes JSON escaping and the aggregate check.
-            if typ is str and len(value) > self.limits.max_bytes:
-                raise EvidenceAssemblyError("legacy byte budget exceeded")
-            try:
-                # ensure_ascii guarantees ASCII; same wire length as [kind,value].
-                encoded_length = len(_json(value))
-                self.scalar_bytes += encoded_length + len(kind) + 5
-            except (ValueError, OverflowError) as exc:
-                raise EvidenceAssemblyError("unserializable legacy scalar") from exc
+            if typ is str:
+                kind = "str"
+                if len(value) > self.limits.max_bytes:
+                    raise EvidenceAssemblyError("legacy byte budget exceeded")
+                encoded_length = len(json.encoder.encode_basestring_ascii(value))
+            elif typ is bool:
+                kind = "bool"
+                encoded_length = 4 if value else 5
+            elif value is None:
+                kind = "null"
+                encoded_length = 4
+            else:
+                kind = "int" if typ is int else "float"
+                try:
+                    # The stdlib JSON encoder uses the same decimal conversion
+                    # for exact ints and the same repr for finite exact floats.
+                    encoded_length = len(str(value) if typ is int else repr(value))
+                except (ValueError, OverflowError) as exc:
+                    raise EvidenceAssemblyError("unserializable legacy scalar") from exc
+            self.scalar_bytes += encoded_length + len(kind) + 5
             if self.scalar_bytes > self.limits.max_bytes:
                 raise EvidenceAssemblyError("legacy byte budget exceeded")
             size = len('{"kind":"' + kind + '","value":}') + encoded_length
@@ -303,12 +313,25 @@ class _Freezer:
                 for key, item in value.items():
                     if type(key) is not str:
                         raise EvidenceAssemblyError("legacy mapping keys must be strings")
-                    self.freeze(key, depth + 1)  # Same key allocation/depth checks.
-                    # The tree stores a raw escaped key inside [key,child], not
-                    # the tagged scalar used while validating/accounting it.
-                    adjustment = 3 - len('{"kind":"str","value":}')
-                    self.canonical_bytes += adjustment
-                    self.retained_bytes += adjustment
+                    # Charge the same logical node, depth and tagged scalar as
+                    # a string, without allocating a leaf discarded by the map.
+                    key_depth = depth + 1
+                    if key_depth > self.limits.max_depth:
+                        raise EvidenceAssemblyError("legacy depth budget exceeded")
+                    if key_depth > self.max_depth_seen:
+                        self.max_depth_seen = key_depth
+                    self.nodes += 1
+                    if self.nodes > self.limits.max_nodes:
+                        raise EvidenceAssemblyError("legacy node budget exceeded")
+                    if len(key) > self.limits.max_bytes:
+                        raise EvidenceAssemblyError("legacy byte budget exceeded")
+                    key_width = len(json.encoder.encode_basestring_ascii(key))
+                    self.scalar_bytes += key_width + len("str") + 5
+                    if self.scalar_bytes > self.limits.max_bytes:
+                        raise EvidenceAssemblyError("legacy byte budget exceeded")
+                    # The wire holds [key,child], including its brackets and comma.
+                    self.canonical_bytes += key_width + 3
+                    self.retained_bytes += key_width + 3
                     child = (self.freeze(item, depth + 1, vector_field=True)
                              if self.journal_vectors and key in _VECTOR_FIELDS
                              else self.freeze(item, depth + 1))
