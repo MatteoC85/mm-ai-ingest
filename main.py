@@ -14271,6 +14271,7 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
     ]
     if profile is not None:
         documentary_parts = out.pop("documentary_request_parts", None)
+        documentary_open_applicability = out.pop("documentary_open_applicability", None)
         required_document_types = (out.get("preferred_source_types") or []
             if out.get("source_type_policy") == "require" else None)
         basis_result = _retrieval_diagnostic_query.enforce_diagnostic_basis(out, profile)
@@ -14287,7 +14288,21 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
                 request, profile, basis_result.summary, documentary_parts, supplied,
                 source_type=_assistant_core_candidate_source_type, source_text=_v13_candidate_text,
                 document_filter=required_document_types,
+                open_applicability=documentary_open_applicability,
             )
+            if documentary is not None and basis_result.summary.get("admitted") is True:
+                question = out.get("clarification_question")
+                if (out.get("effective_mode") == MODE_ROOT_CAUSE
+                        and isinstance(question, str) and 0 < len(question.strip()) <= 1200
+                        and _root_documentary.has_documentary_window(_v13_current_budget())
+                        and _root_documentary.scoped_packet(
+                            request, documentary, company_general_sentinel=COMPANY_GENERAL_MACHINE_SENTINEL,
+                        ) is not None):
+                    # Preserve observation admission. Only the response lane
+                    # changes while the documented interpretation is still open.
+                    out["evidence_state"] = EVIDENCE_CLARIFY
+                else:
+                    documentary = None
             if documentary is not None:
                 request.metadata[_root_documentary.PRIVATE_KEY] = documentary
         # This object is created only after the original partition and admission
@@ -16189,27 +16204,14 @@ def _assistant_core_verified_documentary_context(
     from machinemind.retrieval import root_time_budget
 
     budget = _v13_current_budget()
-    if (budget is None or budget.llm_calls + 2 > budget.max_llm_calls
-            or root_time_budget.documentary_remaining(budget) < 2 * root_time_budget.MIN_PRODUCER_SECONDS
-            or documentary.binding != _root_documentary.request_binding(request)):
+    if not _root_documentary.has_documentary_window(budget):
         return None
-    rows = json.loads(documentary.source_rows_json)
-    records = [
-        {"citation_id": row["citation_id"], "source_type": row["source_type"],
-         "page_from": row["page_from"], "page_to": row["page_to"], "text": row["chunk_full"]}
-        for row in rows
-    ]
-    try:
-        packed = _retrieval_review_packet.build_review_packet(
-            scope={"company_id": request.company_id, "machine_id": request.machine_id,
-                   "ai_scope": request.ai_scope, "document_ids": _assistant_core_scope_value(request, "document_ids"),
-                   "bubble_document_id": _assistant_core_scope_value(request, "bubble_document_id")},
-            candidates=rows, records=records, company_general_sentinel=COMPANY_GENERAL_MACHINE_SENTINEL,
-        )
-    except _retrieval_review_packet.ReviewPacketError:
+    packet = _root_documentary.scoped_packet(
+        request, documentary, company_general_sentinel=COMPANY_GENERAL_MACHINE_SENTINEL,
+    )
+    if packet is None:
         return None
-    if any(row["machine_relation"] == "not_established" for row in packed["validator_records"]):
-        return None
+    rows, packed = packet
     excerpts = {row["citation_id"]: row["text"] for row in packed["validator_records"]}
     user = (
         f"RESPONSE_LANGUAGE: {request.response_language}\n"

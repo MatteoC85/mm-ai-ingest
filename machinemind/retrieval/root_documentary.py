@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 import json
 
-from . import diagnostic_query, review_packet
+from . import diagnostic_query, review_packet, root_time_budget
 
 
 PRIVATE_KEY = "_root_documentary_request"
@@ -52,12 +52,40 @@ def request_binding(request):
     )
 
 
+def _valid_open_applicability(profile, basis, selection):
+    if not isinstance(selection, dict) or set(selection) != {"label_part", "gap_parts"}:
+        return False
+    label_index, gaps = selection["label_part"], selection["gap_parts"]
+    if type(label_index) is not int or not 0 <= label_index < len(profile.parts):
+        return False
+    label = profile.parts[label_index]
+    if (label.role != "observation" or label.basis_use != "support"
+            or basis.get("support_quotes") != [label.quote]
+            or diagnostic_query.protected_literals(label.quote)):
+        return False
+    if any(i != label_index and part.role in diagnostic_query.FACT_ROLES
+           for i, part in enumerate(profile.parts)):
+        return False
+    return (
+        isinstance(gaps, list) and 1 <= len(gaps) <= 3
+        and all(type(i) is int and 0 <= i < len(profile.parts) for i in gaps)
+        and gaps == sorted(set(gaps))
+        and all(profile.parts[i].role in diagnostic_query.MISSING_ROLES for i in gaps)
+    )
+
+
 def bind_request(request, profile, basis, indices, rows, *, source_type, source_text,
-                 document_filter=None):
-    if (request.requested_mode != "root_cause" or basis.get("admitted") is not False
-            or basis.get("reason") != "insufficient_current_observations"
-            or basis.get("validation_error") or basis.get("identity_gap_quotes")
+                 document_filter=None, open_applicability=None):
+    if (request.requested_mode != "root_cause" or basis.get("validation_error")
+            or basis.get("identity_gap_quotes")
             or profile.interpretation_status != "valid"):
+        return None
+    if basis.get("admitted") is True:
+        if (basis.get("reason") != "validated_observation_basis"
+                or not _valid_open_applicability(profile, basis, open_applicability)):
+            return None
+    elif (basis.get("admitted") is not False
+          or basis.get("reason") != "insufficient_current_observations"):
         return None
     if (not isinstance(indices, list) or not 1 <= len(indices) <= 3
             or any(type(i) is not int or not 0 <= i < len(profile.parts) for i in indices)
@@ -114,6 +142,36 @@ def bind_request(request, profile, basis, indices, rows, *, source_type, source_
     return BoundRequest(
         request_binding(request), tuple(profile.parts[i].quote for i in indices),
         json.dumps(selected, ensure_ascii=False, separators=(",", ":")),
+    )
+
+
+def scoped_packet(request, bound, *, company_general_sentinel):
+    if bound.binding != request_binding(request):
+        return None
+    rows = json.loads(bound.source_rows_json)
+    records = [
+        {"citation_id": row["citation_id"], "source_type": row["source_type"],
+         "page_from": row["page_from"], "page_to": row["page_to"], "text": row["chunk_full"]}
+        for row in rows
+    ]
+    try:
+        packed = review_packet.build_review_packet(
+            scope={"company_id": request.company_id, "machine_id": request.machine_id,
+                   "ai_scope": request.ai_scope, "document_ids": request.metadata.get("document_ids"),
+                   "bubble_document_id": request.metadata.get("bubble_document_id")},
+            candidates=rows, records=records, company_general_sentinel=company_general_sentinel,
+        )
+    except review_packet.ReviewPacketError:
+        return None
+    if any(row["machine_relation"] == "not_established" for row in packed["validator_records"]):
+        return None
+    return rows, packed
+
+
+def has_documentary_window(budget):
+    return (
+        budget is not None and budget.llm_calls + 2 <= budget.max_llm_calls
+        and root_time_budget.documentary_remaining(budget) >= 2 * root_time_budget.MIN_PRODUCER_SECONDS
     )
 
 

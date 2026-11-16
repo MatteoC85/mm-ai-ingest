@@ -515,8 +515,15 @@ DIAGNOSTIC_BASIS_INSTRUCTION = (
     "asking what is documented, when that question can be addressed independently of "
     "determining the installed configuration or diagnosing the current condition. "
     "Separate such a question from a request for diagnosis in the partition. Use [] "
-    "for diagnosis-only or unstated documentary interests, unsafe requests, other states, "
-    "or when the distinction is unclear. This field grants no observation admission. "
+    "for diagnosis-only or unstated documentary interests, unsafe requests, or when "
+    "the distinction is unclear. If state is sufficient, use documentary_open_applicability "
+    "only when the sole factual observation merely reports the text of an event label "
+    "and the request explicitly leaves unknown which interpretation applies. "
+    "Identify that exact observation by label_part and the explicit unknown request "
+    "parts by gap_parts. Include a clarification_question asking for those observations. "
+    "A measurement, known event type, specific code, configuration, observed relationship "
+    "or operational action is not a bare label. Use null in all other cases. "
+    "These selections do not change observation admission. "
 )
 
 
@@ -556,9 +563,17 @@ def router_schema_with_diagnostic_basis(schema: Mapping[str, Any], *, original_q
         "type": "array", "maxItems": 3,
         "items": {"type": "integer", "minimum": 0, "maximum": MAX_PARTS - 1},
     }
+    part_index = {"type": "integer", "minimum": 0, "maximum": MAX_PARTS - 1}
+    body["properties"]["documentary_open_applicability"] = {"anyOf": [
+        {"type": "null"},
+        {"type": "object", "additionalProperties": False,
+         "properties": {"label_part": part_index, "gap_parts": {
+             "type": "array", "maxItems": 3, "items": part_index,
+         }}, "required": ["label_part", "gap_parts"]},
+    ]}
     body["required"] = ["diagnostic_basis"] + [
         x for x in body["required"] if x != "diagnostic_basis" and x not in DERIVED_DIAGNOSTIC_FIELDS
-    ] + ["documentary_request_parts"]
+    ] + ["documentary_request_parts", "documentary_open_applicability"]
     return out
 
 
