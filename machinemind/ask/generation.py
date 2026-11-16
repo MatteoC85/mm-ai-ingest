@@ -272,12 +272,28 @@ def generate_ask_response(
         system_msg += " State the participating functions and their temporal/state order explicitly (what opens/closes/moves and when)."
     if REQ_CHECKLIST in required_answer_types:
         system_msg += " Include the requested practical checks as a compact checklist grounded in the sources."
+        if runtime.preserve_procedure_points and REQ_SAFETY_CONDITIONS in required_answer_types:
+            system_msg += (
+                " For each requested check category, cover every distinct, directly applicable prerequisite "
+                "stated in the admitted sources, including standing installation, protection or authorization "
+                "requirements documented outside the immediate operation steps. An immediate visual or "
+                "functional check does not cover a separately documented prerequisite. State existing "
+                "conditions to verify, with the applicable component, limits and units, and cite their own "
+                "support. If the question explicitly asks to distinguish the initial checks from a named "
+                "later phase, give the requested source-supported facts about that phase in a short "
+                "separate section, including the conditions needed to describe it safely. "
+                "Do not turn these into initial prerequisites or instructions to start the later phase. "
+                "An explicit exclusion takes precedence. An explicit request for execution steps still "
+                "requires the supported sequence and closure under the existing procedure rules. "
+                "Exclude unrelated configurations and do not "
+                "turn a documented prerequisite into an instruction to modify, energize or restart equipment.")
     if REQ_SAFETY_CONDITIONS in required_answer_types:
         system_msg += " Include directly applicable authorization or safety conditions without replacing the requested technical answer."
     if conditions_only:
         system_msg += (
-            " PROCEDURE_SCOPE=conditions_only: answer only the checks and safety conditions to verify "
-            "before the requested operation. Do not instruct the user to execute that operation, "
+            " PROCEDURE_SCOPE=conditions_only: operating guidance is limited to checks and safety conditions "
+            "to verify before the requested operation. Keep any expressly requested factual phase distinction "
+            "separate from that guidance. Do not instruct the user to execute that operation, "
             "load material, adjust equipment, run a trial or restart merely because those actions "
             "occur in a retrieved procedure. Select applicable conditions from the supplied sources; "
             "do not copy an entire Step or a neighboring installation/transport operation. "

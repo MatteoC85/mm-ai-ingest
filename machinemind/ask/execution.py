@@ -948,6 +948,19 @@ def verify_or_repair_answer(
         answer, request_key=ask_request_key(request),
         required_facets=tuple(review_facets), required_types=tuple(requirements))
         if _guarded(runtime, request, decision) else None)
+    if (reviewed_draft is not None and answer.strip() and not compact_review
+            and not factual_list_review and not original_retain_only
+            and not (repair_first_contract or repair_missing_facets
+                     or repair_missing_answer_types or repair_missing_list_items)
+            and {REQ_CHECKLIST, REQ_SAFETY_CONDITIONS}.issubset(requirements)):
+        system_msg += (
+            " For a complete, grounded draft that needs no changes, return outcome=pass with an empty "
+            "answer field, the actual complete coverage, and the supporting citation_ids. The server "
+            "retains the exact reviewed draft. If any material coverage, grounding or safety defect "
+            "requires a rewrite, return the complete corrected answer in the answer field. "
+            "Report each required checklist item using a short, distinct label. For covered items, "
+            "copy the label from the resolved answer. Keep the same labels and full inventory across "
+            "the coverage fields. Give a brief reason that identifies any material difference.")
     review_models = [V13_FAST_MODEL, V13_PLANNER_MODEL]
     # Completeness is only representation: the reviewer must still reject any
     # actual source, coverage or safety defect. This initial literal-draft judge

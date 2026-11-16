@@ -16203,6 +16203,7 @@ def _assistant_core_verified_documentary_context(
     documentary: _root_documentary.BoundRequest,
     *,
     diagnostic: dict | None = None,
+    clarification_question: str | None = None,
 ) -> tuple[str, list[dict]] | None:
     from machinemind.retrieval import root_time_budget
 
@@ -16211,13 +16212,16 @@ def _assistant_core_verified_documentary_context(
             diagnostic["outcome"] = state
 
     budget = _v13_current_budget()
-    if not _root_documentary.has_documentary_window(budget):
+    allow_source_bound = _root_documentary.can_review_source_bound(documentary, clarification_question)
+    allow_producer = _root_documentary.has_documentary_window(budget)
+    if not (allow_producer or (
+            allow_source_bound and _root_documentary.has_documentary_window(budget, model_calls=1))):
         note("insufficient_window")
         return None
 
     def read_owner_pages(targets):
         try:
-            with root_time_budget.documentary_page_window(budget) as allowed:
+            with root_time_budget.documentary_page_window(budget, model_calls=2 if allow_producer else 1) as allowed:
                 if allowed:
                     return _retrieval_context_expansion.read_root_documentary_owner_pages(
                         request, targets, scope_where=_ask_evidence_scope_where, db_conn=_db_conn,
@@ -16236,7 +16240,7 @@ def _assistant_core_verified_documentary_context(
     if packet is None:
         note("invalid_scoped_packet")
         return None
-    if not _root_documentary.has_documentary_window(budget):
+    if not _root_documentary.has_documentary_window(budget, model_calls=1):
         note("insufficient_window")
         return None
     rows, packed = packet
@@ -16253,6 +16257,12 @@ def _assistant_core_verified_documentary_context(
     typed_claims = _root_documentary.typed_entry_claims(
         packed["validator_records"], documentary.reported_label, request.response_language,
     )
+    claims = _root_documentary.source_bound_claims(
+        packed["validator_records"], documentary, request.response_language, clarification_question,
+    )
+    source_bound = bool(claims)
+    if source_bound and diagnostic is not None:
+        diagnostic["source_bound_clarification_requires_approval"] = True
     producer_user = request_context + f"REVIEW_PACKET: {packed['model_json']}"
     producer_instruction = _root_documentary.PRODUCER_INSTRUCTION
     if typed_claims:
@@ -16264,24 +16274,28 @@ def _assistant_core_verified_documentary_context(
         )
     stage = "producer"
     try:
-        with root_time_budget.documentary_window(
-            budget=budget, configured_timeout=V13_FAST_TIMEOUT_SECONDS, reserve_review=True,
-        ) as timeout:
-            draft, _ = _v13_json_models(
-                [{"role": "system", "content": producer_instruction + packet_instruction},
-                 {"role": "user", "content": producer_user}],
-                models=[V13_FAST_MODEL], json_schema=_root_documentary.producer_schema(
-                    excerpts, max_claims=_root_documentary.MAX_CLAIMS - len(typed_claims),
-                ),
-                effort="low", reasoning_mode="", timeout=timeout,
-                max_output_tokens=min(1600, V13_FAST_MAX_OUTPUT_TOKENS), company_id=request.company_id,
-                purpose="assistant_core_root_documentary_producer",
-            )
-        generated_claims = _root_documentary.freeze_claims(draft, excerpts)
-        if len(generated_claims) > _root_documentary.MAX_CLAIMS - len(typed_claims):
-            note("no_valid_documentary_claims")
-            return None
-        claims = typed_claims + generated_claims
+        if not source_bound:
+            if not _root_documentary.has_documentary_window(budget):
+                note("insufficient_window")
+                return None
+            with root_time_budget.documentary_window(
+                budget=budget, configured_timeout=V13_FAST_TIMEOUT_SECONDS, reserve_review=True,
+            ) as timeout:
+                draft, _ = _v13_json_models(
+                    [{"role": "system", "content": producer_instruction + packet_instruction},
+                     {"role": "user", "content": producer_user}],
+                    models=[V13_FAST_MODEL], json_schema=_root_documentary.producer_schema(
+                        excerpts, max_claims=_root_documentary.MAX_CLAIMS - len(typed_claims),
+                    ),
+                    effort="low", reasoning_mode="", timeout=timeout,
+                    max_output_tokens=min(1600, V13_FAST_MAX_OUTPUT_TOKENS), company_id=request.company_id,
+                    purpose="assistant_core_root_documentary_producer",
+                )
+            generated_claims = _root_documentary.freeze_claims(draft, excerpts)
+            if len(generated_claims) > _root_documentary.MAX_CLAIMS - len(typed_claims):
+                note("no_valid_documentary_claims")
+                return None
+            claims = typed_claims + generated_claims
         if not claims:
             note("no_valid_documentary_claims")
             return None
@@ -16292,11 +16306,16 @@ def _assistant_core_verified_documentary_context(
         if evidence is None:
             note("invalid_review_evidence")
             return None
+        review_instruction = _root_documentary.REVIEW_INSTRUCTION + packet_instruction
+        reviewer_input = request_context + f"REVIEW_PACKET: {evidence.model_json}"
+        if source_bound:
+            review_instruction += _root_documentary.SOURCE_BOUND_REVIEW_INSTRUCTION
+            reviewer_input += "\nCLARIFICATION_QUESTION: " + json.dumps(clarification_question, ensure_ascii=False)
         stage = "reviewer"
         with root_time_budget.documentary_window(budget=budget, configured_timeout=V13_FAST_TIMEOUT_SECONDS) as timeout:
             result, _ = _v13_json_models(
-                [{"role": "system", "content": _root_documentary.REVIEW_INSTRUCTION + packet_instruction},
-                 {"role": "user", "content": request_context + f"REVIEW_PACKET: {evidence.model_json}"
+                [{"role": "system", "content": review_instruction},
+                 {"role": "user", "content": reviewer_input
                   + "\nIMMUTABLE_CLAIMS: " + json.dumps(claims, ensure_ascii=False)
                   + "\nPROOF_SLOTS: " + json.dumps(_root_documentary.proof_slots(claims), ensure_ascii=False)}],
                 models=[V13_FAST_MODEL], json_schema=_root_documentary.review_schema(claims, evidence),
@@ -16331,11 +16350,12 @@ def _assistant_core_build_clarification(
     request: AssistantCoreRequest,
     decision: AssistantCoreDecision,
 ) -> dict:
-    question = decision.clarification_question or (
+    default_question = (
         "Please specify the machine condition or the exact information you need."
         if request.response_language.lower().startswith("en") else
         "Specifica la condizione della macchina o l'informazione esatta che ti serve."
     )
+    question = decision.clarification_question or default_question
     meta = {"cacheable": False, "semantic_cacheable": False}
     if str(request.requested_mode or "").strip().lower() == MODE_ROOT_CAUSE:
         profile = _assistant_core_diagnostic_query_profile(request)
@@ -16362,16 +16382,28 @@ def _assistant_core_build_clarification(
         if request.requested_mode == MODE_ROOT_CAUSE and isinstance(request.metadata, dict):
             documentary = request.metadata.pop(_root_documentary.PRIVATE_KEY, None)
             if type(documentary) is _root_documentary.BoundRequest and not decision.degraded:
-                diagnostic = {} if request.debug else None
-                verified = _assistant_core_verified_documentary_context(request, documentary, diagnostic=diagnostic)
-                if diagnostic is not None:
+                diagnostic = {} if (request.debug or _root_documentary.can_review_source_bound(
+                    documentary, decision.clarification_question,
+                )) else None
+                verified = _assistant_core_verified_documentary_context(
+                    request, documentary, diagnostic=diagnostic,
+                    clarification_question=decision.clarification_question,
+                )
+                requires_approval = diagnostic is not None and diagnostic.pop(
+                    "source_bound_clarification_requires_approval", False,
+                )
+                if requires_approval and verified is None:
+                    base.update(problem_summary=default_question, clarification_question=default_question)
+                if request.debug and diagnostic is not None:
                     meta["root_documentary_diagnostic"] = diagnostic
                 if verified is not None:
                     text, selected = verified
                     citations = _sanitize_citations_for_response(selected, company_id=request.company_id)
-                    if {row.get("citation_id") for row in citations} == {row["citation_id"] for row in selected}:
+                    if citations and {row.get("citation_id") for row in citations} == {row["citation_id"] for row in selected}:
+                        limit = _root_documentary.diagnostic_limit(documentary, request.response_language)
                         base.update(
-                            problem_summary=text + "\n\n" + question, citations=citations,
+                            problem_summary="\n\n".join(part for part in (text, limit, question) if part),
+                            citations=citations,
                             rg_links=_build_rg_links(request.company_id, citations),
                             grounding="indexed_machine_sources",
                         )

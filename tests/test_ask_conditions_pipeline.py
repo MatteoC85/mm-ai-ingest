@@ -185,6 +185,49 @@ class AskConditionsPipelineTests(unittest.TestCase):
         self.assertIn("guida sia libera", final["answer"])
         self.assertNotIn("carroponte", final["answer"])
 
+    def test_numeric_preconditions_receive_standing_prerequisites_without_procedure_scope(self):
+        m = self.m
+        request, _ = self.request_decision("en")
+        rows = self.rows() + [{
+            "citation_id": "manual:commissioning", "bubble_document_id": "manual",
+            "source_type": "document", "chunk_full":
+                "For the approved configuration, record certified supply isolation before connection.",
+        }]
+        calls = []
+
+        def writer(messages, **options):
+            calls.append(messages)
+            return {"answer_status": "no_sources", "grounded_points": []}, "offline-writer"
+
+        runtime = replace(m._assistant_core_generation_runtime(), preserve_procedure_points=True,
+            _v13_json_models=writer, _v13_choose_ask_model=lambda *a, **kw:(m.V13_FAST_MODEL, "low", ""),
+            _v13_sources_block=lambda *a, **kw:rows[-1]["chunk_full"],
+            _finalize_ask_response_for_ui=lambda result, **kw:result)
+        for types, includes_preconditions in (
+            (["numeric_value", "checklist", "safety_conditions"], True),
+            (["numeric_value", "checklist"], False),
+            (["numeric_value"], False),
+        ):
+            retrieval = {"candidates": rows, "assistant_core_contract": {
+                "fail_closed": True, "information_task": "numeric_specification",
+                "required_answer_types": types,
+            }}
+            generation.generate_ask_response(q=request.query, company_id=request.company_id,
+                response_language="en", top_k=6, retrieval=retrieval, narrow_scope=False,
+                debug=False, runtime=runtime)
+            system, user = [message["content"] for message in calls[-1]]
+            with self.subTest(types=types):
+                self.assertEqual("standing installation, protection or authorization" in system,
+                                 includes_preconditions)
+                self.assertEqual("An explicit exclusion takes precedence" in system,
+                                 includes_preconditions)
+                if includes_preconditions:
+                    self.assertIn("the requested source-supported facts about that phase", system)
+                    self.assertIn("Do not turn these into initial prerequisites", system)
+                self.assertNotIn("PROCEDURE_SCOPE:", user)
+                self.assertIn(rows[-1]["chunk_full"], user)
+        self.assertEqual(len(calls), 3)
+
     def test_missing_safety_still_fails_closed(self):
         final, calls, _ = self.run_pipeline(reject=True)
         self.assertEqual(final["status"], "no_sources")

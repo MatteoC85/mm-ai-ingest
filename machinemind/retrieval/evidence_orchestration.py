@@ -799,10 +799,15 @@ def assistant_core_refine_retrieval(request: AssistantCoreRequest, retrieval: di
                                mode="smart_neutral" if is_smart else "neutral",
                                plan=facet_plan,
                            ))
-                current_candidates = _v13_score_candidates(
-                    query_for_search,
-                    [(dict(c) if lineage is None else lineage("copy", c, dict(c))) for c in (current.get("candidates") or []) if isinstance(c, dict)],
-                )
+                scoring_inputs = [c for c in (current.get("candidates") or []) if isinstance(c, dict)]
+                # The scoped ASK scorer already creates each scored occurrence
+                # and the journal verifies every actual input before and after
+                # scoring. Registering an extra shallow clone between those
+                # boundaries duplicates a witness for the same occurrence.
+                if not is_ask or lineage is None:
+                    scoring_inputs = [(dict(c) if lineage is None else lineage("copy", c, dict(c)))
+                                      for c in scoring_inputs]
+                current_candidates = _v13_score_candidates(query_for_search, scoring_inputs)
                 annotated: list[dict] = []
                 for rank, raw in enumerate(current_candidates, start=1):
                     c = dict(raw)
