@@ -74,6 +74,13 @@ SOURCE_BOUND_REVIEW_INSTRUCTION = (
     "claim and needs no proof slot. Reject the entire response if it breaches these "
     "limits or the documentary claims omit a materially relevant requested distinction."
 )
+REJECTION_FOCUS_INSTRUCTION = (
+    " In rejection_focus, identify the first exact PROOF_SLOTS slot involved in a "
+    "claim or citation defect. Use 'coverage' for a missing documentary variant, "
+    "'clarification' for a defect only in CLARIFICATION_QUESTION, or 'other' for "
+    "a response-wide defect that cannot be localized. Use null on approval. "
+    "This is a diagnostic locator only. Leave any unsupported proof empty."
+)
 
 
 @dataclass(frozen=True)
@@ -590,7 +597,7 @@ def review_evidence(packed, claims):
     return ReviewEvidence(model_json, MappingProxyType(windows))
 
 
-def review_schema(claims, evidence):
+def review_schema(claims, evidence, *, rejection_focus=False):
     names = {cid: f"source_{i}" for i, cid in enumerate(evidence.windows, 1)}
     proof_fields = {entry["slot"]: {"$ref": f"#/$defs/{names[entry['citation_id']]}"}
                     for entry in proof_slots(claims)}
@@ -598,11 +605,47 @@ def review_schema(claims, evidence):
         "verdict": {"type": "string", "enum": ["approve", "reject"]},
         "reason": {"type": "string", "enum": list(REVIEW_REASONS)},
         "proofs": _object(proof_fields),
+        **({"rejection_focus": {"type": ["string", "null"],
+              "enum": [None, *proof_fields, "coverage", "clarification", "other"]}}
+           if rejection_focus else {}),
     })
     schema["$defs"] = {names[cid]: {"type": "string", "enum": ["", *choices]}
                        for cid, choices in evidence.windows.items()}
-    return {"name": "machinemind_root_documentary_review_v4", "strict": True,
+    name = "machinemind_root_documentary_review_debug_v1" if rejection_focus else "machinemind_root_documentary_review_v4"
+    return {"name": name, "strict": True,
             "schema": schema}
+
+
+def rejected_focus(raw, claims, evidence, focus):
+    """Return a located rejected claim and the exact authorized citation units."""
+    if (review_outcome(raw, claims, evidence) != "review_rejected"
+            or type(focus) is not str or type(raw["proofs"]) is not dict):
+        return None
+    slots = {entry["slot"]: entry for entry in proof_slots(claims)}
+    if set(raw["proofs"]) != set(slots):
+        return None
+    for slot, reference in raw["proofs"].items():
+        if type(reference) is not str or (reference and reference not in evidence.windows[slots[slot]["citation_id"]]):
+            return None
+    if focus in {"coverage", "clarification", "other"}:
+        return {"focus": focus, "reason": raw["reason"]}
+    target = slots.get(focus)
+    if target is None:
+        return None
+    cid = target["citation_id"]
+    sources = [source for source in json.loads(evidence.model_json)["sources"] if source.get("citation_id") == cid]
+    if len(sources) != 1:
+        return None
+    parts = sources[0].get("proof_parts")
+    if (type(parts) is not list or not parts or any(
+            type(part) is not list or len(part) != 2 or type(part[0]) is not int
+            or part[0] < 1 or type(part[1]) is not str or len(part[1]) > MAX_PROOF_PART_CHARS
+            for part in parts) or any(second[0] != first[0] + 1 for first, second in zip(parts, parts[1:]))
+            or tuple(_proof_windows(parts)) != evidence.windows.get(cid)):
+        return None
+    return {"focus": focus, "reason": raw["reason"], "claim_index": target["claim_index"],
+            "claim_text": claims[target["claim_index"]][0], "citation_id": cid,
+            "proof_reference": raw["proofs"][focus], "proof_parts": parts}
 
 
 def approved(raw, claims, evidence):

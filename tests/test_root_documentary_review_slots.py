@@ -3,6 +3,7 @@ import json
 import unittest
 
 from machinemind.retrieval import root_documentary as documentary
+from machinemind.retrieval import root_documentary_diagnostics as diagnostics
 from machinemind.retrieval import review_references
 
 
@@ -88,6 +89,44 @@ class DocumentaryProofSlots(unittest.TestCase):
     def test_shared_root_reference_slicing_retains_default_boundaries(self):
         body = "a" * 500 + "\n" + "b" * 700
         self.assertEqual(review_references.slices(body), [(0, 501), (501, 1141), (1141, 1201)])
+
+    def test_rejected_focus_is_diagnostic_only_and_bound_to_one_exact_source(self):
+        claims = (("First precise claim", ("a",)), ("Second precise claim", ("a", "b")))
+        evidence = documentary.review_evidence(packed_excerpts({"a": "Allowed source A", "b": "Allowed source B"}), claims)
+        expected = {"claim_1_citation_1": "1", "claim_2_citation_1": "", "claim_2_citation_2": "2"}
+        raw = {"verdict": "reject", "reason": "other", "proofs": expected}
+        ordinary = documentary.review_schema(claims, evidence)["schema"]["properties"]
+        debug = documentary.review_schema(claims, evidence, rejection_focus=True)["schema"]["properties"]
+        self.assertEqual({key: value for key, value in debug.items() if key != "rejection_focus"}, ordinary)
+        located = documentary.rejected_focus(raw, claims, evidence, "claim_2_citation_1")
+        self.assertEqual(located, {"focus": "claim_2_citation_1", "reason": "other", "claim_index": 1,
+                                   "claim_text": "Second precise claim", "citation_id": "a",
+                                   "proof_reference": "", "proof_parts": [[1, "Allowed source A"]]})
+        foreign = {**raw, "proofs": {**expected, "claim_2_citation_1": "2"}}
+        self.assertIsNone(documentary.rejected_focus(foreign, claims, evidence, "claim_2_citation_1"))
+        self.assertIsNone(documentary.rejected_focus(raw, claims, evidence, "claim_9_citation_1"))
+        self.assertEqual(documentary.rejected_focus(raw, claims, evidence, "coverage"),
+                         {"focus": "coverage", "reason": "other"})
+        self.assertEqual(documentary.review_outcome(raw, claims, evidence), "review_rejected")
+
+    def test_private_rejection_rejects_a_different_scope_and_redacts_credentials(self):
+        record = {"focus": "claim_1_citation_1", "reason": "other", "claim_index": 0,
+                  "claim_origin": "generated", "citation_id": "private-citation", "proof_reference": "1",
+                  "claim_text": "Exact rejected sentence. CHECK_TOKEN=synthetic-test-value",
+                  "proof_parts": [[1, "Exact source unit. synthetic-test-value"]]}
+        binding = {"commit_sha": "a" * 40, "request_id": "b" * 32, "query_sha256": "c" * 64,
+                   "company_id": "private-company", "machine_id": "private-machine"}
+        secret = "synthetic-secret-key-with-32-or-more-bytes"
+        sealed = diagnostics.seal(record=record, binding=binding, secret=secret,
+                                  environment={"CHECK_TOKEN": "synthetic-test-value"})
+        self.assertNotIn("Exact rejected sentence", json.dumps(sealed))
+        self.assertNotIn("private-company", json.dumps(sealed))
+        with self.assertRaises(ValueError):
+            diagnostics.open_envelope(sealed, secret=secret, expected_binding={**binding, "machine_id": "different"})
+        opened = diagnostics.open_envelope(sealed, secret=secret, expected_binding=binding)
+        self.assertTrue(opened["manifest"]["redaction_changed"])
+        self.assertEqual(opened["record"]["claim_text"], "Exact rejected sentence. CHECK_TOKEN=[REDACTED]")
+        self.assertEqual(opened["record"]["proof_parts"], [[1, "Exact source unit. [REDACTED]"]])
 
 
 if __name__ == "__main__":

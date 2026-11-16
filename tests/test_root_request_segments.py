@@ -319,6 +319,56 @@ class ActualRootRouterSegmentTests(unittest.TestCase):
         self.assertIn("technical failure", result["clarification_question"])
         self.assertEqual(req.metadata[dq.BASIS_METADATA_KEY]["reason"], "router_execution_failed")
 
+    def test_documentary_rejection_has_only_one_sealed_claim_in_internal_debug(self):
+        from dataclasses import replace
+        from machinemind.retrieval import root_documentary_diagnostics
+
+        m = self.m
+        d = m._root_documentary
+        secret = "synthetic-long-root-diagnostic-secret-key"
+        commit = "a" * 40
+        evidence = {"citation_id": "fixture-manual:p1", "source_type": "document",
+                    "text": "A machine status has two documented conditions."}
+        packet = {"validator_records": [evidence], "model_packet": {"sources": [evidence]}, "model_json": "{}"}
+        draft_text = "The service manual makes a claim that the reviewer rejects."
+        for debug in (False, True):
+            req = replace(self.request(), debug=debug)
+            artifact = d.BoundRequest(d.request_binding(req), ("Clarify documented conditions",), "[]")
+            reported, calls = {}, []
+
+            def provider(messages, **kwargs):
+                calls.append(kwargs["purpose"])
+                if calls[-1] == "assistant_core_root_documentary_producer":
+                    return {"claims": [{"text": draft_text, "citations": [evidence["citation_id"]]}]}, "offline"
+                result = {"verdict": "reject", "reason": "other", "proofs": {"claim_1_citation_1": ""}}
+                fields = kwargs["json_schema"]["schema"]["properties"]
+                self.assertEqual("rejection_focus" in fields, debug)
+                if debug:
+                    result["rejection_focus"] = "claim_1_citation_1"
+                return result, "offline"
+
+            budget = m._assistant_core_new_budget("root_cause", company_id=req.company_id)
+            token = m._V13_BUDGET_CTX.set(budget)
+            try:
+                with patch.dict(os.environ, {"COMMIT_SHA": commit}), patch.object(m, "AI_INTERNAL_SECRET", secret), \
+                        patch.object(d, "scoped_packet", return_value=([{"bubble_document_id": "fixture-manual"}], packet)), \
+                        patch.object(m, "_v13_json_models", provider):
+                    output = m._assistant_core_verified_documentary_context(req, artifact, diagnostic=reported)
+            finally:
+                m._V13_BUDGET_CTX.reset(token)
+            self.assertIsNone(output)
+            self.assertEqual(calls, ["assistant_core_root_documentary_producer", "assistant_core_root_documentary_reviewer"])
+            self.assertEqual(reported["outcome"], "review_rejected")
+            self.assertNotIn(draft_text, json.dumps(reported))
+            self.assertEqual("rejection_capture" in reported, debug)
+            if debug:
+                opened = root_documentary_diagnostics.open_envelope(reported["rejection_capture"], secret=secret,
+                    expected_binding={"commit_sha": commit, "request_id": budget.request_id,
+                                      "company_id": req.company_id, "machine_id": req.machine_id,
+                                      "query_sha256": dq.query_fingerprint(req.query)})
+                self.assertEqual(opened["record"]["claim_text"], draft_text)
+                self.assertEqual(opened["record"]["claim_origin"], "generated")
+
     def test_valid_new_contract_still_requires_actual_root_review_and_keeps_rejection(self):
         m, req, events = self.m, self.request(), []
         text = "A released feed clamp allows feed motion without material movement. Read only existing recorded clamp indications."

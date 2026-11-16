@@ -16261,6 +16261,7 @@ def _assistant_core_verified_documentary_context(
         packed["validator_records"], documentary, request.response_language, clarification_question,
     )
     source_bound = bool(claims)
+    capture_rejection = request.debug is True and request.requested_mode == MODE_ROOT_CAUSE
     if source_bound and diagnostic is not None:
         diagnostic["source_bound_clarification_requires_approval"] = True
     producer_user = request_context + f"REVIEW_PACKET: {packed['model_json']}"
@@ -16311,6 +16312,8 @@ def _assistant_core_verified_documentary_context(
         if source_bound:
             review_instruction += _root_documentary.SOURCE_BOUND_REVIEW_INSTRUCTION
             reviewer_input += "\nCLARIFICATION_QUESTION: " + json.dumps(clarification_question, ensure_ascii=False)
+        if capture_rejection:
+            review_instruction += _root_documentary.REJECTION_FOCUS_INSTRUCTION
         stage = "reviewer"
         with root_time_budget.documentary_window(budget=budget, configured_timeout=V13_FAST_TIMEOUT_SECONDS) as timeout:
             result, _ = _v13_json_models(
@@ -16318,7 +16321,9 @@ def _assistant_core_verified_documentary_context(
                  {"role": "user", "content": reviewer_input
                   + "\nIMMUTABLE_CLAIMS: " + json.dumps(claims, ensure_ascii=False)
                   + "\nPROOF_SLOTS: " + json.dumps(_root_documentary.proof_slots(claims), ensure_ascii=False)}],
-                models=[V13_FAST_MODEL], json_schema=_root_documentary.review_schema(claims, evidence),
+                models=[V13_FAST_MODEL], json_schema=_root_documentary.review_schema(
+                    claims, evidence, rejection_focus=capture_rejection,
+                ),
                 effort="low", reasoning_mode="", timeout=timeout,
                 max_output_tokens=min(2200, V13_FAST_MAX_OUTPUT_TOKENS), company_id=request.company_id,
                 purpose="assistant_core_root_documentary_reviewer",
@@ -16335,10 +16340,35 @@ def _assistant_core_verified_documentary_context(
     if documentary.binding != _root_documentary.request_binding(request):
         note("request_binding_changed")
         return None
+    focus = None
+    if capture_rejection and type(result) is dict:
+        focus = result.get("rejection_focus")
+        result = {key: value for key, value in result.items() if key != "rejection_focus"}
     outcome = _root_documentary.review_outcome(result, claims, evidence)
     note(outcome)
     if diagnostic is not None and outcome == "review_rejected":
         diagnostic["review_reason"] = result["reason"]
+        if capture_rejection:
+            try:
+                from machinemind.retrieval import root_documentary_diagnostics
+
+                record = _root_documentary.rejected_focus(result, claims, evidence, focus)
+                if record is not None:
+                    index = record.get("claim_index")
+                    record["claim_origin"] = (
+                        "typed" if index is not None and index < len(typed_claims) else
+                        ("structured" if source_bound else "generated") if index is not None else None
+                    )
+                    binding = {"commit_sha": os.environ.get("COMMIT_SHA", "").lower(),
+                               "request_id": budget.request_id,
+                               "company_id": request.company_id, "machine_id": request.machine_id or "",
+                               "query_sha256": _retrieval_diagnostic_query.query_fingerprint(request.query)}
+                    diagnostic["rejection_capture"] = root_documentary_diagnostics.seal(
+                        record=record, binding=binding, secret=AI_INTERNAL_SECRET, environment=os.environ,
+                    )
+            except Exception:
+                # An unavailable diagnostic cannot change a rejected verdict or emit plaintext.
+                pass
     if outcome != "verified":
         return None
     selected_ids = {cid for _, citations in claims for cid in citations}
