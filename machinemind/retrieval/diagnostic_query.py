@@ -511,6 +511,12 @@ DIAGNOSTIC_BASIS_INSTRUCTION = (
     "check or hypothesis is not an observed result. General safety/isolation guidance is "
     "not a reported fault. For needs_observations/needs_target_identity provide a clarification "
     "question and missing_information in RESPONSE_LANGUAGE; do not rank causes. "
+    "Set documentary_request_parts to the zero-based indices of request parts explicitly "
+    "asking what is documented, when that question can be addressed independently of "
+    "determining the installed configuration or diagnosing the current condition. "
+    "Separate such a question from a request for diagnosis in the partition. Use [] "
+    "for diagnosis-only or unstated documentary interests, unsafe requests, other states, "
+    "or when the distinction is unclear. This field grants no observation admission. "
 )
 
 
@@ -546,9 +552,13 @@ def router_schema_with_diagnostic_basis(schema: Mapping[str, Any], *, original_q
     body["properties"] = {"diagnostic_basis": basis, **{
         k: v for k, v in body["properties"].items() if k != "diagnostic_basis"
     }}
+    body["properties"]["documentary_request_parts"] = {
+        "type": "array", "maxItems": 3,
+        "items": {"type": "integer", "minimum": 0, "maximum": MAX_PARTS - 1},
+    }
     body["required"] = ["diagnostic_basis"] + [
         x for x in body["required"] if x != "diagnostic_basis" and x not in DERIVED_DIAGNOSTIC_FIELDS
-    ]
+    ] + ["documentary_request_parts"]
     return out
 
 

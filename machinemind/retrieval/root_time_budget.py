@@ -16,6 +16,7 @@ from machinemind.infrastructure import request_budget as native
 POLICY_VERSION = "root-time-reservation-v1"
 FINALIZATION_RESERVE_SECONDS = 4.0
 MIN_PRODUCER_SECONDS = 12.0
+DOCUMENTARY_END_SECONDS = 56.0
 _WINDOW = ContextVar("machinemind_root_time_window", default=None)
 
 
@@ -188,3 +189,22 @@ def reviewer_window(*, budget):
         raise native._V13BudgetExceeded("root_review_deadline_reserve")
     with _window(budget, allowance, optional=False):
         yield
+
+
+def documentary_remaining(budget) -> float:
+    return max(0.0, min(
+        DOCUMENTARY_END_SECONDS - budget.elapsed(),
+        float(budget.remaining()) - FINALIZATION_RESERVE_SECONDS,
+    ))
+
+
+@contextmanager
+def documentary_window(*, budget, configured_timeout, reserve_review=False):
+    """Use only time left inside the optional documentary phase."""
+    remaining = documentary_remaining(budget)
+    allowance = remaining - (MIN_PRODUCER_SECONDS if reserve_review else 0.0)
+    if allowance < MIN_PRODUCER_SECONDS:
+        raise native._V13BudgetExceeded("root_documentary_deadline_reserve")
+    timeout = min(review_timeout_seconds(configured_timeout), math.floor(allowance))
+    with _window(budget, allowance, optional=False):
+        yield timeout

@@ -725,11 +725,25 @@ def assistant_ui_root_cause_html(resp: dict, *, response_language: str, _runtime
     causes = [c for c in resp.get('possible_causes') or [] if isinstance(c, dict)]
     recommended = _runtime.unique_non_empty_strings(resp.get('recommended_next_checks') or [], limit=10)
     article: list[str] = ['<article data-mm-answer="root-cause" data-mm-render="' + assistant_ui_escape(_runtime.assistant_ui_render_version, _runtime=_runtime) + '" style="box-sizing:border-box;width:100%;font-family:Inter,-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif;font-size:14px;line-height:1.62;color:#1f2937;overflow-wrap:anywhere;padding:2px 2px 1px 2px;">']
+    meta = resp.get('meta')
+    documentary = (
+        status == 'answered' and resp.get('possible_causes') == [] and summary
+        and resp.get('result_code') == 'NEEDS_CLARIFICATION'
+        and isinstance(meta, dict) and meta.get('root_documentary_verified') is True
+        and any(isinstance(row, dict) and row.get('citation_id') for row in resp.get('citations') or [])
+    )
     if status != 'answered' or not causes:
-        title = 'Analysis unavailable' if is_en else 'Analisi non disponibile'
+        if documentary:
+            title = 'What the documents say' if is_en else 'Riscontro dai documenti'
+        else:
+            title = 'Analysis unavailable' if is_en else 'Analisi non disponibile'
         fallback = summary or ('I cannot find enough machine evidence to propose reliable probable causes.' if is_en else 'Non trovo evidenze sufficienti della macchina per proporre cause probabili affidabili.')
         article.append('<h2 style="margin:0 0 9px 0;font-size:18px;line-height:1.35;font-weight:760;color:#111827;">' + assistant_ui_escape(title, _runtime=_runtime) + '</h2>')
-        article.append('<p style="margin:0;color:#4b5563;">' + assistant_ui_inline_markup(fallback, _runtime=_runtime) + '</p>')
+        if documentary:
+            for paragraph in re.split(r'\n\s*\n', fallback):
+                article.append('<p style="margin:0 0 9px 0;color:#4b5563;">' + assistant_ui_inline_markup(paragraph, _runtime=_runtime) + '</p>')
+        else:
+            article.append('<p style="margin:0;color:#4b5563;">' + assistant_ui_inline_markup(fallback, _runtime=_runtime) + '</p>')
         article.append('</article>')
         rendered = ''.join(article)
         return rendered if len(rendered) <= _runtime.assistant_ui_max_html_chars else ''

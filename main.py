@@ -192,6 +192,7 @@ from machinemind.retrieval import candidate_ranking as _retrieval_candidate_rank
 from machinemind.retrieval import lexical as _retrieval_lexical
 from machinemind.retrieval import diagnostic_query as _retrieval_diagnostic_query
 from machinemind.retrieval import root_clue_support as _root_clue_support
+from machinemind.retrieval import root_documentary as _root_documentary
 from machinemind.retrieval import diagnostic_sources as _retrieval_diagnostic_sources
 from machinemind.retrieval import precision_facts as _retrieval_precision_facts
 from machinemind.retrieval import review_packet as _retrieval_review_packet
@@ -14269,6 +14270,9 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
         if str(cid or "").strip() in supplied_ids
     ]
     if profile is not None:
+        documentary_parts = out.pop("documentary_request_parts", None)
+        required_document_types = (out.get("preferred_source_types") or []
+            if out.get("source_type_policy") == "require" else None)
         basis_result = _retrieval_diagnostic_query.enforce_diagnostic_basis(out, profile)
         out = dict(basis_result.payload)
         if router_execution is not None:
@@ -14279,6 +14283,13 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
             )
         if isinstance(request.metadata, dict):
             request.metadata[_retrieval_diagnostic_query.BASIS_METADATA_KEY] = basis_result.summary
+            documentary = _root_documentary.bind_request(
+                request, profile, basis_result.summary, documentary_parts, supplied,
+                source_type=_assistant_core_candidate_source_type, source_text=_v13_candidate_text,
+                document_filter=required_document_types,
+            )
+            if documentary is not None:
+                request.metadata[_root_documentary.PRIVATE_KEY] = documentary
         # This object is created only after the original partition and admission
         # have passed. Provider JSON/candidate tags cannot instantiate the carrier.
         out.pop(_root_clue_support.WIRE_KEY, None)
@@ -16171,6 +16182,80 @@ def _assistant_core_build_no_evidence(
     }
 
 
+def _assistant_core_verified_documentary_context(
+    request: AssistantCoreRequest,
+    documentary: _root_documentary.BoundRequest,
+) -> tuple[str, list[dict]] | None:
+    from machinemind.retrieval import root_time_budget
+
+    budget = _v13_current_budget()
+    if (budget is None or budget.llm_calls + 2 > budget.max_llm_calls
+            or root_time_budget.documentary_remaining(budget) < 2 * root_time_budget.MIN_PRODUCER_SECONDS
+            or documentary.binding != _root_documentary.request_binding(request)):
+        return None
+    rows = json.loads(documentary.source_rows_json)
+    records = [
+        {"citation_id": row["citation_id"], "source_type": row["source_type"],
+         "page_from": row["page_from"], "page_to": row["page_to"], "text": row["chunk_full"]}
+        for row in rows
+    ]
+    try:
+        packed = _retrieval_review_packet.build_review_packet(
+            scope={"company_id": request.company_id, "machine_id": request.machine_id,
+                   "ai_scope": request.ai_scope, "document_ids": _assistant_core_scope_value(request, "document_ids"),
+                   "bubble_document_id": _assistant_core_scope_value(request, "bubble_document_id")},
+            candidates=rows, records=records, company_general_sentinel=COMPANY_GENERAL_MACHINE_SENTINEL,
+        )
+    except _retrieval_review_packet.ReviewPacketError:
+        return None
+    if any(row["machine_relation"] == "not_established" for row in packed["validator_records"]):
+        return None
+    excerpts = {row["citation_id"]: row["text"] for row in packed["validator_records"]}
+    user = (
+        f"RESPONSE_LANGUAGE: {request.response_language}\n"
+        f"ORIGINAL_REQUEST: {json.dumps(request.query, ensure_ascii=False)}\n"
+        f"DOCUMENTARY_QUESTIONS: {json.dumps(documentary.questions, ensure_ascii=False)}\n"
+        f"REVIEW_PACKET: {packed['model_json']}"
+    )
+    packet_instruction = " " + _retrieval_review_packet.INSTRUCTION
+    try:
+        with root_time_budget.documentary_window(
+            budget=budget, configured_timeout=V13_FAST_TIMEOUT_SECONDS, reserve_review=True,
+        ) as timeout:
+            draft, _ = _v13_json_models(
+                [{"role": "system", "content": _root_documentary.PRODUCER_INSTRUCTION + packet_instruction},
+                 {"role": "user", "content": user}],
+                models=[V13_FAST_MODEL], json_schema=_root_documentary.producer_schema(excerpts),
+                effort="low", reasoning_mode="", timeout=timeout,
+                max_output_tokens=min(1600, V13_FAST_MAX_OUTPUT_TOKENS), company_id=request.company_id,
+                purpose="assistant_core_root_documentary_producer",
+            )
+        claims = _root_documentary.freeze_claims(draft, excerpts)
+        if not claims or documentary.binding != _root_documentary.request_binding(request):
+            return None
+        with root_time_budget.documentary_window(budget=budget, configured_timeout=V13_FAST_TIMEOUT_SECONDS) as timeout:
+            result, _ = _v13_json_models(
+                [{"role": "system", "content": _root_documentary.REVIEW_INSTRUCTION + packet_instruction},
+                 {"role": "user", "content": user + "\nIMMUTABLE_CLAIMS: " + json.dumps(claims, ensure_ascii=False)}],
+                models=[V13_FAST_MODEL], json_schema=_root_documentary.review_schema(claims, excerpts),
+                effort="low", reasoning_mode="", timeout=timeout,
+                max_output_tokens=min(2200, V13_FAST_MAX_OUTPUT_TOKENS), company_id=request.company_id,
+                purpose="assistant_core_root_documentary_reviewer",
+            )
+    except _AuthorityError:
+        raise
+    except Exception:
+        # The native dispatch ledger retains known costs and uncertain attempts.
+        return None
+    if (root_time_budget.documentary_remaining(budget) <= 0.0
+            or documentary.binding != _root_documentary.request_binding(request)
+            or not _root_documentary.approved(result, claims, excerpts)):
+        return None
+    selected_ids = {cid for _, citations in claims for cid in citations}
+    selected = [row for row in rows if row["citation_id"] in selected_ids]
+    return "\n\n".join(text for text, _ in claims), selected
+
+
 def _assistant_core_build_clarification(
     request: AssistantCoreRequest,
     decision: AssistantCoreDecision,
@@ -16203,6 +16288,20 @@ def _assistant_core_build_clarification(
             "recommended_next_checks": [],
         })
         meta["diagnostic_state"] = "needs_clarification"
+        if request.requested_mode == MODE_ROOT_CAUSE and isinstance(request.metadata, dict):
+            documentary = request.metadata.pop(_root_documentary.PRIVATE_KEY, None)
+            if type(documentary) is _root_documentary.BoundRequest and not decision.degraded:
+                verified = _assistant_core_verified_documentary_context(request, documentary)
+                if verified is not None:
+                    text, selected = verified
+                    citations = _sanitize_citations_for_response(selected, company_id=request.company_id)
+                    if {row.get("citation_id") for row in citations} == {row["citation_id"] for row in selected}:
+                        base.update(
+                            problem_summary=text + "\n\n" + question, citations=citations,
+                            rg_links=_build_rg_links(request.company_id, citations),
+                            grounding="indexed_machine_sources",
+                        )
+                        meta["root_documentary_verified"] = True
     else:
         base["answer"] = question
     return base
