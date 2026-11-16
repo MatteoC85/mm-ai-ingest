@@ -14289,6 +14289,7 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
                 source_type=_assistant_core_candidate_source_type, source_text=_v13_candidate_text,
                 document_filter=required_document_types,
                 open_applicability=documentary_open_applicability,
+                neutral_rows=candidates,
             )
             if documentary is not None and basis_result.summary.get("admitted") is True:
                 question = out.get("clarification_question")

@@ -2,6 +2,8 @@
 
 from dataclasses import dataclass
 import json
+import re
+import unicodedata
 
 from . import diagnostic_query, review_packet, root_time_budget
 
@@ -11,6 +13,7 @@ MAX_CLAIMS = 4
 MAX_CITATIONS = 3
 MAX_CLAIM_CHARS = 600
 MAX_QUOTE_CHARS = 340
+MAX_NEUTRAL_DOCUMENT_ROWS = 56
 
 PRODUCER_INSTRUCTION = (
     "Answer only the independently requested documentary questions, in RESPONSE_LANGUAGE. "
@@ -78,8 +81,78 @@ def _valid_open_applicability(profile, basis, selection):
     )
 
 
+def _normalize_label(text):
+    return " ".join(unicodedata.normalize("NFKC", text).casefold().split())
+
+
+def _reported_quoted_label(profile):
+    labels = set()
+    for part in profile.parts:
+        if part.role != "observation":
+            continue
+        for match in re.finditer(r'“([^“”\n]{3,100})”|"([^"\n]{3,100})"|«([^«»\n]{3,100})»', part.quote):
+            label = _normalize_label(next(group for group in match.groups() if group))
+            if any(char.isalnum() for char in label):
+                labels.add(label)
+    return next(iter(labels)) if len(labels) == 1 else None
+
+
+def _documentary_rows(request, profile, rows, neutral_rows, *, source_type, source_text, document_filter):
+    """Keep a matching excerpt per document before nearby same-document fragments.
+
+    Secondary candidates come only from the same inspected neutral scope and
+    only for a literal label the user supplied as an observation. The router's
+    candidate set/citations are unchanged. All selected rows still pass the
+    owner and excerpt binding checks before either documentary model call.
+    """
+    label = _reported_quoted_label(profile)
+    original = rows[:review_packet.MAX_RECORDS]
+    cap = len(original)
+    if (label is None or not neutral_rows or cap < 2 or request.ai_scope != "machine_all"
+            or request.metadata.get("document_ids") or request.metadata.get("bubble_document_id")):
+        return original
+    match_label = re.compile(r"(?<!\w)" + re.escape(label) + r"(?!\w)")
+    preferred, matching_pages, seen_documents, seen_citations, seen_pages = [], [], set(), set(), set()
+    for row in (*original, *neutral_rows[:MAX_NEUTRAL_DOCUMENT_ROWS]):
+        kind = source_type(row)
+        if kind not in {"document", "ps"} or (document_filter is not None and kind not in document_filter):
+            continue
+        cid, doc = row.get("citation_id"), row.get("bubble_document_id")
+        if (not isinstance(cid, str) or not cid or not isinstance(doc, str) or not doc
+                or cid in seen_citations):
+            continue
+        if "company_id" in row and row["company_id"] != request.company_id:
+            continue
+        machine = row.get("machine_id")
+        if row.get("exact_machine_scope") is True:
+            if "machine_id" in row and machine != request.machine_id:
+                continue
+        elif (row.get("company_id") != request.company_id or "machine_id" not in row
+              or machine not in (None, request.machine_id)):
+            continue
+        text = source_text(row)
+        if not text or not match_label.search(_normalize_label(text)):
+            continue
+        page_from, page_to = row.get("page_from"), row.get("page_to")
+        page = (doc, page_from if type(page_from) is int else None, page_to if type(page_to) is int else None)
+        if page in seen_pages:
+            continue
+        if doc not in seen_documents:
+            preferred.append(row)
+            seen_documents.add(doc)
+        else:
+            matching_pages.append(row)
+        seen_pages.add(page)
+        seen_citations.add(cid)
+        if len(preferred) >= cap:
+            break
+    if len(preferred) < 2:
+        return original
+    return (preferred + matching_pages + [row for row in original if row.get("citation_id") not in seen_citations])[:cap]
+
+
 def bind_request(request, profile, basis, indices, rows, *, source_type, source_text,
-                 document_filter=None, open_applicability=None):
+                 document_filter=None, open_applicability=None, neutral_rows=None):
     if (request.requested_mode != "root_cause" or basis.get("validation_error")
             or basis.get("identity_gap_quotes")
             or profile.interpretation_status != "valid"):
@@ -103,7 +176,8 @@ def bind_request(request, profile, basis, indices, rows, *, source_type, source_
 
     selected = []
     seen = set()
-    for row in rows[:review_packet.MAX_RECORDS]:
+    for row in _documentary_rows(request, profile, rows, neutral_rows, source_type=source_type, source_text=source_text,
+                                 document_filter=document_filter):
         kind = source_type(row)
         if kind not in {"document", "ps"} or (document_filter is not None and kind not in document_filter):
             continue
