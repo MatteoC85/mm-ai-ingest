@@ -39,9 +39,9 @@ def _same_value(left, right):
     if type(right) is _LegacyWitness:
         if type(left) is _LegacyWitness:
             return left is right or right.matches(left.detached())
-        return right.matches(left)
+        return right.matches(left, journal_vectors=True)
     if type(left) is _LegacyWitness:
-        return left.matches(right)
+        return left.matches(right, journal_vectors=True)
     return _legacy_same_value(left, right)
 from ..evidence.record_adapters import adapt_candidate
 adapt_candidate = _phase_hot("receipt.adapt_candidate")(adapt_candidate)
@@ -358,13 +358,14 @@ class _PreparationTrace:
     are registered earlier at their exact call boundary in the same session.
     """
 
-    def __init__(self, *, limits, max_records, max_bytes):
+    def __init__(self, *, limits, max_records, max_bytes, compact_vectors=False):
         if (type(max_records) is not int or max_records < 1
                 or type(max_bytes) is not int or max_bytes < 1):
             raise EvidenceProductionError("explicit positive preparation trace limits required")
         self.limits = limits
         self.max_records = max_records
         self.max_bytes = max_bytes
+        self.compact_vectors = compact_vectors
         self.entries = {}
         self.roots = {}
         self._adapted_roots = {}
@@ -442,7 +443,8 @@ class _PreparationTrace:
             if copy_entry is not None or len(parents) != 1:
                 raise EvidenceProductionError("one explicit materialized parent required")
             parent = self.roots[parents[0]].record
-            if type(parent) is not _LegacyWitness or not parent.matches(record):
+            if type(parent) is not _LegacyWitness or not parent.matches(
+                    record, journal_vectors=self.compact_vectors):
                 raise EvidenceProductionError("materialized copy differs from its immutable parent")
             witness = parent
         elif copy_entry is not None:
@@ -451,7 +453,8 @@ class _PreparationTrace:
                 raise EvidenceProductionError("copy differs from its registered occurrence")
             witness = copy_entry[1]
         else:
-            witness = _LegacyWitness.capture(record, self.limits.legacy)
+            witness = _LegacyWitness.capture(record, self.limits.legacy,
+                                             journal_vectors=self.compact_vectors)
         budget = getattr(self, "_witness_budget", None)
         if budget is None:
             budget = _WitnessBudget.from_witnesses(
@@ -515,14 +518,32 @@ class _PreparationTrace:
             # callback occurrence receives a fresh mutable materialization.
             if type(item.record) is _LegacyWitness:
                 parent = item.record
-                value = parent.detached()
+                value = parent.journal_record() if self.compact_vectors else parent.detached()
             else:
                 parent = _LegacyWitness.capture(item.record, self.limits.legacy)
-                value = deepcopy(item.record)
+                value = (parent.journal_record() if self.compact_vectors and type(item.record) is dict
+                         else deepcopy(item.record))
             self.roots[h] = replace(item, record=parent)
             self.add(value, (h,), context=item.context, root_copy=True)
             out.append(value)
         return out
+
+    def public_views(self, values):
+        """Recheck each mutable occurrence before exporting its exact legacy record.
+
+        Return a fresh value for registrations. Private transport values stay in
+        the journal, including when a reader needs a selected seed mid-operation.
+        """
+        pairs = tuple(self.entry(record) for record in values)
+        return tuple((item[2], item[1].detached() if self.compact_vectors else item[0])
+                     for item in pairs)
+
+    def export(self, records, views):
+        if self.compact_vectors:
+            for internal, (_, legacy) in zip(records, views):
+                # Preserve the result's candidate/citation object identities.
+                internal.clear()
+                internal.update(legacy)
 
     def copies(self, stage, pairs):
         self.check()
@@ -686,7 +707,7 @@ def prepare_records(*, request: Any, session: AskEvidenceSession,
         before = invoke(authorize, request, request)
         _, limits = session.read_contract(request=request, current_allowed_sources=before)
         journal = _PreparationTrace(limits=limits, max_records=max_trace_records,
-                                    max_bytes=max_trace_bytes)
+                                    max_bytes=max_trace_bytes, compact_vectors=True)
         # P6-A exact collection check BEFORE providing data to a collaborator.
         session.admission(request=request, retrieval=retrieval, selections=selections,
                           current_allowed_sources=before)
@@ -720,7 +741,7 @@ def prepare_records(*, request: Any, session: AskEvidenceSession,
                                 or "candidate_handles" in params
                                 or len(seeds) > limits.assembly.max_occurrences):
                             raise EvidenceProductionError("explicit preparation seed occurrences required")
-                        views = tuple((journal.entry(row)[2], row) for row in seeds)
+                        views = journal.public_views(seeds)
                         seed_handles = session.derive_batch(request=request, views=views,
                             operation=PREPARATION_VERSION + ":source-seeds:" + name,
                             current_allowed_sources=current)
@@ -820,10 +841,11 @@ def prepare_records(*, request: Any, session: AskEvidenceSession,
                     or any(a is not b for a, b in zip(values, output["citations"]))
                     or 2 * len(values) > limits.assembly.max_occurrences):
                 raise EvidenceProductionError("prepared collections lack one exact selection")
-            views = tuple((journal.entry(record)[2], record) for record in values)
+            views = journal.public_views(values)
             # All final source/locator/relationship checks remain in the SAME session.
             handles = session.derive_batch(request=request, views=views,
                 operation=PREPARATION_VERSION, current_allowed_sources=after)
+            journal.export(values, views)
             return result, (AskSelection("candidates", handles), AskSelection("citations", handles))
         finally:
             journal.active = False
@@ -900,7 +922,7 @@ def retrieve_initial_records(*, request: Any, session: AskEvidenceSession,
         if type(cap) is not int or not 1 <= cap <= limits.assembly.max_occurrences:
             raise EvidenceProductionError("bounded initial citation capacity required")
         journal = _PreparationTrace(limits=limits, max_records=max_trace_records,
-                                    max_bytes=max_trace_bytes)
+                                    max_bytes=max_trace_bytes, compact_vectors=True)
         dense_tokens = {}
         flags = {}
         score_result = None
@@ -1036,7 +1058,7 @@ def retrieve_initial_records(*, request: Any, session: AskEvidenceSession,
                         if len(entries) != len(records):
                             raise EvidenceProductionError("initial flag occurrence count changed")
                         for entry, record in zip(entries, records):
-                            expected = dict(entry[1]); expected["fts_v13"] = True
+                            expected = entry[1].journal_record(); expected["fts_v13"] = True
                             if record is not entry[0] or not _same_value(record, expected):
                                 raise EvidenceProductionError("initial flag changed unrecorded fields")
                             # Update only this operation-local view. The session's
@@ -1086,9 +1108,10 @@ def retrieve_initial_records(*, request: Any, session: AskEvidenceSession,
                 raise EvidenceProductionError("aggregate initial output count exceeded")
             after = invoke(authorize, request, request)
             session.validate_records(request=request, handles=tuple(journal.roots), current_allowed_sources=after)
-            views = tuple((journal.entry(record)[2], record) for record in score_result)
+            views = journal.public_views(score_result)
             result_handles = session.derive_batch(request=request, views=views,
                 operation=INITIAL_LINEAGE_VERSION, current_allowed_sources=after)
+            journal.export(score_result, views)
             return result, (AskSelection("candidates", result_handles),
                             AskSelection("citations", result_handles[:cap]))
         finally:
@@ -1109,12 +1132,14 @@ class _OuterRetrievalTrace(_PreparationTrace):
     Collaborators are trusted; callbacks expire even when legacy catches errors.
     """
 
-    def __init__(self, *, request, session, authorize, invoke, max_records, max_bytes):
+    def __init__(self, *, request, session, authorize, invoke, max_records, max_bytes,
+                 compact_vectors=False):
         self.request, self.session = request, session
         self.authorize, self.invoke = authorize, invoke
         allowed = invoke(authorize, request, request)
         self.scope, limits = session.read_contract(request=request, current_allowed_sources=allowed)
-        super().__init__(limits=limits, max_records=max_records, max_bytes=max_bytes)
+        super().__init__(limits=limits, max_records=max_records, max_bytes=max_bytes,
+                         compact_vectors=compact_vectors)
         self.pending = {}
         self.completed = None
         self.bonus_done = False
@@ -1185,7 +1210,8 @@ class _OuterRetrievalTrace(_PreparationTrace):
             witness = _LegacyWitness.sequence("list" if type(value) is list else "tuple",
                                                witnesses, self.limits.legacy)
         else:
-            witness = _LegacyWitness.capture(value, self.limits.legacy)
+            witness = _LegacyWitness.capture(value, self.limits.legacy,
+                                             journal_vectors=self.compact_vectors)
         if witness.size_bytes > self.max_bytes:
             raise EvidenceProductionError("outer retrieval snapshot byte limit exceeded")
         return witness
@@ -1321,7 +1347,7 @@ class _OuterRetrievalTrace(_PreparationTrace):
         for item, record in zip(entries, values):
             if record is not item[0] or not allowed_fields.issubset(record):
                 raise EvidenceProductionError("mutation lost its exact occurrence or fields")
-            expected = dict(item[1])
+            expected = item[1].journal_record() if self.compact_vectors else dict(item[1])
             for key in record:
                 if key in allowed_fields:
                     expected[key] = record[key]
@@ -1414,12 +1440,14 @@ class _OuterRetrievalTrace(_PreparationTrace):
                 raise EvidenceProductionError("citation is not a selected candidate occurrence")
             citation_positions.append(slots.pop(0))
         if preserve is not None:
+            self.export(candidates, self.public_views(candidates))
             self.session.admission(request=self.request, retrieval=result, selections=preserve,
                                    current_allowed_sources=allowed)
             return result, preserve
-        views = tuple((self.entry(value)[2], value) for value in candidates)
+        views = self.public_views(candidates)
         out = self.session.derive_batch(request=self.request, views=views,
             operation=OUTER_RETRIEVAL_LINEAGE_VERSION, current_allowed_sources=allowed)
+        self.export(candidates, views)
         return result, (AskSelection("candidates", out),
                         AskSelection("citations", tuple(out[index] for index in citation_positions)))
 
@@ -1525,7 +1553,8 @@ def refine_records(*, request: Any, session: AskEvidenceSession, retrieval: dict
                 or type(facet_runtime) is not ranking.AssistantCoreMergeFacetCandidatesRuntime):
             raise EvidenceProductionError("ASK/ASK refinement and facet runtimes required")
         trace = _OuterRetrievalTrace(request=request, session=session, authorize=authorize,
-            invoke=invoke, max_records=max_trace_records, max_bytes=max_trace_bytes)
+            invoke=invoke, max_records=max_trace_records, max_bytes=max_trace_bytes,
+            compact_vectors=True)
         try:
             for cap in (runtime.ASSISTANT_CORE_MAX_FACETS, runtime.V13_DENSE_QUERY_LIMIT,
                         runtime.V13_LEXICAL_QUERY_LIMIT, runtime.V13_MAX_EVIDENCE_ITEMS_ASK,

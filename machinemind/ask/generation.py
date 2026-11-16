@@ -193,30 +193,42 @@ def generate_ask_response(
     # missing facets are resolved. The existing independent judge still decides.
     mandatory_facets = [item for item in contract.get("facet_queries", [])
         if isinstance(item, dict) and item.get("must_cover") is True]
-    composition_answer_types = declared_answer_types | {
-        item.get("answer_type") for item in mandatory_facets}
+    mandatory_answer_types = {item.get("answer_type") for item in mandatory_facets}
+    composition_answer_types = declared_answer_types | mandatory_answer_types
     prepared_decision = retrieval.get("assistant_core_decision") or {}
-    finite_factual_composition = bool(
+    finite_owned_request = bool(
         runtime.preserve_procedure_points and contract.get("fail_closed") is True
-        and information_task in {INFO_NUMERIC_SPECIFICATION, "document_explanation"}
         and declared_answer_types and mandatory_facets
-        and REQ_NUMERIC_VALUE in composition_answer_types
-        and composition_answer_types <= {REQ_NUMERIC_VALUE, REQ_SAFETY_CONDITIONS, "explanation"}
-        and prepared_decision.get("request_kind") == "factual"
         and prepared_decision.get("effective_mode") == "ask"
         and prepared_decision.get("enumeration_requested") is False
         and not overview_catalog_requested and not machine_catalog_digest)
+    finite_factual_composition = bool(
+        finite_owned_request
+        and information_task in {INFO_NUMERIC_SPECIFICATION, "document_explanation"}
+        and REQ_NUMERIC_VALUE in composition_answer_types
+        and composition_answer_types <= {REQ_NUMERIC_VALUE, REQ_SAFETY_CONDITIONS, "explanation"}
+        and prepared_decision.get("request_kind") == "factual")
     complete_family_composition = bool(runtime.preserve_procedure_context
         and runtime.procedure_context_sources)
+    conditions_numeric_composition = bool(
+        complete_family_composition and finite_owned_request
+        and contract.get("procedure_scope") == "conditions_only"
+        and not any(contract.get("procedure_phase") or ())
+        and information_task in {INFO_NUMERIC_SPECIFICATION, INFO_PROCEDURE_SEGMENT}
+        and prepared_decision.get("request_kind") in {"factual", "procedure"}
+        and REQ_NUMERIC_VALUE in mandatory_answer_types
+        and mandatory_answer_types & {REQ_CHECKLIST, REQ_SAFETY_CONDITIONS}
+        and composition_answer_types <= {
+            REQ_NUMERIC_VALUE, REQ_CHECKLIST, REQ_SAFETY_CONDITIONS, "explanation"})
     source_backed_composition = bool(
         V13_FAST_MODEL == "gpt-5.6-terra" and runtime.preserve_procedure_points
         and (complete_family_composition or finite_factual_composition))
     if source_backed_composition:
-        # A complete operation family still needs phase/condition reasoning in
-        # its draft; the separate semantic judge remains unchanged. Finite
-        # nonprocedural fact correction keeps the existing NONE composition.
+        # Explicit numeric prerequisites can use the finite drafting profile
+        # with an owned family. The full source packet and independent judge
+        # still check the numeric facts, separation of phases and safety.
         model = V13_FAST_MODEL
-        effort = "low" if complete_family_composition else "none"
+        effort = "low" if complete_family_composition and not conditions_numeric_composition else "none"
         reasoning_mode = ""
     context_chars = V13_FAST_CONTEXT_CHARS if policy_model == V13_FAST_MODEL else V13_HEAVY_CONTEXT_CHARS
     if overview_catalog_requested:

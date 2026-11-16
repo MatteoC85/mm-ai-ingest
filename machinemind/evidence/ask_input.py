@@ -22,7 +22,7 @@ from .adapter_types import AdapterLimits
 from .assembly import AssemblyLimits, EvidenceAssemblyError
 from .contracts import SourceIdentity
 from .legacy_compatibility import (
-    LegacyEvidenceBundle, LegacyLimits, LegacyRecordInput,
+    LegacyEvidenceBundle, LegacyLimits, LegacyRecordInput, _JournalVector,
     build_legacy_bundle, restore_legacy_records,
 )
 
@@ -205,6 +205,8 @@ def _same_value(left: Any, right: Any) -> bool:
     typ = type(left)
     if typ is not type(right):
         return False
+    if typ is _JournalVector:
+        return left.payload is right.payload or left.payload.binary == right.payload.binary
     if typ is dict:
         if tuple(left) != tuple(right):
             return False

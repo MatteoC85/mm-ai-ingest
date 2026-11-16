@@ -154,6 +154,35 @@ def _pack_floats(values):
     return pool.pack(values) if pool is not None else _PackedFloats.from_values(values)
 
 
+_VECTOR_FIELDS = frozenset({"embedding", "embedding_list"})
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _JournalVector:
+    """Read-only transport vector inside one scoped retrieval journal.
+
+    It serializes as the existing list only through the explicit witness path.
+    It is never a public or provider-facing record value.
+    """
+    payload: _PackedFloats
+
+    def __post_init__(self):
+        if type(self.payload) is not _PackedFloats or not self.payload.values:
+            raise EvidenceAssemblyError("nonempty packed immutable float transport required")
+
+    def __len__(self):
+        return len(self.payload.values)
+
+    def __iter__(self):
+        return iter(self.payload.values)
+
+    def __getitem__(self, index):
+        return self.payload.values[index]
+
+    def __deepcopy__(self, memo):
+        return self
+
+
 # Immutable tagged tree; dict insertion order and tuple/list types are preserved.
 @dataclass(frozen=True, slots=True)
 class _Frozen:
@@ -192,8 +221,9 @@ def _json(value: Any) -> str:
 
 
 class _Freezer:
-    def __init__(self, limits: LegacyLimits) -> None:
+    def __init__(self, limits: LegacyLimits, *, journal_vectors=False) -> None:
         self.limits = limits
+        self.journal_vectors = journal_vectors
         self.nodes = 0
         self.scalar_bytes = 0
         self.max_depth_seen = 0
@@ -205,7 +235,7 @@ class _Freezer:
         self.retained_bytes = 0
         self.numeric_payloads = {}
 
-    def freeze(self, value: Any, depth: int = 0) -> _Frozen:
+    def freeze(self, value: Any, depth: int = 0, *, vector_field=False) -> _Frozen:
         if depth > self.limits.max_depth:
             raise EvidenceAssemblyError("legacy depth budget exceeded")
         if depth > self.max_depth_seen:
@@ -233,17 +263,18 @@ class _Freezer:
             self.canonical_bytes += size
             self.retained_bytes += size
             return _Frozen(kind, value)
-        if not isinstance(value, Mapping) and typ not in (list, tuple):
+        compact_vector = self.journal_vectors and vector_field and typ is _JournalVector
+        if not compact_vector and not isinstance(value, Mapping) and typ not in (list, tuple):
             raise EvidenceAssemblyError("unsupported legacy value; no implicit conversion")
         if id(value) in self.ancestors:
             raise EvidenceAssemblyError("cyclic legacy data")
         if len(value) > self.limits.max_nodes - self.nodes:
             raise EvidenceAssemblyError("legacy node budget exceeded")
-        if typ in (list, tuple) and value and set(map(type, value)) == {float}:
+        if compact_vector or (typ in (list, tuple) and value and set(map(type, value)) == {float}):
             if depth + 1 > self.limits.max_depth:
                 raise EvidenceAssemblyError("legacy depth budget exceeded")
             try:
-                packed = _pack_floats(value)
+                packed = value.payload if compact_vector else _pack_floats(value)
             except (ValueError, OverflowError) as exc:
                 raise EvidenceAssemblyError("non-finite legacy value") from exc
             self.nodes += len(value)
@@ -251,7 +282,7 @@ class _Freezer:
             self.scalar_bytes += packed.scalar_bytes
             if self.scalar_bytes > self.limits.max_bytes:
                 raise EvidenceAssemblyError("legacy byte budget exceeded")
-            kind = "list" if typ is list else "tuple"
+            kind = "tuple" if typ is tuple else "list"
             self.canonical_bytes += (len('{"kind":"' + kind + '","value":[]}')
                                      + packed.canonical_children_bytes())
             self.retained_bytes += len(_json({"kind": kind, "value": {
@@ -278,7 +309,10 @@ class _Freezer:
                     adjustment = 3 - len('{"kind":"str","value":}')
                     self.canonical_bytes += adjustment
                     self.retained_bytes += adjustment
-                    pairs.append((key, self.freeze(item, depth + 1)))
+                    child = (self.freeze(item, depth + 1, vector_field=True)
+                             if self.journal_vectors and key in _VECTOR_FIELDS
+                             else self.freeze(item, depth + 1))
+                    pairs.append((key, child))
                 # Mapping.items() defines the tree even for an implementation
                 # whose reported length differs from its actual item iterator.
                 self.canonical_bytes += max(0, len(pairs) - 1)
@@ -408,7 +442,7 @@ def _thaw(node: _Frozen) -> Any:
 _SCALAR_TYPES = {"null": type(None), "str": str, "bool": bool, "int": int, "float": float}
 
 
-def _matches_frozen(value: Any, node: _Frozen) -> bool:
+def _matches_frozen(value: Any, node: _Frozen, *, journal_vectors=False) -> bool:
     """Exact mutable-input comparison to a private immutable witness.
 
     Component values are checked again at EVERY use. Cached serialization never
@@ -421,7 +455,14 @@ def _matches_frozen(value: Any, node: _Frozen) -> bool:
         # Check insertion order and every mutable value in one pass. Avoid
         # allocating two key tuples and another generator at each journal use.
         for (key, item), (expected_key, child) in zip(value.items(), node.value):
-            if key != expected_key or not _matches_frozen(item, child):
+            if key != expected_key:
+                return False
+            if (journal_vectors and key in _VECTOR_FIELDS and type(item) is _JournalVector
+                    and child.kind == "list" and type(child.value) is _PackedFloats):
+                if item.payload is not child.value and item.payload.binary != child.value.binary:
+                    return False
+                continue
+            if not _matches_frozen(item, child, journal_vectors=journal_vectors):
                 return False
         return True
     if node.kind in ("list", "tuple"):
@@ -439,7 +480,7 @@ def _matches_frozen(value: Any, node: _Frozen) -> bool:
             return (set(map(type, value)) == {float}
                     and array("d", value).tobytes() == node.value.binary)
         return len(value) == len(node.value) and all(
-            _matches_frozen(v, n) for v, n in zip(value, node.value))
+            _matches_frozen(v, n, journal_vectors=journal_vectors) for v, n in zip(value, node.value))
     expected = _SCALAR_TYPES[node.kind]
     if typ is not expected:
         return False
@@ -468,8 +509,8 @@ class _LegacyWitness(Mapping):
 
     @classmethod
     @_phase_hot("legacy.capture")
-    def capture(cls, value, limits):
-        freezer = _Freezer(limits)
+    def capture(cls, value, limits, *, journal_vectors=False):
+        freezer = _Freezer(limits, journal_vectors=journal_vectors)
         tree = freezer.freeze(value)
         return cls._from_profile(tree, freezer.canonical_bytes,
             (freezer.nodes, freezer.scalar_bytes, freezer.max_depth_seen),
@@ -521,11 +562,19 @@ class _LegacyWitness(Mapping):
         return cls._from_profile(tree, size, (nodes, scalars, depth),
                                  retained, tuple(payloads.values()))
 
-    def matches(self, value):
-        return _matches_frozen(value, self._tree)
+    def matches(self, value, *, journal_vectors=False):
+        return _matches_frozen(value, self._tree, journal_vectors=journal_vectors)
 
     def detached(self):
         return _thaw(self._tree)
+
+    def journal_record(self):
+        if self._tree.kind != "map":
+            raise EvidenceAssemblyError("mapping witness required for journal record")
+        return {key: (_JournalVector(child.value)
+                      if key in _VECTOR_FIELDS and child.kind == "list"
+                      and type(child.value) is _PackedFloats else _thaw(child))
+                for key, child in self._tree.value}
 
     def __iter__(self):
         if self._tree.kind != "map":

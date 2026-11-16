@@ -103,12 +103,51 @@ class OwnedSourceFastCompositionTests(unittest.TestCase):
   with patch.object(route.RouterFixture,'__init__',init):
    context.AskProcedureContextRecoveryTests.test_actual_r7_required_parent_type_keeps_complete_family_and_manual_support(self)
   self.assertEqual(len(fixtures),3)
-  for h in fixtures:
+  # The joint numeric/checklist request uses finite drafting; the additional
+  # manual-only interface requirement still uses the complete-family profile.
+  # The unchanged independent review can reject either draft.
+  for h,expected_effort in zip(fixtures,('none','low','none'),strict=True):
    writer=next(c for c in h.calls if c[0]=='writer');reviewer=next(c for c in h.calls if c[0]=='reviewer')
-   self.assertEqual(writer[2]['models'],[self.m.V13_FAST_MODEL]);self.assertEqual(writer[2]['effort'],'low')
+   self.assertEqual(writer[2]['models'],[self.m.V13_FAST_MODEL]);self.assertEqual(writer[2]['effort'],expected_effort)
    self.assertEqual(writer[2]['max_output_tokens'],h.owner.generation.V13_HEAVY_MAX_OUTPUT_TOKENS)
+   self.assertEqual(writer[2]['timeout'],h.owner.generation.V13_HEAVY_TIMEOUT_SECONDS)
    self.assertEqual(reviewer[2]['effort'],'low');self.assertIn('Non sostare sotto carichi sospesi.',h.writer_packets[0])
    self.assertIn('Non sostare sotto carichi sospesi.',h.review_packets[0])
+
+ def test_explicit_phase_or_enumeration_keeps_complete_family_low(self):
+  h=context.ContextFixture(self)
+  try:
+   q='State the documented mass and safety checks before cartridge insertion.'
+   base={'candidates':[deepcopy(h.prepared['candidates'][0])], 'metrics':{'confidence':'low'},
+    'assistant_core_decision':{'request_kind':'procedure','effective_mode':'ask','enumeration_requested':False},
+    'assistant_core_contract':{'fail_closed':True,'procedure_scope':'conditions_only',
+     'information_task':'procedure_segment','required_answer_types':['numeric_value','checklist','safety_conditions'],
+     'facet_queries':[{'facet':'mass','answer_type':'numeric_value','must_cover':True},
+         {'facet':'preconditions','answer_type':'checklist','must_cover':True}]}}
+   calls=[]
+   def provider(messages,**kw):
+    calls.append((messages,kw))
+    return {'answer_status':'no_sources','grounded_points':[]},kw['models'][0]
+   runtime=replace(h.owner.generation,preserve_procedure_points=True,preserve_procedure_context=True,
+     procedure_context_sources=('owned family fixture',),_v13_json_models=provider,
+     _v13_sources_block=lambda *a,**kw:'fixed bounded source packet',_finalize_ask_response_for_ui=lambda r,**kw:r)
+   variants=[
+    (None,None,None,'none'),
+    ('assistant_core_contract','procedure_scope','execution_steps','low'),
+    ('assistant_core_contract','procedure_phase',['','before cartridge insertion',''],'low'),
+    ('assistant_core_contract','required_answer_types',['numeric_value','checklist','state_sequence'],'low'),
+    ('assistant_core_decision','enumeration_requested',True,'low'),
+   ]
+   for section,key,value,effort in variants:
+    with self.subTest(key=key,value=value):
+     data=deepcopy(base)
+     if section is not None:data[section][key]=value
+     generation.generate_ask_response(q=q,company_id=h.request.company_id,response_language='en',
+       top_k=6,retrieval=data,narrow_scope=False,debug=False,runtime=runtime)
+     self.assertEqual(calls[-1][1]['effort'],effort)
+   original={k:v for k,v in calls[0][1].items()if k!='effort'}
+   self.assertTrue(all({k:v for k,v in options.items()if k!='effort'}==original for _,options in calls))
+  finally:h.close()
 
  def _finite_manual_case(self,information_task):
   raw={'request_kind':'factual','effective_mode':'ask','confidence':.98,'requested_mode_fit':True,
