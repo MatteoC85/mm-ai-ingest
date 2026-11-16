@@ -366,6 +366,65 @@ class AssistantCoreRootApplicabilityRecordsRuntime:
     _safe_int: Callable[..., Any]
 
 
+def _read_root_owner_pages(request, ranges, *, scope_where, db_conn, doc_ids=None,
+                           bubble_document_id=None, exact_machine=False):
+    """Read a fixed set of pages for the same owner, without a retrieval scan."""
+    where, params = scope_where(
+        company_id=request.company_id, machine_id=request.machine_id,
+        doc_ids=doc_ids, bubble_document_id=bubble_document_id,
+    )
+    if exact_machine:
+        where += " AND machine_id = %s"
+        params.append(request.machine_id)
+    predicates = []
+    for bdid, page_numbers in ranges.items():
+        predicates.append("(bubble_document_id = %s AND page_number = ANY(%s))")
+        params.extend([bdid, sorted(page_numbers)[:12]])
+    ownership = ", company_id, machine_id" if exact_machine else ""
+    limit = "72"
+    if exact_machine:
+        # A spare row lets inconsistent duplicate owner pages fail closed.
+        limit = "%s"
+        params.append(sum(map(len, ranges.values())) + 1)
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT bubble_document_id, page_number, LEFT(COALESCE(text, ''), 6500)" + ownership +
+                " FROM public.document_pages WHERE " + where + " AND (" +
+                " OR ".join(predicates) + ") ORDER BY bubble_document_id, page_number LIMIT " + limit,
+                params,
+            )
+            pages = {}
+            for doc, page, text, *owner in cur.fetchall():
+                key = (str(doc or ""), int(page or 0))
+                if exact_machine and (owner != [request.company_id, request.machine_id]
+                                      or key[1] not in ranges.get(key[0], ()) or key in pages):
+                    return {}
+                if key[1] in ranges.get(key[0], ()):
+                    pages[key] = str(text or "")
+            return pages
+    finally:
+        try:
+            conn.close()
+        except Exception as exc:
+            print("ROOT_OWNER_CONTEXT_CLOSE_ERROR", type(exc).__name__)
+
+
+def read_root_documentary_owner_pages(request, targets, *, scope_where, db_conn):
+    """Read only exact-machine adjacent pages from the documentary binder's targets."""
+    if (request.requested_mode != "root_cause" or request.ai_scope != "machine_all"
+            or not request.company_id or not request.machine_id or not 1 <= len(targets) <= 4
+            or request.metadata.get("document_ids") or request.metadata.get("bubble_document_id")):
+        return {}
+    ranges = {}
+    for doc, page in targets:
+        if type(doc) is not str or not doc or type(page) is not int or page < 1:
+            return {}
+        ranges.setdefault(doc, set()).add(page)
+    return _read_root_owner_pages(request, ranges, scope_where=scope_where, db_conn=db_conn, exact_machine=True)
+
+
 def assistant_core_root_applicability_records(
     request: AssistantCoreRequest, candidates: list[dict],
     *, runtime: AssistantCoreRootApplicabilityRecordsRuntime,
@@ -398,39 +457,16 @@ def assistant_core_root_applicability_records(
     pages: dict[tuple[str, int], str] = {}
     context_error = ""
     if ranges:
-        where, params = _ask_evidence_scope_where(
-            company_id=request.company_id, machine_id=request.machine_id,
-            doc_ids=_assistant_core_scope_value(request, "document_ids"),
-            bubble_document_id=_assistant_core_scope_value(request, "bubble_document_id"),
-        )
-        predicates = []
-        for bdid, page_numbers in ranges.items():
-            predicates.append("(bubble_document_id = %s AND page_number = ANY(%s))")
-            params.extend([bdid, sorted(page_numbers)[:12]])
-        conn = None
         try:
-            conn = _db_conn()
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT bubble_document_id, page_number, LEFT(COALESCE(text, ''), 6500) "
-                    "FROM public.document_pages WHERE " + where + " AND (" +
-                    " OR ".join(predicates) + ") ORDER BY bubble_document_id, page_number LIMIT 72",
-                    params,
-                )
-                for doc, page, text in cur.fetchall():
-                    key = (str(doc or ""), int(page or 0))
-                    if key[0] in ranges and key[1] in ranges[key[0]]:
-                        pages[key] = str(text or "")
+            pages = _read_root_owner_pages(
+                request, ranges, scope_where=_ask_evidence_scope_where, db_conn=_db_conn,
+                doc_ids=_assistant_core_scope_value(request, "document_ids"),
+                bubble_document_id=_assistant_core_scope_value(request, "bubble_document_id"),
+            )
         except Exception as exc:
             # Lack of owner context must remain visible; never infer the owner.
             context_error = type(exc).__name__
             print("ROOT_OWNER_CONTEXT_UNAVAILABLE", context_error)
-        finally:
-            if conn is not None:
-                try:
-                    conn.close()
-                except Exception as exc:
-                    print("ROOT_OWNER_CONTEXT_CLOSE_ERROR", type(exc).__name__)
     records: list[dict] = []
     for c in candidates[:14]:
         cid = str(c.get("citation_id") or "").strip()

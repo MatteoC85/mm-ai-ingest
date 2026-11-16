@@ -19,6 +19,7 @@ MIN_PROOF_PART_CHARS = 120
 MAX_PROOF_PART_CHARS = 150
 MAX_NEUTRAL_DOCUMENT_ROWS = 56
 MAX_ENTRY_SPAN = 2800
+MAX_FORWARD_PAGES = 4
 REVIEW_REASONS = (
     "supported", "missing_documentary_variant", "unsupported_claim", "wrong_source",
     "assumed_applicability", "unsafe_action", "language_mismatch", "other",
@@ -154,6 +155,30 @@ def _indication_entry(text, label):
     return text[bounds[0][0]:bounds[-1][1]]
 
 
+def _typed_entries(text, label):
+    entry = _indication_entry(text, label)
+    if not entry:
+        return
+    lines = [line.strip() for line in entry.splitlines() if line.strip()]
+    normalized = [_normalize_label(line) for line in lines]
+    for pos, value in enumerate(normalized):
+        if value != "message" or normalized[pos + 1:pos + 2] != [label]:
+            continue
+        end = next((i for i in range(pos + 2, len(lines)) if normalized[i] == "message"), len(lines))
+        fields = normalized[pos + 2:end]
+        if "type" not in fields or "description" not in fields:
+            continue
+        kind_pos = pos + 3 + fields.index("type")
+        desc_pos = pos + 3 + fields.index("description")
+        if not kind_pos < desc_pos < end or normalized[kind_pos] not in INDICATION_TYPES:
+            continue
+        trigger = re.split(r"(?<=[.!?])(?:\s+|$)", " ".join(lines[desc_pos:end]), maxsplit=1)[0]
+        if not 20 <= len(trigger) <= 220 or trigger not in entry:
+            continue
+        condition = re.sub(r"^this (?:message|warning|alarm|fault) is activated when ", "", _normalize_label(trigger))
+        yield (normalized[kind_pos], condition), lines[pos + 1], lines[kind_pos], trigger
+
+
 def typed_entry_claims(records, label, language):
     """Render source-reported types and literal triggers, when variants are explicit."""
     variants = {}
@@ -163,31 +188,11 @@ def typed_entry_claims(records, label, language):
     for row in records:
         if row["source_type"] != "document":
             continue
-        entry = _indication_entry(row["text"], label)
-        if not entry:
-            continue
-        lines = [line.strip() for line in entry.splitlines() if line.strip()]
-        normalized = [_normalize_label(line) for line in lines]
-        for pos, value in enumerate(normalized):
-            if value != "message" or normalized[pos + 1:pos + 2] != [label]:
-                continue
-            end = next((i for i in range(pos + 2, len(lines)) if normalized[i] == "message"), len(lines))
-            fields = normalized[pos + 2:end]
-            if "type" not in fields or "description" not in fields:
-                continue
-            kind_pos = pos + 3 + fields.index("type")
-            desc_pos = pos + 3 + fields.index("description")
-            if not kind_pos < desc_pos < end or normalized[kind_pos] not in INDICATION_TYPES:
-                continue
-            trigger_lines = lines[desc_pos:end]
-            trigger = re.split(r"(?<=[.!?])(?:\s+|$)", " ".join(trigger_lines), maxsplit=1)[0]
-            if not 20 <= len(trigger) <= 220 or trigger not in entry:
-                continue
-            description = (f"Per «{lines[pos + 1]}», la fonte riporta il tipo «{lines[kind_pos]}» e descrive "
+        for key, message, kind, trigger in _typed_entries(row["text"], label):
+            description = (f"Per «{message}», la fonte riporta il tipo «{kind}» e descrive "
                            f"la condizione così: «{trigger}».") if is_italian else (
-                           f"For ‘{lines[pos + 1]}’, the source lists the type ‘{lines[kind_pos]}’ and states: ‘{trigger}’.")
-            condition = re.sub(r"^this (?:message|warning|alarm|fault) is activated when ", "", _normalize_label(trigger))
-            variants.setdefault((normalized[kind_pos], condition), (description, (row["citation_id"],)))
+                           f"For ‘{message}’, the source lists the type ‘{kind}’ and states: ‘{trigger}’.")
+            variants.setdefault(key, (description, (row["citation_id"],)))
     # Keep room for the distinguishing observations independently requested.
     types = {kind for kind, _ in variants}
     return tuple(variants.values()) if 2 <= len(types) and len(variants) < MAX_CLAIMS else ()
@@ -327,10 +332,57 @@ def bind_request(request, profile, basis, indices, rows, *, source_type, source_
     )
 
 
-def scoped_packet(request, bound, *, company_general_sentinel):
+def _forward_owner_rows(request, rows, label, read_owner_pages):
+    if (read_owner_pages is None or not label or request.ai_scope != "machine_all"
+            or request.metadata.get("document_ids") or request.metadata.get("bubble_document_id")):
+        return []
+
+    targets, known_types = {}, set()
+    for row in rows:
+        if "company_id" in row and row["company_id"] != request.company_id:
+            return []
+        if row["source_type"] != "document":
+            continue
+        types = {key[0] for key, *_ in _typed_entries(row["chunk_full"], label)}
+        known_types.update(types)
+        doc, last = row["bubble_document_id"], row["page_to"]
+        exact_owner = (
+            row.get("machine_id", request.machine_id) == request.machine_id
+            and (row.get("exact_machine_scope") is True or
+                 (row.get("company_id") == request.company_id and row.get("machine_id") == request.machine_id))
+        )
+        if (types and exact_owner and type(last) is int and last > 0
+                and doc not in targets and len(targets) < MAX_FORWARD_PAGES):
+            targets[doc] = last + 1
+    if not targets:
+        return []
+
+    pages = read_owner_pages(tuple(targets.items()))
+    supplemental = []
+    for doc, page in targets.items():
+        text = pages.get((doc, page), "")
+        new_types = {key[0] for key, *_ in _typed_entries(text, label)} - known_types
+        cid = f"{doc}:p{page}-{page}:v13page"
+        if not new_types or any(row["citation_id"] == cid for row in rows):
+            continue
+        known_types.update(new_types)
+        supplemental.append({
+            "citation_id": cid, "bubble_document_id": doc, "company_id": request.company_id,
+            "machine_id": request.machine_id, "exact_machine_scope": True, "source_type": "document",
+            "chunk_full": text, "page_from": page, "page_to": page,
+        })
+    return supplemental
+
+
+def scoped_packet(request, bound, *, company_general_sentinel, read_owner_pages=None):
     if bound.binding != request_binding(request):
         return None
     rows = json.loads(bound.source_rows_json)
+    forward = _forward_owner_rows(request, rows, bound.reported_label, read_owner_pages)
+    if forward:
+        # Put an exact new type before repeated views. The existing evidence
+        # record and character caps still apply to both provider stages.
+        rows = (forward + rows)[:review_packet.MAX_RECORDS]
     records = [
         {"citation_id": row["citation_id"], "source_type": row["source_type"],
          "page_from": row["page_from"], "page_to": row["page_to"],

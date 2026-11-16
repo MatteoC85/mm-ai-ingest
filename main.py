@@ -16214,11 +16214,30 @@ def _assistant_core_verified_documentary_context(
     if not _root_documentary.has_documentary_window(budget):
         note("insufficient_window")
         return None
+
+    def read_owner_pages(targets):
+        try:
+            with root_time_budget.documentary_page_window(budget) as allowed:
+                if allowed:
+                    return _retrieval_context_expansion.read_root_documentary_owner_pages(
+                        request, targets, scope_where=_ask_evidence_scope_where, db_conn=_db_conn,
+                    )
+        except _AuthorityError:
+            raise
+        except Exception:
+            # An optional document lookup cannot establish new evidence on failure.
+            pass
+        return {}
+
     packet = _root_documentary.scoped_packet(
         request, documentary, company_general_sentinel=COMPANY_GENERAL_MACHINE_SENTINEL,
+        read_owner_pages=read_owner_pages,
     )
     if packet is None:
         note("invalid_scoped_packet")
+        return None
+    if not _root_documentary.has_documentary_window(budget):
+        note("insufficient_window")
         return None
     rows, packed = packet
     if diagnostic is not None:

@@ -199,6 +199,17 @@ def documentary_remaining(budget) -> float:
 
 
 @contextmanager
+def documentary_page_window(budget):
+    """Bound an optional owner-page read before the two existing model windows."""
+    allowance = min(3.0, documentary_remaining(budget) - 2 * MIN_PRODUCER_SECONDS)
+    if allowance < 2.1:  # libpq connect timeout rounds to whole seconds.
+        yield False
+        return
+    with _window(budget, allowance, optional=True):
+        yield True
+
+
+@contextmanager
 def documentary_window(*, budget, configured_timeout, reserve_review=False):
     """Use only time left inside the optional documentary phase."""
     remaining = documentary_remaining(budget)
