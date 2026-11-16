@@ -16232,20 +16232,38 @@ def _assistant_core_verified_documentary_context(
         f"REVIEW_PACKET: {packed['model_json']}"
     )
     packet_instruction = " " + _retrieval_review_packet.INSTRUCTION
+    typed_claims = _root_documentary.typed_entry_claims(
+        packed["validator_records"], documentary.reported_label, request.response_language,
+    )
+    producer_user = user
+    producer_instruction = _root_documentary.PRODUCER_INSTRUCTION
+    if typed_claims:
+        producer_user += "\nSOURCE_BOUND_TYPES: " + json.dumps(typed_claims, ensure_ascii=False)
+        producer_instruction += (
+            " SOURCE_BOUND_TYPES are already included. Supply only independent documentary facts useful "
+            "to distinguish the reported possibilities, such as which observations the source requires. "
+            "Keep their citations and avoid repeating type or trigger claims. "
+        )
     stage = "producer"
     try:
         with root_time_budget.documentary_window(
             budget=budget, configured_timeout=V13_FAST_TIMEOUT_SECONDS, reserve_review=True,
         ) as timeout:
             draft, _ = _v13_json_models(
-                [{"role": "system", "content": _root_documentary.PRODUCER_INSTRUCTION + packet_instruction},
-                 {"role": "user", "content": user}],
-                models=[V13_FAST_MODEL], json_schema=_root_documentary.producer_schema(excerpts),
+                [{"role": "system", "content": producer_instruction + packet_instruction},
+                 {"role": "user", "content": producer_user}],
+                models=[V13_FAST_MODEL], json_schema=_root_documentary.producer_schema(
+                    excerpts, max_claims=_root_documentary.MAX_CLAIMS - len(typed_claims),
+                ),
                 effort="low", reasoning_mode="", timeout=timeout,
                 max_output_tokens=min(1600, V13_FAST_MAX_OUTPUT_TOKENS), company_id=request.company_id,
                 purpose="assistant_core_root_documentary_producer",
             )
-        claims = _root_documentary.freeze_claims(draft, excerpts)
+        generated_claims = _root_documentary.freeze_claims(draft, excerpts)
+        if len(generated_claims) > _root_documentary.MAX_CLAIMS - len(typed_claims):
+            note("no_valid_documentary_claims")
+            return None
+        claims = typed_claims + generated_claims
         if not claims:
             note("no_valid_documentary_claims")
             return None

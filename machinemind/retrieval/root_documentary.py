@@ -19,6 +19,7 @@ REVIEW_REASONS = (
     "supported", "missing_documentary_variant", "unsupported_claim", "wrong_source",
     "assumed_applicability", "unsafe_action", "language_mismatch", "other",
 )
+INDICATION_TYPES = frozenset({"warning", "alarm", "fault", "notice", "information"})
 
 PRODUCER_INSTRUCTION = (
     "Answer only the independently requested documentary questions, in RESPONSE_LANGUAGE. "
@@ -49,8 +50,9 @@ REVIEW_INSTRUCTION = (
     "actual applicability remains open. Reject unsupported conclusions, installed "
     "configuration assumptions, cause rankings, operational instructions, language "
     "mismatch, or materially misleading omissions. Reject any claim whose citations do "
-    "not support that claim, including its qualifications. For approval return a "
-    "supporting verbatim quote from the cited excerpt in every required PROOF_SLOTS "
+    "not support that claim, including its qualifications. Technical quotations in "
+    "the source language are permitted inside a response framed in RESPONSE_LANGUAGE. "
+    "For approval return a supporting verbatim quote from the cited excerpt in every required PROOF_SLOTS "
     "field. Each field is already bound to its exact claim index and citation ID. "
     "Set reason=supported only for approval. When rejecting, report the main reason "
     "and use an empty string in any field without a supporting quote. "
@@ -137,6 +139,45 @@ def _indication_entry(text, label):
     if not bounds or bounds[-1][1] - bounds[0][0] > MAX_ENTRY_SPAN:
         return None
     return text[bounds[0][0]:bounds[-1][1]]
+
+
+def typed_entry_claims(records, label, language):
+    """Render source-reported types and literal triggers, when variants are explicit."""
+    variants = {}
+    is_italian = language == "it"
+    if not label or language not in {"it", "en"}:
+        return ()
+    for row in records:
+        if row["source_type"] != "document":
+            continue
+        entry = _indication_entry(row["text"], label)
+        if not entry:
+            continue
+        lines = [line.strip() for line in entry.splitlines() if line.strip()]
+        normalized = [_normalize_label(line) for line in lines]
+        for pos, value in enumerate(normalized):
+            if value != "message" or normalized[pos + 1:pos + 2] != [label]:
+                continue
+            end = next((i for i in range(pos + 2, len(lines)) if normalized[i] == "message"), len(lines))
+            fields = normalized[pos + 2:end]
+            if "type" not in fields or "description" not in fields:
+                continue
+            kind_pos = pos + 3 + fields.index("type")
+            desc_pos = pos + 3 + fields.index("description")
+            if not kind_pos < desc_pos < end or normalized[kind_pos] not in INDICATION_TYPES:
+                continue
+            trigger_lines = lines[desc_pos:end]
+            trigger = re.split(r"(?<=[.!?])(?:\s+|$)", " ".join(trigger_lines), maxsplit=1)[0]
+            if not 20 <= len(trigger) <= 220 or trigger not in entry:
+                continue
+            description = (f"Per «{lines[pos + 1]}», la fonte riporta il tipo «{lines[kind_pos]}» e descrive "
+                           f"la condizione così: «{trigger}».") if is_italian else (
+                           f"For ‘{lines[pos + 1]}’, the source lists the type ‘{lines[kind_pos]}’ and states: ‘{trigger}’.")
+            condition = re.sub(r"^this (?:message|warning|alarm|fault) is activated when ", "", _normalize_label(trigger))
+            variants.setdefault((normalized[kind_pos], condition), (description, (row["citation_id"],)))
+    # Keep room for the distinguishing observations independently requested.
+    types = {kind for kind, _ in variants}
+    return tuple(variants.values()) if 2 <= len(types) and len(variants) < MAX_CLAIMS else ()
 
 
 def _documentary_rows(request, profile, rows, neutral_rows, *, source_type, source_text, document_filter):
@@ -313,13 +354,13 @@ def _array(items, limit):
     return {"type": "array", "items": items, "maxItems": limit}
 
 
-def producer_schema(citation_ids):
+def producer_schema(citation_ids, *, max_claims=MAX_CLAIMS):
     claim = _object({
         "text": {"type": "string", "maxLength": MAX_CLAIM_CHARS},
         "citations": _array({"type": "string", "enum": list(citation_ids)}, MAX_CITATIONS),
     })
     return {"name": "machinemind_root_documentary_draft_v1", "strict": True,
-            "schema": _object({"claims": _array(claim, MAX_CLAIMS)})}
+            "schema": _object({"claims": _array(claim, max_claims)})}
 
 
 def freeze_claims(raw, excerpts):
