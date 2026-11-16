@@ -11,6 +11,7 @@ ENDPOINT='https://api.openai.com/v1/responses/input_tokens'
 CREATE_ENDPOINT='https://api.openai.com/v1/responses'
 VERSION='ask-owned-exact-input-count-v1'
 from .request_budget import _V13BudgetExceeded
+from . import ask_fast_stage
 
 class _RevalidationDenied(_V13BudgetExceeded):
     def __init__(self, original):
@@ -24,9 +25,11 @@ _CREATE_KEYS=_INPUT_KEYS|{'store','service_tier','safety_identifier','max_output
 def _wire(value):
     return json.dumps(value,ensure_ascii=False,separators=(',',':'),allow_nan=False).encode('utf-8')
 def _sha(value):return hashlib.sha256(_wire(value)).hexdigest()
-def _projection(payload):
-    if (type(payload)is not dict or not set(payload)<=_CREATE_KEYS or payload.get('model')not in MODELS
-            or payload.get('store')is not False or payload.get('service_tier')!='default'
+def _projection(payload, *, fast_attempt=None):
+    keys=_CREATE_KEYS|{'prompt_cache_options'} if fast_attempt is not None else _CREATE_KEYS
+    valid_profile=(ask_fast_stage.check_payload(fast_attempt,payload) if fast_attempt is not None
+        else type(payload)is dict and payload.get('model')in MODELS and payload.get('service_tier')=='default')
+    if (not valid_profile or not set(payload)<=keys or payload.get('store')is not False
             or payload.get('truncation','disabled')!='disabled'):
         raise ValueError('count_projection')
     if 'instructions'in payload and type(payload['instructions'])is not str:raise ValueError('count_projection')
@@ -75,7 +78,8 @@ class _Session:
         try:
             self.budget.ensure_time(7.)
             planned=deepcopy(payload);planned['max_output_tokens']=requested
-            projection=_projection(planned);encoded=_wire(projection)
+            attempt=ask_fast_stage.current(self.budget,purpose=purpose,model=planned['model'])
+            projection=_projection(planned,fast_attempt=attempt);encoded=_wire(projection)
             from .request_budget import _text_input_bound,_V13OutputCapacityInsufficient
             old_bound=_text_input_bound(payload['input'],payload)[0]
             if len(encoded)>2*1024*1024:return None
@@ -136,32 +140,36 @@ def for_owner(budget):
 
 def eligible_refusal(budget,error,*,purpose,max_output_tokens,model):
     from .request_budget import _V13BudgetExceeded,_V13OutputCapacityInsufficient,_v13_model_rates
-    if purpose not in PURPOSES or model not in MODELS:return False
+    attempt=ask_fast_stage.current(budget,purpose=purpose,model=model)
+    if purpose not in PURPOSES or (attempt is None and model not in MODELS):return False
     full=type(error)is _V13OutputCapacityInsufficient
     useful=(type(error)is _V13BudgetExceeded and str(error)==f'V13 {budget.mode} insufficient reserved cost for useful output')
     if not(full or useful):return False
-    _,rate=_v13_model_rates(model)
+    _,rate=attempt.rates if attempt is not None else _v13_model_rates(model)
     required=max_output_tokens if full else min(800,max_output_tokens)
     return type(required)is int and required>0 and required*rate/1000000<=budget.remaining_cost_usd
 
 def consume(proof,*,budget,purpose,model,payload,requested):
     if type(proof)is not _Proof:raise ValueError('input_count_proof')
     session=proof.session;planned=deepcopy(payload);planned['max_output_tokens']=requested
+    attempt=ask_fast_stage.current(budget,purpose=purpose,model=model)
     with session.lock:
         if (session.budget is not budget or not session.live()or proof not in session.proofs or proof.used
                 or proof.purpose!=purpose or proof.model!=model or proof.requested!=requested
-                or proof.planned_sha!=_sha(planned)or proof.projection_sha!=_sha(_projection(planned))):raise ValueError('input_count_proof')
+                or proof.planned_sha!=_sha(planned)
+                or proof.projection_sha!=_sha(_projection(planned,fast_attempt=attempt))):raise ValueError('input_count_proof')
         proof.used=True
         return proof.tokens
 
 def finalize(proof,*,budget,payload,index):
     if type(proof)is not _Proof:raise ValueError('input_count_proof')
     session=proof.session
+    attempt=ask_fast_stage.current(budget,purpose=proof.purpose,model=proof.model)
     with budget._lock,session.lock:
         cap=payload.get('max_output_tokens');planned=deepcopy(payload);planned['max_output_tokens']=proof.requested
         if (session.budget is not budget or not session.live()or proof not in session.proofs or not proof.used or proof.finalized
                 or type(cap)is not int or not 0<cap<=proof.requested or _sha(planned)!=proof.planned_sha
-                or _sha(_projection(payload))!=proof.projection_sha):raise ValueError('input_count_final_payload')
+                or _sha(_projection(payload,fast_attempt=attempt))!=proof.projection_sha):raise ValueError('input_count_final_payload')
         row=budget._row(index)
         if (row['accounting_state']!='pending'or row['dispatched']or row['model']!=proof.model
                 or row['purpose']!=proof.purpose or cap!=row['max_output_tokens']):raise ValueError('input_count_final_payload')

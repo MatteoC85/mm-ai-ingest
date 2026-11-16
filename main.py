@@ -13915,12 +13915,14 @@ def _assistant_core_deterministic_router_fallback(
 
 def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) -> dict:
     from machinemind.ask.request_completion import current as _current_ask_completion
+    from machinemind.retrieval import root_router_wire
     protected_ask_catalog = bool(request.requested_mode == MODE_ASK and _current_ask_completion() is not None)
     specific_assertions_wire = bool(protected_ask_catalog
         and tuple(request.allowed_effective_modes) == (MODE_ASK,))
     is_root_cause = (
         str(request.requested_mode or "").strip().lower() == MODE_ROOT_CAUSE
     )
+    compact_root = is_root_cause and request.allowed_effective_modes == (MODE_ROOT_CAUSE, MODE_ASK)
     profile = (
         _retrieval_diagnostic_query.analyze_diagnostic_query(
             request.query, response_language=request.response_language
@@ -14045,7 +14047,11 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
             "selected_procedure_parent_id to null. Do not force optional evidence citations "
             "to identify an operation. Selecting a parent grants no authority and "
             "does not assert factual, safety or phase coverage.")
-    if is_root_cause:
+    if compact_root:
+        system_msg = (root_router_wire.SYSTEM_INSTRUCTION
+                      + _retrieval_diagnostic_query.DIAGNOSTIC_BASIS_INSTRUCTION
+                      + root_router_wire.WIRE_INSTRUCTION)
+    elif is_root_cause:
         # Factual arrays are constructed from the verified partition, not generated
         # a second time with potentially different wording.
         system_msg = system_msg.replace(
@@ -14157,6 +14163,8 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
         if ask_router_plan is not None:
             router_schema = _ask_router_wire.schema(canonical_router_schema)
             system_msg += _ask_router_wire.INSTRUCTION
+        elif compact_root:
+            router_schema = root_router_wire.schema(canonical_router_schema)
         parsed, model_used = _v13_json_models(
             [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
             models=router_models,
@@ -14174,9 +14182,12 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
                 model_used=model_used,
                 elapsed_seconds=round(time_module.monotonic() - router_started, 3),
             )
-        out = (_ask_router_wire.expand(parsed, canonical_router_schema,
-                   allowed_effective_modes=request.allowed_effective_modes)
-               if ask_router_plan is not None else dict(parsed or {}))
+        if compact_root:
+            out = root_router_wire.expand(parsed, canonical_router_schema, router_schema)
+        else:
+            out = (_ask_router_wire.expand(parsed, canonical_router_schema,
+                       allowed_effective_modes=request.allowed_effective_modes)
+                   if ask_router_plan is not None else dict(parsed or {}))
         if procedure_catalog_ids:
             selected_parent = out.get("selected_procedure_parent_id")
             # Do not repair whitespace/types or accept an un-emitted catalog ID.

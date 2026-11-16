@@ -368,6 +368,7 @@ def generate_ask_response(
     parsed: dict = {}
     model_used = model
     from .request_completion import begin_private_ordinary_writer, finish_private_ordinary_writer
+    from ..infrastructure import ask_fast_stage
     private_writer = None
     try:
         writer_messages = [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}]
@@ -379,17 +380,19 @@ def generate_ask_response(
                 "max_output_tokens": V13_HEAVY_MAX_OUTPUT_TOKENS if policy_model == V13_HEAVY_MODEL else V13_FAST_MAX_OUTPUT_TOKENS,
                 "timeout": V13_HEAVY_TIMEOUT_SECONDS if policy_model == V13_HEAVY_MODEL else V13_FAST_TIMEOUT_SECONDS})
             if runtime.preserve_procedure_points else None)
-        parsed, model_used = _v13_json_models(
-            writer_messages,
-            models=writer_models,
-            json_schema=writer_schema,
-            effort=effort,
-            reasoning_mode=reasoning_mode,
-            timeout=V13_HEAVY_TIMEOUT_SECONDS if policy_model == V13_HEAVY_MODEL else V13_FAST_TIMEOUT_SECONDS,
-            max_output_tokens=V13_HEAVY_MAX_OUTPUT_TOKENS if policy_model == V13_HEAVY_MODEL else V13_FAST_MAX_OUTPUT_TOKENS,
-            company_id=company_id,
-            purpose="ask_final_synthesis",
-        )
+        with ask_fast_stage.allow(ask_fast_stage.WRITER,
+                eligible=source_backed_composition and (finite_factual_composition or conditions_numeric_composition)):
+            parsed, model_used = _v13_json_models(
+                writer_messages,
+                models=writer_models,
+                json_schema=writer_schema,
+                effort=effort,
+                reasoning_mode=reasoning_mode,
+                timeout=V13_HEAVY_TIMEOUT_SECONDS if policy_model == V13_HEAVY_MODEL else V13_FAST_TIMEOUT_SECONDS,
+                max_output_tokens=V13_HEAVY_MAX_OUTPUT_TOKENS if policy_model == V13_HEAVY_MODEL else V13_FAST_MAX_OUTPUT_TOKENS,
+                company_id=company_id,
+                purpose="ask_final_synthesis",
+            )
         finish_private_ordinary_writer(private_writer, actual_reply=parsed, model_used=model_used)
     except _V13BudgetExceeded:
         raise

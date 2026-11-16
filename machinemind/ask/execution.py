@@ -37,6 +37,7 @@ from .request_completion import synthesis_review_reserve as _synthesis_review_re
 from .request_completion import independent_review_reserve as _independent_review_reserve
 from ..evidence.ask_input import AskEvidenceAdmission, apply_ask_evidence_input, ask_request_key
 from ..evidence.contracts import EvidenceContractError, SourceIdentity
+from ..infrastructure import ask_fast_stage
 from ..retrieval.ask_composition import AskEvidenceSession, AskSelection
 
 if TYPE_CHECKING:
@@ -818,6 +819,7 @@ def verify_or_repair_answer(
         f"FACET_CONTRACTS: {json.dumps(facet_contracts, ensure_ascii=False)}\n"
     )
     finite_wire = None
+    review_source_prompt = sources_block
     mandatory_types = {item.answer_type for item in decision.facet_queries if item.must_cover is True}
     if (protected_budget and runtime.preserve_procedure_context and packet is not None
             and review_evidence_diagnostic.get("complete_primary_representation") is True
@@ -848,6 +850,9 @@ def verify_or_repair_answer(
                     < wire_bytes(coverage_block + sources_block)):
                 coverage_block = compact_coverage
                 system_msg += _finite_review_wire.INSTRUCTIONS
+                # Compress only the accepted prompt view. The original packet
+                # and source labels still bind citations and final grounding.
+                review_source_prompt = _review_source_wire.compact_sources_block(finite_wire.sources)
             else:
                 finite_wire = None
     if original_retain_only and (
@@ -890,7 +895,7 @@ def verify_or_repair_answer(
            if factual_list_review else
             ("CURRENT_ANSWER_FORMAT: lossless PROCEDURE_BLOCKS\n\n"
              f"SOURCES:\n{reference_source_view}\n\n" if reference_catalogue is not None else
-             f"CURRENT_ANSWER:\n{answer}\n\nSOURCES:\n{finite_wire.sources if finite_wire else sources_block}\n\n"))
+             f"CURRENT_ANSWER:\n{answer}\n\nSOURCES:\n{review_source_prompt}\n\n"))
         +
         "Return only the required JSON."
     )
@@ -1016,9 +1021,15 @@ def verify_or_repair_answer(
             "reasoning_mode": "", "max_output_tokens": min(4000, max(3200, V13_FAST_MAX_OUTPUT_TOKENS))})
         if _guarded(runtime, request, decision) and not independent_context_review else None)
     try:
+        fast_first_review = bool(protected_budget and reviewed_draft is not None and answer.strip()
+            and getattr(runtime.evidence_observer, "verifier_calls", None) == 0
+            and not (factual_list_review or source_ordered_review or original_retain_only
+                or repair_first_contract or repair_missing_facets
+                or repair_missing_answer_types or repair_missing_list_items))
         # A source-first producer cannot also be its own final semantic check.
         # Reserve the follow-up window across every initial provider fallback.
-        with (_independent_review_reserve(required=True) if independent_context_review else nullcontext()):
+        with (_independent_review_reserve(required=True) if independent_context_review else nullcontext(),
+                ask_fast_stage.allow(ask_fast_stage.REVIEW, eligible=fast_first_review)):
             parsed, model_used = _v13_json_models(
                 review_messages,
                 models=review_models,

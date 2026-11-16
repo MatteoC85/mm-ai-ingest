@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 sys.path[:0] = [str(Path(__file__).resolve().parents[1]), str(Path(__file__).resolve().parent)]
 from machinemind.ask import finite_review_wire as wire
+from machinemind.ask import review_source_wire
 import test_ask_procedure_context_recovery as actual
 import test_ask_router_family_context as route
 
@@ -104,6 +105,21 @@ class FiniteReviewWireTests(unittest.TestCase):
                 self.assertIsNone(wire.prepare(sources, **common))
         self.assertIsNone(wire.prepare(f"{header}\nBody", **{**common, "answer": "Literal @f1"}))
 
+    def test_line_dictionary_keeps_each_source_header_and_restores_literal_text(self):
+        ids = tuple(f"manual-{index}:p{index}-{index}:c0" for index in range(1, 4))
+        shared = "Before work, verify the recorded isolation for this configuration. " * 9
+        original = "\n\n".join(
+            f"[{cid}] source_type=document; doc=manual-{index}; p={index}-{index}\n"
+            f"Applicable configuration {index}.\n{shared}\nPreserve this location."
+            for index, cid in enumerate(ids, 1))
+        frame = wire.prepare(original, citation_ids=ids, facets=("initial checks",), types=("checklist",),
+                             question="Which checks apply?", answer="Review the existing record.")
+        compressed = review_source_wire.compact_sources_block(frame.sources)
+        self.assertLess(payload_bytes(compressed), payload_bytes(frame.sources))
+        self.assertEqual(review_source_wire.restore_sources_block(compressed), frame.sources)
+        self.assertEqual(re.findall(r"^\[(@s[0-9]+)\] source_type=", compressed, flags=re.MULTILINE),
+                         [label for _, label in frame.source_labels])
+
     def test_actual_owned_core_first_review_uses_shorter_input_and_same_semantic_guards(self):
         captures = {False: [], True: []}
         original = route.RouterFixture.run_core
@@ -123,7 +139,8 @@ class FiniteReviewWireTests(unittest.TestCase):
                         frame = prepare_wire(packet.sources, citation_ids=source_ids,
                             facets=tuple(labels["FACET_LABELS"].values()),
                             types=tuple(labels["ANSWER_TYPE_LABELS"].values()), question="", answer="")
-                        self.assertTrue(sources.startswith(frame.sources + "\n\n"))
+                        source_wire = sources.partition("\n\nReturn only the required JSON.")[0]
+                        self.assertEqual(review_source_wire.restore_sources_block(source_wire), frame.sources)
                         restored = re.sub(r"^\[(@s[0-9]+)\] source_type=",
                             lambda match: "[" + dict((alias, cid) for cid, alias in frame.source_labels)[match[1]]
                             + "] source_type=", frame.sources, flags=re.MULTILINE)

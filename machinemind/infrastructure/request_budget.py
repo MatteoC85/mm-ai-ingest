@@ -223,7 +223,17 @@ class _V13RequestBudget:
             if self.llm_calls >= self.max_llm_calls:
                 raise _V13BudgetExceeded(f"V13 {self.mode} LLM call budget exhausted ({self.llm_calls}/{self.max_llm_calls})")
             bound, approx = _text_input_bound(messages, request_payload)
-            input_rate, output_rate = (_positive_rate(v) for v in _v13_model_rates(model))
+            from . import ask_fast_stage
+            fast_attempt = ask_fast_stage.current(self, purpose=purpose, model=model)
+            if fast_attempt is not None:
+                if (not ask_fast_stage.check_payload(fast_attempt, request_payload)
+                        or bound > ask_fast_stage.MAX_SHORT_INPUT_TOKENS):
+                    raise _V13BudgetExceeded("Invalid ASK Fast reservation payload")
+                input_rate, output_rate = fast_attempt.rates
+            else:
+                if request_payload is not None and request_payload.get("service_tier") == "fast":
+                    raise _V13BudgetExceeded("Unowned ASK Fast reservation")
+                input_rate, output_rate = (_positive_rate(v) for v in _v13_model_rates(model))
             # Preserve the existing configured cache-write premium (1.25). Reserve
             # worst-case input; settle actual cache details only when usage arrives.
             input_cost = bound * input_rate * 1.25 / 1_000_000.0
@@ -265,6 +275,9 @@ class _V13RequestBudget:
                    "accounting_state": "pending", "dispatched": False,
                    "input_rate": input_rate, "output_rate": output_rate,
                    "pricing_basis": ("configured_model_rates" if any(name in str(model).lower() for name in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")) else "configured_sol_fallback_not_verified_tariff"), "started_at_elapsed_seconds": round(self.elapsed(), 3)}
+            if fast_attempt is not None:
+                row.update(pricing_basis=ask_fast_stage.VERSION, configured_model=fast_attempt.configured_model,
+                           requested_service_tier="fast", requested_prompt_cache_ttl="30m")
             self.call_log.append(row)
             return timeout, cap, self.llm_calls
 
@@ -325,9 +338,17 @@ class _V13RequestBudget:
             row["reservation_exceeded"] = True
             self.accounting_anomalies.append("provider_usage_exceeded_reservation")
 
-    def record_usage(self, call_index: int, model: str, usage: dict) -> None:
+    def record_usage(self, call_index: int, model: str, usage: dict, *, provider_model=None) -> None:
         with self._lock:
             row = self._row(call_index)
+            from . import ask_fast_stage
+            fast = row.get("pricing_basis") == ask_fast_stage.VERSION
+            if fast:
+                if (row.get("provider_service_tier") not in ask_fast_stage.TIERS
+                        or not ask_fast_stage.response_model_matches(row["model"], provider_model)):
+                    row["usage_source"] = "unverified_fast_provider_identity"
+                    raise _V13BudgetExceeded("ASK Fast provider identity or tier is uncertain")
+                row["provider_model"] = provider_model
             if str(model) != row["model"]:
                 self.accounting_anomalies.append("usage_model_mismatch")
                 row["accounting_state"] = "uncertain" if row["accounting_state"] == "pending" else row["accounting_state"]
@@ -347,6 +368,8 @@ class _V13RequestBudget:
                 if row["accounting_state"] == "pending":
                     row["accounting_state"] = "uncertain"
                     row["usage_source"] = "missing_or_invalid"
+                if fast:
+                    raise _V13BudgetExceeded("ASK Fast usage is uncertain")
                 return
             cost = ((input_tokens - cached - writes) * row["input_rate"] + cached * row["input_rate"] * 0.10 + writes * row["input_rate"] * 1.25 + output_tokens * row["output_rate"]) / 1_000_000.0
             counters = dict(input_tokens=input_tokens, cached_input_tokens=cached, cache_write_tokens=writes, output_tokens=output_tokens, reasoning_tokens=reasoning)
@@ -354,6 +377,8 @@ class _V13RequestBudget:
             if input_tokens > row["reserved_input_tokens"] or output_tokens > row["max_output_tokens"]:
                 row["token_bound_exceeded"] = True
                 self.accounting_anomalies.append("provider_tokens_exceeded_limit")
+                if fast:
+                    raise _V13BudgetExceeded("ASK Fast usage exceeded the reservation")
 
     def grant_retry_allowance(self, *, failed_attempts: int, reason: str) -> int:
         with self._lock:

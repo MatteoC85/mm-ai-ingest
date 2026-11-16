@@ -15,6 +15,7 @@ from collections.abc import Callable
 from typing import Any, Optional, Type
 from machinemind.ask.phase_trace import span as _phase_span
 from machinemind.ask.request_completion import provider_timeout as _provider_timeout
+from . import ask_fast_stage
 from .provider_failures import ProviderResponseError, http_failure, response_status_failure
 from .request_budget import _V13OutputCapacityInsufficient, _V13BudgetExceeded
 
@@ -160,7 +161,11 @@ def _send_json_attempt(*, url, headers, payload, timeout, post_fn, budget,
                 budget.record_embedding_usage(call_index, usage, cache_hits=cache_hits)
             else:
                 _record_service_tier(budget, call_index, payload, data)
-                budget.record_usage(call_index, str(payload["model"]), usage)
+                if payload.get("service_tier") == "fast":
+                    budget.record_usage(call_index, str(payload["model"]), usage,
+                        provider_model=data.get("model") if isinstance(data, dict) else None)
+                else:
+                    budget.record_usage(call_index, str(payload["model"]), usage)
         if response.status_code != 200:
             raise http_failure(response.status_code)
         if not isinstance(data, dict):
@@ -366,6 +371,14 @@ def responses_json(messages: list[dict], *, model: str, json_schema: dict, effor
     _standard_service_tier(payload, url)
     if reasoning_mode:
         payload["reasoning"]["mode"] = reasoning_mode
+    fast_attempt = ask_fast_stage.current(budget, purpose=purpose, model=model)
+    if fast_attempt is not None:
+        from .request_budget import _text_input_bound
+        if url != ask_fast_stage.ENDPOINT:
+            raise ask_fast_stage.UnsupportedEnvelope()
+        payload.update(service_tier="fast", prompt_cache_options={"ttl": "30m"})
+        if _text_input_bound(messages, payload)[0] > ask_fast_stage.MAX_SHORT_INPUT_TOKENS:
+            raise ask_fast_stage.UnsupportedEnvelope()
     timeout = _provider_timeout(purpose, timeout)
     proof = None
     try:
@@ -416,6 +429,10 @@ def responses_json(messages: list[dict], *, model: str, json_schema: dict, effor
         return parsed
     except BaseException as exc:
         budget.mark_call_failed(index, exc)
+        if fast_attempt is not None and isinstance(exc, Exception):
+            with budget._lock:
+                if budget._row(index)["accounting_state"] == "uncertain":
+                    raise _V13BudgetExceeded("ASK Fast provider accounting is uncertain") from None
         raise
 
 
@@ -435,12 +452,27 @@ def json_models(messages: list[dict], *, models: list[str], json_schema: dict, e
         if budget is None:
             raise RuntimeError("V13 budget context missing")
         calls_before = int(budget.llm_calls)
+        dispatch_model = model
         try:
             if str(model).startswith("gpt-5.6"):
-                parsed = responses_json_fn(messages, model=model, json_schema=json_schema, effort=effort,
-                                           reasoning_mode=reasoning_mode, timeout=timeout, max_output_tokens=max_output_tokens,
-                                           company_id=company_id, purpose=purpose,
-                                           **({"require_full_output": True} if require_full_output else {}))
+                def invoke(actual_model):
+                    return responses_json_fn(messages, model=actual_model, json_schema=json_schema, effort=effort,
+                        reasoning_mode=reasoning_mode, timeout=timeout, max_output_tokens=max_output_tokens,
+                        company_id=company_id, purpose=purpose,
+                        **({"require_full_output": True} if require_full_output else {}))
+
+                attempt = ask_fast_stage.select(budget, purpose=purpose, model=model, candidates=candidates,
+                    json_schema=json_schema, company_id=company_id)
+                if attempt is not None:
+                    try:
+                        dispatch_model = attempt.model
+                        with ask_fast_stage.bind(attempt):
+                            parsed = invoke(dispatch_model)
+                    except ask_fast_stage.UnsupportedEnvelope:
+                        dispatch_model = model
+                        parsed = invoke(dispatch_model)
+                else:
+                    parsed = invoke(dispatch_model)
             else:
                 # This delegate now reserves, caps and settles its own receipt, exactly
                 # like Responses. Never fake an empty usage receipt after success.
@@ -449,7 +481,7 @@ def json_models(messages: list[dict], *, models: list[str], json_schema: dict, e
                                       **({"require_full_output": True} if require_full_output else {}))
             if failed_attempts:
                 budget.grant_retry_allowance(failed_attempts=failed_attempts, reason=f"{purpose}:model_fallback_succeeded")
-            return parsed, model
+            return parsed, dispatch_model
         except _RevalidationDenied as denied:
             raise denied.original from None  # preserve authority category without any provider fallback
         except _V13OutputCapacityInsufficient as exc:
@@ -464,7 +496,7 @@ def json_models(messages: list[dict], *, models: list[str], json_schema: dict, e
             last_capacity_error = None
             if int(budget.llm_calls) > calls_before:
                 failed_attempts += 1
-            errors.append(f"{model}: {type(exc).__name__}: {str(exc)[:300]}")
+            errors.append(f"{dispatch_model}: {type(exc).__name__}: {str(exc)[:300]}")
     if last_capacity_error is not None:
         raise last_capacity_error
     raise RuntimeError("All V13 model calls failed: " + " | ".join(errors)[:1800])

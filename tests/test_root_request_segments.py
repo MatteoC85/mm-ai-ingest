@@ -319,6 +319,95 @@ class ActualRootRouterSegmentTests(unittest.TestCase):
         self.assertIn("technical failure", result["clarification_question"])
         self.assertEqual(req.metadata[dq.BASIS_METADATA_KEY]["reason"], "router_execution_failed")
 
+    def test_dedicated_compact_root_round_trips_all_fields_and_preserves_admission(self):
+        from dataclasses import replace
+        from machinemind.retrieval import root_router_wire as wire
+
+        m = self.m
+        modes = ("root_cause", "ask")
+        canonical_schema = dq.router_schema_with_diagnostic_basis(build_router_schema(modes), original_query=QUERY)
+        compact_schema = wire.schema(canonical_schema)
+        raw = reply()
+        for part in raw["diagnostic_basis"]["request_parts"]:
+            part.setdefault("retrieval_aliases", [])
+        for name, rule in canonical_schema["schema"]["properties"].items():
+            if name not in raw:
+                raw[name] = {"array": [], "string": "", "number": 0.85, "boolean": True}.get(rule.get("type"))
+        raw.update(request_kind="fault_diagnostic", information_task="fault_diagnostic", confidence=0.95,
+                   evidence_policy="machine_sources_required", source_type_policy="prefer",
+                   documentary_request_parts=[3], documentary_open_applicability={"label_part": 1, "gap_parts": [2]},
+                   missing_information=["clamp closure"], required_facets=["operator record"],
+                   facet_queries=[{"facet": "operator record", "answer_type": "checklist", "must_cover": True,
+                                   "dense_queries": ["checked observation"], "lexical_queries": ["observed clamp"],
+                                   "exact_terms": ["clamp"], "preferred_source_types": ["document"]}])
+
+        def encode(value, path=()):
+            if type(value) is list:
+                return [encode(item, path) for item in value]
+            if type(value) is dict:
+                return {wire._FIELDS[path][key]: encode(item, (*path, key)) for key, item in value.items()}
+            return value
+
+        captured = []
+        def routed(*, compact, case_raw=raw, query=QUERY, malformed=False):
+            req = replace(self.request(), query=query, allowed_effective_modes=modes if compact else tuple(reversed(modes)))
+            def provider(messages, **options):
+                captured.append((messages, options))
+                model_result = encode(case_raw) if compact else deepcopy(case_raw)
+                if malformed:
+                    model_result["b"]["h"] = "0" * 64
+                return model_result, "offline"
+            with patch.object(m, "_v13_json_models", provider), patch.object(
+                    m, "_v13_gate_candidate_block", return_value=("Exact source body, punctuation and order.", [])):
+                result = m._assistant_core_router_call(req, {})
+            return req, result
+
+        self.assertEqual(wire.expand(encode(raw), canonical_schema, compact_schema), raw)
+        legacy_request, legacy = routed(compact=False)
+        compact_request, compact = routed(compact=True)
+        self.assertEqual(compact, legacy)
+        self.assertEqual(compact_request.metadata[dq.BASIS_METADATA_KEY], legacy_request.metadata[dq.BASIS_METADATA_KEY])
+        self.assertTrue(compact_request.metadata[dq.BASIS_METADATA_KEY]["admitted"])
+        self.assertEqual(compact_request.metadata[dq.BASIS_METADATA_KEY]["validation_error"], "")
+        self.assertEqual(compact["diagnostic_exclusions"], [])  # requested unknown is no negative result
+        self.assertEqual(compact["diagnostic_observables"], [SEGMENTS[1][1]])
+        self.assertEqual(len(captured), 2)
+        old_messages, old_options = captured[0]
+        new_messages, new_options = captured[1]
+        self.assertLess(len(new_messages[0]["content"]), len(old_messages[0]["content"]))
+        self.assertEqual(new_messages[1]["content"].split("USER_REQUEST:", 1)[1],
+                         old_messages[1]["content"].split("USER_REQUEST:", 1)[1])
+        self.assertEqual({k: v for k, v in new_options.items() if k != "json_schema"},
+                         {k: v for k, v in old_options.items() if k != "json_schema"})
+        self.assertEqual(new_options["json_schema"], compact_schema)
+        invalid = encode(raw)
+        invalid["b"]["p"][1]["r"] = "not_allowed"
+        with self.assertRaises(wire.RouterWireError):
+            wire.expand(invalid, canonical_schema, compact_schema)
+        wrong_source = encode(raw)
+        wrong_source["b"]["h"] = "0" * 64
+        with self.assertRaises(wire.RouterWireError):
+            wire.expand(wrong_source, canonical_schema, compact_schema)
+
+        query = "Where is the machine's alarm history available?"
+        factual = reply(query, [("request", query, "context")], state="not_diagnostic", mode="ask")
+        factual = {**raw, **factual, "request_kind": "factual", "information_task": "interface_navigation",
+                   "required_answer_types": ["interface_locations"], "documentary_request_parts": [],
+                   "documentary_open_applicability": None}
+        for part in factual["diagnostic_basis"]["request_parts"]:
+            part["retrieval_aliases"] = []
+        factual_request, returned = routed(compact=True, case_raw=factual, query=query)
+        self.assertEqual(returned["effective_mode"], "ask")
+        self.assertEqual(factual_request.metadata[dq.BASIS_METADATA_KEY]["reason"], "non_diagnostic_request")
+        self.assertFalse(m._assistant_core_diagnostic_query_profile(factual_request).diagnostic_projection)
+
+        captures_before = len(captured)
+        rejected, prohibited = routed(compact=True, malformed=True)
+        self.assertEqual(len(captured), captures_before + 1)
+        self.assertEqual(prohibited["evidence_state"], "clarify")
+        self.assertEqual(prohibited["relevant_evidence_ids"], [])
+        self.assertEqual(rejected.metadata[dq.BASIS_METADATA_KEY]["reason"], "router_execution_failed")
+
     def test_documentary_rejection_has_only_one_sealed_claim_in_internal_debug(self):
         from dataclasses import replace
         from machinemind.retrieval import root_documentary_diagnostics

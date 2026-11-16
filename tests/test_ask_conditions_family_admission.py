@@ -15,7 +15,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path[:0] = [str(Path(__file__).resolve().parents[1]), str(Path(__file__).resolve().parent)]
-from machinemind.ask import execution, validation, procedure_review, request_completion
+from machinemind.ask import execution, validation, procedure_review, request_completion, review_source_wire
 from machinemind.infrastructure import request_budget, openai_transport
 from machinemind.evidence.contracts import EvidenceContractError, SourceIdentity, SourceScope, SourceType, SourceFormat, ScopeLevel
 from machinemind.retrieval.ask_composition import AskEvidenceSession, AskSessionLimits, AskSelection
@@ -208,8 +208,16 @@ class OwnedFamilyFixture:
 
     def reviewer(self, messages, **kwargs):
         self.calls.append(('reviewer', deepcopy(messages), deepcopy(kwargs)))
-        self.review_packets.append(messages[1]['content'])
         wire = messages[1]['content']
+        source_view = wire
+        if '\nFACET_LABELS:' in wire:
+            prefix, marker, suffix = wire.partition('\n\nSOURCES:\n')
+            source, end, tail = suffix.partition('\n\nReturn only the required JSON.')
+            self.test.assertTrue(marker and end)
+            # Body assertions use the logical text. self.calls keeps the exact
+            # provider presentation for the wire and accounting comparisons.
+            source_view = prefix + marker + review_source_wire.restore_sources_block(source) + end + tail
+        self.review_packets.append(source_view)
         block_view = None
         if '\n\nPROCEDURE_BLOCKS:\n' in wire:
             block_view, _ = json.JSONDecoder().raw_decode(wire.split('\n\nPROCEDURE_BLOCKS:\n', 1)[1])
