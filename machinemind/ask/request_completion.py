@@ -29,6 +29,11 @@ def _monotonic() -> float:
 
 VERSION = "ask-completion-through-publication-v1"
 PHASE6_CANDIDATE_VERSION = "phase6-closure-2026-09-29-v1"
+_TIMING_LOG_PHASES = frozenset({
+    "authority.initial", "core.neutral", "core.router", "core.refine", "core.prepare",
+    "core.synthesis", "core.validate", "core.repair", "flow.cache_store",
+    "flow.publication", "provider.llm", "provider.embedding",
+})
 _ACTIVE = ContextVar("mm_ask_request_completion", default=None)
 _CACHE_WINDOW = ContextVar("mm_ask_optional_cache_window", default=None)
 _REVIEW_RESERVE = ContextVar("mm_ask_synthesis_review_reserve", default=None)
@@ -778,6 +783,21 @@ class RequestCompletion:
                     result['meta']['private_factual_review_diagnostics'] = deepcopy(self._private_review_envelope)
             except Exception:
                 pass  # Diagnostic failure never changes publication/accounting.
+        if current() is self and getattr(self.payload, "debug", False) is True:
+            # Log only the request-owned, fixed-name timing data. A response
+            # transport error can otherwise discard the entire client trace.
+            try:
+                trace = result["meta"]["ask_phase_trace"]
+                spans = [[phase["phase"], phase["started_seconds"], phase["wall_seconds"],
+                          phase["thread_cpu_seconds"], phase["outcome"]]
+                         for phase in trace["spans"] if phase["phase"] in _TIMING_LOG_PHASES]
+                print("V13_ASK_PHASE_TIMING " + json.dumps({
+                    "elapsed_seconds": trace["elapsed_seconds"],
+                    "dropped_macro_spans": trace["dropped_macro_spans"],
+                    "spans": spans[:32],
+                }, separators=(",", ":"), allow_nan=False))
+            except (KeyError, OSError, TypeError, ValueError):
+                pass
         if str(result.get("status") or "").lower() == "answered":
             # Metadata/trace serialization belongs to this request too. A
             # callback or scheduler pause after the entry check cannot release

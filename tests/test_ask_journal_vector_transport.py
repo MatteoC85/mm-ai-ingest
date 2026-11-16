@@ -1,5 +1,6 @@
 """Exact, bounded private transport for already-owned ASK embedding vectors."""
 from dataclasses import replace
+import json
 from pathlib import Path
 import sys
 import unittest
@@ -84,6 +85,58 @@ class AskJournalVectorTransportTests(unittest.TestCase):
         self.assertEqual(tuple(first["embedding"]), tuple(vector))
         first["embedding"][0] = 100.0
         self.assertNotEqual(first["embedding"][0], vector[0])
+
+
+class AskJournalPublicWireTests(unittest.TestCase):
+    def test_debug_response_with_dense_candidate_details_is_json_serializable(self):
+        from test_ask_conditions_pipeline import AskConditionsPipelineTests
+        from test_ask_router_family_context import AskRouterFamilyContextTests, RouterFixture
+        from machinemind.retrieval.ask_composition import AskSelection
+        from machinemind.retrieval.chunk_evidence import _source_from_columns, build_chunk_read
+        from machinemind.retrieval.dense import raw_rows_to_dense_candidates
+
+        fixtures = AskRouterFamilyContextTests
+        fixtures.setUpClass()
+        self.addCleanup(fixtures.tearDownClass)
+        self.m = fixtures.m
+        request_decision = AskConditionsPipelineTests.request_decision
+
+        def debug_request(fixture, language="en"):
+            request, decision = request_decision(fixture, language)
+            return replace(request, debug=True), decision
+
+        with patch.object(AskConditionsPipelineTests, "request_decision", debug_request):
+            owner = RouterFixture(self)
+        self.addCleanup(owner.close)
+        self.assertIs(owner.request.debug, True)
+        company, machine = owner.request.company_id, owner.request.machine_id
+        source = "manual-journal-transport"
+        owner.allowance |= frozenset({_source_from_columns(company, machine, source)})
+        _, limits = owner.session.read_contract(request=owner.request,
+                                                current_allowed_sources=owner.allowance)
+        body = "Before installing a cartridge, verify energy isolation and use trained personnel."
+        vector = [-0.0, 0.2, 0.5] * 512
+        row = (source, 0, 1, 1, body, body, 0.88, vector, True)
+        receipt = build_chunk_read(scope=owner.scope, kind="dense", rows=[(*row, company, machine)],
+            candidates=raw_rows_to_dense_candidates([row]), limits=limits)
+        registered = owner.session.register(request=owner.request, receipt=receipt,
+                                             current_allowed_sources=owner.allowance)
+        record, = owner.session.records(request=owner.request, handles=registered.records,
+                                        current_allowed_sources=owner.allowance)
+        candidates = [*owner.prepared["candidates"], dict(record.record)]
+        owner.prepared.update(candidates=candidates, citations=candidates)
+        handles = owner.owner._selection[0].records + registered.records
+        owner.owner._selection = (AskSelection("candidates", handles), AskSelection("citations", handles))
+
+        result = owner.run_core()
+        self.assertEqual(result["status"], "answered")
+        self.assertEqual([call[0] for call in owner.calls], ["router", "writer", "reviewer"])
+        payload = json.loads(json.dumps(result, ensure_ascii=False))
+        details = payload["meta"]["assistant_core_evidence_admission"]["deterministic_signals"]["candidates"]
+        document = next(item for item in details if item["bubble_document_id"] == source)
+        self.assertEqual(document["chunk_full"], body)
+        self.assertEqual(document["embedding_list"], vector)
+        self.assertEqual(document["embedding_list"][0].hex(), "-0x0.0p+0")
 
 
 if __name__ == "__main__":

@@ -88,7 +88,10 @@ def replay(case,output_tokens,*,free_post=None,include_real_manual_pool=True,bou
    if boundary_padding and kw['purpose']=='ask_final_synthesis':
     messages=deepcopy(messages);messages[0]['content']+='\n'*boundary_padding
    if kw['purpose']=='ask_final_synthesis':
-    case.assertEqual(selected,'gpt-5.6-terra');case.assertEqual(kw['effort'],'low')
+    # This pinned replay asks for numeric limits and initial checks from the
+    # authorized operation family. It uses the finite-conditions draft profile.
+    case.assertEqual(h.decision.procedure_scope,'conditions_only')
+    case.assertEqual(selected,'gpt-5.6-terra');case.assertEqual(kw['effort'],'none')
     case.assertEqual(kw['max_output_tokens'],6000)
    if kw['purpose']=='assistant_core_answer_contract_verifier':case.assertEqual(selected,'gpt-5.6-terra')
    def post(url,**options):

@@ -24,6 +24,7 @@ from . import final_contract as _final_contract
 from . import enumeration_review as _enumeration_review
 from . import source_table_review as _source_table_review
 from . import factual_context_review as _factual_context_review
+from . import finite_review_wire as _finite_review_wire
 from . import review_source_wire as _review_source_wire
 from . import phase_trace
 from .numeric_premise_contract import NUMERIC_PREMISE_CORRECTION_INSTRUCTION
@@ -808,6 +809,47 @@ def verify_or_repair_answer(
     operation_boundary = bool(compact_review)
     review_facets = list(dict.fromkeys(list(decision.required_facets) + [
         item.facet for item in decision.facet_queries if item.must_cover]))
+    facet_contracts = [{'facet': item.facet, 'answer_type': item.answer_type, 'must_cover': item.must_cover}
+                       for item in decision.facet_queries if not conditions_only or item.must_cover]
+    coverage_block = (
+        f"REQUIRED_ANSWER_TYPES: {json.dumps(requirements, ensure_ascii=False)}\n"
+        f"HARD_REQUIREMENTS: {json.dumps(hard_requirements, ensure_ascii=False)}\n"
+        f"REQUIRED_FACETS: {json.dumps(list(decision.required_facets), ensure_ascii=False)}\n"
+        f"FACET_CONTRACTS: {json.dumps(facet_contracts, ensure_ascii=False)}\n"
+    )
+    finite_wire = None
+    mandatory_types = {item.answer_type for item in decision.facet_queries if item.must_cover is True}
+    if (protected_budget and runtime.preserve_procedure_context and packet is not None
+            and review_evidence_diagnostic.get("complete_primary_representation") is True
+            and review_evidence_diagnostic.get("reused_request_packet") is False
+            and review_evidence_diagnostic.get("required_records") == len(ordered_candidates)
+            and not source_ordered_review and not original_retain_only and not factual_list_review
+            and not (repair_first_contract or repair_missing_facets
+                     or repair_missing_answer_types or repair_missing_list_items)
+            and V13_FAST_MODEL == "gpt-5.6-terra"
+            and answer.strip() and not (catalog_digest or enumeration_requested)
+            and decision.request_kind in {"factual", "procedure"}
+            and decision.procedure_scope == "conditions_only" and not any(decision.procedure_phase)
+            and decision.information_task in {"numeric_specification", INFO_PROCEDURE_SEGMENT}
+            and decision.required_answer_types and REQ_NUMERIC_VALUE in mandatory_types
+            and mandatory_types & {REQ_CHECKLIST, REQ_SAFETY_CONDITIONS}
+            and set(requirements) <= {REQ_NUMERIC_VALUE, REQ_CHECKLIST, REQ_SAFETY_CONDITIONS, "explanation"}):
+        source_ids = tuple(str(row.get("citation_id") or "").strip() for row in ordered_candidates)
+        if source_ids == tuple(review_evidence_diagnostic.get("emitted_citation_ids") or ()):
+            finite_wire = _finite_review_wire.prepare(sources_block, citation_ids=source_ids,
+                facets=tuple(review_facets) + tuple(item["facet"] for item in facet_contracts),
+                types=tuple(requirements) + tuple(item["answer_type"] for item in facet_contracts),
+                question=request.query, answer=answer)
+        if finite_wire is not None:
+            compact_coverage = finite_wire.coverage(requirements, hard_requirements,
+                decision.required_facets, facet_contracts)
+            wire_bytes = _review_source_wire.serialized_content_bytes
+            if (wire_bytes(compact_coverage + finite_wire.sources + _finite_review_wire.INSTRUCTIONS)
+                    < wire_bytes(coverage_block + sources_block)):
+                coverage_block = compact_coverage
+                system_msg += _finite_review_wire.INSTRUCTIONS
+            else:
+                finite_wire = None
     if original_retain_only and (
             tuple(review_facets) != _grounded_recovery.draft.required_facets
             or tuple(requirements) != _grounded_recovery.draft.required_types):
@@ -836,11 +878,7 @@ def verify_or_repair_answer(
         + (("PROCEDURE_SCOPE: bounded_phase\nPROCEDURE_PHASE: " + json.dumps(dict(zip(
             ("completed_context", "requested_actions", "later_context"), decision.procedure_phase)),
             ensure_ascii=False) + "\n") if bounded_phase else "")
-        +
-        f"REQUIRED_ANSWER_TYPES: {json.dumps(requirements, ensure_ascii=False)}\n"
-        f"HARD_REQUIREMENTS: {json.dumps(hard_requirements, ensure_ascii=False)}\n"
-        f"REQUIRED_FACETS: {json.dumps(list(decision.required_facets), ensure_ascii=False)}\n"
-        f"FACET_CONTRACTS: {json.dumps([{'facet': item.facet, 'answer_type': item.answer_type, 'must_cover': item.must_cover} for item in decision.facet_queries if not conditions_only or item.must_cover], ensure_ascii=False)}\n"
+        + coverage_block +
         f"ENUMERATION_REQUESTED: {json.dumps(bool(enumeration_requested))}\n"
         f"DETERMINISTIC_LIST_CANDIDATES: {json.dumps(deterministic_list_candidates, ensure_ascii=False)}\n"
         f"REPAIR_MISSING_FACETS: {json.dumps(repair_missing_facets, ensure_ascii=False)}\n"
@@ -852,7 +890,7 @@ def verify_or_repair_answer(
            if factual_list_review else
             ("CURRENT_ANSWER_FORMAT: lossless PROCEDURE_BLOCKS\n\n"
              f"SOURCES:\n{reference_source_view}\n\n" if reference_catalogue is not None else
-             f"CURRENT_ANSWER:\n{answer}\n\nSOURCES:\n{sources_block}\n\n"))
+             f"CURRENT_ANSWER:\n{answer}\n\nSOURCES:\n{finite_wire.sources if finite_wire else sources_block}\n\n"))
         +
         "Return only the required JSON."
     )
@@ -940,6 +978,8 @@ def verify_or_repair_answer(
         user_msg += "\n\nPROCEDURE_STRUCTURE:\n" + json.dumps(review_view, ensure_ascii=False)
         # Blocks are lossless spans of CURRENT_ANSWER, not additional sources.
         user_msg += "\n\nPROCEDURE_BLOCKS:\n" + json.dumps(block_view, ensure_ascii=False)
+    if finite_wire is not None:
+        verifier_schema = finite_wire.schema(verifier_schema)
     _admit_input(request, {"candidates": ordered_candidates if packet is not None else candidates}, decision,
         runtime=runtime, stage="verifier.provider")
     # Snapshot the exact CURRENT_ANSWER at the provider boundary. Neither a
@@ -969,7 +1009,8 @@ def verify_or_repair_answer(
     if complete_owned_review:
         review_models.reverse()
     review_messages = [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}]
-    private_review = (begin_private_ordinary_review(request=request, answer=answer, sources_block=sources_block,
+    private_review = (begin_private_ordinary_review(request=request, answer=answer,
+         sources_block=finite_wire.sources if finite_wire else sources_block,
         provider_input={"messages": review_messages, "json_schema": verifier_schema, "models": review_models,
             "effort": "low" if protected_budget else V13_FAST_EFFORT,
             "reasoning_mode": "", "max_output_tokens": min(4000, max(3200, V13_FAST_MAX_OUTPUT_TOKENS))})
@@ -1015,6 +1056,15 @@ def verify_or_repair_answer(
 
     finish_private_ordinary_review(private_review, actual_reply=parsed, model_used=model_used)
     out = dict(parsed or {})
+    if finite_wire is not None:
+        try:
+            out = finite_wire.decode(out)
+        except ValueError:
+            return {"outcome": "no_sources", "answer": "", "citation_ids": [],
+                "covered_facets": [], "missing_facets": review_facets,
+                "covered_answer_types": [], "missing_answer_types": requirements,
+                "missing_list_items": [], "reason": "finite_review_wire_invalid",
+                "_terminal_review_failure": True, "model": model_used}
     wire_reply = deepcopy(out) if independent_context_review else None
     inventory_diagnostics = {}
     if factual_list_review:

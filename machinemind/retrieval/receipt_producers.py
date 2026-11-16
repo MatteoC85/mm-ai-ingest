@@ -805,13 +805,23 @@ def prepare_records(*, request: Any, session: AskEvidenceSession,
                     return result
                 return observed
 
+            read_state = readonly(runtime._v13_deterministic_evidence_state)
+
+            def deterministic_state(query, records, **options):
+                # This observer copies complete candidate rows into the response
+                # diagnostics. Let it see exact checked legacy values, unlike
+                # internal selectors and metrics which never publish rows.
+                views = journal.public_views(records)
+                return read_state(query, [record for _, record in views], **options)
+
             read_only_names = (
                 "_assistant_core_candidate_source_type", "_v13_candidate_text",
                 "_assistant_core_candidate_facet_metrics", "_assistant_core_diagnostic_priority_metrics",
                 "_assistant_core_ps_is_substantive", "_v13_evidence_metrics",
-                "_assistant_core_machine_catalog_digest", "_v13_deterministic_evidence_state")
+                "_assistant_core_machine_catalog_digest")
             bound = replace(runtime,
                 **{name: readonly(getattr(runtime, name)) for name in read_only_names},
+                _v13_deterministic_evidence_state=deterministic_state,
                 _assistant_core_root_diagnostic_evidence_assurance=assurance,
                 _assistant_core_machine_catalog_candidates=lambda *a, **kw: source("catalog", *a, **kw),
                 _v13_assurance_fetch_neighbor_pages=lambda *a, **kw: source("neighbors", *a, **kw),
