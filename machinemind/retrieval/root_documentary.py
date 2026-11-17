@@ -312,6 +312,38 @@ _RECORDED_MEASUREMENT_WORDING = {
     ),
 }
 
+_QUANTITY_WORD = r"[^\W\d_]+(?:[-’'][^\W\d_]+)*"
+_NAMED_QUANTITY = rf"(?P<quantity>{_QUANTITY_WORD}(?:[ \t]+{_QUANTITY_WORD}){{0,3}}?)"
+_EN_QUANTITY_LEADING = r"(?!\b(?:by|from|to|during|with|without|at|after|before|when|where|while|was|is)\b)"
+_EN_QUANTITY_END = r"(?=\s*(?:[,;:.!?()]|$|\b(?:and|or|was|were|is|are|plus|with)\b))"
+_IT_QUANTITY_START = r"(?:^|[,;:(]|\b(?:il|lo|la|i|gli|le|quale|quali|e|o|indica|riporta|specifica|fornisci)[ \t]+)\s*"
+_IT_QUANTITY_LEADING = (
+    r"(?!\b(?:il|lo|la|i|gli|le|da|di|nel|nella|con|prima|dopo|come|quanto|non|indica|riporta|specifica|fornisci)\b)"
+)
+_NAMED_QUANTITY_WORDING = {
+    "en": (
+        re.compile(rf"\bmeasured[ \t]+{_EN_QUANTITY_LEADING}{_NAMED_QUANTITY}{_EN_QUANTITY_END}", re.IGNORECASE),
+        re.compile(rf"\b(?:recorded|logged)[ \t]+{_EN_QUANTITY_LEADING}{_NAMED_QUANTITY}{_EN_QUANTITY_END}",
+                   re.IGNORECASE),
+    ),
+    "it": (
+        re.compile(rf"{_IT_QUANTITY_START}{_IT_QUANTITY_LEADING}{_NAMED_QUANTITY}[ \t]+misurat[oaie]\b",
+                   re.IGNORECASE),
+        re.compile(rf"{_IT_QUANTITY_START}{_IT_QUANTITY_LEADING}{_NAMED_QUANTITY}[ \t]+registrat[oaie]\b",
+                   re.IGNORECASE),
+    ),
+}
+
+
+def _matches_recorded_quantity(unknowns, clarification, language):
+    """Match only verbatim named quantities already established as measurements."""
+    measured, recorded = _NAMED_QUANTITY_WORDING[language]
+    requested = {" ".join(match["quantity"].casefold().split()) for match in recorded.finditer(clarification)}
+    return any(
+        " ".join(match["quantity"].casefold().split()) in requested
+        for quote in unknowns for match in measured.finditer(quote)
+    )
+
 
 def with_recorded_measurement_units(bound, profile, clarification, language):
     """Preserve the draft and bind a request for recorded units before proof review."""
@@ -320,8 +352,10 @@ def with_recorded_measurement_units(bound, profile, clarification, language):
             or not can_review_source_bound(bound, clarification)):
         return clarification
     measurement, unit, operation, addendum = rules
-    if (not measurement.search(clarification) or unit.search(clarification) or operation.search(clarification)
-            or not any(measurement.search(quote) for quote in profile.missing_spans)):
+    unknowns = profile.missing_spans
+    if (unit.search(clarification) or operation.search(clarification)
+            or not any(measurement.search(quote) for quote in unknowns)
+            or not (measurement.search(clarification) or _matches_recorded_quantity(unknowns, clarification, language))):
         return clarification
     amended = clarification + "\n" + addendum
     return amended if can_review_source_bound(bound, amended) else clarification
