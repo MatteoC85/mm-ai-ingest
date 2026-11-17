@@ -1005,6 +1005,14 @@ def verify_or_repair_answer(
             and not (repair_first_contract or repair_missing_facets
                      or repair_missing_answer_types or repair_missing_list_items)
             and {REQ_CHECKLIST, REQ_SAFETY_CONDITIONS}.issubset(requirements)):
+        if conditions_only:
+            system_msg += (
+                " For this prerequisites review, the rewrite rule applies to material defects in "
+                "CURRENT_ANSWER that SOURCES allow you to correct. Return no_sources when a mandatory "
+                "fact, condition or qualifier lacks support in SOURCES. Keep the draft when its technical "
+                "meaning, coverage, safety and applicability are complete. Changes in formatting, phrasing "
+                "or OCR spacing alone do not justify a rewrite. Preserve qualifiers that explain source "
+                "ambiguity and the boundary of the requested phase.")
         system_msg += (
             " For a complete, grounded draft that needs no changes, return outcome=pass with an empty "
             "answer field, the actual complete coverage, and the supporting citation_ids. The server "
