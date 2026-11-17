@@ -91,6 +91,7 @@ class BoundRequest:
     reported_label: str | None = None
     required_indication_types: tuple[str, ...] = ()
     unresolved_indication: bool = False
+    include_structured_observations: bool = False
 
 
 @dataclass(frozen=True)
@@ -258,7 +259,7 @@ def diagnostic_limit(bound, language):
 
 
 def source_bound_claims(records, bound, language, clarification):
-    """Use only explicit typed alternatives and an independent structured limit."""
+    """Use exact typed entries and add the structured observations when separately requested."""
     if not can_review_source_bound(bound, clarification) or language not in {"en", "it"}:
         return ()
     documents = [row for row in records if row["source_type"] == "document"]
@@ -266,8 +267,10 @@ def source_bound_claims(records, bound, language, clarification):
     if not set(bound.required_indication_types) <= present:
         return ()
     typed = typed_entry_claims(documents, bound.reported_label, language)
+    if not typed or not bound.include_structured_observations:
+        return typed
     extra = _structured_observation_claim(records, bound.reported_label, language)
-    return (*typed, extra) if typed and extra is not None else ()
+    return (*typed, extra) if extra is not None else ()
 
 
 def _documentary_rows(request, profile, rows, neutral_rows, *, source_type, source_text, document_filter):
@@ -415,12 +418,15 @@ def bind_request(request, profile, basis, indices, rows, *, source_type, source_
         # Admission already required the exact bare label and explicit gap.
         # On the insufficient-observation path require explicit competing types.
         unresolved_indication = basis.get("admitted") is True or len(indication_types) >= 2
-        if len(indices) == 1 and independent_request:
+        # An unresolved diagnosis can contain both questions in one request
+        # part. The exact competing types still support a documentary answer.
+        if len(indices) == 1 and (independent_request or basis.get("admitted") is False):
             required_types = indication_types
     return BoundRequest(
         request_binding(request), tuple(profile.parts[i].quote for i in indices),
         json.dumps(selected, ensure_ascii=False, separators=(",", ":")),
         label, required_types, unresolved_indication,
+        include_structured_observations=independent_request,
     )
 
 
