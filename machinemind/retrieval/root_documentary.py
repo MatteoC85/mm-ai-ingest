@@ -190,11 +190,20 @@ def _typed_entries(text, label):
         desc_pos = pos + 3 + fields.index("description")
         if not kind_pos < desc_pos < end or normalized[kind_pos] not in INDICATION_TYPES:
             continue
-        trigger = re.split(r"(?<=[.!?])(?:\s+|$)", " ".join(lines[desc_pos:end]), maxsplit=1)[0]
+        desc_end = next((i for i in range(desc_pos, end) if normalized[i] in {
+            "possible causes", "cause", "troubleshooting", "solution", "reset",
+        } or normalized[i].startswith("analysis/")), end)
+        sentences = re.split(r"(?<=[.!?])(?:\s+|$)", " ".join(lines[desc_pos:desc_end]), maxsplit=2)
+        trigger = sentences[0]
         if not 20 <= len(trigger) <= 220 or trigger not in entry:
             continue
         condition = re.sub(r"^this (?:message|warning|alarm|fault) is activated when ", "", _normalize_label(trigger))
-        yield (normalized[kind_pos], condition), lines[pos + 1], lines[kind_pos], trigger
+        details = trigger
+        if len(sentences) > 1 and sentences[1][-1:] in {".", "!", "?"}:
+            match = re.search(re.escape(trigger) + r"\s+" + re.escape(sentences[1]), entry)
+            if match is not None and len(match[0]) <= 180:
+                details = match[0]
+        yield (normalized[kind_pos], condition), lines[pos + 1], lines[kind_pos], details
 
 
 def typed_entry_claims(records, label, language):
@@ -243,6 +252,36 @@ def _structured_observation_claim(records, label, language):
     return text, (cid,)
 
 
+def _listed_indication_causes(records, label, language):
+    """Quote an unambiguous possible-causes list from the exact documented indication."""
+    candidates = {}
+    for row in records:
+        if row["source_type"] != "document":
+            continue
+        entry = _indication_entry(row["text"], label)
+        if not entry:
+            continue
+        block = re.search(
+            r"^Possible causes[ \t]*\n(.*?)(?=\n(?:Analysis(?:[/ \t]|$)|Troubleshooting|"
+            r"Solution|Message)\b|\Z)", entry, flags=re.MULTILINE | re.DOTALL,
+        )
+        if block is None:
+            continue
+        excerpt = block[1].strip()
+        items = re.split(r"^[ \t]*[•*\-](?:[ \t]+|\n)", excerpt, flags=re.MULTILINE)
+        if items[0].strip() or not 1 <= len(items) - 1 <= 4 or not 20 <= len(excerpt) <= 160:
+            continue
+        key = tuple(sorted(_normalize_label(item) for item in items[1:]))
+        if all(key):
+            candidates.setdefault(key, (excerpt, row["citation_id"]))
+    if len(candidates) != 1:
+        return None
+    excerpt, citation = next(iter(candidates.values()))
+    text = (f"La voce citata elenca queste possibili cause: «{excerpt}»."
+            if language == "it" else f"The cited entry lists these possible causes: ‘{excerpt}’.")
+    return text, (citation,)
+
+
 def can_review_source_bound(bound, clarification):
     return (len(bound.required_indication_types) >= 2 and type(clarification) is str
             and 0 < len(clarification.strip()) <= 1200)
@@ -267,7 +306,12 @@ def source_bound_claims(records, bound, language, clarification):
     if not set(bound.required_indication_types) <= present:
         return ()
     typed = typed_entry_claims(documents, bound.reported_label, language)
-    if not typed or not bound.include_structured_observations:
+    if not typed:
+        return ()
+    documented_causes = _listed_indication_causes(documents, bound.reported_label, language)
+    if documented_causes is not None:
+        return (*typed, documented_causes)
+    if not bound.include_structured_observations:
         return typed
     extra = _structured_observation_claim(records, bound.reported_label, language)
     return (*typed, extra) if extra is not None else ()
