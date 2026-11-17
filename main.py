@@ -16407,9 +16407,16 @@ def _assistant_core_build_clarification(
     )
     question = decision.clarification_question or default_question
     meta = {"cacheable": False, "semantic_cacheable": False}
+    recorded_question = None
+    contextual_indication = False
     if str(request.requested_mode or "").strip().lower() == MODE_ROOT_CAUSE:
         profile = _assistant_core_diagnostic_query_profile(request)
         meta["assistant_core_diagnostic_query_state"] = profile.public_summary()
+        if _retrieval_diagnostic_query.unresolved_reported_indication(profile) is not None:
+            recorded_question = _retrieval_diagnostic_query.recorded_indication_question(request.response_language)
+            contextual_indication = _retrieval_diagnostic_query.unresolved_reported_indication(
+                profile, allow_context_heading=False,
+            ) is None
     base = {
         "ok": True,
         "status": "needs_clarification",
@@ -16424,7 +16431,8 @@ def _assistant_core_build_clarification(
         base.update({
             "status": "answered",
             "symptom": request.query,
-            "problem_summary": question,
+            "problem_summary": recorded_question or question,
+            "clarification_question": recorded_question or question,
             "possible_causes": [],
             "recommended_next_checks": [],
         })
@@ -16432,8 +16440,16 @@ def _assistant_core_build_clarification(
         if request.requested_mode == MODE_ROOT_CAUSE and isinstance(request.metadata, dict):
             documentary = request.metadata.pop(_root_documentary.PRIVATE_KEY, None)
             if type(documentary) is _root_documentary.BoundRequest and not decision.degraded:
+                # Contextual or combined documentary requests can elicit a
+                # premature classification from the router. Review a question
+                # about existing records alongside the independently sourced claims.
+                question_to_review = (
+                    recorded_question
+                    if recorded_question and (contextual_indication or len(documentary.questions) > 1)
+                    else decision.clarification_question
+                )
                 reviewed_question = _root_documentary.with_recorded_measurement_units(
-                    documentary, profile, decision.clarification_question, request.response_language,
+                    documentary, profile, question_to_review, request.response_language,
                 )
                 diagnostic = {} if (request.debug or _root_documentary.can_review_source_bound(
                     documentary, reviewed_question,
@@ -16446,9 +16462,7 @@ def _assistant_core_build_clarification(
                     "source_bound_clarification_requires_approval", False,
                 )
                 if requires_approval and verified is None:
-                    fallback = default_question
-                    if _retrieval_diagnostic_query.unresolved_reported_indication(profile) is not None:
-                        fallback = _retrieval_diagnostic_query.recorded_indication_question(request.response_language)
+                    fallback = recorded_question or default_question
                     base.update(problem_summary=fallback, clarification_question=fallback)
                 if request.debug and diagnostic is not None:
                     meta["root_documentary_diagnostic"] = diagnostic
@@ -16457,7 +16471,7 @@ def _assistant_core_build_clarification(
                     citations = _sanitize_citations_for_response(selected, company_id=request.company_id)
                     if citations and {row.get("citation_id") for row in citations} == {row["citation_id"] for row in selected}:
                         limit = _root_documentary.diagnostic_limit(documentary, request.response_language)
-                        rendered_question = reviewed_question if requires_approval else question
+                        rendered_question = reviewed_question if requires_approval else recorded_question or question
                         base.update(
                             problem_summary="\n\n".join(part for part in (text, limit, rendered_question) if part),
                             clarification_question=rendered_question,

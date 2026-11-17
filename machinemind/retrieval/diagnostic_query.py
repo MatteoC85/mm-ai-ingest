@@ -20,7 +20,7 @@ import re
 from collections import Counter
 
 POLICY_VERSION = "root-request-preservation-v5"
-DIAGNOSTIC_BASIS_POLICY = "root-observation-admission-v5"
+DIAGNOSTIC_BASIS_POLICY = "root-observation-admission-v6"
 BASIS_METADATA_KEY = "root_diagnostic_basis"
 MAX_PARTS = 32
 MAX_RETRIEVAL_ALIASES = 2
@@ -49,6 +49,14 @@ _REPORTED_INDICATION = re.compile(
     r'(?:“(?P<curly>[^“”]{3,100})”|"(?P<straight>[^"]{3,100})"|«(?P<angle>[^«»]{3,100})»)[.!?]?',
     re.IGNORECASE,
 )
+_REPORT_CONTEXT_HEADING = re.compile(
+    r"^(?:(?:(?:documentation|documentary|manual|training|verification|validation|test)\s+)?"
+    r"(?:scenario|case|example|exercise|test|report)"
+    r"|(?:scenario|caso|esempio|verbale)\s+(?:di\s+(?:prova|test|verifica|validazione)|documentale)"
+    r"|(?:test|prova|simulazione)\s+documentale)\s*:\s*",
+    re.IGNORECASE,
+)
+
 _REPORT_SUBJECT_EXTRA_CLAUSE = re.compile(
     r'[,;:!?“”"«»]|\.\s|'
     r'\b(?:and|but|because|although|however|then|while|when|after|before|with|without|not|never|'
@@ -87,14 +95,21 @@ def protected_literals_present(clue: str, source: str) -> bool:
     return all(observed[key] > 0 for key in expected)
 
 
-def unresolved_reported_indication(profile: DiagnosticQueryProfile) -> str | None:
+def unresolved_reported_indication(
+    profile: DiagnosticQueryProfile, *, allow_context_heading: bool = True,
+) -> str | None:
     """Recognize an exact reported label whose documented classification is open."""
     if profile.interpretation_status != "valid":
         return None
     facts = [part for part in profile.parts if part.role in FACT_ROLES]
     if len(facts) != 1 or facts[0].role != "observation":
         return None
-    match = _REPORTED_INDICATION.fullmatch(facts[0].quote)
+    # A conventional non-asserting heading can be grouped with the report.
+    # Strip only that heading for recognition; preserve every original span.
+    observation = facts[0].quote
+    if allow_context_heading:
+        observation = _REPORT_CONTEXT_HEADING.sub("", observation, count=1)
+    match = _REPORTED_INDICATION.fullmatch(observation)
     if not match:
         return None
     subject = match.group("subject") or ""

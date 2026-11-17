@@ -606,9 +606,9 @@ def bind_request(request, profile, basis, indices, rows, *, source_type, source_
         # Admission already required the exact bare label and explicit gap.
         # On the insufficient-observation path require explicit competing types.
         unresolved_indication = basis.get("admitted") is True or len(indication_types) >= 2
-        # An unresolved diagnosis can contain both questions in one request
-        # part. The exact competing types still support a documentary answer.
-        if len(indices) == 1 and (independent_request or basis.get("admitted") is False):
+        # On the insufficient-observation path, competing types belong to the
+        # reported indication, independent of how request parts were split.
+        if basis.get("admitted") is False or (len(indices) == 1 and independent_request):
             required_types = indication_types
 
     selected = []
