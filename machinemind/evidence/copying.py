@@ -40,3 +40,29 @@ def deepcopy(value, memo=None):
         _copy_keep_alive(value, memo)
         return out
     return _generic_deepcopy(value, memo)
+
+
+def deepcopy_evidence_snapshot(value):
+    """Detach admitted ASK evidence, keeping stdlib deepcopy for the full graph."""
+    if type(value) is not dict:
+        return _generic_deepcopy(value)
+
+    memo = {}
+
+    def seed_vector(row):
+        if type(row) is not dict:
+            return
+        vector = row.get("embedding_list")
+        if (type(vector) is list and len(vector) >= 8 and id(vector) not in memo
+                and all(type(item) is float for item in vector)):
+            memo[id(vector)] = vector.copy()
+
+    # Reuse only detached copies of these scalar leaves. The stdlib still
+    # preserves every other alias and cycle and handles mixed or custom types.
+    seed_vector(value)
+    for name in ("candidates", "citations", "_assistant_core_validation_evidence"):
+        rows = value.get(name)
+        if type(rows) in (list, tuple):
+            for row in rows:
+                seed_vector(row)
+    return _generic_deepcopy(value, memo or None)

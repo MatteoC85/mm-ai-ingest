@@ -26,6 +26,7 @@ from .request_completion import current as _completion
 from .task_generation import TaskGenerationEvidence
 from .generation import GenerationEvidenceError
 from ..evidence.ask_input import _same_value, apply_ask_evidence_input
+from ..evidence.copying import deepcopy_evidence_snapshot
 from ..retrieval.ask_composition import AskSelection
 from ..retrieval import source_management
 
@@ -121,7 +122,7 @@ class ResponseEvidenceFlow(TaskGenerationEvidence):
 
     def _snapshot(self, response):
         self._envelope(response)
-        return (deepcopy(response), self.handles(response.get("citations", [])),
+        return (deepcopy_evidence_snapshot(response), self.handles(response.get("citations", [])),
                 self.handles(response.get("_assistant_core_validation_evidence", [])))
 
     def generated(self, response, selections, private):
@@ -157,7 +158,7 @@ class ResponseEvidenceFlow(TaskGenerationEvidence):
                 raise ResponseEvidenceError("uncomposed consumer admission stage")
             if decision != self.decision or self.pending is not None:
                 raise ResponseEvidenceError("consumer decision/admission re-entry drift")
-            original = deepcopy(data)
+            original = deepcopy_evidence_snapshot(data)
             selections = self._selections(data)
             # Synthesis metadata transform is independently checked by the existing
             # intake contract before delegating this boundary's exact selections.
@@ -169,9 +170,9 @@ class ResponseEvidenceFlow(TaskGenerationEvidence):
                 if not _same_value(data, self.owner._synthesis_contract(decision)):
                     raise ResponseEvidenceError("synthesis changed prepared contract")
                 if stage == "synthesis.generate":
-                    self.owner._generation_input = deepcopy(data)
+                    self.owner._generation_input = deepcopy_evidence_snapshot(data)
                 else:
-                    self.owner._task_input[stage] = deepcopy(data)
+                    self.owner._task_input[stage] = deepcopy_evidence_snapshot(data)
             self.pending = {"stage": stage, "data": original, "selections": selections,
                             "decision": deepcopy(decision), "used": False}
             try:

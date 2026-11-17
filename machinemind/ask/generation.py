@@ -15,6 +15,7 @@ from typing import Any, Callable
 from .request_scope import conditions_only_contract, bounded_phase_contract
 from ..evidence.ask_input import _same_value, ask_request_key
 from ..evidence.contracts import EvidenceContractError, SourceType
+from ..evidence.copying import deepcopy_evidence_snapshot
 from ..retrieval.ask_composition import AskEvidenceSession, AskSelection
 from ..retrieval.production_adapters import ProductionReaderAdapters
 from ..retrieval.residual_producers import ResidualSourceAdapters
@@ -614,7 +615,7 @@ class GenericGenerationEvidence:
         old = self.refs.get(id(row))
         if old is not None and (old[0] is not row or old[2] != handle):
             raise GenerationEvidenceError("ambiguous generation occurrence identity")
-        self.refs[id(row)] = (row, deepcopy(row), handle)
+        self.refs[id(row)] = (row, deepcopy_evidence_snapshot(row), handle)
 
     def handles(self, rows):
         if type(rows) is not list:
@@ -816,7 +817,7 @@ class GenericGenerationEvidence:
                 for selection in selections:
                     for row, handle in zip(retrieval[selection.name], selection.records):
                         self._bind(row, handle)
-                original = deepcopy(retrieval)
+                original = deepcopy_evidence_snapshot(retrieval)
                 self.retrieval, self.retrieval_snapshot = retrieval, original
                 bound = replace(self.runtime, _v13_sources_block=self._source_block,
                     _v13_json_models=self._model, _render_grounded_answer_points=self._render,

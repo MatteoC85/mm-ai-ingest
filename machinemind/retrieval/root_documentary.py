@@ -323,17 +323,18 @@ def _indication_types(parts):
     } & INDICATION_TYPES))
 
 
+def _exact_machine_owner(request, row):
+    if row.get("exact_machine_scope") is True:
+        return (row.get("company_id", request.company_id) == request.company_id
+                and row.get("machine_id", request.machine_id) == request.machine_id)
+    return row.get("company_id") == request.company_id and row.get("machine_id") == request.machine_id
+
+
 def _retain_indication_cause_list(request, profile, label, selected, typed, *, source_type, source_text):
     """Use a spare slot for a unique scoped cause list without changing typed claims."""
     language = request.response_language
     if language not in {"it", "en"} or diagnostic_query.unresolved_reported_indication(profile) is None:
         return selected
-
-    def exact_owner(row):
-        if row.get("exact_machine_scope") is True:
-            return (row.get("company_id", request.company_id) == request.company_id
-                    and row.get("machine_id", request.machine_id) == request.machine_id)
-        return row.get("company_id") == request.company_id and row.get("machine_id") == request.machine_id
 
     def view(row):
         return {"citation_id": row["citation_id"], "source_type": source_type(row), "text": source_text(row)}
@@ -341,7 +342,7 @@ def _retain_indication_cause_list(request, profile, label, selected, typed, *, s
     ids = [row.get("citation_id") for row in selected]
     if not all(isinstance(cid, str) and cid for cid in ids) or len(set(ids)) != len(ids):
         return selected
-    if not all(exact_owner(row) for row in selected):
+    if not all(_exact_machine_owner(request, row) for row in selected):
         return selected
     selected_views = [view(row) for row in selected]
     if any(not isinstance(row["text"], str) or not row["text"]
@@ -355,7 +356,7 @@ def _retain_indication_cause_list(request, profile, label, selected, typed, *, s
     original_claims = typed_entry_claims(selected_views, label, language)
     if not original_claims or not set(required) <= types:
         return selected
-    options = {row["citation_id"]: row for row in typed if exact_owner(row)}
+    options = {row["citation_id"]: row for row in typed if _exact_machine_owner(request, row)}
     choice = _listed_indication_causes([view(row) for row in options.values()], label, language)
     if choice is None or choice[1][0] in ids:
         return selected
@@ -370,7 +371,58 @@ def _retain_indication_cause_list(request, profile, label, selected, typed, *, s
     return selected
 
 
-def _documentary_rows(request, profile, rows, neutral_rows, *, source_type, source_text, document_filter):
+def _retain_required_indication_types(request, label, selected, candidates, required, *, source_type, source_text):
+    """Keep an exact missing type ahead of redundant views of already retained typed evidence."""
+    if not label or len(required) < 2 or not request.machine_id:
+        return selected
+
+    def types(row):
+        if source_type(row) != "document" or not _exact_machine_owner(request, row):
+            return frozenset()
+        text = source_text(row)
+        return frozenset(key for key, *_ in _typed_entries(text, label)) if isinstance(text, str) else frozenset()
+
+    def cause_list_key(row):
+        view = {"citation_id": row["citation_id"], "source_type": "document", "text": source_text(row)}
+        claim = _listed_indication_causes((view,), label, request.response_language)
+        return " ".join(claim[0].split()) if claim is not None else ""
+
+    retained, retained_cause_lists = set(), set()
+    replaceable = []
+    for index, row in enumerate(selected):
+        keys = types(row)
+        cause_list = cause_list_key(row) if keys else ""
+        if keys and keys <= retained and (not cause_list or cause_list in retained_cause_lists):
+            replaceable.append(index)
+        retained.update(keys)
+        if cause_list:
+            retained_cause_lists.add(cause_list)
+    missing = set(required) - {key[0] for key in retained}
+    if not missing or not replaceable:
+        return selected
+    selected_ids = {row.get("citation_id") for row in selected}
+    options = {row["citation_id"]: (row, types(row)) for row in candidates if row["citation_id"] not in selected_ids}
+    replacements = {}
+    for index in reversed(replaceable):
+        viable = []
+        for cid, (row, keys) in options.items():
+            covered = missing & {key[0] for key in keys}
+            if covered and len(keys | retained) < MAX_CLAIMS:
+                viable.append((-len(covered), len(keys - retained), cid, row, keys, covered))
+        if not viable:
+            break
+        _, _, cid, row, keys, covered = min(viable, key=lambda choice: choice[:3])
+        replacements[index] = row
+        del options[cid]
+        retained.update(keys)
+        missing.difference_update(covered)
+        if not missing:
+            return [row for index, row in enumerate(selected) if index not in replacements] + list(replacements.values())
+    return selected
+
+
+def _documentary_rows(request, profile, rows, neutral_rows, *, source_type, source_text, document_filter,
+                      required_indication_types=()):
     """Keep a matching excerpt per document before nearby same-document fragments.
 
     Secondary candidates come only from the same inspected neutral scope and
@@ -429,6 +481,9 @@ def _documentary_rows(request, profile, rows, neutral_rows, *, source_type, sour
     if len(preferred) < 2:
         return original
     selection = (preferred + matching_pages + [row for row in original if row.get("citation_id") not in selected_ids])[:cap]
+    selection = _retain_required_indication_types(
+        request, label, selection, typed, required_indication_types, source_type=source_type, source_text=source_text,
+    )
     return _retain_indication_cause_list(
         request, profile, label, selection, typed, source_type=source_type, source_text=source_text,
     )
@@ -457,10 +512,35 @@ def bind_request(request, profile, basis, indices, rows, *, source_type, source_
     ):
         return None
 
+    label = _reported_quoted_label(profile)
+    required_types = ()
+    unresolved_indication = False
+    facts = [part for part in profile.parts if part.role in diagnostic_query.FACT_ROLES]
+    independent_request = any(part.role == "request" and i not in indices
+                              for i, part in enumerate(profile.parts))
+    unresolved_report = diagnostic_query.unresolved_reported_indication(profile)
+    if (label and len(facts) == 1 and facts[0].role == "observation"
+            and (not diagnostic_query.protected_literals(facts[0].quote)
+                 or (basis.get("admitted") is False and unresolved_report
+                     and _normalize_label(unresolved_report) == label))):
+        # Admitted requests reached this point only after their open-applicability
+        # contract passed. Use its explicit, validated gaps for those requests.
+        gaps = ([profile.parts[i] for i in open_applicability["gap_parts"]]
+                if basis.get("admitted") is True else
+                [part for part in profile.parts if part.role in diagnostic_query.MISSING_ROLES])
+        indication_types = _indication_types(gaps)
+        # Admission already required the exact bare label and explicit gap.
+        # On the insufficient-observation path require explicit competing types.
+        unresolved_indication = basis.get("admitted") is True or len(indication_types) >= 2
+        # An unresolved diagnosis can contain both questions in one request
+        # part. The exact competing types still support a documentary answer.
+        if len(indices) == 1 and (independent_request or basis.get("admitted") is False):
+            required_types = indication_types
+
     selected = []
     seen = set()
     for row in _documentary_rows(request, profile, rows, neutral_rows, source_type=source_type, source_text=source_text,
-                                 document_filter=document_filter):
+                                 document_filter=document_filter, required_indication_types=required_types):
         kind = source_type(row)
         if kind not in {"document", "ps"} or (document_filter is not None and kind not in document_filter):
             continue
@@ -500,30 +580,6 @@ def bind_request(request, profile, basis, indices, rows, *, source_type, source_
         })
     if not selected:
         return None
-    label = _reported_quoted_label(profile)
-    required_types = ()
-    unresolved_indication = False
-    facts = [part for part in profile.parts if part.role in diagnostic_query.FACT_ROLES]
-    independent_request = any(part.role == "request" and i not in indices
-                              for i, part in enumerate(profile.parts))
-    unresolved_report = diagnostic_query.unresolved_reported_indication(profile)
-    if (label and len(facts) == 1 and facts[0].role == "observation"
-            and (not diagnostic_query.protected_literals(facts[0].quote)
-                 or (basis.get("admitted") is False and unresolved_report
-                     and _normalize_label(unresolved_report) == label))):
-        # Admitted requests reached this point only after their open-applicability
-        # contract passed. Use its explicit, validated gaps for those requests.
-        gaps = ([profile.parts[i] for i in open_applicability["gap_parts"]]
-                if basis.get("admitted") is True else
-                [part for part in profile.parts if part.role in diagnostic_query.MISSING_ROLES])
-        indication_types = _indication_types(gaps)
-        # Admission already required the exact bare label and explicit gap.
-        # On the insufficient-observation path require explicit competing types.
-        unresolved_indication = basis.get("admitted") is True or len(indication_types) >= 2
-        # An unresolved diagnosis can contain both questions in one request
-        # part. The exact competing types still support a documentary answer.
-        if len(indices) == 1 and (independent_request or basis.get("admitted") is False):
-            required_types = indication_types
     return BoundRequest(
         request_binding(request), tuple(profile.parts[i].quote for i in indices),
         json.dumps(selected, ensure_ascii=False, separators=(",", ":")),
@@ -582,7 +638,13 @@ def scoped_packet(request, bound, *, company_general_sentinel, read_owner_pages=
     if forward:
         # Put an exact new type before repeated views. The existing evidence
         # record and character caps still apply to both provider stages.
-        rows = (forward + rows)[:review_packet.MAX_RECORDS]
+        combined = forward + rows
+        rows = combined[:review_packet.MAX_RECORDS]
+        if len(combined) > len(rows):
+            rows = _retain_required_indication_types(
+                request, bound.reported_label, rows, combined, bound.required_indication_types,
+                source_type=lambda row: row["source_type"], source_text=lambda row: row["chunk_full"],
+            )
     records = [
         {"citation_id": row["citation_id"], "source_type": row["source_type"],
          "page_from": row["page_from"], "page_to": row["page_to"],
