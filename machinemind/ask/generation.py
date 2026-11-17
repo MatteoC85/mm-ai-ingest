@@ -403,7 +403,8 @@ def generate_ask_response(
             if runtime.preserve_procedure_points else None)
         with ask_fast_stage.allow(ask_fast_stage.WRITER,
                 eligible=source_backed_composition and (finite_factual_composition
-                    or conditions_numeric_composition or enumerated_conditions_stage_scope)):
+                    or conditions_numeric_composition or enumerated_conditions_stage_scope),
+                prefer_luna=source_backed_composition and conditions_only and conditions_numeric_scope):
             parsed, model_used = _v13_json_models(
                 writer_messages,
                 models=writer_models,

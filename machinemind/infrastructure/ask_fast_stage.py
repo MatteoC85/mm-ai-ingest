@@ -19,6 +19,7 @@ _MODELS = {
     "gpt-5.6-luna": ("gpt-6-luna", (1.0, 6.0)),
 }
 _PERMIT = ContextVar("ask_fast_stage_permit", default=None)
+_PREFER_LUNA_WRITER = ContextVar("ask_fast_luna_writer", default=False)
 _ATTEMPT = ContextVar("ask_fast_stage_attempt", default=None)
 
 
@@ -48,12 +49,14 @@ def _owner(budget):
 
 
 @contextmanager
-def allow(purpose, *, eligible):
+def allow(purpose, *, eligible, prefer_luna=False):
     """The owned producer/consumer supplies eligibility, never request text."""
     token = _PERMIT.set(purpose if eligible else None)
+    preference = _PREFER_LUNA_WRITER.set(purpose == WRITER and eligible and prefer_luna)
     try:
         yield
     finally:
+        _PREFER_LUNA_WRITER.reset(preference)
         _PERMIT.reset(token)
 
 
@@ -78,6 +81,21 @@ def select(budget, *, purpose, model, candidates, json_schema, company_id):
     if any(rate < minimum for rate, minimum in zip(rates, floor, strict=True)):
         return None
     return Attempt(budget, purpose, model, actual, rates)
+
+
+def native_attempts(baseline, *, candidates, json_schema, company_id):
+    """Prefer configured Luna only inside an admitted native writer dispatch."""
+    if (baseline.purpose != WRITER or not _PREFER_LUNA_WRITER.get()
+            or baseline.configured_model != "gpt-5.6-terra" or len(candidates) != 1):
+        return (baseline,)
+    from . import request_budget
+
+    planner = request_budget._runtime_value("V13_PLANNER_MODEL")
+    if planner != "gpt-5.6-luna":
+        return (baseline,)
+    preferred = select(baseline.budget, purpose=WRITER, model=planner,
+        candidates=(planner,), json_schema=json_schema, company_id=company_id)
+    return (preferred, baseline) if preferred is not None else (baseline,)
 
 
 @contextmanager

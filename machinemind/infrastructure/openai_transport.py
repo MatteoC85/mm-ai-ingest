@@ -464,11 +464,19 @@ def json_models(messages: list[dict], *, models: list[str], json_schema: dict, e
                 attempt = ask_fast_stage.select(budget, purpose=purpose, model=model, candidates=candidates,
                     json_schema=json_schema, company_id=company_id)
                 if attempt is not None:
-                    try:
-                        dispatch_model = attempt.model
-                        with ask_fast_stage.bind(attempt):
-                            parsed = invoke(dispatch_model)
-                    except ask_fast_stage.UnsupportedEnvelope:
+                    for native in ask_fast_stage.native_attempts(attempt, candidates=candidates,
+                            json_schema=json_schema, company_id=company_id):
+                        try:
+                            dispatch_model = native.model
+                            with ask_fast_stage.bind(native):
+                                parsed = invoke(dispatch_model)
+                            break
+                        except ask_fast_stage.UnsupportedEnvelope:
+                            # Only a proven unsent envelope can follow the old
+                            # dispatch path. A sent attempt spends its one slot.
+                            if int(budget.llm_calls) != calls_before:
+                                raise
+                    else:
                         dispatch_model = model
                         parsed = invoke(dispatch_model)
                 else:
