@@ -16432,12 +16432,15 @@ def _assistant_core_build_clarification(
         if request.requested_mode == MODE_ROOT_CAUSE and isinstance(request.metadata, dict):
             documentary = request.metadata.pop(_root_documentary.PRIVATE_KEY, None)
             if type(documentary) is _root_documentary.BoundRequest and not decision.degraded:
+                reviewed_question = _root_documentary.with_recorded_measurement_units(
+                    documentary, profile, decision.clarification_question, request.response_language,
+                )
                 diagnostic = {} if (request.debug or _root_documentary.can_review_source_bound(
-                    documentary, decision.clarification_question,
+                    documentary, reviewed_question,
                 )) else None
                 verified = _assistant_core_verified_documentary_context(
                     request, documentary, diagnostic=diagnostic,
-                    clarification_question=decision.clarification_question,
+                    clarification_question=reviewed_question,
                 )
                 requires_approval = diagnostic is not None and diagnostic.pop(
                     "source_bound_clarification_requires_approval", False,
@@ -16454,8 +16457,10 @@ def _assistant_core_build_clarification(
                     citations = _sanitize_citations_for_response(selected, company_id=request.company_id)
                     if citations and {row.get("citation_id") for row in citations} == {row["citation_id"] for row in selected}:
                         limit = _root_documentary.diagnostic_limit(documentary, request.response_language)
+                        rendered_question = reviewed_question if requires_approval else question
                         base.update(
-                            problem_summary="\n\n".join(part for part in (text, limit, question) if part),
+                            problem_summary="\n\n".join(part for part in (text, limit, rendered_question) if part),
+                            clarification_question=rendered_question,
                             citations=citations,
                             rg_links=_build_rg_links(request.company_id, citations),
                             grounding="indexed_machine_sources",

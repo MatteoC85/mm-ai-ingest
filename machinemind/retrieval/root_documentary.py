@@ -287,6 +287,46 @@ def can_review_source_bound(bound, clarification):
             and 0 < len(clarification.strip()) <= 1200)
 
 
+_RECORDED_MEASUREMENT_WORDING = {
+    "en": (
+        re.compile(r"\b(?:measured|measurements?|readings?|(?:recorded|reported|observed|actual)\s+"
+                   r"(?:numeric(?:al)?\s+)?values?)\b", re.IGNORECASE),
+        re.compile(r"\bunits?\s+of\s+measure(?:ment)?\b|\b(?:and|with|include|specify|give)\s+"
+                   r"(?:(?:the|its|their|appropriate|applicable|recorded|corresponding)\s+){0,3}"
+                   r"units?(?=\s*(?:[,;.!?)\n]|if\b|when\b|$))", re.IGNORECASE),
+        re.compile(r"\b(?:measure\s+(?:the|a)\b|(?:take|obtain|repeat|perform)\s+(?:a|another|new)\s+(?:new\s+)?"
+                   r"(?:reading|measurement)\b|no\s+(?:new\s+)?(?:reading|measurement)\s+"
+                   r"(?:is|was)\s+(?:needed|required)\b)", re.IGNORECASE),
+        "Use existing records only. For an available measurement, include its recorded value and unit.",
+    ),
+    "it": (
+        re.compile(r"\b(?:misurat[oaie]|misurazion[ei]|lettur[ae]|valor[ei]\s+"
+                   r"(?:numeric[io]\s+)?(?:registrat[oaie]|rilevat[oaie]|effettiv[io]))\b", re.IGNORECASE),
+        re.compile(r"\bunità\s+di\s+misura\b|\b(?:e|con|indica|specifica)\s+"
+                   r"(?:(?:la|le|sua|loro|relativ[ae]|rispettiv[ae]|corrispondenti|propri[ae])\s+){0,3}"
+                   r"unità(?=\s*(?:[,;.!?)\n]|se\b|quando\b|$))", re.IGNORECASE),
+        re.compile(r"\b(?:misura\s+(?:il|lo|la)\b|(?:esegui|effettua|ripeti|fai)\s+"
+                   r"(?:una|un’altra|un'altra|la)\s+(?:lettura|misurazione)\b|"
+                   r"non\s+(?:serve|occorre|è necessaria)\s+(?:una\s+)?(?:lettura|misurazione)\b)", re.IGNORECASE),
+        "Usa solo i dati già registrati. Per una misurazione disponibile, indica il valore e l’unità di misura.",
+    ),
+}
+
+
+def with_recorded_measurement_units(bound, profile, clarification, language):
+    """Preserve the draft and bind a request for recorded units before proof review."""
+    rules = _RECORDED_MEASUREMENT_WORDING.get(language)
+    if (rules is None or not bound.unresolved_indication or profile.interpretation_status != "valid"
+            or not can_review_source_bound(bound, clarification)):
+        return clarification
+    measurement, unit, operation, addendum = rules
+    if (not measurement.search(clarification) or unit.search(clarification) or operation.search(clarification)
+            or not any(measurement.search(quote) for quote in profile.missing_spans)):
+        return clarification
+    amended = clarification + "\n" + addendum
+    return amended if can_review_source_bound(bound, amended) else clarification
+
+
 def diagnostic_limit(bound, language):
     """Describe the observation limit separately from the verified source claims."""
     if not bound.unresolved_indication:
