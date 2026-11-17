@@ -42,6 +42,20 @@ ROLES = (
 FACT_ROLES = frozenset({"observation", "observed_negative", "action_performed", "action_not_performed"})
 PROJECTION_ROLES = FACT_ROLES | {"target_identity"}
 MISSING_ROLES = frozenset({"unknown", "target_identity_unknown"})
+INDICATION_TYPES = frozenset({"warning", "alarm", "fault", "notice", "information"})
+
+_REPORTED_INDICATION = re.compile(
+    r'(?:(?P<subject>.*?)\b(?:displays?|shows?|reports?|indicates?|visualizza|mostra|segnala|riporta|compare)\s+)?'
+    r'(?:“(?P<curly>[^“”]{3,100})”|"(?P<straight>[^"]{3,100})"|«(?P<angle>[^«»]{3,100})»)[.!?]?',
+    re.IGNORECASE,
+)
+_REPORT_SUBJECT_EXTRA_CLAUSE = re.compile(
+    r'[,;:!?“”"«»]|\.\s|'
+    r'\b(?:and|but|because|although|however|then|while|when|after|before|with|without|not|never|'
+    r'is|are|was|were|has|have|had|'
+    r'e|ma|perché|sebbene|mentre|dopo|prima|quindi|con|senza|non|poi|è|sono|era|erano|ha|aveva)\b',
+    re.IGNORECASE,
+)
 
 
 def _space(value: str) -> str:
@@ -71,6 +85,33 @@ def protected_literals_present(clue: str, source: str) -> bool:
     expected = Counter(re.sub(r"\s+", "", x) for x in protected_literals(clue))
     observed = Counter(re.sub(r"\s+", "", x) for x in protected_literals(source))
     return all(observed[key] > 0 for key in expected)
+
+
+def unresolved_reported_indication(profile: DiagnosticQueryProfile) -> str | None:
+    """Recognize an exact reported label whose documented classification is open."""
+    if profile.interpretation_status != "valid":
+        return None
+    facts = [part for part in profile.parts if part.role in FACT_ROLES]
+    if len(facts) != 1 or facts[0].role != "observation":
+        return None
+    match = _REPORTED_INDICATION.fullmatch(facts[0].quote)
+    if not match:
+        return None
+    subject = match.group("subject") or ""
+    # A model label in the report's subject is identity, not a reading. Leave
+    # measured values and independent factual clauses on their existing lane.
+    if (len(subject) > 120 or _REPORT_SUBJECT_EXTRA_CLAUSE.search(subject)
+            or any(not value[0].isalpha() for value in protected_literals(subject))):
+        return None
+    label = next(value for value in (match["curly"], match["straight"], match["angle"]) if value is not None)
+    if protected_literals(label):
+        return None
+    unknown_types = {
+        word
+        for part in profile.parts if part.role in MISSING_ROLES
+        for word in re.findall(r"[^\W_]+", part.quote.casefold())
+    }
+    return label if len(unknown_types & INDICATION_TYPES) >= 2 else None
 
 
 def _retrieval_aliases(value: Any, quote: str, role: str) -> tuple[str, ...]:
@@ -625,6 +666,13 @@ def enforce_diagnostic_basis(raw: Mapping[str, Any], profile: DiagnosticQueryPro
         and "diagnostic_causes" not in (out.get("required_answer_types") or [])
     )
     exempt = priority or (valid and nondiagnostic)
+    reported_only = (
+        valid and mode == "root_cause" and state == "sufficient" and support and not gaps and not exempt
+        and unresolved_reported_indication(profile) is not None
+    )
+    if reported_only:
+        state = "needs_observations"
+        out["diagnostic_basis"] = {**basis, "state": state}
     admitted = bool(valid and state == "sufficient" and support and not gaps and not exempt)
     if priority:
         reason = "priority_refusal_or_out_of_scope"
@@ -666,6 +714,14 @@ def enforce_diagnostic_basis(raw: Mapping[str, Any], profile: DiagnosticQueryPro
         model_question = out.get("clarification_question")
         if not invalid and isinstance(model_question, str) and 0 < len(model_question.strip()) <= 1200:
             question = model_question.strip()
+        elif reported_only:
+            question = (
+                "What do the existing records say about the event classification and the affected circuit or component? "
+                "Include any recorded measurements with their values and units."
+                if profile.response_language == "en" else
+                "Che cosa riportano i registri disponibili sulla classificazione dell’evento e sul circuito o "
+                "componente interessato? Indica eventuali misure registrate con i relativi valori e unità."
+            )
         out.update(effective_mode="root_cause", evidence_state="clarify", clarification_question=question,
                    source_type_policy="none", rationale=reason)
         for key in ("relevant_evidence_ids", "dense_queries", "lexical_queries", "exact_terms", "required_facets",

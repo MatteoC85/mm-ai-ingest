@@ -24,7 +24,7 @@ REVIEW_REASONS = (
     "supported", "missing_documentary_variant", "unsupported_claim", "wrong_source",
     "assumed_applicability", "unsafe_action", "language_mismatch", "other",
 )
-INDICATION_TYPES = frozenset({"warning", "alarm", "fault", "notice", "information"})
+INDICATION_TYPES = diagnostic_query.INDICATION_TYPES
 
 PRODUCER_INSTRUCTION = (
     "Answer only the independently requested documentary questions, in RESPONSE_LANGUAGE. "
@@ -450,8 +450,11 @@ def bind_request(request, profile, basis, indices, rows, *, source_type, source_
     facts = [part for part in profile.parts if part.role in diagnostic_query.FACT_ROLES]
     independent_request = any(part.role == "request" and i not in indices
                               for i, part in enumerate(profile.parts))
+    unresolved_report = diagnostic_query.unresolved_reported_indication(profile)
     if (label and len(facts) == 1 and facts[0].role == "observation"
-            and not diagnostic_query.protected_literals(facts[0].quote)):
+            and (not diagnostic_query.protected_literals(facts[0].quote)
+                 or (basis.get("admitted") is False and unresolved_report
+                     and _normalize_label(unresolved_report) == label))):
         # Admitted requests reached this point only after their open-applicability
         # contract passed. Use its explicit, validated gaps for those requests.
         gaps = ([profile.parts[i] for i in open_applicability["gap_parts"]]
