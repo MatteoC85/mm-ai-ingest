@@ -329,8 +329,11 @@ def generate_ask_response(
             "occur in a retrieved procedure. Select applicable conditions from the supplied sources; "
             "do not copy an entire Step or a neighboring installation/transport operation. "
             "Write every checklist item and its precautions in RESPONSE_LANGUAGE, preserving "
-            "source labels, units, negations and applicability conditions. Standing isolation, STOP "
-            "and PPE requirements remain in force; do not invent their release.")
+            "source labels, units, negations and applicability conditions. Give each distinct documented "
+            "protective requirement as its own check with the phase or activity it governs. State any required "
+            "energy isolation and PPE explicitly as conditions to verify. Give any required STOP or hold its own "
+            "documented trigger and scope, separate from energy isolation. Keep each required protection "
+            "and safety state in force until the source documents its release.")
     if bounded_phase:
         system_msg += (
             " PROCEDURE_SCOPE=bounded_phase: answer only the phase requested in QUESTION and "
