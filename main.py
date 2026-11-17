@@ -16451,7 +16451,7 @@ def _assistant_core_build_clarification(
                 reviewed_question = _root_documentary.with_recorded_measurement_units(
                     documentary, profile, question_to_review, request.response_language,
                 )
-                diagnostic = {} if (request.debug or _root_documentary.can_review_source_bound(
+                diagnostic = {} if (request.debug or recorded_question or _root_documentary.can_review_source_bound(
                     documentary, reviewed_question,
                 )) else None
                 verified = _assistant_core_verified_documentary_context(
@@ -16482,6 +16482,24 @@ def _assistant_core_build_clarification(
                         meta["root_documentary_verified"] = True
                     elif diagnostic is not None:
                         diagnostic["outcome"] = "public_citation_binding_mismatch"
+                if recorded_question and diagnostic is not None:
+                    budget = _v13_current_budget()
+                    if budget is not None:
+                        # Match the ordinary webapp review to its existing cost receipt.
+                        # Never emit the question, document excerpts, proofs or owner IDs.
+                        try:
+                            print("ROOT_DOCUMENTARY_RESULT", json.dumps({
+                                "request_id": budget.request_id,
+                                "outcome": diagnostic.get("outcome"),
+                                "reason": diagnostic.get("review_reason"),
+                                "source_bound": requires_approval,
+                                "required_type_count": len(documentary.required_indication_types),
+                                "documentary_question_count": len(documentary.questions),
+                                "source_count": diagnostic.get("source_count"),
+                                "document_count": diagnostic.get("distinct_document_count"),
+                            }, separators=(",", ":")), flush=True)
+                        except (OSError, ValueError, TypeError):
+                            pass
     else:
         base["answer"] = question
     return base
