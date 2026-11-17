@@ -16443,7 +16443,10 @@ def _assistant_core_build_clarification(
                     "source_bound_clarification_requires_approval", False,
                 )
                 if requires_approval and verified is None:
-                    base.update(problem_summary=default_question, clarification_question=default_question)
+                    fallback = default_question
+                    if _retrieval_diagnostic_query.unresolved_reported_indication(profile) is not None:
+                        fallback = _retrieval_diagnostic_query.recorded_indication_question(request.response_language)
+                    base.update(problem_summary=fallback, clarification_question=fallback)
                 if request.debug and diagnostic is not None:
                     meta["root_documentary_diagnostic"] = diagnostic
                 if verified is not None:

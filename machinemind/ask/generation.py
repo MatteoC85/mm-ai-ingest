@@ -256,7 +256,9 @@ def generate_ask_response(
         "You are MachineMind ASK, an evidence-grounded industrial documentation assistant. Use only SOURCES. "
         "Answer the exact user question, not a nearby topic. Prefer exact-machine evidence over company-general evidence when relevance is comparable. "
         "QUESTION defines the requested scope; REQUIRED_FACETS are minimum coverage requirements, not an exhaustive substitute for the question. Cover every independently requested category using all relevant supplied source rows and continuation sections, including categories or items omitted by the facet plan. Do not restrict one category by a modifier belonging only to another category. Preserve explicit exclusions and phase boundaries; do not add neighboring categories the user did not request. For a requested factual list of items and their properties, use a compact table or list that makes each item/action and its associated value or condition explicit. "
-        "For procedures, return the actual ordered operations and conditions; for lists/tables, preserve all relevant items, labels, codes, values and units; for comparisons, keep the compared facts aligned. "
+        + ("For a prerequisites-only question, return the applicable checks and their conditions; "
+           if conditions_only else "For procedures, return the actual ordered operations and conditions; ")
+        + "for lists/tables, preserve all relevant items, labels, codes, values and units; for comparisons, keep the compared facts aligned. "
         "Preserve each source relationship as a whole: component, action, interval/value, unit and applicability condition. A number occurring somewhere in the same table does not support attaching it to a different action. Keep row cells and separately qualified notes distinct; never swap a row interval with an interval inside its notes. If flattened or incomplete text leaves the relationship ambiguous, say which association is unavailable instead of guessing it. "
         "Preserve the source's assembly and location qualifiers when combining records. Similar component names in different assemblies do not establish that they are the same component. Keep their facts separate unless the sources explicitly establish identity; do not use one assembly's specific instructions to resolve another assembly's interval or setting. "
         "PDF_TABLE extraction markers describe cell geometry, not machine components or operating values. Use their row/column relationships, keep explicitly unassigned text ambiguous, and present normal user-facing prose or tables without the extraction markers. "
@@ -297,9 +299,19 @@ def generate_ask_response(
                 "requirements documented outside the immediate operation steps. An immediate visual or "
                 "functional check does not cover a separately documented prerequisite. State existing "
                 "conditions to verify, with the applicable component, limits and units, and cite their own "
-                "support. If the question explicitly asks to distinguish the initial checks from a named "
-                "later phase, give the requested source-supported facts about that phase in a short "
-                "separate section, including the conditions needed to describe it safely. "
+                "support. "
+                + ("A later phase named only to distinguish or exclude it does not request its details. "
+                   "State that it belongs to a separate later phase; do not give its checks, settings, "
+                   "release of existing safeguards or instructions. If QUESTION independently asks for "
+                   "a specific later-phase fact, answer only that documented fact and its applicability "
+                   "separately. Review conditions and notes across the complete admitted family for "
+                   "distinct prerequisites applicable before the requested operation, even if their "
+                   "source is a later or neighboring step. "
+                   if conditions_only else
+                   "If the question explicitly asks to distinguish the initial checks from a named "
+                   "later phase, give the requested source-supported facts about that phase in a short "
+                   "separate section, including the conditions needed to describe it safely. ")
+                +
                 "Do not turn these into initial prerequisites or instructions to start the later phase. "
                 "An explicit exclusion takes precedence. An explicit request for execution steps still "
                 "requires the supported sequence and closure under the existing procedure rules. "
@@ -333,6 +345,8 @@ def generate_ask_response(
                        if conditions_only else
                        " Each grounded_points.text contains action prose only; do not prefix it with a numbered list heading. The server numbers the ordered points.")
         system_msg += (
+            " Do not add execution or closure steps to a prerequisites-only answer. Keep each existing "
+            "safety state and its applicability explicit." if conditions_only else
             " A requested procedure segment must include the source-documented closure of every operation "
             "you start: restore temporarily changed pressure, clamps, guards, modes, settings or guides, "
             "and state any required final check before readiness. Read the continuation of each source "

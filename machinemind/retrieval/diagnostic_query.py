@@ -114,6 +114,19 @@ def unresolved_reported_indication(profile: DiagnosticQueryProfile) -> str | Non
     return label if len(unknown_types & INDICATION_TYPES) >= 2 else None
 
 
+def recorded_indication_question(language: str) -> str:
+    """Ask only for records, without stating any documentary or diagnostic fact."""
+    if language == "en":
+        return (
+            "What do the existing records say about the event classification and the affected circuit or component? "
+            "Include any recorded measurements with their values and units."
+        )
+    return (
+        "Che cosa riportano i registri disponibili sulla classificazione dell’evento e sul circuito o "
+        "componente interessato? Indica eventuali misure registrate con i relativi valori e unità."
+    )
+
+
 def _retrieval_aliases(value: Any, quote: str, role: str) -> tuple[str, ...]:
     if role not in FACT_ROLES or not isinstance(value, (list, tuple)) or len(value) > MAX_RETRIEVAL_ALIASES:
         return ()
@@ -715,13 +728,7 @@ def enforce_diagnostic_basis(raw: Mapping[str, Any], profile: DiagnosticQueryPro
         if not invalid and isinstance(model_question, str) and 0 < len(model_question.strip()) <= 1200:
             question = model_question.strip()
         elif reported_only:
-            question = (
-                "What do the existing records say about the event classification and the affected circuit or component? "
-                "Include any recorded measurements with their values and units."
-                if profile.response_language == "en" else
-                "Che cosa riportano i registri disponibili sulla classificazione dell’evento e sul circuito o "
-                "componente interessato? Indica eventuali misure registrate con i relativi valori e unità."
-            )
+            question = recorded_indication_question(profile.response_language)
         out.update(effective_mode="root_cause", evidence_state="clarify", clarification_question=question,
                    source_type_policy="none", rationale=reason)
         for key in ("relevant_evidence_ids", "dense_queries", "lexical_queries", "exact_terms", "required_facets",

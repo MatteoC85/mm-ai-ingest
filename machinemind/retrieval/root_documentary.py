@@ -317,6 +317,59 @@ def source_bound_claims(records, bound, language, clarification):
     return (*typed, extra) if extra is not None else ()
 
 
+def _indication_types(parts):
+    return tuple(sorted({
+        word for part in parts for word in re.findall(r"[^\W_]+", _normalize_label(part.quote))
+    } & INDICATION_TYPES))
+
+
+def _retain_indication_cause_list(request, profile, label, selected, typed, *, source_type, source_text):
+    """Use a spare slot for a unique scoped cause list without changing typed claims."""
+    language = request.response_language
+    if language not in {"it", "en"} or diagnostic_query.unresolved_reported_indication(profile) is None:
+        return selected
+
+    def exact_owner(row):
+        if row.get("exact_machine_scope") is True:
+            return (row.get("company_id", request.company_id) == request.company_id
+                    and row.get("machine_id", request.machine_id) == request.machine_id)
+        return row.get("company_id") == request.company_id and row.get("machine_id") == request.machine_id
+
+    def view(row):
+        return {"citation_id": row["citation_id"], "source_type": source_type(row), "text": source_text(row)}
+
+    ids = [row.get("citation_id") for row in selected]
+    if not all(isinstance(cid, str) and cid for cid in ids) or len(set(ids)) != len(ids):
+        return selected
+    if not all(exact_owner(row) for row in selected):
+        return selected
+    selected_views = [view(row) for row in selected]
+    if any(not isinstance(row["text"], str) or not row["text"]
+           for row in selected_views if row["source_type"] == "document"):
+        return selected
+    if _listed_indication_causes(selected_views, label, language) is not None:
+        return selected
+    required = _indication_types(part for part in profile.parts if part.role in diagnostic_query.MISSING_ROLES)
+    types = {key[0] for row in selected_views if row["source_type"] == "document"
+             for key, *_ in _typed_entries(row["text"], label)}
+    original_claims = typed_entry_claims(selected_views, label, language)
+    if not original_claims or not set(required) <= types:
+        return selected
+    options = {row["citation_id"]: row for row in typed if exact_owner(row)}
+    choice = _listed_indication_causes([view(row) for row in options.values()], label, language)
+    if choice is None or choice[1][0] in ids:
+        return selected
+    candidate = options[choice[1][0]]
+    used = {citation for _, citations in original_claims for citation in citations}
+    for index in range(len(selected) - 1, -1, -1):
+        if ids[index] in used:
+            continue
+        amended = selected[:index] + selected[index + 1:] + [candidate]
+        if typed_entry_claims([view(row) for row in amended], label, language) == original_claims:
+            return amended
+    return selected
+
+
 def _documentary_rows(request, profile, rows, neutral_rows, *, source_type, source_text, document_filter):
     """Keep a matching excerpt per document before nearby same-document fragments.
 
@@ -375,7 +428,10 @@ def _documentary_rows(request, profile, rows, neutral_rows, *, source_type, sour
             break
     if len(preferred) < 2:
         return original
-    return (preferred + matching_pages + [row for row in original if row.get("citation_id") not in selected_ids])[:cap]
+    selection = (preferred + matching_pages + [row for row in original if row.get("citation_id") not in selected_ids])[:cap]
+    return _retain_indication_cause_list(
+        request, profile, label, selection, typed, source_type=source_type, source_text=source_text,
+    )
 
 
 def bind_request(request, profile, basis, indices, rows, *, source_type, source_text,
@@ -460,8 +516,7 @@ def bind_request(request, profile, basis, indices, rows, *, source_type, source_
         gaps = ([profile.parts[i] for i in open_applicability["gap_parts"]]
                 if basis.get("admitted") is True else
                 [part for part in profile.parts if part.role in diagnostic_query.MISSING_ROLES])
-        named_types = {word for part in gaps for word in re.findall(r"[^\W_]+", _normalize_label(part.quote))}
-        indication_types = tuple(sorted(named_types & INDICATION_TYPES))
+        indication_types = _indication_types(gaps)
         # Admission already required the exact bare label and explicit gap.
         # On the insufficient-observation path require explicit competing types.
         unresolved_indication = basis.get("admitted") is True or len(indication_types) >= 2
