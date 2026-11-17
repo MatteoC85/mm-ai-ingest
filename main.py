@@ -20567,7 +20567,7 @@ def _sd_review_step(*, step: dict, state: dict, language: str, debug: bool = Fal
                 **_smart_review.rejection_diagnostic(exc, prepared=prepared),
                 "model": model, "elapsed_seconds": round(time_module.monotonic() - started, 3),
                 "timeout_seconds": review_timeout, "input_version": _smart_review.INPUT_VERSION}
-            if str(exc) == "no_supported_hypotheses" and protocol_context is not None:
+            if str(exc) in _smart_protocol.INCONCLUSIVE_REJECTION_REASONS and protocol_context is not None:
                 try:
                     terminal, checkpoint = _smart_protocol.conclude(context=protocol_context,
                         state=rejected_state, packet=packet, probability_band=_sd_probability_band)

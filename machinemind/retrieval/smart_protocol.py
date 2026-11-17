@@ -10,6 +10,9 @@ from . import smart_review as review
 
 
 POLICY_VERSION = 'smart-no-admissible-update-inconclusive-v1'
+_NO_SUPPORTED = 'no_supported_hypotheses'
+_NO_POSITIVE = 'no_positive_supported_hypothesis'
+INCONCLUSIVE_REJECTION_REASONS = frozenset((_NO_SUPPORTED, _NO_POSITIVE))
 
 
 def require(value, code):
@@ -74,19 +77,42 @@ def prepare(*, state, packet, answer, language, probability_band):
             'question_citation_ids': _question_sources(summary, seal, packet)}
 
 
-def _terminal(history, language):
+def _eligible_rejection(rejection, record):
+    if rejection.get('outcome') != 'rejected' or rejection.get('decision_validated') is not True:
+        return False
+    reason = rejection.get('failure_reason')
+    if reason == _NO_SUPPORTED:
+        return True
+    if reason != _NO_POSITIVE:
+        return False
+    answer = record.get('answer') or {}
+    count = rejection.get('accepted_proposals')
+    verdicts = rejection.get('verdicts')
+    return (answer.get('api_value') == 'unknown' and not answer.get('free_text')
+            and rejection.get('usable_turn') is False
+            and 'question_proposal_index' in rejection and rejection['question_proposal_index'] is None
+            and type(count) is int and count > 0 and rejection.get('rejected_proposals') == 0
+            and isinstance(verdicts, list) and len(verdicts) == count
+            and all(isinstance(verdict, dict) and verdict.get('kind') == 'cause'
+                    and verdict.get('accepted') is True and verdict.get('reason') == 'supported'
+                    and verdict.get('blocking_checks') == [] for verdict in verdicts))
+
+
+def _terminal(history, language, reason):
     last = history[-1]
     question = last['question']['question_text']
     label = last['answer']['label']
     if language == 'en':
-        text = ('The diagnosis remains inconclusive: no cause has been identified. '
+        heading = 'The diagnosis is inconclusive: ' if reason == _NO_POSITIVE else 'The diagnosis remains inconclusive: '
+        text = (heading + 'no cause has been identified. '
                 'Machine documentation is available, but the proposed update did not support a new reliable diagnostic conclusion. '
                 'This does not confirm or exclude the earlier hypotheses.\n\n'
                 'Record of a previous question, not an instruction to repeat a check:\n'
                 + question + '\nRecorded answer: ' + label
                 + '\nThis record requests no new inspection, movement, adjustment or intervention.')
     else:
-        text = ('La diagnosi resta inconclusiva: la causa non è stata identificata. '
+        heading = 'La diagnosi è inconclusiva: ' if reason == _NO_POSITIVE else 'La diagnosi resta inconclusiva: '
+        text = (heading + 'la causa non è stata identificata. '
                 'La documentazione della macchina è disponibile, ma l’aggiornamento proposto non ha consentito una nuova conclusione diagnostica affidabile. '
                 'Questo risultato non conferma né esclude le ipotesi precedenti.\n\n'
                 'Registrazione di una domanda precedente, non un invito a ripetere una verifica:\n'
@@ -100,9 +126,9 @@ def _terminal(history, language):
 
 def conclude(*, context, state, packet, probability_band):
     rejection = state.get('grounding_review_meta') or {}
-    require(rejection.get('outcome') == 'rejected' and rejection.get('decision_validated') is True
-            and rejection.get('failure_reason') == 'no_supported_hypotheses',
-            'protocol_validated_rejection_required')
+    history = state.get('history') or []
+    require(isinstance(history, list) and history and isinstance(history[-1], dict)
+            and _eligible_rejection(rejection, history[-1]), 'protocol_validated_rejection_required')
     updated = deepcopy(state)
     updated.pop('grounding_review', None)
     updated.pop('grounding_review_debug', None)
@@ -129,9 +155,8 @@ def _validate(state, packet, probability_band):
     require(isinstance(last, dict), 'protocol_closed_record_required')
     _closed_record(last.get('question'), last.get('answer'), marker['language'])
     rejection = marker.get('rejection') or {}
-    require(rejection.get('outcome') == 'rejected' and rejection.get('decision_validated') is True
-            and rejection.get('failure_reason') == 'no_supported_hypotheses'
-            and rejection == state.get('grounding_review_meta'), 'protocol_rejection_changed')
+    require(rejection == state.get('grounding_review_meta') and _eligible_rejection(rejection, last),
+            'protocol_rejection_changed')
     prior = {'grounding_review': marker.get('prior_review'), 'history': history[:-1],
              'hypotheses': marker.get('prior_hypotheses'), 'current_question': last['question'],
              'status': 'in_progress', 'symptom_text': state.get('symptom_text', ''),
@@ -139,7 +164,7 @@ def _validate(state, packet, probability_band):
     _, summary = review.replay(state=prior, packet=packet, probability_band=probability_band)
     ids = _question_sources(summary, prior['grounding_review'], packet)
     require(ids == marker.get('question_citation_ids'), 'protocol_question_sources_changed')
-    return _terminal(history, marker['language']), ids
+    return _terminal(history, marker['language'], rejection['failure_reason']), ids
 
 
 def replay(*, state, packet, probability_band):
