@@ -270,7 +270,8 @@ def expected_current_identity(commit, revision, digest):
 
 
 def quality_preflight(service, prior_revision, *, expected_current=None,
-                      expected_current_revision=None, expected_current_digest=None):
+                      expected_current_revision=None, expected_current_digest=None,
+                      read_only_build=False):
     """Read-only check of supplied metadata; return whether known Usage must be removed.
 
     The only permitted cleanup is the exact failed 201 template above. The
@@ -301,8 +302,30 @@ def quality_preflight(service, prior_revision, *, expected_current=None,
         usage_configuration(current_spec)
     require(unaffected_spec(current_spec, True) == unaffected_spec(active_spec, True),
             'SERVICE_TEMPLATE_DIFFERS_FROM_ACTIVE')
-    require(routing_configuration(service)[1] == revision_behavioral_annotations(prior_revision, service),
-            'SERVICE_TEMPLATE_ANNOTATIONS_DIFFER_FROM_ACTIVE')
+    template_annotations = routing_configuration(service)[1]
+    active_annotations = revision_behavioral_annotations(prior_revision, service)
+    if template_annotations != active_annotations:
+        # The R50 rollback restored traffic without replacing its verified Gen2 template.
+        # Accept that exact idle template only for an image-build preflight.
+        r50_revision = SERVICE + '-r50-gen2'
+        status = service.get('status', {})
+        env_key = 'run.googleapis.com/execution-environment'
+        def pinned_r50_tag(section):
+            matches = [item for item in service[section]['traffic'] if item.get('tag') == 'r50-gen2']
+            return (len(matches) == 1 and matches[0].get('revisionName') == r50_revision
+                    and matches[0].get('percent', 0) == 0 and not matches[0].get('latestRevision'))
+        require(read_only_build and not current_usage
+                and expected_current == '62903a06fd542586e76b5114d0fa676064d8985a'
+                and prior == SERVICE + '-bfab1436e05d24eacbe267a840b153d79'
+                and expected_current_digest == 'sha256:1f31e6a55da521e2c5320f72d17a40a1358b530ff2faf35ad6260561f7c1d0b5'
+                and status.get('latestCreatedRevisionName') == r50_revision
+                and status.get('latestReadyRevisionName') == r50_revision
+                and current_commit == '083733f7b7cea5422474c22dacd9870c74d4ff34'
+                and current_spec['containers'][0].get('image') == IMAGE_ROOT + '@sha256:fb3e120642ddd44b464440d549c04443663d03d8fe233f8e4e2a009f4d4be90b'
+                and env_key not in active_annotations
+                and template_annotations == {**active_annotations, env_key: 'gen2'}
+                and pinned_r50_tag('spec') and pinned_r50_tag('status'),
+                'SERVICE_TEMPLATE_ANNOTATIONS_DIFFER_FROM_ACTIVE')
     return bool(current_usage)
 
 
@@ -404,7 +427,8 @@ def execute(project, commit, build, operation, expected_current, *, usage_requir
     if preserve_active:
         remove_usage = quality_preflight(before, prior_revision, expected_current=expected_current,
                                         expected_current_revision=expected_current_revision,
-                                        expected_current_digest=expected_current_digest)
+                                        expected_current_digest=expected_current_digest,
+                                        read_only_build=operation == 'preflight')
     else:
         required_configuration(template(before))
         require(unaffected_spec(template(before),usage_required) == unaffected_spec(prior_revision.get('spec', {}),usage_required),
