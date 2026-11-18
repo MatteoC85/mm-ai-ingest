@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from collections.abc import Mapping
 from typing import Any
 from array import array
+from operator import is_
 
 from .adapter_types import AdapterLimits
 from .assembly import AssemblyLimits, EvidenceAssemblyError
@@ -203,6 +204,8 @@ class AskEvidenceAdmission:
 def _same_value(left: Any, right: Any) -> bool:
     """Exact supported shape/order/types; no permission or mutable-data cache."""
     typ = type(left)
+    if left is right and (left is None or typ in (str, bool, int, float)):
+        return True
     if typ is not type(right):
         return False
     if typ is _JournalVector:
@@ -217,12 +220,17 @@ def _same_value(left: Any, right: Any) -> bool:
     if typ in (list, tuple):
         if len(left) != len(right):
             return False
-        if len(left) >= 8 and set(map(type, left)) == {float} and set(map(type, right)) == {float}:
-            # Binary double comparison preserves every finite float bit, notably
-            # signed zero. NaNs retain the original hex()-based comparison below.
-            if array("d", left).tobytes() == array("d", right).tobytes():
+        if len(left) >= 8 and set(map(type, left)) == {float}:
+            # Shared exact float components prove the same types and bits.
+            # The sequence containers themselves may still be mutable.
+            if all(map(is_, left, right)):
                 return True
-            return all(a.hex() == b.hex() for a, b in zip(left, right))
+            if set(map(type, right)) == {float}:
+                # Binary double comparison preserves signed zero. NaNs retain
+                # the original hex()-based comparison below.
+                if array("d", left).tobytes() == array("d", right).tobytes():
+                    return True
+                return all(a.hex() == b.hex() for a, b in zip(left, right))
         for a, b in zip(left, right):
             if not _same_value(a, b):
                 return False
