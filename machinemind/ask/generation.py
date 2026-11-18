@@ -580,6 +580,7 @@ class GenericGenerationEvidence:
         self.provider_rows = None
         self.validation_selection = ()
         self.generation_packet = None
+        self.document_scalar_draft_used = False
         self.retrieval = self.retrieval_snapshot = None
         self.sources = ResidualSourceAdapters(request=request, session=session,
             readers=readers, authorize=authorize, invoke=self.invoke)
@@ -685,6 +686,45 @@ class GenericGenerationEvidence:
             return result
         return self.invoke(work, self.request)
 
+    def _document_scalar_draft(self, messages):
+        from . import document_scalar_draft as scalar_draft
+        from .request_completion import current
+        completion = current()
+        if (completion is None or self.runtime.preserve_procedure_context
+                or getattr(completion, "_document_scalar_review_required", False)):
+            return None
+        marker = scalar_draft.target(self.request, self.retrieval["assistant_core_contract"],
+                                     self.retrieval.get("plan") or {})
+        if marker is None or not 1 <= len(self.provider_handles) <= 16:
+            return None
+        allowed = self.current()
+        scope, _ = self.session.read_contract(request=self.request, current_allowed_sources=allowed)
+        documents = set(scope.document_ids)
+        if scope.bubble_document_id:
+            documents.add(scope.bubble_document_id)
+        if len(documents) != 1:
+            return None
+        document_id, = documents
+        pages = []
+        for row, handle in zip(self.provider_rows, self.provider_handles, strict=True):
+            item = self.session.inspect_record(request=self.request, handle=handle,
+                                               current_allowed_sources=allowed)
+            if len(item.original_observations) != 1:
+                return None
+            original = item.original_observations[0]
+            if (getattr(original, "stored_machine_id", None) != self.request.machine_id
+                    or getattr(original, "stored_company_id", None) != self.request.company_id):
+                return None
+            pages.append((row, original))
+        result = scalar_draft.proposal(marker=marker, document_id=document_id,
+                                       candidate_pages=pages, emitted_message=messages[-1]["content"])
+        if result is None:
+            return None
+        completion.budget.ensure_time(0.0)
+        completion._document_scalar_review_required = True
+        self.document_scalar_draft_used = True
+        return result, scalar_draft.MODEL
+
     def _model(self, *args, **parameters):
         def work():
             if self.provider_handles is None or not self.provider_handles:
@@ -695,7 +735,9 @@ class GenericGenerationEvidence:
             if not _same_value(self.retrieval, self.retrieval_snapshot):
                 raise GenerationEvidenceError("generation input mutated before model")
             self.records(self.input_handles)
-            result = self.runtime._v13_json_models(*args, **parameters)
+            result = self._document_scalar_draft(args[0]) if args else None
+            if result is None:
+                result = self.runtime._v13_json_models(*args, **parameters)
             self.records(self.input_handles)
             return result
         return self.invoke(work, self.request)
@@ -848,7 +890,7 @@ class GenericGenerationEvidence:
                     current_allowed_sources=self.current())
                 if self.generation_packet is not None:
                     result.setdefault("meta", {})["generation_evidence"] = dict(self.generation_packet)
-                if self.runtime.preserve_procedure_context:
+                if self.runtime.preserve_procedure_context or self.document_scalar_draft_used:
                     result["_assistant_core_force_semantic_verify"] = True
                     if self.provider_rows is not None:
                         result["_assistant_core_validation_evidence"] = list(self.provider_rows)

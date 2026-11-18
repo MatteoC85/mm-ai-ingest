@@ -479,6 +479,7 @@ def run_sync(payload: Any, x_ai_internal_secret: Optional[str], *,
         if (
             requested_mode == MODE_ASK
             and str(final.get("status") or "").strip().lower() == "no_sources"
+            and not getattr(completion, "_document_scalar_review_required", False)
         ):
             rescued = measured("flow.precision_rescue", _assistant_core_precision_fact_rescue,
                 q=q,

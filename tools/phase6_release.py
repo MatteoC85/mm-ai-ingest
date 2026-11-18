@@ -314,6 +314,9 @@ def quality_preflight(service, prior_revision, *, expected_current=None,
             SERVICE + '-r51-gen2': (
                 'r51-gen2', '7b74340d7c4105c32cd7335d141237e9a62ee5bf',
                 'sha256:9609980f5332b02c83cbc8151a41da96f54f294dc528d4600b5534195cd39688'),
+            SERVICE + '-r52-gen2': (
+                'r52-gen2', 'dc132dcf1387684fe56bd9be01a34dd343cd1339',
+                'sha256:de851b8465f3a5e87da975b70be18f492fcdaf89728b85595d38294d75552a9f'),
         }
         status = service.get('status', {})
         idle_revision = status.get('latestCreatedRevisionName')

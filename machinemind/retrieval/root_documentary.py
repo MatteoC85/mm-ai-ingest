@@ -339,10 +339,29 @@ def _matches_recorded_quantity(unknowns, clarification, language):
     """Match only verbatim named quantities already established as measurements."""
     measured, recorded = _NAMED_QUANTITY_WORDING[language]
     requested = {" ".join(match["quantity"].casefold().split()) for match in recorded.finditer(clarification)}
-    return any(
-        " ".join(match["quantity"].casefold().split()) in requested
-        for quote in unknowns for match in measured.finditer(quote)
-    )
+    for quote in unknowns:
+        for match in measured.finditer(quote):
+            quantity = " ".join(match["quantity"].casefold().split())
+            if quantity in requested:
+                return True
+            # A value noun does not change the measured quantity. Match that whole
+            # quantity, never a prefix such as "temperature" in "temperature sensor status".
+            exact = r"[ \t]+".join(re.escape(word) for word in quantity.split())
+            if language == "en":
+                patterns = (
+                    rf"\b(?:recorded|logged)[ \t]+{exact}[ \t]+values?{_EN_QUANTITY_END}",
+                    rf"\b{exact}[ \t]+values?[ \t]+(?:recorded|logged)"
+                    rf"(?=\s*(?:[,;:.!?()]|$|\b(?:and|or|with|at|during|in|on)\b))",
+                )
+            else:
+                patterns = (
+                    rf"{_IT_QUANTITY_START}valor[ei][ \t]+"
+                    rf"(?:di[ \t]+|d(?:el|ello|ella|ei|egli|elle)[ \t]+|dell['’])"
+                    rf"{exact}[ \t]+registrat[oaie]\b",
+                )
+            if any(re.search(pattern, clarification, re.IGNORECASE) for pattern in patterns):
+                return True
+    return False
 
 
 def with_recorded_measurement_units(bound, profile, clarification, language):
