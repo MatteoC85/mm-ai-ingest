@@ -28,7 +28,7 @@ from ..ask.phase_trace import hot as _phase_hot
 from .adapter_types import AdapterContext, AdapterLimits, AdaptationResult
 from .assembly import (AssemblyLimits, EvidenceAssembly, EvidenceAssemblyError,
                        _allowance, _int, assemble_evidence)
-from .contracts import SourceIdentity, _PackedFloats
+from .contracts import SourceIdentity, _evidence_id_scope, _PackedFloats
 from .record_adapters import adapt_candidate, adapt_chunk, adapt_page
 from .structured_adapters import adapt_structured_source
 
@@ -144,7 +144,8 @@ def _payload_scope(pool):
         return
     token = _CURRENT_PAYLOAD_POOL.set(pool)
     try:
-        yield
+        with _evidence_id_scope():
+            yield
     finally:
         _CURRENT_PAYLOAD_POOL.reset(token)
 

@@ -305,26 +305,36 @@ def quality_preflight(service, prior_revision, *, expected_current=None,
     template_annotations = routing_configuration(service)[1]
     active_annotations = revision_behavioral_annotations(prior_revision, service)
     if template_annotations != active_annotations:
-        # The R50 rollback restored traffic without replacing its verified Gen2 template.
-        # Accept that exact idle template only for an image-build preflight.
-        r50_revision = SERVICE + '-r50-gen2'
+        # The R50 rollback and the R51 zero-traffic stage left verified Gen2
+        # templates. Only these exact idle templates may pass a build preflight.
+        idle_templates = {
+            SERVICE + '-r50-gen2': (
+                'r50-gen2', '083733f7b7cea5422474c22dacd9870c74d4ff34',
+                'sha256:fb3e120642ddd44b464440d549c04443663d03d8fe233f8e4e2a009f4d4be90b'),
+            SERVICE + '-r51-gen2': (
+                'r51-gen2', '7b74340d7c4105c32cd7335d141237e9a62ee5bf',
+                'sha256:9609980f5332b02c83cbc8151a41da96f54f294dc528d4600b5534195cd39688'),
+        }
         status = service.get('status', {})
+        idle_revision = status.get('latestCreatedRevisionName')
+        idle = idle_templates.get(idle_revision) if type(idle_revision) is str else None
         env_key = 'run.googleapis.com/execution-environment'
-        def pinned_r50_tag(section):
-            matches = [item for item in service[section]['traffic'] if item.get('tag') == 'r50-gen2']
-            return (len(matches) == 1 and matches[0].get('revisionName') == r50_revision
+
+        def pinned_idle_tag(section):
+            matches = [item for item in service[section]['traffic'] if item.get('tag') == idle[0]]
+            return (len(matches) == 1 and matches[0].get('revisionName') == idle_revision
                     and matches[0].get('percent', 0) == 0 and not matches[0].get('latestRevision'))
-        require(read_only_build and not current_usage
+
+        require(read_only_build and not current_usage and idle is not None
                 and expected_current == '62903a06fd542586e76b5114d0fa676064d8985a'
                 and prior == SERVICE + '-bfab1436e05d24eacbe267a840b153d79'
                 and expected_current_digest == 'sha256:1f31e6a55da521e2c5320f72d17a40a1358b530ff2faf35ad6260561f7c1d0b5'
-                and status.get('latestCreatedRevisionName') == r50_revision
-                and status.get('latestReadyRevisionName') == r50_revision
-                and current_commit == '083733f7b7cea5422474c22dacd9870c74d4ff34'
-                and current_spec['containers'][0].get('image') == IMAGE_ROOT + '@sha256:fb3e120642ddd44b464440d549c04443663d03d8fe233f8e4e2a009f4d4be90b'
+                and status.get('latestReadyRevisionName') == idle_revision
+                and current_commit == idle[1]
+                and current_spec['containers'][0].get('image') == IMAGE_ROOT + '@' + idle[2]
                 and env_key not in active_annotations
                 and template_annotations == {**active_annotations, env_key: 'gen2'}
-                and pinned_r50_tag('spec') and pinned_r50_tag('status'),
+                and pinned_idle_tag('spec') and pinned_idle_tag('status'),
                 'SERVICE_TEMPLATE_ANNOTATIONS_DIFFER_FROM_ACTIVE')
     return bool(current_usage)
 

@@ -8,12 +8,16 @@ Offsets refer to the exact indexed text, NOT to bytes or the original PDF.
 from __future__ import annotations
 
 from array import array
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 from dataclasses import dataclass, fields, is_dataclass, field
 from enum import Enum
 import hashlib
 import json
 import math
+from operator import attrgetter, is_
+from threading import get_ident
 from typing import Any
 
 SCHEMA_VERSION = "canonical-evidence-v1"
@@ -311,8 +315,10 @@ class EvidenceRecord:
         IDs change when declared content/provenance changes. Missing values are
         retained as missing. Text is never normalized, truncated or lowercased.
         """
-        digest = hashlib.sha256((SCHEMA_VERSION + "\n" + canonical_json(self)).encode("utf-8")).hexdigest()
-        return "ev1_" + digest
+        scope = _CANONICAL_EVIDENCE_IDS.get()
+        if scope is not None and type(self) is EvidenceRecord:
+            return scope.evidence_id(self)
+        return _canonical_evidence_id(self)
 
     def to_dict(self) -> dict[str, Any]:
         if type(self) is not EvidenceRecord:
@@ -324,6 +330,110 @@ class EvidenceRecord:
         digest = hashlib.sha256((SCHEMA_VERSION + "\n" + serialized).encode("utf-8")).hexdigest()
         return {"schema_version": SCHEMA_VERSION, "evidence_id": "ev1_" + digest,
                 **primitive}
+
+
+def _canonical_evidence_id(record):
+    digest = hashlib.sha256((SCHEMA_VERSION + "\n" + canonical_json(record)).encode("utf-8")).hexdigest()
+    return "ev1_" + digest
+
+
+def _enum_fields(member):
+    return (member.value,)
+
+
+_EVIDENCE_ID_READERS = {
+    cls: attrgetter(*(item.name for item in fields(cls)))
+    for cls in (EvidenceRecord, SourceIdentity, SourceScope, SourceLocator, Provenance,
+                EvidenceField, EvidenceRelation, LinkTarget)
+}
+_EVIDENCE_ID_READERS.update({cls: _enum_fields for cls in (
+    SourceType, SourceFormat, ScopeLevel, ContentKind, PageBasis)})
+_CANONICAL_EVIDENCE_IDS = ContextVar("mm_ask_canonical_evidence_ids", default=None)
+_MAX_MEMO_BYTES = 2 * 1024 * 1024
+_MAX_STAMP_NODES = 256
+
+
+def _evidence_stamp(record):
+    """Capture all canonical leaves of exact internal types, with a bounded walk."""
+    todo, watched, visited = [record], [], set()
+    size = 0
+    for _ in range(_MAX_STAMP_NODES):
+        if not todo:
+            return tuple(watched), size
+        value = todo.pop()
+        kind = type(value)
+        size += 64
+        if kind is str:
+            size += 4 * len(value)
+        elif kind is int:
+            size += value.bit_length() // 8
+        elif value is None or kind is bool:
+            pass
+        elif kind is tuple:
+            if len(value) > _MAX_STAMP_NODES:
+                return None
+            todo.extend(value)
+        else:
+            reader = _EVIDENCE_ID_READERS.get(kind)
+            if reader is None:
+                return None
+            if id(value) in visited:
+                continue
+            visited.add(id(value))
+            try:
+                current = reader(value)
+            except AttributeError:
+                return None
+            watched.append((value, reader, current))
+            size += 128
+            todo.extend(current)
+        if size > _MAX_MEMO_BYTES:
+            return None
+    return None
+
+
+def _unchanged_evidence_stamp(watched):
+    try:
+        return all(all(map(is_, reader(obj), prior)) for obj, reader, prior in watched)
+    except AttributeError:
+        return False
+
+
+class _EvidenceIdScope:
+    """Reuse only the pure digest of tracked exact values during one ASK."""
+    def __init__(self):
+        self.ids = {}
+        self.remaining = _MAX_MEMO_BYTES
+        self.owner = get_ident()
+        self.closed = False
+
+    def evidence_id(self, record):
+        if self.closed or get_ident() != self.owner:
+            return _canonical_evidence_id(record)
+        key = id(record)
+        prior = self.ids.get(key)
+        if prior is not None:
+            return prior[1] if _unchanged_evidence_stamp(prior[0]) else _canonical_evidence_id(record)
+        stamp = _evidence_stamp(record) if self.remaining else None
+        result = _canonical_evidence_id(record)
+        if stamp is not None:
+            watched, size = stamp
+            if size <= self.remaining and _unchanged_evidence_stamp(watched):
+                self.ids[key] = watched, result
+                self.remaining -= size
+        return result
+
+
+@contextmanager
+def _evidence_id_scope():
+    scope = _EvidenceIdScope()
+    token = _CANONICAL_EVIDENCE_IDS.set(scope)
+    try:
+        yield
+    finally:
+        scope.closed = True
+        scope.ids.clear()
+        _CANONICAL_EVIDENCE_IDS.reset(token)
 
 
 @dataclass(frozen=True, slots=True)
