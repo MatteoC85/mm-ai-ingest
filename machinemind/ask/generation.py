@@ -211,16 +211,23 @@ def generate_ask_response(
         and prepared_decision.get("request_kind") == "factual")
     complete_family_composition = bool(runtime.preserve_procedure_context
         and runtime.procedure_context_sources)
-    conditions_numeric_scope = bool(
+    typed_numeric_checklist = bool(
         complete_family_composition and finite_owned_request
-        and contract.get("procedure_scope") == "conditions_only"
-        and not any(contract.get("procedure_phase") or ())
         and information_task in {INFO_NUMERIC_SPECIFICATION, INFO_PROCEDURE_SEGMENT}
         and prepared_decision.get("request_kind") in {"factual", "procedure"}
         and REQ_NUMERIC_VALUE in mandatory_answer_types
         and mandatory_answer_types & {REQ_CHECKLIST, REQ_SAFETY_CONDITIONS}
         and composition_answer_types <= {
             REQ_NUMERIC_VALUE, REQ_CHECKLIST, REQ_SAFETY_CONDITIONS, "explanation"})
+    conditions_numeric_scope = bool(
+        typed_numeric_checklist and contract.get("procedure_scope") == "conditions_only"
+        and not any(contract.get("procedure_phase") or ()))
+    # A numeric route can keep its task label and still satisfy the typed
+    # prerequisites contract. Use that proof for transport and compact style.
+    fast_terra_checklist = conditions_numeric_scope and conditions_only_contract(
+        procedure_scope=contract.get("procedure_scope"), information_task=INFO_PROCEDURE_SEGMENT,
+        required_answer_types=contract.get("required_answer_types"),
+        facet_queries=contract.get("facet_queries"))
     conditions_numeric_composition = conditions_numeric_scope and enumeration_requested is False
     # A typed prerequisite checklist may legitimately carry P4's lexical
     # enumeration flag. Keep its LOW effort and the existing checklist review.
@@ -369,6 +376,14 @@ def generate_ask_response(
             "after the first overview page or image, and do not present procedure names as physical "
             "groups unless their descriptions identify the underlying assembly/system."
         )
+    if source_backed_composition and fast_terra_checklist:
+        system_msg += (
+            " Start with the grounded facts. Use short section labels only when they help distinguish "
+            "what applies, and state each check or fact once with its citation and all directly "
+            "applicable conditions. Keep a condition with its check unless the source makes it "
+            "an independent requirement. Skip an introductory restatement and a closing recap. "
+            "Use the detail needed for all supported required facts, safeguards and phase boundaries."
+        )
     assurance_block = _v13_assurance_prompt_block(retrieval)
     contract_block = (
         f"INFORMATION_TASK: {information_task}\n"
@@ -406,7 +421,8 @@ def generate_ask_response(
             if runtime.preserve_procedure_points else None)
         with ask_fast_stage.allow(ask_fast_stage.WRITER,
                 eligible=source_backed_composition and (finite_factual_composition
-                    or conditions_numeric_composition or enumerated_conditions_stage_scope),
+                    or conditions_numeric_composition or enumerated_conditions_stage_scope
+                    or fast_terra_checklist),
                 prefer_luna=source_backed_composition and conditions_only and conditions_numeric_scope):
             parsed, model_used = _v13_json_models(
                 writer_messages,

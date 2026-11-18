@@ -212,6 +212,26 @@ def assistant_ui_source_selection_note(numbers: list[int], *, source_procedure_s
     return '<p data-mm-ui-note="source-step-selection" style="margin:0 0 14px 0;font-size:13px;color:#64748b;">' + assistant_ui_escape(note, _runtime=_runtime) + '</p>'
 
 
+def _assistant_ui_atx_heading_lines(lines):
+    """Recognize explicit standalone headings, never hash text inside code fences."""
+    fence = None
+    for raw in lines:
+        if fence:
+            marker, width = fence
+            if re.fullmatch(r' {0,3}' + re.escape(marker) + '{' + str(width) + r',}[ \t]*', raw):
+                fence = None
+            yield raw, ''
+            continue
+        opening = re.match(r' {0,3}(`{3,}|~{3,})(.*)$', raw)
+        if opening and (opening.group(1)[0] == '~' or '`' not in opening.group(2)):
+            fence = (opening.group(1)[0], len(opening.group(1)))
+            yield raw, ''
+            continue
+        heading = re.fullmatch(r' {0,3}#{1,6}[ \t]+(.+?)(?:[ \t]+#+)?[ \t]*', raw)
+        label = heading.group(1).strip() if heading else ''
+        yield raw, label if label.strip('# \t') else ''
+
+
 def assistant_ui_is_section_heading(line: str) -> bool:
     """Complete presentation labels only; never infer headings from prose keywords."""
     return line.casefold().rstrip(':') in {
@@ -554,8 +574,8 @@ def assistant_ui_generic_html(answer: str, *, links: list[dict], citations: Opti
     escaped before the restrained inline formatting is applied.
     """
     is_en = str(response_language or 'it').strip().lower().startswith('en')
-    clean = assistant_ui_normalize_markdown_tables(_runtime.strip_inline_citation_markers_for_display(str(answer or '')), _runtime=_runtime).strip()
-    if not clean:
+    clean = assistant_ui_normalize_markdown_tables(_runtime.strip_inline_citation_markers_for_display(str(answer or '')), _runtime=_runtime).strip('\r\n')
+    if not clean.strip():
         return ''
     status_low = str(status or 'answered').strip().lower()
     sections: list[dict] = []
@@ -566,9 +586,12 @@ def assistant_ui_generic_html(answer: str, *, links: list[dict], citations: Opti
         sections.append(row)
         return row
     raw_lines = [x.rstrip() for x in clean.replace('\r', '\n').split('\n')]
-    for raw in raw_lines:
+    for raw, atx_heading in _assistant_ui_atx_heading_lines(raw_lines):
         line = str(raw or '').strip()
         if not line:
+            continue
+        if atx_heading:
+            current = new_section('heading', atx_heading)
             continue
         if assistant_ui_is_section_heading(line):
             current = new_section('heading', line)
@@ -882,8 +905,8 @@ def assistant_ui_lossless_html(answer: str, *, response_language: str, status: s
     A numbered line and its following detail lines remain together, including
     their original safety notes. Source numbering is never made contiguous.
     """
-    clean = assistant_ui_normalize_markdown_tables(_runtime.strip_inline_citation_markers_for_display(str(answer or '')), _runtime=_runtime).strip()
-    if not clean:
+    clean = assistant_ui_normalize_markdown_tables(_runtime.strip_inline_citation_markers_for_display(str(answer or '')), _runtime=_runtime).strip('\r\n')
+    if not clean.strip():
         return ''
     is_en = str(response_language or 'it').strip().lower().startswith('en')
     status_low = str(status or 'answered').strip().lower()
@@ -934,7 +957,7 @@ def assistant_ui_lossless_html(answer: str, *, response_language: str, status: s
             section_open = False
 
     first_content = True
-    for raw in lines:
+    for raw, atx_heading in _assistant_ui_atx_heading_lines(lines):
         line = str(raw or '').strip()
         if not line:
             continue
@@ -942,8 +965,8 @@ def assistant_ui_lossless_html(answer: str, *, response_language: str, status: s
         numbered = re.match(r'^(\d{1,3})[.)]\s+(.+)$', line)
         bullet = re.match('^[-•]\\s+(.+)$', line)
         known_heading = assistant_ui_is_section_heading(line)
-        if heading or known_heading:
-            open_section(heading.group(1).strip() if heading else line)
+        if atx_heading or heading or known_heading:
+            open_section(atx_heading or (heading.group(1).strip() if heading else line))
         elif numbered:
             if not section_open:
                 open_section('Steps' if is_en else 'Passaggi')
@@ -1010,11 +1033,13 @@ def assistant_ui_finalize_response(resp: dict, *, language: str='it', _runtime: 
     is_native_root_cause = effective_mode == 'root_cause' and (isinstance(out.get('possible_causes'), list) or 'problem_summary' in out or isinstance(out.get('recommended_next_checks'), list))
     if is_native_root_cause:
         canonical_text = assistant_ui_root_cause_text(out, response_language=language, _runtime=_runtime)
+        render_input = canonical_text
         out['answer'] = canonical_text
         rendered = assistant_ui_root_cause_html(out, response_language=language, _runtime=_runtime) if canonical_text else ''
         mode = 'root_cause'
     else:
-        canonical_text = str(out.get('answer') or '').strip()
+        render_input = str(out.get('answer') or '')
+        canonical_text = render_input.strip()
         out['answer'] = canonical_text
         if canonical_text and is_procedure_model:
             rendered = procedure_ui_model_to_html(
@@ -1027,7 +1052,7 @@ def assistant_ui_finalize_response(resp: dict, *, language: str='it', _runtime: 
             mode = 'procedure'
         else:
             rendered = assistant_ui_generic_html(
-                canonical_text,
+                render_input,
                 links=out.get('rg_links') if isinstance(out.get('rg_links'), list) else [],
                 citations=out.get('citations') if isinstance(out.get('citations'), list) else [],
                 response_language=language,
@@ -1040,7 +1065,7 @@ def assistant_ui_finalize_response(resp: dict, *, language: str='it', _runtime: 
     coverage = assistant_ui_token_coverage(canonical_text, visible, _runtime=_runtime) if canonical_text else 1.0
     renderer_fallback_used = False
     if canonical_text and coverage < 0.97:
-        lossless = assistant_ui_lossless_html(canonical_text, response_language=language, status=status,
+        lossless = assistant_ui_lossless_html(render_input, response_language=language, status=status,
                                              source_procedure_selected=source_procedure_selected, _runtime=_runtime)
         lossless_visible = assistant_ui_visible_text_from_html(lossless, _runtime=_runtime)
         lossless_coverage = assistant_ui_token_coverage(canonical_text, lossless_visible, _runtime=_runtime)

@@ -305,7 +305,7 @@ def quality_preflight(service, prior_revision, *, expected_current=None,
     template_annotations = routing_configuration(service)[1]
     active_annotations = revision_behavioral_annotations(prior_revision, service)
     if template_annotations != active_annotations:
-        # The R50 rollback and the R51 zero-traffic stage left verified Gen2
+        # The R50 rollback and the reviewed R51–R53 zero-traffic stages left Gen2
         # templates. Only these exact idle templates may pass a build preflight.
         idle_templates = {
             SERVICE + '-r50-gen2': (
@@ -317,6 +317,9 @@ def quality_preflight(service, prior_revision, *, expected_current=None,
             SERVICE + '-r52-gen2': (
                 'r52-gen2', 'dc132dcf1387684fe56bd9be01a34dd343cd1339',
                 'sha256:de851b8465f3a5e87da975b70be18f492fcdaf89728b85595d38294d75552a9f'),
+            SERVICE + '-r53-gen2': (
+                'r53-gen2', '24d7c94c01fde67bb3e43de581648506f07a1f10',
+                'sha256:922bace7c3818e5a499a83ff67d9be312df0999b798ddab9607c43e3173e9c9e'),
         }
         status = service.get('status', {})
         idle_revision = status.get('latestCreatedRevisionName')
