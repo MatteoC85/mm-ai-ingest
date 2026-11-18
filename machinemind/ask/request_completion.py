@@ -18,6 +18,7 @@ import hashlib
 import json
 import math
 import os
+import re
 from typing import Any
 from . import phase_trace
 
@@ -339,6 +340,93 @@ def independent_review_reserve(*, required: bool):
         _INDEPENDENT_REVIEW_RESERVE.reset(token)
 
 
+_WRITER_CLASSIFICATION = {
+    "information_task": frozenset({"numeric_specification", "document_explanation",
+        "procedure_segment", "procedure_full", "interface_navigation", "sequence_synchronization", "other"}),
+    "procedure_scope": frozenset({"conditions_only", "bounded_phase", "execution_steps", "other"}),
+    "request_kind": frozenset({"factual", "procedure", "ambiguous", "unsafe_request", "out_of_scope", "other"}),
+    "effort": frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"}),
+}
+_WRITER_TYPES = frozenset({"numeric_value", "checklist", "safety_conditions", "explanation",
+    "ordered_actions", "interface_locations", "state_sequence", "source_location", "source_locations"})
+_WRITER_FLAGS = ("enumerated", "owned", "complete_family", "conditions_only", "bounded_phase",
+                 "has_phase", "finite_factual", "typed_numeric_checklist", "fast_checklist",
+                 "fast_eligible", "prefer_luna")
+_WRITER_TRANSPORT_REASONS = frozenset({"disabled", "model", "caller_scope", "owner",
+    "budget_ceiling", "rate_floor", "selected", "unsupported_envelope"})
+_WRITER_MODELS = frozenset({"gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-6-luna",
+    "gpt-6.1-terra", "gpt-6.1-sol", "gpt-6.2-sol", "gpt-6.2-astra", "gpt-4.1", "gpt-4.1-mini"})
+_WRITER_TIERS = frozenset({"auto", "default", "flex", "scale", "priority", "fast",
+                           "ultrafast", "not_reported", "unknown"})
+_WRITER_STATES = frozenset({"pending", "uncertain", "settled", "not_sent"})
+
+
+def _writer_enum(value, allowed):
+    return value if type(value) is str and value in allowed else "other"
+
+
+def _writer_model(value):
+    if type(value) is not str:
+        return "other"
+    # Only expose approved model families. Never include provider text.
+    if len(value) > 34:
+        return "other"
+    if value in _WRITER_MODELS:
+        return value
+    base, sep, date = value[:-11], value[-11:-10], value[-10:]
+    if base in _WRITER_MODELS and sep == "-" and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", date):
+        return base
+    return "other"
+
+
+def observe_writer_scope(**values):
+    owner = current()
+    if owner is None or len(owner.writer_scopes) >= 4:
+        return
+    row = {key: _writer_enum(values.get(key), allowed) for key, allowed in _WRITER_CLASSIFICATION.items()}
+    types = values.get("answer_types")
+    if type(types) in (frozenset, set):
+        row["answer_types"] = sorted(_WRITER_TYPES.intersection(types))
+    for key in _WRITER_FLAGS:
+        value = values.get(key)
+        if type(value) is bool:
+            row[key] = value
+    owner.writer_scopes.append(row)
+
+
+def observe_writer_transport(model, reason):
+    owner = current()
+    if owner is not None and len(owner.writer_transports) < 8 and reason in _WRITER_TRANSPORT_REASONS:
+        owner.writer_transports.append({"model": _writer_model(model), "decision": reason})
+
+
+def _writer_call_projection(rows):
+    """Select only counters and fixed names from the existing budget ledger."""
+    out = []
+    for row in rows[:12]:
+        if type(row) is not dict:
+            continue
+        purpose = row.get("purpose")
+        if type(purpose) is not str or purpose not in _KNOWN_PURPOSES:
+            continue
+        r = {"purpose": purpose, "model": _writer_model(row.get("model")),
+             "provider_model": _writer_model(row.get("provider_model_observed") or row.get("provider_model")),
+             "requested_tier": _writer_enum(row.get("requested_service_tier"), _WRITER_TIERS),
+             "actual_tier": _writer_enum(row.get("provider_service_tier"), _WRITER_TIERS),
+             "state": _writer_enum(row.get("accounting_state"), _WRITER_STATES),
+             "dispatched": row.get("dispatched") is True}
+        for k in ("call", "input_tokens", "output_tokens", "reasoning_tokens", "max_output_tokens"):
+            v = row.get(k)
+            if type(v) is int and 0 <= v <= 10_000_000:
+                r[k] = v
+        for k in ("started_at_elapsed_seconds", "completed_at_elapsed_seconds"):
+            v = row.get(k)
+            if type(v) in (int, float) and math.isfinite(v) and 0 <= v <= 3600:
+                r[k] = v
+        out.append(r)
+    return out
+
+
 def _decision_observation(diagnostics: dict) -> dict:
     """Only fixed diagnostics may survive a terminal without a fresh fence."""
     decision = diagnostics.get('independent_review_decision')
@@ -418,6 +506,9 @@ def record_contract_observation(stage: str, contract: dict, *, diagnostics: dict
                 and gate in _INDEPENDENT_REVIEW_GATES else 'other')
     # Hashes are debug-only and computed/validated here. Never copy arbitrary
     # provider fields, response/source prose, identifiers or exception messages.
+    if stage == "semantic_review" and type(diagnostics) is dict and len(owner.writer_reviews) < 4:
+        if observation := _decision_observation(diagnostics):
+            owner.writer_reviews.append(observation)
     if getattr(owner.payload, "debug", False) is True:
         if stage == "semantic_review" and type(diagnostics) is dict:
             row.update(_decision_observation(diagnostics))
@@ -587,6 +678,9 @@ class RequestCompletion:
         self.cache_committed = False
         self.provider_schedules = []
         self.contract_checks = []
+        self.writer_scopes = []
+        self.writer_transports = []
+        self.writer_reviews = []
         self._private_review_envelope = None
         self._private_review_attempted = False
         self._private_review_invalidated = False
@@ -783,6 +877,16 @@ class RequestCompletion:
                     result['meta']['private_factual_review_diagnostics'] = deepcopy(self._private_review_envelope)
             except Exception:
                 pass  # Diagnostic failure never changes publication/accounting.
+        if current() is self and self.writer_scopes:
+            try:
+                request_key = hashlib.sha256(str(self.budget.request_id).encode("utf-8")).hexdigest()
+                print("MM_ASK_WRITER_TRACE " + json.dumps({
+                    "request_sha256": request_key, "commit": commit, "scopes": self.writer_scopes,
+                    "transport": self.writer_transports, "review": self.writer_reviews,
+                    "calls": _writer_call_projection(self.budget.call_log),
+                }, separators=(",", ":"), allow_nan=False))
+            except (AttributeError, OSError, TypeError, ValueError):
+                pass  # Telemetry must not change the scored answer or its budget.
         if current() is self and getattr(self.payload, "debug", False) is True:
             # Log only the request-owned, fixed-name timing data. A response
             # transport error can otherwise discard the entire client trace.
@@ -817,6 +921,9 @@ class RequestCompletion:
             finally:
                 _ACTIVE.reset(self._owner_token)
                 self.contract_checks.clear()
+                self.writer_scopes.clear()
+                self.writer_transports.clear()
+                self.writer_reviews.clear()
                 self._private_review_invalidated = True
                 self._private_review_envelope = None
                 self._private_ordinary_writer = None

@@ -14,7 +14,9 @@ from copy import deepcopy
 from collections.abc import Callable
 from typing import Any, Optional, Type
 from machinemind.ask.phase_trace import span as _phase_span
-from machinemind.ask.request_completion import provider_timeout as _provider_timeout
+from machinemind.ask.request_completion import (
+    provider_timeout as _provider_timeout, observe_writer_transport, _writer_model,
+)
 from . import ask_fast_stage
 from .provider_failures import ProviderResponseError, http_failure, response_status_failure
 from .request_budget import _V13OutputCapacityInsufficient, _V13BudgetExceeded
@@ -50,6 +52,8 @@ def _record_service_tier(budget, call_index, payload: dict, data=None) -> None:
             actual = data.get("service_tier")
             row["provider_service_tier"] = (actual if isinstance(actual, str) and actual in _SERVICE_TIERS
                                              else "not_reported" if actual is None else "unknown")
+            if row.get("purpose") == ask_fast_stage.WRITER:
+                row["provider_model_observed"] = _writer_model(data.get("model"))
 
 
 def normalize_model_candidates(models: Optional[list[str]]) -> list[str]:
@@ -472,6 +476,8 @@ def json_models(messages: list[dict], *, models: list[str], json_schema: dict, e
                                 parsed = invoke(dispatch_model)
                             break
                         except ask_fast_stage.UnsupportedEnvelope:
+                            if purpose == ask_fast_stage.WRITER:
+                                observe_writer_transport(dispatch_model, "unsupported_envelope")
                             # Only a proven unsent envelope can follow the old
                             # dispatch path. A sent attempt spends its one slot.
                             if int(budget.llm_calls) != calls_before:

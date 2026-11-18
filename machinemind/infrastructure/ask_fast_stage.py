@@ -60,27 +60,36 @@ def allow(purpose, *, eligible, prefer_luna=False):
         _PERMIT.reset(token)
 
 
+def _selection_result(purpose, model, reason, attempt=None):
+    if purpose == WRITER:
+        from machinemind.ask.request_completion import observe_writer_transport
+        observe_writer_transport(model, reason)
+    return attempt
+
+
 def select(budget, *, purpose, model, candidates, json_schema, company_id):
-    if (os.environ.get(FLAG) != VERSION or model not in _MODELS
-            or any(item not in _MODELS for item in candidates)):
-        return None
+    if os.environ.get(FLAG) != VERSION:
+        return _selection_result(purpose, model, "disabled")
+    if model not in _MODELS or any(item not in _MODELS for item in candidates):
+        return _selection_result(purpose, model, "model")
     if purpose == ROUTER:
         if (len(candidates) != 1 or type(json_schema) is not dict
                 or json_schema.get("name") != "machinemind_ask_compact_router_v1"):
             return None
     elif purpose not in {WRITER, REVIEW} or _PERMIT.get() != purpose:
-        return None
+        return _selection_result(purpose, model, "caller_scope")
     owner = _owner(budget)
-    if (owner is None or str(owner.payload.company_id) != str(company_id)
-            or not 0 < budget.max_estimated_cost_usd <= .25):
-        return None
+    if owner is None or str(owner.payload.company_id) != str(company_id):
+        return _selection_result(purpose, model, "owner")
+    if not 0 < budget.max_estimated_cost_usd <= .25:
+        return _selection_result(purpose, model, "budget_ceiling")
     from . import request_budget
 
     actual, floor = _MODELS[model]
     rates = tuple(request_budget._positive_rate(rate) for rate in request_budget._v13_model_rates(model))
     if any(rate < minimum for rate, minimum in zip(rates, floor, strict=True)):
-        return None
-    return Attempt(budget, purpose, model, actual, rates)
+        return _selection_result(purpose, model, "rate_floor")
+    return _selection_result(purpose, actual, "selected", Attempt(budget, purpose, model, actual, rates))
 
 
 def native_attempts(baseline, *, candidates, json_schema, company_id):

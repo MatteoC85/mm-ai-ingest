@@ -201,6 +201,7 @@ from machinemind.retrieval import review_references as _retrieval_review_referen
 from machinemind.retrieval import smart_presentation as _smart_presentation
 from machinemind.retrieval import smart_review as _smart_review
 from machinemind.retrieval import smart_protocol as _smart_protocol
+from machinemind.retrieval import smart_start_observation as _smart_start_observation
 from machinemind.retrieval import smart_evidence as _smart_evidence
 from machinemind.retrieval import smart_context as _smart_context
 from machinemind.retrieval import smart_routing as _smart_routing
@@ -22075,8 +22076,26 @@ def _sd_response_from_step(
             )
         ),
     }
+    observation_meta = None
+    admitted_citations, admitted_rg_links = list(citations), list(rg_links)
+    if state.get(_smart_start_observation.MARKER):
+        try:
+            wanted, observation_meta = _smart_start_observation.projection(state=state, step=step,
+                packet=_smart_evidence.review_packet(_sd_require_grounding_packet(state)))
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail={"code": "SMART_DIAGNOSTIC_SESSION_RESTART_REQUIRED",
+                "reason": str(exc)}) from None
+        by_id = {str(c.get("citation_id") or ""): c for c in citations}
+        if any(cid not in by_id for cid in wanted):
+            raise HTTPException(status_code=502, detail={"code": "SMART_DIAGNOSTIC_REVIEW_CITATION_MISSING"})
+        citations = [by_id[cid] for cid in wanted]
+        source_manifest_meta = {"version": SMART_DIAGNOSTIC_SOURCE_MANIFEST_VERSION,
+            "hypothesis_scoped": False, "protocol_context_only": True, "literal_label_only": True,
+            "reviewer_proof_bound": False, "question_proof_bound": False, "citation_count": len(citations)}
     if final_ready and status != "no_sources":
-        if state.get("protocol_inconclusive"):
+        if observation_meta is not None:
+            pass  # The exact label witness above is context, never a causal proof.
+        elif state.get("protocol_inconclusive"):
             try:
                 terminal, wanted = _smart_protocol.replay(state=state,
                     packet=_smart_evidence.review_packet(_sd_require_grounding_packet(state)),
@@ -22143,8 +22162,11 @@ def _sd_response_from_step(
             "current_step_number": _safe_int(question.get("question_number"), _safe_int(current_state.get("current_step_number"), 0)),
             "hypotheses": hypotheses,
             "final_result": final_result if final_ready else {},
-            "citations": citations,
-            "rg_links": rg_links,
+            # The observation-only public view cites its label witness. Keep
+            # the complete admitted manifest in the signed checkpoint so a
+            # later reviewed answer can cite a different admitted source.
+            "citations": admitted_citations if observation_meta is not None else citations,
+            "rg_links": admitted_rg_links if observation_meta is not None else rg_links,
         }
     )
 
@@ -22205,6 +22227,10 @@ def _sd_response_from_step(
     }
     if public_outcome:
         resp["meta"]["diagnostic_outcome"] = public_outcome
+    if observation_meta is not None:
+        resp["meta"].update(cacheable=False, semantic_cacheable=False,
+            session_history_preserved=True, session_continuable=not final_ready,
+            start_observation_protocol=observation_meta)
     _sd_flatten_question(resp, question)
     if current_state.get("protocol_inconclusive"):
         resp["meta"].update(cacheable=False, semantic_cacheable=False,
@@ -22416,8 +22442,12 @@ def _assistant_core_synthesize_smart_start(
     step, state = _sd_review_step(step=step, state=state, language=request.response_language,
                                  debug=request.debug, raw_draft=parsed)
     if step.get("status") == "no_sources":
-        return _sd_review_rejected_response(state=state, language=request.response_language,
-            session_id=session_id, symptom_text=request.query)
+        try:
+            step, state = _smart_start_observation.start(state=state,
+                packet=_smart_evidence.review_packet(_sd_require_grounding_packet(state)), language=request.response_language)
+        except ValueError:
+            return _sd_review_rejected_response(state=state, language=request.response_language,
+                session_id=session_id, symptom_text=request.query)
     response = _sd_response_from_step(
         session_id=session_id,
         company_id=request.company_id,
@@ -22579,10 +22609,21 @@ def _assistant_core_smart_start_sync(
                     "message": "Smart Diagnostic START was routed outside the guided-diagnostic contract.",
                 },
             )
+        observation_turn = False
+        if not hypotheses and (final.get("meta") or {}).get(_smart_start_observation.MARKER):
+            try:
+                checkpoint = _sd_parse_json(final.get("session_state_json"))
+                _sd_validate_state_binding(checkpoint, company_id=company_id, machine_id=machine_id,
+                    session_id=session_id, question_id=str(question.get("question_id") or ""))
+                observation_turn = _smart_start_observation.validate_start_response(response=final,
+                    state=checkpoint, packet=_smart_evidence.review_packet(_sd_require_grounding_packet(checkpoint)),
+                    expected_symptom=request.query)
+            except (ValueError, HTTPException):
+                pass  # An invalid application marker never relaxes the first-turn guard.
         if (
             status_value in {"answered", "in_progress"}
             and not final_ready
-            and (not question_text or question_number < 1 or not hypotheses)
+            and (not question_text or question_number < 1 or (not hypotheses and not observation_turn))
         ):
             raise HTTPException(
                 status_code=502,
@@ -23080,8 +23121,12 @@ def smart_diagnostic_start_v1(
     }
     step, state = _sd_review_step(step=step, state=state, language=language, debug=bool(payload.debug), raw_draft=parsed)
     if step.get("status") == "no_sources":
-        return _sd_review_rejected_response(state=state, language=language,
-            session_id=session_id, symptom_text=symptom_text)
+        try:
+            step, state = _smart_start_observation.start(state=state,
+                packet=_smart_evidence.review_packet(_sd_require_grounding_packet(state)), language=language)
+        except ValueError:
+            return _sd_review_rejected_response(state=state, language=language,
+                session_id=session_id, symptom_text=symptom_text)
     return _sd_response_from_step(
         session_id=session_id, company_id=company_id, machine_id=machine_id,
         symptom_text=symptom_text, language=language, state=state, step=step,
@@ -23110,6 +23155,8 @@ def smart_diagnostic_answer_v1(
     )
     symptom_text = str(state.get("symptom_text") or "").strip()
     language = _sd_language(payload.language or state.get("language"), symptom_text)
+    if state.get(_smart_start_observation.MARKER):
+        language = str(state.get("language") or language)
     if not _sd_state_has_admitted_evidence(state):
         return _sd_no_sources_response(language, session_id, symptom_text, debug=bool(payload.debug), gate_result=dict(state.get("evidence_gate") or {}))
     _sd_require_grounding_packet(state)
@@ -23134,6 +23181,23 @@ def smart_diagnostic_answer_v1(
         "api_value": answer_api_value, "label": answer_label,
         "free_text": str(payload.answer.free_text or "").strip(),
     }
+    if state.get(_smart_start_observation.MARKER):
+        packet = _smart_evidence.review_packet(_sd_require_grounding_packet(state))
+        try:
+            if answer_api_value == "unknown":
+                step, state = _smart_start_observation.conclude(state=state, packet=packet, answer=answer)
+            else:
+                state = _smart_start_observation.continue_with_observation(state=state, packet=packet, answer=answer)
+        except ValueError as exc:
+            missing_note = str(exc) == "start_observation_existing_note_required"
+            raise HTTPException(status_code=400 if missing_note else 409, detail={
+                "code": "SMART_DIAGNOSTIC_OBSERVATION_REQUIRED" if missing_note else "SMART_DIAGNOSTIC_SESSION_RESTART_REQUIRED",
+                "reason": str(exc)}) from None
+        if answer_api_value == "unknown":
+            return _sd_response_from_step(session_id=session_id, company_id=company_id, machine_id=machine_id,
+                symptom_text=symptom_text, language=language, state=state, step=step,
+                citations=list(state.get("citations") or []), rg_links=list(state.get("rg_links") or []),
+                debug=bool(payload.debug))
     if (answer_api_value == "unknown" and current_question.get("application_reporting_version")
             == _smart_review.continuity.REPORTING_VERSION):
         # The recovery question only requests already-available information.
@@ -23389,6 +23453,18 @@ def smart_diagnostic_finalize_v1(
     language = _sd_language(payload.language or state.get("language"), symptom_text)
     if not _sd_state_has_admitted_evidence(state):
         return _sd_no_sources_response(language, session_id, symptom_text, debug=bool(payload.debug), gate_result=dict(state.get("evidence_gate") or {}))
+    if state.get(_smart_start_observation.MARKER):
+        language = str(state.get("language") or language)
+        try:
+            step, state = _smart_start_observation.conclude(state=state,
+                packet=_smart_evidence.review_packet(_sd_require_grounding_packet(state)))
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail={"code": "SMART_DIAGNOSTIC_SESSION_RESTART_REQUIRED",
+                "reason": str(exc)}) from None
+        return _sd_response_from_step(session_id=session_id, company_id=company_id, machine_id=machine_id,
+            symptom_text=symptom_text, language=language, state=state, step=step,
+            citations=list(state.get("citations") or []), rg_links=list(state.get("rg_links") or []),
+            debug=bool(payload.debug))
     if state.get("protocol_inconclusive"):
         # Replay this signed record in its frozen language; do not change the
         # language binding while returning the same immutable terminal text.

@@ -406,8 +406,23 @@ def generate_ask_response(
 
     parsed: dict = {}
     model_used = model
-    from .request_completion import begin_private_ordinary_writer, finish_private_ordinary_writer
+    from .request_completion import (
+        begin_private_ordinary_writer, finish_private_ordinary_writer, observe_writer_scope,
+    )
     from ..infrastructure import ask_fast_stage
+
+    fast_eligible = source_backed_composition and (
+        finite_factual_composition or conditions_numeric_composition
+        or enumerated_conditions_stage_scope or fast_terra_checklist)
+    prefer_luna = source_backed_composition and conditions_only and conditions_numeric_scope
+    observe_writer_scope(information_task=information_task, procedure_scope=contract.get("procedure_scope"),
+        request_kind=prepared_decision.get("request_kind"), effort=effort,
+        answer_types=composition_answer_types, enumerated=enumeration_requested,
+        owned=finite_owned_request, complete_family=complete_family_composition,
+        conditions_only=conditions_only, bounded_phase=bounded_phase,
+        has_phase=any(contract.get("procedure_phase") or ()), finite_factual=finite_factual_composition,
+        typed_numeric_checklist=typed_numeric_checklist, fast_checklist=fast_terra_checklist,
+        fast_eligible=fast_eligible, prefer_luna=prefer_luna)
     private_writer = None
     try:
         writer_messages = [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}]
@@ -419,11 +434,7 @@ def generate_ask_response(
                 "max_output_tokens": V13_HEAVY_MAX_OUTPUT_TOKENS if policy_model == V13_HEAVY_MODEL else V13_FAST_MAX_OUTPUT_TOKENS,
                 "timeout": V13_HEAVY_TIMEOUT_SECONDS if policy_model == V13_HEAVY_MODEL else V13_FAST_TIMEOUT_SECONDS})
             if runtime.preserve_procedure_points else None)
-        with ask_fast_stage.allow(ask_fast_stage.WRITER,
-                eligible=source_backed_composition and (finite_factual_composition
-                    or conditions_numeric_composition or enumerated_conditions_stage_scope
-                    or fast_terra_checklist),
-                prefer_luna=source_backed_composition and conditions_only and conditions_numeric_scope):
+        with ask_fast_stage.allow(ask_fast_stage.WRITER, eligible=fast_eligible, prefer_luna=prefer_luna):
             parsed, model_used = _v13_json_models(
                 writer_messages,
                 models=writer_models,

@@ -28,10 +28,9 @@ def conditions_only_contract(*, procedure_scope, information_task,
         field = facet.get if isinstance(facet, Mapping) else lambda key, default=None: getattr(facet, key, default)
         if field("must_cover") is True:
             mandatory.append(field("answer_type"))
-    if mixed_numeric:
-        return ("numeric_value" in mandatory and bool(set(mandatory).intersection(checks))
-                and all(kind in checks | {"numeric_value"} for kind in mandatory))
-    return bool(mandatory) and all(kind in checks for kind in mandatory)
+    mandatory_types = set(mandatory)
+    return bool(mandatory_types.intersection(checks) and mandatory_types <= allowed
+                and (not mixed_numeric or "numeric_value" in mandatory_types))
 
 
 def bounded_phase_contract(*, procedure_scope, information_task,
@@ -87,13 +86,17 @@ def bind_conditions_requirements_to_question(decision):
     Reuse one existing facet slot and every query array: no additional retrieval
     queries, source authority or semantic coverage is created by this projection.
     """
-    if decision.effective_mode != "ask" or decision.request_kind in {"ambiguous", "unsafe_request", "out_of_scope"}:
+    if (decision.effective_mode != "ask" or decision.request_kind in {"ambiguous", "unsafe_request", "out_of_scope"}
+            or getattr(decision, "degraded", False) or any(getattr(decision, "procedure_phase", ()))):
         return decision
     # A numeric precondition does not turn a phase-limited procedural checklist
     # into an isolated lookup. Canonicalize only the router's explicit compound
     # shape; preserve every numeric obligation and every retrieval query. The
     # source-family selector and ordinary safety/coverage gates still decide.
-    if (decision.request_kind == "procedure" and decision.information_task == "numeric_specification"
+    factual_explanation = decision.request_kind == "factual" and any(
+        facet.must_cover and facet.answer_type == "explanation" for facet in decision.facet_queries)
+    if ((decision.request_kind == "procedure" or factual_explanation)
+            and decision.information_task == "numeric_specification"
             and "numeric_value" in decision.required_answer_types
             and conditions_only_contract(procedure_scope=decision.procedure_scope,
                 information_task="procedure_segment", required_answer_types=decision.required_answer_types,
@@ -106,12 +109,16 @@ def bind_conditions_requirements_to_question(decision):
         return decision
     mixed_numeric = "numeric_value" in decision.required_answer_types
     anchor = next(i for i, facet in enumerate(decision.facet_queries)
-                  if facet.must_cover and (not mixed_numeric or facet.answer_type in {"checklist", "safety_conditions"}))
+                  if facet.must_cover and facet.answer_type in {"checklist", "safety_conditions"})
+    # The canonical question-wide checks facet replaces redundant check slots.
+    # A requested numeric value or explanation is still a separate obligation.
+    separate_types = {"explanation"} | ({"numeric_value"} if mixed_numeric else set())
     facets = tuple(replace(facet,
         facet=QUESTION_CONDITIONS_REQUIREMENT if i == anchor else facet.facet,
-        must_cover=i == anchor or (mixed_numeric and facet.answer_type == "numeric_value" and facet.must_cover))
+        must_cover=i == anchor or (facet.must_cover and facet.answer_type in separate_types))
         for i, facet in enumerate(decision.facet_queries))
-    numeric_facets = tuple(facet.facet for facet in facets
-                          if mixed_numeric and facet.must_cover and facet.answer_type == "numeric_value")
-    return replace(decision, required_facets=tuple(dict.fromkeys((QUESTION_CONDITIONS_REQUIREMENT, *numeric_facets))),
-                   facet_queries=facets)
+    separate_facets = tuple(facet.facet for facet in facets
+                            if facet.must_cover and facet.answer_type in separate_types)
+    return replace(decision,
+        required_facets=tuple(dict.fromkeys((QUESTION_CONDITIONS_REQUIREMENT, *separate_facets))),
+        facet_queries=facets)
