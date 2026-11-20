@@ -235,9 +235,10 @@ class AskEvidenceSession:
         self._nodes: list[_Node] = []
         self._bytes = 0
         self._payload_pool = _PayloadPool(limits.max_bytes)
-        # One immutable admission envelope, owned by this request only. Reuse
-        # never skips current allowance checks or the canonical round-trip.
-        self._admission_cache = None
+        # A few immutable admission envelopes, owned by this request only.
+        # Alternating candidate/citation selections must not force adaptation
+        # again. Reuse never skips current authority or mutable-input checks.
+        self._admission_cache = []
 
     def __enter__(self) -> AskEvidenceSession:
         with self._lock:
@@ -254,7 +255,7 @@ class AskEvidenceSession:
             self._reads.clear()
             self._payload_pool.close()
             self._nodes.clear()
-            self._admission_cache = None
+            self._admission_cache.clear()
             self._bytes = 0
             self._request = None
             self._key = None
@@ -425,6 +426,13 @@ class AskEvidenceSession:
             raise AskCompositionError("aggregate record count exceeded")
         if self._bytes + size > self._limits.max_bytes:
             raise AskCompositionError("aggregate retained/admission byte budget exceeded")
+        # Envelopes are optional immutable accelerators. Evict oldest entries
+        # before a new retained/admission allocation; charge each full bundle
+        # conservatively even when its immutable values are shared.
+        while (self._admission_cache and self._bytes + size
+               + sum(row[3].bundle.size_bytes for row in self._admission_cache)
+               > self._limits.max_bytes):
+            self._admission_cache.pop(0)
 
     def records(self, *, request: Any, handles: tuple[RecordHandle, ...],
                 current_allowed_sources: frozenset[SourceIdentity]) -> tuple[LegacyRecordInput, ...]:
@@ -442,13 +450,16 @@ class AskEvidenceSession:
             return self._inputs(handles, current_allowed_sources, for_journal=True)
 
     def validate_records(self, *, request: Any, handles: tuple[RecordHandle, ...],
-                         current_allowed_sources: frozenset[SourceIdentity]) -> None:
+                         current_allowed_sources: frozenset[SourceIdentity],
+                         selected_fallback: bool = False) -> None:
         """Revalidate capabilities without allocating unused legacy copies.
 
         Immutable bundles have a pure conversion proof from their construction,
         not a permission cache. EVERY call checks request identity, scope,
         selection bounds, handle ownership and CURRENT source/relation grants.
         Changed adapter limits or an unproven bundle use the original restore.
+        Consumers replacing a discarded records() result may select its
+        positional fallback, which checks the same occurrences as records().
         Mutable consumer data remain checked by their journals and the unchanged
         admission/public Core port. No external calls or limits are removed.
         """
@@ -462,7 +473,8 @@ class AskEvidenceSession:
                 if not _has_validated_conversion(node.bundle, self._limits.evidence.adapter):
                     restore_legacy_records(node.bundle, company_id=self._scope.company_id,
                         allowed_sources=current_allowed_sources,
-                        adapter_limits=self._limits.evidence.adapter)
+                        adapter_limits=self._limits.evidence.adapter,
+                        positions=(node.offset,) if selected_fallback else None)
 
     def inspect_record(self, *, request: Any, handle: RecordHandle,
                        current_allowed_sources: frozenset[SourceIdentity]) -> RecordInspection:
@@ -613,12 +625,12 @@ class AskEvidenceSession:
             for selection in selections:
                 for handle in selection.records:
                     self._node(handle, current_allowed_sources)
-            cached = self._admission_cache
-            if (cached is not None and cached[0] == selections
-                    and cached[1] == current_allowed_sources and cached[2] == bounds):
+            cached = next((row for row in self._admission_cache
+                if row[0] == selections and row[1] == current_allowed_sources
+                and row[2] == bounds), None)
+            if cached is not None:
                 envelope = cached[3]
             else:
-                self._admission_cache = None
                 collections = tuple(AskCollectionInput(s.name,
                     self._inputs(s.records, current_allowed_sources), s.container_kind) for s in selections)
                 envelope = build_ask_evidence_input(request_key=self._key, collections=collections,
@@ -629,7 +641,12 @@ class AskEvidenceSession:
             # Restore with the fresh allowance and compare exact retrieval shape
             # on EVERY invocation. Mutable records are never cached or shared.
             apply_ask_evidence_input(retrieval, request_key=self._key, admission=result)
-            self._admission_cache = (selections, current_allowed_sources, bounds, envelope)
+            self._admission_cache[:] = [row for row in self._admission_cache if row is not cached]
+            self._admission_cache.append((selections, current_allowed_sources, bounds, envelope))
+            while (len(self._admission_cache) > 4 or self._bytes
+                   + sum(row[3].bundle.size_bytes for row in self._admission_cache)
+                   > self._limits.max_bytes):
+                self._admission_cache.pop(0)
             return result
 
     def admission_hook(self, *,

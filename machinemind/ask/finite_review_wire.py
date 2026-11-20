@@ -14,6 +14,12 @@ INSTRUCTIONS = (
     "corresponding coverage fields. Describe newly discovered omissions in full. "
     "Keep all labels out of the answer, edits and evidence quotes."
 )
+CHECKLIST_POSITIONS = (
+    " Write each required checklist item's exact text once in expected_list_items. "
+    "In covered_list_items and missing_list_items, give only the 1-based positions "
+    "of independently checked items in expected_list_items. Example: if the first "
+    "item is covered and the second missing, return [1] and [2]."
+)
 
 
 def _aliases(prefix, values):
@@ -26,6 +32,7 @@ class FiniteReviewWire:
     source_labels: tuple[tuple[str, str], ...]
     facet_labels: tuple[tuple[str, str], ...]
     type_labels: tuple[tuple[str, str], ...]
+    checklist_positions: bool = False
 
     def coverage(self, required_types, hard_requirements, required_facets, facet_contracts):
         facets = dict(self.facet_labels)
@@ -60,10 +67,30 @@ class FiniteReviewWire:
         if "operation_boundary" in fields:
             closure = fields["operation_boundary"]["properties"]["changes"]["items"]["properties"]
             closure["closing_source_citation_id"]["enum"] = source_ids
+        if self.checklist_positions:
+            maximum = fields["expected_list_items"]["maxItems"]
+            for name in ("covered_list_items", "missing_list_items"):
+                fields[name]["items"] = {"type": "integer", "minimum": 1, "maximum": maximum}
         return result
 
     def decode(self, reply):
         out = deepcopy(reply)
+        if self.checklist_positions:
+            expected = out.get("expected_list_items")
+            if type(expected) is not list or any(type(item) is not str for item in expected):
+                raise ValueError("finite review expected checklist has invalid type")
+            seen = set()
+            for name in ("covered_list_items", "missing_list_items"):
+                positions = out.get(name)
+                if type(positions) is not list:
+                    raise ValueError("finite review checklist positions have invalid type")
+                resolved = []
+                for position in positions:
+                    if type(position) is not int or not 1 <= position <= len(expected) or position in seen:
+                        raise ValueError("finite review checklist position is invalid")
+                    seen.add(position)
+                    resolved.append(expected[position - 1])
+                out[name] = resolved
         sources, facets, types = (
             {alias: value for value, alias in pairs}
             for pairs in (self.source_labels, self.facet_labels, self.type_labels)
@@ -107,7 +134,7 @@ class FiniteReviewWire:
         return out
 
 
-def prepare(sources, *, citation_ids, facets, types, question, answer):
+def prepare(sources, *, citation_ids, facets, types, question, answer, checklist_positions=False):
     """Replace the displayed identity of each unique, already-rendered header."""
     if not citation_ids or len(set(citation_ids)) != len(citation_ids):
         return None
@@ -123,4 +150,5 @@ def prepare(sources, *, citation_ids, facets, types, question, answer):
         parts.extend((sources[start:header.start(1)], label))
         start = header.end(1)
     parts.append(sources[start:])
-    return FiniteReviewWire("".join(parts), source_labels, _aliases("f", facets), _aliases("t", types))
+    return FiniteReviewWire("".join(parts), source_labels, _aliases("f", facets), _aliases("t", types),
+                           checklist_positions=checklist_positions)

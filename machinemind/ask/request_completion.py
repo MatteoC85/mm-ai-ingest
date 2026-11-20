@@ -33,7 +33,8 @@ PHASE6_CANDIDATE_VERSION = "phase6-closure-2026-09-29-v1"
 _TIMING_LOG_PHASES = frozenset({
     "authority.initial", "core.neutral", "core.router", "core.refine", "core.prepare",
     "core.synthesis", "core.validate", "core.repair", "flow.cache_store",
-    "flow.publication", "provider.llm", "provider.embedding",
+    "flow.publication", "provider.llm", "provider.embedding", "authority.fence",
+    "authority.files", "consumer.review", "consumer.review_packet", "flow.finalize",
 })
 _ACTIVE = ContextVar("mm_ask_request_completion", default=None)
 _CACHE_WINDOW = ContextVar("mm_ask_optional_cache_window", default=None)
@@ -887,20 +888,26 @@ class RequestCompletion:
                 }, separators=(",", ":"), allow_nan=False))
             except (AttributeError, OSError, TypeError, ValueError):
                 pass  # Telemetry must not change the scored answer or its budget.
-        if current() is self and getattr(self.payload, "debug", False) is True:
-            # Log only the request-owned, fixed-name timing data. A response
-            # transport error can otherwise discard the entire client trace.
+        if current() is self:
+            # The response transport can discard the phase trace. Preserve
+            # fixed-name timings for slow or failed requests without logging
+            # inputs, URLs, source records or provider bodies.
             try:
                 trace = result["meta"]["ask_phase_trace"]
-                spans = [[phase["phase"], phase["started_seconds"], phase["wall_seconds"],
-                          phase["thread_cpu_seconds"], phase["outcome"]]
-                         for phase in trace["spans"] if phase["phase"] in _TIMING_LOG_PHASES]
-                print("V13_ASK_PHASE_TIMING " + json.dumps({
-                    "elapsed_seconds": trace["elapsed_seconds"],
-                    "dropped_macro_spans": trace["dropped_macro_spans"],
-                    "spans": spans[:32],
-                }, separators=(",", ":"), allow_nan=False))
-            except (KeyError, OSError, TypeError, ValueError):
+                debug = getattr(self.payload, "debug", False) is True
+                answered = str(result.get("status") or "").lower() == "answered"
+                if debug or not answered or trace["elapsed_seconds"] >= 45.0:
+                    spans = [[phase["phase"], phase["started_seconds"], phase["wall_seconds"],
+                              phase["thread_cpu_seconds"], phase["outcome"]]
+                             for phase in trace["spans"] if phase["phase"] in _TIMING_LOG_PHASES]
+                    request_key = hashlib.sha256(str(self.budget.request_id).encode("utf-8")).hexdigest()
+                    print("V13_ASK_PHASE_TIMING " + json.dumps({
+                        "request_sha256": request_key, "commit": commit,
+                        "elapsed_seconds": trace["elapsed_seconds"],
+                        "dropped_macro_spans": trace["dropped_macro_spans"],
+                        "spans": spans[:32],
+                    }, separators=(",", ":"), allow_nan=False))
+            except (AttributeError, KeyError, OSError, TypeError, ValueError):
                 pass
         if str(result.get("status") or "").lower() == "answered":
             # Metadata/trace serialization belongs to this request too. A

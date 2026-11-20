@@ -746,13 +746,13 @@ def verify_or_repair_answer(
             "are not evidence of applicability. The complete operation family is context for "
             "finding applicable prerequisites, not a request to enumerate every Step or perform "
             "later actions or startup. expected_list_items must contain only supported checks "
-            "and precautions applicable to the requested phase. Write expected_list_items, "
-            "covered_list_items and missing_list_items in RESPONSE_LANGUAGE. Assess coverage fields "
+            "and precautions applicable to the requested phase. Write all checklist labels in "
+            "RESPONSE_LANGUAGE. Assess coverage fields "
             "against the exact retained answer for pass or the returned replacement for rewrite. "
             "Once an omission is corrected in the replacement, report it as covered; describe the "
             "original defect in reason, not in the replacement's missing fields. For each covered "
-            "item, use a short exact phrase from that answer as its label, with the identical label "
-            "in the expected and covered lists. Ignore formatting and obvious OCR word breaks only "
+            "item, use a short exact phrase from that answer as its label. "
+            "Ignore formatting and obvious OCR word breaks only "
             "when the underlying requirement and its qualifiers are identical. Keep distinct actions "
             "and safety states separate. Report any genuinely missing item, prerequisite, phase or "
             "applicability qualifier; never claim coverage merely to satisfy lexical matching. Preserve "
@@ -848,7 +848,7 @@ def verify_or_repair_answer(
             finite_wire = _finite_review_wire.prepare(sources_block, citation_ids=source_ids,
                 facets=tuple(review_facets) + tuple(item["facet"] for item in facet_contracts),
                 types=tuple(requirements) + tuple(item["answer_type"] for item in facet_contracts),
-                question=request.query, answer=answer)
+                question=request.query, answer=answer, checklist_positions=bool(enumeration_requested))
         if finite_wire is not None:
             compact_coverage = finite_wire.coverage(requirements, hard_requirements,
                 decision.required_facets, facet_contracts)
@@ -857,6 +857,8 @@ def verify_or_repair_answer(
                     < wire_bytes(coverage_block + sources_block)):
                 coverage_block = compact_coverage
                 system_msg += _finite_review_wire.INSTRUCTIONS
+                if finite_wire.checklist_positions:
+                    system_msg += _finite_review_wire.CHECKLIST_POSITIONS
                 # Compress only the accepted prompt view. The original packet
                 # and source labels still bind citations and final grounding.
                 review_source_prompt = _review_source_wire.compact_sources_block(finite_wire.sources)
@@ -1019,8 +1021,12 @@ def verify_or_repair_answer(
             "retains the exact reviewed draft. If any material coverage, grounding or safety defect "
             "requires a rewrite, return the complete corrected answer in the answer field. "
             "Report each required checklist item using a short, distinct label. For covered items, "
-            "copy the label from the resolved answer. Keep the same labels and full inventory across "
-            "the coverage fields. Give a brief reason that identifies any material difference.")
+            "copy the label from the resolved answer. Give a brief reason for any material difference.")
+        if not (finite_wire is not None and finite_wire.checklist_positions):
+            system_msg += " Keep the same labels and full inventory across the coverage fields."
+    if conditions_only and not (finite_wire is not None and finite_wire.checklist_positions):
+        system_msg += (" Write expected_list_items, covered_list_items and missing_list_items in "
+                       "RESPONSE_LANGUAGE. Use identical labels across these lists.")
     review_models = [V13_FAST_MODEL, V13_PLANNER_MODEL]
     # Completeness is only representation: the reviewer must still reject any
     # actual source, coverage or safety defect. This initial literal-draft judge

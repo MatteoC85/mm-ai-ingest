@@ -402,18 +402,86 @@ def source_bound_claims(records, bound, language, clarification):
     if not typed:
         return ()
     documented_causes = _listed_indication_causes(documents, bound.reported_label, language)
-    if documented_causes is not None:
-        return (*typed, documented_causes)
+    claims = (*typed, documented_causes) if documented_causes is not None else typed
     if not bound.include_structured_observations:
-        return typed
+        return claims
     extra = _structured_observation_claim(records, bound.reported_label, language)
-    return (*typed, extra) if extra is not None else ()
+    if extra is not None:
+        # The manual's possible causes and the same-machine record describe
+        # different facts. The reviewer must bind a separate proof to each.
+        return (*claims, extra)
+    return claims if documented_causes is not None else ()
 
 
 def _indication_types(parts):
     return tuple(sorted({
         word for part in parts for word in re.findall(r"[^\W_]+", _normalize_label(part.quote))
     } & INDICATION_TYPES))
+
+
+_EXPLICIT_DOCUMENTARY_REQUEST = {
+    "en": re.compile(
+        r"^(?:what|which)\s+(?:documented\s+(?:causes?|conditions?|types?|variants?)|"
+        r"(?:causes?|conditions?|types?|variants?)\s+(?:are\s+)?"
+        r"(?:documented|supported by (?:the )?(?:manual|documents?)))\b", re.IGNORECASE,
+    ),
+    "it": re.compile(
+        r"^(?:quale|quali)\s+(?:cause|condizion[ei]|tip[oi]|variant[ei])\s+"
+        r"(?:(?:è|sono)\s+)?(?:documentat[aeio]|compatibil[ei] con (?:il|i) (?:manuale|documenti))\b",
+        re.IGNORECASE,
+    ),
+}
+
+_EVENT_LOCATION_GAP = {
+    "en": re.compile(r"(?:the\s+)?(?:affected|involved)\s+(?:circuit|component|subsystem)", re.IGNORECASE),
+    "it": re.compile(r"(?:(?:il|lo|la)\s+)?(?:circuito|componente|sottosistema)\s+"
+                    r"(?:interessat[oa]|coinvolt[oa])", re.IGNORECASE),
+}
+
+_RECORDED_EVIDENCE_REQUEST = {
+    "en": re.compile(
+        r"\b(?:what|which)\s+(?:(?:existing|recorded|already available)\s+"
+        r"(?:evidence|observations?|readings?|records?|measurements?)|"
+        r"(?:evidence|observations?|readings?|records?|measurements?)\s+already available)\b", re.IGNORECASE,
+    ),
+    "it": re.compile(
+        r"\b(?:quale|quali)\s+(?:riscontr[oi]|osservazion[ei]|lettur[ae]|misurazion[ei]|dati)\s+"
+        r"(?:già disponibil[ei]|registrat[aeio])\b", re.IGNORECASE,
+    ),
+}
+
+
+def _explicit_documentary_indices(profile):
+    """Recover a literal documentary question from the validated request partition."""
+    pattern = _EXPLICIT_DOCUMENTARY_REQUEST.get(profile.response_language)
+    if pattern is None or diagnostic_query.unresolved_reported_indication(profile) is None:
+        return []
+    return [i for i, part in enumerate(profile.parts) if part.role == "request" and pattern.match(part.quote)]
+
+
+def _valid_documentary_indices(profile, indices):
+    return (isinstance(indices, list) and 1 <= len(indices) <= 3
+            and all(type(i) is int and 0 <= i < len(profile.parts) for i in indices)
+            and indices == sorted(set(indices))
+            and all(profile.parts[i].role == "request" for i in indices))
+
+
+def _requests_recorded_evidence(profile):
+    pattern = _RECORDED_EVIDENCE_REQUEST.get(profile.response_language)
+    return pattern is not None and any(part.role == "request" and pattern.search(part.quote) for part in profile.parts)
+
+
+def _only_reported_event_location_unknown(request, profile, basis):
+    """An event's missing location does not change the selected machine scope."""
+    pattern = _EVENT_LOCATION_GAP.get(profile.response_language)
+    if (pattern is None or request.ai_scope != "machine_all" or not request.machine_id
+            or basis.get("reason") != "target_identity_required"
+            or basis.get("admitted") is not False
+            or diagnostic_query.unresolved_reported_indication(profile) is None):
+        return False
+    gaps = [part.quote for part in profile.parts
+            if part.role == "target_identity_unknown" and part.basis_use == "identity_gap"]
+    return len(gaps) == 1 and gaps == basis.get("identity_gap_quotes") and pattern.fullmatch(gaps[0]) is not None
 
 
 def _exact_machine_owner(request, row):
@@ -585,20 +653,30 @@ def _documentary_rows(request, profile, rows, neutral_rows, *, source_type, sour
 def bind_request(request, profile, basis, indices, rows, *, source_type, source_text,
                  document_filter=None, open_applicability=None, neutral_rows=None):
     if (request.requested_mode != "root_cause" or basis.get("validation_error")
-            or basis.get("identity_gap_quotes")
             or profile.interpretation_status != "valid"):
         return None
+    reported_location_gap = False
+    if basis.get("identity_gap_quotes"):
+        reported_location_gap = _only_reported_event_location_unknown(request, profile, basis)
+        if not reported_location_gap:
+            return None
     if basis.get("admitted") is True:
         if (basis.get("reason") != "validated_observation_basis"
                 or not _valid_open_applicability(profile, basis, open_applicability)):
             return None
     elif (basis.get("admitted") is not False
-          or basis.get("reason") != "insufficient_current_observations"):
+          or (basis.get("reason") != "insufficient_current_observations" and not reported_location_gap)):
         return None
-    if (not isinstance(indices, list) or not 1 <= len(indices) <= 3
-            or any(type(i) is not int or not 0 <= i < len(profile.parts) for i in indices)
-            or indices != sorted(set(indices))
-            or any(profile.parts[i].role != "request" for i in indices)):
+    else:
+        # A combined question can lead the router to include an adjacent
+        # unknown span or select only a request about existing observations.
+        # Recover only explicit documentary question spans, still subject to
+        # the same source admission and independent review.
+        explicit_indices = _explicit_documentary_indices(profile)
+        if explicit_indices and (not _valid_documentary_indices(profile, indices)
+                                 or not set(explicit_indices).issubset(indices)):
+            indices = explicit_indices
+    if not _valid_documentary_indices(profile, indices):
         return None
     if document_filter is not None and (
         not isinstance(document_filter, list) or any(type(kind) is not str for kind in document_filter)
@@ -677,7 +755,8 @@ def bind_request(request, profile, basis, indices, rows, *, source_type, source_
         request_binding(request), tuple(profile.parts[i].quote for i in indices),
         json.dumps(selected, ensure_ascii=False, separators=(",", ":")),
         label, required_types, unresolved_indication,
-        include_structured_observations=independent_request,
+        include_structured_observations=(independent_request
+                                         or (unresolved_indication and _requests_recorded_evidence(profile))),
     )
 
 

@@ -1621,11 +1621,11 @@ class TaskGenerationEvidence(GenericGenerationEvidence):
             if (not self.model_handles or parameters.get("company_id")!=self.request.company_id
                     or parameters.get("purpose")!=purpose):
                 raise GenerationEvidenceError("task model scope or input missing")
-            self.records(self.all_handles)
+            self.validate_records(self.all_handles)
             if not _same_value(self.retrieval,self.retrieval_snapshot):
                 raise GenerationEvidenceError("task input changed before model")
             result = self.tasks._v13_json_models(*args, **parameters)
-            self.records(self.all_handles)
+            self.validate_records(self.all_handles)
             return result
         return self.invoke(work, self.request)
 
@@ -1903,7 +1903,7 @@ class TaskGenerationEvidence(GenericGenerationEvidence):
                         response_language=r.response_language,top_k=r.top_k,planner=retrieval.get("plan") or {},
                         seed_citations=retrieval.get("citations") or retrieval.get("candidates") or [],
                         assurance_meta=retrieval.get("retrieval_assurance") or {},debug=r.debug,runtime=runtime)
-                self.records(self.all_handles)
+                self.validate_records(self.all_handles)
                 if not _same_value(retrieval,self.retrieval_snapshot):
                     raise GenerationEvidenceError("task changed admitted input")
                 if result is None:return None,(),()

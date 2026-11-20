@@ -641,6 +641,10 @@ class GenericGenerationEvidence:
         return self.session.records(request=self.request, handles=handles,
             current_allowed_sources=self.current())
 
+    def validate_records(self, handles):
+        self.session.validate_records(request=self.request, handles=handles,
+            current_allowed_sources=self.current(), selected_fallback=True)
+
     def _bind(self, row, handle):
         if type(row) is not dict:
             raise GenerationEvidenceError("generation needs exact record dictionaries")
@@ -761,11 +765,11 @@ class GenericGenerationEvidence:
                 raise GenerationEvidenceError("generation model scope drift")
             if not _same_value(self.retrieval, self.retrieval_snapshot):
                 raise GenerationEvidenceError("generation input mutated before model")
-            self.records(self.input_handles)
+            self.validate_records(self.input_handles)
             result = self._document_scalar_draft(args[0]) if args else None
             if result is None:
                 result = self.runtime._v13_json_models(*args, **parameters)
-            self.records(self.input_handles)
+            self.validate_records(self.input_handles)
             return result
         return self.invoke(work, self.request)
 
@@ -904,7 +908,7 @@ class GenericGenerationEvidence:
                     narrow_scope=self.request.narrow_scope, debug=self.request.debug, runtime=bound)
                 if not _same_value(retrieval, original):
                     raise GenerationEvidenceError("synthesis mutated admitted retrieval")
-                self.records(self.input_handles)
+                self.validate_records(self.input_handles)
                 if result.get("citations"):
                     output = self.handles(result["citations"])
                     if output != self.rendered:

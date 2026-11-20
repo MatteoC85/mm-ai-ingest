@@ -8,17 +8,33 @@ Admin authentication needs exposed types and is not user authentication.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import http.client
 import json
+import logging
 import re
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
-from threading import RLock
+from threading import Lock, RLock
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any
 
+from urllib3.exceptions import ConnectTimeoutError, ProtocolError, ReadTimeoutError
+
 from .contracts import AuthorityError, AuthorityMeter, identifier
+
+_LOG = logging.getLogger(__name__)
+_TRANSIENT_STATUS = frozenset({502, 503, 504})
+_TRANSIENT_TRANSPORT = (
+    TimeoutError, ConnectionResetError, ConnectionAbortedError, BrokenPipeError,
+    http.client.RemoteDisconnected, http.client.IncompleteRead,
+    ConnectTimeoutError, ReadTimeoutError, ProtocolError,
+)
+
+
+class _TransientRead(Exception):
+    """Transport failed before a validated Bubble response was available."""
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -78,6 +94,8 @@ class BubbleDirectory:
         self._parallel = request_owned_io
         self._closed = False
         self._batch_lock = RLock()
+        self._retry_lock = Lock()
+        self._transient_retries_left = 2 if request_owned_io else 0
         self._owns_opener = opener is None and request_owned_io
         if self._owns_opener:
             from .pooled_transport import ReadOnlyPool
@@ -102,11 +120,29 @@ class BubbleDirectory:
             "Authorization": "Bearer " + self._connection.token,
             "Accept": "application/json", "Cache-Control": "no-store",
             "User-Agent": "MachineMind-B4l-Authority/1"})
+        try:
+            return self._get_once(request, missing_record=missing_record)
+        except _TransientRead as exc:
+            with self._retry_lock:
+                retry = self._transient_retries_left > 0
+                if retry:
+                    self._transient_retries_left -= 1
+            _LOG.warning("BUBBLE_AUTHORITY_TRANSIENT_FAILURE reason=%s retry=%s", exc, retry)
+        if retry:
+            try:
+                return self._get_once(request, missing_record=missing_record)
+            except _TransientRead as exc:
+                _LOG.warning("BUBBLE_AUTHORITY_TRANSIENT_FAILURE reason=%s retry=False", exc)
+        raise AuthorityError("AUTHORITY_PROVIDER_UNAVAILABLE") from None
+
+    def _get_once(self, request: urllib.request.Request, *, missing_record: bool) -> dict | None:
         from ..ask.request_completion import check_io_time, transport_timeout
         from ..infrastructure.request_budget import _V13BudgetExceeded
+        if self._closed:
+            raise AuthorityError("AUTHORITY_REQUEST_EXPIRED")
         check_io_time()
         timeout = self.meter.begin()
-        size, failed = 0, True
+        size, failed, status = 0, True, None
         try:
             timeout = transport_timeout(timeout)
             try:
@@ -123,6 +159,8 @@ class BubbleDirectory:
                     raise AuthorityError("AUTHORITY_REQUEST_EXPIRED")
                 if size > self.meter.limits.max_response_bytes:
                     raise AuthorityError("AUTHORITY_RESPONSE_TOO_LARGE")
+                if status in _TRANSIENT_STATUS:
+                    raise _TransientRead(f"http_{status}")
                 if status != 200:
                     # 404 can also mean wrong type/environment. Only Bubble's
                     # explicit MISSING_DATA record status is treated as absent.
@@ -141,12 +179,16 @@ class BubbleDirectory:
                     raise AuthorityError("AUTHORITY_RESPONSE_INVALID")
                 failed = False
                 return body
-        except (AuthorityError, _V13BudgetExceeded):
+        except (AuthorityError, _TransientRead, _V13BudgetExceeded):
             raise
-        except Exception:
-            # Expiry of an optional time window is not a poisoned permission.
-            # Before expiry, a transport failure retains its original meaning.
+        except Exception as exc:
+            # An expired optional window and a hard request deadline both take
+            # precedence over retrying a transport failure.
             check_io_time()
+            cause = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+            if ((status is None or status == 200 or status in _TRANSIENT_STATUS)
+                    and isinstance(cause, _TRANSIENT_TRANSPORT)):
+                raise _TransientRead(type(cause).__name__) from None
             raise AuthorityError("AUTHORITY_PROVIDER_UNAVAILABLE") from None
         finally:
             self.meter.finish(size, failed=failed)

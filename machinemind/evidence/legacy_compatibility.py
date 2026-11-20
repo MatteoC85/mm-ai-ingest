@@ -210,7 +210,20 @@ def _wire_json(node: _Frozen) -> str:
         children = (node.value.wire_children() if type(node.value) is _PackedFloats
                     else '[' + ','.join(_wire_json(v) for v in node.value) + ']')
         return '[' + _json(node.kind) + ',' + children + ']'
-    return _json([node.kind, node.value])
+    # Emit exact built-in scalars with the same strict stdlib JSON spelling.
+    # Invalid/private manually constructed nodes keep the original encoder.
+    kind, value = node.kind, node.value
+    if kind == "str" and type(value) is str:
+        return '["str",' + json.encoder.encode_basestring_ascii(value) + "]"
+    if kind == "null" and value is None:
+        return '["null",null]'
+    if kind == "bool" and type(value) is bool:
+        return '["bool",' + ("true" if value else "false") + "]"
+    if kind == "int" and type(value) is int:
+        return '["int",' + str(value) + "]"
+    if kind == "float" and type(value) is float and math.isfinite(value):
+        return '["float",' + repr(value) + "]"
+    return _json([kind, value])
 
 
 # Stateless encoder: reuses only configuration, never content, grants or IDs.

@@ -31,6 +31,9 @@ def encode_verdict(reply, frame):
     for change in out.get("operation_boundary", {}).get("changes", []):
         field = "closing_source_citation_id"
         change[field] = dict(frame.source_labels)[change[field]]
+    if frame.checklist_positions:
+        for name in ("covered_list_items", "missing_list_items"):
+            out[name] = [out["expected_list_items"].index(value) + 1 for value in out[name]]
     return out
 
 
@@ -108,6 +111,27 @@ class FiniteReviewWireTests(unittest.TestCase):
                 self.assertIsNone(wire.prepare(sources, **common))
         self.assertIsNone(wire.prepare(f"{header}\nBody", **{**common, "answer": "Literal @f1"}))
 
+    def test_checklist_positions_preserve_explicit_coverage_and_reject_invalid_indices(self):
+        cid = "step:document:p1-1"
+        frame = wire.prepare(f"[{cid}] source_type=step\nSource notes.", citation_ids=(cid,),
+            facets=("checks",), types=("checklist",), question="What checks apply?",
+            answer="Check the guard.", checklist_positions=True)
+        reply = {
+            "outcome": "rewrite", "answer": "Check the guard.", "citation_ids": [cid],
+            "covered_facets": [], "missing_facets": ["checks"],
+            "covered_answer_types": [], "missing_answer_types": ["checklist"],
+            "expected_list_items": ["Check the guard", "Verify the recorded shutdown"],
+            "covered_list_items": ["Check the guard"], "missing_list_items": ["Verify the recorded shutdown"],
+        }
+        encoded = encode_verdict(reply, frame)
+        self.assertEqual(frame.decode(encoded), reply)
+        self.assertLess(payload_bytes(encoded), payload_bytes(reply))
+        for field, invalid in (("covered_list_items", [True]), ("covered_list_items", [0]),
+                               ("missing_list_items", [3]), ("missing_list_items", [1, 2]),
+                               ("missing_list_items", ["Verify the recorded shutdown"])):
+            with self.subTest(field=field, invalid=invalid), self.assertRaises(ValueError):
+                frame.decode({**encoded, field: invalid})
+
     def test_required_checklist_enumeration_keeps_independent_list_coverage(self):
         m = self.m
         request = m.AssistantCoreRequest(query="Which checks apply before loading and what mass is allowed?",
@@ -134,14 +158,16 @@ class FiniteReviewWireTests(unittest.TestCase):
         draft = "Check cable integrity. Use eye protection. The maximum mass is 1000 kg."
 
         def review(items, *, alternate=decision, enable_aliases=True, catalog=""):
-            def provider(messages, **_options):
+            def provider(messages, **options):
                 content = messages[1]["content"]
                 self.assertIn("ENUMERATION_REQUESTED: true", content)
                 has_aliases = "ANSWER_TYPE_LABELS:" in content
                 self.assertEqual(has_aliases, enable_aliases)
                 if has_aliases:
+                    item_schema = options["json_schema"]["schema"]["properties"]["covered_list_items"]["items"]
+                    self.assertEqual(item_schema, {"type": "integer", "minimum": 1, "maximum": 40})
                     frame = wire.prepare(sources, citation_ids=tuple(ids), facets=facets, types=types,
-                                         question=request.query, answer=draft)
+                                         question=request.query, answer=draft, checklist_positions=True)
                     source = content.split("\n\nSOURCES:\n", 1)[1].split("\n\nReturn only the required JSON.", 1)[0]
                     self.assertTrue(review_source_wire.restore_sources_block(source) == frame.sources)
                 reply = {"outcome": "pass", "reason": "Offline source review", "answer": "",
@@ -208,7 +234,9 @@ class FiniteReviewWireTests(unittest.TestCase):
                         source_ids = tuple(row["citation_id"] for row in packet.rows)
                         frame = prepare_wire(packet.sources, citation_ids=source_ids,
                             facets=tuple(labels["FACET_LABELS"].values()),
-                            types=tuple(labels["ANSWER_TYPE_LABELS"].values()), question="", answer="")
+                            types=tuple(labels["ANSWER_TYPE_LABELS"].values()), question="", answer="",
+                            checklist_positions=options["json_schema"]["schema"]["properties"]
+                                ["covered_list_items"]["items"]["type"] == "integer")
                         source_wire = sources.partition("\n\nReturn only the required JSON.")[0]
                         self.assertEqual(review_source_wire.restore_sources_block(source_wire), frame.sources)
                         restored = re.sub(r"^\[(@s[0-9]+)\] source_type=",

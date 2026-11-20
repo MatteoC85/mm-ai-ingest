@@ -9,6 +9,7 @@ from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass
 import math
+import os
 from typing import Any
 
 from machinemind.infrastructure import request_budget as native
@@ -109,6 +110,19 @@ def review_dispatch_timeout_seconds(configured: int, *, use_remaining_window: bo
     if type(use_remaining_window) is not bool:
         raise ValueError("Root review window policy must be boolean")
     return 35 if use_remaining_window else reserved
+
+
+def producer_dispatch_timeout_seconds(configured: int) -> int:
+    """Allow the normal provider cap inside the already reserved producer window.
+
+    This only spends available producer time. Provider timeout resolution still
+    applies the child deadline, which excludes the independent review and finalization.
+    """
+    window = current_window()
+    available = window is not None and not window.optional
+    return review_dispatch_timeout_seconds(
+        configured, use_remaining_window=available and "MM_V13_FAST_TIMEOUT_SECONDS" not in os.environ,
+    )
 
 
 @contextmanager

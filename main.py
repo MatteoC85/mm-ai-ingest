@@ -13333,6 +13333,7 @@ def _v13_generate_root_cause_response(
     root_literal_fallback_fields: bool = False,
     root_preserve_source_alternatives: bool = False,
     root_producer_applicability_contract: bool = False,
+    root_producer_timeout: int | None = None,
 ) -> dict:
     citations = list(retrieval.get("citations") or retrieval.get("candidates") or [])
     citations = citations[:V13_MAX_EVIDENCE_ITEMS_ROOT_CAUSE]
@@ -13428,7 +13429,8 @@ def _v13_generate_root_cause_response(
             json_schema=producer_schema,
             effort=effort,
             reasoning_mode=reasoning_mode,
-            timeout=V13_HEAVY_TIMEOUT_SECONDS if model == V13_HEAVY_MODEL else V13_FAST_TIMEOUT_SECONDS,
+            timeout=(V13_HEAVY_TIMEOUT_SECONDS if model == V13_HEAVY_MODEL
+                     else (root_producer_timeout if root_producer_timeout is not None else V13_FAST_TIMEOUT_SECONDS)),
             max_output_tokens=V13_HEAVY_MAX_OUTPUT_TOKENS if model == V13_HEAVY_MODEL else V13_FAST_MAX_OUTPUT_TOKENS,
             company_id=company_id,
             purpose="root_cause_final_reasoning",
@@ -14327,6 +14329,21 @@ def _assistant_core_router_call(request: AssistantCoreRequest, retrieval: dict) 
                     documentary = None
             if documentary is not None:
                 request.metadata[_root_documentary.PRIVATE_KEY] = documentary
+            elif _retrieval_diagnostic_query.unresolved_reported_indication(profile) is not None:
+                budget = _v13_current_budget()
+                if budget is not None:
+                    try:
+                        print("ROOT_DOCUMENTARY_RESULT", json.dumps({
+                            "request_id": budget.request_id,
+                            "outcome": "binding_unavailable",
+                            "router_documentary_index_count": (
+                                len(documentary_parts) if type(documentary_parts) is list else None),
+                            "router_source_count": len(supplied),
+                            "neutral_source_count": len(candidates),
+                            "source_type_required": required_document_types is not None,
+                        }, separators=(",", ":")), flush=True)
+                    except (AttributeError, OSError, ValueError, TypeError):
+                        pass
         # This object is created only after the original partition and admission
         # have passed. Provider JSON/candidate tags cannot instantiate the carrier.
         out.pop(_root_clue_support.WIRE_KEY, None)
@@ -16101,6 +16118,9 @@ def _assistant_core_synthesize_root_cause(
                 request.requested_mode == MODE_ROOT_CAUSE
                 and decision.effective_mode == MODE_ROOT_CAUSE
             ),
+            # The producer window keeps the independent review and finalization
+            # reserves. The native dispatch limit can still shorten this cap.
+            root_producer_timeout=root_time_budget.producer_dispatch_timeout_seconds(V13_FAST_TIMEOUT_SECONDS),
             root_preserve_source_alternatives=(
                 request.requested_mode == MODE_ROOT_CAUSE
                 and decision.effective_mode == MODE_ROOT_CAUSE
@@ -16446,7 +16466,10 @@ def _assistant_core_build_clarification(
                 # about existing records alongside the independently sourced claims.
                 question_to_review = (
                     recorded_question
-                    if recorded_question and (contextual_indication or len(documentary.questions) > 1)
+                    if recorded_question and (
+                        contextual_indication or len(documentary.questions) > 1
+                        or any(part.role in {"target_identity", "target_identity_unknown"} for part in profile.parts)
+                    )
                     else decision.clarification_question
                 )
                 reviewed_question = _root_documentary.with_recorded_measurement_units(

@@ -305,7 +305,7 @@ def quality_preflight(service, prior_revision, *, expected_current=None,
     template_annotations = routing_configuration(service)[1]
     active_annotations = revision_behavioral_annotations(prior_revision, service)
     if template_annotations != active_annotations:
-        # The R50 rollback and the reviewed R51–R54 zero-traffic stages left Gen2
+        # The R50 rollback and the reviewed R51–R58 zero-traffic stages left Gen2
         # templates. Only these exact idle templates may pass a build preflight.
         idle_templates = {
             SERVICE + '-r50-gen2': (
@@ -323,6 +323,18 @@ def quality_preflight(service, prior_revision, *, expected_current=None,
             SERVICE + '-r54-gen2': (
                 'r54-gen2', '560ce046e4faf788d46d2b7e31b17f1ddb22e619',
                 'sha256:253a417dcf303f6e27b718182a4efbb3c26e68724d1637ecc374af3b6fd888db'),
+            SERVICE + '-r55-gen2': (
+                'r55-gen2', 'a275711fa6c25e5847164c3dd160839b5cad703e',
+                'sha256:3a4935e2927c3654143c8b4f438b1d5b0316b7625effd6260017279d4bea7ce8'),
+            SERVICE + '-r56-gen2': (
+                'r56-gen2', 'b27dd280a785450c0a6176a52c99b5c744cdce8f',
+                'sha256:124d732450757e0d08fe7d584ae923a6021aa44e860eaa0b910c6e406275f07d'),
+            SERVICE + '-r57-gen2': (
+                'r57-gen2', '2a58f4ec6f9aecaa44067bc012c4257f069fc76c',
+                'sha256:e05e44da21b5edf77d18ba136ac648b345910a618d46a3dc9299fee0dee4fc1e'),
+            SERVICE + '-r58-gen2': (
+                'r58-gen2', 'efc89917c4ee3e28df2a425802b35ac5e7557309',
+                'sha256:fad7678bdac53ad8895f3f3d49384ee42f4ade7af617ce9fe3573791d8efe7ef'),
         }
         status = service.get('status', {})
         idle_revision = status.get('latestCreatedRevisionName')

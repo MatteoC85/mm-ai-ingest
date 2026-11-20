@@ -118,7 +118,7 @@ class ResponseEvidenceFlow(TaskGenerationEvidence):
                 raise ResponseEvidenceError("consumer response has an unregistered link")
         if response.get("candidates"):
             raise ResponseEvidenceError("uncomposed response candidate collection")
-        self.records(self.all_handles)
+        self.validate_records(self.all_handles)
 
     def _snapshot(self, response):
         self._envelope(response)
@@ -277,7 +277,7 @@ class ResponseEvidenceFlow(TaskGenerationEvidence):
                         raise ResponseEvidenceError("canonical verifier outcome invalid")
                     if str(result.get("outcome") or "").lower() == "unavailable":
                         raise ResponseEvidenceError("canonical verifier unavailable: " + str(result.get("reason") or "unknown"))
-                self.records(self.all_handles)
+                self.validate_records(self.all_handles)
                 return result
             finally:
                 self.stack.pop()
@@ -391,7 +391,7 @@ class ResponseEvidenceFlow(TaskGenerationEvidence):
                 raise ResponseEvidenceError("review packet limits changed within request")
             if self.handles(list(packet.rows)) != self._review_packet_handles:
                 raise ResponseEvidenceError("review packet occurrence identity changed")
-            self.records(self.all_handles)
+            self.validate_records(self.all_handles)
             self.model_inputs = self._review_packet_handles
             diagnostic = packet.diagnostic(reused=self._review_packet_uses > 0)
             self._review_packet_uses += 1
@@ -404,10 +404,10 @@ class ResponseEvidenceFlow(TaskGenerationEvidence):
                     or parameters.get("company_id") != self.request.company_id
                     or parameters.get("purpose") != "assistant_core_answer_contract_verifier"):
                 raise ResponseEvidenceError("verifier model lacks its scoped source occurrences")
-            self.records(self.all_handles)
+            self.validate_records(self.all_handles)
             self.verifier_calls += 1
             result = self.execution._v13_json_models(*args, **parameters)
-            self.records(self.all_handles)
+            self.validate_records(self.all_handles)
             return result
         return self.invoke(work, self.request)
 
